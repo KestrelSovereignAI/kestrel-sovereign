@@ -21,6 +21,7 @@ from kestrel_sdk.llm import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
+from .gemini_contents import to_gemini_contents, tool_result_messages
 from .output_ceiling import (
     OutputCeilingUnknownError,
     OutputCeilings,
@@ -141,6 +142,7 @@ class GoogleAdapter(LLMAdapter):
         model: str,
         tools: Optional[List[Dict[str, Any]]],
         call_kwargs: Dict[str, Any],
+        system_instruction: Optional[str] = None,
     ) -> tuple[Dict[str, Any], Optional[int]]:
         """The ``generate_content`` config, and the model ceiling if it was used.
 
@@ -148,7 +150,8 @@ class GoogleAdapter(LLMAdapter):
         returned: a cut at that budget is the caller's to read from the
         finish reason. Otherwise the model's own ceiling is sent and returned,
         so a response that exhausted the model's whole output can be told from
-        one that stopped at a smaller, deliberate budget.
+        one that stopped at a smaller, deliberate budget. The system turns of
+        the messages travel as ``system_instruction`` (#3608).
         """
         requested = call_kwargs.get("max_tokens")
         model_ceiling = None
@@ -159,6 +162,8 @@ class GoogleAdapter(LLMAdapter):
         }
         if "temperature" in call_kwargs:
             config["temperature"] = call_kwargs["temperature"]
+        if system_instruction:
+            config["system_instruction"] = system_instruction
         if tools:
             config["tools"] = [{
                 "function_declarations": self._convert_tools_to_gemini_format(tools)
@@ -348,7 +353,8 @@ class GoogleAdapter(LLMAdapter):
         Args:
             client: google-genai ``Client`` instance (``client.aio.models``)
             model: Model name (e.g., 'gemini-2.0-flash-exp')
-            messages: List of message dicts in Gemini format
+            messages: Chat messages in OpenAI format, or already in Gemini
+                format (``parts``); converted by ``to_gemini_contents``
             format: Response format (ignored for Gemini)
             tools: Optional tools in OpenAI format (will be converted)
             **kwargs: Additional parameters
@@ -357,15 +363,17 @@ class GoogleAdapter(LLMAdapter):
             LLMResponse with content and/or tool calls
         """
         try:
+            # OpenAI-format messages become Gemini contents (#3608)
+            system_instruction, contents = to_gemini_contents(messages)
             config, model_ceiling = await self._generation_config(
-                client, model, tools, kwargs,
+                client, model, tools, kwargs, system_instruction,
             )
 
             # Generate content via the maintained google-genai async client,
             # honoring the routed model (mirrors VertexAIAdapter).
             response = await client.aio.models.generate_content(
                 model=model,
-                contents=messages,
+                contents=contents,
                 config=config,
             )
 
@@ -466,15 +474,17 @@ class GoogleAdapter(LLMAdapter):
             Text chunks as they arrive, then a usage-bearing response.
         """
         try:
+            # OpenAI-format messages become Gemini contents (#3608)
+            system_instruction, contents = to_gemini_contents(messages)
             config, model_ceiling = await self._generation_config(
-                client, model, tools, kwargs,
+                client, model, tools, kwargs, system_instruction,
             )
 
             # Stream via the maintained google-genai async client, honoring the
             # routed model (mirrors VertexAIAdapter).
             stream = await client.aio.models.generate_content_stream(
                 model=model,
-                contents=messages,
+                contents=contents,
                 config=config,
             )
 
@@ -596,29 +606,14 @@ class GoogleAdapter(LLMAdapter):
         """
         Continue conversation after executing tool calls.
 
-        Gemini expects function responses in a specific format.
+        ``messages`` ends with the assistant turn whose ``tool_calls`` the
+        ``tool_results`` (``{"tool_call_id", "content"}``) answer; each result
+        becomes a ``function_response`` named after its call (#3608).
         """
-        extended_messages = messages.copy()
-
-        # Add function response parts
-        function_responses = []
-        for result in tool_results:
-            function_responses.append({
-                "function_response": {
-                    "name": result.get("name", "unknown"),
-                    "response": {"result": result["content"]}
-                }
-            })
-
-        extended_messages.append({
-            "role": "function",
-            "parts": function_responses
-        })
-
         return await self.get_response(
             client=client,
             model=model,
-            messages=extended_messages,
+            messages=[*messages, *tool_result_messages(tool_results)],
             tools=tools,
             **kwargs
         )
