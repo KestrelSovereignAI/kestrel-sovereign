@@ -5,8 +5,10 @@ Production wrote every turn of a PostgreSQL agent without its vector: the
 profile produced 1536 dimensions. Each turn persisted and logged three INFO
 lines. The store now counts each dropped embedding, warns (rate-limited), and
 surfaces the count at ``/health/detailed``; at startup it compares the profile
-with the column's declared width once and reports a disagreement as an ERROR
-and a health misconfiguration, without refusing to boot.
+with the column's declared width and reports a disagreement as an ERROR
+and a health misconfiguration, without refusing to boot. Every runtime change
+to the embedding profile through the models API runs that comparison again, so
+the misconfiguration describes the profile the agent writes with now (#3606).
 
 A drop is counted only once its turn has committed: a turn whose transaction
 rolls back never persisted, and the count and WARNING cannot be taken back. The
@@ -23,15 +25,18 @@ a schema of its own.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
+from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.features.health.checks import (
     check_conversation_embeddings,
     run_standard_checks,
@@ -49,6 +54,7 @@ from kestrel_sovereign.knowledge import (
     SourceOccurrence,
     XSD_STRING,
 )
+from kestrel_sovereign.llm.embedding_discovery import EmbeddingModelInfo
 from kestrel_sovereign.llm.embedding_service import derive_embedding_profile
 from kestrel_sovereign.security.assertion_tenant_resolver import (
     _resolve_authenticated_agent_assertion_capability,
@@ -58,6 +64,7 @@ from kestrel_sovereign.storage.async_conversation_store import AsyncConversation
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.db import TransactionError
+from kestrel_sovereign.storage.embedding_vec_backfill import EmbeddingVecBackfillError
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from tests.utils.postgres_schema import (
     disposable_postgres_schema,
@@ -65,6 +72,7 @@ from tests.utils.postgres_schema import (
     quoted_search_path,
     with_search_path,
 )
+from tests.utils.process_local_llm_service import process_local_service
 
 STORE_LOGGER = store_module.logger.name
 AGENT_ID = "did:test:embedding-drops"
@@ -756,8 +764,10 @@ class _PostgresSchema:
     db: AsyncDatabase
     vector_schema: str
 
-    async def size_embedding_column(self, dim: int) -> None:
+    async def size_embedding_column(self, dim: Optional[int]) -> None:
         """Declare ``embedding_vec`` as ``vector(dim)``, whatever the boot made.
+
+        ``None`` declares an unconstrained ``vector``, with no width.
 
         The boot's ``embedding_vec`` and ``embedding_profile_id`` migrations
         probe ``information_schema`` without a schema filter, so on a shared
@@ -768,9 +778,10 @@ class _PostgresSchema:
             "ALTER TABLE conversation_history DROP COLUMN IF EXISTS embedding_vec",
             (),
         )
+        width = "" if dim is None else f"({dim})"
         await self.db.execute(
             "ALTER TABLE conversation_history ADD COLUMN embedding_vec "
-            f'"{self.vector_schema}".vector({dim})',
+            f'"{self.vector_schema}".vector{width}',
             (),
         )
         await self.db.execute(
@@ -1184,3 +1195,490 @@ async def test_postgres_best_effort_writes_after_a_dropped_vector_keep_the_trans
         assert "best-effort write refused" in cleanup_failures[0].getMessage()
         assert store.dropped_embedding_count == 1
         assert len(_store_records(caplog, logging.WARNING)) == 1
+
+
+# ------------------------------------------------- runtime profile change (#3606)
+
+# Two local embedding routes of different widths. Local routes take no live
+# probe when selected, so the models API selects them offline.
+_NARROW = ("ollama:narrow", "narrow-embed", 4)
+_WIDE = ("ollama:wide", "wide-embed", 6)
+
+
+def _embedding_route(route):
+    name, model, dim = route
+    return {
+        "name": name,
+        "vendor": "ollama",
+        "route": name.split(":", 1)[1],
+        "adapter": object(),
+        "client": object(),
+        "model": "chat-model",
+        "is_local": True,
+        "is_cloud": False,
+        "capabilities": {
+            "supports_embeddings": True,
+            "embedding_model": model,
+            "embedding_dim": dim,
+        },
+    }
+
+
+def _route_profile_id(route) -> str:
+    _, model, dim = route
+    return derive_embedding_profile(
+        provider="ollama", model=model, dim=dim
+    ).profile_id
+
+
+class _ModelsApiAgent(ModelPreferenceMixin):
+    """A booted agent's embedding configuration, over the real store.
+
+    Wired the way ``KestrelAgent`` boot wires it: the conversation store embeds
+    through the agent's ``LLMService``, whose persistence callbacks and
+    resolved-profile listener are the agent's own, and the loaded profile goes
+    through ``refresh_active_embedding_profile``. With an auto
+    ``embedding_route`` the first of *providers*, the chat route, is the one
+    embeddings follow.
+    """
+
+    def __init__(self, db, *providers) -> None:
+        self.agent_id = AGENT_ID
+        self.privacy_agent = None
+        self.llm_service = process_local_service(list(providers))
+        self._raw_storage = SimpleNamespace(
+            db=db,
+            conversation=AsyncConversationStore(
+                db, agent_id=AGENT_ID, llm_service=self.llm_service
+            ),
+        )
+
+    @property
+    def store(self) -> AsyncConversationStore:
+        return self._raw_storage.conversation
+
+    async def boot(self) -> None:
+        service = self.llm_service
+        service.set_preference_persistence_callback(self._persist_model_preference)
+        service.set_embedding_route_persistence_callback(self._persist_embedding_route)
+        service.set_route_embedding_model_persistence_callback(
+            self._persist_route_embedding_models
+        )
+        service.set_embedding_profile_change_callback(
+            self.refresh_active_embedding_profile
+        )
+        await self.refresh_active_embedding_profile()
+
+
+@asynccontextmanager
+async def _models_api(agent):
+    """The models API, served for *agent* on this test's event loop."""
+    import httpx
+    from fastapi import FastAPI
+
+    from kestrel_sovereign.endpoints.models import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = agent
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://agent"
+    ) as client:
+        yield client
+
+
+async def _post(agent, client, path, body) -> None:
+    response = await client.post(path, json=body)
+    assert response.status_code == 200, response.text
+    # The service persists the change, and the agent acts on it, in a task.
+    await agent.llm_service.drain_preference_persistence()
+
+
+async def _select_embedding_route(agent, client, route, *, force=False) -> None:
+    """Point embeddings at *route* (a route triple, or ``"none"``).
+
+    ``force`` overrides the #2417 gate, which refuses a route whose width
+    differs from the width the process believes the column has.
+    """
+    name = route if isinstance(route, str) else route[0]
+    await _post(
+        agent,
+        client,
+        "/api/embedding/settings",
+        {"embedding_route": name, "force": force},
+    )
+
+
+async def _health(agent):
+    health = await check_conversation_embeddings(agent)
+    json.dumps(health)
+    return health
+
+
+@pytest.mark.parametrize("target", [_NARROW, "none"], ids=["matching", "embeddings-off"])
+async def test_postgres_runtime_switch_off_a_mismatched_profile_clears_the_flag(
+    postgres_url, monkeypatch, caplog, target
+):
+    """Booted on a profile wider than the column, the operator switches away.
+
+    The startup flag described the boot profile; health must stop reporting
+    it once the agent no longer writes with that profile.
+    """
+    _configure_column_width(monkeypatch, 4)
+    async with _own_postgres_schema(postgres_url) as case:
+        await case.size_embedding_column(4)
+        agent = _ModelsApiAgent(
+            case.db, _embedding_route(_WIDE), _embedding_route(_NARROW)
+        )
+
+        with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+            await agent.boot()
+        assert len(_store_records(caplog, logging.ERROR)) == 1
+        health = await _health(agent)
+        assert health["details"]["misconfigured"] is True
+        assert health["details"]["misconfiguration"]["profile_id"] == (
+            _route_profile_id(_WIDE)
+        )
+
+        caplog.clear()
+        async with _models_api(agent) as client:
+            with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+                await _select_embedding_route(agent, client, target)
+
+        assert agent.store.embedding_column_mismatch is None
+        health = await _health(agent)
+        assert health["status"] == "pass"
+        assert "misconfiguration" not in health.get("details", {})
+        assert not _store_records(caplog, logging.WARNING)
+
+
+async def _pin_route_model(
+    agent, client, route, model_route, *, force=False
+) -> None:
+    """Pin *route*'s embedding model to *model_route*'s model and width.
+
+    ``force`` overrides the #2417 gate, as for :func:`_select_embedding_route`.
+    """
+    _, model, dim = model_route
+    await _post(
+        agent,
+        client,
+        "/api/embedding/route-model",
+        {
+            "route": route[0],
+            "embedding_model": model,
+            "embedding_dim": dim,
+            "force": force,
+        },
+    )
+
+
+async def _clear_route_model(client, route) -> None:
+    """Clear *route*'s embedding model pin.
+
+    Unlike :func:`_post` it does not wait for the service's tasks: the request
+    itself returns once the agent has acted on the profile it leaves.
+    """
+    response = await client.post(
+        "/api/embedding/route-model",
+        json={"route": route[0], "embedding_model": None},
+    )
+    assert response.status_code == 200, response.text
+
+
+async def _select_chat_route(agent, client, route) -> None:
+    """Select *route* for chat; an auto embedding_route follows it."""
+    vendor, route_name = route[0].split(":", 1)
+    await _post(
+        agent,
+        client,
+        "/api/model/set",
+        {"vendor": vendor, "route": route_name, "model": "chat-model"},
+    )
+
+
+# Every door of the models API that changes the profile the agent embeds
+# with, each persisted through its own agent callback.
+_PROFILE_DOORS = {
+    "embedding-route": lambda agent, client: _select_embedding_route(
+        agent, client, _WIDE
+    ),
+    "route-model-pin": lambda agent, client: _pin_route_model(
+        agent, client, _NARROW, _WIDE
+    ),
+    "chat-route": lambda agent, client: _select_chat_route(agent, client, _WIDE),
+}
+
+
+@pytest.mark.parametrize("door", list(_PROFILE_DOORS))
+async def test_postgres_runtime_switch_onto_a_mismatched_profile_raises_the_flag(
+    postgres_url, monkeypatch, caplog, door
+):
+    """Production's shape, reached at runtime: the process believes the column
+    is as wide as the new profile, but it is declared ``vector(4)``.
+
+    Booted matched, the agent is silent; the switch is an ERROR, once, and a
+    misconfiguration naming the profile it now writes with.
+    """
+    _configure_column_width(monkeypatch, 6)
+    async with _own_postgres_schema(postgres_url) as case:
+        await case.size_embedding_column(4)
+        agent = _ModelsApiAgent(
+            case.db, _embedding_route(_NARROW), _embedding_route(_WIDE)
+        )
+
+        with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+            await agent.boot()
+        assert not _store_records(caplog, logging.WARNING)
+        assert (await _health(agent))["status"] == "pass"
+
+        async with _models_api(agent) as client:
+            with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+                await _PROFILE_DOORS[door](agent, client)
+
+            errors = _store_records(caplog, logging.ERROR)
+            assert len(errors) == 1
+            assert "vector(4)" in errors[0].getMessage()
+            health = await _health(agent)
+            assert health["status"] == "warn"
+            assert health["details"]["misconfigured"] is True
+            # The pin keeps the narrow route's name but embeds with the wide
+            # model, so the profile is the one the model and width derive.
+            assert health["details"]["misconfiguration"] == {
+                "profile_id": _route_profile_id(_WIDE),
+                "profile_dim": 6,
+                "column_dim": 4,
+            }
+            assert health["details"]["dropped"] == 0
+
+            # A later change that leaves the profile where it is finds the same
+            # disagreement and does not report it again.
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+                await _PROFILE_DOORS[door](agent, client)
+
+        assert not _store_records(caplog, logging.ERROR)
+        assert (await _health(agent))["details"]["misconfigured"] is True
+
+
+# A chat route with no embedding model of its own: unpinned, it embeds with
+# what the resolver picks from its adapter's catalog, wider than the column.
+_AUTO = ("ollama:auto", "auto-embed", 6)
+
+
+class _DiscoveringAdapter:
+    """A route adapter whose embedding catalog holds one model."""
+
+    def __init__(self, model: str, dim: int) -> None:
+        self._model, self._dim = model, dim
+
+    async def list_embedding_models(self, client):
+        # Discovery stamps its route on each model, so a fresh one per call.
+        return [
+            EmbeddingModelInfo(id=self._model, provider="ollama", native_dim=self._dim)
+        ]
+
+
+def _discovering_route(route):
+    """*route* with no embedding capability but what its catalog offers."""
+    _, model, dim = route
+    return {
+        **_embedding_route(route),
+        "adapter": _DiscoveringAdapter(model, dim),
+        "capabilities": {},
+    }
+
+
+@pytest.mark.parametrize("pinned", [_NARROW, _WIDE], ids=["matched", "mismatched"])
+async def test_postgres_clearing_a_pin_flags_the_profile_resolved_in_its_place(
+    postgres_url, monkeypatch, caplog, pinned
+):
+    """Clearing a pin hands the route back to the resolver, which the models
+    API runs as it echoes the settings and which here picks a model wider than
+    the column. Health must judge that model, which the writes now embed with,
+    not the moment between the clear and the resolution, when the route had
+    no embedding model at all and so nothing to flag."""
+    _configure_column_width(monkeypatch, 4)
+    async with _own_postgres_schema(postgres_url) as case:
+        await case.size_embedding_column(4)
+        agent = _ModelsApiAgent(case.db, _discovering_route(_AUTO))
+        await agent.boot()
+
+        async with _models_api(agent) as client:
+            await _pin_route_model(
+                agent, client, _AUTO, pinned, force=pinned is _WIDE
+            )
+            assert (agent.store.embedding_column_mismatch is None) is (
+                pinned is _NARROW
+            )
+
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+                await _clear_route_model(client, _AUTO)
+
+            assert agent.store.embedding_service.current_profile_id() == (
+                _route_profile_id(_AUTO)
+            )
+            [error] = _store_records(caplog, logging.ERROR)
+            assert _route_profile_id(_AUTO) in error.getMessage()
+            assert "vector(4)" in error.getMessage()
+            health = await _health(agent)
+            assert health["status"] == "warn"
+            assert health["details"]["misconfiguration"] == {
+                "profile_id": _route_profile_id(_AUTO),
+                "profile_dim": 6,
+                "column_dim": 4,
+            }
+
+
+async def test_runtime_switch_is_quiet_when_sqlite_declares_no_width(
+    sqlite_db, monkeypatch, caplog
+):
+    """SQLite stores vector bytes: there is no declared width to compare with,
+    at startup or after a switch."""
+    _configure_column_width(monkeypatch, 6)
+    agent = _ModelsApiAgent(
+        sqlite_db, _embedding_route(_NARROW), _embedding_route(_WIDE)
+    )
+
+    async with _models_api(agent) as client:
+        with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+            await agent.boot()
+            await _select_embedding_route(agent, client, _WIDE)
+
+    assert not _store_records(caplog, logging.INFO)
+    assert agent.store.embedding_column_mismatch is None
+    assert (await _health(agent))["status"] == "pass"
+
+
+async def test_overlapping_rechecks_of_one_mismatch_report_it_once(
+    sqlite_db, monkeypatch, caplog
+):
+    """Two changes in quick succession each re-check. The slower one must
+    compare its finding with what the faster one recorded meanwhile, not
+    with what was recorded when it started, or the ERROR repeats."""
+    started, release = asyncio.Event(), asyncio.Event()
+    reads = []
+
+    async def declared_width(db, table):
+        reads.append(table)
+        if len(reads) == 1:
+            started.set()
+            await release.wait()
+        return 4
+
+    monkeypatch.setattr(store_module, "declared_embedding_vec_dimension", declared_width)
+    store = _store(sqlite_db, _FixedWidthEmbeddings(6))
+
+    with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+        slower = asyncio.create_task(store.check_embedding_column_dimensions())
+        await started.wait()
+        found = await store.check_embedding_column_dimensions()
+        release.set()
+        assert await slower is found
+
+    assert len(_store_records(caplog, logging.ERROR)) == 1
+    assert store.embedding_column_mismatch is found
+
+
+def _fail_column_width_reads(monkeypatch) -> None:
+    async def unreadable(db, table):
+        raise EmbeddingVecBackfillError("catalog read refused")
+
+    monkeypatch.setattr(store_module, "declared_embedding_vec_dimension", unreadable)
+
+
+async def test_postgres_runtime_switch_is_quiet_when_the_column_width_cannot_be_read(
+    postgres_url, monkeypatch, caplog
+):
+    """The width is never readable: the switch onto a profile the column
+    refuses is as quiet as the boot was."""
+    _configure_column_width(monkeypatch, 6)
+    async with _own_postgres_schema(postgres_url) as case:
+        await case.size_embedding_column(4)
+        _fail_column_width_reads(monkeypatch)
+        agent = _ModelsApiAgent(
+            case.db, _embedding_route(_NARROW), _embedding_route(_WIDE)
+        )
+
+        async with _models_api(agent) as client:
+            with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+                await agent.boot()
+                await _select_embedding_route(agent, client, _WIDE)
+
+        assert not _store_records(caplog, logging.INFO)
+        assert agent.store.embedding_column_mismatch is None
+        assert (await _health(agent))["status"] == "pass"
+
+
+async def test_postgres_recheck_that_cannot_read_the_width_judges_by_the_width_writes_use(
+    postgres_url, monkeypatch, caplog
+):
+    """A re-check whose catalog read fails still knows the width the write
+    path drops against: the one read last. Judged by it, health agrees with
+    the drops in both directions, rather than clearing a flag the writes
+    still bear out."""
+    _configure_column_width(monkeypatch, 6)
+    async with _own_postgres_schema(postgres_url) as case:
+        await case.size_embedding_column(4)
+        agent = _ModelsApiAgent(
+            case.db, _embedding_route(_NARROW), _embedding_route(_WIDE)
+        )
+        await agent.boot()
+        assert agent.store.embedding_column_mismatch is None
+        _fail_column_width_reads(monkeypatch)
+
+        async with _models_api(agent) as client:
+            with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+                await _select_embedding_route(agent, client, _WIDE)
+
+            [error] = _store_records(caplog, logging.ERROR)
+            assert "vector(4)" in error.getMessage()
+            health = await _health(agent)
+            assert health["details"]["misconfiguration"] == {
+                "profile_id": _route_profile_id(_WIDE),
+                "profile_dim": 6,
+                "column_dim": 4,
+            }
+            # The process believes the column is 6 wide; the write path drops
+            # the wide vectors against the width the boot read.
+            drop = agent.store._column_width_drop(  # noqa: SLF001 - drop accounting seam
+                [0.0] * 6, _route_profile_id(_WIDE)
+            )
+            assert drop is not None and drop.column_dim == 4
+
+            # Repinned to the column's width, which the process does not
+            # believe the column has: production's own remedy.
+            await _select_embedding_route(agent, client, _NARROW, force=True)
+
+        assert agent.store.embedding_column_mismatch is None
+        assert (await _health(agent))["status"] == "pass"
+
+
+async def test_postgres_recheck_reads_a_column_that_no_longer_declares_a_width(
+    postgres_url, monkeypatch, caplog
+):
+    """Each re-check reads the column as it is now. Migrated at runtime to an
+    unconstrained ``vector``, it declares no width: the flag clears, and the
+    write path stops dropping against the width it declared before."""
+    _configure_column_width(monkeypatch, 6)
+    async with _own_postgres_schema(postgres_url) as case:
+        await case.size_embedding_column(4)
+        agent = _ModelsApiAgent(
+            case.db, _embedding_route(_WIDE), _embedding_route(_NARROW)
+        )
+        await agent.boot()
+        assert agent.store.embedding_column_mismatch is not None
+        await case.size_embedding_column(None)
+
+        caplog.clear()
+        async with _models_api(agent) as client:
+            with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+                await _select_embedding_route(agent, client, _WIDE)
+
+        assert not _store_records(caplog, logging.INFO)
+        assert agent.store.embedding_column_mismatch is None
+        assert (await _health(agent))["status"] == "pass"
+        assert agent.store._column_width_drop(  # noqa: SLF001 - drop accounting seam
+            [0.0] * 6, _route_profile_id(_WIDE)
+        ) is None

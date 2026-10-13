@@ -2536,6 +2536,20 @@ async def _apply_stale_embedding_counts(settings: Dict, agent, service=None) -> 
     settings["unembeddable_rows"] = breakdown["unembeddable"]
 
 
+async def _drain_preference_persistence(agent) -> None:
+    """Wait for the tasks the LLM service runs after an embedding change.
+
+    Its persistence callbacks, and the agent's re-check of a profile the
+    resolver changed (#3606). Best-effort, like the writes themselves.
+    """
+    drain = getattr(agent.llm_service, "drain_preference_persistence", None)
+    if callable(drain):
+        try:
+            await drain()
+        except Exception as e:  # pragma: no cover - persistence is best-effort
+            logger.debug(f"preference persistence drain failed: {e}")
+
+
 @router.api_route("/api/embedding/settings", methods=["POST", "PUT"])
 async def set_embedding_settings(request: Request):
     """Set or clear the top-level ``embedding_route`` knob at runtime (#2263).
@@ -2713,12 +2727,7 @@ async def set_route_embedding_model(request: Request):
         # land AFTER the rollback "cleared" write and resurrect the partial state
         # on restart. Draining per request serializes the writes so the response
         # only returns once THIS request's override map is durably persisted.
-        drain = getattr(agent.llm_service, "drain_preference_persistence", None)
-        if callable(drain):
-            try:
-                await drain()
-            except Exception as e:  # pragma: no cover - persistence is best-effort
-                logger.debug(f"preference persistence drain failed: {e}")
+        await _drain_preference_persistence(agent)
 
         # Echo the settings for the PINNED route through the single #2372
         # resolver so the response reflects THIS route's own slug — not whatever
@@ -2739,6 +2748,11 @@ async def set_route_embedding_model(request: Request):
             except Exception as e:  # pragma: no cover - defensive; fall back to active
                 logger.debug(f"route embedding service build failed for {route}: {e}")
         await _apply_stale_embedding_counts(settings, agent, service=route_service)
+        # The echo resolved the route, and a cleared pin leaves it to that
+        # resolution, which can pick a model of another width. The agent then
+        # re-checks the profile it embeds with (#3606); wait for that too, so
+        # /health/detailed describes the final profile once this returns.
+        await _drain_preference_persistence(agent)
         return {"success": True, **settings}
     except HTTPException:
         raise
@@ -3292,11 +3306,11 @@ async def verify_embedding_space(request: Request):
             pin_name, record_to=db
         )
         # A pin that passes (or fails) changes the profile the agent resolves.
-        record_active_profile = getattr(
-            agent, "record_active_embedding_profile", None
+        refresh_active_profile = getattr(
+            agent, "refresh_active_embedding_profile", None
         )
-        if inspect.iscoroutinefunction(record_active_profile):
-            await record_active_profile()
+        if inspect.iscoroutinefunction(refresh_active_profile):
+            await refresh_active_profile()
         return {
             "success": True,
             "results": {name: r.to_dict() for name, r in results.items()},

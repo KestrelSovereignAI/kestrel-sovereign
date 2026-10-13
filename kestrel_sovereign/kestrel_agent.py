@@ -4071,14 +4071,19 @@ class KestrelAgent(
 
         # Record the embedding profile the loaded config resolves, so offline
         # tools (`kestrel embeddings reindex` / `verify`) can compare their own
-        # resolution against it (#3420).
-        await self.record_active_embedding_profile()
-
-        # With that configuration loaded, compare its profile with the vector
-        # column's declared width once: a mismatch is then an ERROR here and a
+        # resolution against it (#3420). Then compare that profile with the
+        # vector column's declared width: a mismatch is an ERROR here and a
         # misconfiguration in /health/detailed, not a discovery on every write
-        # (#2913). It never refuses boot; turn writes keep succeeding.
-        await self._raw_storage.conversation.check_embedding_column_dimensions()
+        # (#2913). It never refuses boot; turn writes keep succeeding. Every
+        # persisted runtime change to the embedding config runs the same path,
+        # and so does every resolution that changes a route's embedding model
+        # or width afterwards (clearing a pin leaves the route to be resolved),
+        # so the flag follows the profile the agent writes with (#3606).
+        if hasattr(self.llm_service, "set_embedding_profile_change_callback"):
+            self.llm_service.set_embedding_profile_change_callback(
+                self.refresh_active_embedding_profile
+            )
+        await self.refresh_active_embedding_profile()
 
         # Cache the features prompt (built once at session start)
         self._cached_features_prompt = self._build_features_prompt_section()

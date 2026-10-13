@@ -146,9 +146,9 @@ class DroppedConversationEmbedding:
 class EmbeddingColumnMismatch:
     """The embedding profile and the declared vector column width disagree (#2913).
 
-    Found once at startup. Every embedded conversation write then persists
-    without its vector, so this is a misconfiguration rather than a per-row
-    failure.
+    Found at startup, or when the active embedding profile changes at runtime
+    (#3606). Every embedded conversation write then persists without its
+    vector, so this is a misconfiguration rather than a per-row failure.
     """
 
     profile_id: str
@@ -714,7 +714,8 @@ class AsyncConversationStore:
         self._dropped_embeddings = 0
         self._last_dropped_embedding: Optional[DroppedConversationEmbedding] = None
         self._dropped_embedding_logged_at: Optional[float] = None
-        # Read once by ``check_embedding_column_dimensions`` at startup.
+        # The declared width as ``check_embedding_column_dimensions`` last
+        # read it, at startup or on a runtime change of the embedding profile.
         self._embedding_column_dim: Optional[int] = None
         self._embedding_column_mismatch: Optional[EmbeddingColumnMismatch] = None
 
@@ -1100,7 +1101,10 @@ class AsyncConversationStore:
 
     @property
     def embedding_column_mismatch(self) -> Optional[EmbeddingColumnMismatch]:
-        """The profile/column width disagreement found at startup, if any."""
+        """The active profile's disagreement with the column width, if any.
+
+        As of the last :meth:`check_embedding_column_dimensions`.
+        """
         return self._embedding_column_mismatch
 
     def _current_profile_id(self, service: Optional[Any]) -> Optional[str]:
@@ -1180,18 +1184,58 @@ class AsyncConversationStore:
     ) -> Optional[EmbeddingColumnMismatch]:
         """Compare the embedding profile with the column's declared width (#2913).
 
-        Run once at startup, after the agent's embedding configuration is
-        loaded. A disagreement means every embedded write will persist
-        without its vector, so it is logged at ERROR and kept for
-        ``/health/detailed`` as a misconfiguration. It never raises: the turn
-        writes keep succeeding, and refusing to boot would take the agent
-        down over a recall degradation.
+        Run at startup, after the agent's embedding configuration is loaded,
+        and again whenever that configuration changes at runtime (#3606). A
+        disagreement means every embedded write will persist without its
+        vector, so it is kept for ``/health/detailed`` as a misconfiguration
+        and logged at ERROR when found; finding the same disagreement again
+        does not log it again. It never raises: the turn writes keep
+        succeeding, and refusing to boot would take the agent down over a
+        recall degradation.
 
-        Silent when the widths agree, when there is no embedding profile, and
-        when the backend declares no width to read (SQLite stores bytes).
+        Each run replaces what the last one found, so the flag describes the
+        profile the store writes with now, against the width its writes are
+        checked against. A run whose read of that width fails judges the
+        profile by the width read last, the one the write path still drops
+        against. A run records no disagreement, and logs nothing above DEBUG,
+        when the widths agree, when there is no embedding profile, and when
+        there is no declared width to judge by: the column declares none
+        (SQLite stores bytes), or no read of it has succeeded.
+        """
+        mismatch = await self._find_embedding_column_mismatch()
+        previous = self._embedding_column_mismatch
+        if mismatch is not None and previous is not None and (
+            (mismatch.profile_id, mismatch.profile_dim, mismatch.column_dim)
+            == (previous.profile_id, previous.profile_dim, previous.column_dim)
+        ):
+            return previous
+        self._embedding_column_mismatch = mismatch
+        if mismatch is None:
+            return None
+        logger.error(
+            "Embedding misconfiguration for agent %s: embedding profile %s "
+            "produces %d-dimension vectors, but "
+            "conversation_history.embedding_vec is vector(%d). Every "
+            "conversation write will be persisted without its embedding, so "
+            "semantic recall will not find new turns. Migrate the column or "
+            "repin the embedding profile; /health/detailed reports the "
+            "dropped count.",
+            self.agent_id, mismatch.profile_id, mismatch.profile_dim,
+            mismatch.column_dim,
+        )
+        return mismatch
+
+    async def _find_embedding_column_mismatch(
+        self,
+    ) -> Optional[EmbeddingColumnMismatch]:
+        """The active profile's disagreement with the declared column width.
+
+        ``None`` when they agree, or when there is no profile or no width to
+        compare. A width it reads becomes the one the write path drops
+        against; a read that fails leaves that width as it was.
         """
         try:
-            column_dim = await declared_embedding_vec_dimension(
+            self._embedding_column_dim = await declared_embedding_vec_dimension(
                 self.db, "conversation_history"
             )
         except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail boot
@@ -1199,10 +1243,9 @@ class AsyncConversationStore:
                 "Could not read conversation_history.embedding_vec's declared "
                 "width for agent %s: %s", self.agent_id, exc,
             )
-            return None
+        column_dim = self._embedding_column_dim
         if column_dim is None:
             return None
-        self._embedding_column_dim = column_dim
 
         service = self._lazy_embedding_service()
         describe = getattr(service, "describe", None)
@@ -1224,26 +1267,13 @@ class AsyncConversationStore:
             return None
 
         if profile_dim == column_dim:
-            self._embedding_column_mismatch = None
             return None
-        mismatch = EmbeddingColumnMismatch(
+        return EmbeddingColumnMismatch(
             profile_id=profile_id,
             profile_dim=profile_dim,
             column_dim=column_dim,
             checked_at=datetime.now(timezone.utc),
         )
-        self._embedding_column_mismatch = mismatch
-        logger.error(
-            "Embedding misconfiguration for agent %s: embedding profile %s "
-            "produces %d-dimension vectors, but "
-            "conversation_history.embedding_vec is vector(%d). Every "
-            "conversation write will be persisted without its embedding, so "
-            "semantic recall will not find new turns. Migrate the column or "
-            "repin the embedding profile; /health/detailed reports the "
-            "dropped count.",
-            self.agent_id, profile_id, profile_dim, column_dim,
-        )
-        return mismatch
 
     def _now_sql(self) -> str:
         """Get SQL expression for current timestamp based on backend type."""
@@ -1856,7 +1886,7 @@ class AsyncConversationStore:
         """Why *embedding* cannot be stored in ``embedding_vec``, or ``None``.
 
         The width it must fit is the column's declared width when
-        :meth:`check_embedding_column_dimensions` read one at startup, and
+        :meth:`check_embedding_column_dimensions` has read one, and
         otherwise ``CONVERSATION_MESSAGE_EMBEDDING_DIM``, the width the column
         is created at. The declared width wins because it is the column the
         INSERT lands in, and the two can disagree: production's column was

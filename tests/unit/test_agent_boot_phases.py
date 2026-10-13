@@ -1766,6 +1766,46 @@ async def test_boot_checks_the_embedding_column_width_once_the_profile_is_loaded
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("callback", "args"),
+    [
+        ("_preference_persistence_callback", (None, None, None)),
+        ("_embedding_route_persistence_callback", (None,)),
+        ("_route_embedding_model_persistence_callback", ({},)),
+        ("_embedding_profile_change_callback", ()),
+    ],
+    ids=[
+        "model-preference",
+        "embedding-route",
+        "route-embedding-model",
+        "resolved-profile",
+    ],
+)
+async def test_boot_wires_each_embedding_config_change_to_the_width_check(
+    tmp_path, callback, args
+):
+    """A runtime change re-runs the boot's width check (#3606).
+
+    The LLM service persists each embedding-config change through the
+    callback boot registered, and reports a profile its resolver changed
+    through the listener boot registered; checked only at boot, the
+    misconfiguration would go on describing the profile the agent booted with.
+    """
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_mocks() as mocks:
+            await agent.initialize()
+            check = mocks.storage.conversation.check_embedding_column_dimensions
+            check.reset_mock()
+
+            await getattr(agent.llm_service, callback)(*args)
+
+            check.assert_awaited_once_with()
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
 async def test_second_initialize_when_ready_is_a_noop(tmp_path):
     agent = _make_agent(tmp_path)
     try:
