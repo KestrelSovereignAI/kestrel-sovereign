@@ -74,21 +74,43 @@ def test_tool_outcomes_are_status_words_never_payloads() -> None:
          "result": {"status": "error", "error": "Unknown schema: user_profile" + "!" * 400,
                     "data": {"memory": SECRET}}},
         {"tool_call_id": "2", "name": "recall", "result": {"status": "ok", "data": [SECRET]}},
-        {"tool_call_id": "3", "name": "todo_add", "result": {"status": "partial"}},
+        # A ToolResult.partial as DynamicTool wraps it: the legacy success
+        # flag says the call ran, the status says it only partly succeeded.
+        {"tool_call_id": "3", "name": "todo_add",
+         "result": {"status": "partial", "success": True, "error": "1 of 2 failed"}},
         {"tool_call_id": "4", "name": "legacy", "result": {"success": False}},
         {"tool_call_id": "5", "name": "legacy_ok", "result": {"success": True, "value": SECRET}},
         {"tool_call_id": "6", "name": "raw", "result": SECRET},
         "not-a-dict",
     ]
-    outcomes = da.tool_outcomes_for_audit(results)
+    outcomes, omitted = da.tool_outcomes_for_audit(results)
+    assert omitted == 0
     assert [(o["tool"], o["outcome"]) for o in outcomes] == [
         ("save_item", "failed"), ("recall", "succeeded"), ("todo_add", "partial"),
         ("legacy", "failed"), ("legacy_ok", "succeeded"), ("raw", "unconfirmed")]
     assert len(outcomes[0]["error"]) == da.MAX_TOOL_ERROR_CHARS
     assert SECRET not in json.dumps(outcomes)
-    assert da.tool_outcomes_for_audit(None) == []
-    many = [{"name": f"t{i}", "result": {"status": "ok"}} for i in range(50)]
-    assert len(da.tool_outcomes_for_audit(many)) == da.MAX_TOOL_OUTCOMES
+    assert da.tool_outcomes_for_audit(None) == ([], 0)
+
+
+def test_long_turns_keep_the_late_save_and_say_what_was_left_out() -> None:
+    """Twenty lookups must not crowd out the save that followed them."""
+    lookups = [{"name": "lookup", "result": {"status": "ok"}} for _ in range(30)]
+    save = {"name": "save_fact", "result": {"status": "ok"}}
+    outcomes, omitted = da.tool_outcomes_for_audit(lookups + [save])
+    assert outcomes == [{"tool": "lookup", "outcome": "succeeded", "count": 30},
+                        {"tool": "save_fact", "outcome": "succeeded"}]
+    assert omitted == 0
+
+    distinct = [{"name": f"t{i}", "result": {"status": "ok"}} for i in range(25)] + [save]
+    outcomes, omitted = da.tool_outcomes_for_audit(distinct)
+    assert len(outcomes) == da.MAX_TOOL_OUTCOMES and omitted == 6
+    assert outcomes[-1] == {"tool": "save_fact", "outcome": "succeeded"}
+    request, _ = da.audit_decision_request("Saved.", tool_outcomes=outcomes,
+                                           tool_outcomes_omitted=omitted)
+    assert request.state["tool_outcomes_omitted"] == 6
+    assert "tool_outcomes_omitted" in request.questions["unearned_success"].instructions
+    assert "tool_outcomes_omitted" not in da.audit_decision_request("Hi.")[0].state
 
 
 @pytest.mark.parametrize(
@@ -237,7 +259,8 @@ def test_shipped_samples_use_the_audits_own_builder() -> None:
     for sample in samples:
         request, keys = da.audit_decision_request(
             sample.raw["response"], request=sample.raw.get("request"),
-            tool_outcomes=sample.raw.get("tool_outcomes", []))
+            tool_outcomes=sample.raw.get("tool_outcomes", []),
+            tool_outcomes_omitted=sample.raw.get("tool_outcomes_omitted", 0))
         assert sample.requests == (request,) and sample.threshold_keys == keys
         risk = sample.raw["risk"]
         assert sample.expected == {"block": risk == 3, "concern": risk >= 2,
@@ -256,6 +279,10 @@ def test_shipped_samples_use_the_audits_own_builder() -> None:
           "tool_outcomes": [{"tool": "t", "outcome": "maybe"}]}, "tool_outcomes must be"),
         ({"adapter": "response_audit", "id": "x", "response": "hi", "risk": 1,
           "tool_outcomes": [{"tool": "t", "outcome": "failed", "data": "x"}]}, "tool_outcomes must be"),
+        ({"adapter": "response_audit", "id": "x", "response": "hi", "risk": 1,
+          "tool_outcomes": [{"tool": "t", "outcome": "failed", "count": 0}]}, "tool_outcomes must be"),
+        ({"adapter": "response_audit", "id": "x", "response": "hi", "risk": 1,
+          "tool_outcomes_omitted": -1}, "tool_outcomes_omitted must be"),
         ({"adapter": "response_audit", "id": "x", "response": "hi", "risk": 1, "unearned": "yes"},
          "unearned must be true or false"),
     ],
@@ -311,8 +338,8 @@ async def test_hook_sends_the_turns_request_and_tool_outcomes() -> None:
     ))
     state = service.decide.await_args.args[0].state
     assert state["request"] == "Remember: I'm allergic to peanuts."
-    assert state["tool_outcomes"] == [
-        {"tool": "save_item", "outcome": "failed", "error": "Unknown schema: user_profile"}] * 2
+    assert state["tool_outcomes"] == [{"tool": "save_item", "outcome": "failed",
+                                       "error": "Unknown schema: user_profile", "count": 2}]
     warning = out.updated_input["response_text"]
     assert "[Audit warning (risk 3)" in warning and "p(unearned_success)=0.97" in warning
 
