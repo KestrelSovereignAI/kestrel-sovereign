@@ -179,8 +179,8 @@ class _PreparedConversationWrite:
     provider: Optional[str]
     lexical_index_id: Optional[str]
     lexical_index_version: Optional[str]
-    # A computed embedding this row will not carry. Published only once the
-    # row has committed (see ``_publish_committed_embedding_drop``), so a
+    # A computed embedding this row will not carry. Counted only once the
+    # row has committed (see ``_count_embedding_drop_on_commit``), so a
     # write that fails or rolls back is not a drop.
     embedding_drop: Optional[DroppedConversationEmbedding] = None
 
@@ -1116,28 +1116,28 @@ class AsyncConversationStore:
             )
             return None
 
-    def _publish_committed_embedding_drop(
-        self, prepared: _PreparedConversationWrite
+    def _count_embedding_drop_on_commit(
+        self, drop: DroppedConversationEmbedding
     ) -> None:
-        """Count *prepared*'s dropped embedding once its row has committed (#2913).
+        """Count *drop* once the INSERT that left out its vector commits (#2913).
 
         Only a turn that persisted can have lost its vector, and the count and
-        its WARNING cannot be taken back. The INSERT commits on its own when
-        this task holds no transaction; otherwise the row commits with the
-        transaction's owner, which calls this again after that commit
-        (``AsyncStorage.add_conversation`` does, once the semantic-recall
-        fence has exited). A row that rolls back is never published. Neither
-        is one whose backend cannot report whether a transaction is open
-        (``owns_open_transaction`` is ``None``): its commit cannot be proven.
-
-        Publishes at most once: the drop is cleared from *prepared* when
-        counted.
+        its WARNING cannot be taken back. With no transaction open the INSERT
+        has already committed and the drop is counted now. Inside a
+        transaction, whoever owns it (the caller, or ``AsyncStorage``'s
+        semantic-recall fence) decides: the drop is counted when it commits,
+        and not at all if it rolls back.
         """
-        drop = prepared.embedding_drop
-        if drop is None or self.db.owns_open_transaction is not False:
+        if self.db.call_after_commit(lambda: self._record_dropped_embedding(drop)):
             return
-        prepared.embedding_drop = None
-        self._record_dropped_embedding(drop)
+        logger.warning(
+            "Dropped the embedding of a conversation write for agent %s "
+            "(embedding profile %s, %d dimensions: %s) inside a transaction "
+            "whose commit this database backend cannot report, so it is not "
+            "counted in /health/detailed.",
+            self.agent_id, drop.profile_id or "unknown", drop.embedding_dim,
+            drop.error,
+        )
 
     def _record_dropped_embedding(self, drop: DroppedConversationEmbedding) -> None:
         """Count one embedding dropped from a committed turn, and report it (#2913).
@@ -1693,7 +1693,7 @@ class AsyncConversationStore:
         if embedding_vec_val is not None:
             embedding_service = self._lazy_embedding_service()
             profile_id = self._current_profile_id(embedding_service)
-            embedding_drop = self._configured_width_drop(
+            embedding_drop = self._column_width_drop(
                 embedding_vec_val, profile_id
             )
             if embedding_drop is not None:
@@ -1783,16 +1783,20 @@ class AsyncConversationStore:
         if not inserted.lexical_columns_written and prepared.lexical_index_id:
             await self._discard_lexical_tokens(prepared.lexical_index_id)
             prepared.lexical_index_id = None
-        if inserted.embedding_drop is not None:
-            prepared.embedding_drop = inserted.embedding_drop
-        self._publish_committed_embedding_drop(prepared)
+        drop = inserted.embedding_drop or prepared.embedding_drop
+        prepared.embedding_drop = None
+        if drop is not None:
+            self._count_embedding_drop_on_commit(drop)
 
         # Upsert the profile descriptor into the registry table so
         # ``kestrel-sovereign embeddings audit`` can map id →
         # human-readable fields. Best-effort: registry write must never block
-        # the already-persisted message.
+        # the already-persisted message. A row whose vector dropped carries no
+        # profile id to map, so it skips this write and the risk of it
+        # failing inside a caller's transaction (#2913).
         if (
-            prepared.embedding_profile_id is not None
+            drop is None
+            and prepared.embedding_profile_id is not None
             and prepared.embedding_service is not None
         ):
             try:
@@ -1816,8 +1820,8 @@ class AsyncConversationStore:
         rows. Crucially, a provider / network outage during a chat
         turn must NOT block writing the message.
 
-        The caller checks the result's width against the configured
-        column with :meth:`_configured_width_drop`.
+        The caller checks the result's width against the column with
+        :meth:`_column_width_drop`.
         """
         if not content:
             # Empty content (rare — guardrails would normally reject
@@ -1844,51 +1848,87 @@ class AsyncConversationStore:
 
         return list(embedding)
 
-    def _configured_width_drop(
+    def _column_width_drop(
         self,
         embedding: List[float],
         profile_id: Optional[str],
     ) -> Optional[DroppedConversationEmbedding]:
-        """Why *embedding* cannot be stored at the configured column width.
+        """Why *embedding* cannot be stored in ``embedding_vec``, or ``None``.
 
-        The vector column was created at ``CONVERSATION_MESSAGE_EMBEDDING_DIM``
-        at boot; if the active provider returns a different width (e.g. config
-        drift between agent restart and migration run), writing it would
-        either fail on PG or persist bytes the retriever cannot decode on
-        SQLite. Such a row keeps its turn and drops the vector, falling back
-        to keyword overlap. Returns ``None`` when the widths agree.
-        (Codex P2 on PR-B.)
+        The width it must fit is the column's declared width when
+        :meth:`check_embedding_column_dimensions` read one at startup, and
+        otherwise ``CONVERSATION_MESSAGE_EMBEDDING_DIM``, the width the column
+        is created at. The declared width wins because it is the column the
+        INSERT lands in, and the two can disagree: production's column was
+        ``vector(768)`` while the configured and provider widths were 1536.
+        Inside a PostgreSQL transaction the INSERT pgvector refuses aborts
+        the transaction, so the turn would not persist at all (#2913).
+
+        A vector of another width would either fail on PG or persist bytes
+        the retriever cannot decode on SQLite, so the row keeps its turn and
+        drops the vector, falling back to keyword overlap. (Codex P2 on PR-B.)
         """
         from .sqla.conversation_message import (
             CONVERSATION_MESSAGE_EMBEDDING_DIM,
         )
 
-        if len(embedding) == CONVERSATION_MESSAGE_EMBEDDING_DIM:
+        declared = self._embedding_column_dim
+        column_dim = (
+            declared if declared is not None else CONVERSATION_MESSAGE_EMBEDDING_DIM
+        )
+        if len(embedding) == column_dim:
             return None
+        if declared is not None:
+            remedy = (
+                f"conversation_history.embedding_vec is declared "
+                f"vector({declared}): migrate the column or repin the "
+                f"embedding profile to {declared}-dimension embeddings"
+            )
+        else:
+            remedy = (
+                f"the configured column width is {column_dim}: set "
+                f"KESTREL_EMBEDDING_DIM={len(embedding)} and re-migrate "
+                f"conversation_history.embedding_vec, or switch to a provider "
+                f"that emits {column_dim}-dimension embeddings"
+            )
         return DroppedConversationEmbedding(
             profile_id=profile_id,
             embedding_dim=len(embedding),
-            column_dim=CONVERSATION_MESSAGE_EMBEDDING_DIM,
-            error=(
-                f"dimension mismatch with the configured column width: set "
-                f"KESTREL_EMBEDDING_DIM={len(embedding)} and re-migrate "
-                f"conversation_history.embedding_vec, or switch to a provider "
-                f"that emits {CONVERSATION_MESSAGE_EMBEDDING_DIM}-dimension "
-                f"embeddings"
-            ),
+            column_dim=column_dim,
+            error=f"dimension mismatch: {remedy}",
             dropped_at=datetime.now(timezone.utc),
         )
 
     async def _discard_lexical_tokens(self, lexical_index_id: str) -> None:
         """Best-effort cleanup for a token-first write whose row did not land."""
         try:
-            await self.db.execute(
+            await self._execute_confined(
                 "DELETE FROM conversation_lexical_tokens "
                 "WHERE agent_id = ? AND lexical_index_id = ?",
                 (self.agent_id, lexical_index_id),
             )
         except Exception as exc:  # noqa: BLE001 - original write error wins
             logger.debug("Could not clean orphan lexical tokens: %s", exc)
+
+    async def _execute_confined(self, sql: str, params: tuple) -> None:
+        """Run one write whose failure this store handles and moves past.
+
+        Inside a transaction this task owns, a statement PostgreSQL refuses
+        aborts the whole transaction: the fallback INSERT after it fails too,
+        and so does every later write of the caller's, or COMMIT quietly
+        rolls them all back (#2913). A savepoint confines the failure to this
+        statement. Otherwise it runs as it always did: on its own when no
+        transaction is open, and plainly when the backend cannot say whether
+        one is, or cannot isolate a savepoint inside one.
+        """
+        if (
+            self.db.owns_open_transaction is True
+            and self.db.isolates_nested_savepoints
+        ):
+            async with self.db.transaction(savepoint=True):
+                await self.db.execute_commit(sql, params)
+            return
+        await self.db.execute_commit(sql, params)
 
     async def _insert_message(
         self,
@@ -1932,11 +1972,13 @@ class AsyncConversationStore:
         lists because its migration raises unless the column exists, so no
         schema this method can reach is without it — unlike the
         lexical/embedding columns, whose migrations are non-fatal and whose
-        absence the fallbacks below exist to survive.
+        absence the fallbacks below exist to survive. Each attempt a fallback
+        follows runs through :meth:`_execute_confined`, so inside a caller's
+        transaction a refused attempt does not take the fallback down with it.
 
         Returns whether the lexical-index columns were written and, when no
         vector-bearing shape was accepted, the dropped embedding. The caller
-        publishes that drop only after the row commits (#2913).
+        counts that drop only once the row commits (#2913).
         """
         base_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
@@ -1953,7 +1995,7 @@ class AsyncConversationStore:
             "metadata, session_id, created_at"
         )
         legacy_params = base_params[:8]
-        # Generated, not hand-counted: these lists are spelled into six
+        # Generated, not hand-counted: these lists are spelled into seven
         # statements below and a miscount would only surface at runtime.
         base_binds = ", ".join(["?"] * len(base_params))
         legacy_binds = ", ".join(["?"] * len(legacy_params))
@@ -1964,7 +2006,7 @@ class AsyncConversationStore:
                 f"VALUES ({base_binds}{base_vals_suffix})"
             )
             try:
-                await self.db.execute_commit(sql, base_params)
+                await self._execute_confined(sql, base_params)
                 return _InsertedConversation(lexical_columns_written=True)
             except Exception as exc:
                 if not _is_missing_lexical_column_error(exc):
@@ -1999,7 +2041,7 @@ class AsyncConversationStore:
                 f"VALUES ({base_binds}{base_vals_suffix}, "
                 f"{emb_placeholder}, ?)"
             )
-            await self.db.execute_commit(
+            await self._execute_confined(
                 sql, base_params + (emb_bind, embedding_profile_id),
             )
         except Exception as e:
@@ -2009,7 +2051,7 @@ class AsyncConversationStore:
                 # older schema shapes; otherwise failed lexical DDL silently
                 # removes the row from profile-filtered kNN.
                 try:
-                    await self.db.execute_commit(
+                    await self._execute_confined(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec, embedding_profile_id) "
                         f"VALUES ({legacy_binds}{base_vals_suffix}, "
@@ -2045,7 +2087,7 @@ class AsyncConversationStore:
                     f"VALUES ({base_binds}{base_vals_suffix}, "
                     f"{emb_placeholder})"
                 )
-                await self.db.execute_commit(sql, base_params + (emb_bind,))
+                await self._execute_confined(sql, base_params + (emb_bind,))
                 self._log_unstamped_embedding(e)
                 return _InsertedConversation(lexical_columns_written=True)
             except Exception as e2:
@@ -2054,7 +2096,7 @@ class AsyncConversationStore:
                     "retrying the legacy embedding_vec path.", self.agent_id, e2,
                 )
                 try:
-                    await self.db.execute_commit(
+                    await self._execute_confined(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec) "
                         f"VALUES ({legacy_binds}{base_vals_suffix}, "

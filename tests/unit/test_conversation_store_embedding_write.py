@@ -25,6 +25,16 @@ from kestrel_sovereign.storage.async_conversation_store import (
 # ----------------------------------------------------------------- helpers
 
 
+def _run_now_committed(callback) -> bool:
+    """``AsyncDatabase.call_after_commit`` with no caller transaction open.
+
+    Each ``execute_commit`` commits on its own, so work deferred until commit
+    runs as soon as it is registered (#2913).
+    """
+    callback()
+    return True
+
+
 def _make_store(
     backend_type: str = "sqlite",
     embedding_service: object = None,
@@ -45,9 +55,7 @@ def _make_store(
     db.execute = AsyncMock(return_value=1)
     db.fetchone = AsyncMock(return_value=None)  # no prior history → new session
     db.fetchall = AsyncMock(return_value=[])
-    # No caller transaction: each ``execute_commit`` commits on its own, so a
-    # dropped embedding is published as soon as its row is written (#2913).
-    db.owns_open_transaction = False
+    db.call_after_commit = _run_now_committed
     store = AsyncConversationStore(db=db, agent_id=agent_id)
     # Per-instance override of the provider-embedding lookup. Doing this
     # post-construction instead of via ``__init__`` keeps the production

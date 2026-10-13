@@ -25,6 +25,11 @@ from .interface import (
     Row,
     TransactionError,
 )
+from .after_commit import (
+    AfterCommitCallback,
+    AfterCommitCallbacks,
+    run_after_commit,
+)
 from .write_audit import record_write_query, record_write_script
 from .transaction_control import reject_transaction_control, sqlite_statements
 
@@ -400,6 +405,8 @@ class SQLiteBackend(DatabaseBackend):
         self._in_transaction = False
         self._transaction_poisoned = False
         self._savepoint_counter = 0
+        # What ``call_after_commit`` deferred inside the open transaction.
+        self._after_commit: Optional[AfterCommitCallbacks] = None
         # Serializes operation *units* on the single shared connection. aiosqlite
         # serializes individual operations, but NOT the execute->commit/rollback
         # pair: without this, two concurrent autocommit writers share one
@@ -460,6 +467,19 @@ class SQLiteBackend(DatabaseBackend):
         SQL operations separately enforce healthy native transaction custody.
         """
         return self._in_transaction and self._txn_owner is asyncio.current_task()
+
+    def call_after_commit(self, callback: AfterCommitCallback) -> None:
+        """Run *callback* once this task's writes so far have committed.
+
+        Inside a transaction this task owns, it runs after that transaction
+        commits and never if it rolls back; a savepoint that rolls back
+        discards what was registered inside it. With no transaction open the
+        writes committed on their own, so it runs now.
+        """
+        if self.owns_open_transaction:
+            self._after_commit.register(callback)
+        else:
+            run_after_commit(callback)
 
     @property
     def is_connected(self) -> bool:
@@ -1540,11 +1560,13 @@ class SQLiteBackend(DatabaseBackend):
             self._savepoint_counter += 1
             name = f"kestrel_scope_{self._savepoint_counter}"
             await conn.execute(f"SAVEPOINT {name}")
+            self._after_commit.open_savepoint()
             try:
                 yield
                 self._require_native_transaction()
                 await conn.execute(f"RELEASE SAVEPOINT {name}")
             except BaseException:
+                self._after_commit.roll_back_savepoint()
                 if conn.in_transaction and not self._transaction_poisoned:
                     try:
                         await conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
@@ -1553,21 +1575,25 @@ class SQLiteBackend(DatabaseBackend):
                         self._transaction_poisoned = True
                         raise
                 raise
+            self._after_commit.release_savepoint()
             return
 
         # Hold the write lock for the whole BEGIN..COMMIT/ROLLBACK span so the
         # transaction is one atomic write unit against concurrent writers
         # sharing this connection (#1675).
+        committed: Optional[AfterCommitCallbacks] = None
         async with self._write_guard():
             with self._write_operation():
                 self._in_transaction = True
                 self._transaction_poisoned = False
                 self._txn_owner = asyncio.current_task()
+                self._after_commit = AfterCommitCallbacks()
                 try:
                     await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                     yield
                     self._require_native_transaction()
                     await conn.commit()
+                    committed = self._after_commit
                 except asyncio.CancelledError:
                     self._handoff_cancelled_write(conn)
                     raise
@@ -1581,6 +1607,11 @@ class SQLiteBackend(DatabaseBackend):
                     self._in_transaction = False
                     self._transaction_poisoned = False
                     self._txn_owner = None
+                    self._after_commit = None
+        # Outside the writer slot, with the transaction closed: the
+        # callbacks observe committed state and hold up no other writer.
+        if committed is not None:
+            committed.run()
     
     async def table_exists(self, table_name: str) -> bool:
         """Check if a table exists."""

@@ -642,9 +642,6 @@ class AsyncStorage:
                     prepared_lexical_index_id
                 )
             raise
-        # The INSERT ran inside the fence's transaction, so a dropped
-        # embedding was held back until that transaction committed (#2913).
-        self.conversation._publish_committed_embedding_drop(prepared)  # noqa: SLF001 - coordinated persistence seam
 
     @staticmethod
     def _semantic_recall_dependencies_for_persistence(

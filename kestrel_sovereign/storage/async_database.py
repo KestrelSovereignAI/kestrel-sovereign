@@ -20,6 +20,7 @@ from .db import (
     get_backend,
     normalize_schema,
 )
+from .db.after_commit import AfterCommitCallback, run_after_commit
 from .db.sqlite import _minimum_close_timeout_s
 from .conversation_created_at import (
     CONSTRAINT_NAME as CREATED_AT_CONSTRAINT,
@@ -1355,6 +1356,17 @@ class AsyncDatabase:
         return strategy if strategy in {"savepoint", "joined"} else None
 
     @property
+    def isolates_nested_savepoints(self) -> bool:
+        """Whether ``transaction(savepoint=True)`` inside an open transaction
+        rolls back on its own: an explicit savepoint extension, or nested
+        scopes that are savepoints already. Unknown backends answer ``False``.
+        """
+        return (
+            "savepoint" in getattr(self._backend, "transaction_options", ())
+            or self.nested_transaction_strategy == "savepoint"
+        )
+
+    @property
     def owns_open_transaction(self) -> bool | None:
         """Whether the current task has a transaction open on this database.
 
@@ -1364,6 +1376,27 @@ class AsyncDatabase:
         """
         owns = getattr(self._backend, "owns_open_transaction", None)
         return owns if isinstance(owns, bool) else None
+
+    def call_after_commit(self, callback: AfterCommitCallback) -> bool:
+        """Run *callback* once the current task's writes so far have committed.
+
+        Inside a transaction this task owns, *callback* runs after that
+        transaction commits and never if it rolls back; a savepoint that rolls
+        back discards what was registered inside it. With no transaction open
+        the writes committed on their own, so it runs now.
+
+        Returns ``False``, without running *callback*, when the backend cannot
+        report its commits and a transaction may be open: whether the writes
+        will persist is then unknown.
+        """
+        register = getattr(self._backend, "call_after_commit", None)
+        if callable(register):
+            register(callback)
+            return True
+        if self.owns_open_transaction is False:
+            run_after_commit(callback)
+            return True
+        return False
 
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
@@ -3825,16 +3858,17 @@ class AsyncDatabase:
                     raise NotImplementedError("Backend does not support immediate transactions")
                 options["immediate"] = True
         if savepoint:
-            if "savepoint" in getattr(self._backend, "transaction_options", ()):
-                options["savepoint"] = True
-            elif self.nested_transaction_strategy == "savepoint":
-                # An explicit intrinsic savepoint contract needs no extension
-                # keyword (e.g. the native PostgreSQL adapter).
-                pass
-            elif self.owns_open_transaction is not False:
+            if (
+                not self.isolates_nested_savepoints
+                and self.owns_open_transaction is not False
+            ):
                 # Unknown optional SDK custody cannot prove a top-level
                 # rollback boundary, regardless of the adapter's type name.
                 raise NotImplementedError("Backend does not support isolated nested transactions with unknown or active caller custody")
+            if "savepoint" in getattr(self._backend, "transaction_options", ()):
+                options["savepoint"] = True
+            # An intrinsic savepoint contract needs no extension keyword
+            # (e.g. the native PostgreSQL adapter).
         async with self._backend.transaction(**options):
             yield
     

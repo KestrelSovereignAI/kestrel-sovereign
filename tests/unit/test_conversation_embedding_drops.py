@@ -9,7 +9,11 @@ with the column's declared width once and reports a disagreement as an ERROR
 and a health misconfiguration, without refusing to boot.
 
 A drop is counted only once its turn has committed: a turn whose transaction
-rolls back never persisted, and the count and WARNING cannot be taken back.
+rolls back never persisted, and the count and WARNING cannot be taken back. The
+store defers the count with ``AsyncDatabase.call_after_commit``, so it lands
+when the transaction that owns the INSERT commits, whoever owns it: the
+caller, ``AsyncStorage``'s semantic-recall fence, or no one (an INSERT that
+commits on its own).
 
 Every case writes through the real store onto a real database. The SQLite cases
 run everywhere. The PostgreSQL cases reproduce the production failure itself
@@ -359,6 +363,53 @@ async def test_a_turn_its_transaction_rolls_back_counts_no_drop_and_warns_nothin
     assert health["message"] == "No conversation embeddings dropped"
 
 
+@pytest.mark.parametrize("mechanism", ["configured_width", "refused_by_database"])
+async def test_a_turn_its_transaction_commits_counts_one_drop_after_the_commit(
+    sqlite_db, monkeypatch, caplog, mechanism
+):
+    """The INSERT joins the caller's transaction; its commit counts the drop."""
+    await _drop_every_vector(sqlite_db, monkeypatch, mechanism)
+    service = _FixedWidthEmbeddings(6)
+    store = _store(sqlite_db, service)
+
+    with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+        async with sqlite_db.transaction():
+            await store.add_conversation(role="user", content="committed")
+            # Written, not yet committed: nothing counted, nothing logged.
+            assert store.dropped_embedding_count == 0
+            assert not _store_records(caplog, logging.WARNING)
+
+    assert await _stored_turns(sqlite_db, store) == [("committed", False, None)]
+    assert store.dropped_embedding_count == 1
+    assert store.last_dropped_embedding.profile_id == service.profile.profile_id
+    assert len(_store_records(caplog, logging.WARNING)) == 1
+    health = await check_conversation_embeddings(_agent_holding(store))
+    assert health["status"] == "warn"
+    assert health["details"]["dropped"] == 1
+
+
+@pytest.mark.parametrize("mechanism", ["configured_width", "refused_by_database"])
+async def test_a_turn_in_a_rolled_back_savepoint_counts_no_drop(
+    sqlite_db, monkeypatch, caplog, mechanism
+):
+    """Only the turn that survives the savepoint rollback counts, after commit."""
+    await _drop_every_vector(sqlite_db, monkeypatch, mechanism)
+    store = _store(sqlite_db, _FixedWidthEmbeddings(6))
+
+    with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+        async with sqlite_db.transaction():
+            with pytest.raises(_RollBack):
+                async with sqlite_db.transaction(savepoint=True):
+                    await store.add_conversation(role="user", content="undone")
+                    raise _RollBack()
+            await store.add_conversation(role="user", content="kept")
+            assert store.dropped_embedding_count == 0
+
+    assert await _stored_turns(sqlite_db, store) == [("kept", False, None)]
+    assert store.dropped_embedding_count == 1
+    assert len(_store_records(caplog, logging.WARNING)) == 1
+
+
 _ONTOLOGY = OntologyRef(
     "http://www.w3.org/2000/01/rdf-schema#", "1.0.0",
     "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
@@ -366,14 +417,15 @@ _ONTOLOGY = OntologyRef(
 )
 
 
-@pytest.fixture
-async def fenced_storage(tmp_path):
+@asynccontextmanager
+async def _storage_with_one_assertion(tmp_path, open_storage):
     """Storage bound to an assertion tenant, holding one current assertion.
 
     A conversation write that names that assertion as a semantic-recall
     dependency is persisted inside ``AsyncStorage``'s lifecycle fence: a
     transaction ``AsyncStorage.add_conversation`` owns and commits itself.
-    Yields the storage and the write's metadata.
+    *open_storage* builds the ``AsyncStorage`` from the tenant's agent id and
+    capability. Yields the storage and the write's metadata.
     """
     identity_dir = tmp_path / "identity"
     credentials = await create_kestrel_identity_async(
@@ -381,10 +433,9 @@ async def fenced_storage(tmp_path):
     )
     key_id = f"kestrel_{credentials.agent_did.rsplit(':', 1)[-1]}"
     identity = load_agent_identity(key_id, identity_dir)
-    storage = AsyncStorage(
-        ":memory:",
-        agent_id=credentials.agent_did,
-        _assertion_tenant_capability=_resolve_authenticated_agent_assertion_capability(
+    storage = open_storage(
+        credentials.agent_did,
+        _resolve_authenticated_agent_assertion_capability(
             credentials.agent_did, identity,
         ),
     )
@@ -418,6 +469,19 @@ async def fenced_storage(tmp_path):
         await storage.close()
 
 
+@pytest.fixture
+async def fenced_storage(tmp_path):
+    """SQLite storage holding one current assertion; see ``_storage_with_one_assertion``."""
+
+    def open_sqlite(agent_id, capability):
+        return AsyncStorage(
+            ":memory:", agent_id=agent_id, _assertion_tenant_capability=capability,
+        )
+
+    async with _storage_with_one_assertion(tmp_path, open_sqlite) as fenced:
+        yield fenced
+
+
 def _observe_persist(store, monkeypatch, *, then_raise: bool = False):
     """Record the drop count and transaction state the moment the INSERT returns."""
     seen = []
@@ -437,7 +501,7 @@ def _observe_persist(store, monkeypatch, *, then_raise: bool = False):
 async def test_a_fenced_turn_counts_its_drop_only_after_the_fence_commits(
     fenced_storage, monkeypatch, caplog, mechanism
 ):
-    """``AsyncStorage`` owns the transaction, so it publishes after the commit."""
+    """The fence owns the transaction, so the drop counts when the fence commits."""
     storage, metadata = fenced_storage
     store = storage.conversation
     await _drop_every_vector(storage.db, monkeypatch, mechanism)
@@ -484,6 +548,114 @@ async def test_a_fenced_turn_the_fence_rolls_back_counts_no_drop(
     assert store.dropped_embedding_count == 0
     assert store.last_dropped_embedding is None
     assert not _store_records(caplog, logging.WARNING)
+
+
+@pytest.mark.parametrize("mechanism", ["configured_width", "refused_by_database"])
+async def test_a_fenced_turn_joining_a_committed_transaction_counts_one_drop(
+    fenced_storage, monkeypatch, caplog, mechanism
+):
+    """The fence joins the caller's transaction: one drop, at the caller's commit."""
+    storage, metadata = fenced_storage
+    store = storage.conversation
+    await _drop_every_vector(storage.db, monkeypatch, mechanism)
+    store._lazy_embedding_service = lambda: _FixedWidthEmbeddings(6)
+    seen = _observe_persist(store, monkeypatch)
+
+    with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+        async with storage.transaction():
+            await storage.add_conversation(
+                "assistant", "the heron nests", metadata=metadata
+            )
+            # The fence has exited; the caller's transaction is still open.
+            assert store.dropped_embedding_count == 0
+
+    assert seen == [(0, True)]
+    assert await _stored_turns(storage.db, store) == [
+        ("the heron nests", False, None)
+    ]
+    assert store.dropped_embedding_count == 1
+    assert len(_store_records(caplog, logging.WARNING)) == 1
+
+
+@pytest.fixture
+async def plain_storage(tmp_path):
+    """``AsyncStorage`` with no assertion tenant: writes take the no-fence path."""
+    storage = AsyncStorage(str(tmp_path / "plain.db"), agent_id=AGENT_ID)
+    await storage.initialize()
+    try:
+        yield storage
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("mechanism", ["configured_width", "refused_by_database"])
+async def test_an_ordinary_storage_write_counts_its_drop(
+    plain_storage, monkeypatch, caplog, mechanism
+):
+    """``AsyncStorage.add_conversation`` with no semantic-recall lineage."""
+    store = plain_storage.conversation
+    await _drop_every_vector(plain_storage.db, monkeypatch, mechanism)
+    store._lazy_embedding_service = lambda: _FixedWidthEmbeddings(6)
+
+    with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+        await plain_storage.add_conversation("user", "where is the heron?")
+
+    assert await _stored_turns(plain_storage.db, store) == [
+        ("where is the heron?", False, None)
+    ]
+    assert store.dropped_embedding_count == 1
+    assert len(_store_records(caplog, logging.WARNING)) == 1
+
+
+@pytest.mark.parametrize("mechanism", ["configured_width", "refused_by_database"])
+async def test_an_ordinary_storage_write_in_a_transaction_counts_at_its_outcome(
+    plain_storage, monkeypatch, caplog, mechanism
+):
+    """Committed: one drop after the commit. Rolled back: none."""
+    store = plain_storage.conversation
+    await _drop_every_vector(plain_storage.db, monkeypatch, mechanism)
+    store._lazy_embedding_service = lambda: _FixedWidthEmbeddings(6)
+
+    with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+        with pytest.raises(TransactionError):
+            async with plain_storage.transaction():
+                await plain_storage.add_conversation("user", "rolled back")
+                raise _RollBack()
+        assert store.dropped_embedding_count == 0
+
+        async with plain_storage.transaction():
+            await plain_storage.add_conversation("user", "committed")
+            assert store.dropped_embedding_count == 0
+
+    assert await _stored_turns(plain_storage.db, store) == [
+        ("committed", False, None)
+    ]
+    assert store.dropped_embedding_count == 1
+    assert len(_store_records(caplog, logging.WARNING)) == 1
+
+
+async def test_a_backend_that_cannot_report_its_commits_warns_without_counting(
+    monkeypatch, caplog
+):
+    """No commit to wait for and no proof of one: the drop is still a WARNING."""
+    _configure_column_width(monkeypatch, 4)
+
+    class _CommitBlindDatabase:
+        backend_type = "sqlite"
+
+        def call_after_commit(self, callback):
+            return False
+
+    store = _store(_CommitBlindDatabase(), _FixedWidthEmbeddings(6))
+    drop = store._column_width_drop([0.0] * 6, "profile-x")  # noqa: SLF001 - drop accounting seam
+
+    with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+        store._count_embedding_drop_on_commit(drop)  # noqa: SLF001 - drop accounting seam
+
+    [warning] = _store_records(caplog, logging.WARNING)
+    assert "not counted" in warning.getMessage()
+    assert AGENT_ID in warning.getMessage()
+    assert store.dropped_embedding_count == 0
 
 
 # ------------------------------------------------------------- startup check
@@ -643,7 +815,11 @@ async def test_postgres_width_mismatch_is_an_error_at_startup_and_a_drop_per_wri
     postgres_url, monkeypatch, caplog
 ):
     """The production shape: ``vector(4)`` column, a 6-dimension profile, and a
-    process that believes the column is 6 wide (the provider-derived width)."""
+    process that believes the column is 6 wide (the provider-derived width).
+
+    Once the startup check has read the declared width, a write is checked
+    against it rather than against the width the process believes in.
+    """
     _configure_column_width(monkeypatch, 6)
     async with _own_postgres_schema(postgres_url) as case:
         await case.size_embedding_column(4)
@@ -682,7 +858,9 @@ async def test_postgres_width_mismatch_is_an_error_at_startup_and_a_drop_per_wri
         assert [record.levelno for record in warnings] == [logging.WARNING]
         message = warnings[0].getMessage()
         assert "takes 4 dimensions" in message
-        assert "expected 4 dimensions, not 6" in message
+        # Dropped against the width the startup check read, before an INSERT
+        # pgvector would refuse.
+        assert "declared vector(4)" in message
         assert not [
             r for r in _store_records(caplog, logging.INFO)
             if r.levelno == logging.INFO
@@ -733,19 +911,50 @@ async def test_postgres_startup_check_is_silent_without_an_embedding_profile(
         assert store.embedding_column_mismatch is None
 
 
-async def test_postgres_turn_its_transaction_rolls_back_counts_no_drop(
-    postgres_url, monkeypatch, caplog
-):
-    """PostgreSQL reports the caller's open transaction, so nothing is published.
 
-    Only the configured-width drop is reachable here: inside a PostgreSQL
-    transaction a refused INSERT aborts the transaction, so the fallback
-    chain raises instead of landing a row without its vector.
+
+# Every PostgreSQL mechanism by which a 6-dimension embedding misses a
+# ``vector(4)`` column. See ``_drop_every_postgres_vector``.
+_POSTGRES_MECHANISMS = ["configured_width", "declared_width", "refused_by_database"]
+
+
+async def _drop_every_postgres_vector(case, store, monkeypatch, caplog, mechanism):
+    """Make every 6-dimension embedding drop against a ``vector(4)`` column.
+
+    ``configured_width``: the process believes the column is 4 wide.
+    ``declared_width``: production's shape. The process believes the column
+    is 6 wide, as the provider does, and the startup check has read its
+    declared width, so the store drops the vector before any INSERT.
+    ``refused_by_database``: the same without the startup check, so pgvector
+    refuses every vector-bearing INSERT and the store falls back to a row
+    without one. Inside a transaction each refusal must not abort it.
     """
-    _configure_column_width(monkeypatch, 4)
+    await case.size_embedding_column(4)
+    _configure_column_width(monkeypatch, 4 if mechanism == "configured_width" else 6)
+    if mechanism == "declared_width":
+        assert await store.check_embedding_column_dimensions() is not None
+        caplog.clear()  # its ERROR is the startup check's, tested above
+
+
+def _assert_dropped_by(store, mechanism) -> None:
+    """The drop was decided where *mechanism* says, not by a later fallback."""
+    error = store.last_dropped_embedding.error
+    if mechanism == "configured_width":
+        assert "configured column width is 4" in error
+    elif mechanism == "declared_width":
+        assert "declared vector(4)" in error
+    else:
+        assert "expected 4 dimensions, not 6" in error
+
+
+@pytest.mark.parametrize("mechanism", _POSTGRES_MECHANISMS)
+async def test_postgres_turn_its_transaction_rolls_back_counts_no_drop(
+    postgres_url, monkeypatch, caplog, mechanism
+):
+    """The caller's transaction rolls back, so its drop is never counted."""
     async with _own_postgres_schema(postgres_url) as case:
-        await case.size_embedding_column(4)
         store = _store(case.db, _FixedWidthEmbeddings(6))
+        await _drop_every_postgres_vector(case, store, monkeypatch, caplog, mechanism)
 
         with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
             with pytest.raises(TransactionError) as caught:
@@ -764,5 +973,214 @@ async def test_postgres_turn_its_transaction_rolls_back_counts_no_drop(
             await store.add_conversation(role="user", content="committed")
 
         assert await _stored_turns(case.db, store) == [("committed", False, None)]
+        assert store.dropped_embedding_count == 1
+        assert len(_store_records(caplog, logging.WARNING)) == 1
+        _assert_dropped_by(store, mechanism)
+
+
+@pytest.mark.parametrize("mechanism", _POSTGRES_MECHANISMS)
+async def test_postgres_turn_its_transaction_commits_counts_one_drop_after_the_commit(
+    postgres_url, monkeypatch, caplog, mechanism
+):
+    """The reviewer's case: a mismatched column inside a caller's transaction.
+
+    A vector pgvector refuses aborts the transaction it runs in. Before the
+    store checked the declared width and confined each attempt to a
+    savepoint, the fallback INSERT then failed too, so the turn and the
+    caller's own writes were lost and no drop was reported.
+    """
+    async with _own_postgres_schema(postgres_url) as case:
+        await case.db.execute(
+            "CREATE TABLE caller_writes (note TEXT NOT NULL)", (),
+        )
+        store = _store(case.db, _FixedWidthEmbeddings(6))
+        await _drop_every_postgres_vector(case, store, monkeypatch, caplog, mechanism)
+
+        with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+            async with case.db.transaction():
+                await case.db.execute(
+                    "INSERT INTO caller_writes (note) VALUES (?)", ("before",),
+                )
+                await store.add_conversation(role="user", content="committed")
+                await case.db.execute(
+                    "INSERT INTO caller_writes (note) VALUES (?)", ("after",),
+                )
+                assert store.dropped_embedding_count == 0
+                assert not _store_records(caplog, logging.WARNING)
+
+        assert await _stored_turns(case.db, store) == [("committed", False, None)]
+        notes = await case.db.fetchall(
+            "SELECT note FROM caller_writes ORDER BY note", (),
+        )
+        assert [note for (note,) in notes] == ["after", "before"]
+        assert store.dropped_embedding_count == 1
+        assert len(_store_records(caplog, logging.WARNING)) == 1
+        _assert_dropped_by(store, mechanism)
+
+
+@asynccontextmanager
+async def _fenced_postgres_storage(url, tmp_path):
+    """``_storage_with_one_assertion`` on a fresh schema of *url*'s database."""
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    admin = await AsyncDatabase.postgres(url, schema_initializer=_run_no_schema_ddl)
+    try:
+        vector_schema = await pgvector_schema(admin)
+        async with disposable_postgres_schema(admin, "embedding_drops_fence") as schema:
+            dsn = with_search_path(url, quoted_search_path(schema, vector_schema))
+
+            def open_postgres(agent_id, capability):
+                return AsyncStorage(
+                    backend=PostgresBackend(dsn),
+                    agent_id=agent_id,
+                    _assertion_tenant_capability=capability,
+                )
+
+            async with _storage_with_one_assertion(tmp_path, open_postgres) as (
+                storage, metadata,
+            ):
+                yield _PostgresSchema(storage.db, vector_schema), storage, metadata
+    finally:
+        await admin.close()
+
+
+@pytest.mark.parametrize("mechanism", _POSTGRES_MECHANISMS)
+async def test_postgres_fenced_turn_counts_one_drop_after_the_fence_commits(
+    postgres_url, tmp_path, monkeypatch, caplog, mechanism
+):
+    """``AsyncStorage``'s semantic-recall fence owns the transaction here."""
+    async with _fenced_postgres_storage(postgres_url, tmp_path) as (
+        case, storage, metadata,
+    ):
+        store = storage.conversation
+        service = _FixedWidthEmbeddings(6)
+        store._lazy_embedding_service = lambda: service
+        await _drop_every_postgres_vector(case, store, monkeypatch, caplog, mechanism)
+        seen = _observe_persist(store, monkeypatch)
+
+        with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+            await storage.add_conversation(
+                "assistant", "the heron nests", metadata=metadata
+            )
+
+        # Inside the fence the row was written but not committed: nothing counted.
+        assert seen == [(0, True)]
+        assert await _stored_turns(storage.db, store) == [
+            ("the heron nests", False, None)
+        ]
+        stored_metadata = json.loads(await storage.db.fetchval(
+            "SELECT metadata FROM conversation_history WHERE agent_id = ?",
+            (store.agent_id,),
+        ))
+        # The fence admitted the derivative; an excluded one drops nothing.
+        assert "excluded_from_context" not in stored_metadata
+        assert store.dropped_embedding_count == 1
+        assert store.last_dropped_embedding.profile_id == service.profile.profile_id
+        assert len(_store_records(caplog, logging.WARNING)) == 1
+        _assert_dropped_by(store, mechanism)
+
+
+@pytest.mark.parametrize(
+    ("embedded", "profile_column"),
+    [(True, True), (True, False), (False, True)],
+    ids=["embedded", "embedded-without-profile-column", "unembedded"],
+)
+async def test_postgres_schema_without_lexical_columns_falls_back_inside_a_transaction(
+    postgres_url, monkeypatch, caplog, embedded, profile_column
+):
+    """The schema-shape fallbacks share the vector retries' savepoints.
+
+    Each first INSERT names columns an unmigrated schema lacks. Inside a
+    caller's transaction that refusal must not abort it, or the fallback
+    INSERT, and the turn, fails with it. Without ``embedding_profile_id``
+    too, the vector-and-profile fallback is refused as well, and the vector
+    lands without its profile stamp.
+    """
+    _configure_column_width(monkeypatch, 6)
+    async with _own_postgres_schema(postgres_url) as case:
+        await case.size_embedding_column(6)
+        dropped_columns = ["lexical_index_id", "lexical_index_version"]
+        if not profile_column:
+            dropped_columns.append("embedding_profile_id")
+        await case.db.execute(
+            "ALTER TABLE conversation_history "
+            + ", ".join(f"DROP COLUMN {column}" for column in dropped_columns),
+            (),
+        )
+        service = _FixedWidthEmbeddings(6) if embedded else None
+        store = _store(case.db, service)
+
+        with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+            async with case.db.transaction():
+                await store.add_conversation(role="user", content="unmigrated")
+
+        rows = await case.db.fetchall(
+            "SELECT embedding_vec IS NOT NULL FROM conversation_history "
+            "WHERE agent_id = ?",
+            (store.agent_id,),
+        )
+        assert [bool(has_vector) for (has_vector,) in rows] == [embedded]
+        if profile_column:
+            expected_profile = service.profile.profile_id if embedded else None
+            assert await _stored_turns(case.db, store) == [
+                ("unmigrated", embedded, expected_profile)
+            ]
+        assert store.dropped_embedding_count == 0
+        assert not _store_records(caplog, logging.WARNING)
+
+
+async def test_postgres_best_effort_writes_after_a_dropped_vector_keep_the_transaction(
+    postgres_url, monkeypatch, caplog
+):
+    """After the vector is refused, two best-effort writes follow inside the
+    caller's transaction: discarding the turn's now-unreferenced lexical tokens,
+    and registering its embedding profile. Either one failing used to abort the
+    transaction, and COMMIT then rolled the turn back without an error while
+    its drop was still counted.
+
+    The cleanup is confined to a savepoint; the registry write is skipped,
+    because the row it would describe carries no profile id.
+    """
+    from kestrel_sovereign.storage.sqla import embedding_profile
+
+    # The registry write is cached per process; start with it unwritten.
+    monkeypatch.setattr(embedding_profile, "_PROFILE_UPSERT_CACHE", set())
+    async with _own_postgres_schema(postgres_url) as case:
+        store = _store(case.db, _FixedWidthEmbeddings(6))
+        await _drop_every_postgres_vector(
+            case, store, monkeypatch, caplog, "refused_by_database"
+        )
+        # This schema is the test's own, so its triggers touch nothing shared.
+        await case.db.execute(
+            "CREATE FUNCTION refuse_best_effort_write() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN "
+            "RAISE EXCEPTION 'best-effort write refused'; END $$",
+            (),
+        )
+        for table, event in (
+            ("conversation_lexical_tokens", "DELETE"),
+            ("embedding_profiles", "INSERT"),
+        ):
+            await case.db.execute(
+                f"CREATE TRIGGER refuse_{table} BEFORE {event} ON {table} "
+                "FOR EACH ROW EXECUTE FUNCTION refuse_best_effort_write()",
+                (),
+            )
+
+        with caplog.at_level(logging.DEBUG, logger=STORE_LOGGER):
+            async with case.db.transaction():
+                await store.add_conversation(
+                    role="user", content="the heron nests by the river"
+                )
+
+        assert await _stored_turns(case.db, store) == [
+            ("the heron nests by the river", False, None)
+        ]
+        cleanup_failures = [
+            r for r in _store_records(caplog, logging.DEBUG)
+            if "Could not clean orphan lexical tokens" in r.getMessage()
+        ]
+        assert len(cleanup_failures) == 1
+        assert "best-effort write refused" in cleanup_failures[0].getMessage()
         assert store.dropped_embedding_count == 1
         assert len(_store_records(caplog, logging.WARNING)) == 1
