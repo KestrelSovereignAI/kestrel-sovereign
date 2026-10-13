@@ -10,8 +10,10 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.sovereignty.feature import (
     MAX_SOVEREIGNTY_IMPORT_BYTES,
     SovereigntyFeature,
+    _LighthouseGatewayIpfs,
 )
 from kestrel_sovereign.filecoin_adapter import EnvelopePolicy
+from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
 
@@ -190,6 +192,7 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
     storage = MagicMock()
     storage.get_nodes_by_type = AsyncMock(return_value=[backup_node])
     storage.restore_from_backup_blob = AsyncMock()
+    storage.privacy_mode = PrivacyMode.NORMAL
 
     agent = SimpleNamespace(storage=storage, agent_id="did:kestrel:test")
     adapter = MagicMock()
@@ -214,6 +217,10 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
         envelope_owner="did:kestrel:test",
         envelope_key_hash="keyhash123",
         cache_name=None,
-        remote_ipfs=None,
+        remote_ipfs=adapter.retrieve_content.call_args.kwargs["remote_ipfs"],
+    )
+    # The keyless gateway: this agent has no Lighthouse provider (#3601).
+    assert isinstance(
+        adapter.retrieve_content.call_args.kwargs["remote_ipfs"], _LighthouseGatewayIpfs
     )
     storage.restore_from_backup_blob.assert_not_awaited()

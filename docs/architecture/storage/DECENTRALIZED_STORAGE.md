@@ -161,11 +161,13 @@ content; the payload is the export's sealed envelope. The family is distinct
 from `kestrel_state__`/`kestrel_manifest__` on purpose: cold-start restore
 reads its database from those, and an export is an encrypted archive.
 
-Every reader and pruner of an agent's sovereignty exports uses the credential
-that publishes them: the key the agent's PayerPolicy resolves (an
-agent-scoped key in its encrypted key storage, a `SELF_WALLET` key, or the
-host key). Boot builds the agent's Lighthouse provider from that one
-resolution, and nothing else reads a key of its own for them. The provider
+Everything that reads an agent's sovereignty exports on its account (the
+health checks) or prunes them uses the credential that publishes them: the
+key the agent's PayerPolicy resolves (an agent-scoped key in its encrypted
+key storage, a `SELF_WALLET` key, or the host key). Boot builds the agent's
+Lighthouse provider from that one resolution, and nothing else reads a key of
+its own for them. Restoring an export needs no key at all: an import fetches
+it by CID from the public gateway (see below). The provider
 asks the resolution for the key before each call and never falls back to the
 key it last had: once none resolves (the agent's own key removed, with no
 host key to stand in), it has no key, so an export stays local and says so,
@@ -212,11 +214,17 @@ keep falling back on any storage failure.
   `content.bin` uploads. That holds under `--include-quarantined` and the
   `--delete-older-than-days` age purge.
 - An export the provider took restores from it. `import_sovereignty` reads the
-  host cache, then the IPFS node, then the agent's Lighthouse provider, which
-  fetches the CID from the gateway under the same byte ceiling, reading only
-  an unencoded body. Its bytes are opened and checked exactly as the node's
-  are: the envelope's owner and key, and the content hash. A content hash is
-  never sent to Lighthouse.
+  host cache, then the IPFS node, then Lighthouse's public gateway
+  (`LIGHTHOUSE_GATEWAY_URL`), which it fetches the CID from under the same
+  byte ceiling, reading only an unencoded body. The gateway serves any
+  account's upload by CID, so this read uses no key and not the agent's
+  provider: a fresh host holding no Lighthouse key at all, the agent's own
+  lost with its database, still restores the export (#3601). The gateway is
+  read only when the agent's current privacy mode permits a remote storage
+  tier, since the request discloses the CID and the host to Lighthouse. Its
+  bytes are opened and checked exactly as the node's are: the envelope's
+  owner and key, and the content hash. A content hash is never sent to
+  Lighthouse.
 - When Lighthouse cannot take an export either, it is kept on this host and
   reported as not durable off-host, as when no provider exists.
 - Exports made before the naming restore exactly as before; the name does not

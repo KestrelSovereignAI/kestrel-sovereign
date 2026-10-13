@@ -329,19 +329,6 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             raise ConnectionError("Lighthouse provider not available")
         await self._client.delete_file(file_id)
 
-    async def fetch(self, cid: str, *, max_bytes: Optional[int]) -> bytes:
-        """The bytes Lighthouse's gateway serves for ``cid``, exactly as given.
-
-        The counterpart of :meth:`publish`: it neither decrypts, caches nor
-        indexes, and reads at most ``max_bytes`` (raising
-        ``LighthouseDownloadLimitError`` past it). The caller verifies what
-        it receives; an import does so through the export's envelope (#2874).
-        """
-        await self._ensure_client()
-        if not self.is_available():
-            raise ConnectionError("Lighthouse provider not available")
-        return await self._client.download(cid, max_bytes=max_bytes)
-
     async def retrieve(self, cid: str, encryption_key_hash: Optional[str] = None) -> bytes:
         """
         Retrieve content by CID.

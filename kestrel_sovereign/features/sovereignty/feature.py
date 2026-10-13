@@ -27,10 +27,12 @@ from kestrel_sovereign.filecoin_adapter import (
 from decimal import Decimal
 from datetime import datetime, timezone
 from kestrel_sovereign.audit_time import utc_now_iso
+from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 from kestrel_sovereign.services.key_resolution import KeyUnreadableError
 from kestrel_sovereign.storage import GraphNode
 from kestrel_sovereign.storage.providers.lighthouse_rest import (
     LighthouseDownloadLimitError,
+    LighthouseGateway,
 )
 from kestrel_sovereign.storage.privacy_wrapper import (
     BackupPolicyUnavailableError,
@@ -41,6 +43,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     require_durable_persistence_gate,
 )
 from kestrel_sovereign.storage.sync.health import check_lighthouse_health
+from kestrel_sovereign.storage.tiered_manager import privacy_allows_remote_tiers
 from kestrel_sovereign.storage.sync.retention import load_retention_policy
 from kestrel_sovereign.storage.sync.sovereignty_exports import (
     sovereignty_export_deletions,
@@ -79,16 +82,45 @@ REFUSAL_BACKUP_RECEIPT_INVALID = "backup_receipt_invalid"
 MAX_SOVEREIGNTY_IMPORT_BYTES = 1024 * 1024 * 1024
 
 
-class _LighthouseIpfs:
-    """The agent's Lighthouse provider as the IPFS tier's remote service.
+def _on_agent_loop(loop: asyncio.AbstractEventLoop, coroutine_function, *args, **kwargs):
+    """Run a Lighthouse call on the agent's event loop and wait for its result.
 
-    ``FilecoinAdapter`` publishes to it (``pin``) and reads from it
-    (``fetch``) when its own IPFS node is unreachable, from the worker thread
-    ``store_content`` and ``retrieve_content`` run in. The provider's client
-    belongs to the agent's event loop, so each call runs on that loop while
-    the worker waits for its result. A failure of the provider (unavailable,
-    an HTTP error, a response without a CID) is the adapter's
-    ``RemoteIpfsError``; the import ceiling is its ``ContentRetrievalLimitError``.
+    ``FilecoinAdapter`` calls its remote IPFS service from the worker thread
+    ``store_content`` and ``retrieve_content`` run in, and a Lighthouse client
+    belongs to the agent's loop. A failure of the call (unavailable, an HTTP
+    error, a response without a CID) is the adapter's ``RemoteIpfsError``;
+    the import ceiling is its ``ContentRetrievalLimitError``.
+    """
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        raise RuntimeError(
+            "Lighthouse calls wait on the agent's event loop and must be "
+            "made from a worker thread"
+        )
+    call = coroutine_function(*args, **kwargs)
+    try:
+        future = asyncio.run_coroutine_threadsafe(call, loop)
+    except BaseException:
+        # Never scheduled (the loop is closed): nothing will await it.
+        call.close()
+        raise
+    try:
+        return future.result()
+    except LighthouseDownloadLimitError as exc:
+        raise ContentRetrievalLimitError(str(exc)) from exc
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        raise RemoteIpfsError(f"{type(exc).__name__}: {exc}") from exc
+
+
+class _LighthouseIpfs:
+    """The agent's Lighthouse provider as the IPFS tier's remote publisher.
+
+    ``FilecoinAdapter`` publishes to it (``pin``) when its own IPFS node is
+    unreachable. The provider uploads with the agent's key, on the account
+    its PayerPolicy resolves (#2874).
     """
 
     def __init__(self, provider, *, tag: str, loop: asyncio.AbstractEventLoop):
@@ -97,30 +129,6 @@ class _LighthouseIpfs:
         self._loop = loop
         self.provider_name = provider.provider_name
 
-    def _on_agent_loop(self, coroutine_function, *args, **kwargs):
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is self._loop:
-            raise RuntimeError(
-                "Lighthouse calls wait on the agent's event loop and must be "
-                "made from a worker thread"
-            )
-        call = coroutine_function(*args, **kwargs)
-        try:
-            future = asyncio.run_coroutine_threadsafe(call, self._loop)
-        except BaseException:
-            # Never scheduled (the loop is closed): nothing will await it.
-            call.close()
-            raise
-        try:
-            return future.result()
-        except LighthouseDownloadLimitError as exc:
-            raise ContentRetrievalLimitError(str(exc)) from exc
-        except (httpx.HTTPError, OSError, ValueError) as exc:
-            raise RemoteIpfsError(f"{type(exc).__name__}: {exc}") from exc
-
     def pin(
         self,
         payload: bytes,
@@ -128,7 +136,8 @@ class _LighthouseIpfs:
         filename: str,
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> str:
-        return self._on_agent_loop(
+        return _on_agent_loop(
+            self._loop,
             self.provider.publish,
             payload,
             filename=filename,
@@ -136,8 +145,37 @@ class _LighthouseIpfs:
             on_progress=on_progress,
         )
 
+
+class _LighthouseGatewayIpfs:
+    """Lighthouse's public gateway as the IPFS tier's remote reader.
+
+    ``FilecoinAdapter`` reads an export back from it (``fetch``) by CID when
+    its own IPFS node does not answer, so an export Lighthouse took restores
+    after the host cache is lost (#2874). The gateway serves any account's
+    upload to anyone, so the read needs no credential and never consults the
+    agent's provider: a fresh host holding no Lighthouse key, the agent's own
+    lost with its database, restores it too (#3601). The adapter checks what
+    it serves exactly as it checks its own node's answer.
+
+    Each read opens its own gateway client and closes it when the read ends,
+    so no client outlives the import it served.
+    """
+
+    provider_name = "lighthouse"
+
+    def __init__(self, *, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+
     def fetch(self, cid: str, *, max_bytes: Optional[int]) -> bytes:
-        return self._on_agent_loop(self.provider.fetch, cid, max_bytes=max_bytes)
+        return _on_agent_loop(self._loop, self._download, cid, max_bytes=max_bytes)
+
+    @staticmethod
+    async def _download(cid: str, *, max_bytes: Optional[int]) -> bytes:
+        gateway = LighthouseGateway(gateway_url=get_lighthouse_gateway_url())
+        try:
+            return await gateway.download(cid, max_bytes=max_bytes)
+        finally:
+            await gateway.close()
 
 
 class SovereigntyFeature(Feature):
@@ -459,16 +497,16 @@ class SovereigntyFeature(Feature):
         return ToolResult.ok(confirmation, data=data)
 
     def _lighthouse_ipfs(self) -> Optional[_LighthouseIpfs]:
-        """The IPFS tier's remote service when the adapter's IPFS node is
+        """The IPFS tier's publisher when the adapter's IPFS node is
         unreachable: the agent's Lighthouse provider, or None without one.
 
-        An export publishes to it, and an import reads an export back from
-        it, so an export it took restores after the host cache is lost
-        (#2874). The provider exists only when the agent's remote-tier policy
-        and PayerPolicy permitted one at boot, and resolves its own key, so
-        neither path decides either. A node the adapter reaches is still
-        used first: a sovereign-operated node outranks a delegated service.
-        Without either, an export stays local and reports the downgrade.
+        The provider exists only when the agent's remote-tier policy and
+        PayerPolicy permitted one at boot, and resolves its own key, so this
+        decides neither. A node the adapter reaches is still used first: a
+        sovereign-operated node outranks a delegated service. Without either,
+        an export stays local and reports the downgrade. An import reads
+        what it published back through the public gateway instead
+        (:meth:`_lighthouse_gateway`), which needs no key.
         """
         provider = getattr(self.agent, "lighthouse_provider", None)
         if provider is None:
@@ -478,6 +516,28 @@ class SovereigntyFeature(Feature):
             tag=sovereignty_export_tag(self.agent.agent_id),
             loop=asyncio.get_running_loop(),
         )
+
+    def _lighthouse_gateway(self) -> Optional[_LighthouseGatewayIpfs]:
+        """Where an import reads an export when the adapter's IPFS node does
+        not answer: Lighthouse's public gateway, with or without a provider
+        or a key of the agent's (#3601). A node the adapter reaches is still
+        read first.
+
+        The read discloses the CID and this host to a third party, so it is
+        made only when the agent's current privacy mode permits a remote
+        storage tier: one that keeps storage local reads no gateway, and nor
+        does a storage that exposes no privacy mode. Nothing else the
+        provider's existence implied applies to a keyless read. Who would pay
+        for storage (PayerPolicy) does not, and neither do the remote-tier
+        policy's test-instance, identity and path checks, which keep test
+        agents' writes off production tiers, nor its anchor check, which
+        would refuse the first boot of an agent restoring into an empty
+        database.
+        """
+        mode = getattr(getattr(self.agent, "storage", None), "privacy_mode", None)
+        if mode is None or not privacy_allows_remote_tiers(mode):
+            return None
+        return _LighthouseGatewayIpfs(loop=asyncio.get_running_loop())
 
     async def _thin_lighthouse_exports(self, provider, *, keep_cid: str) -> dict:
         """Thin this agent's older exports on the account ``provider`` just
@@ -698,6 +758,9 @@ class SovereigntyFeature(Feature):
         holds no record of it (#2873). The envelope is sealed for the agent
         that exported it, and an export of another agent is refused: its
         conversation rows are encrypted at rest under that agent's identity.
+        IPFS is the adapter's own node and, when it does not answer and the
+        privacy mode permits a remote tier, Lighthouse's public gateway,
+        which needs no Lighthouse key (#3601).
         Without a backup receipt only IPFS is read, never the host cache
         co-hosted agents share (#3225), and only an encrypted export is
         restored. A legacy encrypted export, made before
@@ -769,7 +832,7 @@ class SovereigntyFeature(Feature):
                     allow_local_cache=False,
                     envelope=EnvelopePolicy.ENCRYPTED_ONLY,
                     envelope_owner=self.agent.agent_id,
-                    remote_ipfs=self._lighthouse_ipfs(),
+                    remote_ipfs=self._lighthouse_gateway(),
                 )
             else:
                 # The envelope names its own key hash, and the receipt's must
@@ -826,7 +889,7 @@ class SovereigntyFeature(Feature):
                     envelope_owner=self.agent.agent_id,
                     envelope_key_hash=key_hash or receipt.node_id,
                     cache_name=cache_name,
-                    remote_ipfs=self._lighthouse_ipfs(),
+                    remote_ipfs=self._lighthouse_gateway(),
                 )
 
             if not content:

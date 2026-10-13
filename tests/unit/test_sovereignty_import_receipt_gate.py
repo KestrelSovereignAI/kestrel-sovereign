@@ -21,17 +21,31 @@ from kestrel_sovereign.features.sovereignty.feature import (
     MAX_SOVEREIGNTY_IMPORT_BYTES,
     REFUSAL_BACKUP_RECEIPT_INVALID,
     SovereigntyFeature,
+    _LighthouseGatewayIpfs,
 )
 from kestrel_sovereign.filecoin_adapter import EnvelopePolicy, FilecoinAdapter, StorageTier
 from kestrel_sovereign.identity import package_intake
+from kestrel_sovereign.privacy import PrivacyMode
 
 HASH = "a" * 64
 
 
-def _feature(receipts):
+class _LighthouseGateway:
+    """Equal to the keyless Lighthouse gateway reader an import is given,
+    which needs no provider on the agent (#3601)."""
+
+    def __eq__(self, other):
+        return isinstance(other, _LighthouseGatewayIpfs)
+
+    def __repr__(self):
+        return "<the Lighthouse gateway reader>"
+
+
+def _feature(receipts, privacy_mode=PrivacyMode.NORMAL):
     storage = SimpleNamespace(
         get_nodes_by_type=AsyncMock(return_value=receipts),
         restore_from_backup_blob=AsyncMock(return_value={"messages_restored": 1}),
+        privacy_mode=privacy_mode,
     )
     agent = SimpleNamespace(storage=storage, features={}, agent_id="did:test:me", did="did:test:me")
     return SovereigntyFeature(agent)
@@ -40,7 +54,8 @@ def _feature(receipts):
 @pytest.mark.asyncio
 async def test_import_without_a_receipt_never_reads_the_host_cache():
     """A restore with no receipt (a fresh host, #2873) may read only IPFS,
-    and only an encrypted export is accepted from it."""
+    and only an encrypted export is accepted from it. IPFS includes the
+    Lighthouse gateway, though this agent has no Lighthouse provider (#3601)."""
     feature = _feature(receipts=[])
     with patch("kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter") as adapter_cls:
         adapter_cls.return_value.retrieve_content = MagicMock(side_effect=ValueError(f"Content not found: {HASH}"))
@@ -53,9 +68,47 @@ async def test_import_without_a_receipt_never_reads_the_host_cache():
         allow_local_cache=False,
         envelope=EnvelopePolicy.ENCRYPTED_ONLY,
         envelope_owner="did:test:me",
-        remote_ipfs=None,
+        remote_ipfs=_LighthouseGateway(),
     )
     feature.agent.storage.restore_from_backup_blob.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "privacy_mode",
+    [PrivacyMode.EPHEMERAL, PrivacyMode.ISOLATED, PrivacyMode.DEIDENTIFIED, None],
+    ids=["ephemeral", "isolated", "deidentified", "no-privacy-mode"],
+)
+@pytest.mark.parametrize("receipts", [[], [SimpleNamespace(node_id=HASH, properties={})]],
+                         ids=["fresh-host", "receipt"])
+async def test_a_privacy_mode_that_keeps_storage_local_reads_no_gateway(
+    privacy_mode, receipts
+):
+    """The gateway read needs no key, but it tells Lighthouse which CID this
+    host wants, so a privacy mode that permits no remote tier makes none
+    (#3601). A storage that exposes no privacy mode is not taken to permit
+    one."""
+    feature = _feature(receipts=receipts, privacy_mode=privacy_mode)
+    if privacy_mode is None:
+        del feature.agent.storage.privacy_mode
+    with patch("kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter") as adapter_cls:
+        adapter_cls.return_value.retrieve_content = MagicMock(
+            side_effect=ValueError(f"Content not found: {HASH}")
+        )
+        await feature.import_sovereignty(HASH)
+    [call] = adapter_cls.return_value.retrieve_content.call_args_list
+    assert call.kwargs["remote_ipfs"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("privacy_mode", [PrivacyMode.ANONYMOUS, PrivacyMode.PUBLIC])
+async def test_a_privacy_mode_that_permits_a_remote_tier_reads_the_gateway(privacy_mode):
+    feature = _feature(receipts=[], privacy_mode=privacy_mode)
+    with patch("kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter") as adapter_cls:
+        adapter_cls.return_value.retrieve_content = MagicMock(return_value=b"blob")
+        await feature.import_sovereignty(HASH)
+    [call] = adapter_cls.return_value.retrieve_content.call_args_list
+    assert call.kwargs["remote_ipfs"] == _LighthouseGateway()
 
 
 @pytest.mark.asyncio
@@ -142,7 +195,7 @@ async def test_import_with_a_receipt_follows_what_it_records(
         envelope_owner="did:test:me",
         envelope_key_hash=envelope_key_hash,
         cache_name=cache_name,
-        remote_ipfs=None,
+        remote_ipfs=_LighthouseGateway(),
     )
 
 
@@ -177,7 +230,7 @@ async def test_a_receipt_without_a_cache_name_reads_its_content_hash_not_its_cid
         envelope_owner="did:test:me",
         envelope_key_hash="kh",
         cache_name=cache_name,
-        remote_ipfs=None,
+        remote_ipfs=_LighthouseGateway(),
     )
 
 
