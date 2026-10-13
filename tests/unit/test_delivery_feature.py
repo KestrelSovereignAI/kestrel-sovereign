@@ -3956,15 +3956,20 @@ class TestGetDeadLetterEntries:
 class TestQueueLifecycle:
 
     @pytest.mark.asyncio
-    async def test_start_creates_tables_and_task(self, queue):
-        with patch.object(queue, "_ensure_tables", new_callable=AsyncMock) as mock_tables:
-            with patch("asyncio.create_task") as mock_create:
-                mock_create.return_value = MagicMock()
-                await queue.start()
-                mock_tables.assert_called_once()
-                mock_create.assert_called_once()
-                mock_create.call_args.args[0].close()
-                assert queue._running is True
+    async def test_start_creates_native_tables_and_task(self, tmp_path):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "start-delivery.db"))
+        queue = DeliveryQueue(db, "native-start-worker", poll_interval=3600)
+        try:
+            assert not await db.table_exists("delivery_queue")
+            await queue.start()
+            assert await db.table_exists("delivery_queue")
+            assert await db.table_exists("delivery_dead_letter")
+            assert queue._running and not queue._task.done()
+        finally:
+            await queue.stop()
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_stop_wakes_and_joins_native_idle_worker(self, tmp_path):

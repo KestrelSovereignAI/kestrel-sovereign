@@ -220,6 +220,7 @@ class DeliveryQueue:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._stop_requested = asyncio.Event()
+        self._loop_entered = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -230,6 +231,7 @@ class DeliveryQueue:
         await self._ensure_tables()
         await self._reclaim_in_flight()
         self._stop_requested.clear()
+        self._loop_entered = False
         self._running = True
         factory = self._runtime_task_factory or create_owned_task
         self._task = factory(
@@ -248,6 +250,12 @@ class DeliveryQueue:
         self._stop_requested.set()
         terminal = getattr(self, "_worker_control", None)
         if self._task:
+            if not self._loop_entered and not self._task.done():
+                # The production factory may still be awaiting agent READY.
+                # No loop query/effect has been admitted, and that barrier
+                # cannot observe this queue's cooperative stop event. There
+                # is no await between the entry check and cancellation.
+                self._task.cancel()
             # Stop future polls, not a finite query/COMMIT already accepted by
             # this resident or its original delivery child. Caller cancellation
             # is replayed only after the original worker physically joins.
@@ -1699,6 +1707,7 @@ class DeliveryQueue:
 
     async def _loop(self):
         """Background poll loop."""
+        self._loop_entered = True
         while self._running:
             try:
                 processed = await self.process_pending()

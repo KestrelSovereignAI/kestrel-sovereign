@@ -793,6 +793,11 @@ renewal returns its row from the same transaction. Delivery disable stops new
 polls and unstarted batch entries, wakes the idle interval, and physically joins
 accepted delivery/status operations through their original COMMIT acknowledgement;
 cancellation of the stop caller does not cancel those operations.
+A resident that has not entered the queue loop may instead be cancelled while
+waiting at the agent's separate READY publication barrier. No queue SQL or
+delivery effect has then been accepted. The loop marks entry synchronously
+before its first await; teardown checks that mark without yielding, so boot
+rollback can retire the dormant resident without cancelling a native ACK.
 
 Hosted default-VENV provisioning also consults retained immutable launch custody.
 Removing an operator setting does not authorize upgrade, adoption or manifest
