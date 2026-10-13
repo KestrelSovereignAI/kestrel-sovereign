@@ -479,7 +479,17 @@ Slices are tracked on #3424. Each one lands with tests that fail without it.
    - **Failure.** Any `DecisionError` becomes `completed=False`, exactly like a chat-judge failure, and the retriever falls back to lexical evidence.
 5. **Response audit**, as an opt-in backend: `KESTREL_RESPONSE_AUDIT_BACKEND=chat|decision` (default `chat`), with `KESTREL_RESPONSE_AUDIT_DECISION_MODEL` as the decision backend's selector. The variables follow the feature's existing env-var configuration.
    - **Questions.** Two `noul` questions over `{response}`, not one `score`: `block` (should not be shown) and `concern` (raises some integrity concern). Code composes them into the hook's 1–3 contract: 3 when `block` clears its threshold, else 2 when `concern` does, else 1. Two yes/no questions calibrate directly with the eval harness (Youden's J per key) and map one-to-one onto the two cut-offs the hook actually acts on. A three-level score would need a derived cut-off the harness cannot calibrate.
-   - **Reasoning** is content-free: route, model and the two probabilities. The strict-mode redaction of telemetry and of the audit anchor therefore holds without special cases.
+   - **Turn context and `unearned_success` (#3553).** The state is `{request, response, tool_outcomes}`: the user text the reply answers (tail, ≤ 2,000 chars) and the turn's tool results reduced to `{tool, outcome, error?}`, where outcome is `succeeded`, `failed`, `partial` or `unconfirmed`. Payloads never reach the audit. A third `noul`, `unearned_success`, asks whether the reply claims an action succeeded that the outcomes show failed, was refused, only partly succeeded, or never ran. When it clears its threshold, risk is 3: it is an honesty failure, which the deterministic narration check also floors at the gate. That check only covers prose streamed *before* a tool ran; this covers the final reply.
+     - **Why.** On a live test agent, "Done. I've saved those details" after two failed saves scored p(concern)=0.61 reply-only; with tool outcomes it is a direct `unearned_success`.
+     - **Measured** (68 samples, 21 unearned; calibrated accuracy for unearned / block / concern):
+       - jev-latest: 0.985 / 0.985 / 0.941, at 294 ms.
+       - gpt-6-luna-decisions: 0.985 (also 0.985 at plain 0.5) / 0.956 / 0.926.
+       - pplx-decider-v1.1: 0.985 / 1.000 / 0.971.
+       - clef: 1.000 / 0.985 / 0.941.
+       - d1: 0.971 / 0.971 / 0.941, but 0.794 at 0.5, so it needs its calibrated cut.
+       - tev1:0.8b: 0.38, so a privacy-mode audit should be calibrated with `uncalibrated = "refuse"` for this caller.
+     - **Chat baseline.** The reply-only chat audit can't judge unearned success at all; its concern recall is 0.47.
+   - **Reasoning** is content-free: route, model and the three probabilities. The strict-mode redaction of telemetry and of the audit anchor therefore holds without special cases.
    - **Failure.** Any `DecisionError` is an un-run audit (`audited=False`), which strict mode already denies.
    - **Privacy.** `decide` applies the live privacy provider. The chat audit now follows the same rule (#3491): `get_audit_response` ORs its `force_local_only` argument with the live state, the hook passes the turn's own privacy state, and under local-only only `is_local` routes are candidates. With no local route the audit does not run (`audited=False`, `reason="no_local_audit_route"`).
    - **Eval.** `kestrel decisions eval --caller response_audit --baseline chat`. In a local-only run the chat baseline audits on local routes only; a sample no local route can audit counts as an error.
