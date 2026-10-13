@@ -763,13 +763,15 @@ async def check_conversation_embeddings(agent) -> Dict[str, Any]:
     A turn whose embedding cannot be stored is still persisted, without its
     vector, so semantic recall over conversation history degrades with every
     such turn. Its only trace used to be INFO lines. The store counts the
-    drops and records a profile/column width disagreement found at startup;
+    drops and records a profile/column width disagreement, found at startup
+    and re-checked whenever the embedding profile changes at runtime (#3606);
     this surfaces both, the way ``check_signal_audit_log`` surfaces dropped
     audit rows.
 
     ``warn`` rather than ``fail``, like that check: the agent keeps serving
     and its turns keep persisting. The count does not clear when later writes
-    succeed, because the vectors dropped earlier are still missing.
+    succeed, because the vectors dropped earlier are still missing. The
+    misconfiguration does clear once the active profile fits the column.
     """
     start = time.monotonic()
 

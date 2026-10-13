@@ -1481,3 +1481,102 @@ async def test_discovery_cache_reused_until_cleared():
     svc.clear_embedding_discovery_cache()
     await svc.discover_embedding_models()
     assert adapter.list_embedding_models.await_count == 2
+
+
+# --- #3606 a resolution that changes a route's profile reports it -------------
+
+
+def _unpinned_route(name, model, dim):
+    """A route with no embedding capability but the one model it discovers."""
+    return {
+        "vendor": name.split(":", 1)[0],
+        "name": name,
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id=model, provider="ignored", native_dim=dim),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+
+
+def _service_reporting_changes(providers):
+    """A real ``LLMService`` whose profile-change listener records what it sees.
+
+    Each run records the ``(model, dim)`` of every route at that moment, so a
+    test can tell a listener that ran after the write from one that ran before.
+    """
+    from tests.utils.process_local_llm_service import process_local_service
+
+    service = process_local_service(providers)
+    service._embedding_discovery_cache = None  # discover from the adapters
+    runs = []
+
+    async def listener():
+        runs.append([
+            (p["capabilities"].get("embedding_model"),
+             p["capabilities"].get("embedding_dim"))
+            for p in providers
+        ])
+
+    service.set_embedding_profile_change_callback(listener)
+    return service, runs
+
+
+@pytest.fixture
+def _no_deployment_dim(monkeypatch):
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+
+
+@pytest.mark.usefixtures("_no_deployment_dim")
+async def test_a_resolution_that_changes_a_route_profile_runs_the_listener_after_it():
+    route = _unpinned_route("openrouter:api", "auto-embed", 6)
+    service, runs = _service_reporting_changes([route])
+
+    assert await service.resolve_route_embedding_model(route) == ("auto-embed", 6)
+    await service.drain_preference_persistence()
+
+    assert runs == [[("auto-embed", 6)]]
+
+
+@pytest.mark.usefixtures("_no_deployment_dim")
+async def test_a_resolution_that_leaves_the_profile_runs_no_listener():
+    route = _unpinned_route("openrouter:api", "auto-embed", 6)
+    pinned = {
+        **_unpinned_route("openai:api", "auto-embed", 6),
+        "capabilities": {
+            "supports_embeddings": True,
+            "embedding_model": "pinned-embed",
+            "embedding_dim": 4,
+        },
+    }
+    service, runs = _service_reporting_changes([route, pinned])
+    await service.resolve_route_embedding_model(route)
+    await service.drain_preference_persistence()
+    runs.clear()
+
+    # Resolved again to what it already holds, and a pin honoured verbatim.
+    await service.resolve_route_embedding_model(route)
+    assert await service.resolve_route_embedding_model(pinned) == ("pinned-embed", 4)
+    await service.drain_preference_persistence()
+
+    assert runs == []
+
+
+@pytest.mark.usefixtures("_no_deployment_dim")
+async def test_a_reconcile_sweep_runs_the_listener_once_after_its_last_route():
+    first = _unpinned_route("openrouter:api", "first-embed", 6)
+    second = _unpinned_route("openai:api", "second-embed", 4)
+    service, runs = _service_reporting_changes([first, second])
+
+    await service.reconcile_embedding_capabilities(use_cache=False)
+    await service.drain_preference_persistence()
+
+    assert runs == [[("first-embed", 6), ("second-embed", 4)]]
+
+    await service.reconcile_embedding_capabilities(use_cache=False)
+    await service.drain_preference_persistence()
+
+    assert len(runs) == 1

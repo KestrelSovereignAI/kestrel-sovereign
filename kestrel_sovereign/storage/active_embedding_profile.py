@@ -10,7 +10,8 @@ none on the profile the agent searches (#3420).
 
 The agent therefore records the profile it resolves in ``agent_metadata``
 under :data:`ACTIVE_EMBEDDING_PROFILE_KEY`: at boot, once its embedding
-config is loaded, and whenever an operator changes that config.
+config is loaded, whenever an operator changes that config, and whenever
+resolution changes the model or width a route embeds with (#3606).
 ``embeddings reindex`` refuses to target any other profile, and
 ``embeddings verify`` counts the stored vectors that are not on it.
 

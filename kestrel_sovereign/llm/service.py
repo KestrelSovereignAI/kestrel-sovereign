@@ -679,6 +679,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         # "row_count"}). Auto-resolution prefers a model matching it so a fresh
         # default doesn't silently move the agent into a new embedding space.
         self._corpus_embedding_profile_provider = None
+        # Listener for an embedding profile the resolver changed (#3606), an
+        # ``async () -> None`` set via set_embedding_profile_change_callback().
+        self._embedding_profile_change_callback = None
         # Per-route records of an auto-default that changed the corpus embedding
         # space (#2366). Keyed by route name; surfaced in get_embedding_settings.
         self._embedding_space_change_warnings: Dict[str, Dict[str, Any]] = {}
@@ -1305,6 +1308,35 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         """
         self._corpus_embedding_profile_provider = callback
         logger.info("Corpus embedding-profile provider enabled")
+
+    def set_embedding_profile_change_callback(self, callback) -> None:
+        """Set the listener for an embedding profile the resolver changed (#3606).
+
+        The callback is ``async () -> None``. The persistence callbacks report
+        an operator's change to the embedding configuration; this reports the
+        other way the profile changes, :meth:`resolve_route_embedding_model`
+        (or a :meth:`reconcile_embedding_capabilities` sweep) writing a route's
+        resolved model and width into its capabilities. It is scheduled once
+        that write is made, as a task tracked with the persistence callbacks',
+        so a :meth:`drain_preference_persistence` begun after the write awaits
+        it too.
+        """
+        self._embedding_profile_change_callback = callback
+
+    def _embedding_profile_changed(self) -> None:
+        """Run the embedding profile listener, if one is set (#3606)."""
+        callback = getattr(self, "_embedding_profile_change_callback", None)
+        if not callback:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            callback(), name="llm-embedding-profile-change"
+        )
+        self._preference_persistence_tasks.add(task)
+        task.add_done_callback(self._handle_preference_persistence_done)
 
     def _find_route_provider(self, route: str) -> Optional[Dict[str, Any]]:
         """Return the configured provider whose ``name`` matches ``route`` exactly."""
