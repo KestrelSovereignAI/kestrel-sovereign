@@ -308,6 +308,27 @@ async def _vec_column(db: "AsyncDatabase", table: str, is_postgres: bool) -> _Ve
     return _VecColumn(present=True, dimension=typmod if typmod > 0 else None)
 
 
+# Tables whose ``embedding_vec`` width :func:`declared_embedding_vec_dimension`
+# reads. Interpolated into SQL like ``LEGACY_EMBEDDING_TABLES``.
+_DECLARED_WIDTH_TABLES = frozenset({"conversation_history", *LEGACY_EMBEDDING_TABLES})
+
+
+async def declared_embedding_vec_dimension(
+    db: "AsyncDatabase", table: str
+) -> Optional[int]:
+    """The width *table*'s ``embedding_vec`` column declares, or ``None``.
+
+    ``None`` when there is no declared width to read: SQLite stores bytes,
+    and a PostgreSQL column can be absent or an unconstrained ``vector``.
+    Raises :class:`EmbeddingVecBackfillError` for an unsupported backend or
+    a PostgreSQL column that is not a pgvector ``vector``.
+    """
+    if table not in _DECLARED_WIDTH_TABLES:
+        raise ValueError(f"no embedding_vec column on table {table!r}")
+    column = await _vec_column(db, table, _is_postgres(db))
+    return column.dimension
+
+
 def _count_when(predicate: str) -> str:
     return f"COALESCE(SUM(CASE WHEN {predicate} THEN 1 ELSE 0 END), 0)"
 

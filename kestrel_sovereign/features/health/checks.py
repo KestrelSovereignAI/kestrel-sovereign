@@ -15,10 +15,13 @@ import logging
 import shutil
 import time
 from datetime import datetime
-from typing import Any, Awaitable, Dict, List
+from typing import Any, Awaitable, Dict, List, Optional
 
 from kestrel_sdk.signals import ResourceLock
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    resolve_conversation_store,
+    resolve_feature_database,
+)
 from kestrel_sovereign.signals import lock_manager as resource_lock_manager
 
 logger = logging.getLogger(__name__)
@@ -747,6 +750,102 @@ async def check_signal_audit_log(agent) -> Dict[str, Any]:
     }
 
 
+def _positive_int(value: Any) -> Optional[int]:
+    """*value* when it is a positive ``int`` (not a ``bool``), else ``None``."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+async def check_conversation_embeddings(agent) -> Dict[str, Any]:
+    """Report conversation embeddings dropped on write, and a width mismatch (#2913).
+
+    A turn whose embedding cannot be stored is still persisted, without its
+    vector, so semantic recall over conversation history degrades with every
+    such turn. Its only trace used to be INFO lines. The store counts the
+    drops and records a profile/column width disagreement found at startup;
+    this surfaces both, the way ``check_signal_audit_log`` surfaces dropped
+    audit rows.
+
+    ``warn`` rather than ``fail``, like that check: the agent keeps serving
+    and its turns keep persisting. The count does not clear when later writes
+    succeed, because the vectors dropped earlier are still missing.
+    """
+    start = time.monotonic()
+
+    store = resolve_conversation_store(agent)
+    if store is None:
+        return {
+            "name": "conversation_embeddings",
+            "status": "pass",
+            "message": "No conversation store on this agent",
+            "duration_ms": _elapsed(start),
+        }
+
+    # Duck-typed and type-checked for the same reason as the signal_log
+    # check: a stand-in store must not report a loss that did not happen.
+    dropped = _positive_int(getattr(store, "dropped_embedding_count", None)) or 0
+    mismatch = getattr(store, "embedding_column_mismatch", None)
+    profile_dim = _positive_int(getattr(mismatch, "profile_dim", None))
+    column_dim = _positive_int(getattr(mismatch, "column_dim", None))
+    misconfigured = (
+        profile_dim is not None
+        and column_dim is not None
+        and profile_dim != column_dim
+    )
+
+    if dropped == 0 and not misconfigured:
+        return {
+            "name": "conversation_embeddings",
+            "status": "pass",
+            "message": "No conversation embeddings dropped",
+            "duration_ms": _elapsed(start),
+        }
+
+    details: Dict[str, Any] = {"dropped": dropped, "misconfigured": misconfigured}
+    messages = []
+    if misconfigured:
+        details["misconfiguration"] = {
+            "profile_id": str(getattr(mismatch, "profile_id", "")),
+            "profile_dim": profile_dim,
+            "column_dim": column_dim,
+        }
+        messages.append(
+            "misconfiguration: the embedding profile produces "
+            f"{profile_dim}-dimension vectors, the conversation_history "
+            f"vector column is {column_dim}-dimension"
+        )
+    if dropped:
+        last = getattr(store, "last_dropped_embedding", None)
+        if last is not None:
+            profile_id = getattr(last, "profile_id", None)
+            details["last_profile_id"] = (
+                profile_id if isinstance(profile_id, str) else None
+            )
+            details["last_embedding_dim"] = _positive_int(
+                getattr(last, "embedding_dim", None)
+            )
+            details["last_column_dim"] = _positive_int(
+                getattr(last, "column_dim", None)
+            )
+            details["last_error"] = str(getattr(last, "error", ""))
+            dropped_at = getattr(last, "dropped_at", None)
+            if isinstance(dropped_at, datetime):
+                details["last_dropped_at"] = dropped_at.isoformat()
+        messages.append(
+            f"{dropped} conversation embedding(s) dropped since start; "
+            "semantic recall cannot find those turns"
+        )
+
+    return {
+        "name": "conversation_embeddings",
+        "status": "warn",
+        "message": "; ".join(messages),
+        "duration_ms": _elapsed(start),
+        "details": details,
+    }
+
+
 def _classify_resource_lock_snapshot(
     raw_holds: Any, start: float
 ) -> Dict[str, Any]:
@@ -1084,6 +1183,7 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
             check_bootstrap_state(agent),
         ),
         await check_signal_audit_log(agent),
+        await check_conversation_embeddings(agent),
         await check_birth_record(agent),
         await check_model_discovery(agent),
     ]
