@@ -327,6 +327,35 @@ export function buildHostUrl(endpoint) {
     return endpoint;
 }
 
+// POST /api/sovereignty/export accepts the endpoint's ALLOWED_TIERS: `local`,
+// `ipfs`, `filecoin`. The console used to send the StorageTier enum names
+// (`LOCAL_ONLY`, `IPFS`, `FILECOIN`), which the endpoint rejects with HTTP 400,
+// and stored export receipts carry either spelling. Every accepted spelling is
+// mapped explicitly: a bare toLowerCase() is not enough, because `local_only`
+// is not `local` (#2876).
+const SOVEREIGNTY_EXPORT_TIERS = new Map([
+    ['local', 'local'],
+    ['local_only', 'local'],
+    ['LOCAL_ONLY', 'local'],
+    ['ipfs', 'ipfs'],
+    ['IPFS', 'ipfs'],
+    ['filecoin', 'filecoin'],
+    ['FILECOIN', 'filecoin'],
+]);
+
+// Map a storage tier to the spelling POST /api/sovereignty/export accepts.
+// Anything outside the map throws, naming the tier, rather than reaching the
+// endpoint as an HTTP 400. Exported for unit tests.
+export function normalizeSovereigntyExportTier(tier) {
+    const normalized = SOVEREIGNTY_EXPORT_TIERS.get(tier);
+    if (normalized === undefined) {
+        const shown = typeof tier === 'string' ? JSON.stringify(tier) : `of type ${typeof tier}`;
+        const accepted = [...new Set(SOVEREIGNTY_EXPORT_TIERS.values())].join(', ');
+        throw new Error(`Unknown sovereignty export tier ${shown}; expected one of: ${accepted}`);
+    }
+    return normalized;
+}
+
 export function requestApiKeyFromOperator({ documentRef = globalThis.document } = {}) {
     const root = documentRef?.body || documentRef?.documentElement;
     if (!root || typeof documentRef?.createElement !== 'function') {
@@ -1199,7 +1228,11 @@ export function createApiClient({
         getIdentityChain: () => client.request('/api/identity-chain'),
         getStorageStats: () => client.request('/api/storage/stats'),
         getSovereigntyExports: () => client.request('/api/sovereignty/exports'),
-        exportSovereignty: (tier, encrypt) => client.request('/api/sovereignty/export', { method: 'POST', body: JSON.stringify({ tier, encrypt }) }),
+        // An unknown tier rejects before any request is made (#2876).
+        exportSovereignty: async (tier, encrypt) => client.request('/api/sovereignty/export', {
+            method: 'POST',
+            body: JSON.stringify({ tier: normalizeSovereigntyExportTier(tier), encrypt }),
+        }),
         importSovereignty: (cid) => client.request('/api/sovereignty/import', { method: 'POST', body: JSON.stringify({ cid }) }),
         getSovereigntyFiles: () => client.request('/api/sovereignty/files'),
         getSovereigntyFilePreview: (filename) => client.request(`/api/sovereignty/files/${encodeURIComponent(filename)}/preview`),
