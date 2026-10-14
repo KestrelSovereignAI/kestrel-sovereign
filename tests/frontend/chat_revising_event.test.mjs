@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 // Wave 5C of #1048: when the server fires a `revising` SSE event for
 // the dispatch's request_id, the chat UI must drop the pre-tool prose
@@ -915,4 +916,79 @@ test('multiple concurrent panes: revise on pane A leaves pane B untouched', asyn
     // pane B must not have inherited the revise flag from pane A.
     assert.equal(paneB.pendingRevise, false,
         'a revise on agent A must not flip agent B\'s pendingRevise');
+});
+
+// =====================================================================
+// #2970 — the pre/post tool join with no pending revise boundary. The
+// server decides the separator and streams it in-band; the client must
+// render exactly the text the server persists and replays. Both sides
+// assert against one fixture
+// (tests/unit/test_streaming_revise_boundary_weld.py drives the server).
+// =====================================================================
+
+const TOOL_JOIN_CASES = JSON.parse(readFileSync(
+    new URL('../fixtures/stream_tool_join_cases.json', import.meta.url), 'utf8',
+)).cases;
+
+// Feed `packets` through the real streaming loop; return the accumulated
+// text the finalized bubble received and the live tool-card events.
+async function streamWireThroughClient(agentName, packets) {
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane(agentName);
+    apiModule.default.setHostAgent(agentName);
+    mountChatPane(agentName);
+    pane.sessionId = `sess-${agentName}`;
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+    try {
+        messageInput.value = 'go';
+        const sendPromise = sendMessage();
+        await Promise.resolve(); await Promise.resolve();
+        // The loop handles a packet in microtasks, so a macrotask turn
+        // between pushes delivers each as its own packet.
+        for (const packet of packets) {
+            ctrl.push(packet);
+            await new Promise((r) => setImmediate(r));
+        }
+        await new Promise((r) => setTimeout(r, 10));
+        const toolEvents = pane.toolEvents.slice();
+        // Cards only change how the text is segmented for display. Keep them
+        // out of the final paint so the finalized bubble is handed the raw
+        // accumulated text itself.
+        pane.toolEventsBaseline = pane.toolEvents.length;
+        ctrl.end();
+        await sendPromise;
+        return { text: finalizeCalls[finalizeCalls.length - 1], toolEvents };
+    } finally {
+        apiModule.default.streamInvoke = origStream;
+    }
+}
+
+TOOL_JOIN_CASES.forEach((tc, i) => {
+    const pre = tc.text.slice(0, tc.text.length - tc.content.length - tc.seam.length);
+    const deliveries = {
+        'one packet per server yield': tc.wire,
+        'every yield coalesced into one packet': [tc.wire.join('')],
+        // Packet edges inside sentinels and around the separator.
+        'one packet per character': [...tc.wire.join('')],
+    };
+    Object.entries(deliveries).forEach(([mode, packets], m) => {
+        test(`tool join (#2970), ${mode}: ${tc.name}`, async () => {
+            const { text, toolEvents } = await streamWireThroughClient(
+                `tool-join-${i}-${m}`, packets,
+            );
+            assert.equal(text, tc.text,
+                `client must render the server's replayed text; got: ${JSON.stringify(text)}`);
+            // Cards stream before any post-tool text, so they sit at the end
+            // of the pre-tool half, before the seam.
+            assert.ok(toolEvents.length > 0);
+            for (const ev of toolEvents) {
+                assert.equal(ev.pos, pre.length,
+                    `card ${ev.name}/${ev.phase} must sit at the join, before the seam`);
+            }
+        });
+    });
 });

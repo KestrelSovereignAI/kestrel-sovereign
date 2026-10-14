@@ -1918,6 +1918,68 @@ class TestStrictRevisingEventSuppression:
         assert "\x1eKESTREL:REVISE:" in joined
 
 
+def _markerless_tool_turn_stream():
+    """A one-tool LLM stream with NO ToolCallStarted marker, so no revise
+    boundary is pending when the post-tool synthesis joins the pre-tool prose
+    (#2970)."""
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    async def mock_stream(**kwargs):
+        yield "Pre-tool question the strict client never sees?"
+        yield LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc-join", name="todo_add", arguments={})],
+        )
+
+    return mock_stream
+
+
+class TestToolJoinSeparatorUnderAudit:
+    """#2970: the pre/post tool join separator streams in-band only when the
+    turn streams live. A strict client never received the pre-tool prose, so it
+    has no join to separate: it gets the reviewed synthesis alone."""
+
+    @pytest.mark.asyncio
+    async def test_strict_allow_releases_no_join_separator(self):
+        add_convo_calls = []
+        agent, _hook = _make_streaming_audit_agent(
+            add_convo_calls, mode="strict",
+            audit_response={"risk_level": 1, "reasoning": "clean"},
+        )
+        agent.llm_service.stream_with_tool_detection = _markerless_tool_turn_stream()
+        agent._handle_orchestrator_response_streaming = _clean_post_tool_orchestrator
+
+        yielded = []
+        async for chunk in agent.process_input_streaming("go", session_id="s-join-strict"):
+            yielded.append(chunk)
+
+        assert yielded == ["Post-tool synthesis that is long enough to audit cleanly."]
+        persisted = [c for c in add_convo_calls if c["role"] == "assistant"]
+        assert persisted[0]["content"] == yielded[0]
+
+    @pytest.mark.asyncio
+    async def test_warn_streams_join_separator_before_the_synthesis(self):
+        add_convo_calls = []
+        agent, _hook = _make_streaming_audit_agent(
+            add_convo_calls, mode="warn",
+            audit_response={"risk_level": 1, "reasoning": "clean"},
+        )
+        agent.llm_service.stream_with_tool_detection = _markerless_tool_turn_stream()
+        agent._handle_orchestrator_response_streaming = _clean_post_tool_orchestrator
+
+        yielded = []
+        async for chunk in agent.process_input_streaming("go", session_id="s-join-warn"):
+            yielded.append(chunk)
+
+        assert yielded == [
+            "Pre-tool question the strict client never sees?",
+            "\n",
+            "Post-tool synthesis that is long enough to audit cleanly.",
+        ]
+        persisted = [c for c in add_convo_calls if c["role"] == "assistant"]
+        assert persisted[0]["metadata"]["pre_tool_reasoning"]["seam"] == "\n"
+
+
 class _RecordingStopHook(Hook):
     """A STOP-event subscriber that records the HookInput it receives — the
     stand-in for an arbitrary ``on_stop`` plugin that could persist or emit it
@@ -2906,7 +2968,6 @@ class TestFinding1ObserverReceivesReviewedOnly:
     """The observer never sees raw pre_tool_prose / tool_calls / tool_results."""
 
     async def _run(self, gate_output):
-        from kestrel_sdk.hooks.base import HookEvent
         add_convo = []
         agent, _none = _make_streaming_audit_agent(
             add_convo, mode="strict", register_hook=False,

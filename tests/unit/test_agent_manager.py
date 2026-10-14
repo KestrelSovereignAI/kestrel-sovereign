@@ -6641,6 +6641,10 @@ async def test_final_receipt_primitive_enforces_child_deadline_itself(tmp_path):
     write_cancelled = asyncio.Event()
 
     async def stalled_write(*_args, **_kwargs):
+        # The signed lifetime ends while the receipt write is stalled here. A
+        # wall-clock budget could instead run out during the signing and the
+        # fsynced registry commit before it, so the write never started.
+        clock.advance(_PINNED_SIGNED_LIFETIME)
         try:
             await asyncio.Event().wait()
         finally:
@@ -6648,15 +6652,12 @@ async def test_final_receipt_primitive_enforces_child_deadline_itself(tmp_path):
 
     child = _make_mock_agent(child_did)
     child._persisted_spawn_mandate = provisional
-    child._host_authority_deadline_monotonic = (
-        asyncio.get_running_loop().time() + 0.03
-    )
     admission = AgentOperationAdmission(
         name="DirectFinalReceiptChild",
         canonical_name="directfinalreceiptchild",
         kind="spawn",
         registration_epoch=0,
-        owner_task=asyncio.current_task(),
+        owner_task=None,
         spawn_receipt_graph=SimpleNamespace(
             add_trusted_cross_agent_edge=AsyncMock(side_effect=stalled_write)
         ),
@@ -6665,18 +6666,27 @@ async def test_final_receipt_primitive_enforces_child_deadline_itself(tmp_path):
         spawn_authority_witness_mandate=provisional,
     )
 
-    with pytest.raises(PersistedSpawnMandateExpiredError):
-        await asyncio.wait_for(
+    with pinned_loop_clock() as clock:
+        child._host_authority_deadline_monotonic = (
+            asyncio.get_running_loop().time() + _PINNED_SIGNED_LIFETIME
+        )
+        commit = asyncio.create_task(
             manager._commit_spawn_receipt_authority(
                 admission,
                 child,
                 final,
                 parent_private_key=parent_private_key,
                 parent_identity=None,
-            ),
-            timeout=0.2,
+            )
         )
+        admission.owner_task = commit
+        await _settle_on_pinned_clock(commit)
 
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match="expired during final signed receipt persistence",
+    ):
+        commit.result()
     assert write_cancelled.is_set()
 
 
