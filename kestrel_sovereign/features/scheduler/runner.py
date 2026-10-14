@@ -37,6 +37,13 @@ from kestrel_sovereign.storage.database_clock import (
     database_now_sql as scheduler_database_now_sql,
 )
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
+from kestrel_sovereign.features.scheduler.failure_streak import (
+    DEFAULT_FAILURE_ALERT_THRESHOLD,
+    FAILURE_STREAK_COLUMNS,
+    FailureStreak,
+    FailureStreakTransition,
+    next_failure_streak,
+)
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.status import (
     DEFAULT_LEASE_SECONDS,
@@ -1064,6 +1071,7 @@ class SchedulerRunner:
             ]
         ] = None,
         authorized_agent_ids_page_size: int = 500,
+        failure_alert_threshold: int = DEFAULT_FAILURE_ALERT_THRESHOLD,
     ):
         try:
             normalized_lease_seconds = int(lease_seconds)
@@ -1136,6 +1144,9 @@ class SchedulerRunner:
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
         self._max_concurrent_tasks = max(1, int(max_concurrent_tasks))
+        # Consecutive failures of one schedule before its marker is recorded
+        # (#3280). Visibility only; it changes no execution decision.
+        self._failure_alert_threshold = max(1, int(failure_alert_threshold))
         # Bounds the occurrences between claim and finalization across every
         # tick (#1675). It is runner-wide because occurrences outlive the
         # tick that admitted them.
@@ -3873,9 +3884,17 @@ class SchedulerRunner:
             # placeholder contract is valid for both backends.
             record_terminal_at = bool(terminal or terminal_status is not None)
             if uses_database_clock:
+                # Read under the claim lock taken above, so the streak this
+                # outcome extends or ends is the one this commit replaces.
+                failure_streak = await self._failure_streak_transition(
+                    task, execution, status=status, at=schedule_now
+                )
                 now_sql = self._database_now_sql()
                 last_run_sql = (
                     f"last_run_at = {now_sql}" if ran else "last_run_at = last_run_at"
+                )
+                streak_sql = ", ".join(
+                    f"{column} = ?" for column in FAILURE_STREAK_COLUMNS
                 )
                 updated = await self._db.execute(
                     f"""
@@ -3885,7 +3904,7 @@ class SchedulerRunner:
                         terminal_at = CASE WHEN ? THEN {now_sql} ELSE NULL END,
                         lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
                         claim_execution_id = NULL, claim_scheduled_for = NULL,
-                        scheduler_claim_fenced = 0
+                        scheduler_claim_fenced = 0, {streak_sql}
                     WHERE id = ? AND agent_id = ?
                       AND scheduler_protocol_version = ?
                       AND scheduler_rollout_fenced = 0
@@ -3899,6 +3918,7 @@ class SchedulerRunner:
                         next_attempt_count,
                         terminal_status,
                         record_terminal_at,
+                        *failure_streak.streak.as_params(),
                         task.id,
                         task.agent_id,
                         SCHEDULER_PROTOCOL_VERSION,
@@ -3927,6 +3947,9 @@ class SchedulerRunner:
                 # Preserve the adapter path for intentionally minimal unit DB
                 # doubles. Real SQLite and PostgreSQL always use the branch
                 # above and therefore never publish host-clock lease state.
+                # Nor do these doubles keep a failure streak: they model no
+                # schedule row to read one from.
+                failure_streak = None
                 now_iso = datetime.now(timezone.utc).isoformat()
                 terminal_at = now_iso if record_terminal_at else None
                 last_run_sql = "last_run_at = ?" if ran else "last_run_at = last_run_at"
@@ -3979,6 +4002,62 @@ class SchedulerRunner:
             "Scheduled task %s (%s) finalized %s (%dms, attempt=%d)",
             task.id, task.task_name, status, duration_ms, execution.attempt,
         )
+        if failure_streak is not None:
+            self._log_failure_streak_transition(task, failure_streak)
+
+    async def _failure_streak_transition(
+        self,
+        task: ScheduledTask,
+        execution: SchedulerExecution,
+        *,
+        status: str,
+        at: datetime,
+    ) -> FailureStreakTransition:
+        """Return what finalizing ``execution`` with ``status`` does to its streak."""
+
+        row = await self._db.fetchone(
+            f"""
+            SELECT {", ".join(FAILURE_STREAK_COLUMNS)}
+            FROM scheduled_tasks WHERE id = ? AND agent_id = ?
+            """,
+            (task.id, task.agent_id),
+        )
+        return next_failure_streak(
+            FailureStreak.from_row(row),
+            status=status,
+            # Fixed width, so stored failure times order as text.
+            at=at.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+            execution_id=execution.id,
+            threshold=self._failure_alert_threshold,
+        )
+
+    def _log_failure_streak_transition(
+        self, task: ScheduledTask, transition: FailureStreakTransition
+    ) -> None:
+        """Log a marker once when it is raised and once when it clears.
+
+        Only after the commit that recorded it: a rolled-back finalization
+        changed nothing. The log names the execution holding the error rather
+        than repeating its stored result, which privacy modes withhold.
+        """
+
+        streak = transition.streak
+        if transition.flagged:
+            logger.warning(
+                "Scheduled task %s (%s) for %s has failed %d consecutive times "
+                "since %s; last failure is execution %s. Its schedule_list "
+                "entry and the scheduled_task_failures health check now "
+                "report it until it succeeds.",
+                task.id, task.task_name, task.agent_id, streak.count,
+                streak.first_at, streak.last_execution_id,
+            )
+        elif transition.recovered:
+            logger.warning(
+                "Scheduled task %s (%s) for %s succeeded after %d consecutive "
+                "failures since %s; its failure marker is cleared.",
+                task.id, task.task_name, task.agent_id,
+                transition.prior.count, transition.prior.first_at,
+            )
 
     async def _mark_cancelled_if_no_longer_runnable(self, execution: SchedulerExecution) -> None:
         if not await self._agent_is_currently_authorized(execution.agent_id):
@@ -4568,6 +4647,9 @@ class SchedulerRunner:
             "scheduler_registration_nonce": "TEXT",
             "scheduler_claim_fenced": "INTEGER NOT NULL DEFAULT 0",
             "scheduler_rollout_fenced_at": "TEXT",
+            # Added only here, never in CREATE TABLE above: the streak's
+            # columns have one definition, shared with its readers (#3280).
+            **FAILURE_STREAK_COLUMNS,
         }
         log_columns = {
             "outcome_signal": "REAL",
