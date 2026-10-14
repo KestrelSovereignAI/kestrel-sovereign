@@ -189,6 +189,41 @@ successful arm replaces that anchor with its database-time arm timestamp. A
 ready hook that never arms therefore fails health after the finite grace, and a
 prior `stopped`, stale, or same-owner row cannot mask missing current telemetry.
 
+## Repeated task failures
+
+A live worker says nothing about whether the tasks it runs succeed. Before
+#3280, a task that failed on every run was visible only as rows in
+`task_execution_log`: one agent's daily `signal_dispatch` failed 23 days in a
+row while every health surface read healthy.
+
+Each schedule row now carries a failure streak (`failure_streak_*` columns),
+written by the same finalize transaction that records the execution:
+
+- a `failed` execution extends the streak, recording the first and latest
+  failure times and the latest failed execution's ID;
+- a `success` ends it;
+- every other outcome (`skipped_misfire`, `missed`, `blocked`) leaves it
+  unchanged, and a paused schedule runs nothing and so changes nothing.
+
+When the streak reaches `[scheduler] failure_alert_threshold` consecutive
+failures (default 3), the runner records a marker on the row and logs one
+WARNING naming the task, the count, the first failure time, and the execution
+holding the error. Later failures raise the count without logging again. The
+next success clears the marker and logs one more WARNING for the recovery. The
+log never repeats the stored result text, which volatile privacy modes withhold.
+
+Two readers report the marker:
+
+- `schedule_list` gives every task `consecutive_failures` and a
+  `failure_marker` (count, first and last failure time, when it was recorded,
+  and a bounded summary of the last error read from that execution's log row),
+  plus a `failing_count` and a confirmation line naming it;
+- the `scheduled_task_failures` health check warns, listing each marked task.
+  It is not a critical check, so a failing task degrades overall health rather
+  than making the agent unhealthy.
+
+The marker is visibility only. It adds no retry, pause, or remediation.
+
 ## Protocol-v2 rollout fence
 
 The old scheduler only selected `agent_id`, `enabled`, and `next_run_at`. It

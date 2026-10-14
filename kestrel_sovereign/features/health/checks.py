@@ -490,18 +490,22 @@ async def check_context_budget(agent) -> Dict[str, Any]:
         }
 
 
+def _enabled_scheduler_feature(agent) -> Optional[Any]:
+    """Return the agent's SchedulerFeature when it is loaded and enabled."""
+
+    features = getattr(agent, "features", None)
+    if isinstance(features, dict):
+        for name, feature in features.items():
+            if name == "SchedulerFeature" or type(feature).__name__ == "SchedulerFeature":
+                return feature if getattr(feature, "enabled", True) else None
+    return None
+
+
 async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
     """Verify that an enabled SchedulerFeature has a current worker report."""
 
     start = time.monotonic()
-    features = getattr(agent, "features", None)
-    scheduler = None
-    if isinstance(features, dict):
-        for name, feature in features.items():
-            if name == "SchedulerFeature" or type(feature).__name__ == "SchedulerFeature":
-                if getattr(feature, "enabled", True):
-                    scheduler = feature
-                break
+    scheduler = _enabled_scheduler_feature(agent)
     if scheduler is None:
         return {
             "name": "scheduler_liveness",
@@ -628,6 +632,85 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
         "status": status["status"],
         "message": message,
         "details": status,
+        "duration_ms": _elapsed(start),
+    }
+
+
+async def check_scheduled_task_failures(agent, db) -> Dict[str, Any]:
+    """Flag every schedule the runner has marked as failing repeatedly (#3280).
+
+    The runner records the marker once a schedule fails
+    ``[scheduler] failure_alert_threshold`` consecutive times and clears it on
+    the next success; this check only reports it. Before it existed, 23
+    consecutive failures of one task showed up nowhere but the execution log.
+    """
+
+    start = time.monotonic()
+    if _enabled_scheduler_feature(agent) is None:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "pass",
+            "message": "SchedulerFeature is not enabled for this agent",
+            "details": {"state": "not_configured"},
+            "duration_ms": _elapsed(start),
+        }
+    if db is None:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "fail",
+            "message": "SchedulerFeature has no database to read task failures from",
+            "details": {"state": "storage_unavailable"},
+            "duration_ms": _elapsed(start),
+        }
+
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        agent_did = resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "fail",
+            "message": "Scheduled task failure inspection requires the agent's durable identity",
+            "details": {"state": "identity_unavailable"},
+            "duration_ms": _elapsed(start),
+        }
+    try:
+        from kestrel_sovereign.features.scheduler.failure_streak import (
+            load_failure_markers,
+        )
+
+        markers = await load_failure_markers(db, agent_did, agent=agent)
+    except Exception as error:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "fail",
+            "message": f"Scheduled task failure inspection failed: {error}",
+            "details": {"state": "inspection_failed"},
+            "duration_ms": _elapsed(start),
+        }
+
+    if not markers:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "pass",
+            "message": "No scheduled task is failing repeatedly",
+            "details": {"state": "none_failing", "failing": []},
+            "duration_ms": _elapsed(start),
+        }
+    summary = "; ".join(
+        f"{marker['task_name']} ({marker['consecutive_failures']} consecutive "
+        f"failures since {marker['first_failure_at']})"
+        for marker in markers
+    )
+    return {
+        "name": "scheduled_task_failures",
+        "status": "warn",
+        "message": f"{len(markers)} scheduled task(s) failing repeatedly: {summary}",
+        "details": {"state": "failing", "failing": markers},
         "duration_ms": _elapsed(start),
     }
 
@@ -1179,6 +1262,10 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
         await _run_database_bound_check(
             "scheduler_liveness",
             check_scheduler_liveness(agent, db),
+        ),
+        await _run_database_bound_check(
+            "scheduled_task_failures",
+            check_scheduled_task_failures(agent, db),
         ),
         await _run_database_bound_check(
             "bootstrap_state",

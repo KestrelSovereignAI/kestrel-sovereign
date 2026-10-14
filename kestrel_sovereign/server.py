@@ -2735,6 +2735,9 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
             misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
             max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
             lease_seconds=SchedulerFeature._load_lease_seconds(),
+            failure_alert_threshold=(
+                SchedulerFeature._load_failure_alert_threshold()
+            ),
         )
         # ``runner.start`` runs schema migration / rollout fencing and can fail.
         # Publish it first so cleanup also reaches a partially-started runner.
