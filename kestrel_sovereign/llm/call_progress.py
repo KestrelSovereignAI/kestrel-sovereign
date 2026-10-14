@@ -16,6 +16,10 @@ report unconditionally.
 
 An adapter that receives its answer in one piece reports nothing, and a bound
 around it covers the whole call.
+
+The service also says which route and model each attempt of the call waits on
+(:func:`report_call_attempt`, #2658), so a bound that gives up on a silent
+call can name the provider that went silent.
 """
 
 from __future__ import annotations
@@ -27,6 +31,9 @@ from typing import Callable, Iterator, Optional
 _LISTENER: ContextVar[Optional[Callable[[], None]]] = ContextVar(
     "kestrel_llm_call_progress_listener", default=None,
 )
+_ATTEMPT_LISTENER: ContextVar[Optional[Callable[[str, str], None]]] = ContextVar(
+    "kestrel_llm_call_attempt_listener", default=None,
+)
 
 
 def report_call_progress() -> None:
@@ -36,14 +43,27 @@ def report_call_progress() -> None:
         listener()
 
 
+def report_call_attempt(provider: str, model: str) -> None:
+    """Tell whoever bounds the current call which route and model it now awaits."""
+    listener = _ATTEMPT_LISTENER.get()
+    if listener is not None:
+        listener(provider, model)
+
+
 @contextmanager
-def call_progress_listener(listener: Callable[[], None]) -> Iterator[None]:
-    """Route the progress of calls awaited inside this block to ``listener``."""
+def call_progress_listener(
+    listener: Callable[[], None],
+    attempt_listener: Optional[Callable[[str, str], None]] = None,
+) -> Iterator[None]:
+    """Route the progress of calls awaited inside this block to ``listener``,
+    and the route and model of each attempt to ``attempt_listener``."""
     token = _LISTENER.set(listener)
+    attempt_token = _ATTEMPT_LISTENER.set(attempt_listener)
     try:
         yield
     finally:
+        _ATTEMPT_LISTENER.reset(attempt_token)
         _LISTENER.reset(token)
 
 
-__all__ = ["call_progress_listener", "report_call_progress"]
+__all__ = ["call_progress_listener", "report_call_attempt", "report_call_progress"]

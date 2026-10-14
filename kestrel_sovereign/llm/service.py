@@ -36,6 +36,7 @@ from .provider_registry import (
     ProviderInitializationError,
     provider_cache_body,
 )
+from .call_progress import report_call_attempt
 from .cancellation import CancelToken
 from .error_handling import (
     handle_llm_errors,
@@ -4035,6 +4036,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 return LLMServiceError(error_message_override)
             return error
 
+        report_call_attempt(provider_name, model)
         started = time.monotonic()
         try:
             response = await attempt

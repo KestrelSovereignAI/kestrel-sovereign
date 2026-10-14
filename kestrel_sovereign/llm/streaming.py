@@ -81,6 +81,7 @@ from .adapter import (
     messages_for,
     response_usage_available,
 )
+from .call_progress import report_call_attempt
 from .cancellation import CancelToken
 from .codex_app_server import CodexAppServerTransportError
 from .error_handling import LLMError
@@ -1102,6 +1103,7 @@ class StreamingMixin:
         ):
             usage_kwargs["usage_sink"] = usage_sink
 
+        report_call_attempt(provider_name, model)
         started = time.monotonic()
         final_response: Optional[LLMResponse] = None
         completed = False
@@ -1312,6 +1314,7 @@ class StreamingMixin:
                 require_completion=require_completion,
             )
 
+        report_call_attempt(provider_name, model)
         started = time.monotonic()
         response = await attempt
         rejected: Optional[IncompleteGenerationError] = None

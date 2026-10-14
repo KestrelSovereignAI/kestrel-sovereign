@@ -1173,11 +1173,21 @@ SUMMARY:"""
 
         # LLMService.generate is keyword-only and requires user_prompt (not
         # prompt) — the old call TypeError'd at runtime (#1844 root-cause sweep).
-        response = await llm_service.generate(
-            system_prompt="You are a conversation summarizer. Create concise summaries.",
-            user_prompt=prompt,
-            model_override=None,
-            session_id=session_id,
+        #
+        # Bounded like compaction's own summary (#2658): the
+        # ``hierarchical_compact`` tool runs inside a turn and holds its
+        # CONVERSATION lock. A call abandoned on the bound fails the
+        # compaction before anything is written or excluded.
+        from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
+
+        response = await LLMCallWatchdog.bound_completion(
+            llm_service,
+            llm_service.generate(
+                system_prompt="You are a conversation summarizer. Create concise summaries.",
+                user_prompt=prompt,
+                model_override=None,
+                session_id=session_id,
+            ),
         )
 
         if isinstance(response, str):

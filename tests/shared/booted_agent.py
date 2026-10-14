@@ -22,9 +22,13 @@ async def booted_agent(
     name: str,
     provenance: str,
     features: AbstractSet[str],
+    genesis: bool = True,
 ):
     """A booted agent past genesis and discovery, loading only ``features``
-    (Feature class names) beyond the mandatory set."""
+    (Feature class names) beyond the mandatory set.
+
+    ``genesis=False`` leaves the genesis audit pending, so the agent's first
+    turn runs it through its own auditor."""
     from kestrel_sovereign.bootstrap import BootstrapState
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
     from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -48,7 +52,8 @@ async def booted_agent(
         assert loaded == MANDATORY_FEATURES | features, (
             f"the agent loaded {sorted(loaded)}, not only the features asked for"
         )
-        await complete_deterministic_genesis_audit(agent, provenance=provenance)
+        if genesis:
+            await complete_deterministic_genesis_audit(agent, provenance=provenance)
         await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
         yield agent
     finally:

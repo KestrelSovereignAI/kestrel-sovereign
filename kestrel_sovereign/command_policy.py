@@ -11,6 +11,11 @@ class RecoveryCommandRule:
 
     requires_sovereign: bool = False
     allowed_in_safe_mode: bool = False
+    # A pure read of agent state, answered without queueing behind an
+    # in-flight turn (#2658): an operator needs it most while a turn is stuck.
+    # Its handler must not touch turn, conversation or governance state, and
+    # the turn entry points skip every pre-turn step that does for it.
+    bypasses_turn_queue: bool = False
 
 
 # Keeping routing and authority in one immutable mapping prevents a one-shot
@@ -18,8 +23,14 @@ class RecoveryCommandRule:
 RECOVERY_COMMAND_POLICY: Final[Mapping[str, RecoveryCommandRule]] = MappingProxyType(
     {
         "!verify-constitution": RecoveryCommandRule(allowed_in_safe_mode=True),
-        "!status": RecoveryCommandRule(allowed_in_safe_mode=True),
-        "!help": RecoveryCommandRule(allowed_in_safe_mode=True),
+        "!status": RecoveryCommandRule(
+            allowed_in_safe_mode=True,
+            bypasses_turn_queue=True,
+        ),
+        "!help": RecoveryCommandRule(
+            allowed_in_safe_mode=True,
+            bypasses_turn_queue=True,
+        ),
         "!safe-mode": RecoveryCommandRule(
             requires_sovereign=True,
             allowed_in_safe_mode=True,
@@ -84,6 +95,11 @@ BOOTSTRAP_ALLOWED_COMMANDS: Final[frozenset[str]] = (
 )
 
 GENESIS_AUDIT_BYPASS_COMMANDS: Final[frozenset[str]] = RECOVERY_COMMANDS
+TURN_QUEUE_BYPASS_COMMANDS: Final[frozenset[str]] = frozenset(
+    command
+    for command, rule in RECOVERY_COMMAND_POLICY.items()
+    if rule.bypasses_turn_queue
+)
 
 
 def prefixed_command_token(user_input: str) -> str | None:
@@ -91,6 +107,13 @@ def prefixed_command_token(user_input: str) -> str | None:
     if not user_input.startswith("!"):
         return None
     return user_input.split(maxsplit=1)[0].lower()
+
+
+def bypasses_turn_queue(user_input: str) -> bool:
+    """Return whether ``user_input`` is a pure read answered beside any
+    in-flight turn rather than queued behind it (#2658)."""
+
+    return prefixed_command_token(user_input) in TURN_QUEUE_BYPASS_COMMANDS
 
 
 def requires_sovereign_authority(command: str) -> bool:

@@ -133,10 +133,22 @@ _T = TypeVar("_T")
 
 
 class LLMCallInactivityTimeout(IncompleteGenerationError):
-    """An orchestrator LLM call went its whole inactivity bound without progress."""
+    """An orchestrator LLM call went its whole inactivity bound without progress.
 
-    def __init__(self, timeout: float) -> None:
+    ``provider`` and ``model`` name the attempt the call was waiting on when
+    it was abandoned, or are ``None`` if no provider attempt had started.
+    """
+
+    def __init__(
+        self,
+        timeout: float,
+        *,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
         self.timeout = timeout
+        self.provider = provider
+        self.model = model
         self.summary = f"timeout after {int(timeout)}s"
         super().__init__(
             f"LLM call produced nothing for {timeout:g}s and was abandoned"
@@ -164,6 +176,9 @@ class LLMCallWatchdog:
 
     Reported progress travels on :mod:`kestrel_sovereign.llm.call_progress`,
     never in the stream, so it re-arms the bound without reaching a consumer.
+    The same channel names the route and model each attempt waits on, so a
+    call abandoned on its bound is logged at WARNING with the provider that
+    went silent (#2658). Starting an attempt is not progress.
 
     Only time spent waiting on the provider counts. Time the consumer spends
     on an item does not, and neither does an inline tool the provider is
@@ -175,6 +190,8 @@ class LLMCallWatchdog:
         self.timeout = timeout
         self._pending: Optional[asyncio.Timeout] = None
         self._tools_running = 0
+        self._provider: Optional[str] = None
+        self._model: Optional[str] = None
 
     @classmethod
     def for_call(
@@ -218,6 +235,28 @@ class LLMCallWatchdog:
             pass
         return cls(timeout)
 
+    @classmethod
+    async def bound_completion(
+        cls,
+        llm_service: Any,
+        pending: Awaitable[_T],
+        *,
+        model_override: Optional[str] = None,
+    ) -> _T:
+        """Await a non-streaming call a turn makes outside its model loop.
+
+        The genesis audit, the bootstrap SOUL.md generation, the compaction
+        and ``!context`` summaries and ``!context query`` hold a turn (or
+        every first turn) just as cognition does, so they carry the same
+        bound as its calls (#2658). The bound is resolved for the routes the
+        call itself selects: pass the ``model_override`` it was given.
+        """
+        watchdog = cls.for_call(
+            llm_service, model_override=model_override, force_local_only=False,
+            streaming=False,
+        )
+        return await watchdog.call(pending)
+
     async def watch(self, stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
         """Yield ``stream``'s items, bounding the wait for each one."""
         iterator = stream.__aiter__()
@@ -243,18 +282,32 @@ class LLMCallWatchdog:
             async with deadline:
                 self._pending = deadline
                 try:
-                    with call_progress_listener(self._rearm):
+                    with call_progress_listener(self._rearm, self._attempting):
                         return await pending
                 finally:
                     self._pending = None
         except TimeoutError as exc:
             if not deadline.expired():
                 raise
+            if self._provider is None:
+                waiting_on = "no provider attempt had started"
+            else:
+                waiting_on = f"provider {self._provider}, model {self._model}"
             logging.warning(
-                "[ORCHESTRATOR] LLM call produced nothing for %ss; abandoning "
-                "it as a failed attempt", self.timeout,
+                "[ORCHESTRATOR] LLM call produced nothing for %ss (%s); "
+                "abandoning it as a failed attempt", self.timeout, waiting_on,
             )
-            raise LLMCallInactivityTimeout(self.timeout) from exc
+            raise LLMCallInactivityTimeout(
+                self.timeout, provider=self._provider, model=self._model,
+            ) from exc
+
+    def _attempting(self, provider: str, model: str) -> None:
+        # While an inline tool runs the call is not waiting on its provider,
+        # so an attempt reported then is the tool's own nested call.
+        if self._tools_running:
+            return
+        self._provider = provider
+        self._model = model
 
     @contextmanager
     def tool_running(self) -> Iterator[None]:

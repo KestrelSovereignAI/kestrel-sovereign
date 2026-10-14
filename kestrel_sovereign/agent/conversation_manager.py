@@ -209,16 +209,26 @@ SUMMARY:"""
             # passing ``prompt=`` raised TypeError that the broad except below
             # swallowed into success=False, silently no-opping ALL compaction
             # (incl. !compact) in production until #1844 Stage 2.
-            summary_response = await llm_service.generate(
-                system_prompt="You are a conversation summarizer. Create concise summaries that preserve essential context.",
-                user_prompt=summary_prompt,
-                model_override=None,  # Use default model
-                # The session being compacted is the session this call belongs
-                # to, unless the caller named the requesting turn separately
-                # for a deliberately global compaction. Neither present (a
-                # background compaction with no chat window) leaves the span
-                # unstamped (#2940).
-                session_id=attribution_session_id or session_id,
+            #
+            # Bounded like the turn's own calls (#2658): the openai:plan
+            # pre-turn compaction and ``!compact`` run inside a turn and hold
+            # its CONVERSATION lock. A call abandoned on the bound fails the
+            # compaction below; nothing is excluded without its summary.
+            from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
+
+            summary_response = await LLMCallWatchdog.bound_completion(
+                llm_service,
+                llm_service.generate(
+                    system_prompt="You are a conversation summarizer. Create concise summaries that preserve essential context.",
+                    user_prompt=summary_prompt,
+                    model_override=None,  # Use default model
+                    # The session being compacted is the session this call
+                    # belongs to, unless the caller named the requesting turn
+                    # separately for a deliberately global compaction. Neither
+                    # present (a background compaction with no chat window)
+                    # leaves the span unstamped (#2940).
+                    session_id=attribution_session_id or session_id,
+                ),
             )
 
             if isinstance(summary_response, str):
@@ -809,11 +819,21 @@ SUMMARY:"""
             # Generate summary
             # Same keyword-only signature fix as compact_session: user_prompt,
             # not prompt (the old call TypeError'd into the broad except).
-            summary_response = await llm_service.generate(
-                system_prompt="You are a conversation summarizer. Create concise summaries that preserve essential context.",
-                user_prompt=summary_prompt,
-                model_override=None,
-                session_id=session_id,
+            #
+            # Bounded like compact_session's summary (#2658): ``!context
+            # summarize`` runs inside a turn and holds its CONVERSATION lock.
+            # A call abandoned on the bound fails the summary below, before
+            # anything is written or excluded.
+            from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
+
+            summary_response = await LLMCallWatchdog.bound_completion(
+                llm_service,
+                llm_service.generate(
+                    system_prompt="You are a conversation summarizer. Create concise summaries that preserve essential context.",
+                    user_prompt=summary_prompt,
+                    model_override=None,
+                    session_id=session_id,
+                ),
             )
 
             if isinstance(summary_response, str):
