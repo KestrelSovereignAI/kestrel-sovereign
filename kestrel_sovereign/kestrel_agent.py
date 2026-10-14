@@ -536,6 +536,35 @@ def _host_authority_deadline_identity(mandate: SpawnMandate) -> tuple[object, ..
     )
 
 
+def _expire_host_authority(
+    agent: object,
+    owner_task: Optional[asyncio.Task],
+    *,
+    raising_task: Optional[asyncio.Task] = None,
+) -> None:
+    """Record one host-authority expiry, notify the host, and cancel the owner.
+
+    ``raising_task`` is the task raising the precise expiry synchronously; it
+    already owns that exception and its rollback. Neither this watchdog nor
+    the host's expiry callback cancels it: the cancellation would escape at an
+    unrelated later await after it catches the expiry. The timer passes no
+    raising task.
+    """
+
+    state = vars(agent)
+    state["_host_authority_boot_expired"] = True
+    expiry_callback = state.get("_host_authority_expiry_callback")
+    if callable(expiry_callback):
+        expiry_callback(agent, raising_task=raising_task)
+    if (
+        owner_task is not None
+        and owner_task is not raising_task
+        and state.get("_host_authority_active_boot_task") is owner_task
+        and not owner_task.done()
+    ):
+        owner_task.cancel()
+
+
 def arm_host_authority_deadline(
     agent: object,
     mandate: SpawnMandate,
@@ -582,25 +611,12 @@ def arm_host_authority_deadline(
     state["_host_authority_deadline_identity"] = identity
     state["_host_authority_boot_expired"] = False
 
-    def expire_active_authority(*, cancel_owner: bool = True) -> None:
-        state["_host_authority_boot_expired"] = True
-        expiry_callback = state.get("_host_authority_expiry_callback")
-        if callable(expiry_callback):
-            expiry_callback(agent)
-        if (
-            cancel_owner
-            and owner_task is not None
-            and state.get("_host_authority_active_boot_task") is owner_task
-            and not owner_task.done()
-        ):
-            owner_task.cancel()
-
     if remaining <= 0:
         # This synchronous caller already owns the expiry exception and its
         # rollback. Cancelling it as well would leave a latent cancellation
         # that escapes at an unrelated later await after the caller catches the
         # precise expiry error.
-        expire_active_authority(cancel_owner=False)
+        _expire_host_authority(agent, owner_task, raising_task=owner_task)
         raise PersistedSpawnMandateExpiredError(
             "Persisted spawn mandate expired before active host admission"
         )
@@ -609,10 +625,42 @@ def arm_host_authority_deadline(
     deadline = loop.time() + remaining
     state["_host_authority_boot_deadline_handle"] = loop.call_at(
         deadline,
-        expire_active_authority,
+        _expire_host_authority,
+        agent,
+        owner_task,
     )
     state["_host_authority_deadline_monotonic"] = deadline
     return deadline
+
+
+def expire_host_authority_deadline(agent: object) -> None:
+    """Expire an armed watchdog now, for a stage check that found it elapsed.
+
+    That check raises ``PersistedSpawnMandateExpiredError`` synchronously and
+    its task rolls the candidate back, while the watchdog for the same
+    deadline is due. Left armed, the watchdog fires at the rollback's first
+    await and cancels that task, so its caller receives a ``CancelledError``
+    nothing requested (#3629). The rule is the one ``arm_host_authority_deadline``
+    applies to an already-elapsed lifetime: the task raising the expiry is not
+    cancelled. An owner that is some other task is cancelled, as the timer
+    would have cancelled it.
+
+    Call it from the task that raises the expiry.
+    """
+
+    state = vars(agent)
+    deadline_handle = state.get("_host_authority_boot_deadline_handle")
+    if (
+        not isinstance(deadline_handle, asyncio.TimerHandle)
+        or state.get("_host_authority_boot_expired") is True
+    ):
+        return
+    deadline_handle.cancel()
+    _expire_host_authority(
+        agent,
+        state.get("_host_authority_active_boot_task"),
+        raising_task=asyncio.current_task(),
+    )
 
 
 def disarm_host_authority_deadline(agent: object) -> None:

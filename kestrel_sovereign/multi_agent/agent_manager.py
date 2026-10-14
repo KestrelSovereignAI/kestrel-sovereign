@@ -41,6 +41,7 @@ from kestrel_sovereign.kestrel_agent import (
     await_agent_shutdown_completion,
     await_lifecycle_task_completion,
     disarm_host_authority_deadline,
+    expire_host_authority_deadline,
 )
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.llm.service import LLMService
@@ -2469,6 +2470,7 @@ class AgentManager:
                     complete_readiness,
                     deadline=deadline,
                     phase="agent readiness",
+                    agent=agent,
                     on_expiry=lambda: self._fence_expired_spawn_route(
                         route_name,
                         agent,
@@ -2927,8 +2929,10 @@ class AgentManager:
                 verify_host_authority_before_active_boot
             )
             agent._host_authority_expiry_callback = (
-                lambda candidate: self._expire_host_authority_candidate(
-                    name, candidate
+                lambda candidate, *, raising_task: (
+                    self._expire_host_authority_candidate(
+                        name, candidate, raising_task=raising_task
+                    )
                 )
             )
             if active_boot_semaphore is not None:
@@ -4586,11 +4590,20 @@ class AgentManager:
         deadline: Optional[float],
         *,
         phase: str,
+        agent: KestrelAgent,
     ) -> None:
+        """Refuse a stage boundary past ``agent``'s signed deadline.
+
+        The expiry raised here is the caller's to roll back, so the watchdog
+        armed for the same deadline is expired now rather than left to cancel
+        the caller during that rollback.
+        """
+
         if (
             deadline is not None
             and asyncio.get_running_loop().time() >= deadline
         ):
+            expire_host_authority_deadline(agent)
             raise PersistedSpawnMandateExpiredError(
                 f"Persisted spawn mandate expired before {phase}"
             )
@@ -4601,6 +4614,7 @@ class AgentManager:
         *,
         deadline: Optional[float],
         phase: str,
+        agent: KestrelAgent,
         on_expiry: Optional[Callable[[], None]] = None,
         admission: Optional[AgentOperationAdmission] = None,
     ) -> object:
@@ -4616,7 +4630,9 @@ class AgentManager:
         if deadline is None:
             return await operation()
         try:
-            self._require_spawn_admission_time(deadline, phase=phase)
+            self._require_spawn_admission_time(
+                deadline, phase=phase, agent=agent
+            )
         except PersistedSpawnMandateExpiredError:
             if on_expiry is not None:
                 on_expiry()
@@ -4664,7 +4680,9 @@ class AgentManager:
         # Completion and the timer can become runnable in the same loop turn.
         # Recheck the signed clock so a just-late result cannot reopen admission.
         try:
-            self._require_spawn_admission_time(deadline, phase=phase)
+            self._require_spawn_admission_time(
+                deadline, phase=phase, agent=agent
+            )
         except PersistedSpawnMandateExpiredError:
             if on_expiry is not None:
                 on_expiry()
@@ -4740,9 +4758,17 @@ class AgentManager:
         )
 
     def _expire_host_authority_candidate(
-        self, name: str, agent: KestrelAgent
+        self,
+        name: str,
+        agent: KestrelAgent,
+        *,
+        raising_task: Optional[asyncio.Task] = None,
     ) -> None:
-        """Fence expiry now; clean a batch-orphaned private boot independently."""
+        """Fence expiry now; clean a batch-orphaned private boot independently.
+
+        ``raising_task`` raised the precise expiry itself and owns its
+        rollback, so it is never cancelled here.
+        """
 
         self._fence_expired_spawn_route(name, agent)
         if not self._spawn_route_is_fenced(name, agent):
@@ -4763,6 +4789,11 @@ class AgentManager:
             # to publish. Cancel the admission owner so that exact load/spawn
             # path performs its cancellation-safe unpublished cleanup.
             owner_task = admission.owner_task
+            if raising_task is not None and owner_task is raising_task:
+                # The owner raised the precise expiry and rolls back from that
+                # exception. Cancelling it too would surface as a
+                # CancelledError at its rollback's first await (#3629).
+                return
             if isinstance(owner_task, asyncio.Task) and not owner_task.done():
                 owner_task.cancel()
                 return
@@ -4795,6 +4826,7 @@ class AgentManager:
         *,
         deadline: Optional[float],
         phase: str,
+        agent: KestrelAgent,
     ):
         """Acquire the publication writer inside the same signed lifetime."""
 
@@ -4810,6 +4842,7 @@ class AgentManager:
                 acquire,
                 deadline=deadline,
                 phase=phase,
+                agent=agent,
             )
             yield
         finally:
@@ -4866,6 +4899,7 @@ class AgentManager:
             lambda: self._run_hosted_agent_ready_hooks(agent),
             deadline=deadline,
             phase="agent readiness",
+            agent=agent,
             on_expiry=lambda: self._fence_expired_spawn_route(name, agent),
             admission=admission,
         )
@@ -5003,6 +5037,7 @@ class AgentManager:
                     lambda: await_lifecycle_task_completion(verification),
                     deadline=deadline,
                     phase="agent readiness publication verification",
+                    agent=agent,
                     on_expiry=lambda: self._fence_expired_spawn_route(
                         name, agent
                     ),
@@ -5049,6 +5084,7 @@ class AgentManager:
             lambda: self._on_agent_registered(name, agent),
             deadline=deadline,
             phase="onboarding",
+            agent=agent,
         )
 
     def _commit_restored_child_ttl(
@@ -6205,6 +6241,7 @@ class AgentManager:
                         lambda: admission.before_publish(agent),
                         deadline=admission_deadline,
                         phase="prepublication authority",
+                        agent=agent,
                     )
                     # A live spawn signs and restamps its mandate inside the
                     # prepublication callback. The unsigned proposal above has
@@ -6214,6 +6251,7 @@ class AgentManager:
                 async with self._a2a_writer_before_spawn_admission_deadline(
                     deadline=admission_deadline,
                     phase="authority preparation",
+                    agent=agent,
                 ):
                     if not self._operation_is_admitted(admission):
                         raise RuntimeError(
@@ -6224,6 +6262,7 @@ class AgentManager:
                 async with self._a2a_writer_before_spawn_admission_deadline(
                     deadline=admission_deadline,
                     phase="registration publication",
+                    agent=agent,
                 ):
                     if not self._operation_is_admitted(admission):
                         raise RuntimeError(
@@ -6246,6 +6285,7 @@ class AgentManager:
                         self._require_spawn_admission_time(
                             admission_deadline,
                             phase="routing publication",
+                            agent=agent,
                         )
                         self._commit_restored_child_ttl(name, agent)
                         self._register_agent(
@@ -7256,6 +7296,7 @@ class AgentManager:
                         async with self._a2a_writer_before_spawn_admission_deadline(
                             deadline=admission_deadline,
                             phase="authority preparation",
+                            agent=result,
                         ):
                             if not self._operation_is_admitted(admission):
                                 raise RuntimeError(
@@ -7266,6 +7307,7 @@ class AgentManager:
                         async with self._a2a_writer_before_spawn_admission_deadline(
                             deadline=admission_deadline,
                             phase="registration publication",
+                            agent=result,
                         ):
                             if not self._operation_is_admitted(admission):
                                 raise RuntimeError(
@@ -7285,6 +7327,7 @@ class AgentManager:
                                 self._require_spawn_admission_time(
                                     admission_deadline,
                                     phase="routing publication",
+                                    agent=result,
                                 )
                                 self._commit_restored_child_ttl(name, result)
                                 self._register_agent(
@@ -11047,6 +11090,7 @@ class AgentManager:
                 ),
                 deadline=signed_deadline,
                 phase="signed receipt persistence",
+                agent=candidate,
                 on_expiry=lambda: self._fence_expired_spawn_route(name, candidate),
                 admission=admission,
             )
@@ -11064,6 +11108,7 @@ class AgentManager:
                 ),
                 deadline=signed_deadline,
                 phase="delegated budget custody",
+                agent=candidate,
                 on_expiry=lambda: self._fence_expired_spawn_route(name, candidate),
                 admission=admission,
             )
@@ -11452,6 +11497,7 @@ class AgentManager:
             ),
             deadline=self._spawn_admission_deadline(child),
             phase="final signed receipt persistence",
+            agent=child,
             on_expiry=lambda: self._fence_expired_spawn_route(
                 admission.name,
                 child,
