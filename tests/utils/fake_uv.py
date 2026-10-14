@@ -137,6 +137,7 @@ class FakeUv:
         feature_on_index=True,
         feature_git_version=None,
         dependency_checkouts=None,
+        dependencies_bypass_constraints=False,
     ):
         self.installed = {CORE: core_version}
         self.editable = {CORE: core_checkout} if core_checkout else {}
@@ -196,6 +197,11 @@ class FakeUv:
         self.feature_on_index = feature_on_index
         #: The version the feature's git URL builds (None: ``feature_version``).
         self.feature_git_version = feature_git_version
+        #: True: the feature's OTHER dependencies resolve without the
+        #: constraints file, as a feature's own build step or a direct pip call
+        #: does. Core's pin still holds core (``honours_constraints``), but
+        #: nothing holds a locked package to the lock (#3324).
+        self.dependencies_bypass_constraints = dependencies_bypass_constraints
         self.commands = []
         #: The TEXT of each install's constraints file, captured because
         #: `_extension_install_run` deletes the file before a test can read it.
@@ -789,8 +795,9 @@ class FakeUv:
         from packaging.specifiers import SpecifierSet
         from packaging.version import Version
 
-        pins = self._constraint_lines(cmd)
-        holds = self._checkout_holds(cmd)
+        bypass = self.dependencies_bypass_constraints
+        pins = {} if bypass else self._constraint_lines(cmd)
+        holds = {} if bypass else self._checkout_holds(cmd)
         for name, spec in self._declared_dependencies(dist or self.feature):
             if name in holds:
                 # Held on a checkout: it stays linked, or becomes linked, and
@@ -827,6 +834,8 @@ class FakeUv:
         from packaging.specifiers import SpecifierSet
         from packaging.version import Version
 
+        if self.dependencies_bypass_constraints:
+            return None
         pins = self._constraint_lines(cmd)
         holds = self._checkout_holds(cmd)
         for name, spec in self._declared_dependencies(dist):
@@ -858,11 +867,22 @@ def use_fake_uv(monkeypatch, venv):
     """Point the venv-state reads and the installer at *venv*."""
     import importlib.metadata as md
 
-    from kestrel_sovereign import cli
+    from kestrel_sovereign import cli, core_lock
 
     monkeypatch.setattr(md, "version", venv.version)
     monkeypatch.setattr(cli, "_editable_install_path", venv.editable_path)
     monkeypatch.setattr(cli, "_installed_requirements", venv.requires)
+    monkeypatch.setattr(
+        cli, "_installed_distribution_names", lambda: tuple(venv.installed),
+    )
+    # The lock comparison reads the venv by name too (#3324): left on the real
+    # interpreter, it compares a test's lock against whatever this runner has.
+    monkeypatch.setattr(
+        core_lock, "installed_versions",
+        lambda names, path=None: {
+            name: venv.installed[name] for name in names if name in venv.installed
+        },
+    )
     monkeypatch.setattr(cli, "_direct_url_provenance", venv.direct_url_provenance)
     # The modelled host's declared checkouts EXIST — that is what makes them
     # declared. Without this the real `_editable_git_pull` runs against paths

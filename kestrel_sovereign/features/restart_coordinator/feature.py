@@ -35,6 +35,11 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.core_lock import (
+    SYNC_LOCK_REPORT_ENV,
+    LockReportError,
+    read_lock_findings_report,
+)
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import (
@@ -225,6 +230,34 @@ _STATUS_ALIASES = {
     "in-progress": "executing",
     "denied": "rejected",
 }
+
+
+def _lock_findings_fields(report: Path) -> Dict[str, Any]:
+    """The lock findings a ``feature_sync`` step wrote to *report*, as outcome fields.
+
+    ``lock_findings`` is every finding, whole: the step's output keeps only
+    its tail, which enough findings outrun (#3324). An empty list means the
+    venv was compared and nothing was below the lock. When there is no usable
+    report it is None, and ``lock_findings_unavailable`` says why. Each finding
+    is logged at WARNING here too, since the sync's own log went to the step's
+    captured stderr, not to this process's log.
+    """
+    try:
+        findings = read_lock_findings_report(report)
+    except LockReportError as exc:
+        reason = f"the lock report the sync wrote will not read: {exc}"
+        logger.warning("restart_coordinator: feature sync: %s", reason)
+        return {"lock_findings": None, "lock_findings_unavailable": reason}
+    if findings is None:
+        reason = (
+            "the sync wrote no lock report: it ended before comparing the venv "
+            "with uv.lock, or the code it ran predates the report"
+        )
+        logger.info("restart_coordinator: feature sync: %s", reason)
+        return {"lock_findings": None, "lock_findings_unavailable": reason}
+    for finding in findings:
+        logger.warning("restart_coordinator: feature sync: %s", finding["message"])
+    return {"lock_findings": findings}
 
 
 def _tail(raw: Any) -> str:
@@ -3089,13 +3122,33 @@ class RestartCoordinatorFeature(Feature):
 
         Uses ``create_subprocess_exec`` (argv list, never a shell) so a
         crafted ref/path can never inject a command.
+
+        A step that ``reports_lock_findings`` is given a private file to write
+        its lock findings to (:data:`SYNC_LOCK_REPORT_ENV`), and its outcome
+        carries them whole (:func:`_lock_findings_fields`): its output is cut to
+        a tail, and every finding must reach ``update_log`` (#3324).
         """
         if getattr(step, "native", None) == "reattach_branch":
             return await self._reattach_branch_step(step)
+        if not getattr(step, "reports_lock_findings", False):
+            return await self._exec_update_step(step)
+        with tempfile.TemporaryDirectory(prefix="kestrel-lock-report-") as private:
+            report = Path(private) / "lock-findings.json"
+            outcome = await self._exec_update_step(
+                step, env={**os.environ, SYNC_LOCK_REPORT_ENV: str(report)},
+            )
+            outcome.update(_lock_findings_fields(report))
+        return outcome
+
+    async def _exec_update_step(
+        self, step, env: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Run *step*'s argv in *env* (None: this process's) and capture it."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *step.argv,
                 cwd=step.cwd,
+                env=env,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

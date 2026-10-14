@@ -14,6 +14,7 @@ here through the ``cli`` module object at call time, so existing
 """
 import functools
 import contextlib
+import logging
 import os
 import re
 import shlex
@@ -34,6 +35,8 @@ from kestrel_sovereign.feature_reconcile import (
     resolve_registry_name,
 )
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
+
+logger = logging.getLogger(__name__)
 
 # Return code for "core drifted and could not be repaired". Distinct from the
 # generic ``1`` so callers can tell an unrepaired SAFETY failure from an
@@ -608,6 +611,34 @@ def _installed_requirements(dist_name: str) -> tuple:
         ) or ())
     except Exception:  # noqa: BLE001 - absent or unreadable metadata
         return ()
+
+
+def _installed_distribution_names() -> tuple:
+    """Every distribution installed in THIS venv, by canonical name, once each.
+
+    A seam beside :func:`_installed_requirements`, which reads each one's
+    requirements: together they are the venv a downgrade's cause is looked for
+    in (#3324). ``invalidate_caches`` for the reason
+    :func:`_installed_version` gives. A distribution whose metadata will not
+    read (``METADATA`` that is not UTF-8 raises; a missing one reads as None
+    on Python 3.14), or names no package, is skipped: it has no requirements
+    to read either, and one damaged dist-info must not crash the sync that is
+    reporting on the venv.
+    """
+    import importlib
+    import importlib.metadata as md
+
+    importlib.invalidate_caches()
+    names = {}
+    for dist in md.distributions():
+        try:
+            metadata = dist.metadata
+        except (OSError, ValueError, TypeError):
+            continue
+        name = metadata.get("Name") if metadata is not None else None
+        if name:
+            names.setdefault(canonical_package(name), None)
+    return tuple(names)
 
 
 def _unsatisfied_requirements(dist_name: str, extras=()) -> tuple:
@@ -1457,6 +1488,100 @@ def core_lock_check():
     from kestrel_sovereign.core_lock import check_venv_against_lock
 
     return check_venv_against_lock(lambda: cli._core_lock(cli._core_install_shape()))
+
+
+def sync_lock_findings(source_index=None) -> tuple:
+    """What this venv holds below core's ``uv.lock``, after a sync (issue #3324).
+
+    Reads only. A :class:`~kestrel_sovereign.core_lock.LockDowngrade` for every
+    locked package installed below its locked version, naming what forced it,
+    or one :class:`~kestrel_sovereign.core_lock.LockNotCompared` when the lock
+    is missing or will not read. Empty when nothing is below the lock, and when
+    core is installed from somewhere no lock belongs (an index wheel): there
+    the lock is not missing, it was never there to compare against.
+
+    *source_index* is the sync's ``{package: SourceEntry}``: the extras the host
+    asked each package for decide which requirements are active, and a checkout
+    it declares is named as the cause of a package held there.
+
+    Read fresh rather than from the batch's guard, whose lock may be refused
+    for a reason that has nothing to do with the lock itself (a manifest it
+    could not read, a pip host that cannot hold a checkout).
+    """
+    from kestrel_sovereign import core_lock as cl
+
+    shape = cli._core_install_shape()
+    try:
+        checkout = cl.core_lock_checkout(shape.provenance)
+        lock = cli._core_lock(shape)
+    except cl.CoreLockError as exc:
+        return (cl.LockNotCompared(str(exc)),)
+    if lock is None:
+        if checkout is None:
+            return ()
+        return (cl.LockNotCompared(f"there is no uv.lock at {checkout / cl.LOCK_FILENAME}"),)
+    index = source_index or {}
+    return cl.lock_downgrades(
+        cl.check_venv_against_lock(lambda: lock).drift,
+        distributions=cli._installed_distribution_names,
+        requires=cli._installed_requirements,
+        extras={package: entry.extras for package, entry in index.items()},
+        declared_checkouts=_declared_checkouts(index),
+    )
+
+
+def _report_sync_lock_findings(findings) -> None:
+    """Print, log and hand over every :func:`sync_lock_findings` result.
+
+    Changes nothing in the venv. A warning, never a failure: the venv still
+    loads, and a refusal would block a host's update on a constraint its
+    operator may not control.
+
+    Printed for whoever reads the sync's output, logged for the process log,
+    and written whole to the report ``update_then_restart`` asks for
+    (:func:`_write_sync_lock_report`): that update keeps the sync's output, not
+    the process log, in the request's ``update_log``, and that log is where the
+    downgrade in #3324 went unseen. It keeps only the tail of that output, which
+    enough findings outrun, so the report, not the printed lines, is what puts
+    every finding there. Printed last, one labelled line per finding after the
+    note, so a tail that cuts the note off still says WARNING on each line.
+    """
+    _write_sync_lock_report(findings)
+    if not findings:
+        return
+    from kestrel_sovereign.core_lock import LockDowngrade
+
+    print()
+    if any(isinstance(finding, LockDowngrade) for finding in findings):
+        print(
+            "  This venv holds packages below the versions core's uv.lock "
+            "pins, so it is not running what CI tested. The sync is not failed "
+            "for it. Move what forced each one to a release that accepts the "
+            "locked version (pull an editable checkout), then re-run the update."
+        )
+    for finding in findings:
+        logger.warning("feature sync: %s", finding.describe())
+        print(f"  WARNING: {finding.describe()}")
+
+
+def _write_sync_lock_report(findings) -> None:
+    """Write *findings* to the file :data:`~kestrel_sovereign.core_lock.SYNC_LOCK_REPORT_ENV`
+    names, when it names one; an empty list included (#3324).
+
+    A report that cannot be written is said, and changes nothing else: the
+    findings are still printed and logged, and the process that asked reads
+    the missing report as one it did not get.
+    """
+    from kestrel_sovereign import core_lock as cl
+
+    path = os.environ.get(cl.SYNC_LOCK_REPORT_ENV)
+    if not path:
+        return
+    try:
+        cl.write_lock_findings_report(Path(path), findings)
+    except OSError as exc:
+        logger.warning("feature sync: could not write the lock report to %s: %s", path, exc)
+        print(f"  WARNING: could not write the lock report to {path}: {exc}")
 
 
 @dataclass(frozen=True)
@@ -2955,7 +3080,8 @@ def cmd_feature_sync(args) -> int:
     # and re-check it afterwards (detection) — issue #2949.
     from kestrel_sovereign import feature_reconcile as fr
 
-    guard = CoreInstallGuard.snapshot(fr.build_source_index(entries, registry))
+    source_index = fr.build_source_index(entries, registry)
+    guard = CoreInstallGuard.snapshot(source_index)
 
     # The manifest is a declaration, not a program: its order says nothing about
     # dependency order. Core is what every other entry depends on, so its
@@ -3198,6 +3324,11 @@ def cmd_feature_sync(args) -> int:
         # the first rather than assigned over it — a repaired-core `1` must not
         # erase a CORE_STALE recorded by the pull above.
         core_state = _worst_rc(core_state, guard.verify())
+        # The lock holds every install above, but a checkout the manifest
+        # declares, or an install that bypassed the constraints, can still
+        # leave a locked package below the lock. Named here, after everything
+        # else, and never folded into the exit status (#3324).
+        _report_sync_lock_findings(sync_lock_findings(source_index))
     # No gate here, deliberately: `_RC_SEVERITY` already ranks every core state
     # above a package failure, so the fold below returns the core state
     # verbatim and `kestrel update` gates its restart on it exactly as
