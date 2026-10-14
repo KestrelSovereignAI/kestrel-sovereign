@@ -431,6 +431,9 @@ class TestGeneration:
         usage = response.raw.usage_metadata
         generated = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
         assert 0 < generated <= budget
+        # The thinking is output, as Gemini bills it (#3623).
+        assert response.output_tokens == generated
+        assert response.total_tokens == response.input_tokens + response.output_tokens
         # Text, or none at all when thinking took the whole budget; never an
         # empty string standing in for an answer.
         assert response.content is None or response.content != ""

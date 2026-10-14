@@ -68,6 +68,17 @@ def _normalized_google_genai_usage(
     inclusive of ``cached_content_token_count``. ``LLMResponse`` defines its
     input and total fields as excluding separately reported cache buckets, so
     normalize that provider shape once for both Google API and Vertex routes.
+
+    Output is ``candidates_token_count`` plus ``thoughts_token_count`` (#3623).
+    Gemini 2.5 thinks by default, counts the thinking against
+    ``max_output_tokens`` and bills it as output, as OpenAI's
+    ``completion_tokens`` and Anthropic's ``output_tokens`` already count
+    reasoning. A response whose budget went entirely to thinking reports no
+    candidates count at all, and still produced billed output.
+
+    ``total_token_count`` also includes ``tool_use_prompt_token_count``,
+    which neither input nor output carries, so total exceeds their sum when
+    Gemini reports one.
     """
 
     def field(name: str) -> Any:
@@ -82,7 +93,11 @@ def _normalized_google_genai_usage(
         return None
 
     input_tokens = token_count("prompt_token_count")
-    output_tokens = token_count("candidates_token_count")
+    candidates_tokens = token_count("candidates_token_count")
+    thoughts_tokens = token_count("thoughts_token_count")
+    output_tokens = None
+    if candidates_tokens is not None or thoughts_tokens is not None:
+        output_tokens = (candidates_tokens or 0) + (thoughts_tokens or 0)
     total_tokens = token_count("total_token_count")
     cache_read_input_tokens = token_count("cached_content_token_count")
 
