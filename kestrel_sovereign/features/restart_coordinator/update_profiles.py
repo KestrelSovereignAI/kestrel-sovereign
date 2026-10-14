@@ -211,6 +211,10 @@ class UpdateStep:
     # carries its validated parameters.
     native: Optional[str] = None
     native_args: tuple = ()
+    # The step is a ``kestrel feature sync`` whose lock findings the
+    # coordinator keeps whole in the step's outcome, read from the report the
+    # sync writes, rather than only in its output's tail (#3324).
+    reports_lock_findings: bool = False
 
 
 @dataclass(frozen=True)
@@ -315,6 +319,7 @@ def _sovereign_local_uv_sync(
                     "feature", "sync", "--manifest", str(manifest),
                 ],
                 cwd=repo_path,
+                reports_lock_findings=True,
             )
         )
 
