@@ -15,6 +15,105 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
 from tests.unit.test_constitution_audit import _DurableConstitutionHarness
 
+# Only a hang guard. Every step here is ordered by an event or by lock state,
+# never by elapsed time, so a loaded host cannot decide the outcome (#3614).
+_HANG_GUARD_SECONDS = 30
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_constitution_authority(monkeypatch):
+    """The signed writers pass an explicit per-test trust root. A root or
+    source descriptor exported by the host would make it ambiguous, and
+    reanchor would refuse before ever reaching the lock under test."""
+    monkeypatch.delenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", raising=False)
+    monkeypatch.delenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", raising=False)
+
+
+class _ConstitutionLockInversion(Exception):
+    """The caller-transaction owner tried to wait on the constitution lock."""
+
+
+def _task_outcome(task):
+    if task.cancelled():
+        return "cancellation"
+    if task.exception() is not None:
+        return repr(task.exception())
+    return f"result {task.result()!r}"
+
+
+async def _wait_for_step(step, event, task):
+    """Wait until ``task`` reaches ``step``; fail at once if it ends first."""
+    reached = asyncio.ensure_future(event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {reached, task}, timeout=_HANG_GUARD_SECONDS, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        if not reached.done():
+            reached.cancel()
+            with suppress(asyncio.CancelledError):
+                await reached
+    if reached in done:
+        return
+    if task in done:
+        pytest.fail(f"{step}: the task ended first with {_task_outcome(task)}")
+    pytest.fail(f"{step}: not reached within the {_HANG_GUARD_SECONDS}s hang guard")
+
+
+async def _await_task(step, task):
+    done, _ = await asyncio.wait({task}, timeout=_HANG_GUARD_SECONDS)
+    if task not in done:
+        pytest.fail(f"{step}: not finished within the {_HANG_GUARD_SECONDS}s hang guard")
+    return task.result()
+
+
+async def _refuse_without_lock_wait(step, lock, transition):
+    """Run ``transition()`` in THIS transaction-owning task.
+
+    Another task holds ``lock`` and is waiting for this task's transaction, so
+    this task reaching ``lock.acquire`` IS the deadlock. It is recorded and
+    failed when it happens rather than inferred from a clock. A task-switching
+    wrapper such as ``wait_for(coroutine)`` would erase the ownership relation
+    under test; ``asyncio.timeout`` keeps the same task and is only a hang guard.
+    """
+    if not lock.locked():
+        pytest.fail(f"{step}: precondition: another task must hold the constitution lock")
+    owner = asyncio.current_task()
+    original_acquire = lock.acquire
+    waits = []
+
+    async def refuse_owner_acquire():
+        if asyncio.current_task() is owner:
+            waits.append(step)
+            raise _ConstitutionLockInversion(step)
+        return await original_acquire()
+
+    lock.acquire = refuse_owner_acquire
+    guard = asyncio.timeout(_HANG_GUARD_SECONDS)
+    result = None
+    try:
+        async with guard:
+            result = await transition()
+    except _ConstitutionLockInversion:
+        pass  # Failed below from ``waits``, which also survives a swallowed raise.
+    except TimeoutError:
+        if not guard.expired():
+            raise
+        pytest.fail(
+            f"{step}: did not return within the {_HANG_GUARD_SECONDS}s hang guard "
+            "while owning the caller transaction"
+        )
+    finally:
+        del lock.acquire
+        # Checked on every exit, so an exception raised after the refusal was
+        # caught cannot carry the test past a recorded wait (test 1 expects one).
+        if waits:
+            pytest.fail(
+                f"{step}: the caller-transaction owner waited on the constitution lock "
+                "held by a task waiting for that transaction: lock inversion deadlock"
+            )
+    return result
+
 
 @pytest.mark.asyncio
 async def test_implicit_rollback_keeps_caller_scope_visible_before_state_lock(tmp_path):
@@ -42,20 +141,20 @@ async def test_implicit_rollback_keeps_caller_scope_visible_before_state_lock(tm
         with pytest.raises(TransactionError, match="rolled back implicitly"):
             async with storage.transaction():
                 waiter = asyncio.create_task(competing_state_owner())
-                await asyncio.wait_for(waiting.wait(), 5)
+                await _wait_for_step("competing owner holds the constitution lock", waiting, waiter)
                 with pytest.raises(QueryError, match="UNIQUE"):
                     await storage._backend.execute("INSERT OR ROLLBACK INTO rollback_conflict VALUES (1)")
                 assert storage._backend._connection.in_transaction is False
-                # SAME task still holds the writer scope. No task-switching
-                # timeout wrapper may hide its actual ownership relation.
-                try:
-                    async with asyncio.timeout(1):
-                        result = await agent.enter_safe_mode("caller caught implicit rollback")
-                except TimeoutError:
-                    pytest.fail("implicit rollback reopened the state/writer lock inversion")
+                # SAME task still holds the writer scope after the implicit
+                # rollback, so a wait here reopens the state/writer inversion.
+                result = await _refuse_without_lock_wait(
+                    "safe-mode entry after implicit rollback",
+                    agent._constitution_state_lock,
+                    lambda: agent.enter_safe_mode("caller caught implicit rollback"),
+                )
                 assert result is False
                 assert agent._safe_mode is True and agent._constitution_state_persistence_pending is True
-        assert await asyncio.wait_for(waiter, 5) is True
+        assert await _await_task("competing owner commits after the caller scope ends", waiter) is True
         assert await agent._constitution_state_store.load(agent.agent_id) == before
     finally:
         if waiter is not None:
@@ -130,31 +229,34 @@ async def test_outer_transaction_refuses_before_constitution_lock_wait(
                 return await ConstitutionMixin._get_governing_constitution(agent)
             return await ConstitutionMixin.reanchor_constitution(agent, amendment_artifact_path=str(artifact))
 
+        async def run_transition():
+            if transition == "entry":
+                return await agent.enter_safe_mode("caller restriction")
+            if transition == "exit":
+                return await agent.exit_safe_mode(authorization="test sovereign")
+            if transition == "audit_begin":
+                return await agent._begin_explicit_constitution_audit()
+            if transition == "audit_record":
+                return await agent._record_successful_constitution_audit(source="caller")
+            if transition == "audit_run":
+                return await agent._run_explicit_constitution_audit()
+            return await agent._maybe_audit()
+
         anchor_task = asyncio.create_task(anchor())
-        await asyncio.wait_for(prepared.wait(), 5)
+        await _wait_for_step(f"{anchor_writer} anchor reaches its first constitution-lock entry", prepared, anchor_task)
         async with storage.transaction():
             assert storage.owns_open_transaction is True
             allow_anchor.set()
-            await asyncio.wait_for(anchor_waiting_for_database.wait(), 5)
-            try:
-                # asyncio.timeout keeps this SAME transaction-owning task.
-                # wait_for(coroutine) would create a new task and erase the
-                # ownership relation the regression must exercise.
-                async with asyncio.timeout(1):
-                    if transition == "entry":
-                        result = await agent.enter_safe_mode("caller restriction")
-                    elif transition == "exit":
-                        result = await agent.exit_safe_mode(authorization="test sovereign")
-                    elif transition == "audit_begin":
-                        result = await agent._begin_explicit_constitution_audit()
-                    elif transition == "audit_record":
-                        result = await agent._record_successful_constitution_audit(source="caller")
-                    elif transition == "audit_run":
-                        result = await agent._run_explicit_constitution_audit()
-                    else:
-                        result = await agent._maybe_audit()
-            except TimeoutError:
-                pytest.fail("ambient transaction waited on constitution lock: lock inversion deadlock")
+            await _wait_for_step(
+                f"{anchor_writer} anchor holds the constitution lock and opens its transaction",
+                anchor_waiting_for_database,
+                anchor_task,
+            )
+            result = await _refuse_without_lock_wait(
+                f"{transition} transition inside the caller transaction",
+                agent._constitution_state_lock,
+                run_transition,
+            )
             assert agent._safe_mode is True
             assert agent._constitution_state_persistence_pending is True
             assert (agent._constitution_state_revision, agent._constitution_state_generation) == (before.revision, before.generation)
@@ -166,7 +268,7 @@ async def test_outer_transaction_refuses_before_constitution_lock_wait(
                 assert result[0] is None and result[2] is False
             else:
                 assert result is None
-        outcome = await asyncio.wait_for(anchor_task, 5)
+        outcome = await _await_task(f"{anchor_writer} anchor completes after the caller transaction", anchor_task)
         assert not outcome.startswith("Error:"), outcome
         durable = await agent._constitution_state_store.load(agent.agent_id)
         # No refused audit/entry/exit was silently included in the anchor's
@@ -238,21 +340,24 @@ async def test_refused_lifecycle_entry_invalidates_inflight_native_exit(
         if blocked_at == "database":
             monkeypatch.setattr(storage._backend, "transaction", observed_transaction)
         exit_task = asyncio.create_task(agent.exit_safe_mode(authorization="test sovereign"))
-        await asyncio.wait_for(blocked.wait(), 5)
+        await _wait_for_step(f"exit holds the constitution lock, blocked at {blocked_at}", blocked, exit_task)
         async with storage.transaction():
             if blocked_at == "database":
                 proceed.set()
-                await asyncio.wait_for(database_waiting.wait(), 5)
-            async with asyncio.timeout(1):
-                assert await agent.enter_safe_mode(
+                await _wait_for_step("exit opens its transaction behind the caller's", database_waiting, exit_task)
+            assert await _refuse_without_lock_wait(
+                "lifecycle-uncertain entry inside the caller transaction",
+                agent._constitution_state_lock,
+                lambda: agent.enter_safe_mode(
                     "feature quarantine could not persist",
                     cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
-                ) is False
+                ),
+            ) is False
             assert agent._safe_mode_cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
             assert agent._feature_lifecycle_integrity_uncertain is True
             assert agent._feature_lifecycle_repair_verified is False
         proceed.set()
-        result = await asyncio.wait_for(exit_task, 5)
+        result = await _await_task("exit completes after the caller transaction", exit_task)
         assert result.startswith("Safe Mode remains active:"), result
         assert agent._safe_mode is True
         assert agent._constitution_state_persistence_pending is True
