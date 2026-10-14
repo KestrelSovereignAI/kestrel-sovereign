@@ -239,6 +239,7 @@ async def test_subagent_executor_enforces_pre_tool_use_hooks():
     )
     hooks_manager = MagicMock()
     hooks_manager.execute_hooks = AsyncMock(return_value=hook_output)
+    hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
     await feature.execute_as_subagent(task="anything")
@@ -287,6 +288,7 @@ async def test_subagent_executor_honors_hook_argument_rewrite():
     )
     hooks_manager = MagicMock()
     hooks_manager.execute_hooks = AsyncMock(return_value=hook_output)
+    hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
     await feature.execute_as_subagent(task="anything")
@@ -335,6 +337,7 @@ async def test_subagent_executor_blocks_on_permission_decision_ask():
     )
     hooks_manager = MagicMock()
     hooks_manager.execute_hooks = AsyncMock(return_value=hook_output)
+    hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
     await feature.execute_as_subagent(task="anything")
@@ -384,6 +387,7 @@ async def test_subagent_executor_honors_in_place_hook_argument_mutation():
 
     hooks_manager = MagicMock()
     hooks_manager.execute_hooks = AsyncMock(side_effect=_mutate_in_place)
+    hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
     await feature.execute_as_subagent(task="anything")
@@ -441,6 +445,7 @@ async def test_subagent_executor_surfaces_redacted_args_on_deny():
 
     hooks_manager = MagicMock()
     hooks_manager.execute_hooks = AsyncMock(side_effect=_redact_then_deny)
+    hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
     await feature.execute_as_subagent(task="anything")
@@ -491,6 +496,7 @@ async def test_subagent_executor_surfaces_redacted_args_on_ask():
 
     hooks_manager = MagicMock()
     hooks_manager.execute_hooks = AsyncMock(side_effect=_redact_then_ask)
+    hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
     await feature.execute_as_subagent(task="anything")
