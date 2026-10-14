@@ -13,7 +13,16 @@ class TestStreamingBasics:
     """Tests for basic streaming behavior."""
 
     @pytest.mark.asyncio
-    async def test_command_input_uses_regular_processing(self):
+    @pytest.mark.parametrize(
+        ("command", "audited"),
+        [
+            ("!memory status", True),
+            # A read-only diagnostic answers beside an in-flight turn and is
+            # not an interaction the periodic audit counts (#2658).
+            ("!help", False),
+        ],
+    )
+    async def test_command_input_uses_regular_processing(self, command, audited):
         """Test that commands fall back to non-streaming processing."""
         from kestrel_sovereign.agent.streaming import StreamingMixin
 
@@ -24,13 +33,13 @@ class TestStreamingBasics:
         mock_agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(mock_agent)
 
         chunks = []
-        async for chunk in mock_agent.process_input_streaming("!help"):
+        async for chunk in mock_agent.process_input_streaming(command):
             chunks.append(chunk)
 
-        mock_agent._maybe_audit.assert_called_once()
+        assert mock_agent._maybe_audit.await_count == (1 if audited else 0)
         mock_agent.process_input.assert_called_once()
         args, kwargs = mock_agent.process_input.call_args
-        assert args == ("!help", None)
+        assert args == (command, None)
         assert kwargs["session_id"] is None
         assert kwargs["caller"] is None
         assert kwargs["invocation_context"] is None

@@ -14,6 +14,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     raise_owned_outcome,
 )
+from kestrel_sovereign.command_policy import bypasses_turn_queue
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
@@ -1064,8 +1065,12 @@ class StreamingMixin:
             yield genesis_block
             return
 
-        # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
-        await self._maybe_audit()
+        # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits. A
+        # read-only diagnostic delegated below answers beside an in-flight
+        # turn and writes no governance state, so it does not count as an
+        # interaction (#2658).
+        if not bypasses_turn_queue(user_input):
+            await self._maybe_audit()
 
         # The streaming endpoint is the primary chat path and must enforce the
         # same constitutional boundary as process_input. Commands delegate

@@ -71,6 +71,7 @@ class HostFeatureConfigError(RuntimeError):
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
     BOOTSTRAP_ALLOWED_COMMANDS,
+    bypasses_turn_queue,
     prefixed_command_token,
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager
@@ -114,7 +115,11 @@ from kestrel_sovereign.agent.streaming import (
 )
 from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.sleep import SleepMixin
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin, ContextStats
+from kestrel_sovereign.agent.orchestrator_engine import (
+    ContextStats,
+    LLMCallWatchdog,
+    OrchestratorEngineMixin,
+)
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
@@ -7359,10 +7364,23 @@ Expected Duration: {expected_duration}
 
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
+        # #2658: a read-only diagnostic (`!status`, `!help`) answers beside an
+        # in-flight turn instead of queueing behind it: an operator needs it
+        # most while a turn is stuck. It is not a turn, so beyond the turn
+        # lock it skips every step below that writes state another turn
+        # shares: the LLM key resolver, the session's tool statistics and the
+        # constitutional interaction count. The Hold, readiness, genesis and
+        # Safe Mode gates still apply. A source that supplied its own
+        # admission guard still has it evaluated inside a turn.
+        answers_beside_turn = (
+            pre_turn_guard is None and bypasses_turn_queue(user_input)
+        )
+
         # USER_BYOK credentials are a non-cognitive readiness input. Refresh
         # them before the genesis gate so a Sovereign can supply the auditor's
         # passphrase on the very first turn.
-        await self._maybe_refresh_user_byok_resolver(user_passphrase)
+        if not answers_beside_turn:
+            await self._maybe_refresh_user_byok_resolver(user_passphrase)
 
         # A restart signal can reach process_input before initialize() creates
         # storage/context. There is no durable receipt to inspect yet, so keep
@@ -7381,12 +7399,13 @@ Expected Duration: {expected_duration}
         if genesis_block is not None:
             return genesis_block
 
-        # Reset context stats on session change
-        if hasattr(self, 'context_stats') and session_id:
-            self.context_stats.check_session(session_id)
+        if not answers_beside_turn:
+            # Reset context stats on session change
+            if hasattr(self, 'context_stats') and session_id:
+                self.context_stats.check_session(session_id)
 
-        # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
-        await self._maybe_audit()
+            # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
+            await self._maybe_audit()
 
         # Check before queueing so an already-restricted turn returns promptly.
         safe_mode_block = safe_mode_cognition_block(self, user_input)
@@ -7432,6 +7451,13 @@ Expected Duration: {expected_duration}
             session_id=session_id,
         ):
             try:
+                # #2658: its handler reads agent state only, so it takes no
+                # turn lock and sets no turn state. It mints no turn id and
+                # passes no durable turn admission.
+                if answers_beside_turn:
+                    return await self.command_handler.handle(
+                        user_input, caller=caller,
+                    )
                 async with self._turn_lifecycle():
                     # Correlation is optional evidence, never cancellation
                     # authority. The observability feature may replace this
@@ -8941,8 +8967,15 @@ Expected Duration: {expected_duration}
 
     async def get_audit_response(self, text_to_audit: str) -> Dict[str, Any]:
         """Audit through the LLM service under this agent's live privacy rule:
-        a local-only mode confines it to local routes (#3491)."""
-        return await self.llm_service.get_audit_response(text_to_audit)
+        a local-only mode confines it to local routes (#3491).
+
+        This is the genesis auditor. It runs before cognition, and every first
+        turn waits on it, so it carries a turn call's inactivity bound
+        (#2658); a call abandoned on the bound leaves genesis pending."""
+        return await LLMCallWatchdog.bound_completion(
+            self.llm_service,
+            self.llm_service.get_audit_response(text_to_audit),
+        )
         
     async def create_trusted_agent(self, agent_name: str) -> str:
         """
