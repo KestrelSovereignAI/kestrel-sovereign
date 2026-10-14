@@ -3063,6 +3063,12 @@ def cmd_feature_sync(args) -> int:
 
     if not entries:
         print(f"Manifest {path} declares no features. Nothing to sync.")
+        if not getattr(args, "dry_run", False):
+            # Nothing to install, but the venv this sync is run on (the one
+            # `uv sync` just left, in an update) can still hold a locked
+            # package below the lock. `update_then_restart` runs this step
+            # whenever the manifest exists, empty or not (#3324).
+            _report_sync_lock_findings(sync_lock_findings())
         return 0
 
     registry = load_registry()

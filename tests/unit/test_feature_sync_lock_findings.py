@@ -8,10 +8,11 @@ manifest declares, or an install that bypasses the constraints file, can
 still leave a locked package below the lock.
 
 These pin that the sync names each such package with both versions and what
-forced it; that this is a warning which never changes the exit status; that a
-sync with nothing below the lock prints exactly what it printed before; and
-that every finding reaches the ``update_log`` of ``update_then_restart``, whole,
-through the report the sync writes for it, however many there are. The report
+forced it, even when its manifest declares nothing to install; that this is a
+warning which never changes the exit status; that a sync with nothing below
+the lock prints exactly what it printed before; and that every finding reaches
+the ``update_log`` of ``update_then_restart``, whole, through the report the
+sync writes for it, however many there are. The report
 and the comparison itself (``core_lock.lock_downgrades``) are pinned at the
 bottom.
 """
@@ -141,9 +142,9 @@ def _manifest(tmp_path, text: str | None = None) -> Path:
     return manifest
 
 
-def _sync(manifest) -> int:
+def _sync(manifest, *, dry_run=False) -> int:
     return cli.cmd_feature_sync(types.SimpleNamespace(
-        manifest=str(manifest), capture=False, dry_run=False, allow_dirty=False,
+        manifest=str(manifest), capture=False, dry_run=dry_run, allow_dirty=False,
     ))
 
 
@@ -406,6 +407,106 @@ def test_a_core_with_no_checkout_has_no_lock_to_miss(monkeypatch, tmp_path, caps
     assert cli.sync_lock_findings(_source_index(manifest)) == ()
 
 
+# --- an empty manifest installs nothing and still compares -------------------
+#
+# ``update_then_restart`` runs the sync whenever the manifest exists, empty or
+# not, so the venv ``uv sync`` left behind is compared even when there is
+# nothing to restore.
+
+def _nothing_to_sync(manifest) -> str:
+    """What the sync prints for a manifest with no entries, before #3324 too."""
+    return f"Manifest {manifest} declares no features. Nothing to sync.\n"
+
+
+def test_an_empty_manifest_still_names_a_package_below_the_lock(
+    monkeypatch, tmp_path, capsys, caplog,
+):
+    """Claws is installed but no longer declared: the sync has nothing to do,
+    and the SDK claws holds below the lock is still named."""
+    venv = _host(tmp_path, sdk="0.37.1")
+    use_fake_uv(monkeypatch, venv)
+    manifest = _manifest(tmp_path, "")
+
+    with caplog.at_level(logging.WARNING, logger=cli_features.__name__):
+        rc = _sync(manifest)
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert not venv.commands
+    assert out.startswith(_nothing_to_sync(manifest))
+    assert f"WARNING: {CLAWS_FINDING}" in out
+    assert "not running what CI tested" in out
+    assert _warnings(caplog) == [f"feature sync: {CLAWS_FINDING}"]
+
+
+@pytest.mark.parametrize("lock, says", [
+    (None, "there is no uv.lock at"),
+    ("version = 1\n", "no [[package]] entries"),
+])
+def test_an_empty_manifest_with_no_usable_lock_is_one_finding(
+    monkeypatch, tmp_path, capsys, caplog, lock, says,
+):
+    venv = _host(tmp_path, sdk="0.37.1", lock=lock)
+    use_fake_uv(monkeypatch, venv)
+    report = tmp_path / "lock-findings.json"
+    monkeypatch.setenv(cl.SYNC_LOCK_REPORT_ENV, str(report))
+
+    with caplog.at_level(logging.WARNING, logger=cli_features.__name__):
+        rc = _sync(_manifest(tmp_path, ""))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    (warning,) = _warnings(caplog)
+    assert warning.startswith(
+        "feature sync: installed versions were not compared against core's "
+        "uv.lock: "
+    )
+    assert says in warning
+    assert f"WARNING: {warning.removeprefix('feature sync: ')}" in out
+    (finding,) = cl.read_lock_findings_report(report)
+    assert finding["kind"] == "lock_not_compared"
+    assert finding["message"] == warning.removeprefix("feature sync: ")
+
+
+def test_an_empty_manifest_with_nothing_below_the_lock_prints_what_it_did_before(
+    monkeypatch, tmp_path, capsys, caplog,
+):
+    """And reports an empty list: compared and clean."""
+    venv = _host(tmp_path, sdk=SDK_LOCKED)
+    use_fake_uv(monkeypatch, venv)
+    manifest = _manifest(tmp_path, "")
+    report = tmp_path / "lock-findings.json"
+    monkeypatch.setenv(cl.SYNC_LOCK_REPORT_ENV, str(report))
+
+    with caplog.at_level(logging.WARNING, logger=cli_features.__name__):
+        rc = _sync(manifest)
+
+    assert rc == 0
+    assert capsys.readouterr().out == _nothing_to_sync(manifest)
+    assert _warnings(caplog) == []
+    assert cl.read_lock_findings_report(report) == []
+
+
+def test_an_empty_manifest_dry_run_compares_nothing(
+    monkeypatch, tmp_path, capsys, caplog,
+):
+    """A dry run on an empty manifest is unchanged: it neither compares nor
+    writes a report, whatever the venv holds."""
+    venv = _host(tmp_path, sdk="0.37.1")
+    use_fake_uv(monkeypatch, venv)
+    manifest = _manifest(tmp_path, "")
+    report = tmp_path / "lock-findings.json"
+    monkeypatch.setenv(cl.SYNC_LOCK_REPORT_ENV, str(report))
+
+    with caplog.at_level(logging.WARNING, logger=cli_features.__name__):
+        rc = _sync(manifest, dry_run=True)
+
+    assert rc == 0
+    assert capsys.readouterr().out == _nothing_to_sync(manifest)
+    assert _warnings(caplog) == []
+    assert not report.exists()
+
+
 # --- 5. the finding reaches what update_then_restart keeps -------------------
 
 
@@ -437,7 +538,13 @@ runpy.run_module("kestrel_sovereign.cli", run_name="__main__", alter_sys=True)
 """
 
 
-def _fake_host_sync_step(tmp_path, *, fillers=(), downgraded=()):
+_LOCK_FROM_DOWNGRADED = object()
+
+
+def _fake_host_sync_step(
+    tmp_path, *, fillers=(), downgraded=(), declares_claws=True,
+    lock=_LOCK_FROM_DOWNGRADED,
+):
     """The profile's own ``feature_sync`` step, run against a fake host.
 
     The step is the profile's argv with one change: a bootstrap that points
@@ -445,19 +552,27 @@ def _fake_host_sync_step(tmp_path, *, fillers=(), downgraded=()):
     ``__main__``. Claws caps the SDK below the lock, and each of *downgraded*
     (locked at 2.0.0, installed at 1.0.0) below 2. *fillers* are manifest
     entries already installed, which the sync lists and leaves alone.
+    ``declares_claws=False`` leaves claws installed but out of the manifest.
+    *lock* is core's uv.lock (None: there is none); by default it pins core,
+    the SDK, and every one of *downgraded*.
     """
     from kestrel_sovereign.features.restart_coordinator.update_profiles import (
         UPDATE_PROFILES,
     )
 
     (tmp_path / ".kestrel-host-features.toml").write_text(
-        f'[[feature]]\nname = "{CLAWS}"\neditable = "{_claws_checkout(tmp_path)}"\n'
+        (
+            f'[[feature]]\nname = "{CLAWS}"\neditable = "{_claws_checkout(tmp_path)}"\n'
+            if declares_claws else ""
+        )
         + "".join(f'[[feature]]\nname = "{name}"\n' for name in fillers)
     )
+    if lock is _LOCK_FROM_DOWNGRADED:
+        lock = _lock_text(downgraded)
     bootstrap = tmp_path / "fake_host_cli.py"
     bootstrap.write_text(_BOOTSTRAP.format(
         repo=str(REPO_ROOT),
-        core=_core_checkout(tmp_path, _lock_text(downgraded)),
+        core=_core_checkout(tmp_path, lock),
         claws=CLAWS,
         claws_checkout=_claws_checkout(tmp_path),
         fillers=list(fillers),
@@ -518,15 +633,11 @@ async def test_the_finding_reaches_the_update_log_of_update_then_restart(tmp_pat
     assert "lock_findings_unavailable" not in outcome
 
 
-async def test_every_finding_reaches_the_update_log_when_they_outrun_the_tail(
-    tmp_path, monkeypatch,
-):
-    """Thirty-one findings, which alone are longer than the tail the log keeps
-    of each stream: the first ones are cut from both tails, and every one is
-    still in the request's ``update_log``, read back from the row."""
+async def _logged_sync_step(tmp_path, monkeypatch, sync_step) -> dict:
+    """*sync_step* run by the coordinator's update, as its request's
+    ``update_log`` row records it."""
     from kestrel_sovereign.auth import CallerContext, caller_context_scope
     from kestrel_sovereign.features.restart_coordinator.feature import (
-        _OUTPUT_TAIL_CHARS,
         RestartCoordinatorFeature,
     )
     from kestrel_sovereign.features.restart_coordinator.store import (
@@ -542,14 +653,6 @@ async def test_every_finding_reaches_the_update_log_when_they_outrun_the_tail(
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.db import SQLiteBackend
 
-    downgraded = [f"kestrel-locked-{i:02d}" for i in range(30)]
-    expected = [CLAWS_FINDING] + [
-        f"{name} 1.0.0 installed, below the 2.0.0 uv.lock pins; forced by "
-        f"{CLAWS} (requires {name}<2)"
-        for name in downgraded
-    ]
-    assert sum(len(message) for message in expected) > _OUTPUT_TAIL_CHARS
-    sync_step = _fake_host_sync_step(tmp_path, downgraded=downgraded)
     profile = UpdateProfile(
         name="probe", description="", supports_migrations=False,
         _build=lambda *_: [
@@ -591,6 +694,31 @@ async def test_every_finding_reaches_the_update_log_when_they_outrun_the_tail(
         await db.close()
 
     (sync,) = [s for s in logged["steps"] if s["step"] == "feature_sync"]
+    return sync
+
+
+async def test_every_finding_reaches_the_update_log_when_they_outrun_the_tail(
+    tmp_path, monkeypatch,
+):
+    """Thirty-one findings, which alone are longer than the tail the log keeps
+    of each stream: the first ones are cut from both tails, and every one is
+    still in the request's ``update_log``, read back from the row."""
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _OUTPUT_TAIL_CHARS,
+    )
+
+    downgraded = [f"kestrel-locked-{i:02d}" for i in range(30)]
+    expected = [CLAWS_FINDING] + [
+        f"{name} 1.0.0 installed, below the 2.0.0 uv.lock pins; forced by "
+        f"{CLAWS} (requires {name}<2)"
+        for name in downgraded
+    ]
+    assert sum(len(message) for message in expected) > _OUTPUT_TAIL_CHARS
+
+    sync = await _logged_sync_step(
+        tmp_path, monkeypatch, _fake_host_sync_step(tmp_path, downgraded=downgraded),
+    )
+
     assert sync["ok"], sync
     # The tails lost the first findings...
     first = next(m for m in expected if m.startswith("kestrel-locked-00 "))
@@ -599,6 +727,37 @@ async def test_every_finding_reaches_the_update_log_when_they_outrun_the_tail(
     # ...and the update log has every one of them, whole.
     assert sorted(f["message"] for f in sync["lock_findings"]) == sorted(expected)
     assert all(f["kind"] == "lock_downgrade" for f in sync["lock_findings"])
+
+
+@pytest.mark.parametrize("lock, expected", [
+    pytest.param(
+        _LOCK_FROM_DOWNGRADED,
+        {"kind": "lock_downgrade", "message": CLAWS_FINDING},
+        id="below-the-lock",
+    ),
+    pytest.param(
+        None,
+        {"kind": "lock_not_compared", "message": "there is no uv.lock at"},
+        id="no-lock",
+    ),
+])
+async def test_an_empty_manifest_reaches_the_update_log(
+    tmp_path, monkeypatch, lock, expected,
+):
+    """The coordinator keeps an empty manifest's findings too: a list, not
+    the ``lock_findings: None`` of a sync that never compared."""
+    sync = await _logged_sync_step(
+        tmp_path, monkeypatch,
+        _fake_host_sync_step(tmp_path, declares_claws=False, lock=lock),
+    )
+
+    assert sync["ok"], sync
+    assert "declares no features" in sync["stdout_tail"]
+    assert "lock_findings_unavailable" not in sync
+    (finding,) = sync["lock_findings"]
+    assert finding["kind"] == expected["kind"]
+    assert expected["message"] in finding["message"]
+    assert f"WARNING: {finding['message']}" in sync["stdout_tail"]
 
 
 def test_a_damaged_dist_info_does_not_crash_the_scan_for_a_cause(
