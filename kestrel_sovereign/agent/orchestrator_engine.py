@@ -120,10 +120,11 @@ _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
 # first ``stream_with_tool_detection`` (#3552) and each tool-loop follow-up, so
 # a hung upstream (anthropic 429 backoff, network blip, frozen provider queue,
 # a local model still loading) surfaces as a visible failure instead of silent
-# dead air. It fires after this many seconds WITHOUT a stream item (#3300) —
-# re-armed on every item — so a long but progressing response is never killed,
-# and it applies PER call, so a long multi-iteration turn isn't either. See
-# ``LLMCallWatchdog``.
+# dead air. It fires after this many seconds WITHOUT provider progress (#3300)
+# — re-armed on every stream item and on every provider event the adapter
+# reports that yields none (#3357) — so a long but progressing response is
+# never killed, and it applies PER call, so a long multi-iteration turn isn't
+# either. See ``LLMCallWatchdog``.
 ORCHESTRATOR_TURN_TIMEOUT_SECS = float(
     os.environ.get("KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS", "180")
 )
@@ -153,11 +154,16 @@ class LLMCallWatchdog:
     pending wait cancelled, which closes the provider request, and raises
     :class:`LLMCallInactivityTimeout`.
 
-    * :meth:`watch` bounds a streamed call; each item it yields is progress.
+    * :meth:`watch` bounds a streamed call. Each item it yields is progress,
+      and so is each provider event its adapter reports that yields no item
+      (#3357): a tool call's arguments, held until the call is whole, or
+      thinking that is not displayed.
     * :meth:`call` bounds a non-streaming call, which yields nothing until it
       returns. Its progress is what the adapter reports while the answer
-      arrives (:mod:`kestrel_sovereign.llm.call_progress`); a call whose
-      adapter reports none is bounded as a whole.
+      arrives; a call whose adapter reports none is bounded as a whole.
+
+    Reported progress travels on :mod:`kestrel_sovereign.llm.call_progress`,
+    never in the stream, so it re-arms the bound without reaching a consumer.
 
     Only time spent waiting on the provider counts. Time the consumer spends
     on an item does not, and neither does an inline tool the provider is
@@ -3594,10 +3600,11 @@ class OrchestratorEngineMixin:
             #      timeout marker rendered as response prose loses its
             #      tool-card error styling).
             # #3300/#3552: the same inactivity bound as the turn's first call
-            # (``LLMCallWatchdog``). It re-arms on every item, so a response
-            # that is still arriving is never cut off however long it runs,
-            # while a stream that goes silent for the bound — including before
-            # its first item — trips it.
+            # (``LLMCallWatchdog``). It re-arms on every item and on every
+            # provider event the adapter reports (#3357), so a response that
+            # is still arriving is never cut off however long it runs, while a
+            # stream that goes silent for the bound — including before its
+            # first event — trips it.
             watchdog = LLMCallWatchdog.for_call(
                 self.llm_service,
                 model_override=effective_model,
