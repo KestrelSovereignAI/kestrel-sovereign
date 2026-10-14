@@ -1,7 +1,7 @@
 """Backlog Hygiene scanner for Strategic Memory.
 
 Scans GitHub repos for issues missing assignees, milestones,
-labels, or stale issues, and optionally auto-fixes by adding labels.
+status labels, or stale issues, and optionally auto-fixes by adding labels.
 """
 
 import logging
@@ -16,6 +16,8 @@ from .github_integration import (
 )
 
 logger = logging.getLogger(__name__)
+
+TRIAGE_LABEL = "needs-triage"
 
 
 def is_auto_fix(fix: str) -> bool:
@@ -55,7 +57,7 @@ async def run_backlog_hygiene(data: Dict[str, Any], fix: str = "no") -> str:
     total_issues = 0
     missing_assignee: List[Dict] = []
     missing_milestone: List[Dict] = []
-    missing_labels: List[Dict] = []
+    missing_status: List[Dict] = []
     stale_issues: List[Dict] = []
     needs_review: List[Dict] = []
     fixes_applied: List[str] = []
@@ -100,17 +102,12 @@ async def run_backlog_hygiene(data: Dict[str, Any], fix: str = "no") -> str:
                 missing_milestone.append(entry)
 
             # Check: missing status label
-            # BUG #2812: has_status is the predicate this check describes, but
-            # the branch below tests has_any_label, so an entry carrying only a
-            # non-status label (e.g. type:bug) is never reported. Left in place
-            # as evidence — fix the branch, don't delete the unused local.
             status_labels = {"status:blocked", "status:in-progress",
                              "status:ready", "status:done", "status:backlog"}
-            has_status = any(l.lower() in status_labels or  # noqa: F841 - see #2812
+            has_status = any(l.lower() in status_labels or
                             l.lower().startswith("status:") for l in labels)
-            has_any_label = len(labels) > 0
-            if not has_any_label:
-                missing_labels.append(entry)
+            if not has_status:
+                missing_status.append(entry)
 
             # Check: stale (not updated in 14+ days)
             if updated:
@@ -132,7 +129,7 @@ async def run_backlog_hygiene(data: Dict[str, Any], fix: str = "no") -> str:
     lines.append(f"- **{total_issues}** open issues across {len(repos)} repos")
     lines.append(f"- **{len(missing_assignee)}** missing assignee")
     lines.append(f"- **{len(missing_milestone)}** missing milestone")
-    lines.append(f"- **{len(missing_labels)}** missing labels")
+    lines.append(f"- **{len(missing_status)}** missing status label")
     lines.append(f"- **{len(stale_issues)}** stale (14+ days without update)")
     lines.append(f"- **{len(needs_review)}** need human review (no assignee + no milestone)")
     lines.append("")
@@ -149,24 +146,31 @@ async def run_backlog_hygiene(data: Dict[str, Any], fix: str = "no") -> str:
             lines.append(f"- {e['short_repo']}#{e['number']}: {e['title']}")
         lines.append("")
 
-    if missing_labels:
-        lines.append("## Missing Labels")
-        for e in missing_labels:
+    if missing_status:
+        lines.append("## Missing Status Label")
+        for e in missing_status:
             lines.append(f"- {e['short_repo']}#{e['number']}: {e['title']}")
 
-        # Auto-fix: add 'needs-triage' label
+        # Auto-fix: add the triage label. It is not a status label, so an
+        # issue already carrying it is still reported; adding it again would
+        # change nothing and must not be counted as a fix.
         if auto_fix:
             lines.append("")
-            lines.append("### Auto-fix: Adding 'needs-triage' label")
-            for e in missing_labels:
+            lines.append(f"### Auto-fix: Adding '{TRIAGE_LABEL}' label")
+            for e in missing_status:
+                if any(l.lower() == TRIAGE_LABEL for l in e["labels"]):
+                    lines.append(
+                        f"  - Already labelled: {e['short_repo']}#{e['number']}"
+                    )
+                    continue
                 result = await github_api_post(
                     f"/repos/{e['repo']}/issues/{e['number']}/labels",
                     token,
-                    {"labels": ["needs-triage"]},
+                    {"labels": [TRIAGE_LABEL]},
                 )
                 if result is not None:
                     fixes_applied.append(
-                        f"Added 'needs-triage' to {e['short_repo']}#{e['number']}"
+                        f"Added '{TRIAGE_LABEL}' to {e['short_repo']}#{e['number']}"
                     )
                     lines.append(f"  - Added to {e['short_repo']}#{e['number']}")
                 else:
