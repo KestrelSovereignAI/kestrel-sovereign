@@ -1054,6 +1054,43 @@ class SchedulerFeature(Feature):
             if held_skip is not None:
                 return held_skip
 
+        # A row runs through whichever registration holds its source name when
+        # it comes due. The schedule-time refusal (#3131) cannot reach a row
+        # queued before a foreign contract took the name: one persisted on an
+        # earlier boot, before a newly installed feature registered the name
+        # first and kept this scheduler's OPTIONAL registration out as a
+        # MISMATCH. Refuse it rather than render the persisted intent into a
+        # turn under another feature's schema, prompt, trust and pre-turn
+        # guard. An absent source is left to the dispatcher, which refuses it.
+        if mode is SignalMode.COGNITION:
+            source_name = cron_source_name(task_name)
+            registry = getattr(self.agent, "signal_registry", None)
+            registration = (
+                registry.get(source_name) if registry is not None else None
+            )
+            if registration is not None and not self._is_scheduler_cron_contract(
+                task_name, registration
+            ):
+                held_by = self._describe_source_holders(source_name)
+                logger.warning(
+                    "SchedulerFeature: refusing to fire %r -- %r is held by %s "
+                    "with a contract this scheduler did not register "
+                    "(prompt template %s); the row is not run through it "
+                    "(#3131).",
+                    task_name,
+                    source_name,
+                    held_by,
+                    registration.prompt_template,
+                )
+                return ScheduledTaskOutcome(
+                    status="failed",
+                    result_text=(
+                        f"refused: {source_name} is held by {held_by} with a "
+                        "contract this scheduler did not register, so the "
+                        "row was not run through it"
+                    ),
+                )
+
         payload = args or {}
         # A COGNITION cron task is a real turn, so it has to land somewhere a
         # human can see when it was scheduled from a chat window. The session
@@ -3275,12 +3312,70 @@ class SchedulerFeature(Feature):
                     "refused": "bound_wake_cannot_surface",
                 },
             )
+        # 7. A COGNITION-shaped registration is not necessarily THIS one. The
+        #    scheduler registers its sources OPTIONAL, so a feature that took
+        #    the name first with a different contract keeps it and the
+        #    scheduler's is only reported as a MISMATCH. Steps 5-6 accept that
+        #    incumbent, and the row would come due through its schema, prompt,
+        #    trust and pre-turn guard instead of this source's (#3131).
+        if not self._is_scheduler_cron_contract(
+            SELF_FOLLOWUP_TASK_NAME, registration
+        ):
+            held_by = self._describe_source_holders(source_name)
+            return ToolResult.failed(
+                f"The '{source_name}' signal source is held by {held_by} with "
+                "a contract this scheduler did not register (prompt template "
+                f"{registration.prompt_template}). This follow-up would run "
+                "through that contract's schema, prompt and trust policy, not "
+                "its own, so it is refused rather than persisted.",
+                data={
+                    "success": False,
+                    "task_name": SELF_FOLLOWUP_TASK_NAME,
+                    "refused": "foreign_source_contract",
+                    "held_by": held_by,
+                },
+            )
 
         return {
             "intent": intent,
             "origin_session_id": origin_session_id,
             "scheduled_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _is_scheduler_cron_contract(
+        self, task_name: str, registration: Any
+    ) -> bool:
+        """Is *registration* the contract this scheduler registers for *task_name*?
+
+        Only COGNITION cron tasks are asked: their registration is built for the
+        agent alone, so it compares equal across scheduler reloads, whereas an
+        ACTION or ARTIFACT handler captures this feature instance. Compared with
+        :meth:`SourceRegistry.contract_equivalent`, the same structural test
+        that reported the incumbent as a MISMATCH, so a field added to the
+        contract is covered without being listed here (#3131).
+        """
+        from kestrel_sovereign.signals import SourceRegistry
+        from kestrel_sovereign.signals.sources.scheduler import (
+            COGNITION_CRON_REGISTRATION_BUILDERS,
+        )
+
+        expected = COGNITION_CRON_REGISTRATION_BUILDERS[task_name](self.agent)
+        return SourceRegistry.contract_equivalent(registration, expected)
+
+    def _describe_source_holders(self, source_name: str) -> str:
+        """Name who holds *source_name* in the agent's signal registry."""
+        registry = getattr(self.agent, "signal_registry", None)
+        owners_of = getattr(registry, "owners_of", None)
+        if not callable(owners_of):
+            return "a holder this registry does not record"
+        owners = owners_of(source_name)
+        if not owners:
+            # Only a host claim: ``owners_of`` lists feature holders.
+            return "the host"
+        return ", ".join(
+            getattr(owner, "name", None) or type(owner).__name__
+            for owner in owners
+        )
 
     async def _create_schedule(self, **kwargs: Any) -> ToolResult:
         """Persist a schedule, serialised against privacy transitions.

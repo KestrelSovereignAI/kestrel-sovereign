@@ -245,22 +245,32 @@ async def test_a_raising_pre_turn_guard_refuses_rather_than_admitting(
     which is the silent-accept shape this feature is written to avoid.
     """
     agent, feature, _runner, _db, _backend = followup_env
+    from kestrel_sovereign.signals.sources import self_followup as source_module
     from kestrel_sovereign.signals.sources.scheduler import cron_source_name
 
     agent.privacy_config = PrivacyConfig(storage="full")
-    registration = agent.signal_registry.get(
-        cron_source_name(SELF_FOLLOWUP_TASK_NAME)
-    )
+    guard_calls = []
 
-    def _boom(_signal, _agent):
+    def _boom(_signal, *, agent):
+        guard_calls.append(agent)
         raise RuntimeError("guard is broken")
 
-    monkeypatch.setattr(registration, "pre_turn_guard", _boom, raising=False)
+    # The raising guard has to be part of the scheduler's OWN contract.
+    # Swapping the registered source's guard in place makes it a different
+    # contract, which the fire-time contract check (#3131) refuses before any
+    # guard runs, so the guard under test would never be reached.
+    monkeypatch.setattr(
+        source_module, "refuse_followup_under_volatile_privacy", _boom
+    )
+    registry = agent.signal_registry
+    registry.unregister(cron_source_name(SELF_FOLLOWUP_TASK_NAME))
+    registry.register(source_module.build_self_followup_registration(agent))
 
     with pytest.raises(RuntimeError):
         await feature._dispatch_scheduled_task(
             SELF_FOLLOWUP_TASK_NAME, {"intent": SENTINEL}
         )
+    assert guard_calls == [agent], "the raising guard was never reached"
     assert not agent.turn_prompts, (
         "a guard that raised was treated as consent and the turn ran"
     )
