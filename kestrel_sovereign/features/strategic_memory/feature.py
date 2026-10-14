@@ -21,11 +21,16 @@ strategic context at runtime.
 
 import asyncio
 import copy
+import errno
+import hashlib
 import logging
+import os
+import stat
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -187,15 +192,115 @@ except ImportError:
 class _SaveOutcome:
     """Truthful result of a ``_save()`` attempt.
 
-    Distinguishes three states so mutating tools can report honestly
+    Distinguishes four states so mutating tools can report honestly
     (F291): the write actually persisted, the feature is not active
-    (no strategy path — nothing could be saved), or the in-memory
-    update happened but the write itself failed.
+    (no strategy path — nothing could be saved), the write was refused
+    and the file left untouched (#2273), or the in-memory update happened
+    but the write itself failed.
     """
 
     persisted: bool
     no_path: bool = False
     error: Optional[str] = None
+    #: Nothing was written, because writing could erase content this feature
+    #: has not read: STRATEGY.yaml changed since it was last loaded or written,
+    #: could not be read or parsed, was removed, or has no room for the change.
+    refused: bool = False
+    #: The file had changed on disk, so it was re-read and only this call's
+    #: change was applied to what it now holds.
+    reloaded: bool = False
+
+
+class _StrategyFileConflict(Exception):
+    """STRATEGY.yaml cannot take a write without losing what it holds.
+
+    Its contents cannot be read as a mapping, or a change cannot be applied to
+    them. The write is refused rather than falling back to the in-memory copy,
+    which would overwrite content this feature never read (#2273).
+    """
+
+
+def _strategy_digest(raw: Optional[bytes]) -> Optional[str]:
+    """Content hash of STRATEGY.yaml's bytes; ``None`` when there is no file."""
+    return None if raw is None else hashlib.sha256(raw).hexdigest()
+
+
+def _read_strategy_bytes(path: Path) -> Optional[bytes]:
+    """The file's bytes, or ``None`` when it does not exist."""
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _parse_strategy(raw: bytes, path: Path) -> Dict[str, Any]:
+    """Parse STRATEGY.yaml's bytes, refusing anything that is not a mapping.
+
+    An empty file is an empty brief. Anything else that is not a mapping is
+    unreadable: treating it as empty would let the next write replace it.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise _StrategyFileConflict(f"{path} is not valid UTF-8: {e}") from e
+    try:
+        parsed = yaml.safe_load(text)
+    except Exception as e:  # noqa: BLE001 - see below
+        # Not only YAMLError: the safe loader's constructors raise ValueError
+        # for an impossible date (``2026-02-30``) or a bad ``!!int``,
+        # AttributeError for a malformed ``!!timestamp``, and RecursionError
+        # for deep nesting. Each is a hand edit that cannot be read.
+        raise _StrategyFileConflict(f"{path} could not be parsed as YAML: {e}") from e
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise _StrategyFileConflict(
+            f"{path} is a YAML {type(parsed).__name__}, not a mapping"
+        )
+    return parsed
+
+
+def _replace_atomically(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` so it holds the old text or the new, never part.
+
+    Staged in a sibling file and moved over the target with ``os.replace``.
+    Writing the target in place truncates it first, so a failure part-way
+    through (a full disk, a kill) left a partial STRATEGY.yaml behind. Writes
+    through a symlink rather than replacing the link, and keeps the existing
+    file's permission bits. A file this process may not write is refused as
+    the in-place write refused it: ``os.replace`` needs only the directory
+    to be writable, and would otherwise override a read-only STRATEGY.yaml.
+    ``newline=""`` keeps the bytes on disk equal to ``content`` on every
+    platform, so the digest of what was written matches the next read of it.
+    """
+    target = Path(os.path.realpath(path))
+    try:
+        mode: Optional[int] = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        mode = None  # a new file keeps the umask-derived mode write_text gives it
+    if mode is not None and not os.access(target, os.W_OK):
+        raise PermissionError(errno.EACCES, "Permission denied", str(target))
+    staging = target.with_name(
+        f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        staging.write_text(content, encoding="utf-8", newline="")
+        descriptor = os.open(staging, os.O_RDWR)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if mode is not None:
+            os.chmod(staging, mode)
+        os.replace(staging, target)
+    except BaseException:
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            logger.warning(
+                "Could not remove staging file %s: %s", staging, cleanup_error
+            )
+        raise
 
 
 def _load_yaml_simple(text: str) -> dict:
@@ -237,6 +342,10 @@ class StrategicMemoryFeature(Feature):
         super().__init__(agent)
         self._data: Dict[str, Any] = {}
         self._strategy_path: Optional[Path] = None
+        #: Digest of STRATEGY.yaml as this feature last loaded or wrote it;
+        #: ``None`` while it has seen no file. A write goes ahead only while
+        #: the file on disk still matches it (#2273).
+        self._disk_digest: Optional[str] = None
         self._ledger = StrategyLedger(None)
         # One per feature, because the ledger is one shared object per feature.
         # Every ledger mutation, its save, and the snapshot of what that save
@@ -278,11 +387,12 @@ class StrategicMemoryFeature(Feature):
             if agent_data_dir:
                 self._strategy_path = Path(agent_data_dir) / self.STRATEGY_FILENAME
                 if self._strategy_path.exists():
-                    raw = self._strategy_path.read_text(encoding="utf-8")
+                    raw = self._strategy_path.read_bytes()
                     if HAS_YAML:
-                        self._data = yaml.safe_load(raw) or {}
+                        self._data = _parse_strategy(raw, self._strategy_path)
+                        self._disk_digest = _strategy_digest(raw)
                     else:
-                        self._data = _load_yaml_simple(raw)
+                        self._data = _load_yaml_simple(raw.decode("utf-8"))
                     logger.info(
                         f"StrategicMemoryFeature loaded: {len(self._data)} top-level keys"
                     )
@@ -299,15 +409,16 @@ class StrategicMemoryFeature(Feature):
                     # disk. Noticed while adding the index consumers (#2954);
                     # the bug predates them.
                     self._data = copy.deepcopy(self._DEFAULT_TEMPLATE)
-                    self._save()
-                    if self._strategy_path.exists():
+                    outcome = self._save()
+                    if outcome.persisted:
                         logger.info(
                             f"Created default {self.STRATEGY_FILENAME} at {self._strategy_path}"
                         )
                     else:
                         logger.info(
                             f"No {self.STRATEGY_FILENAME} at {self._strategy_path} "
-                            "and could not create template -- strategic memory not active"
+                            "and could not create template -- strategic memory not "
+                            f"active: {outcome.error}"
                         )
             else:
                 logger.debug("No agent_data_dir available -- strategic memory not active")
@@ -399,8 +510,10 @@ class StrategicMemoryFeature(Feature):
             outcome = self._save()
             if not outcome.persisted:
                 # The ledger already has the rows; STRATEGY.yaml keeping its
-                # copy for now is a duplicate, not a loss. Re-read it so the
-                # in-memory brief matches the file that is actually on disk.
+                # copy for now is a duplicate, not a loss, and the next start
+                # migrates it again (absorbing is idempotent). A refused save
+                # is not re-applied to a file edited meanwhile: rows that edit
+                # added were never absorbed, so stripping them would lose them.
                 logger.warning(
                     "Strategy ledger written but STRATEGY.yaml could not be "
                     "trimmed: %s",
@@ -708,6 +821,13 @@ class StrategicMemoryFeature(Feature):
         path means the feature is not active and nothing can be saved,
         and a write exception means the in-memory state diverged from
         disk.
+
+        Writes only over the file this feature last loaded or wrote. The
+        in-memory copy is read once at start, so a file an operator edited
+        since then would otherwise be overwritten with it, silently erasing
+        the edit (#2273). A changed file is refused (``refused=True``) and
+        left untouched; a caller that can re-apply its own change to the file
+        as it now stands does so through :meth:`_reload_and_reapply`.
         """
         if not self._strategy_path:
             return _SaveOutcome(
@@ -718,43 +838,178 @@ class StrategicMemoryFeature(Feature):
                     "active, so nothing was persisted."
                 ),
             )
+        if not HAS_YAML:
+            # Without PyYAML we can't safely round-trip.
+            msg = "PyYAML not installed -- cannot save strategic memory updates."
+            logger.warning(msg)
+            return _SaveOutcome(persisted=False, error=msg)
+        return self._write_strategy(self._data, expected_digest=self._disk_digest)
+
+    def _refused_save(self, reason: str) -> _SaveOutcome:
+        return _SaveOutcome(
+            persisted=False,
+            refused=True,
+            error=(
+                f"Refusing to write {self.STRATEGY_FILENAME}: {reason}. The "
+                "file was left untouched."
+            ),
+        )
+
+    def _write_strategy(
+        self, data: Dict[str, Any], expected_digest: Optional[str]
+    ) -> _SaveOutcome:
+        """Write ``data`` if STRATEGY.yaml still has the digest ``expected_digest``.
+
+        On success ``data`` becomes the in-memory copy and its digest the one
+        the next write must find. Not a cross-process lock: an edit landing
+        between the check and the replace is still lost, a window of one
+        small file write rather than the agent's whole uptime.
+        """
+        path = self._strategy_path
         try:
-            if HAS_YAML:
-                content = yaml.dump(
-                    self._data,
-                    default_flow_style=False,
-                    allow_unicode=True,
-                    sort_keys=False,
-                    width=100,
-                )
-            else:
-                # Without PyYAML we can't safely round-trip.
-                msg = "PyYAML not installed -- cannot save strategic memory updates."
-                logger.warning(msg)
-                return _SaveOutcome(persisted=False, error=msg)
-            self._strategy_path.write_text(content, encoding="utf-8")
-            logger.info("Strategic memory saved")
-            return _SaveOutcome(persisted=True)
-        except Exception as e:
+            on_disk = _read_strategy_bytes(path)
+        except OSError as e:
+            return self._refused_save(
+                f"could not read {path} to check it for external edits: {e}"
+            )
+        if _strategy_digest(on_disk) != expected_digest:
+            return self._refused_save(
+                f"{path} changed on disk since it was last read or written, "
+                "and writing over it would erase that change"
+            )
+        try:
+            content = yaml.dump(
+                data,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+                width=100,
+            )
+            _replace_atomically(path, content)
+        except (OSError, UnicodeError, yaml.YAMLError) as e:
             logger.error(f"Failed to save strategic memory: {e}")
             return _SaveOutcome(
                 persisted=False,
                 error=f"Failed to save strategic memory: {e}",
             )
+        self._data = data
+        self._disk_digest = _strategy_digest(content.encode("utf-8"))
+        logger.info("Strategic memory saved")
+        return _SaveOutcome(persisted=True)
 
-    def _persisted_result(self, confirmation: str, data: Dict[str, Any]) -> ToolResult:
-        """Turn a ``_save()`` outcome into an honest ToolResult (F291).
+    def _reload_and_reapply(
+        self, mutation: Callable[[Dict[str, Any]], None]
+    ) -> _SaveOutcome:
+        """Apply this call's change to STRATEGY.yaml as it is now, and write that.
+
+        For when the in-memory copy cannot take the change: :meth:`_save`
+        refused because the file changed on disk, or the copy read at start
+        has no room for it (a file repaired since then must not need a
+        restart). The file is re-read and only ``mutation`` -- this call's own
+        change -- is applied to it, so whatever the edit added or changed is
+        kept.
+
+        Refuses, leaving the file untouched, when the file is gone, cannot be
+        read as a mapping, or no longer has the shape the change needs. None
+        of those may fall back to the in-memory copy: writing it is exactly
+        the overwrite this exists to prevent.
+        """
+        path = self._strategy_path
+        previous = self._disk_digest
+        try:
+            raw = _read_strategy_bytes(path)
+            if raw is None:
+                raise _StrategyFileConflict(
+                    f"{path} was removed after it was loaded, and recreating "
+                    "it from the in-memory copy would undo that"
+                )
+            fresh = _parse_strategy(raw, path)
+            try:
+                mutation(fresh)
+            except _StrategyFileConflict as e:
+                raise _StrategyFileConflict(
+                    f"this change does not apply to {path} as it now stands: {e}"
+                ) from e
+        except OSError as e:
+            outcome = self._refused_save(f"could not read {path}: {e}")
+            logger.warning(outcome.error)
+            return outcome
+        except _StrategyFileConflict as e:
+            outcome = self._refused_save(str(e))
+            logger.warning(outcome.error)
+            return outcome
+
+        digest = _strategy_digest(raw)
+        if digest != previous:
+            logger.info(
+                "%s changed on disk since it was last loaded or written "
+                "(sha256 %s, now %s); re-read it and applied only this change "
+                "rather than overwrite the edit with the in-memory copy",
+                path,
+                previous[:12] if previous else "none",
+                digest[:12],
+            )
+        outcome = self._write_strategy(fresh, expected_digest=digest)
+        if outcome.refused:
+            logger.warning(outcome.error)
+        elif not outcome.persisted:
+            # The write failed after the reload. Keep the in-memory copy as
+            # the file now stands plus this change -- the PARTIAL contract --
+            # rather than the stale copy the reload replaced.
+            self._data = fresh
+            self._disk_digest = digest
+        outcome.reloaded = True
+        return outcome
+
+    def _persisted_result(
+        self,
+        confirmation: str,
+        data: Dict[str, Any],
+        mutation: Callable[[Dict[str, Any]], None],
+    ) -> ToolResult:
+        """Apply ``mutation`` and turn the ``_save()`` outcome into an honest ToolResult (F291).
+
+        ``mutation`` is this call's change to STRATEGY.yaml's data. It must
+        raise :class:`_StrategyFileConflict` rather than apply to data that
+        lacks the shape it needs. It is applied in memory, then re-applied to
+        the file as it stands if the file changed on disk or the in-memory
+        copy has no room for it (#2273).
 
         - No strategy path -> ERROR (nothing could be persisted).
+        - Write refused -> ERROR (the file was left untouched and the
+          in-memory change is undone, so nothing was recorded anywhere).
         - Write failed -> PARTIAL (in-memory state updated, not on disk).
         - Persisted -> OK.
         """
-        outcome = self._save()
+        before = copy.deepcopy(self._data)
+        try:
+            mutation(self._data)
+        except _StrategyFileConflict as e:
+            outcome = self._refused_save(
+                "this change does not apply to "
+                f"{self._strategy_path or self.STRATEGY_FILENAME}: {e}"
+            )
+        else:
+            outcome = self._save()
+        if outcome.refused and self._strategy_path is not None and HAS_YAML:
+            outcome = self._reload_and_reapply(mutation)
+        reloaded = {"reloaded_from_disk": True} if outcome.reloaded else {}
         if outcome.no_path:
             return ToolResult.failed(
                 outcome.error
                 or "No strategy path configured; nothing was persisted.",
                 data={**data, "persisted": False},
+            )
+        if outcome.refused:
+            self._data = before
+            return ToolResult.failed(
+                f"{outcome.error} Nothing was recorded.",
+                data={
+                    **data,
+                    "recorded": False,
+                    "persisted": False,
+                    "conflict": True,
+                },
             )
         if not outcome.persisted:
             return ToolResult.partial(
@@ -764,11 +1019,11 @@ class StrategicMemoryFeature(Feature):
                     or "In-memory update applied but the write failed; "
                     "changes were not persisted."
                 ),
-                data={**data, "persisted": False},
+                data={**data, "persisted": False, **reloaded},
             )
         return ToolResult.ok(
             confirmation=confirmation,
-            data={**data, "persisted": True},
+            data={**data, "persisted": True, **reloaded},
         )
 
     # ------------------------------------------------------------------
@@ -868,9 +1123,6 @@ class StrategicMemoryFeature(Feature):
             session: Session number when the decision was made
             impact: Expected impact of the decision
         """
-        if "decisions" not in self._data:
-            self._data["decisions"] = []
-
         entry = {
             "date": str(date.today()),
             "session": session,
@@ -878,14 +1130,26 @@ class StrategicMemoryFeature(Feature):
             "rationale": rationale,
             "impact": impact,
         }
-        self._data["decisions"].append(entry)
+
+        def append_decision(strategy: Dict[str, Any]) -> None:
+            decisions = strategy.get("decisions")
+            if decisions is None:
+                decisions = strategy["decisions"] = []
+            elif not isinstance(decisions, list):
+                raise _StrategyFileConflict(
+                    f"its 'decisions' section is a {type(decisions).__name__}, "
+                    "not a list"
+                )
+            decisions.append(entry)
+
         result = self._persisted_result(
             confirmation=f"Decision recorded: {decision}",
             data={"recorded": True, "decision": entry},
+            mutation=append_decision,
         )
         # Index it so recall_decisions and mark_superseded can see it — but
-        # only if it reached canonical YAML. The entry is in ``self._data``
-        # whether or not the write succeeded, so projecting unconditionally
+        # only if it reached canonical YAML. A failed write leaves the entry in
+        # ``self._data`` (the PARTIAL contract), so projecting unconditionally
         # would publish a decision through the index that does not exist in the
         # file the index is derived from. The projection still cannot change
         # the outcome: a decision that reached disk was recorded whether or not
