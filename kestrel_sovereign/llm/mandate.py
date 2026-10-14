@@ -143,6 +143,8 @@ class ModelMandateMixin:
         # and clear_model_preference — previously left {"model", "provider"},
         # which desynced the mandate shape mid-session.
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        # The writer goes with the mandate it wrote (#2652).
+        self._mandate_provenance = None
         self._mandate_fallbacks = []
         logger.info("Model mandate cleared, reset to TOML defaults")
 

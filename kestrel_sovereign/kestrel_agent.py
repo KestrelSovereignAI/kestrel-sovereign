@@ -47,6 +47,11 @@ from pathlib import Path, PurePath
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.agent.model_preference import resolve_replayed_model_preference
+from kestrel_sovereign.llm.provider_policy import (
+    OverrideProvenance,
+    override_writer,
+    system_provenance,
+)
 from kestrel_sovereign.agent.privacy_state import (
     PRIVACY_STATE_UNRECORDED_MESSAGE,
     PrivacyState,
@@ -5152,9 +5157,10 @@ class KestrelAgent(
         if not local_route:
             return _PrivacyModelPlan(preference=current, saved=saved)
         try:
-            preference = llm.resolve_model_preference(
-                local_route["model"], local_route.get("vendor"), local_route.get("route")
-            )
+            with override_writer(system_provenance(via="privacy")):
+                preference = llm.resolve_model_preference(
+                    local_route["model"], local_route.get("vendor"), local_route.get("route")
+                )
         except ValueError as exc:
             logging.error(
                 "The local route %s cannot be set as the model mandate (%s); "
@@ -5192,7 +5198,11 @@ class KestrelAgent(
             return _PrivacyModelPlan(preference=_mandate_triple({}), install=True)
         try:
             preference = resolve_replayed_model_preference(
-                llm, saved.model, saved.vendor, saved.route
+                llm,
+                saved.model,
+                saved.vendor,
+                saved.route,
+                provenance=system_provenance(via="privacy"),
             )
         except ValueError as exc:
             logging.error(
@@ -5223,9 +5233,10 @@ class KestrelAgent(
         if preference["model"] is None:
             llm.clear_model_preference()
             return
-        llm.set_model_preference(
-            preference["model"], preference["vendor"], preference["route"], validate=False
-        )
+        with override_writer(system_provenance(via="privacy")):
+            llm.set_model_preference(
+                preference["model"], preference["vendor"], preference["route"], validate=False
+            )
 
     def _model_mandate_change(self):
         """The LLM service's ``mandate_change``, held by a privacy transition.
@@ -5241,6 +5252,24 @@ class KestrelAgent(
     def _privacy_record_db(self):
         """The database the privacy record lives in; None in a harness without one."""
         return getattr(getattr(self, "_raw_storage", None), "db", None)
+
+    def _privacy_mandate_provenance(
+        self, preference: Mapping[str, Optional[str]]
+    ) -> OverrideProvenance:
+        """Who wrote ``preference``, for the mandate row a transition writes.
+
+        The mandate in force keeps its own writer (#2652). Any other is one a
+        local-only mode forces or restores.
+        """
+        llm = getattr(self, "llm_service", None)
+        in_force = getattr(llm, "_mandate_provenance", None)
+        if (
+            isinstance(in_force, OverrideProvenance)
+            and _mandate_triple(llm.get_model_preference() or {})
+            == _mandate_triple(preference)
+        ):
+            return in_force
+        return system_provenance(via="privacy")
 
     async def _write_privacy_mandate(
         self, preference: Optional[Mapping[str, Optional[str]]]
@@ -5258,7 +5287,10 @@ class KestrelAgent(
             return True
         try:
             await self._write_model_preference(
-                preference["model"], preference["vendor"], preference["route"]
+                preference["model"],
+                preference["vendor"],
+                preference["route"],
+                provenance=self._privacy_mandate_provenance(preference),
             )
         except Exception as exc:  # noqa: BLE001 - the caller refuses the transition
             logging.error(

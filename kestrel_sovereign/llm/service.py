@@ -13,6 +13,7 @@ import json
 import time
 import asyncio
 import inspect
+from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
@@ -71,6 +72,19 @@ from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import BackendType, RemoteBackendMixin
 from .decision_service import DecisionServiceMixin
 from .modality_recording import ModalityRecordingMixin
+from .provider_policy import (
+    OVERRIDE_HISTORY_LIMIT,
+    OverrideProvenance,
+    ProviderPolicyRefusal,
+    approved_vendors,
+    current_override_writer,
+    describe_chain,
+    parse_denied_providers,
+    provider_is_denied,
+    route_priority_entries,
+    selector_is_denied,
+    utc_now_iso,
+)
 from .decisions.resolve import RouteDecisionState
 from .decisions.config import DecisionRouteConfig
 from kestrel_sovereign.kestrel_config.constants import (
@@ -364,6 +378,14 @@ class ModelNotAvailableForRoute(LLMError):
         super().__init__(message)
 
 
+def _accepts_keyword(callback: Any, name: str) -> bool:
+    """Whether ``callback`` names a ``name`` parameter explicitly."""
+    try:
+        return name in inspect.signature(callback).parameters
+    except (ValueError, TypeError):
+        return False
+
+
 def _warn_no_llm_config_found() -> None:
     """Loud warning when ``[llm]`` is empty/missing on LLMService startup.
 
@@ -474,6 +496,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         self.config = load_section("llm")
         if not self.config:
             _warn_no_llm_config_found()
+        # A malformed deny-list fails here, at startup, rather than denying
+        # nothing (#2652).
+        parse_denied_providers(self.config)
         self.mandate_config = load_config("model_mandate.toml")
 
         # Initialize provider registry
@@ -654,7 +679,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         # Persistence callback for model preference (writes to database)
         # Set via set_preference_persistence_callback() after initialization
         self._preference_persistence_callback = None
+        self._preference_persistence_accepts_provenance = False
         self._preference_persistence_tasks: set[asyncio.Task[None]] = set()
+        # Who wrote the mandate in force, and the override decisions made
+        # since start, accepted and refused (#2652).
+        self._mandate_provenance: Optional[OverrideProvenance] = None
+        self._override_history: deque = deque(maxlen=OVERRIDE_HISTORY_LIMIT)
 
         # Persistence callback for the top-level embedding_route knob (#2263).
         # Set via set_embedding_route_persistence_callback(); mirrors the model
@@ -886,8 +916,15 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
         Args:
             callback: Async function(model, provider) to call on preference change
+
+        A callback that accepts a ``provenance`` keyword also receives the
+        :class:`OverrideProvenance` of the write, or None for a cleared
+        preference, so a stored override keeps who wrote it (#2652).
         """
         self._preference_persistence_callback = callback
+        self._preference_persistence_accepts_provenance = _accepts_keyword(
+            callback, "provenance"
+        )
         logger.info("Model preference persistence enabled")
 
     def set_embedding_route_persistence_callback(self, callback) -> None:
@@ -1907,11 +1944,172 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         ``self.providers`` so each user turn skips dead routes immediately.
         If every route has been disabled (pathological), return an empty
         list — the caller raises a clear error rather than pretending.
+
+        Routes ``[llm] denied_providers`` names are never available (#2652).
         """
-        src = providers if providers is not None else self.providers
+        src = self._without_denied(
+            providers if providers is not None else self.providers
+        )
         if not self._disabled_routes:
-            return list(src)
+            return src
         return [p for p in src if p.get("name") not in self._disabled_routes]
+
+    def _denied_providers(self) -> tuple[str, ...]:
+        """``[llm] denied_providers``; see :mod:`.provider_policy`."""
+        return parse_denied_providers(getattr(self, "config", None) or {})
+
+    def _without_denied(
+        self, providers: Optional[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """``providers`` less every route the deny-list names."""
+        denied = self._denied_providers()
+        return [p for p in (providers or []) if not provider_is_denied(p, denied)]
+
+    def _refuse_denied_selector(
+        self, selector: Optional[str], model: Optional[str]
+    ) -> None:
+        """Raise when ``selector`` names only routes the deny-list removed.
+
+        Routing filters denied routes out before matching, so without this a
+        request for one would read as "not configured" rather than refused.
+        """
+        if not selector:
+            return
+        denied = self._denied_providers()
+        if not denied:
+            return
+        vendor, _, route = selector.partition(":")
+        matching = self._filter_providers_by_selector(self.providers or [], selector)
+        if selector_is_denied(vendor, route or None, denied) or (
+            matching and all(provider_is_denied(p, denied) for p in matching)
+        ):
+            raise ProviderPolicyRefusal(
+                ProviderPolicyRefusal.PROVIDER_DENIED,
+                vendor=vendor,
+                route=route or None,
+                model=model,
+                reason=(
+                    f"'{selector}' is listed in [llm] denied_providers and is "
+                    "never used"
+                ),
+            )
+
+    def _admit_model_preference(
+        self,
+        preference: Dict[str, Optional[str]],
+        provenance: OverrideProvenance,
+    ) -> None:
+        """Refuse ``preference`` unless the provider policy admits it (#2652).
+
+        A denied provider is refused whoever wrote the override. An override
+        the agent wrote must also select a vendor in the approved chain. A
+        refusal is recorded, logged at WARNING and raised; it installs nothing.
+        """
+        vendor = preference.get("vendor")
+        route = preference.get("route")
+        model = preference.get("model")
+        selector = f"{vendor}:{route}" if vendor and route else vendor
+        try:
+            self._refuse_denied_selector(selector, model)
+            if provenance.narrowed_by_chain:
+                approved = approved_vendors(
+                    getattr(self, "config", None) or {},
+                    getattr(self, "providers", None) or [],
+                    self._denied_providers(),
+                )
+                # An empty chain (every approved vendor denied, or nothing
+                # declared and nothing initialized) admits nothing: it is not
+                # a missing chain that admits everything.
+                if vendor not in approved:
+                    chain = ", ".join(sorted(approved)) or "empty"
+                    raise ProviderPolicyRefusal(
+                        ProviderPolicyRefusal.OUTSIDE_APPROVED_CHAIN,
+                        vendor=vendor,
+                        route=route,
+                        model=model,
+                        reason=(
+                            f"an override the agent writes may select only a "
+                            f"provider in the approved chain ({chain}); "
+                            f"'{selector or model}' is not in it"
+                        ),
+                        source=provenance.source,
+                        approved_vendors=approved,
+                    )
+        except ProviderPolicyRefusal as refusal:
+            if refusal.source is None:
+                refusal.source = provenance.source
+            self._record_override_decision(preference, provenance, refusal=refusal)
+            logger.warning(
+                "Model override refused (%s): agent=%s task=%s source=%s "
+                "role=%s provider=%s model=%s",
+                refusal.code,
+                getattr(self, "_agent_display_name", None),
+                provenance.task,
+                provenance.source.value,
+                provenance.role,
+                refusal.provider,
+                model,
+            )
+            raise
+
+    def _record_override_decision(
+        self,
+        preference: Dict[str, Optional[str]],
+        provenance: OverrideProvenance,
+        *,
+        refusal: Optional[ProviderPolicyRefusal] = None,
+    ) -> None:
+        """Add one override decision to the audit history."""
+        history = getattr(self, "_override_history", None)
+        if history is None:
+            history = deque(maxlen=OVERRIDE_HISTORY_LIMIT)
+            self._override_history = history
+        history.append({
+            "vendor": preference.get("vendor"),
+            "route": preference.get("route"),
+            "model": preference.get("model"),
+            "agent": getattr(self, "_agent_display_name", None),
+            **provenance.to_dict(),
+            "accepted": refusal is None,
+            "refusal": refusal.to_dict() if refusal is not None else None,
+            "decided_at": utc_now_iso(),
+        })
+
+    def describe_provider_policy(self) -> Dict[str, Any]:
+        """The provider policy in force, for the read-only audit surface.
+
+        The effective chain with each route's state, the deny-list, the
+        override in force with who wrote it, and the override decisions made
+        since this service started, newest last (#2652).
+        """
+        config = getattr(self, "config", None) or {}
+        providers = getattr(self, "providers", None) or []
+        denied = self._denied_providers()
+        preference = self.get_model_preference()
+        provenance = getattr(self, "_mandate_provenance", None)
+        override = None
+        if preference.get("model"):
+            override = {
+                "vendor": preference.get("vendor"),
+                "route": preference.get("route"),
+                "model": preference.get("model"),
+                "agent": getattr(self, "_agent_display_name", None),
+                "provenance": provenance.to_dict() if provenance else None,
+            }
+        return {
+            "route_priority": route_priority_entries(config),
+            "chain_declared": bool(route_priority_entries(config)),
+            "chain": describe_chain(
+                config,
+                providers,
+                denied,
+                getattr(self, "_disabled_routes", None) or {},
+            ),
+            "approved_vendors": sorted(approved_vendors(config, providers, denied)),
+            "denied_providers": list(denied),
+            "override": override,
+            "override_history": list(getattr(self, "_override_history", None) or ()),
+        }
 
     def set_model_preference(
         self,
@@ -1944,6 +2142,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 zero matches (unknown model) or multiple matches (ambiguous);
                 or if an explicit ``{vendor, route, model}`` triple names a
                 route that is not configured, or a model not serveable on it.
+            ProviderPolicyRefusal: if the provider policy refuses the override
+                for the writer :func:`~.provider_policy.override_writer` names,
+                or for the agent when none is named (#2652); nothing is
+                installed or persisted. A ``ValueError`` too.
             MandateChangeInProgressError: if another caller holds
                 :meth:`mandate_change`.
         """
@@ -1952,9 +2154,13 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             return
 
         self._refuse_mandate_change_held_elsewhere()
-        self._mandate_preference = self.resolve_model_preference(
+        provenance = current_override_writer(via="set_model_preference")
+        preference = self.resolve_model_preference(
             model, vendor, route, validate=validate
         )
+        self._mandate_preference = preference
+        self._mandate_provenance = provenance
+        self._record_override_decision(preference, provenance)
         vendor = self._mandate_preference["vendor"]
         # A mandate is in effect again — clear any recorded boot-time drop so
         # the health surface stops reporting a condition the operator fixed
@@ -1982,7 +2188,29 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         raises the same ``ValueError``, but installs and persists nothing. A
         caller that must record a mandate durably before it takes effect
         (a privacy-mode transition, #3554) resolves it here first.
+
+        The provider policy admits the resolved mandate here too, for the
+        writer :func:`~.provider_policy.override_writer` names, else for the
+        agent (#2652), so a refusal comes before any consent, plan or write
+        that would follow it.
         """
+        preference = self._resolve_model_preference_unchecked(
+            model, vendor, route, validate=validate
+        )
+        self._admit_model_preference(
+            preference, current_override_writer(via="resolve_model_preference")
+        )
+        return preference
+
+    def _resolve_model_preference_unchecked(
+        self,
+        model: str,
+        vendor: Optional[str],
+        route: Optional[str],
+        *,
+        validate: bool,
+    ) -> Dict[str, Optional[str]]:
+        """Resolve and validate a mandate; see :meth:`resolve_model_preference`."""
         if vendor is None:
             resolved = self._resolve_vendor_for_model(model)
             if isinstance(resolved, list):
@@ -2164,6 +2392,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         """
         self._refuse_mandate_change_held_elsewhere()
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        self._mandate_provenance = None
         # Returning to automatic routing is a DELIBERATE unpinned state, so the
         # boot-failure notice must go with it (#3190 r3 P2). Only the set path
         # cleared it, so health went on reporting "a persisted preference
@@ -2195,10 +2424,16 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             # No running loop — skip persistence (happens in tests/sync contexts)
             return None
 
-        task = loop.create_task(
-            self._preference_persistence_callback(model, vendor, route),
-            name="llm-preference-persistence",
-        )
+        if getattr(self, "_preference_persistence_accepts_provenance", False):
+            write = self._preference_persistence_callback(
+                model,
+                vendor,
+                route,
+                provenance=getattr(self, "_mandate_provenance", None),
+            )
+        else:
+            write = self._preference_persistence_callback(model, vendor, route)
+        task = loop.create_task(write, name="llm-preference-persistence")
         self._preference_persistence_tasks.add(task)
         task.add_done_callback(self._handle_preference_persistence_done)
         return task
@@ -2469,6 +2704,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 if matching:
                     providers_to_use = matching
                 else:
+                    # A denied provider is refused by name (#2652), not
+                    # reported as unconfigured.
+                    self._refuse_denied_selector(left, model_name)
                     # If the requested route exists but was disabled earlier
                     # in this session (#655), say so specifically — "not
                     # available" misleads the caller into thinking it was
@@ -2508,6 +2746,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             if pref_vendor:
                 selector = f"{pref_vendor}:{pref_route}" if pref_route else pref_vendor
                 matching = self._filter_providers_by_selector(providers_to_use, selector)
+                if not matching:
+                    # A mandate on a denied provider is refused by name, never
+                    # served by its fallbacks (#2652).
+                    self._refuse_denied_selector(selector, pref_model)
                 if matching:
                     providers_to_use = matching
                     mandate_pin = True
@@ -2527,7 +2769,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                         fb_vendor = fb.get("vendor") or fb.get("provider")
                         if fb_vendor:
                             match_list = self._filter_providers_by_selector(
-                                self.providers,
+                                self._without_denied(self.providers),
                                 fb_vendor,
                             )
                             if match_list:
@@ -5226,17 +5468,29 @@ No other text or formatting.
         self._check_policy()
         invocation_context = self._resolve_invocation_context(invocation_context)
         provider_for_model = None
-        for provider in self.providers:
+        permitted = self._without_denied(self.providers)
+        for provider in permitted:
             if provider["model"] == model_id or model_id in provider["model"]:
                 provider_for_model = provider
                 break
 
         if not provider_for_model:
+            denied_match = next(
+                (
+                    p for p in self.providers
+                    if p not in permitted
+                    and (p["model"] == model_id or model_id in p["model"])
+                ),
+                None,
+            )
+            if denied_match is not None:
+                # Served only by a denied route: refused, not auto-pulled (#2652).
+                self._refuse_denied_selector(denied_match.get("name"), model_id)
             if ":" in model_id and auto_pull:
                 logger.info(f"Model '{model_id}' not found. Attempting auto-pull...")
                 try:
                     await self.pull_model(model_id, auto_confirm=True)
-                    for provider in self.providers:
+                    for provider in permitted:
                         if provider.get("vendor") == "ollama":
                             provider_for_model = provider
                             break
@@ -5728,6 +5982,7 @@ No other text or formatting.
                     providers = matched
                     logger.info(f"Model mandate: using {target_provider} with {target_model}")
                 elif model_override:
+                    self._refuse_denied_selector(target_provider, target_model)
                     # Same disabled-route helpful error as in
                     # resolve_provider_routing — if the requested target
                     # matches a route that was disabled this session,

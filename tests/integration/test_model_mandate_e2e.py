@@ -6,8 +6,9 @@ Uses TestClient for API tests - no running server required.
 """
 from contextlib import asynccontextmanager
 import pytest
-from typing import Dict, Any
 from fastapi.testclient import TestClient
+
+from tests.utils.override_writers import as_operator
 
 
 @asynccontextmanager
@@ -61,9 +62,12 @@ class TestModelMandateMethods:
         llm_service.providers.append(
             {"name": "test-vendor:api", "vendor": "test-vendor", "route": "api", "model": "auto"}
         )
-        llm_service.set_model_preference(
-            "test-model-123", vendor="test-vendor", route="api"
-        )
+        # Outside whatever chain the host config declares: the operator's pin
+        # (#2652).
+        with as_operator():
+            llm_service.set_model_preference(
+                "test-model-123", vendor="test-vendor", route="api"
+            )
 
         mandate = llm_service.get_current_mandate()
         assert mandate["preference"]["model"] == "test-model-123"
@@ -110,7 +114,8 @@ class TestModelMandateMethods:
         llm_service.providers.append(
             {"name": "custom-vendor:api", "vendor": "custom-vendor", "route": "api", "model": "auto"}
         )
-        llm_service.set_model_preference("custom-model", vendor="custom-vendor")
+        with as_operator():
+            llm_service.set_model_preference("custom-model", vendor="custom-vendor")
         llm_service.add_fallback_model("custom-fallback")
 
         # Verify it was set

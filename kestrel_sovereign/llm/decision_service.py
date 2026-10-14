@@ -50,6 +50,7 @@ from .decisions.resolve import (
 )
 from .decisions.thresholds import ThresholdBook
 from .modality_recording import ModalityCall
+from .provider_policy import parse_denied_providers, provider_is_denied
 
 logger = logging.getLogger(__name__)
 
@@ -142,9 +143,13 @@ class DecisionServiceMixin:
         if not isinstance(providers, list):
             return []
         disabled = getattr(self, "_disabled_routes", None) or ()
+        # Routes ``[llm] denied_providers`` names are never used (#2652).
+        denied = parse_denied_providers(getattr(self, "config", None) or {})
         return [
             p for p in providers
-            if _supports_decisions(p) and p.get("name") not in disabled
+            if _supports_decisions(p)
+            and p.get("name") not in disabled
+            and not provider_is_denied(p, denied)
         ]
 
     def describe_decision_routes(self) -> List[Dict[str, Any]]:
