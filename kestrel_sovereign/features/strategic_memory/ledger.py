@@ -25,6 +25,12 @@ Two properties this file is responsible for, both absent before:
 2. **Supersession.** A row is retired in place (``superseded_at`` for a
    pattern, ``resolved_at`` for a blocker) rather than appended around. The
    history stays; the active view shrinks.
+
+It also keeps the file's edits. The ledger is read once at start, so writing
+the whole in-memory copy back would erase anything a human changed in the file
+since -- the damage #2273 fixed for STRATEGY.yaml. A write now goes ahead only
+over the bytes this ledger last read or wrote; a changed file is re-read and
+only the calling tool's own change is applied to it (#3636).
 """
 
 from __future__ import annotations
@@ -37,7 +43,9 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+
+from .atomic_file import file_digest, read_file_bytes, replace_atomically
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +217,78 @@ def _rows(data: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
     return [row for row in value if isinstance(row, dict)]
 
 
+class LedgerChangeConflict(Exception):
+    """A change cannot be applied to the ledger as it now stands.
+
+    Raised by the change a caller hands :meth:`StrategyLedger.commit` when the
+    rows it acts on are gone from the file, or no longer in the state it needs:
+    a pattern already superseded, a blocker already resolved by hand. Applying
+    it anyway would act on a row the caller never saw.
+    """
+
+
+class _LedgerFileError(Exception):
+    """The file's bytes cannot be read as a ledger; the message says why."""
+
+
+@dataclass
+class LedgerCommit:
+    """Truthful result of :meth:`StrategyLedger.commit`.
+
+    ``error`` is ``None`` exactly when the change reached the file. Otherwise
+    ``refused`` says which of two things happened: nothing was written and the
+    change was undone in memory too (the file could not take it without losing
+    something), or the change is held in memory and only the write failed.
+    """
+
+    #: What the change returned on the last pass that ran: after a reload,
+    #: computed against the file as it now stands. A refused commit keeps what
+    #: the change would have recorded.
+    value: Any = None
+    error: Optional[str] = None
+    refused: bool = False
+    #: The file had changed on disk, so it was re-read and only this change
+    #: was applied to what it now holds.
+    reloaded: bool = False
+
+    @property
+    def persisted(self) -> bool:
+        return self.error is None
+
+
+def _parse_ledger(raw: bytes) -> Optional[Dict[str, Any]]:
+    """Parse the ledger's bytes; ``None`` for an empty file, which is an empty ledger.
+
+    Raises :class:`_LedgerFileError` for bytes that are not a ledger.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise _LedgerFileError(f"could not be read: {e}") from e
+    if not HAS_YAML:
+        raise _LedgerFileError("PyYAML is not installed, so it cannot be parsed")
+    try:
+        parsed = yaml.safe_load(text)
+    except Exception as e:  # noqa: BLE001
+        # Not only YAMLError: the safe loader also raises ValueError,
+        # AttributeError and RecursionError on hand edits it cannot read.
+        raise _LedgerFileError(f"could not be parsed as YAML: {e}") from e
+    if parsed is None:
+        return None
+    if not isinstance(parsed, dict):
+        raise _LedgerFileError("is not a YAML mapping")
+    for key in (PATTERNS_KEY, BLOCKERS_KEY):
+        value = parsed.get(key)
+        if key in parsed and not isinstance(value, list):
+            # Do NOT normalize this away. Replacing a malformed section
+            # with an empty list makes the next save silently delete
+            # whatever was actually in there.
+            raise _LedgerFileError(
+                f"section {key!r} is a {type(value).__name__}, not a list"
+            )
+    return parsed
+
+
 class StrategyLedger:
     """Load/mutate/persist ``STRATEGY_LEDGER.yaml``.
 
@@ -237,6 +317,20 @@ class StrategyLedger:
         #: refreshed by a mutation, and not by a failed save: see
         #: :class:`LedgerSnapshot`.
         self._persisted_snapshot: Optional[LedgerSnapshot] = None
+        #: Digest of the file as this ledger last loaded or wrote it; ``None``
+        #: while it has seen no file. A write goes ahead only while the file
+        #: on disk still matches it (#3636).
+        self._disk_digest: Optional[str] = None
+        #: Why the last write was refused over a file that changed on disk or
+        #: could not be checked, or ``None``. :meth:`save` keeps its
+        #: ``Optional[str]`` contract, so this is how :meth:`commit` tells a
+        #: refusal it can recover from by re-reading the file from a write
+        #: that failed.
+        self._write_refusal: Optional[str] = None
+        #: Whether a failed write left a change in memory that the file does
+        #: not hold. The next successful write carries it, unless the file
+        #: changed meanwhile: a reload applies only the calling change.
+        self._holds_unwritten_change = False
 
     # ------------------------------------------------------------------
     # Persistence
@@ -325,37 +419,25 @@ class StrategyLedger:
     def _load(self) -> None:
         self.load_error = None
         self._unsaved_normalization = 0
-        if not self.path or not self.path.exists():
+        self._disk_digest = None
+        if not self.path:
             return
         try:
-            raw = self.path.read_text(encoding="utf-8")
-        except Exception as e:  # noqa: BLE001
+            raw = read_file_bytes(self.path)
+        except OSError as e:
             self._fail_load(f"could not be read: {e}")
             return
-        if not HAS_YAML:
-            self._fail_load("PyYAML is not installed, so it cannot be parsed")
+        if raw is None:
             return
         try:
-            parsed = yaml.safe_load(raw)
-        except Exception as e:  # noqa: BLE001
-            self._fail_load(f"could not be parsed as YAML: {e}")
+            parsed = _parse_ledger(raw)
+        except _LedgerFileError as e:
+            self._fail_load(str(e))
             return
+        self._disk_digest = file_digest(raw)
         if parsed is None:
             # An empty file is an empty ledger, not a malformed one.
             return
-        if not isinstance(parsed, dict):
-            self._fail_load("is not a YAML mapping")
-            return
-        for key in (PATTERNS_KEY, BLOCKERS_KEY):
-            value = parsed.get(key)
-            if key in parsed and not isinstance(value, list):
-                # Do NOT normalize this away. Replacing a malformed section
-                # with an empty list makes the next save silently delete
-                # whatever was actually in there.
-                self._fail_load(
-                    f"section {key!r} is a {type(value).__name__}, not a list"
-                )
-                return
         self.data = parsed
         self.normalize()
 
@@ -384,7 +466,15 @@ class StrategyLedger:
         return minted
 
     def save(self) -> Optional[str]:
-        """Persist the ledger. Returns ``None`` on success, else the reason."""
+        """Persist the ledger. Returns ``None`` on success, else the reason.
+
+        Writes only over the file this ledger last loaded or wrote. The ledger
+        is read once at start, so a file edited since would otherwise be
+        overwritten with the copy read then, silently erasing the edit
+        (#3636). A changed file is refused and left untouched; a caller with a
+        change to re-apply to the file as it now stands uses :meth:`commit`.
+        """
+        self._write_refusal = None
         if not self.path:
             return (
                 "No ledger path configured -- strategic memory is not active, "
@@ -403,21 +493,194 @@ class StrategyLedger:
             return (
                 f"PyYAML not installed -- cannot save {LEDGER_FILENAME}."
             )
+        return self._write(self.data, expected_digest=self._disk_digest)
+
+    def _refusal(self, reason: str) -> str:
+        return (
+            f"Refusing to write {LEDGER_FILENAME}: {reason}. The file was left "
+            "untouched."
+        )
+
+    def _write(
+        self, data: Dict[str, Any], expected_digest: Optional[str]
+    ) -> Optional[str]:
+        """Write ``data`` if the file still has the digest ``expected_digest``.
+
+        Returns ``None`` on success, else the reason; a refusal over a changed
+        or uncheckable file is also recorded in :attr:`_write_refusal`. On
+        success ``data`` becomes the ledger and its digest the one the next
+        write must find. Not a cross-process lock: an edit landing between the
+        check and the replace is still lost, a window of one small file write
+        rather than the agent's whole uptime.
+        """
+        self._write_refusal = None
+        path = self.path
+        try:
+            on_disk = read_file_bytes(path)
+        except OSError as e:
+            self._write_refusal = (
+                f"could not read {path} to check it for external edits: {e}"
+            )
+            return self._refusal(self._write_refusal)
+        if file_digest(on_disk) != expected_digest:
+            self._write_refusal = (
+                f"{path} changed on disk since it was last read or written, "
+                "and writing over it would erase that change"
+            )
+            return self._refusal(self._write_refusal)
         try:
             content = yaml.dump(
-                self.data,
+                data,
                 default_flow_style=False,
                 allow_unicode=True,
                 sort_keys=False,
                 width=100,
             )
-            self.path.write_text(content, encoding="utf-8")
-        except Exception as e:  # noqa: BLE001
-            logger.error("Failed to save %s: %s", self.path, e)
+            replace_atomically(path, content)
+        except (OSError, UnicodeError, yaml.YAMLError) as e:
+            logger.error("Failed to save %s: %s", path, e)
+            self._holds_unwritten_change = True
             return f"Failed to save {LEDGER_FILENAME}: {e}"
+        self.data = data
+        self._disk_digest = file_digest(content.encode("utf-8"))
         self._unsaved_normalization = 0
+        self._holds_unwritten_change = False
         self._capture_snapshot(confirmed=True)
         return None
+
+    def commit(self, change: Callable[["StrategyLedger"], Any]) -> LedgerCommit:
+        """Apply ``change`` and persist it without erasing edits made on disk.
+
+        ``change`` is one caller's mutation, written against a ledger: it finds
+        the rows it acts on itself and raises :class:`LedgerChangeConflict`
+        rather than act on rows that are gone or no longer in the state it
+        needs. It is applied here and saved. If the file changed on disk since
+        this ledger last loaded or wrote it, the in-memory change is undone,
+        the file is re-read, and ``change`` alone is applied to what it now
+        holds and written -- so the edit is kept rather than overwritten by
+        the copy read at start (#3636).
+
+        Refused, leaving the file untouched and the in-memory ledger as it
+        was, when the file was removed, cannot be read as a ledger, or no
+        longer takes the change. None of those may fall back to the in-memory
+        copy: writing it is exactly the overwrite this exists to prevent.
+
+        A write that fails outright (a full disk) keeps the change in memory,
+        to be carried by the next successful write.
+        """
+        before = copy.deepcopy(self.data)
+        unsaved = self._unsaved_normalization
+        value: Any = None
+        try:
+            value = change(self)
+        except LedgerChangeConflict as e:
+            # The copy read at start has no room for the change. The file may
+            # have been edited so that it does, and needs no restart for it.
+            conflict: Optional[str] = str(e)
+        else:
+            conflict = None
+            # Reset here too: a replaced ``save`` must not inherit a refusal
+            # an earlier write recorded.
+            self._write_refusal = None
+            error = self.save()
+            if error is None:
+                return LedgerCommit(value=value)
+            if self._write_refusal is None:
+                # The write failed, or there is no file to write to: nothing
+                # on disk is newer than this ledger, so the change is held.
+                return LedgerCommit(value=value, error=error)
+        self.data = before
+        self._unsaved_normalization = unsaved
+        if not self.path or self.load_error or not HAS_YAML:
+            return LedgerCommit(
+                value=value,
+                error=self._refusal(f"this change does not apply: {conflict}"),
+                refused=True,
+            )
+        held = self._holds_unwritten_change
+        outcome = self._reload_and_reapply(change)
+        if held and outcome.reloaded and not outcome.refused:
+            logger.warning(
+                "%s changed on disk while a change an earlier failed write "
+                "left in memory was waiting to be written. The ledger now "
+                "holds the file plus only this call's change; the earlier "
+                "change was dropped and must be made again.",
+                self.path,
+            )
+        if outcome.value is None:
+            outcome.value = value
+        return outcome
+
+    def _refused_commit(self, reason: str) -> LedgerCommit:
+        error = self._refusal(reason)
+        logger.warning(error)
+        return LedgerCommit(error=error, refused=True)
+
+    def _reload_and_reapply(
+        self, change: Callable[["StrategyLedger"], Any]
+    ) -> LedgerCommit:
+        """Apply ``change`` to the file as it is now, and write that."""
+        path = self.path
+        previous = self._disk_digest
+        try:
+            raw = read_file_bytes(path)
+        except OSError as e:
+            return self._refused_commit(f"could not read {path}: {e}")
+        digest = file_digest(raw)
+        reloaded = digest != previous
+        fresh = StrategyLedger(path)
+        if not reloaded:
+            # The file is as this ledger last read or wrote it; only the check
+            # failed to read it. The in-memory copy is still the file plus
+            # anything a failed write left held, so the change goes on that.
+            fresh.data = copy.deepcopy(self.data)
+            fresh._unsaved_normalization = self._unsaved_normalization
+        elif raw is None:
+            return self._refused_commit(
+                f"{path} was removed after it was loaded, and recreating it "
+                "from the in-memory copy would undo that"
+            )
+        else:
+            try:
+                parsed = _parse_ledger(raw)
+            except _LedgerFileError as e:
+                return self._refused_commit(f"{path} {e}")
+            if parsed is not None:
+                fresh.data = parsed
+            # Rows written by hand without an id get one, exactly as at load.
+            fresh.normalize()
+        try:
+            value = change(fresh)
+        except LedgerChangeConflict as e:
+            return self._refused_commit(
+                f"this change does not apply to {path} as it now stands: {e}"
+            )
+
+        if reloaded:
+            logger.info(
+                "%s changed on disk since it was last loaded or written "
+                "(sha256 %s, now %s); re-read it and applied only this change "
+                "rather than overwrite the edit with the in-memory copy",
+                path,
+                previous[:12] if previous else "none",
+                digest[:12] if digest else "none",
+            )
+        error = self._write(fresh.data, expected_digest=digest)
+        if error is None:
+            return LedgerCommit(value=value, reloaded=reloaded)
+        if self._write_refusal is not None:
+            # Edited again between the re-read and the write.
+            logger.warning(error)
+            return LedgerCommit(
+                value=value, error=error, refused=True, reloaded=reloaded
+            )
+        # The write failed. Hold the file as it now stands plus this change in
+        # memory -- the same contract as any failed write -- rather than a
+        # stale copy the reload replaced.
+        self.data = fresh.data
+        self._disk_digest = digest
+        self._unsaved_normalization = fresh._unsaved_normalization
+        return LedgerCommit(value=value, error=error, reloaded=reloaded)
 
     # ------------------------------------------------------------------
     # Sections
