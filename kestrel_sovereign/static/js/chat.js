@@ -3319,6 +3319,9 @@ export async function sendMessage(
                     // one (`leadingReviseBoundary`). Either way the left
                     // side is the accumulated `fullContent`; don't glue
                     // "...check.The answer".
+                    // #2970: a pre/post tool join with NO revise boundary is
+                    // not welded here — the server streams its separator as
+                    // visible text, so the bytes render verbatim.
                     if ((pendingReviseBoundary || leadingReviseBoundary)
                         && /^\S/.test(chunk)
                         && fullContent && !/\s$/.test(fullContent)) {
