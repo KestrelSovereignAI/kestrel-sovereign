@@ -34,6 +34,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.error_handling import LLMError
 from kestrel_sovereign.llm.google_adapter import _normalized_google_genai_usage
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.llm.output_ceiling import response_stop_reason
@@ -78,6 +79,15 @@ BUDGET_200 = _body([{"text": "The Scales of Aerion,"}], "MAX_TOKENS", {
     "promptTokenCount": 11, "candidatesTokenCount": 6,
     "totalTokenCount": 207, "thoughtsTokenCount": 190,
 })
+#: ``max_tokens=200``, the counts #3623 measured through
+#: ``VertexAIAdapter.get_response``: 8 tokens of text after 188 of thinking.
+#: Its text was not recorded; this one stands in for it.
+BUDGET_200_MEASURED = _body(
+    [{"text": "In the jagged peaks of the north,"}], "MAX_TOKENS", {
+        "promptTokenCount": 11, "candidatesTokenCount": 8,
+        "totalTokenCount": 207, "thoughtsTokenCount": 188,
+    },
+)
 #: A finished answer: 21 tokens of thinking for 2 of text.
 SAID_HELLO = _body([{"text": "Hello!"}], "STOP", {
     "promptTokenCount": 8, "candidatesTokenCount": 2,
@@ -99,6 +109,10 @@ CASES = {
     "budget-200": (
         BUDGET_200, STORY, 200,
         ("The Scales of Aerion,", "MAX_TOKENS", 11, 196, 207),
+    ),
+    "budget-200-measured": (
+        BUDGET_200_MEASURED, STORY, 200,
+        ("In the jagged peaks of the north,", "MAX_TOKENS", 11, 196, 207),
     ),
     "said-hello": (SAID_HELLO, HELLO, None, ("Hello!", "STOP", 8, 23, 31)),
     "no-thinking": (
@@ -404,7 +418,7 @@ async def test_the_thinking_is_billed_as_completion_tokens(
     if stop_reason == "STOP":
         await _call(llm, entry, messages)
     else:
-        with pytest.raises(Exception):
+        with pytest.raises(LLMError, match=f"stop_reason={stop_reason}"):
             await _call(llm, entry, messages)
 
     assert wire.generations() == [
