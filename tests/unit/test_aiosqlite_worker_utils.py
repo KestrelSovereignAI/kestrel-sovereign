@@ -1,10 +1,18 @@
 """Tests for aiosqlite worker-lifecycle synchronization helpers."""
 
 import asyncio
+import threading
 
 import pytest
 
-from tests.utils.aiosqlite_workers import wait_for_lifecycle_checkpoint
+import kestrel_sovereign.storage.db.sqlite as sqlite_module
+from kestrel_sovereign.storage.db import SQLiteBackend
+from tests.utils.aiosqlite_workers import (
+    CloseStage,
+    aiosqlite_worker,
+    observe_bounded_close_stages,
+    wait_for_lifecycle_checkpoint,
+)
 
 
 @pytest.mark.asyncio
@@ -116,50 +124,6 @@ async def test_lifecycle_checkpoint_reports_owner_cancellation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_checkpoint_tolerates_contracted_owner_failure() -> None:
-    """An owner whose failure IS the asserted behavior must not read as a flake.
-
-    ``test_factory_dispose_error_preserves_cleanup_timeout_for_checked_out_worker``
-    (in ``tests/unit/storage/test_db_backends.py``) patches the shutdown drain
-    to 0.01s and asserts ``db.close()`` raises, so the owner terminating before
-    the held worker publishes its checkpoint is a legitimate scheduling order —
-    aiosqlite resolves the close future before it reaches the injected exit
-    delay, making the race genuine rather than theoretical.  That is the only
-    opted-out call site; the default fail-closed rule still applies everywhere
-    else (see ``test_lifecycle_checkpoint_reports_owner_failure``).
-    """
-    failure = RuntimeError("worker did not terminate")
-    checkpoint = asyncio.Event()
-
-    async def owner() -> None:
-        raise failure
-
-    owner_task = asyncio.create_task(owner())
-    await asyncio.wait({owner_task})
-    assert owner_task.done()
-
-    async def publish_checkpoint_after_owner_failed() -> None:
-        await asyncio.sleep(0)
-        checkpoint.set()
-
-    publisher = asyncio.create_task(publish_checkpoint_after_owner_failed())
-    try:
-        await wait_for_lifecycle_checkpoint(
-            checkpoint.wait(),
-            owner_task,
-            description="the delayed worker exit",
-            harness_timeout=1.0,
-            require_live_lifecycle=False,
-        )
-    finally:
-        await publisher
-
-    assert checkpoint.is_set()
-    # The owner's failure stays intact for the caller to assert on itself.
-    assert owner_task.exception() is failure
-
-
-@pytest.mark.asyncio
 async def test_lifecycle_checkpoint_has_finite_deadlock_guard() -> None:
     owner_release = asyncio.Event()
 
@@ -181,3 +145,77 @@ async def test_lifecycle_checkpoint_has_finite_deadlock_guard() -> None:
     finally:
         owner_release.set()
         await owner_task
+
+
+@pytest.mark.asyncio
+async def test_close_stages_record_both_waits_and_the_deadline(tmp_path) -> None:
+    backend = SQLiteBackend(str(tmp_path / "observed-close.db"))
+    await backend.connect()
+    connection = backend._connection
+    assert connection is not None
+    loop = asyncio.get_running_loop()
+
+    with observe_bounded_close_stages() as stages:
+        started = loop.time()
+        await backend.close()
+        finished = loop.time()
+
+    await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
+    await stages.reached(connection, CloseStage.WORKER_EXIT)
+    budget = sqlite_module._minimum_close_timeout_s()
+    assert started + budget <= stages.deadlines[connection] <= finished + budget
+    assert not aiosqlite_worker(connection).is_alive()
+
+
+@pytest.mark.asyncio
+async def test_close_stages_report_a_wait_while_it_is_armed(tmp_path) -> None:
+    """``reached`` returns while the close is still parked in that wait."""
+    backend = SQLiteBackend(str(tmp_path / "parked-close.db"))
+    await backend.connect()
+    connection = backend._connection
+    assert connection is not None
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block() -> int:
+        entered.set()
+        release.wait()
+        return 1
+
+    await connection.create_function("block", 0, block)
+    blocked = asyncio.create_task(connection.execute("SELECT block()"))
+    close_task = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 30.0)
+        with observe_bounded_close_stages() as stages:
+            close_task = asyncio.create_task(
+                sqlite_module._close_aiosqlite_connection(
+                    connection,
+                    retained_closes=backend._retired_connection_closes,
+                )
+            )
+            await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
+            assert not close_task.done()
+            assert not stages.has_reached(connection, CloseStage.WORKER_EXIT)
+            release.set()
+            await close_task
+            await stages.reached(connection, CloseStage.WORKER_EXIT)
+    finally:
+        release.set()
+        await asyncio.gather(blocked, return_exceptions=True)
+        if close_task is not None:
+            await asyncio.gather(close_task, return_exceptions=True)
+        await asyncio.to_thread(aiosqlite_worker(connection).join, 30.0)
+
+
+def test_close_stages_restore_the_close_helpers() -> None:
+    finish_close = sqlite_module._finish_aiosqlite_connection_close
+    wait_for_worker_exit = sqlite_module._wait_for_aiosqlite_worker_shutdown
+
+    with observe_bounded_close_stages():
+        assert sqlite_module._finish_aiosqlite_connection_close is not finish_close
+
+    assert sqlite_module._finish_aiosqlite_connection_close is finish_close
+    assert (
+        sqlite_module._wait_for_aiosqlite_worker_shutdown is wait_for_worker_exit
+    )
