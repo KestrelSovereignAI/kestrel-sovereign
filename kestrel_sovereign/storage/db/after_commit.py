@@ -34,7 +34,7 @@ def run_after_commit(callback: AfterCommitCallback) -> None:
     """
     try:
         callback()
-    except Exception as error:  # noqa: BLE001 - ordinary reporting failure is not rollback
+    except BaseException as error:  # explicit cancellation/group carriers can contain control
         if is_execution_control_error(error):
             # The original write has committed. Custody/native-close failure
             # is still control, not a logged-and-forgotten reporting error.
@@ -46,6 +46,8 @@ def run_after_commit(callback: AfterCommitCallback) -> None:
             if execution_commit_outcome(error) is not None:
                 raise
             raise ExecutionCommitOutcomeError("committed") from error
+        if not isinstance(error, Exception):
+            raise
         logger.exception("After-commit callback %r failed", callback)
 
 

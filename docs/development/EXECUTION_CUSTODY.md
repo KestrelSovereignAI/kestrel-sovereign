@@ -780,6 +780,15 @@ Cancellation stops publication between statements; it does not manufacture an
 unknown transaction outcome by interrupting a healthy COMMIT. Genuine native
 unknown/committed receipts still fence readiness and remain available at shutdown.
 
+A pure, originally scoped scheduler occurrence denial retires that occurrence,
+not the shared host. The runner retains at most 32 original receipts without
+reauthorizing an expired claim. Runtime/unscoped denial, native close debt and
+committed/unknown outcomes still latch host readiness failure. After-commit
+callbacks preserve that committed distinction across explicit cancellation
+causes and exception groups; ordinary reporting errors remain nonfatal.
+Embedding-width diagnostics likewise propagate original database control rather
+than treating authority/ACK loss as unavailable recall metadata.
+
 Reanchor inspection propagates original canonical control carriers before
 formatting operator diagnostics, including the initial runtime read, local
 birth-anchor retargeting and bootstrap-custody inspection. An ordinary database

@@ -1198,9 +1198,10 @@ class AsyncConversationStore:
         disagreement means every embedded write will persist without its
         vector, so it is kept for ``/health/detailed`` as a misconfiguration
         and logged at ERROR when found; finding the same disagreement again
-        does not log it again. It never raises: the turn writes keep
+        does not log it again. Recall degradation never raises: the turn writes keep
         succeeding, and refusing to boot would take the agent down over a
-        recall degradation.
+        recall degradation. Execution authority, native retirement and commit
+        control still propagate; these are not recall misconfiguration.
 
         Each run replaces what the last one found, so the flag describes the
         profile the store writes with now, against the width its writes are
@@ -1247,7 +1248,9 @@ class AsyncConversationStore:
             self._embedding_column_dim = await declared_embedding_vec_dimension(
                 self.db, "conversation_history"
             )
-        except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail boot
+        except Exception as exc:  # noqa: BLE001 - ordinary diagnostic unavailability is not fatal
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "Could not read conversation_history.embedding_vec's declared "
                 "width for agent %s: %s", self.agent_id, exc,
@@ -1260,7 +1263,9 @@ class AsyncConversationStore:
         describe = getattr(service, "describe", None)
         try:
             profile = describe() if callable(describe) else None
-        except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail boot
+        except Exception as exc:  # noqa: BLE001 - ordinary diagnostic unavailability is not fatal
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "Could not describe the embedding profile for agent %s: %s",
                 self.agent_id, exc,
