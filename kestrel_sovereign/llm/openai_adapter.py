@@ -63,6 +63,7 @@ except ImportError:  # pragma: no cover - compatibility with SDK v4 checkouts.
     CodeExecOptions = FileRef = FilesMode = PromptCacheMode = None
     RawResponse = ReasoningControlMode = RequestOptions = ServerToolMode = None
     TokenCount = TokenCountMode = WebSearchOptions = None
+from .call_progress import report_call_progress
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo, ModelCategory
 from .output_ceiling import (
@@ -721,6 +722,9 @@ class OpenAIAdapter(LLMAdapter):
             chunk_count = 0
             finish_reason = None
             async for chunk in stream:
+                # #3357: every chunk is the provider still answering, whether
+                # or not it yields anything.
+                report_call_progress()
                 # #3355: the finish reason rides on the last choice chunk.
                 finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
                 delta = chunk.choices[0].delta
@@ -870,6 +874,9 @@ class OpenAIAdapter(LLMAdapter):
             finish_reason = None
 
             async for chunk in stream:
+                # #3357: every chunk is the provider still answering, including
+                # the tool-call argument deltas below, which yield nothing.
+                report_call_progress()
                 # Extract usage from final chunk (OpenAI sends it with stream_options)
                 if hasattr(chunk, 'usage') and chunk.usage:
                     (
