@@ -77,6 +77,54 @@ degrading quietly. CI and the devcontainer pin `pgvector/pgvector:pg16`.
 Application code writes SQLite-style `?` placeholders. The backend layer
 normalizes SQL for PostgreSQL where needed.
 
+### SQLite close budget
+
+Every aiosqlite connection Kestrel opens is closed under one budget, which
+covers aiosqlite's `close()` and then the exit of the connection's worker
+thread. `KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S` sets it:
+
+- **What it bounds.** SQLite's own close runs inside the window. When the last
+  connection to a WAL database closes, SQLite checkpoints the whole `-wal`
+  into the main file, fsyncs it and deletes the `-wal`. The budget therefore
+  bounds that disk I/O as well as the thread exit. One 10 ms poll interval is
+  added to it, so errors name `1.01s`.
+- **Default:** `1.0` seconds. Values below `0.01` are raised to `0.01`.
+- **Read once, at import** of `kestrel_sovereign/storage/db/sqlite.py`. Set it
+  in the environment before the process starts; changing it afterwards has no
+  effect.
+- **It also sizes the shutdown reservation.** SQLite storage advertises the
+  budget as `minimum_close_timeout_s`, and whole-agent shutdown reserves that
+  much of its own budget for the storage close (`_resolve_shutdown_budget` in
+  `kestrel_sovereign/kestrel_agent.py`). A larger value leaves less time for
+  the shutdown steps before it, and takes the whole shutdown budget once it
+  exceeds it.
+
+A close that overruns the budget raises `ConnectionError` and logs the same
+message once at WARNING, with what the close had to do (#3460):
+
+```text
+SQLite connection close did not complete within 1.01s (elapsed=1.012s budget=1.01s database=kestrel_prime.db journal_mode=wal wal_bytes=2525592 wal_pages=613)
+```
+
+- `elapsed` is measured from the start of the close; `budget` is the
+  configured budget.
+- `database` is the file's basename only, never its path.
+- `journal_mode` is what SQLite reported when the backend set it at connect.
+  It is `unknown` where the opener does not set it: cold reads, backup
+  targets and SQLAlchemy engines.
+- `wal_bytes` is the size of the `-wal`, from a `stat` taken before the close
+  began. `wal_pages` counts the frames that size holds, one page each, using
+  the page size the backend read at connect; it is `unknown` where the opener
+  has no page size, on the same three paths. Both are `unknown` if the `stat`
+  failed, and `absent` when there is no `-wal`. They are omitted for a
+  database known not to be in WAL mode. The `-wal` is never opened: every
+  close takes this reading, and on ext4 a read can update the file's access
+  time, which can wait on the filesystem journal during the very fsync stalls
+  this reports on.
+
+A worker that outlives the window reports the same fields after
+`SQLite worker did not terminate`.
+
 ## SQLAlchemy Layer
 
 SQLAlchemy is used for typed ORM views and vector search, not as a wholesale

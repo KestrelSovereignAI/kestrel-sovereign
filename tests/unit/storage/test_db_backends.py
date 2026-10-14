@@ -1206,13 +1206,16 @@ class TestSQLiteBackend:
             await release_read.wait()
             return await original_fetch(*args, **kwargs)
 
-        async def held_close(connection, *, retained_closes, deadline=None):
+        async def held_close(
+            connection, *, retained_closes, deadline=None, diagnostics=None
+        ):
             close_entered.set()
             await release_close.wait()
             await original_close(
                 connection,
                 retained_closes=retained_closes,
                 deadline=deadline,
+                diagnostics=diagnostics,
             )
 
         monkeypatch.setattr(backend, "_fetch_on_connection", held_fetch)
@@ -1921,13 +1924,16 @@ class TestSQLiteBackend:
         release_close = asyncio.Event()
         real_close = sqlite_backend_module._close_aiosqlite_connection
 
-        async def delayed_close(connection, *, retained_closes, deadline=None):
+        async def delayed_close(
+            connection, *, retained_closes, deadline=None, diagnostics=None
+        ):
             close_entered.set()
             await release_close.wait()
             await real_close(
                 connection,
                 retained_closes=retained_closes,
                 deadline=deadline,
+                diagnostics=diagnostics,
             )
 
         with patch.object(
@@ -2764,6 +2770,7 @@ class TestAsyncDatabase:
             deadline=None,
             close_task=None,
             cancel_close_task_on_timeout=True,
+            diagnostics=None,
         ):
             deadlines.append(deadline)
             await real_close(
@@ -2772,6 +2779,7 @@ class TestAsyncDatabase:
                 deadline=deadline,
                 close_task=close_task,
                 cancel_close_task_on_timeout=cancel_close_task_on_timeout,
+                diagnostics=diagnostics,
             )
 
         try:
