@@ -77,6 +77,7 @@ from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.stop import AuthoritativeStopDescendant
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 from tests.utils.scheduler_ticks import tick_and_settle
+from tests.utils.virtual_clock import pinned_loop_clock
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
@@ -5937,6 +5938,57 @@ async def test_live_spawn_owns_signed_deadline_before_delegated_budget(tmp_path)
     assert vars(child).get("_host_authority_boot_deadline_handle") is None
 
 
+# The two stalled-stage deadline tests below pin the loop clock and spend the
+# signed host lifetime from inside the stage they exercise. With a wall-clock
+# budget, the fsynced authority-registry writes between stages could use it
+# up first, so the deadline landed one stage early (#3480).
+_PINNED_SIGNED_LIFETIME = 1.0
+# Long enough that the wall-clock governance-commit checks never fire first.
+_WALL_CLOCK_MANDATE_TTL = 3600
+
+
+async def _settle_on_pinned_clock(task: asyncio.Task, *, turns: int = 10_000):
+    """Run the loop until ``task`` ends, and fail rather than hang.
+
+    Once the stage under test has advanced the pinned clock, nothing advances
+    it again, so a task still pending after ``turns`` loop iterations is
+    parked on an await that never resolves.
+    """
+
+    for _ in range(turns):
+        if task.done():
+            return
+        await asyncio.sleep(0)
+    pending = [
+        repr(other)
+        for other in asyncio.all_tasks()
+        if other is not asyncio.current_task() and not other.done()
+    ]
+    pytest.fail(
+        f"{task!r} did not finish after its deadline; pending tasks: {pending}"
+    )
+
+
+def _assert_no_leaked_spawn_tasks(manager: AgentManager) -> None:
+    leaked = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and not task.done()
+    ]
+    assert leaked == []
+    assert not manager._admission_delegate_tasks
+    assert not manager._expired_admission_operations
+
+
+def _is_committed_signed_receipt(properties: dict) -> bool:
+    """The final receipt: signed, with the provisional flag dropped."""
+
+    return (
+        properties["parent_signature"] is not None
+        and "authority_committed" not in properties
+    )
+
+
 @pytest.mark.asyncio
 async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path):
     """A stalled custody provider cannot keep signed authority alive."""
@@ -5958,6 +6010,8 @@ async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path)
         return child
 
     async def stalled_budget(*_args, **_kwargs):
+        # The signed lifetime ends while custody is stalled here.
+        clock.advance(_PINNED_SIGNED_LIFETIME)
         try:
             await asyncio.Event().wait()
         finally:
@@ -5965,24 +6019,32 @@ async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path)
 
     manager.create_agent = AsyncMock(side_effect=create_child)
     manager._apply_delegated_budget = AsyncMock(side_effect=stalled_budget)
-    with patch(
-        "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
-        return_value=0.03,
+    with (
+        pinned_loop_clock() as clock,
+        patch(
+            "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+            return_value=_PINNED_SIGNED_LIFETIME,
+        ),
     ):
         spawn = asyncio.create_task(
             manager.spawn_agent(
                 "StalledBudgetChild",
                 parent,
-                SpawnMandate(parent_did=parent.agent_id, ttl_seconds=1),
+                SpawnMandate(
+                    parent_did=parent.agent_id,
+                    ttl_seconds=_WALL_CLOCK_MANDATE_TTL,
+                ),
             )
         )
-        with pytest.raises(
-            PersistedSpawnMandateExpiredError,
-            match="expired during active host admission",
-        ):
-            await asyncio.wait_for(spawn, timeout=0.5)
+        await _settle_on_pinned_clock(spawn)
 
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match="expired during active host admission",
+    ):
+        spawn.result()
     assert budget_cancelled.is_set()
+    assert manager.get_agent("StalledBudgetChild") is None
     assert vars(child).get("_host_authority_boot_deadline_handle") is None
     witness = manager._spawn_authority_registry.get(child.agent_id)
     assert witness is not None and witness.retired
@@ -5992,6 +6054,7 @@ async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path)
         .kwargs["properties"]["parent_signature"]
         is None
     )
+    _assert_no_leaked_spawn_tasks(manager)
 
 
 @pytest.mark.asyncio
@@ -6004,12 +6067,14 @@ async def test_live_signed_deadline_cancels_stalled_final_receipt_write(tmp_path
     parent.identity = None
     parent.features = {}
     final_write_cancelled = asyncio.Event()
-    write_count = 0
+    receipts: list[dict] = []
 
-    async def write_receipt(*_args, **_kwargs):
-        nonlocal write_count
-        write_count += 1
-        if write_count == 2:
+    async def write_receipt(*_args, properties, **_kwargs):
+        receipts.append(properties)
+        # Stall the final receipt itself, never the revocation that follows.
+        if _is_committed_signed_receipt(properties):
+            # The signed lifetime ends while this write is in flight.
+            clock.advance(_PINNED_SIGNED_LIFETIME)
             try:
                 await asyncio.Event().wait()
             finally:
@@ -6036,23 +6101,44 @@ async def test_live_signed_deadline_cancels_stalled_final_receipt_write(tmp_path
     manager.create_agent = AsyncMock(side_effect=create_child)
     manager.remove_agent = AsyncMock(side_effect=remove_child)
 
-    with patch(
-        "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
-        return_value=0.03,
+    with (
+        pinned_loop_clock() as clock,
+        patch(
+            "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+            return_value=_PINNED_SIGNED_LIFETIME,
+        ),
     ):
         spawn = asyncio.create_task(
             manager.spawn_agent(
                 "StalledFinalReceiptChild",
                 parent,
-                SpawnMandate(parent_did=parent.agent_id, ttl_seconds=1),
+                SpawnMandate(
+                    parent_did=parent.agent_id,
+                    ttl_seconds=_WALL_CLOCK_MANDATE_TTL,
+                ),
             )
         )
-        with pytest.raises(PersistedSpawnMandateExpiredError):
-            await asyncio.wait_for(spawn, timeout=0.5)
+        await _settle_on_pinned_clock(spawn)
 
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match="expired during active host admission",
+    ):
+        spawn.result()
     assert final_write_cancelled.is_set()
+    # Provisional receipt, the stalled final receipt, then its revocation.
+    assert [receipt["parent_signature"] is not None for receipt in receipts] == [
+        True,
+        True,
+        False,
+    ]
+    assert _is_committed_signed_receipt(receipts[1])
+    assert child._persisted_spawn_mandate.parent_signature is None
+    assert vars(child).get("_host_authority_boot_deadline_handle") is None
+    assert manager.get_agent("StalledFinalReceiptChild") is None
     witness = manager._spawn_authority_registry.get(child.agent_id)
     assert witness is not None and witness.retired
+    _assert_no_leaked_spawn_tasks(manager)
 
 
 @pytest.mark.asyncio

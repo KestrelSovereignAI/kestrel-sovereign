@@ -52,22 +52,9 @@ from kestrel_sovereign.llm.streaming_errors import (
     safe_streaming_error_message,
 )
 from tests.shared.booted_agent import booted_agent
+from tests.utils.virtual_clock import VirtualClockLoop as _VirtualClockLoop
 
 BOUND = 180
-
-
-class _VirtualClockLoop(asyncio.SelectorEventLoop):
-    """An event loop whose ``time()`` only moves when a test advances it."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._now = 0.0
-
-    def time(self) -> float:
-        return self._now
-
-    def advance(self, seconds: float) -> None:
-        self._now += seconds
 
 
 def _run(loop: _VirtualClockLoop, coro):
