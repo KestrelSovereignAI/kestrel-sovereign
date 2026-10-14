@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-13
-**Scope:** 2699 tracked files (1909 `.py`, 352 `.md`, 438 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-14
+**Scope:** 2717 tracked files (1927 `.py`, 352 `.md`, 438 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -286,7 +286,7 @@ Repo entry points and standard project files.
   - `class ConstitutionAdoptionError`; `class ConstitutionAdoptionCheck`; `def local_agents(project_dir)`; `def check_constitution_adoption(project_dir)`; `def check_installed_constitution_adoption(project_dir)`; `def deployed_content_at(repo_path, revision)`; `def refusal_lines(check)`; `def refusal_reason(check)`; `…`
 - **kestrel_sovereign/constitutional_profiles.toml** — (configuration)
 - **kestrel_sovereign/core_lock.py** — Core's ``uv.lock`` as the declaration of what the host venv holds (#3502).
-  - `class CoreLockError`; `class LockedPackage`; `class CoreLock`; `def checkout_hold_line(name, checkout)`; `class LockDrift`; `class LockCheck`; `def core_lock_checkout(provenance)`; `def core_lock_path(checkout)`; `…`
+  - `class LockReportError`; `class CoreLockError`; `class LockedPackage`; `class CoreLock`; `def checkout_hold_line(name, checkout)`; `class LockDrift`; `class LockForcer`; `class LockDowngrade`; `…`
 - **kestrel_sovereign/data/KESTREL_CONSTITUTION.md** — The Kestrel Constitution — ## Preamble
 - **kestrel_sovereign/data/feature_registry.toml** — (configuration)
 - **kestrel_sovereign/data/feature_template/README.md.tpl** — —
@@ -597,8 +597,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/privacy/pii_detector.py** — PII Detection Module for Kestrel Privacy System.
   - `class PIIType`; `class PIIMatch`; `class PIIDetector`; `def get_pii_detector()`; `def anonymize_text(text)`
 - **kestrel_sovereign/features/response_audit/__init__.py** — —
-- **kestrel_sovereign/features/response_audit/decision_audit.py** — Response audit as a decision call (#3424 slice 5).
-  - `def audit_decision_request(text)`; `def compose_risk(p_block, p_concern, thresholds)`; `async def decision_audit(llm_service, text)`; `def response_audit_eval_sample(raw, source)`; `async def response_audit_chat_baseline(llm_service, sample)`
+- **kestrel_sovereign/features/response_audit/decision_audit.py** — Response audit as a decision call (#3424 slice 5, #3553).
+  - `def tool_outcomes_for_audit(tool_results)`; `def audit_decision_request(text)`; `def compose_risk(p_block, p_concern, thresholds, p_unearned)`; `async def decision_audit(llm_service, text)`; `def response_audit_eval_sample(raw, source)`; `async def response_audit_chat_baseline(llm_service, sample)`
 - **kestrel_sovereign/features/response_audit/feature.py** — Optional per-response LLM integrity audit feature.
   - `class ResponseAuditFeature`
 - **kestrel_sovereign/features/response_audit/hook.py** — Response audit hook - evaluates LLM responses for integrity.
@@ -663,7 +663,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/state_of_mind.py** — State of Mind Feature
   - `class StateOfMindFeature`
 - **kestrel_sovereign/features/storage_access.py** — Safe storage resolvers for feature-internal persistence access.
-  - `class AgentIdentityUnavailable`; `def resolve_scoped_agent_did(agent)`; `def resolve_workflow_owner_did(identity)`; `def resolve_feature_database(agent)`; `def resolve_agent_privacy_config(agent)`; `def hides_persisted_user_content(agent)`; `def resolve_feature_conversation_store(agent)`
+  - `class AgentIdentityUnavailable`; `def resolve_scoped_agent_did(agent)`; `def resolve_workflow_owner_did(identity)`; `def resolve_feature_database(agent)`; `def resolve_conversation_store(agent)`; `def resolve_agent_privacy_config(agent)`; `def hides_persisted_user_content(agent)`; `def resolve_feature_conversation_store(agent)`
 - **kestrel_sovereign/features/strategic_memory/__init__.py** — Strategic Memory Feature package.
 - **kestrel_sovereign/features/strategic_memory/backlog_hygiene.py** — Backlog Hygiene scanner for Strategic Memory.
   - `def is_auto_fix(fix)`; `async def run_backlog_hygiene(data, fix)`
@@ -933,7 +933,7 @@ Repo entry points and standard project files.
   - `class NoLLMProvidersError`; `class NoReachableProvidersError`; `class IdentityIsolationError`; `def is_isolated_nonproduction_kite_environment(env)`; `def verify_llm_providers_initialized(llm_service)`; `async def verify_llm_providers_reachable(llm_service)`; `def verify_identity_isolation(db_did, expected_did)`; `async def warn_stale_bootstrap_pending(agent)`
 - **kestrel_sovereign/llm/LLM_SERVICE_HARDENING.md** — LLM Service Hardening Implementation — ## Overview
 - **kestrel_sovereign/llm/adapter.py** — Framework-side LLM adapter base.
-  - `def response_usage_available(response)`; `def provider_usage_cost(usage)`; `class ReportedUsage`; `class ThinkingDelta`; `def split_thinking_from_content(content, reasoning_content)`; `class ThinkingContentSplitter`; `def build_messages(user_prompt, system_prompt)`; `def messages_for(adapter)`; `…`
+  - `def response_usage_available(response)`; `def provider_usage_cost(usage)`; `class ReportedUsage`; `class ToolCallWithExtraContent`; `def tool_call_history_entry(tool_call)`; `class ThinkingDelta`; `def split_thinking_from_content(content, reasoning_content)`; `class ThinkingContentSplitter`; `…`
 - **kestrel_sovereign/llm/anthropic_adapter.py** — Anthropic Claude Adapter
   - `def anthropic_model_info(model_data)`; `class AnthropicAdapter`
 - **kestrel_sovereign/llm/anthropic_oauth.py** — Claude subscription (Claude Pro/Max) OAuth token lifecycle.
@@ -989,6 +989,8 @@ Repo entry points and standard project files.
   - `class LLMError`; `class LLMProviderError`; `class LLMProviderTimeoutError`; `class LLMProviderAuthError`; `class LLMProviderQuotaError`; `class LLMProviderUnavailableError`; `class LLMAllProvidersFailedError`; `def handle_llm_errors(provider_name, log_errors, reraise_as)`; `…`
 - **kestrel_sovereign/llm/escalation_classifier.py** — Classify a tool-escalation failure outcome honestly (#1540 / #1563).
   - `class EscalationOutcome`; `class EscalationDecision`; `def classify_escalation_failure(raw_error)`; `def format_escalation_outcome(decision)`
+- **kestrel_sovereign/llm/gemini_contents.py** — Chat messages as Gemini ``contents``, shared by the Google and Vertex adapters.
+  - `def tool_call_from_part(part, call_id)`; `def to_gemini_contents(messages)`; `def tool_result_messages(tool_results)`
 - **kestrel_sovereign/llm/generation_gate.py** — The one gate a model's generation passes to become an answer (#3552).
   - `class NoCompletionEvidenceError`; `class UnfinishedStopError`; `class GenerationCancelledError`; `def judge_generation(response)`; `def failure_summary(failure)`; `def first_unfinished_attempt(route_errors)`; `class UnfinishedAfterInlineToolsError`; `def ran_inline_tools(response)`; `…`
 - **kestrel_sovereign/llm/google_adapter.py** — Google Gemini Adapter
@@ -1146,7 +1148,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/security/sealed_capsule.py** — Sealed capsule — Wave 4 sub-PR 3 of Quantum Hardening (#921, #919).
   - `class SealedCapsuleError`; `def seal_capsule(payload)`; `def open_capsule(capsule, classical_keypair, pq_keypair)`
 - **kestrel_sovereign/security/service_key_storage.py** — Service API Key Storage for Kestrel.
-  - `class ServiceKeyInfo`; `class UsageRecord`; `class ServiceKeyStorage`
+  - `class StoredKeyCiphertextMissingError`; `class ServiceKeyInfo`; `class UsageRecord`; `class ServiceKeyStorage`
 - **kestrel_sovereign/security/sovereign_key.py** — Process-local provenance for the sovereign API key.
   - `def sovereign_key_fingerprint(key)`; `def normalize_sovereign_api_key(key)`; `def mark_ephemeral_sovereign_key(key)`; `def is_ephemeral_sovereign_key(key)`
 - **kestrel_sovereign/security/sponsor_key_storage.py** — Sponsor Master Key Storage + beneficiary roster for Kestrel.
@@ -1169,7 +1171,7 @@ Repo entry points and standard project files.
   - `def load_server_dotenv(package_dir)`; `def resolve_multi_agent_path(env)`; `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class MultiAgentAgentRoutingMiddleware`; `def canonical_rate_limit_exceeded_handler(request, exc)`; `class CanonicalCORSMiddleware`; `…`
 - **kestrel_sovereign/services/__init__.py** — Kestrel Services.
 - **kestrel_sovereign/services/key_resolution.py** — Key Resolution Service for Kestrel.
-  - `class KeyNotConfiguredError`; `class KeyResolutionService`; `async def resolve_key(provider, agent_did, storage, require)`
+  - `class KeyNotConfiguredError`; `class KeyUnreadableError`; `class KeyResolutionService`; `async def resolve_key(provider, agent_did, storage, require)`
 - **kestrel_sovereign/services/payer_resolver.py** — PayerResolver — concrete foundation impl of `kestrel_sdk.payer_policy.PayerResolver`.
   - `class FoundationPayerResolver`; `async def open_host_db()`; `def load_policy_from_toml()`
 - **kestrel_sovereign/setup/__init__.py** — Kestrel setup wizard package.
@@ -1388,7 +1390,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/async_assertion_store.py** — Tenant-bound persistence for canonical semantic assertions.
   - `class AssertionStoreError`; `class SemanticRecallUnavailableError`; `class MaintenanceLeaseLostError`; `class TenantIsolationError`; `class AssertionConflictError`; `class AssertionOperationErasedError`; `class AssertionWriteResult`; `class SupersessionResult`; `…`
 - **kestrel_sovereign/storage/async_conversation_store.py** — Async Conversation Store for Kestrel Storage.
-  - `class ProjectionNotReady`; `class ConversationLexicalSchemaError`; `class ConversationSessionTimestampError`; `class SearchTerms`; `def session_match_decoration(messages, name, terms)`; `def search_session_summaries(normalized_messages, query, names, limit)`; `class AsyncConversationStore`
+  - `class ProjectionNotReady`; `class ConversationLexicalSchemaError`; `class ConversationSessionTimestampError`; `class DroppedConversationEmbedding`; `class EmbeddingColumnMismatch`; `class SearchTerms`; `def session_match_decoration(messages, name, terms)`; `def search_session_summaries(normalized_messages, query, names, limit)`; `…`
 - **kestrel_sovereign/storage/async_database.py** — Async Database for Kestrel Storage.
   - `class DatabaseRetirementError`; `class DatabaseInitializationCleanupError`; `def graph_created_at_index_columns(backend_type)`; `def core_schema_sql(backend_type)`; `def validate_sqlite_core_schema_readiness(db_path)`; `class AsyncDatabase`
 - **kestrel_sovereign/storage/async_file_store.py** — Async File Store for Kestrel Storage.
@@ -1417,6 +1419,8 @@ Repo entry points and standard project files.
   - `class TimestampBoundOutOfRange`; `def database_backend_type(db)`; `def database_now_sql(db)`; `def database_lease_cutoff_sql(db, lease_seconds)`; `def database_timestamp_bound_text(db, value)`; `async def database_clock(db)`
 - **kestrel_sovereign/storage/db/__init__.py** — Database Backend Factory
   - `def postgres_backend()`; `async def get_backend(config)`; `def create_backend(config)`
+- **kestrel_sovereign/storage/db/after_commit.py** — Work deferred until the transaction holding a write commits (#2913).
+  - `def run_after_commit(callback)`; `class AfterCommitCallbacks`
 - **kestrel_sovereign/storage/db/interface.py** — Database backend interface — sovereign-side re-export.
 - **kestrel_sovereign/storage/db/placeholder.py** — SQL Placeholder Conversion Utilities
   - `def sqlite_to_postgres(query)`; `def postgres_to_sqlite(query)`; `def normalize_schema(schema, backend)`
@@ -1437,7 +1441,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/embedding_reindex.py** — Operator-triggered re-embedding of stored vectors (#2289).
   - `class ReindexStats`; `async def stored_vectors_by_profile(db)`; `async def dominant_embedding_profile(db, agent_id)`; `class EmbeddingReindexer`
 - **kestrel_sovereign/storage/embedding_vec_backfill.py** — Verify and backfill ``embedding_vec`` from the legacy ``embedding`` column.
-  - `class EmbeddingVecBackfillError`; `class EmbeddingVecReport`; `async def verify_embedding_vec(db, table)`; `async def backfill_embedding_vec(db, table)`; `async def backfill_missing_embedding_vec(db, table)`
+  - `class EmbeddingVecBackfillError`; `class EmbeddingVecReport`; `async def verify_embedding_vec(db, table)`; `async def backfill_embedding_vec(db, table)`; `async def backfill_missing_embedding_vec(db, table)`; `async def declared_embedding_vec_dimension(db, table)`
 - **kestrel_sovereign/storage/emotional_tagger.py** — Emotional analysis for conversation messages.
   - `class EmotionalTagger`; `async def analyze_message(content, role)`
 - **kestrel_sovereign/storage/encryption.py** — Backward-compatible encryption re-exports — DEPRECATED SHIM.
@@ -1475,9 +1479,9 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/providers/filebase_provider.py** — Filebase Storage Provider
   - `class FilebaseProvider`; `def create_filebase_provider(api_key, api_key_secret, endpoint_url, bucket_name)`
 - **kestrel_sovereign/storage/providers/lighthouse_provider.py** — Lighthouse Storage Provider
-  - `class LighthouseProvider`; `def create_lighthouse_provider(api_key, tier, key_resolver)`
+  - `class LighthouseProvider`; `def create_lighthouse_provider(api_key, tier, key_resolver)`; `async def resolve_lighthouse_storage(agent_did)`; `async def lighthouse_api_key_for(resolved)`; `async def lighthouse_provider_for(resolved)`
 - **kestrel_sovereign/storage/providers/lighthouse_rest.py** — Async REST client for Lighthouse storage API.
-  - `class LighthouseRestClient`
+  - `class LighthouseDownloadLimitError`; `def deal_records(status)`; `async def list_all_uploads(client)`; `class LighthouseGateway`; `class LighthouseRestClient`
 - **kestrel_sovereign/storage/retention.py** — Retention helpers for the soft-delete migration (#764).
   - `def load_trash_config()`; `def resolve_retention_days()`; `def load_forgetting_config()`; `def agent_privacy_mode(agent)`
 - **kestrel_sovereign/storage/saved_items_store.py** — Saved Items Store for Kestrel.
@@ -1521,7 +1525,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/sync/gcs_target.py** — GCS Sync Target
   - `class GCSTarget`
 - **kestrel_sovereign/storage/sync/health.py** — Storage health checks for operator-facing backup status.
-  - `class TargetHealth`; `class StorageHealthReport`; `async def check_sovereign_ipfs_health()`; `async def check_lighthouse_health()`; `async def check_gcs_health()`; `async def build_storage_health_report()`; `def load_env_file(path, env)`
+  - `class TargetHealth`; `class StorageHealthReport`; `async def check_sovereign_ipfs_health()`; `async def check_lighthouse_health()`; `async def check_gcs_health()`; `async def build_storage_health_report()`
 - **kestrel_sovereign/storage/sync/lighthouse_target.py** — Lighthouse Sync Target
   - `class LighthouseTarget`
 - **kestrel_sovereign/storage/sync/manifest_manager.py** — Manifest Manager Mixin
@@ -1534,6 +1538,8 @@ Repo entry points and standard project files.
   - `class RemoteTierPolicyContext`; `class RemoteTierPolicyDecision`; `class SyncStats`; `class SyncState`; `class SyncService`
 - **kestrel_sovereign/storage/sync/sovereign_ipfs_target.py** — Sovereign IPFS Sync Target
   - `class SovereignIPFSTarget`
+- **kestrel_sovereign/storage/sync/sovereignty_exports.py** — Agent-scoped Lighthouse records of sovereignty exports (#2874).
+  - `def sovereignty_export_upload_name(agent_id, uploaded_at)`; `def sovereignty_export_tag(agent_id)`; `def sovereignty_export_owner(upload)`; `def sovereignty_export_uploads(uploads, agent_id)`; `def is_sovereignty_export_candidate(upload)`; `class AmbiguousPublishedExportError`; `def sovereignty_export_deletions(uploads, agent_id, policy)`
 - **kestrel_sovereign/storage/sync/targets.py** — Sync Targets
   - `class TrustTier`; `class TierState`; `class SyncResult`; `class SyncTarget`
 - **kestrel_sovereign/storage/sync_protocol.py** — Sync Protocol for Multi-Tier Storage
@@ -2571,6 +2577,8 @@ Repo entry points and standard project files.
   - `async def test_conversations_are_actually_saved()`; `async def test_platform_shutdown_does_not_lose_data()`; `async def test_encryption_actually_works()`; `async def test_content_integrity_verification()`; `async def test_sovereignty_vs_simple_download()`; `async def test_inheritance_scenario()`; `async def test_performance_vs_cloud()`
 - **tests/integration/test_sovereignty_import.py** — Integration tests for V2 Import/Restore functionality.
   - `def temp_db()`; `async def llm_service()`; `async def test_restore_preserves_created_at_and_trash(temp_db)`; `async def test_restore_preserves_turn_order_for_same_second(temp_db)`; `async def test_export_import_roundtrip(temp_db)`; `async def test_import_rederives_the_session_id_column(temp_db)`; `async def test_import_with_wrong_key_fails(temp_db)`; `async def test_agent_command_import(temp_db, llm_service, skip_bootstrap)`; `…`
+- **tests/integration/test_sovereignty_lighthouse_attribution.py** — Sovereignty exports on Lighthouse are attributed to their agent (#2874).
+  - `def data_key(monkeypatch)`; `def kubo()`; `def lighthouse(monkeypatch)`; `def no_ambient_backup_tiers(monkeypatch)`; `def newest_only(monkeypatch)`; `async def test_export_is_found_by_the_health_check_and_attributed_to_its_agent(tmp_path, monkeypatch, kubo, lighthouse, …)`; `async def test_cleanup_for_one_agent_never_touches_another_agents_export(tmp_path, monkeypatch, kubo, lighthouse, …)`; `async def test_an_unattributable_legacy_upload_is_retained_by_cleanup(tmp_path, monkeypatch, kubo, lighthouse, …)`; `…`
 - **tests/integration/test_sovereignty_v2.py** — —
   - `class MockStorageResult`; `class MockFilecoinAdapter`; `def temp_db()`; `async def test_sovereignty_export_v3_car(temp_db)`; `class MockLLMService`; `class MockWallet`; `async def test_agent_export_command(temp_db, skip_bootstrap)`
 - **tests/integration/test_spawned_by_restart_authority.py** — Durable spawned-by authority crosses a real SQLite restart boundary.
@@ -2650,6 +2658,8 @@ Repo entry points and standard project files.
 - **tests/unit/conftest.py** — Unit-suite isolation from the operator's real host-runtime state (#3087).
   - `def pytest_collection_modifyitems(config, items)`; `def kestrel_toml_catalog(request, monkeypatch)`; `def new_york_clock(monkeypatch)`; `async def followup_env(tmp_path)`
 - **tests/unit/storage/__init__.py** — —
+- **tests/unit/storage/test_after_commit.py** — Work deferred until the owning transaction commits (#2913).
+  - `async def db(request, tmp_path)`; `async def test_with_no_transaction_open_it_runs_now(db)`; `async def test_it_runs_after_the_transaction_commits(db)`; `async def test_it_never_runs_when_the_transaction_rolls_back(db)`; `async def test_a_rolled_back_savepoint_discards_only_its_own_callbacks(db)`; `async def test_a_released_savepoint_waits_for_the_outer_commit(db)`; `async def test_a_joined_scope_shares_its_parents_outcome(tmp_path)`; `async def test_a_task_that_does_not_own_the_transaction_runs_now(db)`; `…`
 - **tests/unit/storage/test_async_assertion_store.py** — Canonical assertion persistence contracts on the SQLite backend.
   - `def source(identifier)`; `def direct(revision_id, value, source_id)`; `def derived(revision_id, input_revision_id)`; `async def test_assertion_crud_provenance_idempotency_and_checkpoint()`; `async def test_list_assertion_sources_selects_distinct_sort_keys_for_postgres()`; `async def test_governed_source_append_creates_a_validated_provenance_revision()`; `async def test_raw_storage_binding_cannot_authorize_the_explicit_fact_adapter()`; `async def test_foreign_tenant_and_missing_lineage_fail_without_writes()`; `…`
 - **tests/unit/storage/test_conversation_created_at.py** — #3009: ``conversation_history.created_at`` stops promising nothing.
@@ -2696,6 +2706,8 @@ Repo entry points and standard project files.
   - `async def test_a_salvage_marker_is_filed_in_the_session_it_salvaged(tmp_path)`; `async def test_a_salvage_marker_outside_the_contract_stamps_null_not_garbage(tmp_path)`; `async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(tmp_path)`; `async def test_a_restore_rederives_the_column_from_the_backup_metadata(tmp_path)`
 - **tests/unit/storage/test_sovereign_import_destination.py** — #2525: ``target_db_path`` is refused before the bound database is touched.
   - `async def test_non_none_target_db_path_is_refused_before_any_io(target)`; `async def test_omitted_keyword_does_not_warn(recwarn)`; `def test_unsupported_destination_is_a_value_error()`
+- **tests/unit/storage/test_sqlite_close_diagnostics.py** — What an SQLite close reports when it overruns its budget (#3460).
+  - `def short_close_window(monkeypatch)`; `async def test_slow_close_reports_elapsed_budget_and_wal_size(tmp_path, short_close_window, caplog)`; `async def test_overrun_interrupts_before_it_logs(tmp_path, short_close_window, monkeypatch)`; `async def test_normal_close_logs_nothing_and_checkpoints(tmp_path, caplog)`; `async def test_failed_wal_read_reports_unknown_and_keeps_close_error(tmp_path, short_close_window, monkeypatch, caplog)`; `async def test_non_wal_database_reports_journal_mode_without_wal(short_close_window, caplog)`; `async def test_non_wal_database_closes_normally(caplog)`; `async def test_known_non_wal_journal_mode_never_reads_a_stray_wal(tmp_path)`; `…`
 - **tests/unit/storage/test_sqlite_cold_read.py** — Cold-read semantics for the SQLite backend (#2920).
   - `async def test_native_connection_and_snapshot_reader_keep_the_original_relative_target(tmp_path, monkeypatch)`; `async def test_cold_read_of_quiescent_db_leaves_no_sidecars(tmp_path)`; `async def test_cold_read_sees_data_that_is_still_only_in_the_wal(tmp_path)`; `async def test_cold_read_does_not_migrate_a_database_it_only_inspects(tmp_path)`; `async def test_cold_read_follows_a_symlink_to_where_the_sidecars_really_are(tmp_path)`; `async def test_cold_read_refuses_to_report_after_a_writer_came_and_went(tmp_path)`; `async def test_cold_read_via_config_does_not_migrate_the_database(tmp_path)`; `async def test_cold_read_of_a_missing_default_store_creates_nothing(tmp_path, monkeypatch)`; `…`
 - **tests/unit/storage/test_sqlite_script_transaction.py** — Native scripts must not steal an enclosing transaction's commit boundary.
@@ -2851,7 +2863,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_backup_blob_online.py** — Online-backup behaviour for AsyncStorage.create_backup_blob (F266).
   - `def data_key(monkeypatch)`; `async def test_connection_stays_open_and_usable_during_and_after_backup(tmp_path)`; `async def test_backup_blob_restores_into_fresh_storage(tmp_path)`; `async def test_restore_coerces_text_timestamps_for_postgres(tmp_path, monkeypatch)`; `async def test_restore_preserves_created_at_on_sqlite(tmp_path)`; `async def test_backup_runs_off_event_loop(tmp_path, monkeypatch)`
 - **tests/unit/test_backup_cleanup.py** — —
-  - `def test_dry_run_reports_correct_keep_delete_sets_against_synthetic_fixture()`; `async def test_apply_without_confirmation_refuses_to_delete(tmp_path)`; `async def test_apply_with_confirmation_deletes_and_audits_gcs_and_lighthouse(tmp_path)`; `class AsyncDeleteClient`; `async def test_lighthouse_pagination_consumes_empty_and_multi_page_responses(caplog)`; `async def test_unattributed_lighthouse_files_are_reported_and_never_deleted()`; `async def test_manifest_index_attributes_export_car_and_rejects_malformed_manifest()`; `async def test_manifest_index_retries_429_and_preserves_attribution()`; `…`
+  - `def test_dry_run_reports_correct_keep_delete_sets_against_synthetic_fixture()`; `async def test_apply_without_confirmation_refuses_to_delete(tmp_path)`; `async def test_apply_with_confirmation_deletes_and_audits_gcs_and_lighthouse(tmp_path)`; `class AsyncDeleteClient`; `async def test_lighthouse_pagination_consumes_empty_and_multi_page_responses(caplog)`; `async def test_unattributed_lighthouse_files_are_reported_and_never_deleted()`; `async def test_manifest_index_attributes_export_car_and_rejects_malformed_manifest()`; `async def test_sovereignty_exports_are_attributed_by_record_and_never_deleted(tmp_path)`; `…`
 - **tests/unit/test_backup_privacy_transition_contracts.py** — Backup caller contracts for retryable privacy-transition refusals.
   - `async def test_promote_backup_does_not_backup_after_transition_refusal()`
 - **tests/unit/test_backup_remote_tier_policy.py** — —
@@ -3150,6 +3162,8 @@ Repo entry points and standard project files.
   - `class TestIdentityChallenge`; `class TestChallengeResult`; `class TestContinuityScore`; `class TestMigrationCertificate`; `class TestChallengeGenerator`; `class TestContinuityVerifier`; `class TestAuditTrail`; `class TestVerifyMigration`
 - **tests/unit/test_contributing_canonicality.py** — Guard the contributor guide's public-repository mirror.
   - `def test_public_contributing_copy_matches_canonical_guide()`; `def test_public_contributing_copy_has_public_provenance()`
+- **tests/unit/test_conversation_embedding_drops.py** — A conversation write that drops its embedding is reported, not silent (#2913).
+  - `async def sqlite_db(tmp_path)`; `async def test_mismatched_width_write_persists_the_turn_warns_and_counts(sqlite_db, monkeypatch, caplog)`; `async def test_a_vector_the_database_refuses_is_dropped_through_every_fallback(sqlite_db, monkeypatch, caplog)`; `async def test_repeated_drops_warn_once_per_window_and_count_every_one(sqlite_db, monkeypatch, caplog)`; `async def test_a_matching_width_write_stores_the_vector_and_counts_nothing(sqlite_db, monkeypatch, caplog)`; `async def test_a_write_that_fails_outright_is_not_counted_as_a_drop(sqlite_db, monkeypatch)`; `async def test_a_row_excluded_from_retrieval_is_not_counted_as_a_drop(sqlite_db, monkeypatch)`; `async def test_a_turn_its_transaction_rolls_back_counts_no_drop_and_warns_nothing(sqlite_db, monkeypatch, caplog, mechanism)`; `…`
 - **tests/unit/test_conversation_fulltext_search.py** — Full-text search over conversations (conversations-pane server search).
   - `class TestSearchSessionSummaries`; `async def store()`; `async def encrypted_store(monkeypatch)`; `class TestStoreSearchSessions`; `class TestPrivacyWrappedSearch`; `def test_conversations_endpoint_q_dispatches_to_search()`; `def test_conversations_endpoint_q_redacts_snippets_when_decrypt_false()`; `def test_conversations_endpoint_without_q_lists_normally()`; `…`
 - **tests/unit/test_conversation_lifecycle_tools.py** — Session-grain navigation + lifecycle, store and memory-tool layers (#2019).
@@ -3396,6 +3410,8 @@ Repo entry points and standard project files.
   - `class PrivacyWrappedStorage`; `class PropertyBackedPrivacyAgent`; `def test_resolve_feature_database_prefers_raw_storage()`; `def test_resolve_feature_database_unwraps_privacy_storage_without_touching_property()`; `def test_resolve_feature_database_supports_legacy_unwrapped_storage_names()`; `def test_resolve_feature_database_ignores_magicmock_fabricated_attributes()`; `def test_resolve_feature_database_supports_explicit_magicmock_db()`; `def test_resolve_feature_conversation_store_unwraps_without_touching_property()`; `…`
 - **tests/unit/test_feature_subagent_tool_executor.py** — Regression tests for ``Feature.execute_as_subagent`` threading a ``tool_executor`` to the LLM service (#1461 follow-up).
   - `async def test_subagent_threads_tool_executor_through_to_llm_service()`; `async def test_subagent_executor_dispatches_to_feature_tool()`; `async def test_subagent_executor_rejects_tool_outside_palette()`; `async def test_subagent_executor_surfaces_tool_exception_as_error_envelope()`; `async def test_subagent_no_tools_passes_no_executor()`; `async def test_subagent_executor_enforces_pre_tool_use_hooks()`; `async def test_subagent_executor_honors_hook_argument_rewrite()`; `async def test_subagent_executor_blocks_on_permission_decision_ask()`; `…`
+- **tests/unit/test_feature_sync_lock_findings.py** — ``kestrel feature sync`` names every locked package it leaves below uv.lock (#3324).
+  - `def test_a_feature_capping_a_locked_package_below_the_lock_is_named(monkeypatch, tmp_path, capsys, caplog)`; `def test_a_sync_that_moves_a_locked_package_below_the_lock_names_it(monkeypatch, tmp_path, capsys, caplog)`; `def test_a_declared_checkout_below_the_lock_names_the_manifest(monkeypatch, tmp_path, capsys)`; `def test_a_downgrade_nothing_installed_explains_is_named_with_an_unknown_cause(monkeypatch, tmp_path, capsys)`; `def test_a_sync_with_nothing_below_the_lock_prints_what_it_printed_before(monkeypatch, tmp_path, capsys, caplog)`; `def test_a_sync_that_moves_a_locked_package_above_the_lock_names_nothing(monkeypatch, tmp_path, capsys, caplog)`; `def test_a_core_checkout_without_a_uv_lock_is_one_finding(monkeypatch, tmp_path, capsys, caplog)`; `def test_a_uv_lock_that_will_not_read_is_one_finding(monkeypatch, tmp_path, capsys, caplog, …)`; `…`
 - **tests/unit/test_features_allowed_reload.py** — Enforce a spawned child's features_allowed on every boot path (#2226).
   - `async def test_read_features_allowed_from_edge(tmp_path)`; `async def test_read_features_allowed_none_for_root(tmp_path)`; `async def test_read_features_allowed_none_for_empty(tmp_path)`; `async def test_direct_boot_enforces_feature_ceiling(tmp_path)`; `async def test_do_spawn_persists_inherited_ceiling()`; `async def test_root_agent_loads_beyond_the_ceiling(tmp_path)`
 - **tests/unit/test_features_api.py** — Tests for the Feature Store API endpoints (endpoints/features.py).
@@ -3404,6 +3420,8 @@ Repo entry points and standard project files.
   - `def no_ipfs_daemon()`; `def data_key(monkeypatch)`; `def test_header_names_what_decryption_needs_and_no_key(tmp_path, data_key)`; `def test_header_is_the_tokens_associated_data(tmp_path, data_key)`; `def test_envelope_opens_on_another_host_from_the_payload_and_data_key(tmp_path, data_key)`; `def test_envelope_under_another_key_names_both_key_ids(tmp_path, data_key, monkeypatch)`; `def test_envelope_without_a_configured_key_is_refused(tmp_path, data_key)`; `def test_envelope_whose_plaintext_misses_its_key_hash_is_refused(tmp_path, data_key)`; `…`
 - **tests/unit/test_filecoin_encryption_portability.py** — F187 portability: an encrypted export must be restorable on a *different* host from only the CID + ``key_hash``, with no local key sidecar present.
   - `def data_key(monkeypatch)`; `def test_encrypted_content_restores_without_sidecar(tmp_path, data_key)`; `def test_store_and_retrieve_roundtrip_encrypted(tmp_path, data_key)`; `def test_legacy_sidecar_still_decrypts(tmp_path, data_key)`
+- **tests/unit/test_filecoin_ipfs_pinning.py** — The IPFS tier's remote publisher and reader when the adapter's node is unreachable (#2874, #3601).
+  - `def test_an_unreachable_node_publishes_through_the_pinning_service(tmp_path)`; `def test_a_reachable_node_takes_the_upload_under_its_name(tmp_path)`; `def test_the_pinning_service_needs_the_name_it_pins_under(tmp_path)`; `def test_only_the_ipfs_tier_consults_the_pinning_service(tmp_path, tier)`; `async def test_lighthouse_pinning_uploads_on_the_agent_loop_from_a_worker()`; `def test_lighthouse_pinning_refuses_to_block_the_agent_loop()`; `def test_retrieval_reads_the_remote_service_when_the_node_cannot_answer(tmp_path)`; `def test_a_node_that_answers_is_read_before_the_remote_service(tmp_path)`; `…`
 - **tests/unit/test_filecoin_miner_selection.py** — Unit tests for Filecoin miner selection logic.
   - `class TestMinerSelection`; `class TestMinerSelectionIntegration`; `class TestMinerSelectionEdgeCases`
 - **tests/unit/test_finalize_route_discovery.py** — Regression tests for #2247: model discovery must include finalize-registered routes.
@@ -3416,6 +3434,14 @@ Repo entry points and standard project files.
   - `def prometheus(monkeypatch)`; `async def store(tmp_path)`; `def service(monkeypatch, store)`; `async def test_an_attempt_is_recorded_with_the_gates_verdict_and_its_usage(service, store, prometheus, entry, …)`; `async def test_a_stream_without_a_terminal_response_keeps_its_flushed_usage(service, store, prometheus)`; `async def test_a_fallback_attempt_without_the_service_runner_records_the_verdict(ending)`
 - **tests/unit/test_gcp_auth.py** — Tests for the shared GCP credential discovery in ``kestrel_sovereign.features.deploy._gcp_auth``.
   - `def test_setup_gcp_auth_clears_stale_credentials_env_var(tmp_path, monkeypatch, caplog)`; `def test_setup_gcp_auth_keeps_valid_credentials_env_var(tmp_path, monkeypatch)`
+- **tests/unit/test_gemini_contents.py** — #3608: the Google and Vertex adapters send the agent's messages as Gemini contents.
+  - `async def test_an_openai_first_turn_reaches_the_wire_as_gemini_contents(route, path)`; `async def test_a_tool_loop_follow_up_reaches_the_wire_as_gemini_contents(route, path)`; `async def test_the_agents_tool_detection_turn_is_sent_and_answered(route)`; `async def test_a_gemini_shaped_message_list_is_sent_unchanged(route, path)`; `async def test_continue_with_tool_results_answers_the_calls_of_the_turn_before_it(route)`; `async def test_a_tool_result_without_its_call_is_refused_before_any_request(route)`; `async def test_an_openai_image_part_reaches_the_wire_as_inline_data(route)`; `def test_system_turns_become_one_system_instruction_in_order()`; `…`
+- **tests/unit/test_gemini_max_tokens.py** — #3621: a caller's ``max_tokens`` on a Gemini model that thinks.
+  - `async def test_a_budget_spent_on_thinking_is_reported_as_cut(route, body, text, path)`
+- **tests/unit/test_gemini_thinking_usage.py** — #3623: Gemini's thinking tokens are output tokens.
+  - `async def test_thinking_is_counted_as_output(route, case, path)`; `async def test_a_stream_reports_the_thinking_of_its_last_chunk_once(route)`; `def test_measured_counts_normalize_with_thinking_as_output(usage, expected)`; `def test_cached_prompt_tokens_leave_thinking_in_output()`; `def test_tool_use_prompt_tokens_stay_in_the_total_only()`; `def prometheus_tokens(monkeypatch)`; `async def test_the_thinking_is_billed_as_completion_tokens(monkeypatch, prometheus_tokens, route, case, …)`
+- **tests/unit/test_gemini_thought_signatures.py** — #3619: a Gemini 3 call's ``thought_signature`` goes back with its replay.
+  - `async def test_a_signed_calls_follow_up_sends_its_signature_back(route, path)`; `async def test_of_parallel_calls_only_the_signed_first_gets_its_signature(route)`; `async def test_sequential_signed_calls_each_get_their_own_signature(route)`; `async def test_an_unsigned_calls_follow_up_is_the_request_sent_before(route, path)`; `async def test_the_agents_streaming_entry_point_keeps_the_signature(route)`; `async def test_a_call_streamed_by_vertex_keeps_its_signature()`; `async def test_the_history_entry_survives_a_json_round_trip(route)`; `def test_a_signed_part_keeps_its_signature_as_base64_extra_content()`; `…`
 - **tests/unit/test_generate_feature_docs.py** — Tests for the feature-doc generation pipeline.
   - `def test_generator_uses_canonical_source_path()`; `def test_dry_run_returns_expected_output_paths(capsys)`; `def test_okf_frontmatter_for_generated_docs_is_deterministic()`; `def test_checked_in_generated_docs_have_okf_metadata()`; `def test_compose_generated_body_preserves_boundary_contract_verbatim()`; `def test_generator_rejects_non_bundled_surface_promotions(claim)`; `def test_generator_rejects_context_overclaims(claim)`; `def test_generated_links_are_rebased_only_when_root_relative()`; `…`
 - **tests/unit/test_generation_gate.py** — #3552: one gate decides whether a generation becomes an answer.
@@ -3585,7 +3611,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_lighthouse_payment.py** — Unit tests for Lighthouse payment methods.
   - `class TestLighthousePayment`; `class TestLighthouseBalance`; `class TestLighthousePaymentIntegration`
 - **tests/unit/test_lighthouse_rest.py** — Tests for Lighthouse REST client.
-  - `def client()`; `def mock_response()`; `class TestLighthouseRestClient`; `async def test_upload_car_budget_is_proportional_to_the_payload(client, mock_response)`; `async def test_upload_budget_is_sized_from_the_content_too(client, mock_response)`; `async def test_download_is_given_the_transfer_budget_when_the_size_is_known(client)`; `def test_a_small_upload_keeps_the_default_budget(client)`; `def test_the_budget_is_the_larger_of_the_default_and_the_payload_rate(client)`
+  - `def client()`; `def mock_response()`; `class TestLighthouseRestClient`; `async def test_upload_car_budget_is_proportional_to_the_payload(client, mock_response)`; `async def test_upload_budget_is_sized_from_the_content_too(client, mock_response)`; `async def test_download_is_given_the_transfer_budget_when_the_size_is_known(client)`; `def test_a_small_upload_keeps_the_default_budget(client)`; `def test_the_budget_is_the_larger_of_the_default_and_the_payload_rate(client)`; `…`
 - **tests/unit/test_list_trashed_messages_tool.py** — Message-level trash navigation (#2025).
   - `async def store()`; `async def test_lists_only_trashed_messages(store)`; `async def test_discover_then_restore_round_trip(store)`; `async def test_preview_unwraps_sent_form(store)`; `async def test_trashed_session_markers_are_hidden(store)`; `async def test_empty_trash_returns_zero(store)`; `async def test_ephemeral_and_isolated_expose_no_trash(store)`
 - **tests/unit/test_llm_call_watchdog.py** — #3552: every orchestrator LLM call a turn makes has one inactivity bound.
@@ -3825,7 +3851,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_personality_analyzer.py** — Unit tests for the Personality Analyzer module.
   - `class TestPersonalityAnalyzer`; `class TestPersonalityAnalyzerDecryption`; `class TestCalibrationPromptGenerator`; `class TestConvenienceFunctions`; `class TestPersonalityConsistency`
 - **tests/unit/test_phase3a_wiring.py** — Unit tests for Phase 3a — Lighthouse + LLM resolver wiring.
-  - `class TestLighthouseConstructorContract`; `class TestLLMServiceDisabledFlag`
+  - `class TestLighthouseConstructorContract`; `class TestLighthouseResolverOwnsTheKey`; `class TestLLMServiceDisabledFlag`
 - **tests/unit/test_phoenix_assets_redirect.py** — Root-absolute Phoenix chunk requests redirect into the /phoenix cookie scope.
   - `def client()`; `def test_assets_redirects_unauthenticated_into_phoenix_scope(client)`; `def test_assets_404_when_phoenix_not_supervised(client)`; `def test_assets_post_stays_protected(client)`
 - **tests/unit/test_phoenix_supervisor.py** — Tests for the host-supervised Phoenix subprocess + reverse proxy (#2570).
@@ -3947,7 +3973,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_response_audit.py** — Unit tests for the per-response audit plugin.
   - `class TestResponseAuditHook`; `class TestResponseAuditHookNarrationFolding`; `class TestResponseAuditFeature`; `async def test_post_response_hook_flags_user_denial_without_audit()`; `async def test_post_response_hook_allows_audit_backed_user_denial()`; `async def test_post_response_hook_missing_security_feature_does_not_break()`
 - **tests/unit/test_response_audit_decision.py** — Response audit on decide (#3490, #3424 slice 5): request builder, risk composition, failure semantics, hook/feature wiring, and the eval adapter.
-  - `def test_request_builder_shape()`; `def test_compose_risk(p_block, p_concern, risk)`; `async def test_decision_audit_uses_resolved_thresholds_and_content_free_reasoning()`; `async def test_decision_failure_is_an_unrun_audit(error)`; `async def test_strict_hook_with_decision_backend_blocks_and_fails_closed()`; `async def test_warn_hook_annotates_concern_without_leaking_response()`; `async def test_chat_backend_is_the_default_and_unchanged()`; `def test_backend_config_validation(env, message)`; `…`
+  - `def test_request_builder_shape()`; `def test_tool_outcomes_are_status_words_never_payloads()`; `def test_long_turns_keep_the_late_save_and_say_what_was_left_out()`; `def test_compose_risk(p_block, p_concern, p_unearned, risk)`; `async def test_decision_audit_uses_resolved_thresholds_and_content_free_reasoning()`; `async def test_decision_failure_is_an_unrun_audit(error)`; `async def test_strict_hook_with_decision_backend_blocks_and_fails_closed()`; `async def test_warn_hook_annotates_concern_without_leaking_response()`; `…`
 - **tests/unit/test_response_audit_privacy.py** — #3491: the response audit follows the privacy rule of the turn it audits.
   - `async def test_live_local_only_mode_audits_on_the_local_route_only(mode)`; `async def test_isolated_hook_passes_the_turn_privacy_state_explicitly()`; `async def test_explicit_false_cannot_loosen_the_live_restriction()`; `async def test_unreadable_live_restriction_fails_closed_to_local()`; `async def test_no_local_route_returns_typed_unaudited_result()`; `async def test_strict_hook_blocks_the_turn_when_no_local_route_can_audit()`; `async def test_warn_hook_does_not_send_or_block_when_no_local_route_can_audit()`; `async def test_hook_that_cannot_read_the_turn_privacy_state_makes_no_audit_call()`; `…`
 - **tests/unit/test_restart_coordinator.py** — Tests for the durable restart coordinator (#1512).
@@ -4190,8 +4216,10 @@ Repo entry points and standard project files.
   - `async def test_export_sovereignty_reports_upload_progress()`; `async def test_export_sovereignty_unknown_tier_is_failed()`; `async def test_export_sovereignty_falsy_nonstring_tier_is_failed(bad_tier)`; `async def test_export_sovereignty_valid_local_tier_resolves()`; `async def test_export_sovereignty_cloud_tier_is_rejected(cloud_tier)`; `async def test_encrypted_local_export_is_honoured_not_downgraded()`; `async def test_encrypted_export_without_master_key_is_refused_before_backup(tier)`; `async def test_unencrypted_export_needs_no_master_key()`; `…`
 - **tests/unit/test_sovereignty_export_receipt_contracts.py** — Sovereignty export receipt seam contracts.
   - `class AuditAnchorFeature`; `async def test_export_persists_receipt_with_import_and_audit_provenance()`; `async def test_export_partial_when_tier_falls_back_to_local()`; `async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotated(error, expected)`
+- **tests/unit/test_sovereignty_export_records.py** — Attribution of sovereignty export upload records to exactly one agent (#2874).
+  - `def test_a_did_is_named_verbatim_and_attributed_back_to_itself()`; `def test_every_publication_is_named_apart_even_in_the_same_second()`; `def test_an_export_named_before_3602_is_still_attributed()`; `def test_every_agent_id_round_trips_to_exactly_itself(agent_id)`; `def test_an_agent_whose_id_extends_another_is_never_attributed_to_it()`; `def test_slash_and_underscore_ids_do_not_collide()`; `def test_a_record_outside_the_family_or_not_canonical_belongs_to_no_agent(name)`; `def test_a_tag_naming_another_agent_leaves_the_record_unattributed()`; `…`
 - **tests/unit/test_sovereignty_import_receipt_gate.py** — Reading the host cache by a caller-supplied name needs a receipt (#3225).
-  - `async def test_import_without_a_receipt_never_reads_the_host_cache()`; `async def test_import_without_a_receipt_cannot_restore_a_cached_export(tmp_path, monkeypatch, seal_envelope)`; `async def test_import_with_a_receipt_follows_what_it_records(properties, key_hash, policy, envelope_key_hash, …)`; `async def test_a_receipt_without_a_cache_name_reads_its_content_hash_not_its_cid(node_id, cache_name)`; `async def test_import_refuses_a_receipt_whose_cache_name_is_not_its_exports(cache_name)`; `def test_identity_intake_never_answers_a_cid_from_the_local_cache()`; `def test_adapter_honours_allow_local_cache(tmp_path)`; `def test_artifacts_module_imports_standalone()`
+  - `async def test_import_without_a_receipt_never_reads_the_host_cache()`; `async def test_a_privacy_mode_that_keeps_storage_local_reads_no_gateway(privacy_mode, receipts)`; `async def test_a_privacy_mode_that_permits_a_remote_tier_reads_the_gateway(privacy_mode)`; `async def test_import_without_a_receipt_cannot_restore_a_cached_export(tmp_path, monkeypatch, seal_envelope)`; `async def test_import_with_a_receipt_follows_what_it_records(properties, key_hash, policy, envelope_key_hash, …)`; `async def test_a_receipt_without_a_cache_name_reads_its_content_hash_not_its_cid(node_id, cache_name)`; `async def test_import_refuses_a_receipt_whose_cache_name_is_not_its_exports(cache_name)`; `def test_identity_intake_never_answers_a_cid_from_the_local_cache()`; `…`
 - **tests/unit/test_sovereignty_sanitization.py** — Unit tests for sovereignty endpoint input sanitization.
   - `class TestTierValidation`; `class TestCIDValidation`; `class TestMaxSizeBounded`
 - **tests/unit/test_sovereignty_v3.py** — Unit tests for V3 Sovereignty: AssetCollector, manifest v3, and CAR packaging.
@@ -4380,6 +4408,8 @@ Repo entry points and standard project files.
   - `def test_resolved_host_database_is_inside_the_isolation_root(host_runtime_isolation_root)`; `def test_every_default_branch_behind_the_override_also_lands_in_the_root(host_runtime_isolation_root, monkeypatch)`; `def test_the_isolation_root_is_not_inside_the_test_tmp_path(host_runtime_isolation_root, tmp_path)`; `def test_discovered_context_limit_cache_is_redirected(host_runtime_isolation_root)`; `async def test_building_the_host_context_writes_only_under_the_root(host_runtime_isolation_root)`; `def test_the_suite_starts_no_host_features()`; `def test_a_host_feature_added_later_is_disabled_without_touching_the_fixture()`; `def test_the_opt_out_hands_enablement_back_to_the_test(tmp_path, monkeypatch)`; `…`
 - **tests/unit/test_update_profile_feature_restore.py** — F234: update_then_restart must restore out-of-tree feature packages that a bare `uv sync` prunes — mirroring what `kestrel update` does — instead of restarting into a host with its isolated/entry-poi…
   - `def test_feature_sync_step_added_when_manifest_present(tmp_path)`; `def test_a_linked_manifest_is_passed_as_the_project_directorys_path(tmp_path)`; `def test_no_feature_sync_step_when_manifest_absent(_project_home)`; `def test_reattach_branch_step_shape()`
+- **tests/unit/test_usage_db_concurrent_open.py** — Regression tests for #3618 — concurrent first LLM calls open the usage DB once.
+  - `async def test_concurrent_first_calls_open_the_sqlite_db_once(tmp_path, monkeypatch, callers)`; `async def test_concurrent_first_usage_writes_share_one_connection(tmp_path, monkeypatch)`; `async def test_concurrent_first_calls_open_the_postgres_db_once(monkeypatch)`; `async def test_failed_first_open_is_retried_once_by_later_calls(tmp_path, monkeypatch)`; `async def test_close_during_an_open_closes_the_connection_it_opens(tmp_path, monkeypatch)`; `async def test_initialized_fast_path_does_not_wait_for_the_lock(tmp_path)`
 - **tests/unit/test_usage_db_per_agent_scope.py** — Regression tests for #2769 — LLM usage rows must follow the OWNING agent.
   - `def test_agent_data_dir_outranks_process_env(tmp_path, monkeypatch)`; `def test_two_agents_in_one_process_do_not_share_a_usage_db(tmp_path, monkeypatch)`; `def test_env_var_still_authoritative_without_an_agent_binding(tmp_path, monkeypatch)`; `def test_falls_back_to_historical_default_when_nothing_is_set(tmp_path, monkeypatch)`; `def test_accepts_a_string_agent_data_dir(tmp_path)`; `def test_postgres_url_wins_over_any_agent_dir(tmp_path)`; `def test_init_does_not_touch_disk(tmp_path)`; `def test_llm_service_threads_agent_data_dir_through(tmp_path, monkeypatch)`; `…`
 - **tests/unit/test_user_byok_key_storage.py** — Unit tests for zero-knowledge USER_BYOK key storage.
@@ -4390,6 +4420,8 @@ Repo entry points and standard project files.
   - `async def outage()`; `class TestPersistedVendorWidePinIsTrustedAtUse`; `class TestNonPersistedSelectionsKeepTheGuard`; `class TestTheAuditStillFailsClosedButNamesTheStaleCatalog`; `class TestRouteQualifiedPinIsUnchanged`; `class TestMandatePinIsSetByTheBranchThatChoseTheRoutes`
 - **tests/unit/test_verify_policy.py** — verify_policy tests — Wave 1 sub-PR 4 (#916).
   - `def test_archival_import_defaults_to_legacy_allowed()`; `def test_live_identity_defaults_to_legacy_allowed_pre_wave_2()`; `def test_new_identity_issuance_defaults_to_hybrid_required()`; `def test_constitution_checkpoint_defaults_to_pq_required()`; `def test_every_context_has_a_default()`; `def test_legacy_allowed_accepts_classical_only()`; `def test_legacy_allowed_accepts_pq_only()`; `def test_legacy_allowed_accepts_hybrid()`; `…`
+- **tests/unit/test_vertex_tool_calling.py** — #2811: the Vertex adapter sends its tools, and reads the calls that come back.
+  - `async def test_get_response_sends_the_tools_as_function_declarations()`; `async def test_streaming_response_sends_the_tools_as_function_declarations()`; `async def test_a_request_without_tools_carries_no_tools_key(tools)`; `async def test_a_request_with_nothing_to_configure_still_sends_no_config()`; `async def test_tools_travel_alongside_the_other_request_settings()`; `async def test_a_function_call_part_becomes_a_tool_call()`; `async def test_a_part_whose_function_call_is_none_never_becomes_a_tool_call()`; `async def test_streaming_with_tools_surfaces_the_call_end_to_end()`; `…`
 - **tests/unit/test_wait_fallback_driver.py** — Fallback wait-reconcile driver + reconcile serialization (#2729 P1).
   - `async def db(tmp_path, sqlite_database_factory)`; `def test_fallback_due_when_no_reconciler_yet()`; `def test_fallback_due_when_never_reconciled()`; `def test_fallback_stands_down_when_recently_reconciled()`; `def test_fallback_due_when_stale()`; `async def test_post_all_features_loaded_starts_fallback_task()`; `async def test_post_all_features_loaded_noop_without_wait_registry()`; `async def test_concurrent_reconciles_emit_one_signal(db)`; `…`
 - **tests/unit/test_wait_ownership_validation.py** — Provider/handle ownership validation + restart re-arm for wait watches (#2729).
@@ -4447,6 +4479,8 @@ Repo entry points and standard project files.
   - `def write_legacy_history(path, rows)`; `async def open_legacy_history(path, rows)`
 - **tests/utils/legacy_embedding_column.py** — A pre-#3411 schema for tests that need the legacy ``embedding`` column.
   - `async def restore_legacy_embedding_column(db)`
+- **tests/utils/lighthouse_gateway.py** — Lighthouse's public gateway, answered in-process (#3601).
+  - `class GatewayServer`
 - **tests/utils/log_records.py** — Find caller content in captured log records, whatever field carries it.
   - `def records_containing(records, needle)`
 - **tests/utils/parallel_support.py** — Parallel test execution support utilities.
@@ -4459,6 +4493,8 @@ Repo entry points and standard project files.
   - `async def settle_occurrences(runner)`; `async def tick_and_settle(runner)`
 - **tests/utils/test_result_analyzer.py** — Test Result Analyzer for Agent Reflection.
   - `class InsightType`; `class TestInsight`; `class TestPattern`; `class TestResultAnalyzer`
+- **tests/utils/virtual_clock.py** — Event-loop clocks that only move when a test advances them.
+  - `class VirtualClock`; `class VirtualClockLoop`; `def pinned_loop_clock()`
 
 ## `demos/`
 

@@ -1,14 +1,18 @@
-"""Progress a non-streaming LLM call reports while its answer arrives (#3552).
+"""Progress an LLM call reports while its answer arrives (#3552, #3357).
 
-A streamed call shows it is alive by yielding items. A non-streaming call
-yields nothing until it returns, so a bound on its silence (the orchestrator's
-``LLMCallWatchdog``) cannot tell a long answer from a hung provider unless the
-call says when part of its answer has arrived.
+A bound on a call's silence (the orchestrator's ``LLMCallWatchdog``) cannot
+tell a long answer from a hung provider unless the call says when the provider
+sent something. A streamed call shows it is alive by yielding items, but not
+every provider event becomes an item: a tool call's arguments are held until
+the call is whole, and thinking that is not displayed yields nothing. A
+non-streaming call yields nothing at all until it returns.
 
-An adapter that reads a non-streaming answer incrementally, over a stream it
-does not expose, calls :func:`report_call_progress` for each part it receives.
-Whoever bounds the call listens with :func:`call_progress_listener`. A report
-with no listener does nothing, so adapters report unconditionally.
+So an adapter calls :func:`report_call_progress` for each provider event it
+reads, streamed or not, whether or not that event yields anything. Whoever
+bounds the call listens with :func:`call_progress_listener`. A report carries
+no content and is never yielded, so a consumer of the stream sees exactly
+what it saw without it. A report with no listener does nothing, so adapters
+report unconditionally.
 
 An adapter that receives its answer in one piece reports nothing, and a bound
 around it covers the whole call.
@@ -26,7 +30,7 @@ _LISTENER: ContextVar[Optional[Callable[[], None]]] = ContextVar(
 
 
 def report_call_progress() -> None:
-    """Tell whoever bounds the current call that part of its answer arrived."""
+    """Tell whoever bounds the current call that the provider sent something."""
     listener = _LISTENER.get()
     if listener is not None:
         listener()

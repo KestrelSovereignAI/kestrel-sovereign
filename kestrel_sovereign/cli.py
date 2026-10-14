@@ -2421,6 +2421,7 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     _core_install_shape,
     _core_lock,
     core_lock_check,
+    sync_lock_findings,
     CoreInstallGuard,
     _installed_extension_distributions,
     _registry_info_for,
@@ -2428,6 +2429,7 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     _host_manifest_path,
     _installed_version,
     _installed_requirements,
+    _installed_distribution_names,
     _pip_spec,
     _toml_basic_string,
 )

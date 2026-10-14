@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,9 @@ from kestrel_sovereign.execution_custody import (
 from kestrel_sovereign.storage.db.interface import ConnectionError
 from kestrel_sovereign.storage.db.sqlite import (
     SQLiteBackend,
+    _SQLiteCloseDiagnostics,
     _aiosqlite_worker_is_alive,
+    _capture_close_diagnostics,
     _close_aiosqlite_connection,
     _minimum_close_timeout_s,
     _prune_retained_aiosqlite_closes,
@@ -123,11 +126,22 @@ class SovereignSqlaSessionFactory:
     just needs ENOUGH of it to drive ``kestrel_sovereign.storage.vector``.
     """
 
-    def __init__(self, engine: Any, *, sqlite_custody=None, execution_owner=None) -> None:
+    def __init__(
+        self,
+        engine: Any,
+        *,
+        sqlite_custody=None,
+        sqlite_path: str | None = None,
+        execution_owner=None,
+    ) -> None:
         refuse_unfenced_executor(execution_owner)
         self._engine = engine
         self._execution_owner = execution_owner
         self._sqlite_custody = sqlite_custody
+        # The SQLite file this engine opens, named by a close that overruns
+        # its budget (#3460). ``None`` reports the database as unknown.
+        self._sqlite_path = sqlite_path
+        self._sqlite_close_diagnostics: _SQLiteCloseDiagnostics | None = None
         # SQLAlchemy's aiosqlite dialect acknowledges ``engine.dispose()``
         # after each driver's ``Connection.close()`` returns, which has the
         # same final-worker-turn gap as our primary SQLite backend.  Track the
@@ -332,6 +346,18 @@ class SovereignSqlaSessionFactory:
     async def close(self) -> None:
         """Dispose the engine and drain every SQLite worker it opened."""
         loop = asyncio.get_running_loop()
+        diagnostics: _SQLiteCloseDiagnostics | None = None
+        if getattr(self._engine.dialect, "name", None) == "sqlite":
+            if self._sqlite_close_diagnostics is None:
+                # Once, before the first close: a retry must not report a -wal
+                # that the first attempt's driver closes have already consumed.
+                self._sqlite_close_diagnostics = _capture_close_diagnostics(
+                    self._sqlite_path, None
+                )
+            # Each attempt is timed against its own deadline.
+            diagnostics = replace(
+                self._sqlite_close_diagnostics, started_at=loop.time()
+            )
         deadline = loop.time() + _minimum_close_timeout_s()
         if not self._close_started:
             self._close_started = True
@@ -412,7 +438,9 @@ class SovereignSqlaSessionFactory:
 
         cleanup_error: BaseException | None = None
         try:
-            await self._close_live_sqlite_connections(deadline=deadline)
+            await self._close_live_sqlite_connections(
+                deadline=deadline, diagnostics=diagnostics
+            )
         except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
             cleanup_error = exc
 
@@ -495,7 +523,12 @@ class SovereignSqlaSessionFactory:
                 self._retired_sqlite_closes,
             )
 
-    async def _close_live_sqlite_connections(self, *, deadline: float) -> None:
+    async def _close_live_sqlite_connections(
+        self,
+        *,
+        deadline: float,
+        diagnostics: _SQLiteCloseDiagnostics | None = None,
+    ) -> None:
         """Close and drain every live raw SQLite driver this factory owns.
 
         ``AsyncEngine.dispose()`` normally sends the close sentinel for pooled
@@ -527,6 +560,7 @@ class SovereignSqlaSessionFactory:
                         deadline=deadline,
                         close_task=retained.close_task,
                         cancel_close_task_on_timeout=False,
+                        diagnostics=diagnostics,
                     ),
                     name=f"sqla-aiosqlite-close:{id(connection)}",
                 )
@@ -653,7 +687,9 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
             engine = create_async_engine(URL.create("sqlite+aiosqlite", database=Path(path).as_uri(), query={"mode": "rw", "uri": "true"}))
         else:
             engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
-        factory = SovereignSqlaSessionFactory(engine, sqlite_custody=custody, execution_owner=db.backend)
+        factory = SovereignSqlaSessionFactory(
+            engine, sqlite_custody=custody, sqlite_path=path, execution_owner=db.backend
+        )
         try:
             setattr(db, _CACHE_ATTR, factory)
         except Exception:

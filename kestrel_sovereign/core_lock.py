@@ -22,6 +22,14 @@ One reading of the lock serves two purposes:
   for this environment refuses it.
 * :func:`lock_drift` lists every installed package whose version differs from
   the lock. It reports and never repairs.
+* :func:`lock_downgrades` takes the drift that went *below* the lock and names
+  what forced each package there (#3324). ``kestrel feature sync`` reports it
+  after every sync, because a downgrade the hold did not prevent (a checkout
+  the manifest declares, an install that bypassed the constraints) otherwise
+  runs unannounced on a host whose update reported every step at rc=0.
+  :func:`write_lock_findings_report` hands those findings, whole, to the
+  process that ran the sync (:data:`SYNC_LOCK_REPORT_ENV`), and
+  :func:`read_lock_findings_report` is how that process reads them back.
 
 The lock read is core's own: the ``uv.lock`` in the checkout core is installed
 from (:func:`core_lock_checkout`). A core installed from an index wheel has no
@@ -30,6 +38,7 @@ lock beside it, and then there is nothing to hold or compare.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import tomllib
@@ -41,10 +50,32 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from kestrel_sovereign.feature_reconcile import (
     CORE_DISTRIBUTION,
     canonical_package,
+    requirement_applies,
     version_is_valid,
 )
 
 LOCK_FILENAME = "uv.lock"
+
+#: What a :class:`LockDowngrade` names as its cause when nothing installed
+#: excludes the locked version (#3324).
+UNKNOWN_CAUSE = "unknown"
+
+#: Names the file ``kestrel feature sync`` writes its lock findings to, when
+#: set (#3324). ``update_then_restart`` sets it for its sync step: it keeps
+#: only the tail of the step's output, which enough findings outrun, so it
+#: reads them from here instead. An environment variable rather than a flag,
+#: so an update that lands an older revision, whose sync has no such flag,
+#: still runs: that sync ignores it and writes nothing.
+SYNC_LOCK_REPORT_ENV = "KESTREL_FEATURE_SYNC_LOCK_REPORT"
+
+#: The largest lock report :func:`read_lock_findings_report` reads. Its
+#: findings are bounded by the packages the lock pins, which keep a real
+#: report far under this; it bounds what the reader holds and persists.
+LOCK_REPORT_MAX_BYTES = 1 << 20
+
+
+class LockReportError(ValueError):
+    """A lock report that was written cannot be read (#3324)."""
 
 
 class CoreLockError(ValueError):
@@ -194,6 +225,101 @@ class LockDrift:
 
     def describe(self) -> str:
         return f"{self.name} {self.installed} installed, uv.lock pins {self.locked}"
+
+    @property
+    def below(self) -> bool:
+        """Installed at a lower version than the lock pins.
+
+        False when either side is not a PEP 440 version: no order between them
+        can be read, and :meth:`describe` already names the mismatch.
+        """
+        if not (version_is_valid(self.installed) and version_is_valid(self.locked)):
+            return False
+        from packaging.version import Version
+
+        return Version(self.installed) < Version(self.locked)
+
+
+@dataclass(frozen=True)
+class LockForcer:
+    """Something that excludes a package's locked version, and how (#3324).
+
+    *source* is the installed distribution whose requirement excludes it, or
+    the host manifest when it holds the package on a checkout. *reason* says
+    what that source asks for.
+    """
+
+    source: str
+    reason: str
+
+    def describe(self) -> str:
+        return f"{self.source} ({self.reason})"
+
+
+@dataclass(frozen=True)
+class LockDowngrade:
+    """A locked package installed below the version core's ``uv.lock`` pins (#3324).
+
+    *forced_by* names everything found that excludes the locked version. Empty
+    when nothing does, and :attr:`cause` then says ``unknown`` rather than
+    guess: the package may have been moved by a direct install that left no
+    requirement behind.
+    """
+
+    name: str
+    locked: str
+    installed: str
+    forced_by: Tuple[LockForcer, ...] = ()
+
+    @property
+    def cause(self) -> str:
+        return "; ".join(f.describe() for f in self.forced_by) or UNKNOWN_CAUSE
+
+    def describe(self) -> str:
+        return (
+            f"{self.name} {self.installed} installed, below the {self.locked} "
+            f"uv.lock pins; forced by {self.cause}"
+        )
+
+    def as_report(self) -> dict:
+        """This finding as one entry of :func:`write_lock_findings_report`."""
+        return {
+            "kind": "lock_downgrade",
+            "package": self.name,
+            "locked": self.locked,
+            "installed": self.installed,
+            "forced_by": [
+                {"source": forcer.source, "reason": forcer.reason}
+                for forcer in self.forced_by
+            ],
+            "cause": self.cause,
+            "message": self.describe(),
+        }
+
+
+@dataclass(frozen=True)
+class LockNotCompared:
+    """Core's ``uv.lock`` is missing or will not read, so nothing was compared (#3324).
+
+    Its own finding, never an empty list: "nothing is below the lock" and "the
+    lock could not be read" are different answers.
+    """
+
+    reason: str
+
+    def describe(self) -> str:
+        return (
+            "installed versions were not compared against core's uv.lock: "
+            f"{self.reason}"
+        )
+
+    def as_report(self) -> dict:
+        """This finding as one entry of :func:`write_lock_findings_report`."""
+        return {
+            "kind": "lock_not_compared",
+            "reason": self.reason,
+            "message": self.describe(),
+        }
 
 
 @dataclass(frozen=True)
@@ -509,6 +635,155 @@ def lock_drift(
             continue
         drift.append(LockDrift(name=package.name, locked=package.version, installed=have))
     return tuple(drift)
+
+
+def _requirements_excluding(
+    name: str,
+    locked: str,
+    requirements: Mapping[str, Iterable[str]],
+    extras: Mapping[str, Iterable[str]],
+) -> List[LockForcer]:
+    """Each installed distribution whose active requirement on *name* excludes *locked*.
+
+    A requirement is active when its markers hold in this environment or
+    under an extra the host asked that distribution for (*extras*). One that
+    will not parse is skipped: it names nothing that could be shown to force
+    anything.
+    """
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    forcers = []
+    for dist in sorted(requirements):
+        if dist == name:
+            continue
+        for raw in requirements[dist]:
+            try:
+                req = Requirement(raw)
+            except InvalidRequirement:
+                continue
+            if canonical_package(req.name) != name or not req.specifier:
+                continue
+            if not requirement_applies(req, tuple(extras.get(dist, ()))):
+                continue
+            if req.specifier.contains(locked, prereleases=True):
+                continue
+            forcers.append(LockForcer(dist, f"requires {req.name}{req.specifier}"))
+    return forcers
+
+
+def lock_downgrades(
+    drift: Iterable[LockDrift],
+    *,
+    distributions: Callable[[], Iterable[str]],
+    requires: Callable[[str], Iterable[str]],
+    extras: Mapping[str, Iterable[str]] = MappingProxyType({}),
+    declared_checkouts: Mapping[str, str] = MappingProxyType({}),
+) -> Tuple[LockDowngrade, ...]:
+    """Every *drift* below its locked version, with what forced it there (#3324).
+
+    A package installed above the lock is not one: it still runs every fix the
+    locked version carries, and the drift report (:meth:`LockCheck.report_lines`)
+    already names it.
+
+    The cause is read from what the venv holds now, not from the install that
+    moved it: an installer's output says nothing reliable about why it chose a
+    version. Each installed distribution (*distributions*, read through
+    *requires*) whose active requirement excludes the locked version is named,
+    and so is the host manifest when it holds the package on a checkout
+    (*declared_checkouts*, ``{package: checkout}``), since that hold keeps it at
+    whatever the checkout builds. *extras* maps a distribution to the extras the
+    host asked for it. Both readers are called only when something is below the
+    lock.
+    """
+    below = [entry for entry in drift if entry.below]
+    if not below:
+        return ()
+    requirements = {}
+    for dist in distributions():
+        name = canonical_package(dist)
+        if name not in requirements:
+            requirements[name] = tuple(requires(dist) or ())
+    wanted_extras = {canonical_package(dist): tuple(e) for dist, e in extras.items()}
+    checkouts = {
+        canonical_package(package): checkout
+        for package, checkout in declared_checkouts.items()
+        if checkout
+    }
+    findings = []
+    for entry in below:
+        forcers = _requirements_excluding(
+            entry.name, entry.locked, requirements, wanted_extras,
+        )
+        if entry.name in checkouts:
+            forcers.append(LockForcer(
+                "host manifest", f"holds it on checkout {checkouts[entry.name]}",
+            ))
+        findings.append(LockDowngrade(
+            name=entry.name,
+            locked=entry.locked,
+            installed=entry.installed,
+            forced_by=tuple(forcers),
+        ))
+    return tuple(findings)
+
+
+def write_lock_findings_report(path: Path, findings) -> None:
+    """Write every finding to *path* as one JSON report (#3324).
+
+    ``{"findings": [...]}``, one :meth:`~LockDowngrade.as_report` entry per
+    finding, each with the ``message`` the sync printed for it. Written even
+    when there are none: an empty list says the venv was compared and nothing
+    was below the lock, where no report says it was never compared. Staged
+    beside *path* and moved into place, so a reader sees all of it or none.
+
+    Raises:
+        OSError: The report could not be written.
+    """
+    path = Path(path)
+    text = json.dumps({"findings": [finding.as_report() for finding in findings]})
+    staged = path.with_name(f"{path.name}.partial")
+    staged.write_text(text, encoding="utf-8")
+    os.replace(staged, path)
+
+
+def read_lock_findings_report(path: Path) -> Optional[List[dict]]:
+    """The findings :func:`write_lock_findings_report` wrote to *path*.
+
+    None when nothing was written there: the sync ended before it compared, or
+    the code it ran predates the report. Each finding is returned as written;
+    every one carries a ``message``.
+
+    Raises:
+        LockReportError: Something is at *path* that is not a report.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(LOCK_REPORT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise LockReportError(f"{path} cannot be read: {exc}") from exc
+    if len(raw) > LOCK_REPORT_MAX_BYTES:
+        raise LockReportError(
+            f"{path} is larger than the {LOCK_REPORT_MAX_BYTES} bytes a lock "
+            "report is read up to"
+        )
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    # RecursionError: Python 3.11's decoder raises it, not ValueError, on
+    # deeply nested brackets.
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise LockReportError(f"{path} is not JSON: {exc}") from exc
+    findings = data.get("findings") if isinstance(data, dict) else None
+    if not isinstance(findings, list) or not all(
+        isinstance(finding, dict) and isinstance(finding.get("message"), str)
+        for finding in findings
+    ):
+        raise LockReportError(
+            f"{path} is not a lock report: it has no list of findings that "
+            "each carry a message"
+        )
+    return findings
 
 
 def load_core_lock(checkout: Optional[Path]) -> Optional[CoreLock]:

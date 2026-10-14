@@ -140,6 +140,25 @@ def _resolve_deployment_embedding_dim() -> Optional[int]:
         return None
 
 
+# The capabilities a route's embedding profile is built from: whether the
+# route embeds at all, and with which model at which width. These are what
+# resolution decides (#2372); the auto-resolved marker it also writes changes
+# no profile.
+_EMBEDDING_PROFILE_CAPABILITIES = (
+    "supports_embeddings",
+    "embedding_model",
+    "embedding_dim",
+)
+
+
+def _embedding_profile_capabilities(provider: dict) -> Tuple[Any, ...]:
+    """The values of a route's ``_EMBEDDING_PROFILE_CAPABILITIES`` (#3606)."""
+    caps = provider.get("capabilities")
+    if not isinstance(caps, dict):
+        caps = {}
+    return tuple(caps.get(key) for key in _EMBEDDING_PROFILE_CAPABILITIES)
+
+
 class ModelDiscoveryMixin:
     """
     Mixin class providing model discovery methods for LLMService.
@@ -1049,6 +1068,16 @@ class ModelDiscoveryMixin:
         to reconcile.
         """
 
+    def _embedding_profile_changed(self) -> None:
+        """Hook: a resolution changed the profile a route embeds with (#3606).
+
+        Called once :meth:`resolve_route_embedding_model` (or a
+        :meth:`reconcile_embedding_capabilities` sweep) has written new
+        embedding capabilities. ``LLMService`` overrides it to run the
+        listener set with ``set_embedding_profile_change_callback``; a bare
+        discovery mixin has no listener.
+        """
+
     @execution_work_operation
     async def reconcile_embedding_capabilities(self, *, use_cache: bool = True) -> None:
         """Fold live embedding discovery into each route's static capabilities (#2338).
@@ -1070,6 +1099,10 @@ class ModelDiscoveryMixin:
         discovered embeddings (never a same-vendor sibling), and it is only ever
         turned ON — a config pin / prior TOML capability is never downgraded
         here (the #2326 set-time probe owns dead-model detection).
+
+        A sweep that changes any route's embedding profile reports it once,
+        after every route is resolved, through :meth:`_embedding_profile_changed`
+        (#3606).
         """
         providers = getattr(self, "providers", None)
         if not isinstance(providers, list):
@@ -1094,6 +1127,7 @@ class ModelDiscoveryMixin:
         corpus_profile = await self._get_corpus_embedding_profile()
         deployment_dim = _resolve_deployment_embedding_dim()
 
+        profile_changed = False
         for provider in providers:
             route_name = provider.get("name")
             # Only advertise where THIS route actually discovered embeddings —
@@ -1110,8 +1144,9 @@ class ModelDiscoveryMixin:
             # auto-resolved writes so they are never later mistaken for an
             # operator pin, and records any space-change warning. A config/static
             # pin is honoured verbatim (never downgraded).
+            before = _embedding_profile_capabilities(provider)
             try:
-                await self.resolve_route_embedding_model(
+                await self._resolve_route_embedding_capabilities(
                     provider,
                     corpus_profile=corpus_profile,
                     deployment_dim=deployment_dim,
@@ -1124,6 +1159,10 @@ class ModelDiscoveryMixin:
                     route_name,
                     exc,
                 )
+            if _embedding_profile_capabilities(provider) != before:
+                profile_changed = True
+        if profile_changed:
+            self._embedding_profile_changed()
 
     def _note_embedding_space_change(
         self,
@@ -1255,9 +1294,37 @@ class ModelDiscoveryMixin:
         (``get_embedding_settings``, ``ProviderEmbeddingService.describe``)
         observe the same answer and ``embedding_model`` NEVER stands without a
         ``embedding_dim``.
+
+        Storage embeds with whatever those capabilities say, so a resolution
+        that changes them changes the agent's embedding profile without any
+        setting being persisted: clearing a pin, for one, leaves the route to
+        be resolved here afterwards. Such a change is reported through
+        :meth:`_embedding_profile_changed` once it is written (#3606).
         """
         if not isinstance(provider, dict):
             return None, None
+        before = _embedding_profile_capabilities(provider)
+        resolved = await self._resolve_route_embedding_capabilities(
+            provider,
+            corpus_profile=corpus_profile,
+            deployment_dim=deployment_dim,
+        )
+        if _embedding_profile_capabilities(provider) != before:
+            self._embedding_profile_changed()
+        return resolved
+
+    async def _resolve_route_embedding_capabilities(
+        self,
+        provider: dict,
+        *,
+        corpus_profile: Optional[Dict[str, Any]],
+        deployment_dim: Optional[int],
+    ) -> Tuple[Optional[str], Optional[int]]:
+        """:meth:`resolve_route_embedding_model`, without reporting a change.
+
+        A :meth:`reconcile_embedding_capabilities` sweep resolves every route
+        through this and reports its changes once, after the last route.
+        """
         caps = provider.get("capabilities")
         if not isinstance(caps, dict):
             caps = {}

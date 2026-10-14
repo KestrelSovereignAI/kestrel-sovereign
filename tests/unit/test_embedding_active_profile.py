@@ -680,11 +680,21 @@ async def test_a_preference_that_cannot_be_applied_leaves_both_unpinned(
 # ---------------------------------------------------- the agent's own record
 
 
+class _ColumnWidthCheck:
+    """The conversation store's profile/column width check, counting its runs."""
+
+    def __init__(self) -> None:
+        self.runs = 0
+
+    async def check_embedding_column_dimensions(self) -> None:
+        self.runs += 1
+
+
 class _Agent(ModelPreferenceMixin):
     """The state ``record_active_embedding_profile`` reads from an agent."""
 
     def __init__(self, db, service, *, allows_cloud=True) -> None:
-        self._raw_storage = SimpleNamespace(db=db)
+        self._raw_storage = SimpleNamespace(db=db, conversation=_ColumnWidthCheck())
         self.agent_id = AGENT
         self.llm_service = SimpleNamespace(get_embedding_service=lambda: service)
         self.privacy_agent = SimpleNamespace(
@@ -708,6 +718,17 @@ async def test_a_local_only_privacy_mode_records_nothing(db):
     assert (await load_active_embedding_profiles(db)).records == ()
 
 
+async def test_a_change_after_storage_is_released_acts_on_nothing(db):
+    # A failed boot's rollback releases storage; a change persisted after
+    # that has no column to compare and no store to flag.
+    agent = _Agent(db, _Service("after"))
+    agent._raw_storage = None
+
+    await agent.refresh_active_embedding_profile()
+
+    assert (await load_active_embedding_profiles(db)).records == ()
+
+
 @pytest.mark.parametrize(
     ("callback", "args"),
     [
@@ -721,11 +742,14 @@ async def test_a_persisted_embedding_change_records_the_new_profile(
 ):
     before, after = _Service("before"), _Service("after")
     await record_active_embedding_profile(db, AGENT, before)
+    agent = _Agent(db, after)
 
-    await getattr(_Agent(db, after), callback)(*args)
+    await getattr(agent, callback)(*args)
 
     lookup = await load_active_embedding_profiles(db, AGENT)
     assert lookup.profile_id == after.current_profile_id()
+    # And compares the new profile with the vector column's width (#3606).
+    assert agent._raw_storage.conversation.runs == 1
 
 
 async def test_a_parity_verification_records_the_profile_it_now_resolves(db):
@@ -755,3 +779,5 @@ async def test_a_parity_verification_records_the_profile_it_now_resolves(db):
     assert (await verify_embedding_space(_Request()))["success"] is True
     lookup = await load_active_embedding_profiles(db, AGENT)
     assert lookup.profile_id == shared.current_profile_id()
+    # And compares it with the vector column's width (#3606).
+    assert agent._raw_storage.conversation.runs == 1

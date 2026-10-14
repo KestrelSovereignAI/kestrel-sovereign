@@ -23,6 +23,7 @@ framework-side.
 """
 
 from dataclasses import dataclass
+import json
 import math
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
@@ -123,6 +124,47 @@ class ReportedUsage:
             self.cost = (self.cost or 0.0) + float(cost)
         if isinstance(model, str) and model:
             self.model = model
+
+
+@dataclass
+class ToolCallWithExtraContent(ToolCall):
+    """A tool call carrying provider data its replay must send back (#3619).
+
+    ``extra_content`` is the provider-namespaced ``extra_content`` member of
+    the OpenAI-format ``tool_calls`` entry the agent replays the call as:
+    Gemini 3's ``{"google": {"thought_signature": <base64>}}``, the shape
+    Gemini's own OpenAI compatibility uses. It is opaque to the agent and
+    copied onto the replayed entry unchanged by
+    :func:`tool_call_history_entry`; the provider that wrote it reads it back
+    from its own namespace. The SDK ``ToolCall`` has no field for it yet; a
+    plain ``ToolCall`` is a call that carries none.
+    """
+
+    extra_content: Optional[Dict[str, Any]] = None
+
+
+def tool_call_history_entry(tool_call: ToolCall) -> Dict[str, Any]:
+    """``tool_call`` as an OpenAI-format assistant ``tool_calls`` entry.
+
+    The entry the agent's tool loops replay the call as on their next
+    request. Arguments stay a dict (the ollama library expects one, and the
+    OpenAI adapter encodes them). A call's ``extra_content`` rides on the
+    entry unchanged; a call with none gets no ``extra_content`` key.
+    """
+    arguments = tool_call.arguments
+    entry: Dict[str, Any] = {
+        "id": tool_call.id,
+        "type": "function",
+        "function": {
+            "name": tool_call.name,
+            "arguments": arguments if isinstance(arguments, dict)
+            else json.loads(arguments) if arguments else {},
+        },
+    }
+    extra_content = getattr(tool_call, "extra_content", None)
+    if extra_content is not None:
+        entry["extra_content"] = extra_content
+    return entry
 
 
 @dataclass(frozen=True)
@@ -255,9 +297,11 @@ __all__ = [
     "ThinkingDelta",
     "ThinkingContentSplitter",
     "ToolCall",
+    "ToolCallWithExtraContent",
     "build_messages",
     "messages_for",
     "split_thinking_from_content",
+    "tool_call_history_entry",
 ]
 
 

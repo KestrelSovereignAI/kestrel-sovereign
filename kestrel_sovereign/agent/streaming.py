@@ -2045,6 +2045,7 @@ class StreamingMixin:
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
                 hook_snapshot=audit_hook_snapshot,
+                user_message=user_input,
             )
             # #2674 P0-2: cancellation can arrive WHILE the audit provider call is
             # in flight (``get_audit_response`` hangs, user hits stop, the audit
@@ -2318,6 +2319,7 @@ class StreamingMixin:
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
                 hook_snapshot=audit_hook_snapshot,
+                user_message=user_input,
             )
             # #2674 P0-2: cancellation that lands WHILE the audit await was in
             # flight is invisible to the pre-audit check above. Recheck here and
@@ -2423,6 +2425,7 @@ class StreamingMixin:
             final_text = await self._fire_post_response_hook(
                 final_text, session_id,
                 hook_snapshot=audit_hook_snapshot,
+                user_message=user_input,
             )
             # #2674 P0-2: cancellation that lands WHILE the audit await was in
             # flight is invisible to the pre-audit check above. Recheck here and
@@ -2744,6 +2747,7 @@ class StreamingMixin:
         tool_calls: Optional[list] = None,
         tool_results: Optional[list] = None,
         hook_snapshot: Optional[list] = None,
+        user_message: Optional[str] = None,
     ) -> str:
         """Fire POST_RESPONSE hooks on completed response text.
 
@@ -2844,6 +2848,9 @@ class StreamingMixin:
             pre_tool_prose=pre_tool_prose,
             tool_calls=tool_calls,
             tool_results=tool_results,
+            # What the reply answers, so an audit can judge it against the ask
+            # (#3553). STOP hooks already receive it.
+            user_message=user_message,
         )
         # #2674: pin each snapshotted hook to its turn-start mode while the audit
         # runs (defers an in-place warn→strict flip to the next turn), and run

@@ -135,9 +135,70 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
             None, _enter, acquired_result_cleanup=close_acquired,
         )
     try:
+        _report_body_progress(stream)
         yield stream
     finally:
         await close_acquired((stream_cm, stream))
+
+
+class _ProgressReportingBody(httpx.AsyncByteStream):
+    """An Anthropic response body that reports each chunk it reads as call
+    progress (#3357)."""
+
+    def __init__(self, body: httpx.AsyncByteStream) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._body:
+            report_call_progress()
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._body.aclose()
+
+
+def _report_body_progress(stream: Any) -> None:
+    """Report every chunk of ``stream``'s response body as call progress.
+
+    Thinking that is not displayed reaches the client as ``ping`` events
+    alone. With ``display: "omitted"``, the default on current Claude models,
+    a thinking block streams one empty ``thinking_delta`` and then its
+    ``signature_delta``, however long the model thinks; the stream between
+    them carries only pings. The SDK consumes pings itself, so no event the
+    adapter reads stands for them. The response body is the one place they
+    are visible, and each chunk read off it is reported, whatever it carries.
+
+    Must run before the stream is first read; the SDK reads the body lazily.
+    A stream with no HTTP body behind it is left alone. Its events are still
+    reported one by one (:func:`_next_stream_event`).
+    """
+    response = getattr(stream, "response", None)
+    body = getattr(response, "stream", None)
+    if isinstance(body, httpx.AsyncByteStream) and not isinstance(
+        body, _ProgressReportingBody
+    ):
+        response.stream = _ProgressReportingBody(body)
+
+
+async def _next_stream_event(
+    stream_iter: AsyncIterator[Any],
+    cancel_token: Optional[CancelToken],
+) -> Any:
+    """The next event off an Anthropic stream, reported as call progress.
+
+    Every event is the provider still answering, including the many that
+    yield nothing to the caller: a tool call's ``input_json_delta`` (the
+    call is announced only once it is whole), redacted thinking and the
+    empty deltas of thinking that is not displayed, block and message
+    boundaries. Reporting each one lets an inactivity bound around the
+    stream measure provider silence rather than the gaps between yielded
+    items (#3357). The report carries nothing, so no partial tool call or
+    other artefact reaches a consumer. Pings never surface as events; the
+    response body reports them (:func:`_report_body_progress`).
+    """
+    event = await anext_or_cancelled(stream_iter, cancel_token)
+    report_call_progress()
+    return event
 
 
 async def _anthropic_final_message(client, api_params):
@@ -157,14 +218,16 @@ async def _anthropic_final_message(client, api_params):
     been shown to anyone until the final message exists, so a retry cannot
     duplicate visible output.
 
-    Each event read off the stream is reported as call progress (#3552), so
-    an inactivity bound around this call measures provider silence, not the
-    length of the answer.
+    Each event read off the stream is reported as call progress (#3552), and
+    so is each chunk of its body, which carries the pings of thinking that is
+    not displayed (#3357). An inactivity bound around this call therefore
+    measures provider silence, not the length of the answer.
     """
     async def _once():
         # The outer retry still owns this whole non-incremental request; do
         # not multiply its retry budget with a second open retry policy.
         async with _anthropic_stream_with_retry(client, api_params, retry_open=False) as stream:
+            _report_body_progress(stream)
             async for _event in stream:
                 report_call_progress()
             return await stream.get_final_message()
@@ -1518,7 +1581,7 @@ class AnthropicAdapter(LLMAdapter):
                 stream_iter = stream.__aiter__()
                 while True:
                     try:
-                        event = await anext_or_cancelled(
+                        event = await _next_stream_event(
                             stream_iter, cancel_token
                         )
                     except StopAsyncIteration:
@@ -1688,7 +1751,7 @@ class AnthropicAdapter(LLMAdapter):
                 stream_iter = stream.__aiter__()
                 while True:
                     try:
-                        event = await anext_or_cancelled(
+                        event = await _next_stream_event(
                             stream_iter, cancel_token
                         )
                     except StopAsyncIteration:

@@ -15,10 +15,13 @@ import logging
 import shutil
 import time
 from datetime import datetime
-from typing import Any, Awaitable, Dict, List
+from typing import Any, Awaitable, Dict, List, Optional
 
 from kestrel_sdk.signals import ResourceLock
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    resolve_conversation_store,
+    resolve_feature_database,
+)
 from kestrel_sovereign.signals import lock_manager as resource_lock_manager
 
 logger = logging.getLogger(__name__)
@@ -487,18 +490,22 @@ async def check_context_budget(agent) -> Dict[str, Any]:
         }
 
 
+def _enabled_scheduler_feature(agent) -> Optional[Any]:
+    """Return the agent's SchedulerFeature when it is loaded and enabled."""
+
+    features = getattr(agent, "features", None)
+    if isinstance(features, dict):
+        for name, feature in features.items():
+            if name == "SchedulerFeature" or type(feature).__name__ == "SchedulerFeature":
+                return feature if getattr(feature, "enabled", True) else None
+    return None
+
+
 async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
     """Verify that an enabled SchedulerFeature has a current worker report."""
 
     start = time.monotonic()
-    features = getattr(agent, "features", None)
-    scheduler = None
-    if isinstance(features, dict):
-        for name, feature in features.items():
-            if name == "SchedulerFeature" or type(feature).__name__ == "SchedulerFeature":
-                if getattr(feature, "enabled", True):
-                    scheduler = feature
-                break
+    scheduler = _enabled_scheduler_feature(agent)
     if scheduler is None:
         return {
             "name": "scheduler_liveness",
@@ -629,6 +636,85 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
     }
 
 
+async def check_scheduled_task_failures(agent, db) -> Dict[str, Any]:
+    """Flag every schedule the runner has marked as failing repeatedly (#3280).
+
+    The runner records the marker once a schedule fails
+    ``[scheduler] failure_alert_threshold`` consecutive times and clears it on
+    the next success; this check only reports it. Before it existed, 23
+    consecutive failures of one task showed up nowhere but the execution log.
+    """
+
+    start = time.monotonic()
+    if _enabled_scheduler_feature(agent) is None:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "pass",
+            "message": "SchedulerFeature is not enabled for this agent",
+            "details": {"state": "not_configured"},
+            "duration_ms": _elapsed(start),
+        }
+    if db is None:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "fail",
+            "message": "SchedulerFeature has no database to read task failures from",
+            "details": {"state": "storage_unavailable"},
+            "duration_ms": _elapsed(start),
+        }
+
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        agent_did = resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "fail",
+            "message": "Scheduled task failure inspection requires the agent's durable identity",
+            "details": {"state": "identity_unavailable"},
+            "duration_ms": _elapsed(start),
+        }
+    try:
+        from kestrel_sovereign.features.scheduler.failure_streak import (
+            load_failure_markers,
+        )
+
+        markers = await load_failure_markers(db, agent_did, agent=agent)
+    except Exception as error:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "fail",
+            "message": f"Scheduled task failure inspection failed: {error}",
+            "details": {"state": "inspection_failed"},
+            "duration_ms": _elapsed(start),
+        }
+
+    if not markers:
+        return {
+            "name": "scheduled_task_failures",
+            "status": "pass",
+            "message": "No scheduled task is failing repeatedly",
+            "details": {"state": "none_failing", "failing": []},
+            "duration_ms": _elapsed(start),
+        }
+    summary = "; ".join(
+        f"{marker['task_name']} ({marker['consecutive_failures']} consecutive "
+        f"failures since {marker['first_failure_at']})"
+        for marker in markers
+    )
+    return {
+        "name": "scheduled_task_failures",
+        "status": "warn",
+        "message": f"{len(markers)} scheduled task(s) failing repeatedly: {summary}",
+        "details": {"state": "failing", "failing": markers},
+        "duration_ms": _elapsed(start),
+    }
+
+
 async def check_bootstrap_state(agent, threshold_seconds: int = 3600) -> Dict[str, Any]:
     """Check whether first-contact bootstrap is stuck in PENDING."""
     start = time.monotonic()
@@ -742,6 +828,104 @@ async def check_signal_audit_log(agent) -> Dict[str, Any]:
             f"{dropped} signal_log audit row(s) dropped since start; "
             "the audit trail is incomplete"
         ),
+        "duration_ms": _elapsed(start),
+        "details": details,
+    }
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    """*value* when it is a positive ``int`` (not a ``bool``), else ``None``."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+async def check_conversation_embeddings(agent) -> Dict[str, Any]:
+    """Report conversation embeddings dropped on write, and a width mismatch (#2913).
+
+    A turn whose embedding cannot be stored is still persisted, without its
+    vector, so semantic recall over conversation history degrades with every
+    such turn. Its only trace used to be INFO lines. The store counts the
+    drops and records a profile/column width disagreement, found at startup
+    and re-checked whenever the embedding profile changes at runtime (#3606);
+    this surfaces both, the way ``check_signal_audit_log`` surfaces dropped
+    audit rows.
+
+    ``warn`` rather than ``fail``, like that check: the agent keeps serving
+    and its turns keep persisting. The count does not clear when later writes
+    succeed, because the vectors dropped earlier are still missing. The
+    misconfiguration does clear once the active profile fits the column.
+    """
+    start = time.monotonic()
+
+    store = resolve_conversation_store(agent)
+    if store is None:
+        return {
+            "name": "conversation_embeddings",
+            "status": "pass",
+            "message": "No conversation store on this agent",
+            "duration_ms": _elapsed(start),
+        }
+
+    # Duck-typed and type-checked for the same reason as the signal_log
+    # check: a stand-in store must not report a loss that did not happen.
+    dropped = _positive_int(getattr(store, "dropped_embedding_count", None)) or 0
+    mismatch = getattr(store, "embedding_column_mismatch", None)
+    profile_dim = _positive_int(getattr(mismatch, "profile_dim", None))
+    column_dim = _positive_int(getattr(mismatch, "column_dim", None))
+    misconfigured = (
+        profile_dim is not None
+        and column_dim is not None
+        and profile_dim != column_dim
+    )
+
+    if dropped == 0 and not misconfigured:
+        return {
+            "name": "conversation_embeddings",
+            "status": "pass",
+            "message": "No conversation embeddings dropped",
+            "duration_ms": _elapsed(start),
+        }
+
+    details: Dict[str, Any] = {"dropped": dropped, "misconfigured": misconfigured}
+    messages = []
+    if misconfigured:
+        details["misconfiguration"] = {
+            "profile_id": str(getattr(mismatch, "profile_id", "")),
+            "profile_dim": profile_dim,
+            "column_dim": column_dim,
+        }
+        messages.append(
+            "misconfiguration: the embedding profile produces "
+            f"{profile_dim}-dimension vectors, the conversation_history "
+            f"vector column is {column_dim}-dimension"
+        )
+    if dropped:
+        last = getattr(store, "last_dropped_embedding", None)
+        if last is not None:
+            profile_id = getattr(last, "profile_id", None)
+            details["last_profile_id"] = (
+                profile_id if isinstance(profile_id, str) else None
+            )
+            details["last_embedding_dim"] = _positive_int(
+                getattr(last, "embedding_dim", None)
+            )
+            details["last_column_dim"] = _positive_int(
+                getattr(last, "column_dim", None)
+            )
+            details["last_error"] = str(getattr(last, "error", ""))
+            dropped_at = getattr(last, "dropped_at", None)
+            if isinstance(dropped_at, datetime):
+                details["last_dropped_at"] = dropped_at.isoformat()
+        messages.append(
+            f"{dropped} conversation embedding(s) dropped since start; "
+            "semantic recall cannot find those turns"
+        )
+
+    return {
+        "name": "conversation_embeddings",
+        "status": "warn",
+        "message": "; ".join(messages),
         "duration_ms": _elapsed(start),
         "details": details,
     }
@@ -1080,10 +1264,15 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
             check_scheduler_liveness(agent, db),
         ),
         await _run_database_bound_check(
+            "scheduled_task_failures",
+            check_scheduled_task_failures(agent, db),
+        ),
+        await _run_database_bound_check(
             "bootstrap_state",
             check_bootstrap_state(agent),
         ),
         await check_signal_audit_log(agent),
+        await check_conversation_embeddings(agent),
         await check_birth_record(agent),
         await check_model_discovery(agent),
     ]

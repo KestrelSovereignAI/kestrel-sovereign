@@ -102,7 +102,7 @@ class ModelPreferenceMixin:
                 raise
             logging.warning(f"Failed to persist model preference: {e}")
         # With an auto embedding_route, embeddings follow the chat route.
-        await self.record_active_embedding_profile()
+        await self.refresh_active_embedding_profile()
 
     async def _write_model_preference(
         self,
@@ -194,7 +194,28 @@ class ModelPreferenceMixin:
             if is_execution_control_error(e):
                 raise
             logging.warning(f"Failed to persist embedding_route: {e}")
+        await self.refresh_active_embedding_profile()
+
+    async def refresh_active_embedding_profile(self) -> None:
+        """Act on the embedding profile this agent now resolves.
+
+        The one path for boot, once the embedding config is loaded, for
+        every persisted runtime change to that config, and for every
+        resolution that changes a route's embedding model or width after it
+        (the LLM service's embedding profile listener): record the profile
+        for offline tools (#3420), then compare it with the declared width of
+        the conversation vector column (#2913). Re-running the comparison on a
+        change keeps ``/health/detailed``'s misconfiguration about the profile
+        the agent writes with now, not the one it booted with (#3606).
+
+        With no storage (torn down by a failed boot) there is no column to
+        compare and nothing written to flag.
+        """
         await self.record_active_embedding_profile()
+        conversation = getattr(self._raw_storage, "conversation", None)
+        if conversation is None:
+            return
+        await conversation.check_embedding_column_dimensions()
 
     async def record_active_embedding_profile(self) -> None:
         """Record the embedding profile this agent resolves (#3420).
@@ -202,9 +223,10 @@ class ModelPreferenceMixin:
         Offline tools compare against it: ``kestrel embeddings reindex``
         refuses to move rows to any other profile, and ``embeddings verify``
         counts the vectors that are off it (see
-        :mod:`kestrel_sovereign.storage.active_embedding_profile`). Called at
-        boot once the embedding config is loaded, and after every persisted
-        change to that config.
+        :mod:`kestrel_sovereign.storage.active_embedding_profile`). Called
+        through :meth:`refresh_active_embedding_profile`, at boot once the
+        embedding config is loaded, after every persisted change to it, and
+        after a resolution that changes the profile.
 
         Skipped while a local-only privacy mode forces the resolution: it
         writes no durable rows, and its forced route does not describe the
@@ -330,7 +352,7 @@ class ModelPreferenceMixin:
             if is_execution_control_error(e):
                 raise
             logging.warning(f"Failed to persist embedding_model overrides: {e}")
-        await self.record_active_embedding_profile()
+        await self.refresh_active_embedding_profile()
 
     def _get_local_model_fallback(self) -> str:
         """Get the configured local (ollama) model for economy/solvency fallback."""

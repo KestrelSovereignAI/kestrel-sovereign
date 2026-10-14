@@ -1538,7 +1538,10 @@
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/kestrel_agent.py",
+        "kestrel_sovereign/storage/db/sqlite.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],

@@ -12,7 +12,7 @@ import os
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union, AsyncIterator
 
-from .adapter import LLMAdapter, LLMResponse, ToolCall
+from .adapter import LLMAdapter, LLMResponse
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     StructuredOutputMode,
@@ -22,6 +22,11 @@ from kestrel_sdk.llm import (
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
 from .genai_custody import genai_operation, genai_stream, joined_iterator
+from .gemini_contents import (
+    to_gemini_contents,
+    tool_call_from_part,
+    tool_result_messages,
+)
 from .output_ceiling import (
     OutputCeilingUnknownError,
     OutputCeilings,
@@ -64,6 +69,17 @@ def _normalized_google_genai_usage(
     inclusive of ``cached_content_token_count``. ``LLMResponse`` defines its
     input and total fields as excluding separately reported cache buckets, so
     normalize that provider shape once for both Google API and Vertex routes.
+
+    Output is ``candidates_token_count`` plus ``thoughts_token_count`` (#3623).
+    Gemini 2.5 thinks by default, counts the thinking against
+    ``max_output_tokens`` and bills it as output, as OpenAI's
+    ``completion_tokens`` and Anthropic's ``output_tokens`` already count
+    reasoning. A response whose budget went entirely to thinking reports no
+    candidates count at all, and still produced billed output.
+
+    ``total_token_count`` also includes ``tool_use_prompt_token_count``,
+    which neither input nor output carries, so total exceeds their sum when
+    Gemini reports one.
     """
 
     def field(name: str) -> Any:
@@ -78,7 +94,11 @@ def _normalized_google_genai_usage(
         return None
 
     input_tokens = token_count("prompt_token_count")
-    output_tokens = token_count("candidates_token_count")
+    candidates_tokens = token_count("candidates_token_count")
+    thoughts_tokens = token_count("thoughts_token_count")
+    output_tokens = None
+    if candidates_tokens is not None or thoughts_tokens is not None:
+        output_tokens = (candidates_tokens or 0) + (thoughts_tokens or 0)
     total_tokens = token_count("total_token_count")
     cache_read_input_tokens = token_count("cached_content_token_count")
 
@@ -143,6 +163,7 @@ class GoogleAdapter(LLMAdapter):
         model: str,
         tools: Optional[List[Dict[str, Any]]],
         call_kwargs: Dict[str, Any],
+        system_instruction: Optional[str] = None,
     ) -> tuple[Dict[str, Any], Optional[int]]:
         """The ``generate_content`` config, and the model ceiling if it was used.
 
@@ -150,7 +171,8 @@ class GoogleAdapter(LLMAdapter):
         returned: a cut at that budget is the caller's to read from the
         finish reason. Otherwise the model's own ceiling is sent and returned,
         so a response that exhausted the model's whole output can be told from
-        one that stopped at a smaller, deliberate budget.
+        one that stopped at a smaller, deliberate budget. The system turns of
+        the messages travel as ``system_instruction`` (#3608).
         """
         requested = call_kwargs.get("max_tokens")
         model_ceiling = None
@@ -161,6 +183,8 @@ class GoogleAdapter(LLMAdapter):
         }
         if "temperature" in call_kwargs:
             config["temperature"] = call_kwargs["temperature"]
+        if system_instruction:
+            config["system_instruction"] = system_instruction
         if tools:
             config["tools"] = [{
                 "function_declarations": self._convert_tools_to_gemini_format(tools)
@@ -353,7 +377,8 @@ class GoogleAdapter(LLMAdapter):
         Args:
             client: google-genai ``Client`` instance (``client.aio.models``)
             model: Model name (e.g., 'gemini-2.0-flash-exp')
-            messages: List of message dicts in Gemini format
+            messages: Chat messages in OpenAI format, or already in Gemini
+                format (``parts``); converted by ``to_gemini_contents``
             format: Response format (ignored for Gemini)
             tools: Optional tools in OpenAI format (will be converted)
             **kwargs: Additional parameters
@@ -362,15 +387,17 @@ class GoogleAdapter(LLMAdapter):
             LLMResponse with content and/or tool calls
         """
         try:
+            # OpenAI-format messages become Gemini contents (#3608)
+            system_instruction, contents = to_gemini_contents(messages)
             config, model_ceiling = await self._generation_config(
-                client, model, tools, kwargs,
+                client, model, tools, kwargs, system_instruction,
             )
 
             # Generate content via the maintained google-genai async client,
             # honoring the routed model (mirrors VertexAIAdapter).
             response = await client.aio.models.generate_content(
                 model=model,
-                contents=messages,
+                contents=contents,
                 config=config,
             )
 
@@ -412,21 +439,14 @@ class GoogleAdapter(LLMAdapter):
                     continue
                 if getattr(part, "text", None):
                     content = part.text
-                # google-genai Part ALWAYS carries a `function_call` attribute
-                # (defaults to None), so `hasattr` is always True — check the
-                # value, or a plain text/thought part (function_call=None) would
-                # enter this branch and crash on fc.name / dict(fc.args).
-                elif getattr(part, "function_call", None) is not None:
-                    if parsed_tool_calls is None:
-                        parsed_tool_calls = []
-                    fc = part.function_call
-                    # Gemini function_call has name and args
-                    args = dict(fc.args) if getattr(fc, "args", None) else {}
-                    parsed_tool_calls.append(ToolCall(
-                        id=f"gemini_call_{len(parsed_tool_calls)}",
-                        name=fc.name,
-                        arguments=args
-                    ))
+                    continue
+                # A Gemini 3 call keeps its thought signature (#3619).
+                tool_call = tool_call_from_part(
+                    part, f"gemini_call_{len(parsed_tool_calls or ())}",
+                )
+                if tool_call is not None:
+                    parsed_tool_calls = parsed_tool_calls or []
+                    parsed_tool_calls.append(tool_call)
 
             input_tokens = output_tokens = total_tokens = None
             cache_read_input_tokens = None
@@ -472,15 +492,17 @@ class GoogleAdapter(LLMAdapter):
             Text chunks as they arrive, then a usage-bearing response.
         """
         try:
+            # OpenAI-format messages become Gemini contents (#3608)
+            system_instruction, contents = to_gemini_contents(messages)
             config, model_ceiling = await self._generation_config(
-                client, model, tools, kwargs,
+                client, model, tools, kwargs, system_instruction,
             )
 
             # Stream via the maintained google-genai async client, honoring the
             # routed model (mirrors VertexAIAdapter).
             stream = await client.aio.models.generate_content_stream(
                 model=model,
-                contents=messages,
+                contents=contents,
                 config=config,
             )
 
@@ -604,29 +626,14 @@ class GoogleAdapter(LLMAdapter):
         """
         Continue conversation after executing tool calls.
 
-        Gemini expects function responses in a specific format.
+        ``messages`` ends with the assistant turn whose ``tool_calls`` the
+        ``tool_results`` (``{"tool_call_id", "content"}``) answer; each result
+        becomes a ``function_response`` named after its call (#3608).
         """
-        extended_messages = messages.copy()
-
-        # Add function response parts
-        function_responses = []
-        for result in tool_results:
-            function_responses.append({
-                "function_response": {
-                    "name": result.get("name", "unknown"),
-                    "response": {"result": result["content"]}
-                }
-            })
-
-        extended_messages.append({
-            "role": "function",
-            "parts": function_responses
-        })
-
         return await self.get_response(
             client=client,
             model=model,
-            messages=extended_messages,
+            messages=[*messages, *tool_result_messages(tool_results)],
             tools=tools,
             **kwargs
         )

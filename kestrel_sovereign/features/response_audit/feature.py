@@ -1,7 +1,7 @@
 """Optional per-response LLM integrity audit feature."""
 import logging
 import os
-from typing import List
+from typing import List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sdk.hooks.base import Hook
@@ -84,11 +84,19 @@ class ResponseAuditFeature(Feature):
     def _decision_auditor(self):
         from kestrel_sovereign.features.response_audit.decision_audit import decision_audit
 
-        async def audit(text: str, redact_content: bool) -> dict:
+        async def audit(
+            text: str,
+            redact_content: bool,
+            *,
+            request: Optional[str] = None,
+            tool_results: Optional[list] = None,
+        ) -> dict:
             # Decision telemetry never records content, so redact_content has
             # nothing further to withhold on this backend.
             return await decision_audit(
-                self.agent.llm_service, text, model_override=self._decision_model,
+                self.agent.llm_service, text,
+                request=request, tool_results=tool_results,
+                model_override=self._decision_model,
             )
 
         return audit

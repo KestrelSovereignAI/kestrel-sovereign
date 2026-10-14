@@ -21,21 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
-
-
-class _VirtualClockLoop(asyncio.SelectorEventLoop):
-    """An event loop whose ``time()`` only moves when a test advances it, so
-    ``asyncio.timeout`` deadlines are measured against virtual seconds."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._now = 0.0
-
-    def time(self) -> float:
-        return self._now
-
-    def advance(self, seconds: float) -> None:
-        self._now += seconds
+from tests.utils.virtual_clock import VirtualClockLoop as _VirtualClockLoop
 
 
 _BOUND_METHODS = (

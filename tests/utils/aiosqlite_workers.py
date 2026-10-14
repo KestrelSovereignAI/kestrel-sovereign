@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import threading
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
@@ -11,10 +12,92 @@ from unittest.mock import patch
 
 import aiosqlite
 
+import kestrel_sovereign.storage.db.sqlite as sqlite_module
+from tests.utils.virtual_clock import await_within_hang_guard
+
 
 def aiosqlite_worker(connection: aiosqlite.Connection) -> threading.Thread:
     """Return the worker for either supported aiosqlite threading model."""
     return getattr(connection, "_thread", connection)
+
+
+class CloseStage(enum.Enum):
+    """The two waits of one bounded aiosqlite close, in order."""
+
+    CONNECTION_CLOSE = "Connection.close()"
+    WORKER_EXIT = "worker exit"
+
+
+class BoundedCloseStages:
+    """Which bounded closes have reached which deadline wait.
+
+    ``kestrel_sovereign.storage.db.sqlite`` closes a connection in two waits
+    under one absolute deadline: for ``Connection.close()`` to finish, then
+    for the worker thread to exit. A close arms each wait before it next
+    yields, so once :meth:`reached` returns, moving the loop clock past the
+    deadline expires exactly that wait. The worker-exit wait arms only for a
+    worker still alive when the close reaches it.
+    """
+
+    def __init__(self) -> None:
+        self._reached: dict[
+            tuple[CloseStage, aiosqlite.Connection], asyncio.Event
+        ] = {}
+        #: The absolute deadline each connection's close was given.
+        self.deadlines: dict[aiosqlite.Connection, float] = {}
+
+    def _event(
+        self, stage: CloseStage, connection: aiosqlite.Connection
+    ) -> asyncio.Event:
+        return self._reached.setdefault((stage, connection), asyncio.Event())
+
+    def _enter(
+        self, stage: CloseStage, connection: aiosqlite.Connection
+    ) -> None:
+        self._event(stage, connection).set()
+
+    def has_reached(
+        self, connection: aiosqlite.Connection, stage: CloseStage
+    ) -> bool:
+        """Whether the close of ``connection`` has entered ``stage`` yet."""
+        return self._event(stage, connection).is_set()
+
+    async def reached(
+        self, connection: aiosqlite.Connection, stage: CloseStage
+    ) -> None:
+        """Return once the close of ``connection`` has entered ``stage``."""
+        await await_within_hang_guard(
+            self._event(stage, connection).wait(),
+            step=f"the close reaching its {stage.value} wait",
+        )
+
+
+@contextmanager
+def observe_bounded_close_stages() -> Iterator[BoundedCloseStages]:
+    """Record each bounded close as it reaches each of its deadline waits."""
+    stages = BoundedCloseStages()
+    finish_close = sqlite_module._finish_aiosqlite_connection_close
+    wait_for_worker_exit = sqlite_module._wait_for_aiosqlite_worker_shutdown
+
+    async def observed_finish_close(connection, **kwargs):
+        stages.deadlines[connection] = kwargs["deadline"]
+        stages._enter(CloseStage.CONNECTION_CLOSE, connection)
+        return await finish_close(connection, **kwargs)
+
+    async def observed_wait_for_worker_exit(connection, **kwargs):
+        stages._enter(CloseStage.WORKER_EXIT, connection)
+        return await wait_for_worker_exit(connection, **kwargs)
+
+    with patch.object(
+        sqlite_module,
+        "_finish_aiosqlite_connection_close",
+        observed_finish_close,
+    ), patch.object(
+        sqlite_module,
+        "_wait_for_aiosqlite_worker_shutdown",
+        observed_wait_for_worker_exit,
+    ):
+        yield stages
 
 
 @contextmanager
@@ -81,7 +164,6 @@ async def wait_for_lifecycle_checkpoint(
     *,
     description: str,
     harness_timeout: float = 10.0,
-    require_live_lifecycle: bool = True,
 ) -> None:
     """Wait for a checkpoint unless the lifecycle terminates first.
 
@@ -90,18 +172,9 @@ async def wait_for_lifecycle_checkpoint(
     runner did not schedule two cooperating tasks within a one-second wall
     clock window.  ``harness_timeout`` remains a generous deadlock guard; it
     is not part of the behavior being asserted.
-
-    Pass ``require_live_lifecycle=False`` where the asserted contract is that
-    the lifecycle *terminates*—for a deliberately short shutdown drain, the
-    owner raising before the checkpoint is the behavior under test, not a
-    regression.  The injected worker still sets the checkpoint on its way out,
-    so the wait stays bounded by the same guard; imposing the live-owner
-    precondition there would turn a legitimate scheduling order into a flake.
     """
     checkpoint_task = asyncio.ensure_future(checkpoint)
-    awaited: set[asyncio.Future[Any]] = {checkpoint_task}
-    if require_live_lifecycle:
-        awaited.add(lifecycle_task)
+    awaited: set[asyncio.Future[Any]] = {checkpoint_task, lifecycle_task}
     try:
         done, _pending = await asyncio.wait(
             awaited,

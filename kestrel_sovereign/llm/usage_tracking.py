@@ -82,7 +82,7 @@ class UsageTrackingMixin:
         
         if self._usage_database_url:
             self._db_backend = "postgres"
-            logger.info(f"Model usage tracking configured: PostgreSQL")
+            logger.info("Model usage tracking configured: PostgreSQL")
         else:
             self._db_backend = "sqlite"
             # Record the path but DON'T touch disk here. Constructing an
@@ -112,41 +112,67 @@ class UsageTrackingMixin:
             self._usage_db_path = os.path.join(db_path, "llm_usage.db")
             logger.info(f"Model usage tracking configured: SQLite at {self._usage_db_path}")
 
+    def _get_usage_db_lock(self) -> asyncio.Lock:
+        """The lock held around opening and closing the owned usage DB.
+
+        Created on first use, like ``LLMService._get_mandate_lock``: some hosts
+        build the tracker with ``__new__`` and never call
+        :meth:`_init_usage_tracking`.
+        """
+        lock = getattr(self, "_usage_db_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._usage_db_lock = lock
+        return lock
+
     async def _ensure_db_initialized(self):
         """Ensure database connection is initialized (lazy initialization).
-        
+
         Uses the abstract data layer to support both SQLite and PostgreSQL.
         The model_usage table is part of the core schema in AsyncDatabase.
+
+        Concurrent first calls open the database once (#3618). Without the
+        lock each one opened its own connection and ran the startup migrations
+        against the same file at the same time; the last assignment won and
+        the other connections were never closed. A failed open leaves the
+        tracker uninitialized, so a later call tries again.
         """
         if self._db_initialized:
             return
 
-        try:
-            from kestrel_sovereign.storage.async_database import AsyncDatabase
-            
-            if self._db_backend == "postgres":
-                # PostgreSQL backend via abstract data layer
-                self._usage_db = await AsyncDatabase.postgres(self._usage_database_url)
-                logger.info("Model usage database initialized: PostgreSQL")
-            else:
-                # SQLite backend via abstract data layer. Create the containing
-                # directory lazily, right before we actually open the DB, so an
-                # unwritable KESTREL_DB_PATH surfaces here (and is swallowed into
-                # the "usage tracking disabled" warning below) rather than as a
-                # path-touching side effect of merely constructing LLMService
-                # (#2362).
-                os.makedirs(getattr(self, "_usage_db_dir", None)
-                            or os.path.dirname(self._usage_db_path) or ".",
-                            exist_ok=True)
-                self._usage_db = await AsyncDatabase.sqlite(self._usage_db_path)
-                logger.info(f"Model usage database initialized: SQLite at {self._usage_db_path}")
-            
+        async with self._get_usage_db_lock():
+            # A caller that held the lock before us may have opened it.
+            if self._db_initialized:
+                return
+            try:
+                from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+                if self._db_backend == "postgres":
+                    # PostgreSQL backend via abstract data layer
+                    usage_db = await AsyncDatabase.postgres(self._usage_database_url)
+                    description = "PostgreSQL"
+                else:
+                    # SQLite backend via abstract data layer. Create the containing
+                    # directory lazily, right before we actually open the DB, so an
+                    # unwritable KESTREL_DB_PATH surfaces here (and is swallowed into
+                    # the "usage tracking disabled" warning below) rather than as a
+                    # path-touching side effect of merely constructing LLMService
+                    # (#2362).
+                    os.makedirs(getattr(self, "_usage_db_dir", None)
+                                or os.path.dirname(self._usage_db_path) or ".",
+                                exist_ok=True)
+                    usage_db = await AsyncDatabase.sqlite(self._usage_db_path)
+                    description = f"SQLite at {self._usage_db_path}"
+            except Exception as e:
+                if is_execution_control_error(e):
+                    raise
+                logger.warning(f"Failed to initialize usage tracking: {e}")
+                self._usage_db = None
+                return
+
+            self._usage_db = usage_db
             self._db_initialized = True
-        except Exception as e:
-            if is_execution_control_error(e):
-                raise
-            logger.warning(f"Failed to initialize usage tracking: {e}")
-            self._usage_db = None
+            logger.info(f"Model usage database initialized: {description}")
 
     async def _record_model_usage(
         self,
@@ -652,14 +678,17 @@ class UsageTrackingMixin:
             # A host can share one database across many LLM services. Closing
             # any one service must not retire the host's operational pool.
             return
-        if self._usage_db:
-            try:
-                await self._usage_db.close()
-                logger.info("Usage tracking database closed.")
-            except Exception as e:
-                if is_execution_control_error(e):
-                    raise
-                logger.debug(f"Error closing usage database: {e}")
-            finally:
-                self._usage_db = None
-                self._db_initialized = False
+        # Wait for an open in progress, which would otherwise publish its
+        # connection after this close had found nothing to close.
+        async with self._get_usage_db_lock():
+            if self._usage_db:
+                try:
+                    await self._usage_db.close()
+                    logger.info("Usage tracking database closed.")
+                except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
+                    logger.debug(f"Error closing usage database: {e}")
+                finally:
+                    self._usage_db = None
+                    self._db_initialized = False

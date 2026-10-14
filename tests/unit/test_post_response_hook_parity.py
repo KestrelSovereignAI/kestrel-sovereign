@@ -465,6 +465,12 @@ async def test_tool_turn_evidence_matches_across_transports(monkeypatch):
     assert st_input.tool_results == [_TOOL_RESULT_ENVELOPE]
     assert ns_input.tool_results == st_input.tool_results
 
+    # The request the reply answers (#3553): an audit judges the reply
+    # against it, so both transports must deliver the user's own text.
+    assert st_input.user_message == "save my color"
+    assert ns_input.user_message
+    assert ns_input.user_message == st_input.user_message
+
 
 @pytest.mark.asyncio
 async def test_narration_check_fires_identically_on_both_transports(monkeypatch):
@@ -550,6 +556,7 @@ async def test_no_tool_turn_evidence_matches_and_stays_empty(monkeypatch):
         assert hook_input.pre_tool_prose is None
         assert hook_input.tool_calls is None
         assert hook_input.tool_results is None
+    assert st_input.user_message == "hi"
 
 
 @pytest.mark.asyncio

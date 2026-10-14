@@ -51,6 +51,7 @@ def process_local_service(
     service._embedding_discovery_cache = []  # discovery finds nothing new
     service._embedding_space_change_warnings = {}
     service._corpus_embedding_profile_provider = None
+    service._embedding_profile_change_callback = None
     service._force_local_only_provider = None
     service._embedding_space_pins = embedding_space_pins
     service._verified_space_pins = {}

@@ -39,7 +39,7 @@ class ResponseAuditHook(Hook):
         mode: str = "warn",
         strategy: str = "post",
         risk_threshold: int = 3,
-        auditor: Optional[Callable[[str, bool], Awaitable[Dict[str, Any]]]] = None,
+        auditor: Optional[Callable[..., Awaitable[Dict[str, Any]]]] = None,
     ):
         super().__init__(
             name="response_audit",
@@ -54,7 +54,8 @@ class ResponseAuditHook(Hook):
         self.audit_count = 0
         self.last_risk_level = None
         self.last_narration_verdict = None
-        # ``auditor(text, redact_content)``; None means the chat backend.
+        # ``auditor(text, redact_content, *, request, tool_results)``; None
+        # means the chat backend, which audits the reply alone.
         self._auditor = auditor
 
     @property
@@ -148,7 +149,11 @@ class ResponseAuditHook(Hook):
             # audit provider call — whose ``user_prompt`` IS the withheld prose —
             # must redact its own durable telemetry. ``fail_closed`` is True iff
             # ``mode == "strict"``, so advisory (warn) audits keep full telemetry.
-            audit_result = await self._audit(response_text)
+            audit_result = await self._audit(
+                response_text,
+                request=input.user_message,
+                tool_results=input.tool_results,
+            )
         except Exception as e:
             from kestrel_sovereign.execution_custody import is_execution_control_error
             if is_execution_control_error(e):
@@ -226,9 +231,20 @@ class ResponseAuditHook(Hook):
             reasoning=reasoning,
         )
 
-    async def _audit(self, response_text: str) -> Dict[str, Any]:
+    async def _audit(
+        self,
+        response_text: str,
+        *,
+        request: Optional[str] = None,
+        tool_results: Optional[list] = None,
+    ) -> Dict[str, Any]:
         if self._auditor is not None:
-            return await self._auditor(response_text, self.fail_closed)
+            # The decision backend also judges the reply against what the
+            # turn asked for and what its tools did (#3553).
+            return await self._auditor(
+                response_text, self.fail_closed,
+                request=request, tool_results=tool_results,
+            )
         return await self.agent.llm_service.get_audit_response(
             response_text,
             redact_content=self.fail_closed,

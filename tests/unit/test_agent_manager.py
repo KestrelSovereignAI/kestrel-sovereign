@@ -40,6 +40,8 @@ from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     arm_host_authority_deadline,
     await_lifecycle_task_completion,
+    disarm_host_authority_deadline,
+    expire_host_authority_deadline,
 )
 from kestrel_sovereign.knowledge import InferenceError, InferenceProfile, OntologyRef
 from kestrel_sovereign.multi_agent.agent_manager import (
@@ -77,6 +79,7 @@ from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.stop import AuthoritativeStopDescendant
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 from tests.utils.scheduler_ticks import tick_and_settle
+from tests.utils.virtual_clock import pinned_loop_clock
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
@@ -147,6 +150,21 @@ async def _persist_and_publish_spawn_test_child(
     await admission.before_publish(child)
     manager._agents[name] = child
     manager._agent_names[child.agent_id] = name
+
+
+def _install_load_path_expiry_callback(manager, name: str, child) -> list:
+    """Install the callback ``_initialize_agent`` gives every hosted child."""
+
+    expired_candidates: list = []
+
+    def expire(candidate, *, raising_task):
+        expired_candidates.append(candidate)
+        manager._expire_host_authority_candidate(
+            name, candidate, raising_task=raising_task
+        )
+
+    child._host_authority_expiry_callback = expire
+    return expired_candidates
 
 
 async def _load_spawn_after_mocked_inception(
@@ -533,6 +551,7 @@ async def test_post_acquire_admission_expiry_releases_a2a_writer(tmp_path):
         async with manager._a2a_writer_before_spawn_admission_deadline(
             deadline=1.0,
             phase="test publication",
+            agent=SimpleNamespace(),
         ):
             pytest.fail("expired writer must not enter its protected body")
 
@@ -2171,6 +2190,7 @@ async def test_expired_admission_fences_route_before_joining_stubborn_work(
             stubborn_work,
             deadline=deadline,
             phase="stubborn readiness",
+            agent=child,
             on_expiry=lambda: manager._fence_expired_spawn_route(
                 "StubbornChild", child
             ),
@@ -2320,8 +2340,10 @@ async def test_expired_private_candidate_cancels_admission_owner_and_shuts_down(
     async def initialize(name, _config, **_kwargs):
         manager._initializing_agents[name] = child
         child._host_authority_expiry_callback = (
-            lambda candidate: manager._expire_host_authority_candidate(
-                name, candidate
+            lambda candidate, *, raising_task: (
+                manager._expire_host_authority_candidate(
+                    name, candidate, raising_task=raising_task
+                )
             )
         )
         arm_host_authority_deadline(child, mandate)
@@ -2389,6 +2411,207 @@ async def test_already_expired_host_deadline_does_not_leave_latent_cancellation(
         return cancelling, True
 
     assert await asyncio.create_task(arm_then_continue()) == (0, True)
+
+
+def _live_signed_mandate(label: str) -> SpawnMandate:
+    return SpawnMandate(
+        parent_did=f"did:test:{label}-parent",
+        child_did=f"did:test:{label}-child",
+        ttl_seconds=60,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        parent_signature=f"signed-{label}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_already_expired_host_deadline_does_not_cancel_admission_owner(
+    tmp_path,
+):
+    """The load-path callback leaves the raising admission owner alone too."""
+
+    name = "ExpiredOwnerChild"
+    manager = AgentManager(base_data_dir=tmp_path)
+    child = _make_mock_agent("did:test:expired-admission-owner-child")
+    mandate = SpawnMandate(
+        parent_did="did:test:expired-admission-owner-parent",
+        child_did=child.agent_id,
+        ttl_seconds=1,
+        created_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+        parent_signature="signed-expired-admission-owner",
+    )
+    expired_candidates = _install_load_path_expiry_callback(manager, name, child)
+
+    async def load_owner_arms_expired_deadline() -> tuple[int, bool]:
+        admission, owns = await manager._admit_agent_operation(name, kind="load")
+        assert owns and admission.owner_task is asyncio.current_task()
+        manager._initializing_agents[name] = child
+        try:
+            with pytest.raises(PersistedSpawnMandateExpiredError):
+                arm_host_authority_deadline(child, mandate)
+            assert admission.host_authority_expired
+            cancelling = asyncio.current_task().cancelling()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                return cancelling, False
+            return cancelling, True
+        finally:
+            manager._initializing_agents.pop(name, None)
+            await manager._release_agent_operation(admission)
+
+    assert await asyncio.create_task(load_owner_arms_expired_deadline()) == (
+        0,
+        True,
+    )
+    assert expired_candidates == [child]
+    assert manager._spawn_route_is_fenced(name, child)
+
+
+@pytest.mark.asyncio
+async def test_load_path_expiry_callback_spares_raising_boot_owner(tmp_path):
+    """The host's installed callback receives the raising task (#3629).
+
+    Boot arms a lifetime that has already ended, so the expiry is raised
+    synchronously inside the load's own task while the host callback runs.
+    """
+
+    child_did = "did:test:expired-at-boot-child"
+    expired_mandate = SpawnMandate(
+        parent_did="did:test:expired-at-boot-parent",
+        child_did=child_did,
+        ttl_seconds=1,
+        created_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+        parent_signature="signed-expired-at-boot",
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    host_callbacks: list = []
+
+    class HostedChild:
+        def __init__(self, *, did, **_kwargs):
+            self.agent_id = did
+            self.did = did
+            self.identity = None
+            self._persisted_spawn_mandate = None
+
+        async def initialize(self):
+            host_callbacks.append(self._host_authority_expiry_callback)
+            arm_host_authority_deadline(self, expired_mandate)
+
+        async def shutdown(self):
+            return None
+
+    config = LocalAgentConfig(data_dir=Path("expired-at-boot-child"), port=8801)
+    with (
+        patch.object(LocalAgentConfig, "validate_runtime", return_value=[]),
+        patch(
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+            new=AsyncMock(return_value=child_did),
+        ),
+        patch(
+            "kestrel_sovereign.multi_agent.agent_manager.KestrelAgent",
+            HostedChild,
+        ),
+    ):
+        load = asyncio.create_task(
+            manager.load_agent("ExpiredAtBootChild", config)
+        )
+        await asyncio.wait({load})
+
+    assert len(host_callbacks) == 1
+    assert not load.cancelled()
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match="expired before active host admission",
+    ):
+        load.result()
+    assert manager.get_agent("ExpiredAtBootChild") is None
+
+
+@pytest.mark.asyncio
+async def test_stage_check_expiry_retires_due_watchdog_without_cancelling_owner():
+    """The task raising a stage expiry is never also cancelled for it (#3629)."""
+
+    agent = SimpleNamespace()
+    expired_agents: list = []
+    agent._host_authority_expiry_callback = (
+        lambda candidate, *, raising_task: expired_agents.append(candidate)
+    )
+
+    async def owner_expires_at_stage_check() -> int:
+        with pinned_loop_clock() as clock:
+            arm_host_authority_deadline(agent, _live_signed_mandate("stage-owner"))
+            clock.advance(3600)
+            expire_host_authority_deadline(agent)
+            cancelling = asyncio.current_task().cancelling()
+            # The due watchdog would have run during these turns.
+            for _ in range(3):
+                await asyncio.sleep(0)
+        return cancelling
+
+    assert await asyncio.create_task(owner_expires_at_stage_check()) == 0
+    assert expired_agents == [agent]
+    assert agent._host_authority_boot_expired is True
+    assert agent._host_authority_boot_deadline_handle.cancelled()
+    disarm_host_authority_deadline(agent)
+
+
+@pytest.mark.asyncio
+async def test_stage_check_expiry_in_another_task_cancels_watchdog_owner():
+    """A check outside the owner cancels it, exactly as the watchdog would."""
+
+    agent = SimpleNamespace()
+    expired_agents: list = []
+    agent._host_authority_expiry_callback = (
+        lambda candidate, *, raising_task: expired_agents.append(candidate)
+    )
+    armed = asyncio.Event()
+
+    async def owner() -> None:
+        arm_host_authority_deadline(agent, _live_signed_mandate("other-owner"))
+        armed.set()
+        await asyncio.Event().wait()
+
+    with pinned_loop_clock() as clock:
+        owner_task = asyncio.create_task(owner())
+        await armed.wait()
+        clock.advance(3600)
+        expire_host_authority_deadline(agent)
+        await _settle_on_pinned_clock(owner_task)
+
+    assert owner_task.cancelled()
+    assert expired_agents == [agent]
+    disarm_host_authority_deadline(agent)
+
+
+@pytest.mark.asyncio
+async def test_stage_check_after_watchdog_fired_does_not_expire_twice():
+    """Expiry runs once whether the watchdog or a stage check gets there first."""
+
+    agent = SimpleNamespace()
+    expired_agents: list = []
+    agent._host_authority_expiry_callback = (
+        lambda candidate, *, raising_task: expired_agents.append(candidate)
+    )
+    armed = asyncio.Event()
+
+    async def owner() -> None:
+        arm_host_authority_deadline(agent, _live_signed_mandate("fired-owner"))
+        armed.set()
+        await asyncio.Event().wait()
+
+    with pinned_loop_clock() as clock:
+        owner_task = asyncio.create_task(owner())
+        await armed.wait()
+        clock.advance(3600)
+        await _settle_on_pinned_clock(owner_task)
+        assert owner_task.cancelled()
+        assert expired_agents == [agent]
+        expire_host_authority_deadline(agent)
+
+    assert expired_agents == [agent]
+    disarm_host_authority_deadline(agent)
+    expire_host_authority_deadline(agent)
+    assert expired_agents == [agent]
 
 
 @pytest.mark.asyncio
@@ -5943,6 +6166,57 @@ async def test_live_spawn_owns_signed_deadline_before_delegated_budget(tmp_path)
     assert vars(child).get("_host_authority_boot_deadline_handle") is None
 
 
+# The two stalled-stage deadline tests below pin the loop clock and spend the
+# signed host lifetime from inside the stage they exercise. With a wall-clock
+# budget, the fsynced authority-registry writes between stages could use it
+# up first, so the deadline landed one stage early (#3480).
+_PINNED_SIGNED_LIFETIME = 1.0
+# Long enough that the wall-clock governance-commit checks never fire first.
+_WALL_CLOCK_MANDATE_TTL = 3600
+
+
+async def _settle_on_pinned_clock(task: asyncio.Task, *, turns: int = 10_000):
+    """Run the loop until ``task`` ends, and fail rather than hang.
+
+    Once the stage under test has advanced the pinned clock, nothing advances
+    it again, so a task still pending after ``turns`` loop iterations is
+    parked on an await that never resolves.
+    """
+
+    for _ in range(turns):
+        if task.done():
+            return
+        await asyncio.sleep(0)
+    pending = [
+        repr(other)
+        for other in asyncio.all_tasks()
+        if other is not asyncio.current_task() and not other.done()
+    ]
+    pytest.fail(
+        f"{task!r} did not finish after its deadline; pending tasks: {pending}"
+    )
+
+
+def _assert_no_leaked_spawn_tasks(manager: AgentManager) -> None:
+    leaked = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and not task.done()
+    ]
+    assert leaked == []
+    assert not manager._admission_delegate_tasks
+    assert not manager._expired_admission_operations
+
+
+def _is_committed_signed_receipt(properties: dict) -> bool:
+    """The final receipt: signed, with the provisional flag dropped."""
+
+    return (
+        properties["parent_signature"] is not None
+        and "authority_committed" not in properties
+    )
+
+
 @pytest.mark.asyncio
 async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path):
     """A stalled custody provider cannot keep signed authority alive."""
@@ -5964,6 +6238,8 @@ async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path)
         return child
 
     async def stalled_budget(*_args, **_kwargs):
+        # The signed lifetime ends while custody is stalled here.
+        clock.advance(_PINNED_SIGNED_LIFETIME)
         try:
             await asyncio.Event().wait()
         finally:
@@ -5971,24 +6247,32 @@ async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path)
 
     manager.create_agent = AsyncMock(side_effect=create_child)
     manager._apply_delegated_budget = AsyncMock(side_effect=stalled_budget)
-    with patch(
-        "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
-        return_value=0.03,
+    with (
+        pinned_loop_clock() as clock,
+        patch(
+            "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+            return_value=_PINNED_SIGNED_LIFETIME,
+        ),
     ):
         spawn = asyncio.create_task(
             manager.spawn_agent(
                 "StalledBudgetChild",
                 parent,
-                SpawnMandate(parent_did=parent.agent_id, ttl_seconds=1),
+                SpawnMandate(
+                    parent_did=parent.agent_id,
+                    ttl_seconds=_WALL_CLOCK_MANDATE_TTL,
+                ),
             )
         )
-        with pytest.raises(
-            PersistedSpawnMandateExpiredError,
-            match="expired during active host admission",
-        ):
-            await asyncio.wait_for(spawn, timeout=0.5)
+        await _settle_on_pinned_clock(spawn)
 
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match="expired during active host admission",
+    ):
+        spawn.result()
     assert budget_cancelled.is_set()
+    assert manager.get_agent("StalledBudgetChild") is None
     assert vars(child).get("_host_authority_boot_deadline_handle") is None
     witness = manager._spawn_authority_registry.get(child.agent_id)
     assert witness is not None and witness.retired
@@ -5998,6 +6282,7 @@ async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path)
         .kwargs["properties"]["parent_signature"]
         is None
     )
+    _assert_no_leaked_spawn_tasks(manager)
 
 
 @pytest.mark.asyncio
@@ -6010,12 +6295,14 @@ async def test_live_signed_deadline_cancels_stalled_final_receipt_write(tmp_path
     parent.identity = None
     parent.features = {}
     final_write_cancelled = asyncio.Event()
-    write_count = 0
+    receipts: list[dict] = []
 
-    async def write_receipt(*_args, **_kwargs):
-        nonlocal write_count
-        write_count += 1
-        if write_count == 2:
+    async def write_receipt(*_args, properties, **_kwargs):
+        receipts.append(properties)
+        # Stall the final receipt itself, never the revocation that follows.
+        if _is_committed_signed_receipt(properties):
+            # The signed lifetime ends while this write is in flight.
+            clock.advance(_PINNED_SIGNED_LIFETIME)
             try:
                 await asyncio.Event().wait()
             finally:
@@ -6042,23 +6329,294 @@ async def test_live_signed_deadline_cancels_stalled_final_receipt_write(tmp_path
     manager.create_agent = AsyncMock(side_effect=create_child)
     manager.remove_agent = AsyncMock(side_effect=remove_child)
 
-    with patch(
-        "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
-        return_value=0.03,
+    with (
+        pinned_loop_clock() as clock,
+        patch(
+            "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+            return_value=_PINNED_SIGNED_LIFETIME,
+        ),
     ):
         spawn = asyncio.create_task(
             manager.spawn_agent(
                 "StalledFinalReceiptChild",
                 parent,
-                SpawnMandate(parent_did=parent.agent_id, ttl_seconds=1),
+                SpawnMandate(
+                    parent_did=parent.agent_id,
+                    ttl_seconds=_WALL_CLOCK_MANDATE_TTL,
+                ),
             )
         )
-        with pytest.raises(PersistedSpawnMandateExpiredError):
-            await asyncio.wait_for(spawn, timeout=0.5)
+        await _settle_on_pinned_clock(spawn)
 
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match="expired during active host admission",
+    ):
+        spawn.result()
     assert final_write_cancelled.is_set()
+    # Provisional receipt, the stalled final receipt, then its revocation.
+    assert [receipt["parent_signature"] is not None for receipt in receipts] == [
+        True,
+        True,
+        False,
+    ]
+    assert _is_committed_signed_receipt(receipts[1])
+    assert child._persisted_spawn_mandate.parent_signature is None
+    assert vars(child).get("_host_authority_boot_deadline_handle") is None
+    assert manager.get_agent("StalledFinalReceiptChild") is None
     witness = manager._spawn_authority_registry.get(child.agent_id)
     assert witness is not None and witness.retired
+    _assert_no_leaked_spawn_tasks(manager)
+
+
+def _boundary_expiry_spawn(tmp_path, label: str, write_receipt):
+    """A public spawn whose child graph runs ``write_receipt`` per receipt."""
+
+    private_key, _ = generate_secp256k1_keypair()
+    parent = _make_mock_agent(f"did:test:{label}-parent")
+    parent._private_key = private_key
+    parent.identity = None
+    parent.features = {}
+    graph = SimpleNamespace(
+        add_trusted_cross_agent_edge=AsyncMock(side_effect=write_receipt)
+    )
+    child = _make_mock_agent(f"did:test:{label}-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+
+    async def create_child(name, **kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
+        return child
+
+    async def remove_child(name, **_kwargs):
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_child)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+    return manager, parent, child, graph
+
+
+def _spawn_with_wall_clock_ttl(manager, name, parent):
+    return asyncio.create_task(
+        manager.spawn_agent(
+            name,
+            parent,
+            SpawnMandate(
+                parent_did=parent.agent_id,
+                ttl_seconds=_WALL_CLOCK_MANDATE_TTL,
+            ),
+        )
+    )
+
+
+def _assert_signed_receipt_revoked(manager, child, graph) -> None:
+    witness = manager._spawn_authority_registry.get(child.agent_id)
+    assert witness is not None and witness.retired
+    assert (
+        graph.add_trusted_cross_agent_edge.await_args_list[-1]
+        .kwargs["properties"]["parent_signature"]
+        is None
+    )
+    assert vars(child).get("_host_authority_boot_deadline_handle") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("load_path_callback", [False, True])
+@pytest.mark.parametrize("slow_step", ["promote_pending", "commit_active_receipt"])
+async def test_signed_lifetime_ending_at_stage_boundary_raises_expiry(
+    tmp_path, slow_step, load_path_callback
+):
+    """A stage check's expiry reaches the caller, not a stray cancellation (#3629).
+
+    The lifetime ends inside one of the synchronous registry writes, so the
+    next stage check raises the expiry while the watchdog is due. The
+    rollback's revocation write then yields, as a real graph write does.
+    """
+
+    async def write_receipt(*_args, **_kwargs):
+        await asyncio.sleep(0)
+
+    name = "BoundaryChild"
+    manager, parent, child, graph = _boundary_expiry_spawn(
+        tmp_path, "boundary", write_receipt
+    )
+    expired_candidates = (
+        _install_load_path_expiry_callback(manager, name, child)
+        if load_path_callback
+        else None
+    )
+    registry = manager._spawn_authority_registry
+    registry_write = getattr(registry, slow_step)
+
+    def lifetime_ends_inside_write(*args, **kwargs):
+        result = registry_write(*args, **kwargs)
+        clock.advance(_PINNED_SIGNED_LIFETIME)
+        return result
+
+    setattr(registry, slow_step, lifetime_ends_inside_write)
+    with (
+        pinned_loop_clock() as clock,
+        patch(
+            "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+            return_value=_PINNED_SIGNED_LIFETIME,
+        ),
+    ):
+        spawn = _spawn_with_wall_clock_ttl(manager, name, parent)
+        await _settle_on_pinned_clock(spawn)
+
+    assert not spawn.cancelled()
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match=(
+            "expired before final signed receipt persistence"
+            if slow_step == "commit_active_receipt"
+            else "expired before signed receipt persistence"
+        ),
+    ):
+        spawn.result()
+    if load_path_callback:
+        assert expired_candidates == [child]
+    assert manager.get_agent(name) is None
+    _assert_signed_receipt_revoked(manager, child, graph)
+    _assert_no_leaked_spawn_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_signed_lifetime_ending_with_stage_completion_raises_expiry(tmp_path):
+    """The post-completion recheck owns the expiry too (#3629).
+
+    The lifetime ends in the loop turn that completes the signed receipt
+    write, after that turn has collected its due timers. The spawn resumes
+    ahead of the watchdog, so its post-completion recheck raises the expiry.
+    """
+
+    async def write_receipt(*_args, properties, **_kwargs):
+        await asyncio.sleep(0)
+        if (
+            properties["parent_signature"] is not None
+            and not _is_committed_signed_receipt(properties)
+        ):
+            asyncio.get_running_loop().call_soon(
+                clock.advance, _PINNED_SIGNED_LIFETIME
+            )
+
+    name = "CompletionBoundaryChild"
+    manager, parent, child, graph = _boundary_expiry_spawn(
+        tmp_path, "completion-boundary", write_receipt
+    )
+    expired_candidates = _install_load_path_expiry_callback(manager, name, child)
+    with (
+        pinned_loop_clock() as clock,
+        patch(
+            "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+            return_value=_PINNED_SIGNED_LIFETIME,
+        ),
+    ):
+        spawn = _spawn_with_wall_clock_ttl(manager, name, parent)
+        await _settle_on_pinned_clock(spawn)
+
+    assert not spawn.cancelled()
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match="expired before signed receipt persistence",
+    ):
+        spawn.result()
+    # The signed receipt completed before its recheck refused it.
+    assert [
+        call.kwargs["properties"]["parent_signature"] is not None
+        for call in graph.add_trusted_cross_agent_edge.await_args_list
+    ] == [True, False]
+    assert expired_candidates == [child]
+    _assert_signed_receipt_revoked(manager, child, graph)
+    _assert_no_leaked_spawn_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_expiry_during_awaited_stage_with_load_path_callback(tmp_path):
+    """Expiry inside an awaited stage still cancels that stage, as before."""
+
+    final_write_cancelled = asyncio.Event()
+
+    async def write_receipt(*_args, properties, **_kwargs):
+        if _is_committed_signed_receipt(properties):
+            clock.advance(_PINNED_SIGNED_LIFETIME)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                final_write_cancelled.set()
+        await asyncio.sleep(0)
+
+    name = "DuringStageChild"
+    manager, parent, child, graph = _boundary_expiry_spawn(
+        tmp_path, "during-stage", write_receipt
+    )
+    expired_candidates = _install_load_path_expiry_callback(manager, name, child)
+    with (
+        pinned_loop_clock() as clock,
+        patch(
+            "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+            return_value=_PINNED_SIGNED_LIFETIME,
+        ),
+    ):
+        spawn = _spawn_with_wall_clock_ttl(manager, name, parent)
+        await _settle_on_pinned_clock(spawn)
+
+    assert not spawn.cancelled()
+    with pytest.raises(
+        PersistedSpawnMandateExpiredError,
+        match="expired during active host admission",
+    ):
+        spawn.result()
+    assert final_write_cancelled.is_set()
+    assert expired_candidates == [child]
+    _assert_signed_receipt_revoked(manager, child, graph)
+    _assert_no_leaked_spawn_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_during_boundary_expiry_rollback_cancels_spawn(
+    tmp_path,
+):
+    """Owning the expiry does not swallow a caller's own cancellation."""
+
+    async def write_receipt(*_args, properties, **_kwargs):
+        if properties["parent_signature"] is None:
+            # The caller gives up while the rollback revokes the receipt.
+            spawn.cancel()
+        await asyncio.sleep(0)
+
+    name = "CancelledBoundaryChild"
+    manager, parent, child, graph = _boundary_expiry_spawn(
+        tmp_path, "cancelled-boundary", write_receipt
+    )
+    expired_candidates = _install_load_path_expiry_callback(manager, name, child)
+    registry = manager._spawn_authority_registry
+    promote_pending = registry.promote_pending
+
+    def lifetime_ends_inside_write(*args, **kwargs):
+        result = promote_pending(*args, **kwargs)
+        clock.advance(_PINNED_SIGNED_LIFETIME)
+        return result
+
+    registry.promote_pending = lifetime_ends_inside_write
+    with (
+        pinned_loop_clock() as clock,
+        patch(
+            "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+            return_value=_PINNED_SIGNED_LIFETIME,
+        ),
+    ):
+        spawn = _spawn_with_wall_clock_ttl(manager, name, parent)
+        await _settle_on_pinned_clock(spawn)
+
+    assert spawn.cancelled()
+    assert expired_candidates == [child]
+    assert manager.get_agent(name) is None
+    _assert_signed_receipt_revoked(manager, child, graph)
+    _assert_no_leaked_spawn_tasks(manager)
 
 
 @pytest.mark.asyncio

@@ -47,6 +47,21 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
 from kestrel_sovereign.agent.direct_tool_arguments import (
     normalize_direct_tool_arguments,
 )
+from kestrel_sovereign.llm.adapter import (
+    LLMResponse,
+    ThinkingDelta,
+    tool_call_history_entry,
+)
+from kestrel_sovereign.llm.call_progress import call_progress_listener
+from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
+from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
+from kestrel_sovereign.turn_completion import (
+    confirm_unfinished,
+    confirms_complete,
+    repair_addition,
+    settle_repaired_content,
+    turn_completion_repair_prompt,
+)
 from kestrel_sovereign.agent.invocation import (
     current_invocation_effect_checkpoint,
     current_invocation_id,
@@ -80,10 +95,6 @@ from kestrel_sovereign.execution_custody import (
     require_execution_work,
 )
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
-from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
-from kestrel_sovereign.llm.call_progress import call_progress_listener
-from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
-from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_RESOLUTION,
@@ -102,13 +113,6 @@ from kestrel_sovereign.telemetry import (
     # One definition of "is this an actual session?", shared with the LLM and
     # signal-dispatch spans that stamp the same value (#2940).
     real_session_id,
-)
-from kestrel_sovereign.turn_completion import (
-    confirm_unfinished,
-    confirms_complete,
-    repair_addition,
-    settle_repaired_content,
-    turn_completion_repair_prompt,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
 
@@ -132,10 +136,11 @@ _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
 # first ``stream_with_tool_detection`` (#3552) and each tool-loop follow-up, so
 # a hung upstream (anthropic 429 backoff, network blip, frozen provider queue,
 # a local model still loading) surfaces as a visible failure instead of silent
-# dead air. It fires after this many seconds WITHOUT a stream item (#3300) —
-# re-armed on every item — so a long but progressing response is never killed,
-# and it applies PER call, so a long multi-iteration turn isn't either. See
-# ``LLMCallWatchdog``.
+# dead air. It fires after this many seconds WITHOUT provider progress (#3300)
+# — re-armed on every stream item and on every provider event the adapter
+# reports that yields none (#3357) — so a long but progressing response is
+# never killed, and it applies PER call, so a long multi-iteration turn isn't
+# either. See ``LLMCallWatchdog``.
 ORCHESTRATOR_TURN_TIMEOUT_SECS = float(
     os.environ.get("KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS", "180")
 )
@@ -165,11 +170,16 @@ class LLMCallWatchdog:
     pending wait cancelled, which closes the provider request, and raises
     :class:`LLMCallInactivityTimeout`.
 
-    * :meth:`watch` bounds a streamed call; each item it yields is progress.
+    * :meth:`watch` bounds a streamed call. Each item it yields is progress,
+      and so is each provider event its adapter reports that yields no item
+      (#3357): a tool call's arguments, held until the call is whole, or
+      thinking that is not displayed.
     * :meth:`call` bounds a non-streaming call, which yields nothing until it
       returns. Its progress is what the adapter reports while the answer
-      arrives (:mod:`kestrel_sovereign.llm.call_progress`); a call whose
-      adapter reports none is bounded as a whole.
+      arrives; a call whose adapter reports none is bounded as a whole.
+
+    Reported progress travels on :mod:`kestrel_sovereign.llm.call_progress`,
+    never in the stream, so it re-arms the bound without reaching a consumer.
 
     Only time spent waiting on the provider counts. Time the consumer spends
     on an item does not, and neither does an inline tool the provider is
@@ -1835,19 +1845,7 @@ class OrchestratorEngineMixin:
     @staticmethod
     def _build_tool_calls_msg(tool_calls) -> list:
         """Convert LLMResponse tool_calls to OpenAI-format dicts."""
-        return [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    # ollama library expects arguments as dict, not string
-                    "arguments": tc.arguments if isinstance(tc.arguments, dict)
-                    else json.loads(tc.arguments) if tc.arguments else {}
-                }
-            }
-            for tc in tool_calls
-        ]
+        return [tool_call_history_entry(tc) for tc in tool_calls]
 
     @staticmethod
     def _extract_response_reasoning_content(response: LLMResponse) -> Optional[str]:
@@ -3689,10 +3687,11 @@ class OrchestratorEngineMixin:
             #      timeout marker rendered as response prose loses its
             #      tool-card error styling).
             # #3300/#3552: the same inactivity bound as the turn's first call
-            # (``LLMCallWatchdog``). It re-arms on every item, so a response
-            # that is still arriving is never cut off however long it runs,
-            # while a stream that goes silent for the bound — including before
-            # its first item — trips it.
+            # (``LLMCallWatchdog``). It re-arms on every item and on every
+            # provider event the adapter reports (#3357), so a response that
+            # is still arriving is never cut off however long it runs, while a
+            # stream that goes silent for the bound — including before its
+            # first event — trips it.
             watchdog = LLMCallWatchdog.for_call(
                 self.llm_service,
                 model_override=effective_model,

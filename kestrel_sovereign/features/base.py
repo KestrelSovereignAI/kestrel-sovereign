@@ -383,22 +383,13 @@ class Feature(_SdkFeature):
 
     def _build_subagent_assistant_tool_history_msg(self, response: Any) -> dict:
         """Build assistant tool-call history for feature subagent loops."""
+        from kestrel_sovereign.llm.adapter import tool_call_history_entry
+
         message = {
             "role": "assistant",
             "content": getattr(response, "content", None) or "",
             "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": (
-                            tc.arguments if isinstance(tc.arguments, dict)
-                            else json.loads(tc.arguments) if tc.arguments else {}
-                        ),
-                    },
-                }
-                for tc in response.tool_calls
+                tool_call_history_entry(tc) for tc in response.tool_calls
             ],
         }
 

@@ -83,6 +83,11 @@ from kestrel_sovereign.features.scheduler.cron import (
     next_run,
     parse,
 )
+from kestrel_sovereign.features.scheduler.failure_streak import (
+    FAILURE_STREAK_PROJECTION,
+    FAILURE_STREAK_PROJECTION_WIDTH,
+    failure_streak_view,
+)
 from kestrel_sovereign.features.scheduler.runner import (
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
     SCHEDULER_PROTOCOL_VERSION,
@@ -362,6 +367,7 @@ class SchedulerFeature(Feature):
                 if callable(getattr(type(self.agent), "_track_background_task", None))
                 else None
             ),
+            failure_alert_threshold=self._load_failure_alert_threshold(),
         )
         await self._runner.start(polling=False)
         logger.info("SchedulerFeature initialized; polling awaits agent readiness")
@@ -455,6 +461,30 @@ class SchedulerFeature(Feature):
                 raw, DEFAULT_LEASE_SECONDS,
             )
             return DEFAULT_LEASE_SECONDS
+
+    @staticmethod
+    def _load_failure_alert_threshold() -> int:
+        """Read ``[scheduler] failure_alert_threshold`` from kestrel.toml.
+
+        How many consecutive failures of one schedule record its failure
+        marker (#3280). Defaults to ``DEFAULT_FAILURE_ALERT_THRESHOLD``; the
+        marker is visibility only and changes no execution decision.
+        """
+        from kestrel_sovereign.config import load_section
+        from kestrel_sovereign.features.scheduler.failure_streak import (
+            DEFAULT_FAILURE_ALERT_THRESHOLD,
+        )
+
+        cfg = load_section("scheduler") or {}
+        raw = cfg.get("failure_alert_threshold", DEFAULT_FAILURE_ALERT_THRESHOLD)
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid scheduler.failure_alert_threshold=%r, using %d",
+                raw, DEFAULT_FAILURE_ALERT_THRESHOLD,
+            )
+            return DEFAULT_FAILURE_ALERT_THRESHOLD
 
     @staticmethod
     def _legacy_ecosystem_discovery_watch(task: Dict[str, Any]) -> bool:
@@ -2712,13 +2742,14 @@ class SchedulerFeature(Feature):
         try:
             schedule_now = await scheduler_database_clock(self._db)
             rows = await self._db.fetchall(
-                """
+                f"""
                 SELECT id, task_name, cron_expression, args_json,
                        enabled, last_run_at, next_run_at, created_at,
                        schedule_kind, run_at, timezone_name, misfire_policy,
                        misfire_grace_seconds, idempotency_key, lease_owner,
                        lease_expires_at, attempt_count, terminal_status, terminal_at,
-                       scheduler_rollout_fenced, scheduler_claim_fenced
+                       scheduler_rollout_fenced, scheduler_claim_fenced,
+                       {FAILURE_STREAK_PROJECTION}
                 FROM scheduled_tasks
                 WHERE agent_id = ?
                 ORDER BY created_at ASC
@@ -2737,6 +2768,7 @@ class SchedulerFeature(Feature):
         # tank direct in-process callers (e.g. default-schedule setup).
         tasks = []
         load_errors = []
+        failing_count = 0
         for row in rows:
             args: Dict[str, Any] = {}
             raw_args = row[3]
@@ -2757,6 +2789,16 @@ class SchedulerFeature(Feature):
                         "task_id": row[0],
                         "error": f"args_json malformed: {e}",
                     })
+            # Rows shorter than the full projection are legacy test/upgrade
+            # rows that predate the streak; they have none to report.
+            streak_values = row[21:21 + FAILURE_STREAK_PROJECTION_WIDTH]
+            consecutive_failures, failure_marker = (
+                failure_streak_view(streak_values, agent=self.agent)
+                if len(streak_values) == FAILURE_STREAK_PROJECTION_WIDTH
+                else (0, None)
+            )
+            if failure_marker is not None:
+                failing_count += 1
             tasks.append({
                 "id": row[0],
                 "task_name": row[1],
@@ -2791,6 +2833,10 @@ class SchedulerFeature(Feature):
                     lease_owner=row[14] if len(row) > 14 else None,
                     lease_expires_at=row[15] if len(row) > 15 else None,
                 ),
+                # Repeated-failure visibility (#3280): the current streak, and
+                # the marker the runner records once it reaches the threshold.
+                "consecutive_failures": consecutive_failures,
+                "failure_marker": failure_marker,
             })
 
         try:
@@ -2820,12 +2866,17 @@ class SchedulerFeature(Feature):
         data: Dict[str, Any] = {
             "tasks": tasks,
             "count": len(tasks),
+            "failing_count": failing_count,
             "scheduler_status": liveness,
         }
         confirmation = (
             f"Listed {len(tasks)} scheduled task(s); "
             f"scheduler={liveness['state']} enabled={liveness['enabled_count']}"
         )
+        if failing_count:
+            confirmation += (
+                f"; {failing_count} failing repeatedly (see failure_marker)"
+            )
 
         if load_errors:
             data["load_errors"] = load_errors

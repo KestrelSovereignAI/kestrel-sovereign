@@ -79,7 +79,8 @@ SAMPLE_ADAPTERS: Mapping[str, str] = {
 
 #: Caller-owned baselines: caller -> {name: "module:function"}. A baseline is
 #: ``async (llm_service, sample, *, timeout_seconds, local_only)`` returning
-#: ``{question_id: bool}`` for noul samples, or ``None`` when it failed.
+#: ``{question_id: bool}`` for noul samples, or ``None`` when it failed. It may
+#: answer only the questions it can judge; the rest are not scored for it.
 BASELINES: Mapping[str, Mapping[str, str]] = {
     "memory_answerability": {
         "chat": "kestrel_sovereign.storage.memory_answerability:answerability_chat_baseline",
@@ -566,8 +567,9 @@ async def evaluate_baseline(
     baseline = _resolve(target)
     report = ModelReport(
         selector=f"baseline:{name}", route="baseline", model=name, baseline=True,
-        expected_keys=sorted({s.threshold_keys.get(q, q) for s in samples for q in s.questions}),
+        expected_keys=[],
     )
+    answered_keys: set = set()
     gate = asyncio.Semaphore(max(1, concurrency))
     observations: List[Observation] = []
     loop = asyncio.get_running_loop()
@@ -584,8 +586,11 @@ async def evaluate_baseline(
             return
         report.latencies_ms.append(elapsed)
         for qid, question in sample.questions.items():
+            if qid not in verdicts:
+                continue
             if not isinstance(question, NoulQuestion):
                 raise SampleError(f"baseline {name!r} only scores noul questions")
+            answered_keys.add(sample.threshold_keys.get(qid, qid))
             observations.append(Observation(
                 key=sample.threshold_keys.get(qid, qid),
                 question=question,
@@ -594,6 +599,7 @@ async def evaluate_baseline(
             ))
 
     await asyncio.gather(*(one(sample) for sample in samples))
+    report.expected_keys = sorted(answered_keys)
     if observations:
         report.metrics = score_observations(observations, target_accuracy=target_accuracy)
     return report
