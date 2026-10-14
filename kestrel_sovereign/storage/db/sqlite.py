@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 # worker before that thread has necessarily returned.  Do not let the caller
 # tear down its event loop in that narrow interval: wait for the worker itself
 # and fail explicitly if it remains alive beyond this bounded window.
+#
+# The window also contains SQLite's own close. When the last connection to a
+# WAL database closes, that close checkpoints the whole -wal into the main file
+# and fsyncs it, so this budget bounds disk I/O as well as thread termination.
+# Read once, at import; see docs/architecture/storage/STORAGE_ARCHITECTURE.md.
 AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S = max(
     float(os.environ.get("KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", "1.0")),
     0.01,
@@ -119,10 +124,126 @@ def _minimum_close_timeout_s() -> float:
     return AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S + _AIOSQLITE_WORKER_SHUTDOWN_POLL_S
 
 
+# The fixed-size header at the start of every -wal file, then the header in
+# front of each frame (one page) after it: https://sqlite.org/fileformat2.html
+_WAL_HEADER_BYTES = 32
+_WAL_FRAME_HEADER_BYTES = 24
+
+
+@dataclass(frozen=True)
+class _WalSize:
+    """The -wal file beside a database, read before its close started.
+
+    ``None`` means the value is not known. ``pages`` counts the frames the
+    file holds, one page each; that bounds what the final checkpoint has to
+    copy into the main file.
+    """
+
+    absent: bool = False
+    size: Optional[int] = None
+    pages: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class _SQLiteCloseDiagnostics:
+    """What one SQLite close had to do, reported only if it overruns (#3460).
+
+    Taken before the close starts: once the close is running, the final
+    checkpoint is already consuming the -wal it would measure.
+    """
+
+    started_at: float
+    database: str
+    journal_mode: str
+    #: ``None`` when the journal mode is known not to be WAL.
+    wal: Optional[_WalSize]
+
+    def describe(self, now: float) -> str:
+        """Render the facts for an error message and its log line."""
+        parts = [
+            f"elapsed={now - self.started_at:.3f}s",
+            f"budget={_minimum_close_timeout_s():.2f}s",
+            f"database={self.database}",
+            f"journal_mode={self.journal_mode}",
+        ]
+        if self.wal is not None:
+            if self.wal.absent:
+                parts.append("wal_bytes=absent wal_pages=absent")
+            else:
+                parts.append(f"wal_bytes={_or_unknown(self.wal.size)}")
+                parts.append(f"wal_pages={_or_unknown(self.wal.pages)}")
+        return " ".join(parts)
+
+
+def _or_unknown(value: Optional[int]) -> str:
+    return "unknown" if value is None else str(value)
+
+
+def _read_wal_size(db_path: Path, page_size: Optional[int]) -> _WalSize:
+    """Stat the -wal beside ``db_path``, best-effort.
+
+    Every close runs this, so it only stats: it opens no file. Reading the
+    -wal could update its access time, which on ext4 needs a journal handle
+    and can block behind the very fsync this is meant to diagnose. Opening
+    the database file is worse: closing any descriptor on it releases the
+    POSIX locks SQLite holds on it for the whole process.
+    """
+    try:
+        wal_bytes = Path(f"{db_path}-wal").stat().st_size
+    except FileNotFoundError:
+        return _WalSize(absent=True)
+    except (OSError, ValueError):
+        return _WalSize()
+    if page_size is None:
+        return _WalSize(size=wal_bytes)
+    frames = max(0, wal_bytes - _WAL_HEADER_BYTES) // (
+        _WAL_FRAME_HEADER_BYTES + page_size
+    )
+    return _WalSize(size=wal_bytes, pages=frames)
+
+
+def _capture_close_diagnostics(
+    db_path: Optional[str | Path],
+    journal_mode: Optional[str],
+    page_size: Optional[int] = None,
+) -> _SQLiteCloseDiagnostics:
+    """Take the facts an overrunning close reports, before it starts.
+
+    ``journal_mode`` and ``page_size`` are what the connection's opener knows
+    (``None`` when it does not), never a query: a statement queued now would
+    wait behind whatever the worker is doing. Reports only the database's
+    basename.
+    """
+    started_at = asyncio.get_running_loop().time()
+    if db_path is not None and str(db_path) == ":memory:":
+        return _SQLiteCloseDiagnostics(
+            started_at, ":memory:", journal_mode or "memory", None
+        )
+    mode = journal_mode or "unknown"
+    if mode not in ("wal", "unknown"):
+        wal = None
+    elif db_path is None:
+        wal = _WalSize()
+    else:
+        wal = _read_wal_size(Path(db_path), page_size)
+    database = "unknown" if db_path is None else Path(db_path).name
+    return _SQLiteCloseDiagnostics(started_at, database, mode, wal)
+
+
+def _close_overrun_error(
+    summary: str, diagnostics: _SQLiteCloseDiagnostics, overrun_at: float
+) -> ConnectionError:
+    """Build the error for a close past its budget, and log it once."""
+    message = f"{summary} ({diagnostics.describe(overrun_at)})"
+    logger.warning("%s", message)
+    return ConnectionError(message)
+
+
 async def _wait_for_aiosqlite_worker_shutdown(
     connection: aiosqlite.Connection,
     *,
     timeout_s: float = AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S,
+    diagnostics: Optional[_SQLiteCloseDiagnostics] = None,
 ) -> None:
     """Wait until ``connection``'s worker has actually terminated.
 
@@ -145,9 +266,14 @@ async def _wait_for_aiosqlite_worker_shutdown(
         # Avoid a false failure if the worker exits as the timeout fires.
         if not is_alive():
             return
-        raise ConnectionError(
+        summary = (
             "SQLite worker did not terminate within "
             f"{timeout_s:.2f}s after close"
+        )
+        if diagnostics is None:
+            raise ConnectionError(summary) from exc
+        raise _close_overrun_error(
+            summary, diagnostics, asyncio.get_running_loop().time()
         ) from exc
 
 
@@ -232,6 +358,7 @@ async def _close_aiosqlite_connection(
     deadline: Optional[float] = None,
     close_task: Optional[asyncio.Task[None]] = None,
     cancel_close_task_on_timeout: bool = True,
+    diagnostics: Optional[_SQLiteCloseDiagnostics] = None,
 ) -> None:
     """Close an owned aiosqlite connection through its full lifecycle.
 
@@ -243,8 +370,12 @@ async def _close_aiosqlite_connection(
     SQLAlchemy callers set ``cancel_close_task_on_timeout=False`` because their
     task is the one engine-disposal attempt already closing the same driver;
     starting a second close would race two sentinels against one worker.
+    ``diagnostics`` is what an overrun reports; a caller that knows the
+    database passes it, taken before its close began.
     """
     loop = asyncio.get_running_loop()
+    if diagnostics is None:
+        diagnostics = _capture_close_diagnostics(None, None)
     if deadline is None:
         deadline = loop.time() + _minimum_close_timeout_s()
     if close_task is None:
@@ -257,6 +388,7 @@ async def _close_aiosqlite_connection(
             deadline=deadline,
             retained_closes=retained_closes,
             cancel_close_task_on_timeout=cancel_close_task_on_timeout,
+            diagnostics=diagnostics,
         )
     except BaseException:
         # Repeated cancellation can interrupt either bounded retry. Never let
@@ -275,6 +407,7 @@ async def _finish_aiosqlite_connection_close(
     deadline: float,
     retained_closes: _RetainedAiosqliteCloses,
     cancel_close_task_on_timeout: bool,
+    diagnostics: _SQLiteCloseDiagnostics,
 ) -> None:
     """Complete one bounded close under the caller's retention guard."""
     loop = asyncio.get_running_loop()
@@ -293,6 +426,7 @@ async def _finish_aiosqlite_connection_close(
         done, _ = await asyncio.wait({close_task}, timeout=remaining)
 
     if not done:
+        overrun_at = loop.time()
         interrupt_error: Optional[Exception] = None
         try:
             await connection.interrupt()
@@ -306,9 +440,11 @@ async def _finish_aiosqlite_connection_close(
         _retain_aiosqlite_close(
             connection, close_task, retained_closes
         )
-        error = ConnectionError(
+        error = _close_overrun_error(
             "SQLite connection close did not complete within "
-            f"{_minimum_close_timeout_s():.2f}s"
+            f"{_minimum_close_timeout_s():.2f}s",
+            diagnostics,
+            overrun_at,
         )
         if interrupt_error is not None:
             raise error from interrupt_error
@@ -326,6 +462,7 @@ async def _finish_aiosqlite_connection_close(
             await _wait_for_aiosqlite_worker_shutdown(
                 connection,
                 timeout_s=remaining,
+                diagnostics=diagnostics,
             )
         except ConnectionError:
             _retain_aiosqlite_close(
@@ -339,6 +476,7 @@ async def _finish_aiosqlite_connection_close(
             await _wait_for_aiosqlite_worker_shutdown(
                 connection,
                 timeout_s=remaining,
+                diagnostics=diagnostics,
             )
         except ConnectionError:
             _retain_aiosqlite_close(
@@ -402,6 +540,12 @@ class SQLiteBackend(DatabaseBackend):
         self._cold_read_marker: tuple = ()
         self._connection: Optional[aiosqlite.Connection] = None
         self._connected_file_identity: Optional[tuple[int, int]] = None
+        #: The journal mode SQLite reported when this backend set it at
+        #: connect, and the page size it read then; ``None`` for a cold read,
+        #: which leaves the database alone. Reported by a close that overruns
+        #: its budget (#3460).
+        self._journal_mode: Optional[str] = None
+        self._page_size: Optional[int] = None
         self._in_transaction = False
         self._transaction_poisoned = False
         self._savepoint_counter = 0
@@ -753,8 +897,18 @@ class SQLiteBackend(DatabaseBackend):
             # setting the journal mode WRITES to the database header, so this
             # is not merely unnecessary there — it would fail the connection
             # outright, which is the trap in making this path read-only.
+            self._journal_mode = None
+            self._page_size = None
             if not self.cold_read:
-                await self._connection.execute("PRAGMA journal_mode=WAL")
+                rows = await self._connection.execute_fetchall(
+                    "PRAGMA journal_mode=WAL"
+                )
+                self._journal_mode = str(rows[0][0]).lower() if rows else None
+                # Fixed from here on: WAL mode cannot change the page size.
+                rows = await self._connection.execute_fetchall(
+                    "PRAGMA page_size"
+                )
+                self._page_size = int(rows[0][0]) if rows else None
             
             # Allow concurrent writers to wait up to 30s for the lock
             await self._connection.execute(
@@ -793,6 +947,7 @@ class SQLiteBackend(DatabaseBackend):
 
         pending_cancellation: Optional[asyncio.CancelledError] = None
         loop = asyncio.get_running_loop()
+        diagnostics = self._close_diagnostics()
         close_deadline = loop.time() + self.minimum_close_timeout_s
         # Fence new cancellation handoffs before sampling the retained drain.
         # A write cancelled from this point onward is retired by connection
@@ -865,12 +1020,15 @@ class SQLiteBackend(DatabaseBackend):
                 conn,
                 retained_closes=self._retired_connection_closes,
                 deadline=close_deadline,
+                diagnostics=diagnostics,
             )
             self._raise_if_connection_retirement_pending()
             logger.debug(f"Closed SQLite connection: {self.db_path}")
         finally:
             self._connection = None
             self._connected_file_identity = None
+            self._journal_mode = None
+            self._page_size = None
             self._cancelled_write_drain = None
             self._cancelled_write_drain_started_at = None
             self._cancelled_write_drain_error = None
@@ -880,6 +1038,16 @@ class SQLiteBackend(DatabaseBackend):
         if pending_cancellation is not None:
             raise pending_cancellation
     
+    def _close_diagnostics(self) -> _SQLiteCloseDiagnostics:
+        """What a close of a connection to this database reports on overrun.
+
+        Snapshot connections share the file, and with it a WAL journal mode
+        and page size, so they report the primary connection's too.
+        """
+        return _capture_close_diagnostics(
+            self.db_path, self._journal_mode, self._page_size
+        )
+
     def _ensure_connected(self) -> aiosqlite.Connection:
         """Ensure we have an active connection."""
         if self._connection is None:
@@ -908,6 +1076,7 @@ class SQLiteBackend(DatabaseBackend):
                 await _close_aiosqlite_connection(
                     dest,
                     retained_closes=self._retired_connection_closes,
+                    diagnostics=_capture_close_diagnostics(dest_path, None),
                 )
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
@@ -931,6 +1100,7 @@ class SQLiteBackend(DatabaseBackend):
             await _close_aiosqlite_connection(
                 conn,
                 retained_closes=self._retired_connection_closes,
+                diagnostics=self._close_diagnostics(),
             )
             raise
 
@@ -973,6 +1143,7 @@ class SQLiteBackend(DatabaseBackend):
                 await _close_aiosqlite_connection(
                     read_conn,
                     retained_closes=self._retired_connection_closes,
+                    diagnostics=self._close_diagnostics(),
                 )
             return
 
