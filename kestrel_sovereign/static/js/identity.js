@@ -1365,11 +1365,8 @@ async function startNewConversationForPane() {
             // #2248: anchor the host agent's chat pane to the freshly-minted
             // session EXPLICITLY. wipeAgentChatPane() above just nulled
             // pane.sessionId, and the send path reads pane.sessionId directly
-            // (chat.js). Without this the first turn goes up with
-            // session_id=null and only lands in the new session via the
-            // implicit last-message derive race — any interleaved conversation
-            // row would misfile it. Set it so the first turn is unambiguously
-            // anchored to the minted session.
+            // (chat.js). Without this the first turn would start a session of
+            // its own (#3654) instead of the one this New Chat just created.
             const pane = state.chatPanes.get(host);
             if (pane) pane.sessionId = sid;
         }

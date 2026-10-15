@@ -55,10 +55,10 @@ let _conversationsStaleTimer = null;
 let _conversationsStaleDetail = null;
 // #2254: carry `{ sessionId, agent }` in the stale event so identity.js's
 // listener can sync the active-row highlight for ORGANIC sessions — the ones
-// the user reaches by just typing, where the effective session id is learned
-// from the X-Session-Id header onto `pane.sessionId` and identity.js's
-// `activeConversationId` was never updated. The detail is captured at call time
-// (the latest turn wins) and read at fire time, since the dispatch is debounced.
+// the user reaches by just typing, where the pane mints its own session id at
+// send (#3654) and identity.js's `activeConversationId` was never updated. The
+// detail is captured at call time (the latest turn wins) and read at fire time,
+// since the dispatch is debounced.
 function notifyConversationsStale(sessionId, agent) {
     if (typeof window === 'undefined'
         || typeof window.dispatchEvent !== 'function') return;
@@ -2881,6 +2881,26 @@ export function prepareHostStop(items = []) {
     };
 }
 
+/**
+ * Mint a session id for a pane that is about to send without one (#3654).
+ *
+ * The same spelling the server mints (`new_session_id`: a UUID4), so the id is
+ * one the store files and indexes like any other. `randomUUID` exists only in
+ * a secure context; a console served over plain http on a LAN address has
+ * `getRandomValues` but not `randomUUID`, so the v4 layout is built from it.
+ */
+export function mintChatSessionId() {
+    const cryptoApi = globalThis.crypto;
+    if (typeof cryptoApi?.randomUUID === 'function') {
+        return cryptoApi.randomUUID();
+    }
+    const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function newChatRequestId() {
     const randomUuid = globalThis.crypto?.randomUUID;
     if (typeof randomUuid === 'function') {
@@ -3107,7 +3127,14 @@ export async function sendMessage(
     // currentSessionId getter resolves to the mounted agent — at this
     // point the user could have already switched, so go through the
     // pane directly).
-    const sessionId = pane.sessionId || null;
+    //
+    // #3654: a turn never leaves without a session. A pane holding none (a
+    // cold load before auto-load committed, a purge of the open conversation)
+    // starts a fresh one here. Sending none left the choice to the server's
+    // 30-minute rule, which filed the turn into whatever conversation was
+    // newest: for an agent that chains its own work, its autonomous session.
+    if (!pane.sessionId) pane.sessionId = mintChatSessionId();
+    const sessionId = pane.sessionId;
 
     // #1662: the attachments for THIS turn. A composer send takes whatever is
     // staged in the tray; a queued re-dispatch (fromComposer false) carries the
@@ -3202,7 +3229,6 @@ export async function sendMessage(
                 // user switches mid-flight or a 401 refresh forces a
                 // retry. Without this the URL would be recaptured
                 // from state.selectedHostAgent at fetch time.
-                let learnedSessionId = false;
                 // Wave 5E: cross-chunk parser buffer for partial
                 // sentinels. ReadableStream chunking isn't guaranteed
                 // to preserve server yields, so a sentinel can split
@@ -3463,21 +3489,6 @@ export async function sendMessage(
                     pendingReviseBoundary = chunk
                         ? reviseBoundaryPending
                         : (pendingReviseBoundary || reviseBoundaryPending);
-                    // The server resolves the effective session_id and
-                    // returns it as the X-Session-Id response header,
-                    // which streamInvoke captures before yielding the
-                    // first body chunk. Adopt it onto the pane so the
-                    // next turn sends it back explicitly, anchoring
-                    // the pane to a durable conversation id. Only when
-                    // pane.sessionId was null — never overwrite an
-                    // explicit user-clicked conversation.
-                    if (!learnedSessionId && !pane.sessionId) {
-                        const effective = deps().api.getEffectiveSessionId(dispatchAgent);
-                        if (effective) {
-                            pane.sessionId = effective;
-                        }
-                        learnedSessionId = true;
-                    }
                     // Per-pane gate only — chunks DO paint into the
                     // dispatch agent's pane element even when that
                     // pane is detached (the user is viewing a
@@ -3544,9 +3555,6 @@ export async function sendMessage(
                     const response = await deps().api.invokeForAgent(
                         text, null, sessionId, null, dispatchAgent, clientRequestId,
                     );
-                    if (response && response.session_id && !pane.sessionId) {
-                        pane.sessionId = response.session_id;
-                    }
                     if (isPaneFresh() && ownsStream()) {
                         await addMessage(
                             'agent', response.response, pane.element, null,
@@ -3564,9 +3572,6 @@ export async function sendMessage(
             const response = await deps().api.invokeForAgent(
                 text, null, sessionId, null, dispatchAgent, clientRequestId,
             );
-            if (response && response.session_id && !pane.sessionId) {
-                pane.sessionId = response.session_id;
-            }
             if (isPaneFresh() && ownsStream()) {
                 await addMessage(
                     'agent', response.response, pane.element, null,
