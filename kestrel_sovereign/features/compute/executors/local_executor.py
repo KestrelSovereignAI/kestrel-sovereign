@@ -23,7 +23,13 @@ from .base import (
     _SAFE_ENV_VARS,
 )
 from ..destructive_policy import DestructiveOperationPolicy
-from ..models import ComputeScript, ExecutionRecord
+from ..models import (
+    ALLOW_LOCAL_COMPUTE_ENV,
+    ComputePolicy,
+    ComputeScript,
+    ExecutionRecord,
+    local_compute_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,8 @@ class LocalExecutor(BaseExecutor):
         max_output_bytes: int = 1024 * 1024,
         require_env_flag: bool = True,
         current_agent_data_path: Optional[str | Path] = None,
+        *,
+        policy: Optional[ComputePolicy] = None,
     ):
         """
         Initialize the local executor.
@@ -56,11 +64,13 @@ class LocalExecutor(BaseExecutor):
         Args:
             max_output_bytes: Maximum stdout/stderr size to capture
             require_env_flag: Require KESTREL_ALLOW_LOCAL_COMPUTE=true
+            policy: The compute policy whose deletable prefixes apply
         """
-        super().__init__(max_output_bytes=max_output_bytes)
+        super().__init__(max_output_bytes=max_output_bytes, policy=policy)
         self._require_env_flag = require_env_flag
         self._policy = DestructiveOperationPolicy(
-            current_agent_data_path=current_agent_data_path
+            current_agent_data_path=current_agent_data_path,
+            deletable_prefixes=self.compute_policy.deletable_prefixes,
         )
     
     @property
@@ -71,7 +81,7 @@ class LocalExecutor(BaseExecutor):
     def is_available(self) -> bool:
         """Check if local execution is enabled."""
         if self._require_env_flag:
-            return os.environ.get("KESTREL_ALLOW_LOCAL_COMPUTE") == "true"
+            return local_compute_enabled()
         return True
     
     async def execute(
@@ -91,7 +101,7 @@ class LocalExecutor(BaseExecutor):
         """
         if not self.is_available:
             raise ExecutionEnvironmentError(
-                "Local executor not enabled. Set KESTREL_ALLOW_LOCAL_COMPUTE=true"
+                f"Local executor not enabled. Set {ALLOW_LOCAL_COMPUTE_ENV}=true"
             )
 
         async def run(context: _ExecutionContext) -> _ExecutionResult:

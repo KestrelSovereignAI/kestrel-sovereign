@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Optional, TypeVar, cast
 from uuid import uuid4
 
-from ..models import ComputeCommand, ComputeScript, ExecutionRecord
+from ..models import ComputeCommand, ComputePolicy, ComputeScript, ExecutionRecord
 from kestrel_sovereign.security.subprocess_env import SAFE_SUBPROCESS_ENV_VARS
 
 logger = logging.getLogger(__name__)
@@ -172,8 +172,12 @@ class BaseExecutor(ABC):
         self,
         *,
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+        policy: Optional[ComputePolicy] = None,
     ) -> None:
         self._max_output_bytes = max_output_bytes
+        # The feature passes the one policy instance it reports in status, so
+        # the executor enforces what status claims (#2483).
+        self.compute_policy = policy if policy is not None else ComputePolicy()
 
     @property
     @abstractmethod

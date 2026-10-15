@@ -5,10 +5,58 @@ This module defines the core data structures for script management
 and execution tracking.
 """
 
+import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+#: How long a script or command may run when its caller names no timeout.
+#: ``run_script``'s ``timeout`` parameter defaults to it, and that default is
+#: part of the tool's published schema, so no policy setting moves it.
+DEFAULT_TIMEOUT_SECONDS = 300
+
+#: The longest timeout ``run_script`` accepts unless the policy says otherwise.
+DEFAULT_MAX_TIMEOUT_SECONDS = 3600
+
+#: How many days trash is kept before ``empty_trash`` may delete it.
+DEFAULT_TRASH_RETENTION_DAYS = 30
+
+#: Where deletion may be real rather than a move to trash. Each value is a
+#: parent directory plus a generated-directory name prefix, not an arbitrary
+#: string prefix: ``DestructiveOperationPolicy`` resolves both sides and
+#: compares path components. A policy may narrow this set, never widen it.
+DEFAULT_DELETABLE_PREFIXES: Tuple[str, ...] = (
+    "/tmp/kestrel_compute_",
+    "/tmp/kestrel_scratch_",
+    "/private/tmp/kestrel_compute_",
+    "/private/tmp/kestrel_scratch_",
+)
+
+#: ``ScriptAnalyzer`` finding categories that mean the script reaches the
+#: network: sockets, HTTP clients and netcat (``network``), and fetches with
+#: curl or wget (``download``).
+NETWORK_FINDING_CATEGORIES = frozenset({"network", "download"})
+
+AUTO_APPROVE_RISK_ENV = "KESTREL_COMPUTE_AUTO_APPROVE_RISK"
+MAX_TIMEOUT_ENV = "KESTREL_COMPUTE_MAX_TIMEOUT"
+ALLOW_DOCKER_ENV = "KESTREL_COMPUTE_ALLOW_DOCKER"
+ALLOW_LOCAL_COMPUTE_ENV = "KESTREL_ALLOW_LOCAL_COMPUTE"
+#: Deprecated: read only to warn that it does nothing.
+DEFAULT_TIMEOUT_ENV = "KESTREL_COMPUTE_DEFAULT_TIMEOUT"
+
+
+def local_compute_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the host opted in to the unisolated local executor.
+
+    Only the exact value ``true`` opts in. The policy and ``LocalExecutor``
+    both ask here, so they cannot disagree about a spelling such as ``TRUE``.
+    """
+    env = os.environ if environ is None else environ
+    return env.get(ALLOW_LOCAL_COMPUTE_ENV) == "true"
 
 
 class ScriptState(Enum):
@@ -124,7 +172,7 @@ class ComputeScript:
     
     # Execution configuration
     execution_id: Optional[str] = None  # Links to ExecutionRecord
-    timeout_seconds: int = 300  # 5 minute default
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     environment: Dict[str, str] = field(default_factory=dict)  # Env vars for execution
     requirements: List[str] = field(default_factory=list)  # Python packages needed
     
@@ -175,7 +223,7 @@ class ComputeScript:
             risk_score=data.get("risk_score", 0),
             review_notes=data.get("review_notes"),
             execution_id=data.get("execution_id"),
-            timeout_seconds=data.get("timeout_seconds", 300),
+            timeout_seconds=data.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
             environment=data.get("environment", {}),
             requirements=data.get("requirements", []),
             parent_task_id=data.get("parent_task_id"),
@@ -208,7 +256,7 @@ class ComputeCommand:
     argv: Tuple[str, ...]  # argv[0] is the program; the rest its arguments
     purpose: str  # Why the agent created this
 
-    timeout_seconds: int = 300
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     environment: Dict[str, str] = field(default_factory=dict)  # Env vars
 
     parent_task_id: Optional[str] = None  # A2A task that triggered this
@@ -337,33 +385,161 @@ class ExecutionRecord:
         return self.exit_code == 0
 
 
-@dataclass
+# A deprecated ``ComputePolicy`` argument nobody passed. Distinct from every
+# value, so passing even the value the runtime uses is still reported.
+_UNSET: Any = object()
+
+
+@dataclass(frozen=True, init=False)
 class ComputePolicy:
-    """Configuration for compute security policy."""
-    # Risk thresholds
-    auto_approve_below_risk: int = 0  # 0 = never auto-approve
-    require_approval_for_network: bool = True
-    
-    # Execution limits
-    max_timeout_seconds: int = 3600  # 1 hour max
-    default_timeout_seconds: int = 300  # 5 minutes
-    
-    # Trash settings
-    trash_enabled: bool = True
-    trash_retention_days: int = 30
-    
-    # Allowed executors
-    allow_docker: bool = True
-    allow_local: bool = False  # Only for trusted dev environments
-    
-    # Temp directories where true deletion is allowed
-    deletable_prefixes: List[str] = field(default_factory=lambda: [
-        "/tmp/kestrel_compute_",
-        "/tmp/kestrel_scratch_",
-    ])
+    """The compute security policy, and the only place its settings live.
+
+    ``ComputeFeature`` builds one instance (:meth:`from_env`) and hands that
+    same instance to the trash manager and to every executor; the status
+    tools report it. It is frozen, so what status reports is what the
+    consumers were given. Each setting has one enforcing consumer:
+
+    * ``auto_approve_below_risk`` and ``require_approval_for_network`` --
+      :meth:`requires_approval`, which ``run_script`` asks before it runs a
+      script. Whether to ask is decided here; asking, and recording the
+      answer, belong to the security feature's approval queue.
+    * ``max_timeout_seconds`` -- ``run_script`` refuses a longer timeout, and
+      the Docker executor leaves an unowned staging directory alone for at
+      least this long.
+    * ``trash_retention_days`` -- ``TrashManager.empty`` refuses to delete
+      trash younger than this.
+    * ``allow_docker`` and ``allow_local`` -- whether the feature builds that
+      executor at all.
+    * ``deletable_prefixes`` -- the executor-owned temp roots where deletion
+      is real rather than a move to trash. It may only narrow
+      :data:`DEFAULT_DELETABLE_PREFIXES`; anything else is refused here.
+
+    ``default_timeout_seconds`` and ``trash_enabled`` are deprecated and do
+    nothing. ``run_script``'s timeout default is fixed by its published tool
+    schema, and trash cannot be turned off: without it every ``rm`` would
+    delete for real. Passing either logs a warning; reading either returns
+    the value the runtime actually uses.
+    """
+
+    auto_approve_below_risk: int
+    require_approval_for_network: bool
+    max_timeout_seconds: int
+    trash_retention_days: int
+    allow_docker: bool
+    allow_local: bool
+    deletable_prefixes: Tuple[str, ...]
+
+    def __init__(
+        self,
+        auto_approve_below_risk: int = 0,  # 0 = never auto-approve
+        require_approval_for_network: bool = True,
+        max_timeout_seconds: int = DEFAULT_MAX_TIMEOUT_SECONDS,
+        default_timeout_seconds: Any = _UNSET,
+        trash_enabled: Any = _UNSET,
+        trash_retention_days: int = DEFAULT_TRASH_RETENTION_DAYS,
+        allow_docker: bool = True,
+        allow_local: bool = False,  # Only for trusted dev environments
+        deletable_prefixes: Optional[Iterable[str]] = None,
+    ) -> None:
+        if default_timeout_seconds is not _UNSET:
+            logger.warning(
+                "ComputePolicy.default_timeout_seconds is deprecated and has no "
+                "effect (got %r): run_script's timeout defaults to %ss, fixed by "
+                "its tool schema.",
+                default_timeout_seconds,
+                DEFAULT_TIMEOUT_SECONDS,
+            )
+        if trash_enabled is not _UNSET:
+            logger.warning(
+                "ComputePolicy.trash_enabled is deprecated and has no effect "
+                "(got %r): compute deletion always moves files to trash.",
+                trash_enabled,
+            )
+        if max_timeout_seconds < 1:
+            raise ValueError(
+                f"max_timeout_seconds must be at least 1, got {max_timeout_seconds}"
+            )
+        if trash_retention_days < 0:
+            raise ValueError(
+                f"trash_retention_days must be at least 0, got {trash_retention_days}"
+            )
+        if deletable_prefixes is None:
+            prefixes = DEFAULT_DELETABLE_PREFIXES
+        elif isinstance(deletable_prefixes, str):
+            raise TypeError(
+                "deletable_prefixes must be a collection of prefixes, not a str"
+            )
+        else:
+            prefixes = tuple(deletable_prefixes)
+        widened = [
+            prefix for prefix in prefixes if prefix not in DEFAULT_DELETABLE_PREFIXES
+        ]
+        if widened:
+            raise ValueError(
+                "deletable_prefixes may only narrow the built-in set "
+                f"{list(DEFAULT_DELETABLE_PREFIXES)}; refusing {widened}"
+            )
+
+        object.__setattr__(self, "auto_approve_below_risk", auto_approve_below_risk)
+        object.__setattr__(
+            self, "require_approval_for_network", require_approval_for_network
+        )
+        object.__setattr__(self, "max_timeout_seconds", max_timeout_seconds)
+        object.__setattr__(self, "trash_retention_days", trash_retention_days)
+        object.__setattr__(self, "allow_docker", allow_docker)
+        object.__setattr__(self, "allow_local", allow_local)
+        object.__setattr__(self, "deletable_prefixes", prefixes)
+
+    @classmethod
+    def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> "ComputePolicy":
+        """Build the policy from the ``KESTREL_COMPUTE_*`` environment."""
+        env = os.environ if environ is None else environ
+        if DEFAULT_TIMEOUT_ENV in env:
+            logger.warning(
+                "%s is deprecated and has no effect (set to %r): run_script's "
+                "timeout defaults to %ss, fixed by its tool schema. Remove it.",
+                DEFAULT_TIMEOUT_ENV,
+                env[DEFAULT_TIMEOUT_ENV],
+                DEFAULT_TIMEOUT_SECONDS,
+            )
+        return cls(
+            auto_approve_below_risk=int(env.get(AUTO_APPROVE_RISK_ENV, "0")),
+            max_timeout_seconds=int(
+                env.get(MAX_TIMEOUT_ENV, str(DEFAULT_MAX_TIMEOUT_SECONDS))
+            ),
+            allow_docker=env.get(ALLOW_DOCKER_ENV, "true").lower() == "true",
+            allow_local=local_compute_enabled(env),
+        )
+
+    @property
+    def default_timeout_seconds(self) -> int:
+        """Deprecated: the default ``run_script`` timeout, which is fixed."""
+        return DEFAULT_TIMEOUT_SECONDS
+
+    @property
+    def trash_enabled(self) -> bool:
+        """Deprecated: compute deletion always goes to trash."""
+        return True
+
+    def requires_approval(
+        self,
+        risk_score: int,
+        findings: Iterable[SecurityFinding],
+    ) -> bool:
+        """Whether ``run_script`` must ask before running this script.
+
+        A risk score at or above ``auto_approve_below_risk`` always asks. So
+        does a script whose analysis found it reaching the network, whatever
+        its score, while ``require_approval_for_network`` is set.
+        """
+        if risk_score >= self.auto_approve_below_risk:
+            return True
+        return self.require_approval_for_network and any(
+            finding.category in NETWORK_FINDING_CATEGORIES for finding in findings
+        )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
+        """The values the runtime uses, for JSON serialization."""
         return {
             "auto_approve_below_risk": self.auto_approve_below_risk,
             "require_approval_for_network": self.require_approval_for_network,
@@ -373,7 +549,7 @@ class ComputePolicy:
             "trash_retention_days": self.trash_retention_days,
             "allow_docker": self.allow_docker,
             "allow_local": self.allow_local,
-            "deletable_prefixes": self.deletable_prefixes,
+            "deletable_prefixes": list(self.deletable_prefixes),
         }
 
 

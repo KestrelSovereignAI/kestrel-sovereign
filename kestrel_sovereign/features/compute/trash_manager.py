@@ -22,8 +22,23 @@ from .destructive_policy import (
     DestructiveOperationPolicy,
     default_trash_dir,
 )
+from .models import ComputePolicy
 
 logger = logging.getLogger(__name__)
+
+
+class TrashRetentionError(ValueError):
+    """Raised when emptying trash would delete items inside the retention period."""
+
+    def __init__(self, older_than_days: int, retention_days: int):
+        self.older_than_days = older_than_days
+        self.retention_days = retention_days
+        super().__init__(
+            f"Refusing to permanently delete trash younger than the "
+            f"{retention_days}-day retention period (older_than_days="
+            f"{older_than_days}). Pass older_than_days of at least "
+            f"{retention_days}."
+        )
 
 
 def _absolute_path(path: Path) -> Path:
@@ -221,14 +236,16 @@ class TrashManager:
         # Restore an item
         manager.restore(item.path, "/original/location")
 
-        # Empty old trash
-        deleted_count = manager.empty(older_than_days=30)
+        # Empty trash past the retention period
+        deleted_count = manager.empty()
     """
 
     def __init__(
         self,
         trash_dir: Optional[Path] = None,
         current_agent_data_path: Optional[str | Path] = None,
+        *,
+        policy: Optional[ComputePolicy] = None,
     ):
         """
         Initialize the trash manager.
@@ -237,10 +254,14 @@ class TrashManager:
             trash_dir: Path to trash directory (default: ``default_trash_dir()``)
             current_agent_data_path: This agent's own data directory. Restore
                 targets under other agent_data children are rejected.
+            policy: The compute policy whose ``trash_retention_days`` bounds
+                :meth:`empty` (default: ``ComputePolicy()``)
         """
         self.trash_dir = trash_dir or default_trash_dir()
+        self.compute_policy = policy if policy is not None else ComputePolicy()
         self._policy = DestructiveOperationPolicy(
             trash_dir=self.trash_dir,
+            deletable_prefixes=self.compute_policy.deletable_prefixes,
             current_agent_data_path=current_agent_data_path,
         )
 
@@ -530,19 +551,32 @@ class TrashManager:
 
     def empty(
         self,
-        older_than_days: int = 30,
+        older_than_days: Optional[int] = None,
         dry_run: bool = False,
     ) -> int:
         """
         Permanently delete old trash items.
 
         Args:
-            older_than_days: Delete items older than this many days
+            older_than_days: Delete items older than this many days. Defaults
+                to, and may not be less than, the policy's
+                ``trash_retention_days``.
             dry_run: If True, don't actually delete, just count
 
         Returns:
             Number of items deleted
+
+        Raises:
+            TrashRetentionError: If ``older_than_days`` is inside the
+                retention period. Checked before anything is counted, so a
+                dry run never reports a deletion a real run would refuse.
         """
+        retention_days = self.compute_policy.trash_retention_days
+        if older_than_days is None:
+            older_than_days = retention_days
+        if older_than_days < retention_days:
+            raise TrashRetentionError(older_than_days, retention_days)
+
         if not self.trash_dir.exists():
             return 0
 
