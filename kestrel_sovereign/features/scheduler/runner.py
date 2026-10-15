@@ -48,6 +48,7 @@ from kestrel_sovereign._async_ownership import (
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.execution_custody import (
     AdvisoryExecutionFence,
+    ConfirmedLeaseDeadline,
     ExecutionAuthorityError,
     bind_execution_custody,
     bind_execution_custody_snapshot,
@@ -513,7 +514,7 @@ class _SchedulerEffectFence(AdvisoryExecutionFence):
 
 
 @dataclass
-class _LeaseRenewalState:
+class _LeaseRenewalState(ConfirmedLeaseDeadline):
     """Shared fail-closed state for an owned claim-renewal task.
 
     A renewal worker returning is never a benign completion: it either lost
@@ -522,43 +523,15 @@ class _LeaseRenewalState:
     letting a completed executor attempt a stale terminal compare-and-set.
     """
 
-    lost: asyncio.Event = field(default_factory=asyncio.Event)
     stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
     stop_owner: Optional[Callable[[], Awaitable[None]]] = None
-    error: Optional[BaseException] = None
     custody: tuple = ()
-    confirmed_deadline: float | None = None
-    deadline_changed: asyncio.Event = field(default_factory=asyncio.Event)
     backend_type: str = field(default="postgres", init=False)
-
-    def require_work(self) -> None:
-        if not self.is_live():
-            raise ExecutionAuthorityError("scheduler confirmed preparation lease lost")
 
     async def lock_and_validate(self, connection: Any) -> None:
         # The original confirmed deadline, not a fresh claim or checkout.
         # Exact token/owner validation remains in native claim CAS.
         self.require_work()
-
-    def is_live(self) -> bool:
-        # Synchronous guards must deny even if renewal/the timer is stalled.
-        if self.confirmed_deadline is not None and time.monotonic() >= self.confirmed_deadline:
-            self.mark_lost(ExecutionAuthorityError("scheduler confirmed lease expired"))
-        return not self.lost.is_set()
-
-    def confirm(self, deadline: float) -> bool:
-        if not self.is_live() or deadline <= time.monotonic():
-            self.mark_lost(ExecutionAuthorityError("scheduler renewal exceeded confirmed lease"))
-            return False
-        self.confirmed_deadline = deadline
-        self.deadline_changed.set()
-        return True
-
-    def mark_lost(self, error: Optional[BaseException] = None) -> None:
-        if self.error is None and error is not None:
-            self.error = error
-        self.lost.set()
-        self.deadline_changed.set()
 
 
 _rollout_renewal_state: contextvars.ContextVar[_LeaseRenewalState | None] = contextvars.ContextVar(
@@ -3840,19 +3813,7 @@ class SchedulerRunner:
 
     async def _monitor_confirmed_lease_deadline(self, state: _LeaseRenewalState) -> None:
         """Expire custody independently of a blocked renewal checkout/row lock."""
-        while state.is_live():
-            state.deadline_changed.clear()
-            deadline = state.confirmed_deadline
-            if deadline is None:
-                await state.deadline_changed.wait()
-                continue
-            try:
-                async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
-                    await state.deadline_changed.wait()
-            except TimeoutError:
-                # A completed renewal may have advanced the deadline in this
-                # same event-loop turn. Recheck, never revoke a newer interval.
-                state.is_live()
+        await state.monitor()
 
     async def _renew_live_claim_once(self, task: ScheduledTask) -> bool:
         """Renew a claim and expose only its bounded live-lease interval."""

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import stat
 import sys
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -21,8 +23,8 @@ from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
-from httpx import AsyncClient as _NativeHTTPXAsyncClient
 from httpx import AsyncByteStream as _NativeHTTPXAsyncByteStream
+from httpx import AsyncClient as _NativeHTTPXAsyncClient
 from httpx import Response as _NativeHTTPXResponse
 from kestrel_sdk.storage.database import TransactionError
 
@@ -47,6 +49,62 @@ class ExecutionCommitOutcomeError(ExecutionAuthorityError, TransactionError):
             f"execution transaction outcome is {outcome}; the operation may have "
             "committed; reconcile durable state before any retry"
         )
+
+
+@dataclass
+class ConfirmedLeaseDeadline:
+    """Irreversible local deadline shared by original lease owners.
+
+    This is not distributed authority or a token validator. A host combines
+    this additional fail-closed lifetime with its existing exact-token CAS.
+    Both synchronous admission and an independent monitor consult the SAME
+    monotonic deadline, so a stalled renewal cannot extend an old interval.
+    Only a completed, still-timely renewal may confirm a later interval.
+    """
+
+    lost: asyncio.Event = field(default_factory=asyncio.Event)
+    error: BaseException | None = None
+    confirmed_deadline: float | None = None
+    deadline_changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def require_work(self) -> None:
+        if not self.is_live():
+            raise ExecutionAuthorityError("original confirmed lease lost")
+
+    def is_live(self) -> bool:
+        if self.confirmed_deadline is not None and time.monotonic() >= self.confirmed_deadline:
+            self.mark_lost(ExecutionAuthorityError("original confirmed lease expired"))
+        return not self.lost.is_set()
+
+    def confirm(self, deadline: float) -> bool:
+        if not self.is_live() or not math.isfinite(deadline) or deadline <= time.monotonic():
+            self.mark_lost(ExecutionAuthorityError("renewal exceeded original confirmed lease"))
+            return False
+        self.confirmed_deadline = deadline
+        self.deadline_changed.set()
+        return True
+
+    def mark_lost(self, error: BaseException | None = None) -> None:
+        if self.error is None and error is not None:
+            self.error = error
+        self.lost.set()
+        self.deadline_changed.set()
+
+    async def monitor(self) -> None:
+        """Expire independently of a blocked renewal checkout or row lock."""
+        while self.is_live():
+            self.deadline_changed.clear()
+            deadline = self.confirmed_deadline
+            if deadline is None:
+                await self.deadline_changed.wait()
+                continue
+            try:
+                async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                    await self.deadline_changed.wait()
+            except TimeoutError:
+                # A timely completion may have advanced the interval in this
+                # event-loop turn. Never revoke that newer confirmed interval.
+                self.is_live()
 
 
 @dataclass(eq=False)
@@ -1232,7 +1290,9 @@ class _ExecutionForwarder:
                     await require_native_execution_admission(self._runtime_owner)
                 if self._iterator is None:
                     from kestrel_sovereign._async_ownership import OwnedAsyncIterator
-                    from kestrel_sovereign.llm.call_progress import inherit_call_progress
+                    from kestrel_sovereign.llm.call_progress import (
+                        inherit_call_progress,
+                    )
                     inherit_call_progress(self._owner_context)
                     with self._turn_scope.bind():
                         self._iterator = OwnedAsyncIterator(

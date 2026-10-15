@@ -418,6 +418,13 @@ checkout. Synchronous effect guards enforce that deadline, and a separately
 owned watcher expires/cancels/joins work even while renewal is blocked. A late
 renewal acknowledgement cannot revive an expired admission; watcher and renewal
 tasks are joined before occurrence ownership is released.
+The canonical `ConfirmedLeaseDeadline` owns this monotonic lifetime algorithm;
+scheduler state retains its existing stop/custody fields and delegates its
+watcher to that same implementation. The deadline alone is not distributed
+authority. Downstream hosts must retain their exact-token validation, attach
+their backend-specific execution fence, and physically join original native
+COMMIT/RESET owners even when the confirmed interval expires. Invalid/nonfinite
+or already-expired confirmations fail closed and cannot revive lost work.
 
 Custody-bound durable-signal boot uses transactional creation/repair of its
 exact source-sequence index, retaining generation locks through commit. Unbound
