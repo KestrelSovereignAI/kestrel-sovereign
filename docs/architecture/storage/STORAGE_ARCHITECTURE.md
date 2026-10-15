@@ -125,6 +125,12 @@ installed it or passed live rollout acceptance.
 
 ### SQLite close budget
 
+Close observes a retained rollback drain's completion separately from its
+terminal error. A drain's cancellation is not cancellation of the close caller;
+real caller cancellation (including a request pending before close starts) is
+delivered only after drain and native connection retirement. Original control
+errors and failed native closers remain failures, not successful shutdown.
+
 Every aiosqlite connection Kestrel opens is closed under one budget, which
 covers aiosqlite's `close()` and then the exit of the connection's worker
 thread. `KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S` sets it:

@@ -10,7 +10,7 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cancel_close", [False, True])
+@pytest.mark.parametrize("cancel_close", ["none", "after", "before"])
 @pytest.mark.parametrize("historical_cancel", [False, True])
 async def test_close_distinguishes_native_drain_from_original_caller(
     tmp_path,
@@ -53,6 +53,9 @@ async def test_close_distinguishes_native_drain_from_original_caller(
                 await asyncio.sleep(0)
             except asyncio.CancelledError:
                 pass  # Historical cancelling() is not a new close cancellation.
+        if cancel_close == "before":
+            release.set()
+            asyncio.current_task().cancel("original close caller cancellation")
         await backend.close()
 
     try:
@@ -61,11 +64,11 @@ async def test_close_distinguishes_native_drain_from_original_caller(
         await asyncio.wait_for(closing.wait(), 2)
         # close has reached its actual retained drain, not just a done fake.
         await asyncio.sleep(0)
-        if cancel_close:
+        if cancel_close == "after":
             closer.cancel("original close caller cancellation")
         release.set()
         outcome = await asyncio.wait_for(await_owned_task(closer), 3)
-        if cancel_close:
+        if cancel_close != "none":
             assert isinstance(outcome.error, asyncio.CancelledError)
             assert outcome.error.args == ("original close caller cancellation",)
         else:

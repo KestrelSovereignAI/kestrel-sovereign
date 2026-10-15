@@ -1327,8 +1327,7 @@ class SQLiteBackend(DatabaseBackend):
                 except BaseException as error:
                     failure = execution_terminal_error(failure, error)
             if drain is not None and drain is not asyncio.current_task():
-                caller = asyncio.current_task()
-                cancellation_count = caller.cancelling() if caller is not None else 0
+                from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
                 try:
                     async with asyncio.timeout(
                         min(
@@ -1336,39 +1335,29 @@ class SQLiteBackend(DatabaseBackend):
                             max(0.0, close_deadline - loop.time()),
                         )
                     ):
-                        await asyncio.shield(drain)
+                        # A completion wait never raises the CHILD's
+                        # cancellation. A CancelledError here can only be the
+                        # close caller's, including one pending before entry.
+                        await asyncio.wait({drain})
                 except (TimeoutError, asyncio.CancelledError) as exc:
                     # The connection close remains responsible for the queued
                     # SQLite work.  Retire the Python task so loop teardown
                     # cannot strand a backend-owned cleanup task.
-                    if (
-                        isinstance(exc, asyncio.CancelledError)
-                        and (
-                            not drain.cancelled()
-                            or (caller is not None and caller.cancelling() > cancellation_count)
-                        )
-                    ):
-                        # shield also raises CancelledError when its child is
-                        # cancelled. That is not a new cancellation of this
-                        # observer, including after an earlier caught cancel.
+                    if isinstance(exc, asyncio.CancelledError):
                         pending_cancellation = exc
                     drain.cancel()
-                    try:
-                        await drain
-                    except asyncio.CancelledError as drain_cancelled:
-                        # Usually this is the cancellation just sent to the
-                        # drain. If the close caller itself is cancelled while
-                        # awaiting a stubborn drain, preserve that cancellation
-                        # and deliver it after the connection is retired.
-                        if caller is not None and caller.cancelling() > cancellation_count:
-                            pending_cancellation = (
-                                pending_cancellation or drain_cancelled
-                            )
-                        if is_execution_control_error(drain_cancelled):
-                            failure = execution_terminal_error(failure, drain_cancelled)
-                    except BaseException as error:
-                        failure = execution_terminal_error(failure, error)
-                except BaseException as error:
+                    # Retire the Python drain separately from observing its
+                    # original result. A new caller cancellation can interrupt
+                    # a stubborn drain once; repeated cancellation cannot
+                    # abandon this owner or replace native control evidence.
+                    outcome = await await_owned_task(drain, cancel_on_caller_cancellation=True)
+                    pending_cancellation = pending_cancellation or outcome.cancellation
+                # Harvest the original terminal error only after completion;
+                # ordinary drain cancellation is not caller cancellation.
+                error = owned_task_error(drain)
+                if error is not None and (
+                    not isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)
+                ):
                     failure = execution_terminal_error(failure, error)
 
             # A grouped drain failure cannot skip the independently owned
