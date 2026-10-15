@@ -10,7 +10,6 @@ regardless of whether the HMAC math would have 'verified.'
 These tests prove the fix and prevent silent regressions.
 """
 
-import asyncio
 import base64
 import hashlib
 import hmac
@@ -139,7 +138,7 @@ async def test_verify_genuine_ecdsa_signature(temp_db, script):
     signer = _signer_with_keys(temp_db)
     sig = await signer.sign(script)
     script.signature = sig
-    assert sig.startswith("ecdsa:")
+    assert sig.startswith("v2:ecdsa:")
     assert await signer.verify(script) is True
 
 

