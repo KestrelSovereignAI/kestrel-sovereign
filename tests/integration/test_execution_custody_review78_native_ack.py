@@ -24,6 +24,119 @@ native_pg = _native_pg
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
+@pytest.mark.parametrize("failure", ["authority", "cancel", "ordinary"])
+async def test_wrapper_failure_after_reset_retains_known_commit_and_all_scopes(
+    native_pg, failure
+):
+    backend, observer, schema = native_pg
+    pool = backend._pool
+    child = ExecutionCustody(ProcessRuntimeExecutionFence("wrapper failing child"))
+    parent = ExecutionCustody(ProcessRuntimeExecutionFence("wrapper failing parent"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    callbacks = []
+
+    @asynccontextmanager
+    async def wrapper(native):
+        async with native as connection:
+            yield connection
+        if failure == "authority":
+            parent.revoke("original parent retired after reset")
+            child.revoke("original child retired after reset")
+            child.require_work()
+        elif failure == "cancel":
+            entered.set()
+            await release.wait()
+        else:
+            raise OSError("ordinary wrapper accounting failed after reset")
+
+    backend._pool = PostgresPoolAdapter(pool, wrapper)
+
+    async def write():
+        with bind_execution_custody_snapshot((parent, child)):
+            async with backend.transaction():
+                backend.call_after_commit(lambda: callbacks.append(True))
+                await backend.execute(
+                    "INSERT INTO effects VALUES (781, 'original proven commit')"
+                )
+
+    owner = create_owned_task(write())
+    try:
+        if failure == "cancel":
+            await asyncio.wait_for(entered.wait(), 3)
+            owner.cancel("original caller cancelled after reset")
+        outcome = await asyncio.wait_for(await_owned_task(owner), 3)
+        assert execution_commit_outcome(outcome.error) == "committed"
+        denied = execution_denial_scopes(outcome.error)
+        assert set(denied) == ({parent, child} if failure == "authority" else set())
+        if failure != "authority":
+            parent.require_work()
+            child.require_work()
+        assert callbacks == []
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 1
+    finally:
+        release.set()
+        await await_owned_task(owner)
+        backend._pool = pool
+
+
+@pytest.mark.parametrize("native_cancel", [False, True])
+async def test_failed_commit_keeps_original_observer_cancel_and_native_failure(
+    native_pg, monkeypatch, native_cancel
+):
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    from kestrel_sovereign.storage.db import postgres
+
+    backend, observer, schema = native_pg
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("failed commit observer"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_exit = asyncpg.transaction.Transaction.__aexit__
+    original_join = postgres.await_owned_task
+    native_failure = (asyncio.CancelledError if native_cancel else OSError)(
+        "original native commit ACK failed"
+    )
+    cancellations = []
+
+    async def join(owner, *args, **kwargs):
+        outcome = await original_join(owner, *args, **kwargs)
+        if owner.get_name().endswith(":postgres-original-transaction-exit"):
+            cancellations.append(outcome.cancellation)
+        return outcome
+
+    async def exit(transaction, error_type, error, traceback):
+        result = await original_exit(transaction, error_type, error, traceback)
+        if error is None:
+            entered.set()
+            await release.wait()
+            raise native_failure
+        return result
+
+    monkeypatch.setattr(postgres, "await_owned_task", join)
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", exit)
+
+    async def write():
+        with bind_execution_custody_snapshot((scope,)):
+            await backend.execute(
+                "INSERT INTO effects VALUES (780, 'committed before ACK failed')"
+            )
+
+    owner = create_owned_task(write())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        owner.cancel("original observer stopped during failing COMMIT")
+        await asyncio.sleep(0)
+        release.set()
+        outcome = await asyncio.wait_for(await_owned_task(owner), 3)
+        assert execution_commit_outcome(outcome.error) == "unknown"
+        (cancelled,) = cancellations
+        assert isinstance(cancelled, asyncio.CancelledError)
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert cancelled in chain and native_failure in chain
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 1
+    finally:
+        release.set()
+        await await_owned_task(owner)
+
+
 @pytest.mark.parametrize("boundary", ["checkout", "transaction"])
 async def test_opaque_native_context_subclass_is_refused_before_body(
     native_pg, monkeypatch, boundary
@@ -219,14 +332,17 @@ async def test_wrapper_late_scope_loss_is_checked_after_entire_exit(native_pg, s
 
 
 @pytest.mark.parametrize("boundary", ["rollback", "reset"])
+@pytest.mark.parametrize("caused", [False, True])
 async def test_actual_cleanup_failure_retains_body_cancel_and_denies_all_scopes(
-    native_pg, monkeypatch, boundary
+    native_pg, monkeypatch, boundary, caused
 ):
     backend, observer, schema = native_pg
     scope = ExecutionCustody(
         ProcessRuntimeExecutionFence("original cancelled rollback")
     )
     cancelled = asyncio.CancelledError("original body stopped before commit")
+    if caused:
+        cancelled.__cause__ = ValueError("original body cancellation cause")
     failure = OSError("actual native cleanup failed")
     original_transaction = asyncpg.transaction.Transaction.__aexit__
     original_reset = asyncpg.pool.PoolAcquireContext.__aexit__
@@ -545,7 +661,9 @@ async def test_adapter_cannot_abandon_or_suppress_original_native_lease(
 
 
 @pytest.mark.parametrize("boundary", ["transaction-exit", "pool-reset"])
-@pytest.mark.parametrize("body_fails", [False, "ordinary", "cancel", "authority"])
+@pytest.mark.parametrize(
+    "body_fails", [False, "ordinary", "cancel", "cancel_caused", "authority"]
+)
 async def test_task_factory_refusal_retains_original_resource_and_body(
     native_pg,
     boundary,
@@ -557,10 +675,14 @@ async def test_task_factory_refusal_retains_original_resource_and_body(
     original_factory = loop.get_task_factory()
     refusal = RuntimeError("native epilogue task factory refused")
     body_error = (
-        {"cancel": asyncio.CancelledError, "authority": ExecutionAuthorityError}.get(
-            body_fails, ValueError
-        )
+        {
+            "cancel": asyncio.CancelledError,
+            "cancel_caused": asyncio.CancelledError,
+            "authority": ExecutionAuthorityError,
+        }.get(body_fails, ValueError)
     )("original transaction body failed")
+    if body_fails == "cancel_caused":
+        body_error.__cause__ = ValueError("original cancelled body cause")
     refusals = []
 
     def reject_native_exit(loop, coro, **kwargs):

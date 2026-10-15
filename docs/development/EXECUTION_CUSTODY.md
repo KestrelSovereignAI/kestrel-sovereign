@@ -88,6 +88,14 @@ participating scope even if no commit occurred. Error aggregation separately
 retains the bounded unresolved-commit classification of legacy carriers; a
 settled acknowledged receipt cannot erase unrelated reconciliation debt just
 because the selected exception object changes.
+Native aggregation preserves an original enclosing cancellation when its
+explicit cause would otherwise be selected; it never creates a reverse cause
+edge or drops that cancellation just to avoid a cycle. A failing COMMIT also
+retains the original observer cancellation alongside its native failure.
+Errors or cancellation in wrapper code AFTER successful native reset carry
+that same known commit receipt before classification, and all participating
+scopes are sampled on that failure path too. They do not invent uncertainty on
+healthy scopes merely because a wrapper stopped observing after retirement.
 Cancellation while observing a successful native ACK is delivered on the
 original cancellation object with an `AcknowledgedExecutionCommit`, not an
 invented UNKNOWN. Its commit owner and shared original-reset record are

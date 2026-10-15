@@ -982,6 +982,10 @@ class PostgresBackend(DatabaseBackend):
                     failure = execution_terminal_error(failure, cleanup, retain_originals=True)
             failure = execution_terminal_error(state.body_failure, state.terminal, failure, retain_originals=True)
             if failure is not None:
+                # A new wrapper error AFTER successful reset is still an
+                # observer of this checkout's already-proven commit. Attach
+                # that fact before classifying, then sample ALL admissions.
+                failure = state.retain_acknowledgments(failure)
                 if state.outcome is not None and not is_execution_control_error(failure):
                     for scope in state.scopes:
                         scope.preserve_commit_uncertainty(state.outcome)
@@ -1171,12 +1175,13 @@ class PostgresBackend(DatabaseBackend):
         completed = await await_owned_task(completion)
         if completed.error is not None:
             if committing:
-                outcome = execution_commit_outcome(completed.error) or "unknown"
+                terminal = execution_terminal_error(completed.error, completed.cancellation, retain_originals=True)
+                outcome = execution_commit_outcome(terminal) or "unknown"
                 for scope in scopes:
                     scope.preserve_commit_uncertainty(outcome)
-                if execution_commit_outcome(completed.error) is not None:
-                    raise completed.error
-                raise ExecutionCommitOutcomeError(outcome) from completed.error
+                if execution_commit_outcome(terminal) is not None:
+                    raise terminal
+                raise ExecutionCommitOutcomeError(outcome) from terminal
             terminal = execution_terminal_error(body_failure, completed.error, completed.cancellation, retain_originals=True)
             terminal._kestrel_native_retirement_debts = (
                 *getattr(terminal, "_kestrel_native_retirement_debts", ()),

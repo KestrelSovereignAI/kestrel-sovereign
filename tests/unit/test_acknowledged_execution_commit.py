@@ -103,6 +103,19 @@ async def acknowledged_receipt():
     return AcknowledgedExecutionCommit(commit)
 
 
+def test_native_original_retention_keeps_enclosing_cancellation_without_cause_cycle():
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+
+    cause = ValueError("original explicit cause")
+    cancellation = asyncio.CancelledError("original body cancellation")
+    cancellation.__cause__ = cause
+    closer = OSError("actual rollback failed")
+    terminal = execution_terminal_error(cancellation, closer, retain_originals=True)
+    chain = tuple(_explicit_control_chain(terminal))
+    assert cancellation in chain and cause in chain and closer in chain
+    assert terminal not in tuple(_explicit_control_chain(terminal.__cause__))
+
+
 @pytest.mark.asyncio
 async def test_observer_receipt_is_local_only_after_original_retirement():
     receipt = await acknowledged_receipt()

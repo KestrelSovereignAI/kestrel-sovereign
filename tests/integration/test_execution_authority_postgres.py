@@ -656,20 +656,20 @@ async def test_failed_generation_validation_irrevocably_retires_original_admissi
 @pytest.mark.parametrize("operational", [False, True])
 @pytest.mark.parametrize("failure", ["error", "cancel"])
 @pytest.mark.parametrize("surface", ["query", "batch", "script"])
-async def test_pool_release_failure_preserves_committed_outcome(native_pg, explicit, operational, failure, surface):
+async def test_pool_release_failure_preserves_committed_outcome(native_pg, monkeypatch, explicit, operational, failure, surface):
     from contextlib import asynccontextmanager
     from kestrel_sovereign.execution_custody import execution_commit_outcome
     backend, _, _ = native_pg
     pool = backend._pool
-    class ReleaseFailurePool:
-        @asynccontextmanager
-        async def acquire(self, native):
-            async with native as connection:
-                yield connection
-            if failure == "cancel":
-                raise asyncio.CancelledError("cancelled during pool reset")
-            raise OSError("pool reset acknowledgement lost")
-    backend._pool = PostgresPoolAdapter(pool, ReleaseFailurePool().acquire)
+    original_release = asyncpg.pool.PoolAcquireContext.__aexit__
+    async def failed_native_release(checkout, *errors):
+        await original_release(checkout, *errors)
+        if failure == "cancel":
+            raise asyncio.CancelledError("cancelled during pool reset")
+        raise OSError("pool reset acknowledgement lost")
+    # Fail the ACTUAL native reset acknowledgement, not arbitrary wrapper
+    # accounting after Core's managed native lease has already retired.
+    monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", failed_native_release)
     @asynccontextmanager
     async def checkout():
         if operational:
@@ -699,12 +699,13 @@ async def test_pool_release_failure_preserves_committed_outcome(native_pg, expli
             assert execution_commit_outcome(denied.value) == "committed"
     finally:
         backend._pool = pool
+        monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", original_release)
     assert await backend.fetch_val("SELECT value FROM effects") == "committed before release"
 
 
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("release", ["error", "cancel", "revoke"])
-async def test_unbound_operational_checkout_retains_participating_admission(native_pg, explicit, release):
+async def test_unbound_operational_checkout_retains_participating_admission(native_pg, monkeypatch, explicit, release):
     from contextlib import asynccontextmanager
     from kestrel_sovereign.execution_custody import execution_commit_outcome
 
@@ -715,20 +716,17 @@ async def test_unbound_operational_checkout_retains_participating_admission(nati
     scope = ExecutionCustody(GenerationFence())
     owner = SimpleNamespace(_execution_custody=scope)
 
-    class ReleaseBoundaryPool:
-        @asynccontextmanager
-        async def acquire(self, native):
-            async with native as connection:
-                yield connection
-                await asyncio.sleep(0)
-                if release == "revoke":
-                    scope.revoke("retired during pool release")
-            if release == "error":
-                raise OSError("late release failed")
-            if release == "cancel":
-                raise asyncio.CancelledError("late release cancelled")
-
-    backend._pool = PostgresPoolAdapter(pool, ReleaseBoundaryPool().acquire)
+    original_release = asyncpg.pool.PoolAcquireContext.__aexit__
+    async def native_release_boundary(checkout, *errors):
+        await original_release(checkout, *errors)
+        await asyncio.sleep(0)
+        if release == "revoke":
+            scope.revoke("retired during pool release")
+        if release == "error":
+            raise OSError("late release failed")
+        if release == "cancel":
+            raise asyncio.CancelledError("late release cancelled")
+    monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", native_release_boundary)
     try:
         with pytest.raises(Exception) as caught:
             # Shared operational sessions are deliberately unbound at entry.
@@ -745,6 +743,7 @@ async def test_unbound_operational_checkout_retains_participating_admission(nati
         assert execution_commit_outcome(denied.value) == "committed"
     finally:
         backend._pool = pool
+        monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", original_release)
     assert await backend.fetch_val("SELECT value FROM effects") == "committed"
 
 

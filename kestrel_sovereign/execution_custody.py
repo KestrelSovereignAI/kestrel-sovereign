@@ -235,6 +235,19 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
     import asyncio
     present = tuple(error for error in errors if error is not None)
     def retain(selected):
+        if retain_originals:
+            # A selected cause cannot point back to its enclosing original
+            # cancellation without a cycle. Keep that ORIGINAL enclosing
+            # carrier instead; irreversible classification is retained below.
+            promoted = {id(selected)}
+            while True:
+                parent = next((error for error in present
+                    if id(error) not in promoted
+                    and selected in tuple(_explicit_control_chain(error))), None)
+                if parent is None:
+                    break
+                selected = parent
+                promoted.add(id(parent))
         debts = []
         commits = []
         denied_scopes = []
@@ -283,7 +296,7 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
                     others.insert(0, selected.__cause__)
                 selected.__cause__ = (others[0] if len(others) == 1 else
                     BaseExceptionGroup("original execution terminal evidence", others))
-        return selected
+        return retained_execution_error(selected)
     for outcome in ("unknown", "committed"):
         for error in present:
             if execution_commit_outcome(error) == outcome:
