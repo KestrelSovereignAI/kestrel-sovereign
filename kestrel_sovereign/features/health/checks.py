@@ -15,7 +15,7 @@ import logging
 import shutil
 import time
 from datetime import datetime
-from typing import Any, Awaitable, Dict, List, Optional
+from typing import Any, Awaitable, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import ResourceLock
 from kestrel_sovereign.features.storage_access import (
@@ -23,6 +23,12 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.signals import lock_manager as resource_lock_manager
+from kestrel_sovereign.storage.consolidation_drain import (
+    DRAIN_STATE_DONE,
+    DRAIN_STATE_DRAINING,
+    consolidation_drain_record_path,
+    reconcile_consolidation_drain,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,15 +145,19 @@ async def check_database(db) -> Dict[str, Any]:
             )
             is True
         )
+        quarantined = (
+            getattr(backend, "write_connection_quarantined", False) is True
+        )
         cleanup_failed = reconnect_required or cleanup_deadline_exceeded
         return {
             "name": "database",
             # A live rollback handoff is transient and self-healing. It fences
             # reads and writes for correctness, but remains a warning only
             # inside its bounded cleanup window. Once that deadline expires,
-            # normal database operations are unavailable indefinitely and the
-            # critical database check must fail even if cleanup may eventually
-            # self-heal without reconnecting.
+            # or the owner of the abandoned work isolates the connection,
+            # normal database operations are unavailable until cleanup ends
+            # and the critical database check must fail even if cleanup may
+            # eventually self-heal without reconnecting.
             "status": "fail" if cleanup_failed else "warn",
             "message": (
                 "Database write connection is unavailable because cancellation "
@@ -155,10 +165,16 @@ async def check_database(db) -> Dict[str, Any]:
                     "cleanup failed; reconnect is required"
                     if reconnect_required
                     else (
-                        "cleanup exceeded its deadline; normal reads and writes "
+                        "cleanup is still running and the connection is "
+                        "isolated until it finishes; normal reads and writes "
                         "are unavailable"
-                        if cleanup_deadline_exceeded
-                        else "cleanup is still pending"
+                        if quarantined
+                        else (
+                            "cleanup exceeded its deadline; normal reads and "
+                            "writes are unavailable"
+                            if cleanup_deadline_exceeded
+                            else "cleanup is still pending"
+                        )
                     )
                 )
             ),
@@ -352,12 +368,24 @@ async def check_memory_system(agent) -> Dict[str, Any]:
                 "duration_ms": _elapsed(start),
             }
 
-        return {
+        drain, settled_drain = _consolidation_drain_check(db)
+        if drain is not None:
+            return {
+                "name": "memory_system",
+                **drain,
+                "duration_ms": _elapsed(start),
+            }
+
+        result = {
             "name": "memory_system",
             "status": "pass",
             "message": f"Memory system components: {', '.join(components)}",
             "duration_ms": _elapsed(start),
         }
+        if settled_drain is not None:
+            # History, not a fault: the last timed-out pass's work settled.
+            result["details"] = {"consolidation_drain": settled_drain}
+        return result
     except Exception as e:
         return {
             "name": "memory_system",
@@ -365,6 +393,87 @@ async def check_memory_system(agent) -> Dict[str, Any]:
             "message": f"Memory system check failed: {e}",
             "duration_ms": _elapsed(start),
         }
+
+
+def _consolidation_drain_check(
+    db,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Report a timed-out consolidation pass whose database work is unsettled.
+
+    Reads the durable record the pass left beside the database file (#2978),
+    never the database: while that work runs the database refuses or delays
+    operations, and this check must answer regardless. The record is first
+    reconciled against its owner, so one left by a process that died mid-drain
+    is closed out rather than reported as running work forever.
+
+    Returns ``(concern, settled)``: a status/message to report, or the record
+    of work that has settled, kept as history. Both ``None`` when there is no
+    record.
+    """
+    path = consolidation_drain_record_path(db)
+    if path is None:
+        return None, None
+    try:
+        status = reconcile_consolidation_drain(db)
+    except (OSError, ValueError) as exc:
+        return {
+            "status": "warn",
+            "message": (
+                "Could not read the memory consolidation drain record "
+                f"{path}: {exc}"
+            ),
+        }, None
+    if status is None:
+        return None, None
+    record = status.record
+    state = record.get("state")
+    if not status.unsettled:
+        if state == DRAIN_STATE_DONE:
+            return None, record
+        return {
+            "status": "warn",
+            "message": (
+                f"Memory consolidation drain record {path} has an unknown state "
+                f"{state!r}"
+            ),
+        }, None
+    details = {"consolidation_drain": record}
+    if status.holder is not None:
+        # Running, but not on the connection this agent uses: it is not
+        # isolated, though its writes may wait behind that work.
+        return {
+            "status": "warn",
+            "message": (
+                "A memory consolidation pass timed out at "
+                f"{record.get('timed_out_at')} and recorded its database work "
+                f"as {state}, held by {status.holder}; this agent's database "
+                "connection is not the one holding it, but its writes may "
+                f"wait behind that work (record: {path})"
+            ),
+            "details": details,
+        }, None
+    if state == DRAIN_STATE_DRAINING:
+        return {
+            "status": "warn",
+            "message": (
+                "A memory consolidation pass timed out at "
+                f"{record.get('timed_out_at')} and its database work is still "
+                "running; the memory lock is held until it finishes "
+                f"(record: {path})"
+            ),
+            "details": details,
+        }, None
+    # Unsettled work is draining or isolated.
+    return {
+        "status": "fail",
+        "message": (
+            "A memory consolidation pass timed out at "
+            f"{record.get('timed_out_at')} and its database work is still "
+            "running; the database connection refuses all work until it "
+            f"finishes (record: {path})"
+        ),
+        "details": details,
+    }, None
 
 
 async def check_disk_space(threshold_mb: int = 100) -> Dict[str, Any]:

@@ -9,11 +9,21 @@ import logging
 import os
 import sqlite3
 import time
+import uuid
 import weakref
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, List, Literal, Optional, overload
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    overload,
+)
 
 import aiosqlite
 
@@ -79,6 +89,24 @@ class ColdReadUnavailable(RuntimeError):
 
 class _CancelledWriteDrainDeadlineExceeded(RuntimeError):
     """A retained rollback is still running after a later writer's budget."""
+
+
+class _CancelledWorkQuarantined(_CancelledWriteDrainDeadlineExceeded):
+    """The owner of abandoned work stopped waiting for its rollback (#2978).
+
+    The same transient latch as an expired cleanup deadline, set by that
+    owner: every application read and write fails closed at once rather than
+    queueing behind the abandoned statement, and the retained drain lifts it
+    only when its rollback has run, which proves that statement has returned.
+    """
+
+
+#: How :meth:`SQLiteBackend.await_cancellation_cleanup` found the work a
+#: cancelled caller abandoned on the shared connection.
+CANCELLATION_CLEANUP_FINISHED = "finished"
+CANCELLATION_CLEANUP_FAILED = "failed"
+CANCELLATION_CLEANUP_ISOLATED = "isolated"
+CANCELLATION_CLEANUP_RETIRED = "retired"
 
 
 def _is_sqlite_interrupt(exc: Exception) -> bool:
@@ -586,6 +614,9 @@ class SQLiteBackend(DatabaseBackend):
         )
         self._retired_connection_closes: _RetainedAiosqliteCloses = {}
         self._closing = False
+        # Names the open connection: new on every connect, None while closed.
+        # Evidence about work running on one connection is bound to it (#2978).
+        self._connection_generation: Optional[str] = None
     
     @property
     def backend_type(self) -> str:
@@ -689,6 +720,122 @@ class SQLiteBackend(DatabaseBackend):
             and started_at is not None
             and self._cancelled_write_drain_remaining(started_at) <= 0
         )
+
+    @property
+    def connection_generation(self) -> Optional[str]:
+        """The open connection's identity, new on every connect; None if closed.
+
+        Work a cancelled caller abandoned runs on one connection and settles
+        when it closes, so evidence of that work names the generation it ran
+        on (#2978).
+        """
+        return self._connection_generation
+
+    @property
+    def write_connection_quarantined(self) -> bool:
+        """Whether the connection is isolated until abandoned work finishes."""
+        return isinstance(
+            self._cancelled_write_drain_error, _CancelledWorkQuarantined
+        )
+
+    @property
+    def cancellation_cleanup_pending(self) -> bool:
+        """Whether work a cancelled caller abandoned may still be running.
+
+        True from the moment a cancelled operation hands its rollback to the
+        retained drain until that drain settles. aiosqlite runs one FIFO
+        worker per connection, so the rollback runs only after the abandoned
+        statement has returned: the drain settling is the proof.
+        """
+        drain = self._cancelled_write_drain
+        return drain is not None and not drain.done()
+
+    def quarantine_cancellation_cleanup(self) -> bool:
+        """Fail every later operation closed until pending cleanup settles.
+
+        Returns whether cleanup was pending. Without this, a later operation
+        waits on the shared connection behind the abandoned statement; with
+        it, the operation fails at once and the connection stays isolated
+        until the retained rollback proves the statement has returned, which
+        lifts the latch. A failure or expired deadline already latched is
+        kept: it isolates the connection at least as strongly.
+        """
+        if not self.cancellation_cleanup_pending:
+            return False
+        if self._cancelled_write_drain_error is None:
+            self._cancelled_write_drain_error = _CancelledWorkQuarantined(
+                "SQLite connection is quarantined until work a cancelled "
+                "caller abandoned has finished"
+            )
+        return True
+
+    async def await_cancellation_cleanup(self) -> str:
+        """Wait until work a cancelled caller abandoned is provably finished.
+
+        Bounded by the retained drain's own deadline; this adds none. Returns
+        ``CANCELLATION_CLEANUP_FINISHED`` once the drain's rollback has run
+        and the connection is usable, ``CANCELLATION_CLEANUP_FAILED`` when
+        that rollback failed and the connection needs a reconnect,
+        ``CANCELLATION_CLEANUP_ISOLATED`` when the deadline ran out first
+        (every later operation then fails closed until the drain settles), and
+        ``CANCELLATION_CLEANUP_RETIRED`` when ``close`` took the work over. A
+        caller cancelled while waiting quarantines the connection before the
+        cancellation propagates, so the abandoned statement is never left
+        sharing it.
+        """
+        drain = self._cancelled_write_drain
+        started_at = self._cancelled_write_drain_started_at
+        if drain is not None and not drain.done():
+            remaining = _CANCELLED_OPERATION_DRAIN_TIMEOUT_S
+            if started_at is not None:
+                remaining = self._cancelled_write_drain_remaining(started_at)
+            # Waits on the drain itself, not through the operation fence: a
+            # quarantine refuses later operations, never the wait for proof.
+            try:
+                async with asyncio.timeout(max(0.0, remaining)):
+                    await asyncio.shield(drain)
+            except TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                caller = asyncio.current_task()
+                if caller is not None and caller.cancelling():
+                    self.quarantine_cancellation_cleanup()
+                    raise
+                # ``close`` cancelled the drain, not this caller.
+            if not drain.done():
+                self.quarantine_cancellation_cleanup()
+                return CANCELLATION_CLEANUP_ISOLATED
+        return self._cancellation_cleanup_outcome(drain)
+
+    def add_cancellation_cleanup_callback(
+        self, callback: Callable[[str], None]
+    ) -> bool:
+        """Call ``callback(outcome)`` when the pending cleanup settles.
+
+        ``outcome`` is one of the ``CANCELLATION_CLEANUP_*`` values other than
+        isolated. Returns False, and never calls it, when nothing is pending.
+        The callback runs on the event loop and must not block.
+        """
+        drain = self._cancelled_write_drain
+        if drain is None or drain.done():
+            return False
+        drain.add_done_callback(
+            lambda task: callback(self._cancellation_cleanup_outcome(task))
+        )
+        return True
+
+    def _cancellation_cleanup_outcome(
+        self, drain: Optional["asyncio.Task[None]"]
+    ) -> str:
+        """What a settled drain (or none at all) left the connection in."""
+        if drain is not None and drain.cancelled():
+            return CANCELLATION_CLEANUP_RETIRED
+        error = self._cancelled_write_drain_error
+        if error is not None and not isinstance(
+            error, _CancelledWriteDrainDeadlineExceeded
+        ):
+            return CANCELLATION_CLEANUP_FAILED
+        return CANCELLATION_CLEANUP_FINISHED
 
     @property
     def connection_retirement_pending(self) -> bool:
@@ -929,6 +1076,7 @@ class SQLiteBackend(DatabaseBackend):
             self._cancelled_write_drain_error = None
             self._abandoned_read_cursors.clear()
             self._closing = False
+            self._connection_generation = uuid.uuid4().hex
             
             logger.debug(f"Connected to SQLite: {self.db_path}")
             
@@ -1034,6 +1182,7 @@ class SQLiteBackend(DatabaseBackend):
             self._cancelled_write_drain_error = None
             self._abandoned_read_cursors.clear()
             self._closing = False
+            self._connection_generation = None
 
         if pending_cancellation is not None:
             raise pending_cancellation
@@ -1206,6 +1355,11 @@ class SQLiteBackend(DatabaseBackend):
         """Fail closed after a detached rollback could not restore safety."""
         error = self._cancelled_write_drain_error
         if error is not None:
+            if isinstance(error, _CancelledWorkQuarantined):
+                raise ConnectionError(
+                    "SQLite connection is isolated until work a cancelled "
+                    "caller abandoned has finished"
+                ) from error
             if isinstance(error, _CancelledWriteDrainDeadlineExceeded):
                 raise ConnectionError(
                     "SQLite write connection is unavailable because cancellation "
@@ -1225,6 +1379,12 @@ class SQLiteBackend(DatabaseBackend):
         """
         drain = self._cancelled_write_drain
         if drain is not None and drain is not asyncio.current_task():
+            if not drain.done() and isinstance(
+                self._cancelled_write_drain_error, _CancelledWorkQuarantined
+            ):
+                # Quarantined: refuse at once rather than wait behind the
+                # abandoned statement for the rest of the drain's budget.
+                self._raise_cancelled_write_drain_error()
             # A caller cancelled while waiting must not cancel the backend-owned
             # cleanup task.  The retained task remains the sole drain owner.
             started_at = self._cancelled_write_drain_started_at

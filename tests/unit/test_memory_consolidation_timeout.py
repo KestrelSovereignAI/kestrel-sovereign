@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -517,3 +518,124 @@ async def test_blocked_lock_acquisition_has_its_own_failure(monkeypatch):
     release.set()
     await holder_task
     assert not locks.is_held(ResourceLock.MEMORY)
+
+
+async def test_deadline_holds_memory_until_abandoned_aiosqlite_write_finishes(
+    monkeypatch, tmp_path,
+):
+    """A deadline that fires mid-statement keeps MEMORY until it finishes (#2978).
+
+    Cancelling the aiosqlite await does not stop the UPDATE already running
+    on the worker thread. Before #2978 the tool released MEMORY at the
+    deadline anyway, so the next pass took the lock and queued its work on
+    the connection behind a statement nobody owned any more.
+    """
+    import importlib
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    locks = OrderedLockManager()
+    database_file = tmp_path / "abandoned-write.db"
+    backend = SQLiteBackend(str(database_file))
+    await backend.connect()
+    db = AsyncDatabase(backend)
+    loop = asyncio.get_running_loop()
+    entered_worker = asyncio.Event()
+    release_worker = threading.Event()
+    worker_returned = threading.Event()
+    # Only a safety net: the test releases the worker itself. A regression
+    # that never reaches the draining record fails on the assertion below
+    # once this fires, instead of hanging the suite.
+    watchdog = threading.Timer(5.0, release_worker.set)
+
+    def block_in_worker(value):
+        loop.call_soon_threadsafe(entered_worker.set)
+        release_worker.wait()
+        worker_returned.set()
+        return value + 1
+
+    draining_recorded = asyncio.Event()
+    # Absent before #2978, where this test must fail on the lock assertion
+    # below rather than on an import.
+    try:
+        drain_module = importlib.import_module(
+            "kestrel_sovereign.storage.consolidation_drain"
+        )
+    except ImportError:
+        drain_module = None
+    real_writer = getattr(drain_module, "write_consolidation_drain_record", None)
+
+    def recording_writer(path, record):
+        if real_writer is not None:
+            real_writer(path, record)
+        if record.get("state") == "draining":
+            draining_recorded.set()
+
+    if drain_module is not None:
+        monkeypatch.setattr(
+            drain_module, "write_consolidation_drain_record", recording_writer
+        )
+
+    try:
+        conn = backend._ensure_connected()
+        await conn.create_function("block_in_worker", 1, block_in_worker)
+        await db.execute("CREATE TABLE memories (value INTEGER NOT NULL)")
+        await db.execute("INSERT INTO memories (value) VALUES (0)")
+
+        async def run_consolidation():
+            await db.execute("UPDATE memories SET value = block_in_worker(value)")
+            return {"episodes_created": 1}
+
+        monkeypatch.setattr(
+            "kestrel_sovereign.storage.memory_system.load_section",
+            lambda _section: {"memory_consolidation_timeout_seconds": 0.05},
+        )
+        memory_system = MemorySystem(
+            storage=SimpleNamespace(db=db), agent_id="did:test:abandoned-write"
+        )
+        memory_system.consolidator = SimpleNamespace(
+            run_consolidation=run_consolidation
+        )
+        feature = _feature(memory_system, locks)
+
+        watchdog.start()
+        tool = asyncio.create_task(feature.memory_consolidate())
+        recorded = asyncio.create_task(draining_recorded.wait())
+        done, _ = await asyncio.wait(
+            {tool, recorded}, return_when=asyncio.FIRST_COMPLETED
+        )
+        recorded.cancel()
+
+        assert tool not in done, (
+            "memory_consolidate released the MEMORY lock while the UPDATE its "
+            "timed-out pass abandoned was still running on the aiosqlite worker"
+        )
+        await entered_worker.wait()
+        assert not worker_returned.is_set()
+        assert locks.holder(ResourceLock.MEMORY).label == (
+            "Claw MemoryFeature.memory_consolidate"
+        )
+        record_path = tmp_path / "abandoned-write.db.consolidation-drain.json"
+        record = json.loads(record_path.read_text())
+        assert record["state"] == "draining"
+        assert record["agent_id"] == "did:test:abandoned-write"
+        assert record["deadline_seconds"] == 0.05
+
+        release_worker.set()
+        result = await tool
+
+        assert worker_returned.is_set()
+        assert result.status is ToolResultStatus.ERROR
+        assert "configured deadline of 0.05 seconds" in result.error
+        assert "finished before the memory lock was released" in result.error
+        assert not locks.is_held(ResourceLock.MEMORY)
+        assert not backend.write_connection_unavailable
+        record = json.loads(record_path.read_text())
+        assert record["state"] == "done"
+        assert record["cleanup"] == "finished"
+        # The abandoned UPDATE was rolled back, not committed late.
+        assert await db.fetchall("SELECT value FROM memories") == [(0,)]
+    finally:
+        watchdog.cancel()
+        release_worker.set()
+        await backend.close()

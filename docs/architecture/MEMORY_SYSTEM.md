@@ -698,8 +698,42 @@ unwind in the same task. An aiosqlite statement already running in the driver's
 worker thread is not stopped by coroutine cancellation itself. The SQLite
 backend hands the abandoned operation to a retained `sqlite3_interrupt()` plus
 rollback drain, but a Python UDF or stalled VFS operation may not observe that
-interrupt until it returns control to SQLite and can therefore keep draining
-after the lock context is released.
+interrupt until it returns control to SQLite.
+
+So a timed-out pass does not release MEMORY while that statement runs (#2978).
+`MemorySystem.consolidate()` keeps the lock until the drain's rollback has run,
+which proves the statement returned, waiting no longer than the drain's own
+30-second cleanup deadline. If that deadline runs out, or the caller cancels
+the wait, the database connection is isolated first: every later read and
+write fails closed until the statement returns, and only then is the lock
+released. A later pass therefore never queues work behind, or interleaves
+with, a statement nobody owns. Caller cancellation before the deadline, and a
+provider or socket `TimeoutError` raised inside the pass, still propagate
+unchanged. `MemoryConsolidationTimeoutError.abandoned_work` says which of
+these happened.
+
+While the work runs, a JSON record beside the database file
+(`<database>.consolidation-drain.json`, written by
+`kestrel_sovereign.storage.consolidation_drain`) tracks it as `draining`
+(lock held) or `isolated` (lock released, connection refusing work), then
+`done` with how its cleanup settled. The database itself is fenced meanwhile,
+so it cannot hold this evidence. The `memory_system` health check reports the
+first two states as `warn` and `fail`.
+
+The record names its owner: the process (PID, start instant, host and PID
+namespace, as a serving record does, plus a per-process incarnation id) and
+the connection generation the statement runs on. Only the owner moves the
+record on, so a process that crashes mid-drain leaves it `draining` or
+`isolated`. A record like that is believed only while its owner may be alive.
+`MemorySystem.initialize()` at startup, and the health check on every read,
+close it out as `done` with `cleanup: owner_retired` once the owning process
+has provably exited, by the same proof that sweeps a stale serving record, or,
+in the owning process, once no pass there still holds it. The original fields
+are kept, with `reconciled_from` and `reconciliation` saying why, and the
+health check reports a settled record as history in its `pass` details. A
+record whose owner cannot be proven gone (another host, an unreadable start
+time) is kept and reported as `warn`, as is work held by another connection
+of this process: neither isolates the connection being checked.
 
 ### 1. Episode Creation
 

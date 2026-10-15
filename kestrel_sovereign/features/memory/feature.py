@@ -1525,7 +1525,13 @@ class MemoryFeature(Feature):
             logger.error(
                 "memory_consolidate reached its configured deadline: %s", exc
             )
-            return ToolResult.failed(str(exc))
+            return ToolResult.failed(
+                str(exc),
+                data={
+                    "abandoned_work": exc.abandoned_work,
+                    "drain_record": exc.drain_record,
+                },
+            )
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))

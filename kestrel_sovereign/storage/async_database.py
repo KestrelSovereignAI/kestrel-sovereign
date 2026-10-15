@@ -21,7 +21,10 @@ from .db import (
     normalize_schema,
 )
 from .db.after_commit import AfterCommitCallback, run_after_commit
-from .db.sqlite import _minimum_close_timeout_s
+from .db.sqlite import (
+    CANCELLATION_CLEANUP_FINISHED,
+    _minimum_close_timeout_s,
+)
 from .conversation_created_at import (
     CONSTRAINT_NAME as CREATED_AT_CONSTRAINT,
     UNDATED_DDL,
@@ -3985,6 +3988,41 @@ class AsyncDatabase:
             for factory in factories
         )
         return backend_pending is True or factory_pending
+
+    @property
+    def cancellation_cleanup_pending(self) -> bool:
+        """Whether work a cancelled caller abandoned may still be running.
+
+        Only SQLite's aiosqlite worker can outlive the cancelled await that
+        queued it; other backends report False (#2978).
+        """
+        pending = getattr(self._backend, "cancellation_cleanup_pending", False)
+        return pending is True
+
+    async def await_cancellation_cleanup(self) -> str:
+        """Wait, within the backend's own bound, for abandoned work to finish.
+
+        See :meth:`SQLiteBackend.await_cancellation_cleanup`. A backend with
+        no such work reports it finished.
+        """
+        wait = getattr(self._backend, "await_cancellation_cleanup", None)
+        if wait is None:
+            return CANCELLATION_CLEANUP_FINISHED
+        return await wait()
+
+    def quarantine_cancellation_cleanup(self) -> bool:
+        """Fail later operations closed until abandoned work has finished."""
+        quarantine = getattr(
+            self._backend, "quarantine_cancellation_cleanup", None
+        )
+        return quarantine() is True if quarantine is not None else False
+
+    def add_cancellation_cleanup_callback(
+        self, callback: Callable[[str], None]
+    ) -> bool:
+        """Call ``callback(outcome)`` once pending abandoned work settles."""
+        add = getattr(self._backend, "add_cancellation_cleanup_callback", None)
+        return add(callback) is True if add is not None else False
 
     @property
     def minimum_sqla_factory_close_timeout_s(self) -> float:
