@@ -8234,7 +8234,9 @@ Expected Duration: {expected_duration}
             return None
         try:
             return await self.storage.find_signal_wake_reply_id(signal_id)
-        except DatabaseError:
+        except DatabaseError as error:
+            if is_execution_control_error(error):
+                raise
             logging.warning(
                 "Could not read back the stored reply to signal %s", signal_id,
                 exc_info=True,

@@ -6,6 +6,7 @@ import json
 import logging
 
 from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from kestrel_sovereign.storage.session_grouping import (
     autonomous_wake_preview,
@@ -530,7 +531,9 @@ async def get_message(request: Request, message_id: int):
         agent = get_agent(request)
         try:
             message = await agent.storage.get_conversation_message(message_id)
-        except DecryptionError:
+        except DecryptionError as error:
+            if is_execution_control_error(error):
+                raise
             raise HTTPException(
                 status_code=409, detail="Message cannot be decrypted."
             )
@@ -552,6 +555,8 @@ async def get_message(request: Request, message_id: int):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error getting message {message_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving message.")
 

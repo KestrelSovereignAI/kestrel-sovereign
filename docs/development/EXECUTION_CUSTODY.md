@@ -410,6 +410,11 @@ conversation embedding fallbacks preserve control evidence instead of allowing
 cancellation, advisory policy or keyword fallback to erase it. A default native
 LLM service reuses storage's initialized PostgreSQL usage database before boot
 consumers; an externally supplied service retains its own host binding.
+Optional wake-reply ID readback and the console's single-message endpoint also
+propagate original native control/retirement failures before applying ordinary
+lookup, decryption or HTTP-error normalization. A missing reply or ordinary
+database read error keeps its established optional/UI behavior; an original
+failed RESET and its resource/closer are not a missing message.
 
 Scheduler effect markers lock the exact claim first and sample database lease
 time in a separate statement after the row lock is held. Each confirmed renewal
