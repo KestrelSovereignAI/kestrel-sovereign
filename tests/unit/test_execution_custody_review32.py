@@ -13,7 +13,10 @@ from kestrel_sovereign.execution_custody import (
 )
 from tests.unit.test_execution_custody import Authority
 from tests.unit.test_execution_custody_review29 import native_owner, retire
-from tests.unit.test_execution_custody_review30 import service_owner
+from tests.unit.test_execution_custody_review30 import (
+    assert_recorded_preference_rows,
+    service_owner,
+)
 
 
 def receipt(kind):
@@ -81,7 +84,9 @@ async def test_actual_agent_retains_storage_until_native_preference_writer_settl
         writer = service._schedule_route_embedding_model_persistence()
     try:
         await asyncio.wait_for(committed.wait(), 5)
-        assert await db.fetchval("SELECT COUNT(*) FROM agent_metadata") == 1
+        assert_recorded_preference_rows(
+            await db.fetchall("SELECT key, value FROM agent_metadata"), route,
+        )
         shutdown = asyncio.create_task(agent.shutdown())
         await asyncio.wait_for(asyncio.shield(shutdown), 2)
         assert not storage_closed.is_set()

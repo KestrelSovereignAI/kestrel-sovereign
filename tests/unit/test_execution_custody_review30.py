@@ -1,6 +1,7 @@
 """Actual preference and late accounting owners retain native control (#3569)."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,23 @@ from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.llm.modality_recording import ModalityCall
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+
+def assert_recorded_preference_rows(rows, route):
+    """The original single write now includes atomic provenance (#2652)."""
+    mandate = {"model": "model", "vendor": "local", "route": "unit"}
+    expected = {
+        "model": {
+            KestrelAgent.MODEL_PREFERENCE_KEY: mandate,
+            KestrelAgent.MODEL_PREFERENCE_PROVENANCE_KEY: {
+                "mandate": mandate, "provenance": None,
+            },
+        },
+        "embedding": {KestrelAgent.EMBEDDING_ROUTE_KEY: None},
+        "overrides": {KestrelAgent.EMBEDDING_MODEL_OVERRIDES_KEY: {}},
+    }[route]
+    assert len(rows) == len(expected)
+    assert {row[0]: json.loads(row[1]) for row in rows} == expected
 
 
 def carrier(kind):
@@ -97,7 +115,9 @@ async def test_installed_agent_preference_callback_retains_completed_native_erro
     task.add_done_callback(lambda done: completed.set())
     try:
         await asyncio.wait_for(completed.wait(), 2)
-        assert await db.fetchval("SELECT COUNT(*) FROM agent_metadata") == 1
+        assert_recorded_preference_rows(
+            await db.fetchall("SELECT key, value FROM agent_metadata"), route,
+        )
         assert writes == [True]
         if kind == "ordinary":
             await service.drain_preference_persistence()
