@@ -20,6 +20,11 @@ import pytest
 
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 from kestrel_sovereign.llm.service import LLMService
+from tests.utils.override_writers import as_operator
+
+# A bare service has no initialized route and no declared chain, so it admits
+# no override the agent writes (#2652). The cases that must install a mandate
+# on one name the operator as its writer; what they resolve is unchanged.
 
 
 def _cached(models):
@@ -55,7 +60,9 @@ class TestBareModelResolution:
     def test_unambiguous_bare_model_auto_resolves_vendor(self):
         svc = _make_service()
         cache = _cached([_mk_model("claude-opus-4-7", "anthropic")])
-        with patch("kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache):
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache
+        ), as_operator():
             svc.set_model_preference("claude-opus-4-7")
 
         pref = svc.get_model_preference()
@@ -110,7 +117,9 @@ class TestBareModelResolution:
         """When caller supplies a vendor, we trust it — no catalog lookup."""
         svc = _make_service()
         cache = _cached([])  # Empty catalog would refuse a bare call.
-        with patch("kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache):
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache
+        ), as_operator():
             svc.set_model_preference("claude-opus-4-7", vendor="anthropic", route="plan")
 
         pref = svc.get_model_preference()

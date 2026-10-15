@@ -875,13 +875,18 @@ class TaskManager:
         else:
             args = self._parse_command_args(user_input)
 
+        # Mark the tool as typed for the duration of its call, so what it
+        # writes is attributed to the caller rather than to the agent (#2652).
+        from kestrel_sovereign.llm.provider_policy import command_authored_scope
+
         try:
-            task = await self.execute_skill(
-                agent_id=agent_id,
-                skill_id=skill_id,
-                args=args,
-                sync=True,
-            )
+            with command_authored_scope(skill_id):
+                task = await self.execute_skill(
+                    agent_id=agent_id,
+                    skill_id=skill_id,
+                    args=args,
+                    sync=True,
+                )
 
             # Extract result from task artifacts
             if task.status.state == TaskState.COMPLETED and task.artifacts:

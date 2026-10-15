@@ -13,13 +13,14 @@ import json
 import time
 import asyncio
 import inspect
+from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.llm.retry import state_aggregate_verdicts
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
-from typing import AsyncIterator, Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
+from typing import AsyncIterator, Awaitable, Callable, List, Dict, Any, Optional, Sequence, Union, Type, TYPE_CHECKING
 
 import openai
 import httpx
@@ -68,9 +69,36 @@ from .invocation_context import (
     resolve_invocation_context,
 )
 from .constitutional_awareness import ConstitutionalAwarenessMixin
-from .remote_backend import BackendType, RemoteBackendMixin
+from .remote_backend import REMOTE_ROUTE_NAME, BackendType, RemoteBackendMixin
 from .decision_service import DecisionServiceMixin
 from .modality_recording import ModalityRecordingMixin
+from .provider_policy import (
+    FALLBACK_WRITER_KEY,
+    OVERRIDE_HISTORY_LIMIT,
+    OverrideProvenance,
+    ProviderPolicyRefusal,
+    agent_provenance,
+    approved_vendors,
+    attested_call_override,
+    attested_call_override_writer,
+    call_override_selection,
+    config_provenance,
+    current_override_writer,
+    current_task,
+    describe_chain,
+    fallback_selection,
+    fallback_writer,
+    in_declared_chain,
+    known_vendors,
+    named_override_writer,
+    parse_denied_providers,
+    provider_is_denied,
+    public_fallback,
+    route_priority_entries,
+    selection_covers,
+    selector_is_denied,
+    utc_now_iso,
+)
 from .decisions.resolve import RouteDecisionState
 from .decisions.config import DecisionRouteConfig
 from kestrel_sovereign.kestrel_config.constants import (
@@ -364,6 +392,27 @@ class ModelNotAvailableForRoute(LLMError):
         super().__init__(message)
 
 
+def _route_vendor(provider: Any) -> Optional[str]:
+    """A registry route's vendor, read from its composite name when unset."""
+    return getattr(provider, "vendor", None) or provider.name.split(":", 1)[0]
+
+
+# What makes a per-call override decision the same decision again: everything
+# but when it was written and decided (#2652).
+_CONTINUATION_KEYS = (
+    "kind", "vendor", "route", "model", "source", "role", "identity", "via",
+    "task", "accepted",
+)
+
+
+def _accepts_keyword(callback: Any, name: str) -> bool:
+    """Whether ``callback`` names a ``name`` parameter explicitly."""
+    try:
+        return name in inspect.signature(callback).parameters
+    except (ValueError, TypeError):
+        return False
+
+
 def _warn_no_llm_config_found() -> None:
     """Loud warning when ``[llm]`` is empty/missing on LLMService startup.
 
@@ -474,6 +523,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         self.config = load_section("llm")
         if not self.config:
             _warn_no_llm_config_found()
+        # A malformed deny-list fails here, at startup, rather than denying
+        # nothing (#2652).
+        parse_denied_providers(self.config)
         self.mandate_config = load_config("model_mandate.toml")
 
         # Initialize provider registry
@@ -654,7 +706,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         # Persistence callback for model preference (writes to database)
         # Set via set_preference_persistence_callback() after initialization
         self._preference_persistence_callback = None
+        self._preference_persistence_accepts_provenance = False
         self._preference_persistence_tasks: set[asyncio.Task[None]] = set()
+        # Who wrote the mandate in force, and the override decisions made
+        # since start, accepted and refused (#2652).
+        self._mandate_provenance: Optional[OverrideProvenance] = None
+        self._override_history: deque = deque(maxlen=OVERRIDE_HISTORY_LIMIT)
 
         # Persistence callback for the top-level embedding_route knob (#2263).
         # Set via set_embedding_route_persistence_callback(); mirrors the model
@@ -886,8 +943,15 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
         Args:
             callback: Async function(model, provider) to call on preference change
+
+        A callback that accepts a ``provenance`` keyword also receives the
+        :class:`OverrideProvenance` of the write, or None for a cleared
+        preference, so a stored override keeps who wrote it (#2652).
         """
         self._preference_persistence_callback = callback
+        self._preference_persistence_accepts_provenance = _accepts_keyword(
+            callback, "provenance"
+        )
         logger.info("Model preference persistence enabled")
 
     def set_embedding_route_persistence_callback(self, callback) -> None:
@@ -1907,11 +1971,575 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         ``self.providers`` so each user turn skips dead routes immediately.
         If every route has been disabled (pathological), return an empty
         list — the caller raises a clear error rather than pretending.
+
+        Routes ``[llm] denied_providers`` names are never available (#2652).
         """
-        src = providers if providers is not None else self.providers
+        src = self._without_denied(
+            providers if providers is not None else self.providers
+        )
         if not self._disabled_routes:
-            return list(src)
+            return src
         return [p for p in src if p.get("name") not in self._disabled_routes]
+
+    def _denied_providers(self) -> tuple[str, ...]:
+        """``[llm] denied_providers``; see :mod:`.provider_policy`."""
+        return parse_denied_providers(getattr(self, "config", None) or {})
+
+    def _without_denied(
+        self, providers: Optional[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """``providers`` less every route the deny-list names."""
+        denied = self._denied_providers()
+        return [p for p in (providers or []) if not provider_is_denied(p, denied)]
+
+    def _refuse_denied_selector(
+        self, selector: Optional[str], model: Optional[str]
+    ) -> None:
+        """Raise when ``selector`` names only routes the deny-list removed.
+
+        Routing filters denied routes out before matching, so without this a
+        request for one would read as "not configured" rather than refused.
+        """
+        if not selector:
+            return
+        denied = self._denied_providers()
+        if not denied:
+            return
+        vendor, _, route = selector.partition(":")
+        matching = self._filter_providers_by_selector(self.providers or [], selector)
+        if selector_is_denied(vendor, route or None, denied) or (
+            matching and all(provider_is_denied(p, denied) for p in matching)
+        ):
+            raise ProviderPolicyRefusal(
+                ProviderPolicyRefusal.PROVIDER_DENIED,
+                vendor=vendor,
+                route=route or None,
+                model=model,
+                reason=(
+                    f"'{selector}' is listed in [llm] denied_providers and is "
+                    "never used"
+                ),
+            )
+
+    def _admit_provider_selection(
+        self,
+        preference: Dict[str, Optional[str]],
+        provenance: OverrideProvenance,
+        *,
+        kind: str = "mandate",
+        continuation: bool = False,
+    ) -> None:
+        """Refuse ``preference`` unless the provider policy admits it (#2652).
+
+        The one admission check for every override: a mandate (``kind``
+        ``"mandate"``), a mandate fallback (``"fallback"``) and a per-call
+        ``model_override`` (``"call"``). A denied provider is refused whoever
+        wrote the override. An override the agent wrote must also select a
+        vendor in the approved chain. A refusal is recorded, logged at WARNING
+        and raised; it installs nothing and routes nothing. With
+        ``continuation``, a refusal already recorded for the same task is not
+        recorded or logged again (see :meth:`_record_override_decision`).
+        """
+        vendor = preference.get("vendor")
+        route = preference.get("route")
+        model = preference.get("model")
+        selector = f"{vendor}:{route}" if vendor and route else vendor
+        try:
+            self._refuse_denied_selector(selector, model)
+            if provenance.narrowed_by_chain:
+                approved = approved_vendors(
+                    getattr(self, "config", None) or {},
+                    getattr(self, "providers", None) or [],
+                    self._denied_providers(),
+                )
+                # An empty chain (every approved vendor denied, or nothing
+                # declared and nothing initialized) admits nothing: it is not
+                # a missing chain that admits everything.
+                if vendor not in approved:
+                    chain = ", ".join(sorted(approved)) or "empty"
+                    raise ProviderPolicyRefusal(
+                        ProviderPolicyRefusal.OUTSIDE_APPROVED_CHAIN,
+                        vendor=vendor,
+                        route=route,
+                        model=model,
+                        reason=(
+                            f"an override the agent writes may select only a "
+                            f"provider in the approved chain ({chain}); "
+                            f"'{selector or model}' is not in it"
+                        ),
+                        source=provenance.source,
+                        approved_vendors=approved,
+                    )
+        except ProviderPolicyRefusal as refusal:
+            self._report_override_refusal(
+                refusal,
+                preference,
+                provenance,
+                kind=kind,
+                continuation=continuation,
+            )
+            raise
+
+    def _report_override_refusal(
+        self,
+        refusal: ProviderPolicyRefusal,
+        preference: Dict[str, Optional[str]],
+        provenance: OverrideProvenance,
+        *,
+        kind: str,
+        continuation: bool,
+    ) -> None:
+        """Record ``refusal`` in the audit history and log it at WARNING.
+
+        With ``continuation``, a refusal already recorded for the same task is
+        neither recorded nor logged again (:meth:`_record_override_decision`).
+        """
+        if refusal.source is None:
+            refusal.source = provenance.source
+        if self._record_override_decision(
+            preference,
+            provenance,
+            refusal=refusal,
+            kind=kind,
+            continuation=continuation,
+        ):
+            logger.warning(
+                "Model override refused (%s): agent=%s task=%s source=%s "
+                "role=%s kind=%s provider=%s model=%s",
+                refusal.code,
+                getattr(self, "_agent_display_name", None),
+                provenance.task,
+                provenance.source.value,
+                provenance.role,
+                kind,
+                refusal.provider,
+                preference.get("model"),
+            )
+
+    def _admit_call_override(
+        self, model_override: Optional[str], *, via: str = "model_override"
+    ) -> None:
+        """Admit a per-call ``model_override`` that names a provider (#2652).
+
+        Its writer is the principal the turn attests for this exact override
+        (:func:`~.provider_policy.caller_call_override_scope`) or the
+        configuration a component names for it
+        (:func:`~.provider_policy.named_call_override_scope`), else the
+        operator when ``model_mandate.toml`` names it, else whoever
+        :func:`~.provider_policy.override_writer` names, else the agent. A bare
+        model id selects no provider and is not an override of the chain.
+
+        Every routing path that resolves a per-call override calls this before
+        it narrows to a route, so a refused override is never served:
+        ``_remote_route_attempt`` (the lease route's one entry, for
+        ``generate``, ``generate_with_messages``, ``generate_stream``,
+        ``stream_with_messages`` and ``stream_with_tool_detection``),
+        ``resolve_provider_routing``, ``generate_with_messages`` and
+        ``get_response_with_model``. ``decide`` parses its override its own
+        way and admits what that parse selects through
+        :meth:`_admit_call_selection`. A call the turn already
+        admitted, with the same override and writer, is a continuation: it is
+        checked again but not recorded again.
+        """
+        self._admit_call_selection(
+            model_override,
+            self._call_override_selection(model_override),
+            via=via,
+        )
+
+    def _known_vendors(self) -> set[str]:
+        """Every vendor name this host knows (:func:`.provider_policy.known_vendors`)."""
+        return known_vendors(
+            getattr(self, "config", None) or {},
+            getattr(self, "providers", None) or [],
+        )
+
+    def _call_override_selection(
+        self, model_override: Optional[str]
+    ) -> Optional[Dict[str, Optional[str]]]:
+        """The provider ``model_override`` selects on this host, if any."""
+        return call_override_selection(model_override, self._known_vendors())
+
+    def _admit_call_selection(
+        self,
+        model_override: Optional[str],
+        selection: Optional[Dict[str, Optional[str]]],
+        *,
+        via: str,
+    ) -> Optional[OverrideProvenance]:
+        """Admit ``selection``, the provider a per-call ``model_override`` selects.
+
+        :meth:`_admit_call_override` for a path that parses the override
+        itself: it admits the provider its own parse selects, so admission
+        and routing cannot read one override two ways. The writer is still
+        looked up by the override exactly as it was passed. ``None`` selects
+        no provider and is not an override of the chain.
+
+        Returns the writer the override was admitted for, or None when it
+        selects no provider.
+        """
+        if selection is None:
+            return None
+        provenance = (
+            attested_call_override_writer(model_override)
+            or self._config_selector_provenance(model_override)
+            or current_override_writer(via=via)
+        )
+        task = current_task()
+        if task and provenance.task != task:
+            provenance = replace(provenance, task=task)
+        # Outside a task there is no turn to continue: each call is decided,
+        # and each refusal is recorded and logged.
+        self._admit_provider_selection(
+            selection, provenance, kind="call", continuation=bool(provenance.task)
+        )
+        # An accepted override repeated is the same decision again: recorded
+        # once per task, and once outside any, so the calls a sleep cycle or
+        # a configured decision model makes cannot push refusals out of the
+        # bounded history.
+        self._record_override_decision(
+            selection, provenance, kind="call", continuation=True
+        )
+        return provenance
+
+    def _guard_dispatch(
+        self,
+        provider_name: str,
+        model: Optional[str],
+        *,
+        path: str,
+        force_local_only: Optional[bool] = None,
+        admitted: Sequence[
+            tuple[Dict[str, Optional[str]], OverrideProvenance]
+        ] = (),
+    ) -> None:
+        """Refuse a dispatch the provider policy gives no authority for (#2652).
+
+        The fail-closed backstop behind admission. Every adapter dispatch runs
+        it before the adapter does: ``_run_provider_attempt`` (every
+        non-streaming call), ``_stream_adapter_with_usage`` (every streaming
+        call) and ``decide``. A route ``[llm] denied_providers`` names is
+        refused whoever chose it. Any other route may be dispatched to when it
+        is
+
+        * in the approved chain (every route, with no chain declared);
+        * a local route, on a call held to local routes;
+        * the active lease route, with the lease's own model or a model that
+          names no provider; or
+        * a route an override in force names, written by someone the chain
+          does not narrow (:meth:`_dispatch_authority`), or one of
+          ``admitted``, the ``(selection, writer)`` pairs the entry point
+          admitted for this call (``decide`` passes its override and its
+          explicit ``[llm] decision_route``), names.
+
+        Anything else is refused: recorded as the agent's (``kind``
+        ``"dispatch"``), logged at WARNING and raised before the adapter runs,
+        so a path that reaches an adapter without admission fails closed. An
+        accepted dispatch records nothing, so a call its entry point admitted
+        is not recorded twice.
+        """
+        config = getattr(self, "config", None) or {}
+        denied = self._denied_providers()
+        if provider_name == REMOTE_ROUTE_NAME:
+            lease = getattr(self, "_remote_lease", None)
+            # The lease's own model is the lease's, whatever its id looks like
+            # (``Qwen/Qwen3-8B``); any other model came from a caller's
+            # override, and must name no provider.
+            named = (
+                None
+                if lease is not None and model == lease.model
+                else self._call_override_selection(model)
+            )
+            if lease is not None and named is None:
+                return
+            selection = dict(named or {}, model=model)
+            selection.setdefault("vendor", REMOTE_ROUTE_NAME)
+            selection.setdefault("route", None)
+            reason = (
+                "the private inference lease route serves only an active lease, "
+                "and never a model that names a provider"
+            )
+            code = ProviderPolicyRefusal.OUTSIDE_APPROVED_CHAIN
+            if named is not None and selector_is_denied(
+                named["vendor"], named.get("route"), denied
+            ):
+                code = ProviderPolicyRefusal.PROVIDER_DENIED
+        else:
+            provider = next(
+                (
+                    p for p in getattr(self, "providers", None) or []
+                    if p.get("name") == provider_name
+                ),
+                None,
+            )
+            vendor, _, route = provider_name.partition(":")
+            route = route or None
+            if provider is not None:
+                vendor = provider.get("vendor") or vendor
+                route = provider.get("route") or route
+            selection = {"vendor": vendor, "route": route, "model": model}
+            if provider_is_denied(
+                {"name": provider_name, "vendor": vendor, "route": route}, denied
+            ):
+                code = ProviderPolicyRefusal.PROVIDER_DENIED
+                reason = (
+                    f"'{provider_name}' is listed in [llm] denied_providers and "
+                    "is never used"
+                )
+            elif in_declared_chain(config, vendor):
+                return
+            elif (
+                provider is not None
+                and provider.get("is_local")
+                and self._effective_force_local_only(force_local_only)
+            ):
+                return
+            elif any(
+                not writer.narrowed_by_chain
+                and selection_covers(chosen, vendor, route)
+                for chosen, writer in admitted
+            ):
+                return
+            elif self._dispatch_authority(vendor, route) is not None:
+                return
+            else:
+                code = ProviderPolicyRefusal.OUTSIDE_APPROVED_CHAIN
+                reason = (
+                    f"'{provider_name}' is outside the approved chain "
+                    f"([llm] route_priority) and no override in force by the "
+                    "Sovereign or an operator selects it"
+                )
+        refusal = ProviderPolicyRefusal(
+            code,
+            vendor=selection["vendor"],
+            route=selection["route"],
+            model=model,
+            reason=reason,
+            approved_vendors=approved_vendors(
+                config, getattr(self, "providers", None) or [], denied
+            ),
+        )
+        task = current_task()
+        self._report_override_refusal(
+            refusal,
+            selection,
+            agent_provenance(via=f"dispatch:{path}"),
+            kind="dispatch",
+            continuation=bool(task),
+        )
+        raise refusal
+
+    def _dispatch_authority(
+        self, vendor: Optional[str], route: Optional[str]
+    ) -> Optional[OverrideProvenance]:
+        """Who, unnarrowed by the chain, chose the route ``vendor``/``route``.
+
+        The writer of an override in force that names the route, when the
+        approved chain does not narrow that writer: the writer named for this
+        scope, the principal or configuration attesting this scope's per-call
+        override, the mandate's, a stored fallback's, or the operator's
+        ``model_mandate.toml``. None when no such override names it.
+        """
+        writer = named_override_writer()
+        if writer is not None and not writer.narrowed_by_chain:
+            return writer
+        attested = attested_call_override()
+        if attested is not None and not attested.provenance.narrowed_by_chain:
+            chosen = self._call_override_selection(attested.override)
+            if chosen is not None and selection_covers(chosen, vendor, route):
+                return attested.provenance
+        mandate = getattr(self, "_mandate_preference", None) or {}
+        provenance = self.get_model_preference_provenance()
+        if (
+            provenance is not None
+            and not provenance.narrowed_by_chain
+            and mandate.get("model")
+            and selection_covers(mandate, vendor, route)
+        ):
+            return provenance
+        for fallback in getattr(self, "_mandate_fallbacks", None) or []:
+            chosen = fallback_selection(fallback)
+            writer = fallback_writer(fallback)
+            if (
+                chosen is not None
+                and not writer.narrowed_by_chain
+                and selection_covers(chosen, vendor, route)
+            ):
+                return writer
+        for selector in self._config_selectors():
+            chosen = self._call_override_selection(selector)
+            if chosen is not None and selection_covers(chosen, vendor, route):
+                return config_provenance(via="model_mandate.toml")
+        return None
+
+    def _admitted_mandate_fallbacks(
+        self,
+    ) -> tuple[List[Dict[str, Any]], Optional[ProviderPolicyRefusal]]:
+        """The mandate fallbacks routing may follow, and the first refusal (#2652).
+
+        ``add_fallback_model`` admitted each fallback when it was written.
+        Routing admits it again, under the writer stored with it, whenever an
+        unmatched mandate would fall back to it: an entry put in the list some
+        other way has no recorded writer and is the agent's, and the policy
+        may not admit now what it admitted then. A refused fallback is left
+        out, so it is neither followed nor authorized. Its refusal is
+        recorded and logged once per task (and once outside any task), not on
+        every routing pass. An entry that names no provider is never followed
+        and is returned as it is.
+        """
+        admitted: List[Dict[str, Any]] = []
+        first_refusal: Optional[ProviderPolicyRefusal] = None
+        task = current_task()
+        for fallback in getattr(self, "_mandate_fallbacks", None) or []:
+            selection = fallback_selection(fallback)
+            if selection is None:
+                admitted.append(fallback)
+                continue
+            writer = fallback_writer(fallback)
+            if writer.task != task:
+                # The decision belongs to the task routing it, not the writer's.
+                writer = replace(writer, task=task)
+            try:
+                self._admit_provider_selection(
+                    selection, writer, kind="fallback", continuation=True
+                )
+            except ProviderPolicyRefusal as refusal:
+                if first_refusal is None:
+                    first_refusal = refusal
+                continue
+            admitted.append(fallback)
+        return admitted, first_refusal
+
+    def _config_selector_provenance(
+        self, model_override: str
+    ) -> Optional[OverrideProvenance]:
+        """The operator's, when ``model_mandate.toml`` names ``model_override``.
+
+        ``[defaults] preferred``, a ``[mandates]`` value and an explicit
+        ``[defaults] cheap_model`` are routes the operator configured for the
+        agent's calls. A cheap model ``cheap_model_hints`` picked is not named
+        there, and a banned selector is never the operator's.
+        """
+        if model_override in self._config_selectors():
+            return config_provenance(via="model_mandate.toml")
+        return None
+
+    def _config_selectors(self) -> List[str]:
+        """The selectors ``model_mandate.toml`` names, as written and resolved.
+
+        See :meth:`_config_selector_provenance`.
+        """
+        config = getattr(self, "mandate_config", None) or {}
+        defaults = config.get("defaults") or {}
+        mandates = config.get("mandates") or {}
+        named = [defaults.get("preferred"), *mandates.values()]
+        if defaults.get("cheap_model") != "auto":
+            named.append(defaults.get("cheap_model"))
+        selectors: List[str] = []
+        for selector in named:
+            if not isinstance(selector, str) or selector in ("", "auto", "cheap"):
+                continue
+            if self._is_banned_selector(selector):
+                continue
+            selectors.append(selector)
+            resolved = self._resolve_model_selector(selector).get("selector")
+            if isinstance(resolved, str) and resolved:
+                selectors.append(resolved)
+        return selectors
+
+    def _record_override_decision(
+        self,
+        preference: Dict[str, Optional[str]],
+        provenance: OverrideProvenance,
+        *,
+        refusal: Optional[ProviderPolicyRefusal] = None,
+        kind: str = "mandate",
+        continuation: bool = False,
+    ) -> bool:
+        """Add one override decision to the audit history.
+
+        With ``continuation``, a decision already recorded for the same task,
+        override, writer and outcome is the same decision made again (a per-
+        call override a turn passes on, a stored fallback routing consults on
+        every pass) and is not added again. Returns whether the decision was
+        added.
+        """
+        history = getattr(self, "_override_history", None)
+        if history is None:
+            history = deque(maxlen=OVERRIDE_HISTORY_LIMIT)
+            self._override_history = history
+        entry = {
+            "kind": kind,
+            "vendor": preference.get("vendor"),
+            "route": preference.get("route"),
+            "model": preference.get("model"),
+            "agent": getattr(self, "_agent_display_name", None),
+            **provenance.to_dict(),
+            "accepted": refusal is None,
+            "refusal": refusal.to_dict() if refusal is not None else None,
+        }
+        if continuation and any(
+            all(recorded.get(key) == entry[key] for key in _CONTINUATION_KEYS)
+            for recorded in history
+        ):
+            return False
+        entry["decided_at"] = utc_now_iso()
+        history.append(entry)
+        return True
+
+    def describe_provider_policy(self) -> Dict[str, Any]:
+        """The provider policy in force, for the read-only audit surface.
+
+        The effective chain with each route's state, the deny-list, the
+        override in force and its fallbacks with who wrote each, and the
+        override decisions made since this service started, newest last
+        (#2652).
+        """
+        config = getattr(self, "config", None) or {}
+        providers = getattr(self, "providers", None) or []
+        denied = self._denied_providers()
+        preference = self.get_model_preference()
+        provenance = self.get_model_preference_provenance()
+        override = None
+        if preference.get("model"):
+            override = {
+                "vendor": preference.get("vendor"),
+                "route": preference.get("route"),
+                "model": preference.get("model"),
+                "agent": getattr(self, "_agent_display_name", None),
+                "provenance": provenance.to_dict() if provenance else None,
+            }
+        # The mandate's fallbacks, each with the writer stored with it; an
+        # entry with none recorded is shown as unattributed (#2652).
+        fallbacks = []
+        for fallback in getattr(self, "_mandate_fallbacks", None) or []:
+            selection = fallback_selection(fallback) or {}
+            recorded = fallback.get(FALLBACK_WRITER_KEY)
+            fallbacks.append({
+                **public_fallback(fallback),
+                "vendor": selection.get("vendor"),
+                "route": selection.get("route"),
+                "provenance": (
+                    recorded.to_dict()
+                    if isinstance(recorded, OverrideProvenance)
+                    else None
+                ),
+            })
+        return {
+            "route_priority": route_priority_entries(config),
+            "chain_declared": bool(route_priority_entries(config)),
+            "chain": describe_chain(
+                config,
+                providers,
+                denied,
+                getattr(self, "_disabled_routes", None) or {},
+            ),
+            "approved_vendors": sorted(approved_vendors(config, providers, denied)),
+            "denied_providers": list(denied),
+            "override": override,
+            "fallbacks": fallbacks,
+            "override_history": list(getattr(self, "_override_history", None) or ()),
+        }
 
     def set_model_preference(
         self,
@@ -1944,6 +2572,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 zero matches (unknown model) or multiple matches (ambiguous);
                 or if an explicit ``{vendor, route, model}`` triple names a
                 route that is not configured, or a model not serveable on it.
+            ProviderPolicyRefusal: if the provider policy refuses the override
+                for the writer :func:`~.provider_policy.override_writer` names,
+                or for the agent when none is named (#2652); nothing is
+                installed or persisted. A ``ValueError`` too.
             MandateChangeInProgressError: if another caller holds
                 :meth:`mandate_change`.
         """
@@ -1952,9 +2584,13 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             return
 
         self._refuse_mandate_change_held_elsewhere()
-        self._mandate_preference = self.resolve_model_preference(
+        provenance = current_override_writer(via="set_model_preference")
+        preference = self.resolve_model_preference(
             model, vendor, route, validate=validate
         )
+        self._mandate_preference = preference
+        self._mandate_provenance = provenance
+        self._record_override_decision(preference, provenance)
         vendor = self._mandate_preference["vendor"]
         # A mandate is in effect again — clear any recorded boot-time drop so
         # the health surface stops reporting a condition the operator fixed
@@ -1982,7 +2618,29 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         raises the same ``ValueError``, but installs and persists nothing. A
         caller that must record a mandate durably before it takes effect
         (a privacy-mode transition, #3554) resolves it here first.
+
+        The provider policy admits the resolved mandate here too, for the
+        writer :func:`~.provider_policy.override_writer` names, else for the
+        agent (#2652), so a refusal comes before any consent, plan or write
+        that would follow it.
         """
+        preference = self._resolve_model_preference_unchecked(
+            model, vendor, route, validate=validate
+        )
+        self._admit_provider_selection(
+            preference, current_override_writer(via="resolve_model_preference")
+        )
+        return preference
+
+    def _resolve_model_preference_unchecked(
+        self,
+        model: str,
+        vendor: Optional[str],
+        route: Optional[str],
+        *,
+        validate: bool,
+    ) -> Dict[str, Optional[str]]:
+        """Resolve and validate a mandate; see :meth:`resolve_model_preference`."""
         if vendor is None:
             resolved = self._resolve_vendor_for_model(model)
             if isinstance(resolved, list):
@@ -2164,6 +2822,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         """
         self._refuse_mandate_change_held_elsewhere()
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        self._mandate_provenance = None
         # Returning to automatic routing is a DELIBERATE unpinned state, so the
         # boot-failure notice must go with it (#3190 r3 P2). Only the set path
         # cleared it, so health went on reporting "a persisted preference
@@ -2195,10 +2854,16 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             # No running loop — skip persistence (happens in tests/sync contexts)
             return None
 
-        task = loop.create_task(
-            self._preference_persistence_callback(model, vendor, route),
-            name="llm-preference-persistence",
-        )
+        if getattr(self, "_preference_persistence_accepts_provenance", False):
+            write = self._preference_persistence_callback(
+                model,
+                vendor,
+                route,
+                provenance=self.get_model_preference_provenance(),
+            )
+        else:
+            write = self._preference_persistence_callback(model, vendor, route)
+        task = loop.create_task(write, name="llm-preference-persistence")
         self._preference_persistence_tasks.add(task)
         task.add_done_callback(self._handle_preference_persistence_done)
         return task
@@ -2382,6 +3047,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         """
         return self._mandate_preference.copy()
 
+    def get_model_preference_provenance(self) -> Optional[OverrideProvenance]:
+        """Who wrote the model preference in force; None when none is (#2652)."""
+        return getattr(self, "_mandate_provenance", None)
+
     def _remote_first_allowed(self, model_override: Optional[str]) -> bool:
         """Return True iff the remote-GPU fast path may run for this call.
 
@@ -2398,8 +3067,14 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         vendor-prefixed ``model_override``.  A bare model string (no ``:``
         or ``/``) is allowed through since the remote route has its own
         configured model and the user hasn't pinned a backend.
+
+        A bare string that names a vendor this host knows (``openrouter``,
+        ``anthropic``) names a provider, not a model: it is never sent to the
+        lease as a model id (#2652).
         """
         if "/" in (model_override or "") or ":" in (model_override or ""):
+            return False
+        if self._call_override_selection(model_override) is not None:
             return False
         pref = self._mandate_preference
         if pref.get("vendor") or pref.get("route"):
@@ -2462,6 +3137,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
 
         # --- 1. Explicit model_override ---
         if model_override:
+            # Admitted before it narrows anything, so a refused or denied
+            # override is never served, nor reported as unconfigured (#2652).
+            self._admit_call_override(model_override)
             if "/" in model_override:
                 left, model_name = model_override.split("/", 1)
                 target_model = model_name
@@ -2508,6 +3186,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             if pref_vendor:
                 selector = f"{pref_vendor}:{pref_route}" if pref_route else pref_vendor
                 matching = self._filter_providers_by_selector(providers_to_use, selector)
+                if not matching:
+                    # A mandate on a denied provider is refused by name, never
+                    # served by its fallbacks (#2652).
+                    self._refuse_denied_selector(selector, pref_model)
                 if matching:
                     providers_to_use = matching
                     mandate_pin = True
@@ -2517,17 +3199,26 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                         pref_model,
                     )
                 elif self._mandate_fallbacks:
+                    # Each fallback is admitted again under its writer, so a
+                    # fallback the policy refuses is never followed (#2652).
+                    fallbacks, refused = self._admitted_mandate_fallbacks()
+                    if refused is not None and not any(
+                        fallback_selection(fb) for fb in fallbacks
+                    ):
+                        # Every fallback that names a provider was refused.
+                        # The task fails naming one, rather than routing on.
+                        raise refused
                     logger.warning(
                         "Mandated %s unavailable; using %d fallback(s)",
                         selector,
-                        len(self._mandate_fallbacks),
+                        len(fallbacks),
                     )
                     fallback_providers = []
-                    for fb in self._mandate_fallbacks:
+                    for fb in fallbacks:
                         fb_vendor = fb.get("vendor") or fb.get("provider")
                         if fb_vendor:
                             match_list = self._filter_providers_by_selector(
-                                self.providers,
+                                self._without_denied(self.providers),
                                 fb_vendor,
                             )
                             if match_list:
@@ -2828,7 +3519,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         # embedding the right answer is "fall back to keyword
         # search," not "crash the storage write" — so catch it here.
         try:
-            providers_to_use, target_model = self.resolve_provider_routing(
+            resolution = self.resolve_provider_routing(
                 force_local_only=force_local_only,
             )
         except RuntimeError as exc:
@@ -2839,7 +3530,24 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 exc,
             )
             return None
+        providers_to_use, target_model = resolution
 
+        # The chat route embeds only where chat may run: never a route outside
+        # the authorized vendors, even when every route in the chain is
+        # disabled (#2652).
+        meta = getattr(resolution, "meta", None)
+        if (
+            meta is not None
+            and not meta.explicit_selection
+            and self._configured_route_vendors()
+        ):
+            providers_to_use = [
+                candidate
+                for candidate in providers_to_use
+                if not self._skip_unconfigured_route(
+                    candidate, meta.authorized_vendors
+                )
+            ]
         if not providers_to_use:
             return None
         provider = next(
@@ -4036,6 +4744,16 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 return LLMServiceError(error_message_override)
             return error
 
+        try:
+            self._guard_dispatch(
+                provider_name, model, path=path, force_local_only=force_local_only
+            )
+        except ProviderPolicyRefusal:
+            # Refused before the adapter runs: its call is never awaited.
+            if inspect.iscoroutine(attempt):
+                attempt.close()
+            raise
+
         report_call_attempt(provider_name, model)
         started = time.monotonic()
         try:
@@ -4436,13 +5154,29 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             return None
 
         cheap_providers = self.provider_registry.get_providers_with_pattern(cheap_patterns)
+        # A hint picks a route; it never widens the approved chain or reaches
+        # a denied provider (#2652).
+        config = getattr(self, "config", None) or {}
+        denied = parse_denied_providers(config)
+        cheap_providers = [
+            match for match in cheap_providers or []
+            if in_declared_chain(config, _route_vendor(match))
+            and not provider_is_denied(
+                {
+                    "name": match.name,
+                    "vendor": _route_vendor(match),
+                    "route": getattr(match, "route", None),
+                },
+                denied,
+            )
+        ]
         if not cheap_providers:
             return None
 
         # First hit wins. Return vendor-scoped selector so routing can't
         # broadcast to providers that don't serve this model.
         match = cheap_providers[0]
-        vendor = getattr(match, "vendor", None) or match.name.split(":", 1)[0]
+        vendor = _route_vendor(match)
         model = match.model
         if vendor and model and model != "auto":
             return f"{vendor}/{model}"
@@ -4669,6 +5403,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         text_to_audit: str,
         invocation_context: LLMInvocationContext,
         provider_name: str,
+        force_local_only: Optional[bool] = None,
     ) -> Union[str, LLMResponse]:
         """One audit attempt on one route.
 
@@ -4699,10 +5434,34 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             system_prompt=system_prompt,
             user_prompt=text_to_audit,
             response_format=AuditResult,
+            force_local_only=force_local_only,
             # An internal audit must not replace the visible assistant
             # response identity used by persistence.
             publish_identity=False,
         )
+
+    def _audit_route_vendors(
+        self, target_selector: Optional[str], local_only: bool
+    ) -> Optional[set]:
+        """The vendors the audit may send a response to, or None for any (#2652).
+
+        With ``[llm] route_priority`` declared, those generation may use (the
+        chain, the mandate's vendor and its admitted fallbacks, and the local
+        routes a local-only mode forces) and the vendor the audit target names,
+        such as the operator's ``[defaults] preferred``. A target that names
+        only a model adds no vendor. Without a chain, every route, as before.
+        """
+        if not self._configured_route_vendors():
+            return None
+        vendors = set(
+            self._compute_route_authorization(
+                force_local_only=local_only
+            ).authorized_vendors
+        )
+        named = self._call_override_selection(target_selector)
+        if named is not None:
+            vendors.add(named["vendor"])
+        return vendors
 
     async def get_audit_response(
         self,
@@ -4791,6 +5550,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 available_providers = self._filter_providers_by_selector(
                     available_providers, target_provider
                 ) or available_providers
+        audit_vendors = self._audit_route_vendors(target_selector, local_only)
         if local_only and target_model and not any(
             target_model == p.get("model") for p in available_providers
         ):
@@ -4825,6 +5585,21 @@ No other text or formatting.
             # failed, so it is not a preferred route a paid one would replace.
             attempted_routes: List[Dict[str, Any]] = []
             for provider in available_providers:
+                # The audit sends the response to the route, so it keeps to
+                # the vendors generation may use (#2652).
+                if audit_vendors is not None and self._skip_unconfigured_route(
+                    provider, audit_vendors
+                ):
+                    errors[provider["name"]] = (
+                        f"skipped: vendor {provider.get('vendor')} is outside "
+                        "the approved chain ([llm] route_priority)"
+                    )
+                    logger.warning(
+                        "Audit: skipping %s (vendor %s not authorized); refusing "
+                        "blind cross-vendor fallback.",
+                        provider["name"], provider.get("vendor"),
+                    )
+                    continue
                 # A failed route now falls through to the next one (#3492), so
                 # the audit must refuse the same silent plan->paid downgrade
                 # generation refuses.
@@ -4929,6 +5704,7 @@ No other text or formatting.
                         text_to_audit=text_to_audit,
                         invocation_context=invocation_context,
                         provider_name=provider["name"],
+                        force_local_only=local_only,
                     )
                     if response_stop_reason(response) == _REFUSAL_STOP_REASON:
                         # The audit model declined to evaluate the text (live
@@ -5226,17 +6002,32 @@ No other text or formatting.
         self._check_policy()
         invocation_context = self._resolve_invocation_context(invocation_context)
         provider_for_model = None
-        for provider in self.providers:
+        permitted = self._without_denied(self.providers)
+        for provider in permitted:
             if provider["model"] == model_id or model_id in provider["model"]:
                 provider_for_model = provider
                 break
 
         if not provider_for_model:
+            denied_match = next(
+                (
+                    p for p in self.providers
+                    if p not in permitted
+                    and (p["model"] == model_id or model_id in p["model"])
+                ),
+                None,
+            )
+            if denied_match is not None:
+                # Served only by a denied route: refused, not auto-pulled (#2652).
+                self._admit_call_override(
+                    f"{denied_match.get('name')}/{model_id}",
+                    via="get_response_with_model",
+                )
             if ":" in model_id and auto_pull:
                 logger.info(f"Model '{model_id}' not found. Attempting auto-pull...")
                 try:
                     await self.pull_model(model_id, auto_confirm=True)
-                    for provider in self.providers:
+                    for provider in permitted:
                         if provider.get("vendor") == "ollama":
                             provider_for_model = provider
                             break
@@ -5253,6 +6044,13 @@ No other text or formatting.
             if not provider_for_model:
                 available = [p["model"] for p in self.providers]
                 raise ValueError(f"Model '{model_id}' not found. Available: {', '.join(available)}")
+
+        # The route that serves ``model_id`` is the provider this call
+        # selects: admitted like any per-call override (#2652).
+        self._admit_call_override(
+            f"{provider_for_model['name']}/{model_id}",
+            via="get_response_with_model",
+        )
 
         try:
             logger.info(f"Getting response from model: {model_id}")
@@ -5467,7 +6265,7 @@ No other text or formatting.
                                 response_format=response_format,
                                 cancel_token=cancel_token,
                             ),
-                            "remote_gpu",
+                            REMOTE_ROUTE_NAME,
                             model,
                             path="generate.remote_gpu",
                             invocation_context=invocation_context,
@@ -5637,7 +6435,7 @@ No other text or formatting.
                             response_format=response_format,
                             cancel_token=cancel_token,
                         ),
-                        "remote_gpu",
+                        REMOTE_ROUTE_NAME,
                         model,
                         path="generate_with_messages.remote_gpu",
                         invocation_context=invocation_context,
@@ -5693,6 +6491,10 @@ No other text or formatting.
                 model_override == p["model"] for p in providers
             ):
                 model_override = None
+
+        # A per-call override is admitted before it narrows routing, as in
+        # resolve_provider_routing (#2652).
+        self._admit_call_override(model_override)
 
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(providers, tools, model_override)

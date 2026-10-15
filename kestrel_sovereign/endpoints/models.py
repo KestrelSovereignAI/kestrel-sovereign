@@ -18,6 +18,11 @@ from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
 from kestrel_sovereign.api_errors import rate_limited_until
 from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.llm.model_metadata import ModelCategory
+from kestrel_sovereign.llm.provider_policy import (
+    ProviderPolicyRefusal,
+    override_writer,
+    provenance_for_caller,
+)
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
@@ -2311,15 +2316,20 @@ async def set_current_model(request: Request):
             else:
                 vendor = left
 
+        # The authenticated caller wrote this override (#2652).
+        provenance = provenance_for_caller(get_caller(request), via="/api/model/set")
         try:
             # One mandate change: it waits for a privacy-mode transition
             # recording the mandate its mode implies, and that transition
             # waits for this selection to be persisted (#3554).
             async with agent.llm_service.mandate_change():
-                agent.llm_service.set_model_preference(model_name, vendor, route)
+                with override_writer(provenance):
+                    agent.llm_service.set_model_preference(model_name, vendor, route)
                 # Re-read the selection so the response reflects any vendor
                 # auto-resolution that happened inside set_model_preference.
                 pref = agent.llm_service.get_model_preference()
+        except ProviderPolicyRefusal as refusal:
+            raise HTTPException(status_code=403, detail=str(refusal))
         except ValueError as ve:
             # set_model_preference raises ValueError for bare models that
             # can't be auto-resolved (unknown or ambiguous). Surface the

@@ -36,6 +36,7 @@ from .temporal_analyzer import TemporalAnalyzer
 from .associative_linker import AssociativeLinker
 from .memory_retriever import MemoryRetriever
 from kestrel_sovereign.llm.decisions.config import parse_decision_selector
+from kestrel_sovereign.llm.provider_policy import config_provenance
 
 from .memory_answerability import (
     AnswerabilityGate,
@@ -223,16 +224,24 @@ def _attestation_settings() -> AttestationSettings:
 def _build_answerability_gate(
     llm_service: Any, settings: AnswerabilitySettings
 ) -> AnswerabilityGate:
+    # The model is the operator's ``[retrieval]`` setting, not the agent's
+    # choice (#2652).
     if settings.backend == "decision":
         return DecisionAnswerabilityGate(
             llm_service,
             timeout_seconds=settings.timeout_seconds,
             model_override=settings.decision_model,
+            model_override_writer=config_provenance(
+                via="[retrieval] memory_answerability_decision_model"
+            ),
         )
     return LLMAnswerabilityGate(
         llm_service,
         timeout_seconds=settings.timeout_seconds,
         model_override=settings.model,
+        model_override_writer=config_provenance(
+            via="[retrieval] memory_answerability_model"
+        ),
     )
 
 

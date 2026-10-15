@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import replace
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from kestrel_sdk.llm.decisions import (
     DecisionModelInfo,
@@ -25,7 +25,9 @@ from kestrel_sdk.llm.decisions import (
     DecisionResult,
     DecisionTimeout,
     DecisionTransportError,
+    DecisionUnavailable,
     NoulQuestion,
+    UnavailableReason,
     ValidatedDecisionRequest,
     validate_decision_request,
 )
@@ -50,6 +52,15 @@ from .decisions.resolve import (
 )
 from .decisions.thresholds import ThresholdBook
 from .modality_recording import ModalityCall
+from .provider_policy import (
+    OverrideProvenance,
+    ProviderPolicyRefusal,
+    approved_vendors,
+    config_provenance,
+    parse_denied_providers,
+    provider_is_denied,
+    route_priority_entries,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +73,22 @@ CANARY_REQUEST: ValidatedDecisionRequest = validate_decision_request(
 )
 CANARY_CALLER = "kestrel.canary"
 _THRESHOLD_KEY = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
+
+
+class DecisionOverrideRefused(DecisionUnavailable):
+    """The provider policy refused a decision ``model_override`` (#2652).
+
+    Nothing was sent. A :class:`DecisionUnavailable`, so every caller that
+    handles a failed decision handles a refused one; :attr:`refusal` carries
+    the structured :class:`~.provider_policy.ProviderPolicyRefusal`.
+    """
+
+    def __init__(self, refusal: ProviderPolicyRefusal) -> None:
+        super().__init__(UnavailableReason.NO_ROUTE, str(refusal))
+        self.refusal = refusal
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.refusal.to_dict()
 
 
 def _route_state(provider: Mapping[str, Any]) -> RouteDecisionState:
@@ -142,10 +169,85 @@ class DecisionServiceMixin:
         if not isinstance(providers, list):
             return []
         disabled = getattr(self, "_disabled_routes", None) or ()
+        # Routes ``[llm] denied_providers`` names are never used (#2652).
+        denied = parse_denied_providers(getattr(self, "config", None) or {})
         return [
             p for p in providers
-            if _supports_decisions(p) and p.get("name") not in disabled
+            if _supports_decisions(p)
+            and p.get("name") not in disabled
+            and not provider_is_denied(p, denied)
         ]
+
+    def _admit_decision_override(
+        self, model_override: Optional[str], selector: Optional[DecisionSelector]
+    ) -> List[Tuple[Dict[str, Optional[str]], OverrideProvenance]]:
+        """Admit a decision ``model_override`` as any per-call override (#2652).
+
+        The provider policy's one admission check, under the writer named for
+        exactly this override (an operator's configured decision model, say),
+        else the agent's. It admits the provider ``selector``, the override as
+        :func:`parse_decision_selector` read it, selects: the route ``decide``
+        dispatches to is chosen by that parse, so admission reads the same
+        one (``" openrouter "`` is OpenRouter to both). A refusal is recorded
+        and logged by the check and raised here as
+        :class:`DecisionOverrideRefused`.
+
+        Returns the choices ``decide``'s dispatch check honors: the admitted
+        selection with the writer it was admitted for, and an explicit
+        ``[llm] decision_route``, which is the operator's.
+        """
+        admitted: List[Tuple[Dict[str, Optional[str]], OverrideProvenance]] = []
+        configured = self._decision_config.route
+        if configured:
+            vendor, _, route = configured.partition(":")
+            admitted.append((
+                {"vendor": vendor, "route": route or None, "model": None},
+                config_provenance(via="decision_route"),
+            ))
+        if selector is None:
+            return admitted
+        selection = self._call_override_selection(selector.text)
+        try:
+            provenance = self._admit_call_selection(
+                model_override, selection, via="decide"
+            )
+        except ProviderPolicyRefusal as refusal:
+            raise DecisionOverrideRefused(refusal) from refusal
+        if selection is not None and provenance is not None:
+            admitted.append((selection, provenance))
+        return admitted
+
+    def _chain_decision_routes(
+        self, routes: List[Dict[str, Any]], *, local_only: bool
+    ) -> List[Dict[str, Any]]:
+        """The decision routes automatic routing may use (#2652).
+
+        With ``[llm] route_priority`` declared, only routes whose vendor is in
+        that approved chain, plus, under local-only privacy, the local routes it
+        forces (which chat routing authorizes too). The chat mandate is a chat
+        choice and authorizes nothing here. Without a chain, every decision
+        route, as before. An admitted override or an explicit
+        ``[llm] decision_route`` is the writer's choice and is not narrowed
+        here.
+        """
+        config = getattr(self, "config", None) or {}
+        if not route_priority_entries(config):
+            return routes
+        approved = approved_vendors(
+            config, getattr(self, "providers", None) or [], parse_denied_providers(config)
+        )
+        kept = [
+            p for p in routes
+            if p.get("vendor") in approved or (local_only and p.get("is_local"))
+        ]
+        if routes and not kept:
+            raise DecisionUnavailable(
+                UnavailableReason.NO_ROUTE,
+                "no decision route is in the approved chain ([llm] "
+                f"route_priority: {', '.join(sorted(approved)) or 'empty'}); "
+                "name one with [llm] decision_route or route_priority",
+            )
+        return kept
 
     def describe_decision_routes(self) -> List[Dict[str, Any]]:
         """Operator view of every decision-capable route's state (no I/O).
@@ -341,12 +443,20 @@ class DecisionServiceMixin:
         selector: Optional[DecisionSelector] = (
             parse_decision_selector(model_override) if model_override else None
         )
+        # Admitted before discovery or dispatch, so a refused override reaches
+        # no route (#2652).
+        admitted = self._admit_decision_override(model_override, selector)
         effective_local_only = self._effective_force_local_only(local_only)
         context = self._resolve_invocation_context(session_id=session_id)
         footprint = RequestFootprint.of(snapshot)
 
+        decision_routes = self._decision_routes()
+        if selector is None and self._decision_config.route is None:
+            decision_routes = self._chain_decision_routes(
+                decision_routes, local_only=effective_local_only
+            )
         routes = candidate_routes(
-            self._decision_routes(),
+            decision_routes,
             service_config=self._decision_config,
             selector=selector,
             local_only=effective_local_only,
@@ -378,6 +488,18 @@ class DecisionServiceMixin:
                 )
                 calibrated = resolution.calibrated
                 provider = candidate.provider
+                # The provider policy's dispatch check, before the adapter
+                # runs (#2652).
+                try:
+                    self._guard_dispatch(
+                        str(provider.get("name")),
+                        candidate.info.id,
+                        path="decide",
+                        force_local_only=effective_local_only,
+                        admitted=admitted,
+                    )
+                except ProviderPolicyRefusal as refusal:
+                    raise DecisionOverrideRefused(refusal) from refusal
                 dispatched = True
                 started = time.monotonic()
                 body = await provider["adapter"].adecide(

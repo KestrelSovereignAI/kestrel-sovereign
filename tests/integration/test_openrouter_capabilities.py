@@ -16,8 +16,9 @@ Run with: uv run pytest tests/integration/test_openrouter_capabilities.py -v
 import os
 import json
 import pytest
-from typing import List, Dict, Any
 from dotenv import load_dotenv
+
+from tests.utils.override_writers import as_operator
 
 # Load .env before checking for keys
 load_dotenv()
@@ -560,7 +561,10 @@ class TestOpenRouterViaLLMService:
         from kestrel_sovereign.llm.adapter import LLMResponse
 
         service = LLMService()
-        service.set_model_preference("deepseek/deepseek-chat-v3.1", "openrouter")
+        # The operator's pin: the host config's chain need not name openrouter
+        # (#2652).
+        with as_operator():
+            service.set_model_preference("deepseek/deepseek-chat-v3.1", "openrouter")
 
         try:
             results = []

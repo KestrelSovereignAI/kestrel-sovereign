@@ -30,6 +30,10 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
 from kestrel_sdk.llm.decisions import DecisionError, DecisionRequest, NoulQuestion
 
 from kestrel_sovereign.llm.output_ceiling import response_stop_reason
+from kestrel_sovereign.llm.provider_policy import (
+    OverrideProvenance,
+    named_call_override_scope,
+)
 
 from .async_conversation_store import _strip_search_wrappers, _tokenize_for_search
 
@@ -230,6 +234,7 @@ class AnswerabilityGate:
         timeout_seconds: float = DEFAULT_ANSWERABILITY_TIMEOUT_SECONDS,
         force_local_only_provider: Optional[Callable[[], bool]] = None,
         model_override: Optional[str] = None,
+        model_override_writer: Optional[OverrideProvenance] = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("answerability timeout_seconds must be positive")
@@ -237,6 +242,14 @@ class AnswerabilityGate:
         self.timeout_seconds = float(timeout_seconds)
         self._force_local_only_provider = force_local_only_provider
         self.model_override = model_override
+        # Who chose ``model_override``: the ``[retrieval]`` setting it was read
+        # from. Unnamed, the provider policy holds it to the chain (#2652).
+        self._model_override_writer = model_override_writer
+
+    def _override_scope(self):
+        return named_call_override_scope(
+            self.model_override, self._model_override_writer
+        )
 
     def _force_local_only(self) -> bool:
         if self._force_local_only_provider is not None:
@@ -300,14 +313,15 @@ class LLMAnswerabilityGate(AnswerabilityGate):
         }
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                response = await self.llm_service.generate(
-                    system_prompt=_SYSTEM_PROMPT,
-                    user_prompt=json.dumps(payload, ensure_ascii=False),
-                    force_local_only=self._force_local_only(),
-                    model_override=self.model_override,
-                    session_id=session_id,
-                    return_response=True,
-                )
+                with self._override_scope():
+                    response = await self.llm_service.generate(
+                        system_prompt=_SYSTEM_PROMPT,
+                        user_prompt=json.dumps(payload, ensure_ascii=False),
+                        force_local_only=self._force_local_only(),
+                        model_override=self.model_override,
+                        session_id=session_id,
+                        return_response=True,
+                    )
         except (TimeoutError, asyncio.TimeoutError) as exc:
             return self._failed(started, f"timeout: {exc}")
         except Exception as exc:  # noqa: BLE001 - boundary returns fail-closed state
@@ -400,10 +414,11 @@ class DecisionAnswerabilityGate(AnswerabilityGate):
                 },
             )
 
-        outcomes = await asyncio.gather(
-            *(ask(label, request) for label, request in zip(keys, requests)),
-            return_exceptions=True,
-        )
+        with self._override_scope():
+            outcomes = await asyncio.gather(
+                *(ask(label, request) for label, request in zip(keys, requests)),
+                return_exceptions=True,
+            )
         for outcome in outcomes:
             if isinstance(outcome, BaseException) and not isinstance(outcome, DecisionError):
                 raise outcome

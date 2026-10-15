@@ -42,6 +42,7 @@ from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
 from kestrel_sovereign.llm.service import LLMService, ModelNotAvailableForRoute
 from kestrel_sovereign.llm.streaming import LLMStreamingError
+from tests.utils.override_writers import as_operator
 
 PINNED = "claude-opus-5"
 AGENT_ID = "did:test:vendor-wide-pin"
@@ -430,9 +431,11 @@ class TestMandatePinIsSetByTheBranchThatChoseTheRoutes:
     @pytest.mark.asyncio
     async def test_mandate_fallbacks_do_not_set_it(self, outage):
         """An unmatched mandate routes to its fallbacks: not the pin itself."""
-        outage.service.set_model_preference(
-            "some-model", "absent-vendor", None, validate=False
-        )
+        # A vendor outside the chain: only an operator may pin it (#2652).
+        with as_operator():
+            outage.service.set_model_preference(
+                "some-model", "absent-vendor", None, validate=False
+            )
         outage.service._mandate_fallbacks = [{"vendor": "openai", "model": "gpt-5"}]
         resolution = outage.service.resolve_provider_routing()
         assert [p["name"] for p in resolution.providers] == ["openai:api"]
