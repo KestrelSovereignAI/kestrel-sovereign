@@ -80,7 +80,8 @@ async def test_fresh_caller_joins_inflight_background_refresh(monkeypatch):
             if not self.joined:
                 return None
             return ModelCatalogSnapshot(
-                version=1, models=tuple(models), outcomes={}, timestamp=1.0
+                version=1, catalog_version=1, models=tuple(models), outcomes={},
+                timestamp=1.0,
             )
 
         async def wait_for_refresh(self):

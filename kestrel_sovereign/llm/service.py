@@ -60,7 +60,7 @@ from .output_ceiling import (
 )
 from .generation_gate import UnfinishedAfterInlineToolsError
 from .discovery_deadline import discovery_route_deadline_seconds
-from .model_discovery import ModelDiscoveryMixin
+from .model_discovery import ModelDiscoveryMixin, discovery_call
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
 from .streaming import StreamingMixin, RoutingResolution
@@ -1860,18 +1860,22 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         (the single resolver, funnelled through ``reconcile_embedding_capabilities``)
         so the read is self-sufficient regardless of whether the caller
         pre-reconciled. Best-effort — a discovery hiccup must never fail the read.
+
+        The reconcile and the resolution are one discovery call, so a route
+        that overran the reconcile's sweep is not asked again here (#3646).
         """
-        if hasattr(self, "reconcile_embedding_capabilities"):
-            try:
-                await self.reconcile_embedding_capabilities(use_cache=True)
-            except Exception as exc:  # pragma: no cover - never fail the read
-                logger.debug("embedding capability reconcile skipped in aget: %s", exc)
-        provider = self.resolve_embedding_provider()
-        if provider is not None:
-            try:
-                await self.resolve_route_embedding_model(provider)
-            except Exception as exc:  # pragma: no cover - never fail the read
-                logger.debug("active-route embedding resolve skipped: %s", exc)
+        with discovery_call():
+            if hasattr(self, "reconcile_embedding_capabilities"):
+                try:
+                    await self.reconcile_embedding_capabilities(use_cache=True)
+                except Exception as exc:  # pragma: no cover - never fail the read
+                    logger.debug("embedding capability reconcile skipped in aget: %s", exc)
+            provider = self.resolve_embedding_provider()
+            if provider is not None:
+                try:
+                    await self.resolve_route_embedding_model(provider)
+                except Exception as exc:  # pragma: no cover - never fail the read
+                    logger.debug("active-route embedding resolve skipped: %s", exc)
         return self.get_embedding_settings()
 
     async def aget_embedding_settings_for_route(

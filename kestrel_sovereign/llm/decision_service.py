@@ -307,13 +307,19 @@ class DecisionServiceMixin:
 
         The listing runs under the per-route discovery deadline (#3646): a
         route that never answers is a failed discovery, not a stalled
-        reconcile. The canary keeps its own ``decision_canary_timeout_seconds``.
+        reconcile. A route that did not answer this discovery call (this
+        listing overran, or was skipped because an earlier step did) gets no
+        canary either: it would be one more request to a silent route and one
+        more timeout to wait out. Its pin keeps its last verification, marked
+        stale. The canary otherwise keeps its own
+        ``decision_canary_timeout_seconds``.
         """
         name = str(provider.get("name"))
         state = _route_state(provider)
         async with self._decision_lock(name):
             if not force and not state.needs_discovery:
                 return
+            silent: Optional[DiscoveryStepTimeout] = None
             try:
                 async with self._discovery_deadline(
                     str(provider.get("vendor") or name.split(":", 1)[0]),
@@ -325,8 +331,9 @@ class DecisionServiceMixin:
                     )
             except asyncio.CancelledError:
                 raise
-            except DiscoveryStepTimeout:
+            except DiscoveryStepTimeout as exc:
                 # The deadline logged and recorded it; keep the last list.
+                silent = exc
                 state.record_discovery_failure()
             except Exception as exc:  # noqa: BLE001 - any discovery failure marks the route stale
                 state.record_discovery_failure()
@@ -340,8 +347,13 @@ class DecisionServiceMixin:
                     for info in discovered
                 )
                 logger.info("Decision discovery for %s: %d model(s)", name, len(state.models or ()))
-            if state.config.pin is not None:
-                await self._run_pin_canary(provider, state)
+            if state.config.pin is None:
+                return
+            if silent is not None:
+                state.canary_stale_since = state.canary_stale_since or time.time()
+                logger.debug("Decision pin canary for %s not sent: %s", name, silent)
+                return
+            await self._run_pin_canary(provider, state)
 
     def _pin_info(self, provider: Mapping[str, Any], state: RouteDecisionState) -> DecisionModelInfo:
         pin = state.config.pin

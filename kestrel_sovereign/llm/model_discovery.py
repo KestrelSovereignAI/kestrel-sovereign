@@ -32,12 +32,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: The outcomes the discovery pass running in this context has observed so far
-#: (#3197). A pass's vendors run as gathered child tasks; each copies this
-#: context, so every one writes into the same pass-owned map.
-_PASS_OUTCOMES: ContextVar[Optional[Dict[str, VendorDiscoveryOutcome]]] = ContextVar(
-    "kestrel_model_discovery_pass_outcomes", default=None
+@dataclasses.dataclass(eq=False)
+class _DiscoveryPass:
+    """The outcomes one discovery pass has observed so far (#3197).
+
+    A pass's vendors run as gathered child tasks; each copies this context, so
+    every one writes into the same pass-owned map. A task created during the
+    pass can also outlive it, still holding that context: once the pass ends
+    it is closed, and such a task's later discovery is outside any pass rather
+    than recording into a map nothing will publish (#3646).
+    """
+
+    outcomes: Dict[str, VendorDiscoveryOutcome]
+    #: False once the pass's scope has ended.
+    open: bool = True
+
+
+_PASS: ContextVar[Optional[_DiscoveryPass]] = ContextVar(
+    "kestrel_model_discovery_pass", default=None
 )
+
+
+def _pass_outcomes() -> Optional[Dict[str, VendorDiscoveryOutcome]]:
+    """The outcome map of the discovery pass running in this context, if any."""
+    scope = _PASS.get()
+    return scope.outcomes if scope is not None and scope.open else None
 
 
 @contextlib.contextmanager
@@ -54,32 +73,75 @@ def collect_discovery_outcomes(
     record into it again: a pass's capability reconciliation runs after its
     catalog requests, and its overruns are the same pass's outcomes (#3646).
     """
-    if outcomes is None:
-        outcomes = {}
-    token = _PASS_OUTCOMES.set(outcomes)
+    scope = _DiscoveryPass({} if outcomes is None else outcomes)
+    token = _PASS.set(scope)
     try:
-        yield outcomes
+        yield scope.outcomes
     finally:
-        _PASS_OUTCOMES.reset(token)
+        scope.open = False
+        _PASS.reset(token)
 
 
-#: Routes that overran a discovery step earlier in the discovery call running
-#: in this context (#3646). The call's later steps skip them, so a route that
-#: never answers costs one call one deadline, not one per step. Gathered child
-#: tasks copy the context and so share the set.
-_SILENT_ROUTES: ContextVar[Optional[Set[str]]] = ContextVar(
-    "kestrel_model_discovery_silent_routes", default=None
+@dataclasses.dataclass(eq=False)
+class _DiscoveryCall:
+    """What one discovery call has learned about its routes so far (#3646).
+
+    Gathered child tasks copy the context and so share it. So does any task
+    created during the call, which may outlive it: once the call ends the
+    scope is closed, and such a task's later discovery starts a call of its
+    own rather than inheriting stale silence and a stale sweep.
+    """
+
+    #: False once the call has ended.
+    open: bool = True
+    #: Routes that overran a discovery step earlier in this call. The call's
+    #: later steps skip them, so a route that never answers costs the call one
+    #: deadline, not one per step.
+    silent: Set[str] = dataclasses.field(default_factory=set)
+    #: An incomplete embedding sweep's models, by ``id()`` of the service that
+    #: ran or joined it. An incomplete sweep is not cached, so without this
+    #: every later embedding lookup in the call (one per route a reconcile
+    #: resolves) would sweep again and ask the silent route again.
+    embedding_sweeps: Dict[int, List["EmbeddingModelInfo"]] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+_DISCOVERY_CALL: ContextVar[Optional[_DiscoveryCall]] = ContextVar(
+    "kestrel_model_discovery_call", default=None
 )
 
 
 @contextlib.contextmanager
-def _discovery_call() -> Iterator[None]:
-    """Scope one discovery call: the routes it found silent start empty."""
-    token = _SILENT_ROUTES.set(set())
+def discovery_call() -> Iterator[None]:
+    """Scope one discovery call (#3646).
+
+    Within it a route that overran one discovery step is not asked again, and
+    an incomplete embedding sweep is reused rather than repeated. A call
+    nested in another (a reconcile inside :meth:`discover_all_models`) is part
+    of it. The next call asks every route again.
+    """
+    if _current_discovery_call() is not None:
+        yield
+        return
+    call = _DiscoveryCall()
+    token = _DISCOVERY_CALL.set(call)
     try:
         yield
     finally:
-        _SILENT_ROUTES.reset(token)
+        call.open = False
+        _DISCOVERY_CALL.reset(token)
+
+
+def _current_discovery_call() -> Optional[_DiscoveryCall]:
+    """The discovery call running in this context, if it has not ended."""
+    call = _DISCOVERY_CALL.get()
+    return call if call is not None and call.open else None
+
+
+def _silent_routes() -> Optional[Set[str]]:
+    call = _current_discovery_call()
+    return None if call is None else call.silent
 
 
 #: Every field the framework ``ModelInfo`` constructor accepts (#3270).
@@ -212,15 +274,16 @@ class ModelDiscoveryMixin:
         (:func:`collect_discovery_outcomes`), which publishes it with the
         catalog it produced (#3197). A cache hit's reconciliation collects its
         own, and its failures amend the snapshot the hit served (#3646).
-        Outside a pass, as in local-only route
-        resolution, no catalog is published, so there is nothing to pair the
-        observation with and it is not recorded.
+        Outside a pass, as in local-only route resolution, no catalog is
+        published, so this records nothing; a discovery step that overruns
+        its deadline there amends the current catalog instead
+        (:meth:`_record_step_overrun`).
 
         Nothing gates routing on this. It drives the ``model_discovery`` health
         check, so a dead credential is visible instead of living only in a log
         line — which is the operator-facing gap #3190 was filed for.
         """
-        outcomes = _PASS_OUTCOMES.get()
+        outcomes = _pass_outcomes()
         if outcomes is None:
             logger.debug("%s: discovery outcome outside a discovery pass", vendor)
             return
@@ -255,12 +318,10 @@ class ModelDiscoveryMixin:
         A route that accepts the connection and never answers used to stall
         the whole discovery pass, and with it every caller. An overrun now
         cancels the step, is logged at WARNING naming the vendor, route and
-        step, and is recorded as the vendor's discovery failure for the pass
-        running in this context (a refresh, or a cache hit's reconciliation;
-        local-only route resolution records none, see
-        :meth:`_note_discovery_outcome`). It then raises :class:`DiscoveryStepTimeout`,
-        so the caller leaves that route out of what it returns rather than
-        waiting on it.
+        step, and is recorded as the vendor's discovery failure
+        (:meth:`_record_step_overrun`). It then raises
+        :class:`DiscoveryStepTimeout`, so the caller leaves that route out of
+        what it returns rather than waiting on it.
 
         A ``TimeoutError`` the step raises itself (the Ollama adapter bounds
         its listing calls by the same value) is the same failure.
@@ -271,18 +332,25 @@ class ModelDiscoveryMixin:
         must use asynchronous clients (the Google and Vertex listings did not
         before #3646).
 
-        Within one :meth:`discover_all_models` call, a route that overran one
-        step is not asked again: its later steps raise a skipped
+        Within one discovery call (:func:`discovery_call`), a route that
+        overran one step is not asked again: its later steps raise a skipped
         :class:`DiscoveryStepTimeout` at once, without contacting it.
         """
         seconds = self._discovery_route_deadline_seconds()
-        silent = _SILENT_ROUTES.get()
+        silent = _silent_routes()
         if silent is not None and route in silent:
             skipped = DiscoveryStepTimeout(
                 vendor=vendor, route=route, step=step, seconds=seconds, skipped=True
             )
             logger.debug("%s: %s", vendor, skipped)
             raise skipped
+        # Outside a discovery pass an overrun amends the catalog that was
+        # current when the step began, so capture it now.
+        current = (
+            get_shared_model_cache().snapshot()
+            if _pass_outcomes() is None
+            else None
+        )
         try:
             async with asyncio.timeout(seconds) as scope:
                 yield
@@ -294,22 +362,58 @@ class ModelDiscoveryMixin:
                 seconds=seconds,
                 cause=None if scope.expired() else exc,
             )
-            if _PASS_OUTCOMES.get() is not None:
-                logger.warning(
-                    "%s: %s; recorded as that vendor's discovery failure",
-                    vendor, timeout,
-                )
-            else:
-                # Local-only route resolution publishes no catalog, so there
-                # is no snapshot to record the failure in.
-                logger.warning(
-                    "%s: %s; outside a discovery pass, so not recorded",
-                    vendor, timeout,
-                )
-            self._note_discovery_outcome(vendor, timeout)
-            if silent is not None:
-                silent.add(route)
+            logger.warning(
+                "%s: %s; %s", vendor, timeout,
+                self._record_step_overrun(timeout, current),
+            )
             raise timeout from exc
+
+    def _record_step_overrun(
+        self,
+        overrun: DiscoveryStepTimeout,
+        current: Optional[ModelCatalogSnapshot],
+    ) -> str:
+        """Record ``overrun`` as its vendor's discovery failure (#3646).
+
+        In a discovery pass (a refresh, or a cache hit's reconciliation) it is
+        the pass's outcome for the vendor. Outside one (local-only route
+        resolution, or an embedding or decision reconcile called on its own)
+        nothing will publish it, so it amends ``current``, the catalog that was
+        current when the step began, as a cache hit's failures do. Either way
+        the ``model_discovery`` health check reports it. The route also joins
+        the silent routes of the discovery call running in this context.
+
+        Returns how it was recorded, for the overrun's log line.
+        """
+        silent = _silent_routes()
+        if silent is not None:
+            silent.add(overrun.route)
+        if _pass_outcomes() is not None:
+            self._note_discovery_outcome(overrun.vendor, overrun)
+            return "recorded as that vendor's discovery failure"
+        if current is None:
+            return "no model catalog has been published, so not recorded"
+        with collect_discovery_outcomes() as outcomes:
+            self._note_discovery_outcome(overrun.vendor, overrun)
+        if not self._amend_catalog_failures(get_shared_model_cache(), current, outcomes):
+            return "the model catalog was replaced while it ran, so not recorded"
+        return "recorded as that vendor's discovery failure"
+
+    def _absorb_shared_overruns(self, overruns: List[DiscoveryStepTimeout]) -> None:
+        """Take on the overruns of a sweep another caller started (#3646).
+
+        A caller that joins a coalesced embedding sweep receives what its
+        routes returned but ran none of its steps. The sweep's owner recorded
+        each overrun (into its own pass, or against the current catalog). This
+        caller's discovery pass, if any, records them too, so the catalog it
+        publishes does not report a silent vendor healthy, and its discovery
+        call does not ask those routes again.
+        """
+        silent = _silent_routes()
+        for overrun in overruns:
+            if silent is not None:
+                silent.add(overrun.route)
+            self._note_discovery_outcome(overrun.vendor, overrun)
 
     async def _discover_vendor_catalog(
         self, vendor: str, route: dict
@@ -357,7 +461,7 @@ class ModelDiscoveryMixin:
         therefore delays this call by one deadline and is recorded as its
         vendor's discovery failure, rather than stalling it.
         """
-        with _discovery_call():
+        with discovery_call():
             return await self._discover_all_models(
                 use_cache=use_cache,
                 featured_only=featured_only,
@@ -414,7 +518,7 @@ class ModelDiscoveryMixin:
                     # Decision models (#3424): reuse cached decision state;
                     # only never-discovered routes are contacted on a cache hit.
                     await self.reconcile_decision_capabilities(use_cache=True)
-                self._record_cache_hit_failures(
+                self._amend_catalog_failures(
                     shared_cache, snapshot, reconcile_outcomes
                 )
                 return self._filter_models(
@@ -618,29 +722,38 @@ class ModelDiscoveryMixin:
         )
 
     @staticmethod
-    def _record_cache_hit_failures(
+    def _amend_catalog_failures(
         shared_cache: SharedModelCache,
         snapshot: ModelCatalogSnapshot,
         outcomes: Dict[str, VendorDiscoveryOutcome],
-    ) -> None:
-        """Publish the failures a cache hit's reconciliation recorded (#3646).
+    ) -> bool:
+        """Publish failures that discovery saw against ``snapshot``'s catalog (#3646).
 
-        A cache hit publishes no catalog, so its failures amend the snapshot
-        it served instead: the ``model_discovery`` health check then reports a
-        route that overran its deadline on any service's cache hit, not only on
-        the service that refreshed the catalog.
+        Discovery that publishes no catalog (a cache hit's reconciliation, or
+        a discovery step outside any pass) amends the catalog it read instead:
+        the ``model_discovery`` health check then reports a route that overran
+        its deadline whichever service saw it, not only on a service that
+        refreshed the catalog. Amendments from concurrent services merge
+        (:meth:`SharedModelCache.record_failures`).
+
+        Returns ``False`` when a later catalog replaced ``snapshot``'s, which
+        leaves the failures unrecorded.
         """
         failures = {
             vendor: outcome
             for vendor, outcome in outcomes.items()
             if outcome.status is DiscoveryStatus.FAILED
         }
-        if failures and not shared_cache.record_failures(snapshot.version, failures):
-            logger.debug(
-                "Discovery failures for %s add nothing to snapshot %d: it "
-                "already reports them, or a later publication replaced it",
-                sorted(failures), snapshot.version,
-            )
+        if not failures or shared_cache.record_failures(
+            snapshot.catalog_version, failures
+        ):
+            return True
+        logger.info(
+            "Discovery failures for %s were seen against model catalog %d, "
+            "which a later catalog replaced; not recorded",
+            sorted(failures), snapshot.catalog_version,
+        )
+        return False
 
     def _snapshot_chat_models_by_route(self, models: List[ModelInfo]) -> None:
         """Snapshot discovered chat ids keyed by the ROUTE that fetched them (#2433).
@@ -759,8 +872,13 @@ class ModelDiscoveryMixin:
                 exactly that route (#2338).
         """
         cache = getattr(self, "_embedding_discovery_cache", None)
+        call = _current_discovery_call()
+        partial = None if call is None else call.embedding_sweeps.get(id(self))
         if use_cache and cache is not None:
             models = list(cache)
+        elif use_cache and partial is not None:
+            # This call's own sweep, which a route overran (#3646).
+            models = list(partial)
         else:
             models = await self._discover_embedding_models_coalesced()
 
@@ -786,30 +904,38 @@ class ModelDiscoveryMixin:
         A sweep in which a route overran is incomplete: its callers get what
         the other routes returned, but it is not cached, so a later call asks
         the silent route again instead of reading its absence as its catalog.
+        Within one discovery call (:func:`discovery_call`) the incomplete
+        sweep is reused instead. A caller that joined the sweep also takes on
+        its overruns (:meth:`_absorb_shared_overruns`): the sweep ran in its
+        starter's context, so they are recorded only there.
         """
         inflight = getattr(self, "_embedding_discovery_inflight", None)
         if inflight is not None and not inflight.done():
-            models, _complete = await inflight
-            return models
-
-        task = asyncio.ensure_future(self._discover_embedding_models_uncached())
-        self._embedding_discovery_inflight = task
-        try:
-            models, complete = await task
-        finally:
-            if getattr(self, "_embedding_discovery_inflight", None) is task:
-                self._embedding_discovery_inflight = None
-        if complete:
-            self._embedding_discovery_cache = list(models)
+            models, overruns = await inflight
+            self._absorb_shared_overruns(overruns)
+        else:
+            task = asyncio.ensure_future(self._discover_embedding_models_uncached())
+            self._embedding_discovery_inflight = task
+            try:
+                models, overruns = await task
+            finally:
+                if getattr(self, "_embedding_discovery_inflight", None) is task:
+                    self._embedding_discovery_inflight = None
+            if not overruns:
+                self._embedding_discovery_cache = list(models)
+        call = _current_discovery_call()
+        if overruns and call is not None:
+            call.embedding_sweeps[id(self)] = list(models)
         return models
 
     async def _discover_embedding_models_uncached(
         self,
-    ) -> Tuple[List["EmbeddingModelInfo"], bool]:
+    ) -> Tuple[List["EmbeddingModelInfo"], List[DiscoveryStepTimeout]]:
         """One embedding-discovery sweep over every route.
 
-        Returns the discovered models and whether the sweep is complete, i.e.
-        no route's step overran its deadline (#3646).
+        Returns the discovered models and every route step that overran its
+        deadline or was skipped for an earlier overrun (#3646). The sweep is
+        complete only when there are none.
         """
         from .embedding_discovery import EmbeddingModelInfo
 
@@ -849,11 +975,11 @@ class ModelDiscoveryMixin:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         discovered: List[EmbeddingModelInfo] = []
-        complete = True
+        overruns: List[DiscoveryStepTimeout] = []
         for result in results:
             if isinstance(result, DiscoveryStepTimeout):
                 # Already logged and recorded by the step's deadline.
-                complete = False
+                overruns.append(result)
             elif isinstance(result, Exception):
                 logger.warning(f"Embedding discovery failed: {result}")
             elif isinstance(result, list):
@@ -907,7 +1033,7 @@ class ModelDiscoveryMixin:
                     ))
                     seen.add((route_name, pinned_model))
 
-        return discovered, complete
+        return discovered, overruns
 
     @staticmethod
     def _route_claims_embedding_support(route: dict) -> bool:
@@ -1293,7 +1419,16 @@ class ModelDiscoveryMixin:
         A sweep that changes any route's embedding profile reports it once,
         after every route is resolved, through :meth:`_embedding_profile_changed`
         (#3606).
+
+        The sweep and every route's resolution are one discovery call
+        (:func:`discovery_call`): a route that overran the sweep is not asked
+        again while its siblings resolve (#3646).
         """
+        with discovery_call():
+            await self._reconcile_embedding_capabilities(use_cache=use_cache)
+
+    async def _reconcile_embedding_capabilities(self, *, use_cache: bool) -> None:
+        """:meth:`reconcile_embedding_capabilities` within its discovery call."""
         providers = getattr(self, "providers", None)
         if not isinstance(providers, list):
             return

@@ -201,20 +201,31 @@ as that vendor's discovery failure, which the `model_discovery` health check
 shows. The rest of discovery returns without it, and within one discovery call
 the route's later steps are skipped, so a route that accepts connections and
 never answers delays `!model-list`, `/api/models` or a turn's `auto` warm-up by
-one deadline instead of stalling it (#3646). A turn whose route stays `auto`
+one deadline instead of stalling it (#3646). A route with a pinned
+`decision_model` that did not answer is not sent its pin canary either; the pin
+keeps its last verification, marked stale. A turn whose route stays `auto`
 because its discovery failed is refused by the route chain, with that failure
 named, rather than sent the literal `auto`.
 
 A cache hit still reconciles every route's embedding and decision listings. An
 overrun there amends the snapshot the hit served: the same catalog and age,
 with the vendor's failure added, so the health check shows it whichever
-service hit the cache. Local-only `auto` resolution publishes no catalog and
-records none; its WARNING says so.
+service hit the cache. An overrun outside any discovery pass (local-only `auto`
+resolution, or an embedding or decision reconcile called on its own) amends the
+catalog that was current when the step began, the same way. Amendments against
+one catalog merge: services that each saw a different vendor fail both add
+theirs, and a vendor reported failing twice reports the later failure. Only a
+new catalog (a refresh, a restore from disk, an invalidation) discards an
+amendment made against the one it replaced. The health check's
+`catalog_version` names the catalog, which an amendment keeps.
 
-An embedding sweep with an overrun is not cached, so the next caller asks that
-route again. The Ollama adapter bounds its own listing calls by the same value.
-Its chat client carries no timeout: generation is bounded by the cancellable
-generation path and the orchestrator's call watchdog, not by this deadline.
+An embedding sweep with an overrun is not cached, so the next discovery call
+asks that route again. Within one call (a listing, a reconcile with every
+route it resolves, an embedding settings read) the incomplete sweep is reused,
+and a caller that joined another caller's sweep records its overruns too. The
+Ollama adapter bounds its own listing calls by the same value. Its chat client
+carries no timeout: generation is bounded by the cancellable generation path
+and the orchestrator's call watchdog, not by this deadline.
 
 The deadline can only cancel a step that awaits. A listing that blocks the
 event loop cannot be cut off and holds every other route's step and deadline

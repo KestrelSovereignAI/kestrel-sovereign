@@ -28,6 +28,7 @@ import time
 from collections import Counter
 from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
 
 import httpx
 import ollama
@@ -37,8 +38,11 @@ from kestrel_sdk.llm.decisions import DecisionModelInfo
 from kestrel_sovereign.agent import token_counter
 from kestrel_sovereign.features.health.checks import check_model_discovery
 from kestrel_sovereign.llm import model_catalog
-from kestrel_sovereign.llm.decisions.config import DecisionRouteConfig
-from kestrel_sovereign.llm.decisions.resolve import RouteDecisionState
+from kestrel_sovereign.llm.decisions.config import (
+    DecisionRouteConfig,
+    parse_service_decision_config,
+)
+from kestrel_sovereign.llm.decisions.resolve import PinStatus, RouteDecisionState
 from kestrel_sovereign.llm.discovery_deadline import (
     DEFAULT_DISCOVERY_ROUTE_DEADLINE_SECONDS,
     DISCOVERY_ROUTE_DEADLINE_KEY,
@@ -73,6 +77,10 @@ SHORT_DEADLINE = 0.5
 DISCOVERY_LOGGER = "kestrel_sovereign.llm.model_discovery"
 
 CHAT, EMBEDDING, DECISION = "chat catalog", "embedding discovery", "decision discovery"
+
+#: The pinned decision model's canary: not a discovery step, but a request
+#: to the same route, which a silent route must not be sent.
+CANARY = "pin canary"
 
 
 class _Vendor:
@@ -121,6 +129,11 @@ class _Vendor:
             id=f"{self.name}-decide", vendor="", route="", context_limit=8192,
         )])
 
+    async def adecide(self, client, model, request, *, timeout):
+        return await self._answer(
+            CANARY, {"answers": {"canary": {"type": "noul", "noul": 0.9}}}
+        )
+
 
 def _route(vendor: _Vendor, *, local: bool = False) -> Dict[str, Any]:
     return {
@@ -149,6 +162,18 @@ def _service(*vendors: _Vendor, config: Dict[str, Any] | None = None):
 
 def _route_of(service, vendor: _Vendor) -> Dict[str, Any]:
     return next(p for p in service.providers if p["vendor"] == vendor.name)
+
+
+def _pin_decision_models(service) -> None:
+    """Pin every route's decision model, so discovery canaries each pin."""
+    for route in service.providers:
+        route["decision_state"] = RouteDecisionState(
+            config=DecisionRouteConfig(pin=f"{route['vendor']}-decide")
+        )
+    service._decision_config = parse_service_decision_config({})
+    service._observability_store = SimpleNamespace(log_llm_call=AsyncMock())
+    service._track_model_usage = AsyncMock()
+    service._owner_agent_did = "did:test:deadline"
 
 
 @pytest.fixture(autouse=True)
@@ -254,6 +279,10 @@ async def test_a_silent_embedding_listing_times_out_on_its_own(caplog):
     assert silent.calls[DECISION] == 0
     assert _route_of(service, answering)["capabilities"]["supports_embeddings"] is True
     assert "supports_embeddings" not in _route_of(service, silent)["capabilities"]
+    # Resolving the answering route reused the call's one sweep, which is not
+    # cached, rather than sweeping every route again.
+    assert silent.calls[EMBEDDING] == answering.calls[EMBEDDING] == 1
+    assert service._embedding_discovery_cache is None
     assert len(_deadline_warnings(caplog)) == 1
     assert "embedding discovery on silent:api" in _deadline_warnings(caplog)[0]
 
@@ -284,6 +313,130 @@ async def test_a_silent_decision_listing_times_out_on_its_own(caplog):
     assert _route_of(service, silent)["capabilities"]["supports_embeddings"] is True
     assert len(_deadline_warnings(caplog)) == 1
     assert "decision discovery on silent:api" in _deadline_warnings(caplog)[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("silent_step", [CHAT, EMBEDDING, DECISION])
+async def test_a_pinned_route_that_did_not_answer_gets_no_canary(silent_step):
+    """A pinned decision model is checked with one canary decision after the
+    listing. A route that did not answer this call, at its decision listing or
+    at an earlier step that skipped it, is not sent one: the canary would wait
+    out its own timeout on top of the deadline. Its pin keeps its last
+    verification, marked stale. The answering route's pin is still checked.
+
+    The silent route never answers its canary either, so sending one would
+    park the call past the single deadline the clock is moved by.
+    """
+    silent = _Vendor("silent", silent={silent_step, DECISION, CANARY})
+    answering = _Vendor("answering")
+    service = _service(silent, answering)
+    _pin_decision_models(service)
+
+    _, took = await _with_one_deadline(service.discover_all_models(use_cache=False), silent)
+
+    assert took == DEADLINE
+    assert silent.calls[DECISION] == (1 if silent_step == DECISION else 0)
+    assert silent.calls[CANARY] == 0
+    silent_state = _route_of(service, silent)["decision_state"]
+    assert silent_state.pin_status is PinStatus.UNCHECKED
+    assert silent_state.discovery_stale_since is not None
+    assert silent_state.canary_stale_since is not None
+    assert _failures() == {
+        "silent": f"DiscoveryStepTimeout: {silent_step} on silent:api did not finish within {DEADLINE:g}s",
+    }
+
+    assert answering.calls[CANARY] == 1
+    answering_state = _route_of(service, answering)["decision_state"]
+    assert answering_state.pin_status is PinStatus.VERIFIED
+    assert answering_state.canary_stale_since is None
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_route_that_answers_is_canaried_on_every_refresh():
+    answering = _Vendor("answering")
+    service = _service(answering)
+    _pin_decision_models(service)
+
+    for refresh in (1, 2):
+        await await_within_hang_guard(
+            service.discover_all_models(use_cache=False), step="discovery"
+        )
+        assert answering.calls[CANARY] == refresh
+    assert _route_of(service, answering)["decision_state"].pin_status is PinStatus.VERIFIED
+
+
+@pytest.mark.asyncio
+async def test_a_task_created_during_a_call_does_not_inherit_its_silence():
+    """A task created during a discovery call copies its context, and can
+    outlive it. Its own later discovery asks every route again, rather than
+    skipping one the ended call found silent."""
+    silent, answering = _Vendor("silent", silent={CHAT}), _Vendor("answering")
+    service = _service(silent, answering)
+    later = asyncio.Event()
+    spawned: List[asyncio.Future] = []
+    list_models = answering.list_models
+
+    async def list_and_spawn(client=None):
+        if not spawned:
+            async def discover_later():
+                await later.wait()
+                return await service.discover_all_models(use_cache=False)
+
+            spawned.append(asyncio.ensure_future(discover_later()))
+        return await list_models(client)
+
+    answering.list_models = list_and_spawn
+
+    _, took = await _with_one_deadline(service.discover_all_models(use_cache=False), silent)
+    assert took == DEADLINE
+    assert silent.calls[CHAT] == 1
+
+    silent.silent.clear()
+    later.set()
+    models = await await_within_hang_guard(spawned[0], step="a later discovery")
+
+    assert silent.calls[CHAT] == 2
+    assert sorted(m.id for m in models) == ["answering-chat", "silent-chat"]
+
+
+@pytest.mark.asyncio
+async def test_a_task_created_during_a_pass_records_its_later_overrun(caplog):
+    """A task created during a refresh holds the refresh's pass in its
+    context. Once that pass has published, the task's later discovery is
+    outside any pass: an overrun there amends the current catalog, instead of
+    going into the ended pass's map, which nothing will publish again."""
+    caplog.set_level(logging.WARNING, logger=DISCOVERY_LOGGER)
+    late = _Vendor("late")
+    service = _service(late)
+    later = asyncio.Event()
+    spawned: List[asyncio.Future] = []
+    list_models = late.list_models
+
+    async def list_and_spawn(client=None):
+        if not spawned:
+            async def reconcile_later():
+                await later.wait()
+                await service.reconcile_decision_capabilities(use_cache=False)
+
+            spawned.append(asyncio.ensure_future(reconcile_later()))
+        return await list_models(client)
+
+    late.list_models = list_and_spawn
+    await await_within_hang_guard(service.discover_all_models(use_cache=False), step="refresh")
+    assert _failures() == {}
+
+    late.silent.add(DECISION)
+    later.set()
+    _, took = await _with_one_deadline(spawned[0], late)
+
+    assert took == DEADLINE
+    assert _failures() == {
+        "late": f"DiscoveryStepTimeout: decision discovery on late:api did not finish within {DEADLINE:g}s",
+    }
+    assert _deadline_warnings(caplog) == [
+        f"late: decision discovery on late:api did not finish within {DEADLINE:g}s; "
+        "recorded as that vendor's discovery failure",
+    ]
 
 
 @pytest.mark.asyncio
@@ -372,6 +525,7 @@ async def test_a_cache_hits_overrun_reaches_the_health_check_with_the_catalog_it
     failure = f"DiscoveryStepTimeout: embedding discovery on silent:api did not finish within {DEADLINE:g}s"
     amended = cache.snapshot()
     assert amended.version == served.version + 1
+    assert amended.catalog_version == served.catalog_version
     assert (amended.models, amended.timestamp) == (served.models, served.timestamp)
     assert amended.discovery_failures == {"silent": failure}
     assert amended.outcomes["silent"].observed_version == amended.version
@@ -381,7 +535,7 @@ async def test_a_cache_hits_overrun_reaches_the_health_check_with_the_catalog_it
     health = await check_model_discovery(SimpleNamespace(llm_service=service))
     assert health["status"] == "warn"
     assert health["details"]["failed_vendors"] == {"silent": failure}
-    assert health["details"]["catalog_version"] == amended.version
+    assert health["details"]["catalog_version"] == served.catalog_version
 
     # Another service's hit finds the failure already reported: nothing new.
     silent.parked.clear()
@@ -412,7 +566,17 @@ async def test_a_cache_hits_overrun_is_not_pinned_on_a_catalog_published_since()
     assert cache.snapshot().outcomes["silent"].status is DiscoveryStatus.OK
 
 
-def test_a_failure_amends_only_the_catalog_it_was_observed_against():
+def _timeout(vendor: str, note: str = "") -> VendorDiscoveryOutcome:
+    return VendorDiscoveryOutcome.failed(f"DiscoveryStepTimeout: {vendor}{note}")
+
+
+def test_amendments_against_one_catalog_merge_and_keep_each_vendors_latest_failure():
+    """Services reconciling against one catalog each add what they saw.
+
+    Each amendment republishes the snapshot, so a version check would reject
+    every amendment after the first made against the same catalog, and a real
+    timeout would vanish from the health check. Only the catalog matters.
+    """
     cache = SharedModelCache()
     cache.set([_chat_model("a-chat", "a")], outcomes={
         "a": VendorDiscoveryOutcome.ok(),
@@ -420,37 +584,121 @@ def test_a_failure_amends_only_the_catalog_it_was_observed_against():
     })
     served = cache.snapshot()
 
-    assert cache.record_failures(served.version, {
-        "a": VendorDiscoveryOutcome.failed("DiscoveryStepTimeout: a"),
-        "b": VendorDiscoveryOutcome.failed("DiscoveryStepTimeout: b"),
-    })
-    amended = cache.snapshot()
-    assert (amended.models, amended.timestamp) == (served.models, served.timestamp)
-    # A vendor already reported failing keeps the failure it reported.
-    assert amended.discovery_failures == {
-        "a": "DiscoveryStepTimeout: a", "b": "RuntimeError: 401",
+    assert cache.record_failures(served.catalog_version, {"a": _timeout("a")})
+    assert cache.record_failures(served.catalog_version, {"c": _timeout("c")})
+    merged = cache.snapshot()
+    assert merged.version == served.version + 2
+    assert merged.catalog_version == served.catalog_version
+    assert (merged.models, merged.timestamp) == (served.models, served.timestamp)
+    assert merged.discovery_failures == {
+        "a": "DiscoveryStepTimeout: a",
+        "b": "RuntimeError: 401",
+        "c": "DiscoveryStepTimeout: c",
     }
-    assert amended.outcomes["b"] == served.outcomes["b"]
 
-    # Nothing new to add, or a catalog no longer current: no publication.
-    assert not cache.record_failures(amended.version, {
-        "a": VendorDiscoveryOutcome.failed("DiscoveryStepTimeout: again"),
-    })
-    assert not cache.record_failures(served.version, {
-        "c": VendorDiscoveryOutcome.failed("DiscoveryStepTimeout: c"),
-    })
-    assert cache.snapshot() is amended
+    # A vendor reported failing again reports the later failure.
+    assert cache.record_failures(served.catalog_version, {"b": _timeout("b")})
+    assert cache.snapshot().discovery_failures["b"] == "DiscoveryStepTimeout: b"
+    assert cache.snapshot().outcomes["b"].observed_version == cache.snapshot().version
+
+    # The same failure again adds nothing and does not republish.
+    latest = cache.snapshot()
+    assert cache.record_failures(served.catalog_version, {"a": _timeout("a")})
+    assert cache.snapshot() is latest
 
     with pytest.raises(ValueError, match="only a failed outcome"):
-        cache.record_failures(amended.version, {"c": VendorDiscoveryOutcome.ok()})
+        cache.record_failures(served.catalog_version, {"c": VendorDiscoveryOutcome.ok()})
+
+
+@pytest.mark.parametrize("replace", ["refresh", "restore", "invalidate"])
+def test_an_amendment_against_a_replaced_catalog_is_rejected(replace):
+    cache = SharedModelCache()
+    cache.set([_chat_model("a-chat", "a")], outcomes={"a": VendorDiscoveryOutcome.ok()})
+    served = cache.snapshot()
+    assert cache.record_failures(served.catalog_version, {"a": _timeout("a")})
+
+    if replace == "refresh":
+        cache.set([_chat_model("a-chat", "a")], outcomes={"a": VendorDiscoveryOutcome.ok()})
+    elif replace == "restore":
+        cache.clear()
+        cache.set_stale([_chat_model("a-chat", "a")])
+    else:
+        cache.clear()
+    replaced = cache.snapshot()
+    assert replaced.catalog_version > served.catalog_version
+
+    assert not cache.record_failures(served.catalog_version, {"b": _timeout("b")})
+    assert cache.snapshot() is replaced
 
 
 @pytest.mark.asyncio
-async def test_local_only_auto_resolution_is_bounded(caplog):
+async def test_two_services_failures_against_one_catalog_both_reach_the_health_check():
+    """Two agents' warm-ups hit the same catalog, each with its own silent route.
+
+    Both read the catalog before either amends it; the second amendment used
+    to be rejected because the first had republished the snapshot, and its
+    vendor's timeout never reached the health check.
+    """
+    first_silent = _Vendor("first", silent={EMBEDDING})
+    second_silent = _Vendor("second", silent={EMBEDDING})
+    first, second = _service(first_silent), _service(second_silent)
+    cache = get_shared_model_cache()
+    cache.set(
+        [_chat_model("first-chat", "first"), _chat_model("second-chat", "second")],
+        outcomes={"first": VendorDiscoveryOutcome.ok(), "second": VendorDiscoveryOutcome.ok()},
+    )
+    served = cache.snapshot()
+
+    async def both_hit_the_cache():
+        return await asyncio.gather(first.discover_all_models(), second.discover_all_models())
+
+    _, took = await _with_one_deadline(both_hit_the_cache(), first_silent, second_silent)
+
+    assert took == DEADLINE
+    failures = {
+        name: f"DiscoveryStepTimeout: embedding discovery on {name}:api did not finish within {DEADLINE:g}s"
+        for name in ("first", "second")
+    }
+    amended = cache.snapshot()
+    assert amended.catalog_version == served.catalog_version
+    assert amended.models == served.models
+    assert amended.discovery_failures == failures
+    for service in (first, second):
+        health = await check_model_discovery(SimpleNamespace(llm_service=service))
+        assert health["details"]["failed_vendors"] == failures
+        assert health["details"]["catalog_version"] == served.catalog_version
+
+
+@pytest.mark.asyncio
+async def test_local_only_auto_resolution_is_bounded_and_amends_the_current_catalog(caplog):
     """A privacy-gated turn resolves its local routes without the full pass.
 
-    It publishes no catalog, so the overrun is not recorded, and says so.
+    It publishes no catalog, so the overrun amends the one that is current,
+    as a cache hit's would.
     """
+    caplog.set_level(logging.WARNING, logger=DISCOVERY_LOGGER)
+    silent = _Vendor("silent", silent={CHAT})
+    service = process_local_service([_route(silent, local=True)])
+    cache = get_shared_model_cache()
+    cache.set([_chat_model("other-chat", "other")], outcomes={"other": VendorDiscoveryOutcome.ok()})
+    served = cache.snapshot()
+
+    _, took = await _with_one_deadline(service._resolve_local_auto_routes(), silent)
+
+    assert took == DEADLINE
+    assert service.providers[0]["model"] == "auto"
+    assert cache.snapshot().catalog_version == served.catalog_version
+    assert _failures() == {
+        "silent": f"DiscoveryStepTimeout: chat catalog on silent:api did not finish within {DEADLINE:g}s",
+    }
+    assert _deadline_warnings(caplog) == [
+        f"silent: chat catalog on silent:api did not finish within {DEADLINE:g}s; "
+        "recorded as that vendor's discovery failure",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_overrun_with_no_catalog_published_says_it_was_not_recorded(caplog):
     caplog.set_level(logging.WARNING, logger=DISCOVERY_LOGGER)
     silent = _Vendor("silent", silent={CHAT})
     service = process_local_service([_route(silent, local=True)])
@@ -458,12 +706,44 @@ async def test_local_only_auto_resolution_is_bounded(caplog):
     _, took = await _with_one_deadline(service._resolve_local_auto_routes(), silent)
 
     assert took == DEADLINE
-    assert service.providers[0]["model"] == "auto"
-    assert _deadline_warnings(caplog) == []
+    assert get_shared_model_cache().snapshot() is None
     assert [r.getMessage() for r in caplog.records if r.name == DISCOVERY_LOGGER] == [
         f"silent: chat catalog on silent:api did not finish within {DEADLINE:g}s; "
-        "outside a discovery pass, so not recorded",
+        "no model catalog has been published, so not recorded",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step, reconcile", [
+    (EMBEDDING, lambda service: service.reconcile_embedding_capabilities(use_cache=True)),
+    (DECISION, lambda service: service.reconcile_decision_capabilities(use_cache=False)),
+])
+async def test_a_reconcile_called_on_its_own_records_its_overrun(step, reconcile, caplog):
+    """The embedding settings endpoints, boot and ``kestrel decisions``
+    reconcile outside any discovery pass. A route that overruns there is
+    still that vendor's failure, against the catalog current when it began."""
+    caplog.set_level(logging.WARNING, logger=DISCOVERY_LOGGER)
+    silent, answering = _Vendor("silent", silent={step}), _Vendor("answering")
+    service = _service(silent, answering)
+    cache = get_shared_model_cache()
+    cache.set(
+        [_chat_model("silent-chat", "silent"), _chat_model("answering-chat", "answering")],
+        outcomes={"silent": VendorDiscoveryOutcome.ok(), "answering": VendorDiscoveryOutcome.ok()},
+    )
+    served = cache.snapshot()
+
+    _, took = await _with_one_deadline(reconcile(service), silent)
+
+    assert took == DEADLINE
+    assert silent.cancelled[step] == 1
+    # Resolving the answering route reused the sweep: nothing was asked twice.
+    assert silent.calls[step] == 1
+    assert answering.calls[step] == 1
+    assert cache.snapshot().catalog_version == served.catalog_version
+    assert _failures() == {
+        "silent": f"DiscoveryStepTimeout: {step} on silent:api did not finish within {DEADLINE:g}s",
+    }
+    assert len(_deadline_warnings(caplog)) == 1
 
 
 # --------------------------------------------------------------------------
@@ -623,6 +903,86 @@ async def test_coalesced_waiters_are_released_and_the_overrun_is_not_cached():
     assert [m.id for m in models] == ["answering-embed"]
     assert sorted(m.id for m in service._embedding_discovery_cache) == [
         "answering-embed", "silent-embed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_embedding_settings_read_asks_a_silent_route_once():
+    """The settings read reconciles every route, then resolves the active one.
+    Both are one discovery call, so the resolution reuses the reconcile's
+    sweep instead of sweeping again and waiting out another deadline."""
+    silent, answering = _Vendor("silent", silent={EMBEDDING}), _Vendor("answering")
+    service = _service(silent, answering)
+    service._embedding_route = "answering:api"
+
+    settings, took = await _with_one_deadline(service.aget_embedding_settings(), silent)
+
+    assert took == DEADLINE
+    assert settings["resolved_route"] == "answering:api"
+    assert settings["embedding_model"] == "answering-embed"
+    assert silent.calls[EMBEDDING] == answering.calls[EMBEDDING] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_joins_another_callers_sweep_takes_on_its_overrun(caplog):
+    """A refresh whose embedding reconcile joins a sweep started outside it.
+
+    The sweep runs in its starter's context, so its overrun was recorded only
+    there (here, nowhere: no catalog had been published). The refresh took the
+    sweep's result and used to publish the silent vendor healthy, then send
+    the silent route its decision listing.
+    """
+    caplog.set_level(logging.WARNING, logger=DISCOVERY_LOGGER)
+    silent = _Vendor("silent", silent={EMBEDDING, DECISION})
+    answering = _Vendor("answering")
+    service = _service(silent, answering)
+
+    joined = asyncio.Event()
+    discover_embedding_models = service.discover_embedding_models
+
+    async def refresh_joins_the_sweep():
+        starter = asyncio.ensure_future(discover_embedding_models(use_cache=False))
+        await silent.parked.wait()
+
+        async def joining(**kwargs):
+            joined.set()
+            return await discover_embedding_models(**kwargs)
+
+        service.discover_embedding_models = joining
+        refresh = await service.discover_all_models(use_cache=False)
+        return refresh, await starter
+
+    with pinned_loop_clock() as clock:
+        started = clock.time()
+
+        async def move_once_joined():
+            await joined.wait()
+            clock.advance(DEADLINE)
+
+        mover = asyncio.ensure_future(move_once_joined())
+        try:
+            (refreshed, swept) = await await_within_hang_guard(
+                refresh_joins_the_sweep(), step="a refresh joining a silent sweep"
+            )
+        finally:
+            mover.cancel()
+        took = clock.time() - started
+
+    assert took == DEADLINE
+    assert [m.id for m in swept] == ["answering-embed"]
+    assert sorted(m.id for m in refreshed) == ["answering-chat", "silent-chat"]
+    # One sweep, reused by the refresh; it did not ask the silent route
+    # anything after it.
+    assert silent.calls[EMBEDDING] == answering.calls[EMBEDDING] == 1
+    assert silent.calls[DECISION] == 0
+    assert _failures() == {
+        "silent": f"DiscoveryStepTimeout: embedding discovery on silent:api did not finish within {DEADLINE:g}s",
+    }
+    assert [
+        r.getMessage() for r in caplog.records if r.name == DISCOVERY_LOGGER
+    ] == [
+        f"silent: embedding discovery on silent:api did not finish within {DEADLINE:g}s; "
+        "no model catalog has been published, so not recorded",
     ]
 
 

@@ -90,9 +90,15 @@ class ModelCatalogSnapshot:
     invalidation by ``clear()`` — observed no vendor, so it carries every
     failure the previous snapshot reported, as not attempted. A failure
     therefore stands until a refresh either issues a request for its vendor or
-    does not cover it. A cache hit that saw a vendor's discovery fail amends
-    the snapshot it read (:meth:`SharedModelCache.record_failures`): the same
-    catalog and timestamp, with that failure added (#3646).
+    does not cover it. Discovery that saw a vendor fail without publishing a
+    catalog (a cache hit's reconciliation, for one) amends the snapshot
+    (:meth:`SharedModelCache.record_failures`): the same catalog and
+    timestamp, with that failure added (#3646).
+
+    ``version`` names this publication. ``catalog_version`` names the
+    publication that produced ``models``, which an amendment keeps: two
+    snapshots with the same ``catalog_version`` hold the same catalog, whatever
+    failures each reports.
 
     ``models`` is ``None`` once ``clear()`` has invalidated the catalog.
     ``timestamp`` is ``0.0`` for a catalog restored from disk, which is
@@ -100,6 +106,7 @@ class ModelCatalogSnapshot:
     """
 
     version: int
+    catalog_version: int
     models: Optional[Tuple[ModelInfo, ...]]
     outcomes: Mapping[str, VendorDiscoveryOutcome]
     timestamp: float
@@ -240,25 +247,34 @@ class SharedModelCache:
 
     def record_failures(
         self,
-        version: int,
+        catalog_version: int,
         failures: Mapping[str, VendorDiscoveryOutcome],
     ) -> bool:
-        """Add discovery failures observed against the catalog at ``version``.
+        """Add discovery failures observed against the catalog ``catalog_version``.
 
-        A cache hit publishes no catalog, but it still reconciles every route's
-        embedding and decision capabilities, and a route can overrun its
-        discovery deadline there (#3646). That is the vendor's discovery
-        failing against the catalog the hit served, so the snapshot gains it:
-        a new publication with the same catalog and the same age, in which each
-        vendor in ``failures`` reports its failure. A vendor the snapshot
-        already reports as failed keeps the failure it reports.
+        Discovery that publishes no catalog can still see a vendor fail: a
+        cache hit reconciles every route's embedding and decision capabilities,
+        and a route can overrun its discovery deadline there (#3646). That is
+        the vendor's discovery failing against the catalog it read, so the
+        snapshot gains it: a new publication with the same catalog and the same
+        age, in which each vendor in ``failures`` reports its failure.
 
-        Only the catalog at ``version`` is amended. A failure observed against
-        a catalog another publication has since replaced is not recorded: a
-        refresh observes every vendor it covers itself, and an invalidated
-        catalog has no reader left to warn.
+        Amendments against one catalog merge, whichever lands first: services
+        reconciling against the same catalog each add the vendors they saw
+        fail. A vendor reported failing twice reports the later failure; one
+        whose failure is already reported verbatim adds nothing, so the
+        snapshot is not republished.
 
-        Returns whether the snapshot was amended.
+        Only a new catalog discards an amendment: a failure observed against a
+        catalog that a refresh, a restore or an invalidation has since replaced
+        is not recorded. A refresh observes every vendor it covers itself;
+        after a restore or an invalidation, the next refresh does. The snapshot
+        an invalidation publishes is a catalog in its own right, so a failure
+        observed against it while it is current amends it, and the health
+        check reports it.
+
+        Returns whether the snapshot reports ``failures``: ``False`` only when
+        the catalog has been replaced.
         """
         for vendor, outcome in failures.items():
             if outcome.status is not DiscoveryStatus.FAILED:
@@ -268,19 +284,20 @@ class SharedModelCache:
                 )
         with self._lock:
             current = self._snapshot
-            if current is None or current.version != version:
+            if current is None or current.catalog_version != catalog_version:
                 return False
-            newly_failed = {
+            changed = {
                 vendor: outcome
                 for vendor, outcome in failures.items()
                 if (prior := current.outcomes.get(vendor)) is None
                 or prior.status is not DiscoveryStatus.FAILED
+                or prior.error != outcome.error
             }
-            if not newly_failed:
-                return False
+            if not changed:
+                return True
             self._version += 1
             outcomes = dict(current.outcomes)
-            for vendor, outcome in newly_failed.items():
+            for vendor, outcome in changed.items():
                 outcomes[vendor] = dataclasses.replace(
                     outcome, observed_version=self._version
                 )
@@ -288,8 +305,9 @@ class SharedModelCache:
                 current, version=self._version, outcomes=MappingProxyType(outcomes)
             )
             logger.debug(
-                "Shared model cache snapshot %d records discovery failures for %s",
-                self._version, sorted(newly_failed),
+                "Shared model cache snapshot %d (catalog %d) records discovery "
+                "failures for %s",
+                self._version, catalog_version, sorted(changed),
             )
             return True
 
@@ -303,6 +321,7 @@ class SharedModelCache:
         self._version += 1
         self._snapshot = ModelCatalogSnapshot(
             version=self._version,
+            catalog_version=self._version,
             models=None if models is None else tuple(models),
             outcomes=_settle_outcomes(outcomes, self._snapshot, self._version),
             timestamp=timestamp,
