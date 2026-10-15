@@ -461,3 +461,93 @@ def test_audience_is_bound_only_when_present():
     assert bound != bound_envelope_fields(
         {"a2a_verb": "peer_stop", A2A_AUDIENCE_METADATA_KEY: "did:test:b"}
     )
+
+
+# --------------------------------------------------------------------------
+# Malformed resolved DID material is a rejection, never a server error (#2487)
+# --------------------------------------------------------------------------
+
+
+def _first_method(**fields):
+    def mutate(doc):
+        doc["verificationMethod"][0].update(fields)
+        return doc
+    return mutate
+
+
+def _methods(value_from_methods):
+    def mutate(doc):
+        doc["verificationMethod"] = value_from_methods(doc["verificationMethod"])
+        return doc
+    return mutate
+
+
+MALFORMED_DOCUMENTS = {
+    "method id int": _first_method(id=5),
+    "method id list (unhashable)": _first_method(id=[f"{DID}#key-1"]),
+    "method id dict (unhashable)": _first_method(id={"id": "key-1"}),
+    "method is not an object": _methods(lambda vms: ["junk", vms[1]]),
+    "duplicate kid": _methods(lambda vms: vms + [{**vms[1], "id": vms[0]["id"]}]),
+    "multibase non-base58btc": _first_method(publicKeyMultibase="z0OIl"),
+    "multibase int": _first_method(publicKeyMultibase=5),
+    # "3D" is base58btc for b"\x80": a varint with no terminator byte.
+    "multicodec varint truncated": _first_method(publicKeyMultibase="z3D"),
+    "verificationMethod is an object": _methods(lambda vms: vms[0]),
+    "verificationMethod is a string": _methods(lambda vms: "verificationMethod"),
+    "verificationMethod is an int": _methods(lambda vms: 7),
+    "document is a list": lambda doc: [doc],
+    "document is a string": lambda doc: "did-document",
+}
+
+
+@pytest.mark.parametrize(
+    "mutate", MALFORMED_DOCUMENTS.values(), ids=MALFORMED_DOCUMENTS.keys(),
+)
+def test_malformed_resolved_did_document_is_a_structured_rejection(mutate):
+    """A hostile or broken peer DID document must not turn a rejection into
+    a TypeError/ValueError the endpoint would surface as a 500."""
+    import copy
+
+    kp, doc = _keypair_and_doc()
+    meta = _signed_metadata(kp)
+    bad_doc = mutate(copy.deepcopy(doc))
+
+    verdict = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda _did: bad_doc,
+    ))
+
+    assert verdict.ok is False
+    assert verdict.verified is False
+    assert verdict.reason.startswith(
+        ("signature check failed:", "sender DID document is not an object")
+    )
+
+
+MALFORMED_SIGNATURE_ENTRIES = {
+    "sig int": lambda entries: [{**entries[0], "sig": 123}, entries[1]],
+    "kid list (unhashable)": lambda entries: [{**entries[0], "kid": ["key-1"]}, entries[1]],
+    "kid int": lambda entries: [{**entries[0], "kid": 7}, entries[1]],
+    "alg relabelled to the PQ suite": lambda entries: [
+        {**entries[0], "alg": "ml-dsa-65"}, entries[1],
+    ],
+    "signatures is a string": lambda entries: "signatures",
+}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    MALFORMED_SIGNATURE_ENTRIES.values(),
+    ids=MALFORMED_SIGNATURE_ENTRIES.keys(),
+)
+def test_malformed_signature_entries_are_a_structured_rejection(mutate):
+    kp, doc = _keypair_and_doc()
+    meta = _signed_metadata(kp)
+    meta["signature"]["signatures"] = mutate(meta["signature"]["signatures"])
+
+    verdict = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda _did: doc,
+    ))
+
+    assert verdict.ok is False
+    assert verdict.verified is False
+    assert verdict.reason.startswith("signature check failed:")
