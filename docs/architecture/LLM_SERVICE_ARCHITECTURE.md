@@ -190,6 +190,37 @@ Multiple routes can target the same vendor. Discovery runs **once per vendor**: 
 
 This means `openai:plan` shows the same model list as `openai:api`, without alias tables.
 
+### Discovery deadline
+
+Each route's discovery steps run under one per-route deadline,
+`[llm] discovery_route_deadline_seconds` (default 5; a non-positive or
+non-numeric value fails at startup). The steps are the vendor's chat catalog,
+the route's embedding listing, and its decision listing. A step that overruns
+is cancelled, logged at WARNING with the vendor, route and step, and recorded
+as that vendor's discovery failure, which the `model_discovery` health check
+shows. The rest of discovery returns without it, and within one discovery call
+the route's later steps are skipped, so a route that accepts connections and
+never answers delays `!model-list`, `/api/models` or a turn's `auto` warm-up by
+one deadline instead of stalling it (#3646). A turn whose route stays `auto`
+because its discovery failed is refused by the route chain, with that failure
+named, rather than sent the literal `auto`.
+
+A cache hit still reconciles every route's embedding and decision listings. An
+overrun there amends the snapshot the hit served: the same catalog and age,
+with the vendor's failure added, so the health check shows it whichever
+service hit the cache. Local-only `auto` resolution publishes no catalog and
+records none; its WARNING says so.
+
+An embedding sweep with an overrun is not cached, so the next caller asks that
+route again. The Ollama adapter bounds its own listing calls by the same value.
+Its chat client carries no timeout: generation is bounded by the cancellable
+generation path and the orchestrator's call watchdog, not by this deadline.
+
+The deadline can only cancel a step that awaits. A listing that blocks the
+event loop cannot be cut off and holds every other route's step and deadline
+with it, so adapter listings use asynchronous clients: the Google and Vertex
+adapters list through the route's `google-genai` client's `aio` surface.
+
 ---
 
 ## Streaming, tools, and the honesty layer

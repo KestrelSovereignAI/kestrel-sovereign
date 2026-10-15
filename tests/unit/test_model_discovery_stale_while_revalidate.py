@@ -2,6 +2,7 @@
 
 import pytest
 
+from kestrel_sovereign.llm.model_cache import ModelCatalogSnapshot
 from kestrel_sovereign.llm.model_discovery import ModelDiscoveryMixin
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
@@ -11,7 +12,7 @@ class _Cache:
         self.models = models
         self.refresh_factory = None
 
-    def get(self):
+    def fresh_snapshot(self):
         return None
 
     def get_any(self):
@@ -75,8 +76,12 @@ async def test_fresh_caller_joins_inflight_background_refresh(monkeypatch):
         def __init__(self):
             self.joined = False
 
-        def get(self):
-            return models if self.joined else None
+        def fresh_snapshot(self):
+            if not self.joined:
+                return None
+            return ModelCatalogSnapshot(
+                version=1, models=tuple(models), outcomes={}, timestamp=1.0
+            )
 
         async def wait_for_refresh(self):
             self.joined = True

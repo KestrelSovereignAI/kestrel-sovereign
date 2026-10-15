@@ -51,6 +51,7 @@ from .decisions.resolve import (
     select_candidate,
 )
 from .decisions.thresholds import ThresholdBook
+from .discovery_deadline import DiscoveryStepTimeout
 from .modality_recording import ModalityCall
 from .provider_policy import (
     OverrideProvenance,
@@ -302,15 +303,31 @@ class DecisionServiceMixin:
         )
 
     async def _discover_decision_route(self, provider: Dict[str, Any], *, force: bool) -> None:
+        """Discover one route's decision models, then run its pin canary.
+
+        The listing runs under the per-route discovery deadline (#3646): a
+        route that never answers is a failed discovery, not a stalled
+        reconcile. The canary keeps its own ``decision_canary_timeout_seconds``.
+        """
         name = str(provider.get("name"))
         state = _route_state(provider)
         async with self._decision_lock(name):
             if not force and not state.needs_discovery:
                 return
             try:
-                discovered = await provider["adapter"].list_decision_models(provider.get("client"))
+                async with self._discovery_deadline(
+                    str(provider.get("vendor") or name.split(":", 1)[0]),
+                    name,
+                    "decision discovery",
+                ):
+                    discovered = await provider["adapter"].list_decision_models(
+                        provider.get("client")
+                    )
             except asyncio.CancelledError:
                 raise
+            except DiscoveryStepTimeout:
+                # The deadline logged and recorded it; keep the last list.
+                state.record_discovery_failure()
             except Exception as exc:  # noqa: BLE001 - any discovery failure marks the route stale
                 state.record_discovery_failure()
                 logger.warning(

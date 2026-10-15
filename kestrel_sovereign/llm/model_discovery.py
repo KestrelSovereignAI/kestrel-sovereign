@@ -10,13 +10,22 @@ import contextlib
 import dataclasses
 import logging
 from contextvars import ContextVar
-from typing import List, Dict, Any, Iterator, Optional, Tuple, TYPE_CHECKING
+from typing import (
+    List, Dict, Any, AsyncIterator, Iterator, Optional, Set, Tuple, TYPE_CHECKING,
+)
 
 from kestrel_sdk.llm import ModelInfo as SDKModelInfo
 
+from .discovery_deadline import DiscoveryStepTimeout, discovery_route_deadline_seconds
 from .model_metadata import ModelInfo, ModelCategory
 from .model_catalog import get_catalog_service
-from .model_cache import VendorDiscoveryOutcome, get_shared_model_cache
+from .model_cache import (
+    DiscoveryStatus,
+    ModelCatalogSnapshot,
+    SharedModelCache,
+    VendorDiscoveryOutcome,
+    get_shared_model_cache,
+)
 
 if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
@@ -32,19 +41,45 @@ _PASS_OUTCOMES: ContextVar[Optional[Dict[str, VendorDiscoveryOutcome]]] = Contex
 
 
 @contextlib.contextmanager
-def collect_discovery_outcomes() -> Iterator[Dict[str, VendorDiscoveryOutcome]]:
+def collect_discovery_outcomes(
+    outcomes: Optional[Dict[str, VendorDiscoveryOutcome]] = None,
+) -> Iterator[Dict[str, VendorDiscoveryOutcome]]:
     """Scope one discovery pass: yield the map its outcomes are recorded into.
 
     The outcomes reach the shared cache only when the pass publishes them with
     the catalog they produced, so no reader sees an outcome before its catalog.
     A pass that raises before publishing publishes neither.
+
+    Pass ``outcomes``, the map an earlier part of the same pass yielded, to
+    record into it again: a pass's capability reconciliation runs after its
+    catalog requests, and its overruns are the same pass's outcomes (#3646).
     """
-    outcomes: Dict[str, VendorDiscoveryOutcome] = {}
+    if outcomes is None:
+        outcomes = {}
     token = _PASS_OUTCOMES.set(outcomes)
     try:
         yield outcomes
     finally:
         _PASS_OUTCOMES.reset(token)
+
+
+#: Routes that overran a discovery step earlier in the discovery call running
+#: in this context (#3646). The call's later steps skip them, so a route that
+#: never answers costs one call one deadline, not one per step. Gathered child
+#: tasks copy the context and so share the set.
+_SILENT_ROUTES: ContextVar[Optional[Set[str]]] = ContextVar(
+    "kestrel_model_discovery_silent_routes", default=None
+)
+
+
+@contextlib.contextmanager
+def _discovery_call() -> Iterator[None]:
+    """Scope one discovery call: the routes it found silent start empty."""
+    token = _SILENT_ROUTES.set(set())
+    try:
+        yield
+    finally:
+        _SILENT_ROUTES.reset(token)
 
 
 #: Every field the framework ``ModelInfo`` constructor accepts (#3270).
@@ -175,7 +210,9 @@ class ModelDiscoveryMixin:
 
         The outcome belongs to the discovery pass running in this context
         (:func:`collect_discovery_outcomes`), which publishes it with the
-        catalog it produced (#3197). Outside a pass, as in local-only route
+        catalog it produced (#3197). A cache hit's reconciliation collects its
+        own, and its failures amend the snapshot the hit served (#3646).
+        Outside a pass, as in local-only route
         resolution, no catalog is published, so there is nothing to pair the
         observation with and it is not recorded.
 
@@ -189,10 +226,106 @@ class ModelDiscoveryMixin:
             return
         if error is None:
             outcomes[vendor] = VendorDiscoveryOutcome.ok()
-        else:
-            outcomes[vendor] = VendorDiscoveryOutcome.failed(
-                f"{type(error).__name__}: {error}"[:300]
+            return
+        previous = outcomes.get(vendor)
+        if previous is not None and previous.status is DiscoveryStatus.FAILED:
+            # A pass can see a vendor fail more than once: its catalog request,
+            # then a reconciliation step that overran its deadline (#3646). The
+            # first failure stays, since the later ones usually follow from it.
+            logger.debug("%s: further discovery failure this pass: %s", vendor, error)
+            return
+        outcomes[vendor] = VendorDiscoveryOutcome.failed(
+            f"{type(error).__name__}: {error}"[:300]
+        )
+
+    def _discovery_route_deadline_seconds(self) -> float:
+        """Seconds each route gets for each discovery step (#3646).
+
+        ``[llm] discovery_route_deadline_seconds``; ``LLMService`` validates
+        it at construction, so a malformed value never reaches discovery.
+        """
+        return discovery_route_deadline_seconds(getattr(self, "config", None))
+
+    @contextlib.asynccontextmanager
+    async def _discovery_deadline(
+        self, vendor: str, route: str, step: str
+    ) -> AsyncIterator[None]:
+        """Run one route's discovery ``step`` under the per-route deadline (#3646).
+
+        A route that accepts the connection and never answers used to stall
+        the whole discovery pass, and with it every caller. An overrun now
+        cancels the step, is logged at WARNING naming the vendor, route and
+        step, and is recorded as the vendor's discovery failure for the pass
+        running in this context (a refresh, or a cache hit's reconciliation;
+        local-only route resolution records none, see
+        :meth:`_note_discovery_outcome`). It then raises :class:`DiscoveryStepTimeout`,
+        so the caller leaves that route out of what it returns rather than
+        waiting on it.
+
+        A ``TimeoutError`` the step raises itself (the Ollama adapter bounds
+        its listing calls by the same value) is the same failure.
+
+        The deadline can only cancel a step that awaits. A listing that blocks
+        the event loop (a synchronous SDK call) cannot be cut off, and stalls
+        every other route's step and deadline with it, so adapter listings
+        must use asynchronous clients (the Google and Vertex listings did not
+        before #3646).
+
+        Within one :meth:`discover_all_models` call, a route that overran one
+        step is not asked again: its later steps raise a skipped
+        :class:`DiscoveryStepTimeout` at once, without contacting it.
+        """
+        seconds = self._discovery_route_deadline_seconds()
+        silent = _SILENT_ROUTES.get()
+        if silent is not None and route in silent:
+            skipped = DiscoveryStepTimeout(
+                vendor=vendor, route=route, step=step, seconds=seconds, skipped=True
             )
+            logger.debug("%s: %s", vendor, skipped)
+            raise skipped
+        try:
+            async with asyncio.timeout(seconds) as scope:
+                yield
+        except TimeoutError as exc:
+            timeout = DiscoveryStepTimeout(
+                vendor=vendor,
+                route=route,
+                step=step,
+                seconds=seconds,
+                cause=None if scope.expired() else exc,
+            )
+            if _PASS_OUTCOMES.get() is not None:
+                logger.warning(
+                    "%s: %s; recorded as that vendor's discovery failure",
+                    vendor, timeout,
+                )
+            else:
+                # Local-only route resolution publishes no catalog, so there
+                # is no snapshot to record the failure in.
+                logger.warning(
+                    "%s: %s; outside a discovery pass, so not recorded",
+                    vendor, timeout,
+                )
+            self._note_discovery_outcome(vendor, timeout)
+            if silent is not None:
+                silent.add(route)
+            raise timeout from exc
+
+    async def _discover_vendor_catalog(
+        self, vendor: str, route: dict
+    ) -> List[ModelInfo]:
+        """:meth:`_discover_for_vendor_route` under the route's deadline (#3646).
+
+        A route whose catalog request overruns contributes no models, and the
+        vendor's discovery is recorded as failed.
+        """
+        try:
+            async with self._discovery_deadline(
+                vendor, route.get("name") or vendor, "chat catalog"
+            ):
+                return await self._discover_for_vendor_route(vendor, route)
+        except DiscoveryStepTimeout:
+            return []
 
     async def discover_all_models(
         self,
@@ -217,12 +350,38 @@ class ModelDiscoveryMixin:
 
         Returns:
             List of ModelInfo objects, enriched with catalog data
+
+        Each route's discovery steps run under the per-route deadline
+        (``[llm] discovery_route_deadline_seconds``), and a route that overruns
+        one is not asked again in this call (#3646). A route that never answers
+        therefore delays this call by one deadline and is recorded as its
+        vendor's discovery failure, rather than stalling it.
         """
+        with _discovery_call():
+            return await self._discover_all_models(
+                use_cache=use_cache,
+                featured_only=featured_only,
+                category=category,
+                providers=providers,
+                stale_while_revalidate=stale_while_revalidate,
+            )
+
+    async def _discover_all_models(
+        self,
+        *,
+        use_cache: bool,
+        featured_only: bool,
+        category: Optional[ModelCategory],
+        providers: Optional[List[str]],
+        stale_while_revalidate: bool,
+    ) -> List[ModelInfo]:
+        """:meth:`discover_all_models` within its discovery-call scope."""
         # Check shared process-wide cache
         shared_cache = get_shared_model_cache()
         if use_cache:
-            async def _return_cached(cached_models: List[ModelInfo]) -> List[ModelInfo]:
+            async def _return_cached(snapshot: ModelCatalogSnapshot) -> List[ModelInfo]:
                 logger.debug("Using shared model cache")
+                cached_models = list(snapshot.models)
                 # Resolve THIS instance's ``model="auto"`` routes against the
                 # cached models before returning. A route registered after the
                 # cache was populated (e.g. an OpenRouter bootstrap route minted
@@ -246,10 +405,18 @@ class ModelDiscoveryMixin:
                 # runs on a cache miss, leaving a dynamically-discovered
                 # embedding route's ``supports_embeddings`` unset on this
                 # instance even though its embedding catalog is discoverable.
-                await self.reconcile_embedding_capabilities(use_cache=True)
-                # Decision models (#3424): reuse cached decision state; only
-                # never-discovered routes are contacted on a cache hit.
-                await self.reconcile_decision_capabilities(use_cache=True)
+                #
+                # Reconciliation is still discovery: a route that overruns its
+                # deadline here is that vendor's failure, recorded against the
+                # catalog this hit served (#3646).
+                with collect_discovery_outcomes() as reconcile_outcomes:
+                    await self.reconcile_embedding_capabilities(use_cache=True)
+                    # Decision models (#3424): reuse cached decision state;
+                    # only never-discovered routes are contacted on a cache hit.
+                    await self.reconcile_decision_capabilities(use_cache=True)
+                self._record_cache_hit_failures(
+                    shared_cache, snapshot, reconcile_outcomes
+                )
                 return self._filter_models(
                     cached_models,
                     featured_only=featured_only,
@@ -257,7 +424,7 @@ class ModelDiscoveryMixin:
                     providers=providers,
                 )
 
-            cached = shared_cache.get()
+            cached = shared_cache.fresh_snapshot()
             if cached is not None:
                 return await _return_cached(cached)
 
@@ -265,7 +432,7 @@ class ModelDiscoveryMixin:
                 not stale_while_revalidate
                 and await shared_cache.wait_for_refresh()
             ):
-                cached = shared_cache.get()
+                cached = shared_cache.fresh_snapshot()
                 if cached is not None:
                     return await _return_cached(cached)
 
@@ -297,9 +464,7 @@ class ModelDiscoveryMixin:
         with collect_discovery_outcomes() as discovery_outcomes:
             for vendor, route in self._select_discovery_routes():
                 discovery_vendors.append(vendor)
-                discovery_tasks.append(
-                    self._discover_for_vendor_route(vendor, route)
-                )
+                discovery_tasks.append(self._discover_vendor_catalog(vendor, route))
 
             results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
 
@@ -312,14 +477,6 @@ class ModelDiscoveryMixin:
                     self._note_discovery_outcome(vendor, result)
                 elif isinstance(result, list):
                     all_models.extend(result)
-        # Every vendor the pass covered, with the outcome its discovery recorded.
-        # A vendor that recorded nothing issued no catalog request.
-        pass_outcomes = {
-            vendor: discovery_outcomes.get(
-                vendor, VendorDiscoveryOutcome.not_attempted()
-            )
-            for vendor in discovery_vendors
-        }
 
         # Add configured provider models (from kestrel.toml [llm]) that weren't discovered
         # This ensures models like xai/grok show up even without API discovery
@@ -426,10 +583,25 @@ class ModelDiscoveryMixin:
         # it — not just before the UI list. Local-only turns never reach here
         # (they use ``_resolve_local_auto_routes``), so cloud embedding
         # endpoints are not contacted under a privacy-gated turn.
-        await self.reconcile_embedding_capabilities(use_cache=True)
-        # Decision models (#3424) on the same non-local warm-up path; a cache
-        # miss refreshes every decision route and re-runs pin canaries.
-        await self.reconcile_decision_capabilities(use_cache=False)
+        #
+        # Reconciliation belongs to this pass: a route whose embedding or
+        # decision listing overruns its deadline is recorded as that vendor's
+        # discovery failure, published with this catalog (#3646).
+        with collect_discovery_outcomes(discovery_outcomes):
+            await self.reconcile_embedding_capabilities(use_cache=True)
+            # Decision models (#3424) on the same non-local warm-up path; a
+            # cache miss refreshes every decision route and re-runs pin
+            # canaries.
+            await self.reconcile_decision_capabilities(use_cache=False)
+
+        # Every vendor the pass covered, with the outcome its discovery recorded.
+        # A vendor that recorded nothing issued no catalog request.
+        pass_outcomes = {
+            vendor: discovery_outcomes.get(
+                vendor, VendorDiscoveryOutcome.not_attempted()
+            )
+            for vendor in discovery_vendors
+        }
 
         # Cache results in shared memory cache and on disk. The catalog and the
         # outcomes that produced it are published as one snapshot (#3197).
@@ -444,6 +616,31 @@ class ModelDiscoveryMixin:
             category=category,
             providers=providers
         )
+
+    @staticmethod
+    def _record_cache_hit_failures(
+        shared_cache: SharedModelCache,
+        snapshot: ModelCatalogSnapshot,
+        outcomes: Dict[str, VendorDiscoveryOutcome],
+    ) -> None:
+        """Publish the failures a cache hit's reconciliation recorded (#3646).
+
+        A cache hit publishes no catalog, so its failures amend the snapshot
+        it served instead: the ``model_discovery`` health check then reports a
+        route that overran its deadline on any service's cache hit, not only on
+        the service that refreshed the catalog.
+        """
+        failures = {
+            vendor: outcome
+            for vendor, outcome in outcomes.items()
+            if outcome.status is DiscoveryStatus.FAILED
+        }
+        if failures and not shared_cache.record_failures(snapshot.version, failures):
+            logger.debug(
+                "Discovery failures for %s add nothing to snapshot %d: it "
+                "already reports them, or a later publication replaced it",
+                sorted(failures), snapshot.version,
+            )
 
     def _snapshot_chat_models_by_route(self, models: List[ModelInfo]) -> None:
         """Snapshot discovered chat ids keyed by the ROUTE that fetched them (#2433).
@@ -583,22 +780,37 @@ class ModelDiscoveryMixin:
         in-flight future so overlapping callers share a single provider sweep
         (and a single INFO line per unsupported route) instead of each issuing
         its own.
+
+        Every route's step runs under the per-route deadline, so the shared
+        sweep always finishes and releases every caller waiting on it (#3646).
+        A sweep in which a route overran is incomplete: its callers get what
+        the other routes returned, but it is not cached, so a later call asks
+        the silent route again instead of reading its absence as its catalog.
         """
         inflight = getattr(self, "_embedding_discovery_inflight", None)
         if inflight is not None and not inflight.done():
-            return await inflight
+            models, _complete = await inflight
+            return models
 
         task = asyncio.ensure_future(self._discover_embedding_models_uncached())
         self._embedding_discovery_inflight = task
         try:
-            models = await task
+            models, complete = await task
         finally:
             if getattr(self, "_embedding_discovery_inflight", None) is task:
                 self._embedding_discovery_inflight = None
-        self._embedding_discovery_cache = list(models)
+        if complete:
+            self._embedding_discovery_cache = list(models)
         return models
 
-    async def _discover_embedding_models_uncached(self) -> List["EmbeddingModelInfo"]:
+    async def _discover_embedding_models_uncached(
+        self,
+    ) -> Tuple[List["EmbeddingModelInfo"], bool]:
+        """One embedding-discovery sweep over every route.
+
+        Returns the discovered models and whether the sweep is complete, i.e.
+        no route's step overran its deadline (#3646).
+        """
         from .embedding_discovery import EmbeddingModelInfo
 
         # Discover per ACTUAL route, not one-route-per-vendor: embedding
@@ -637,8 +849,12 @@ class ModelDiscoveryMixin:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         discovered: List[EmbeddingModelInfo] = []
+        complete = True
         for result in results:
-            if isinstance(result, Exception):
+            if isinstance(result, DiscoveryStepTimeout):
+                # Already logged and recorded by the step's deadline.
+                complete = False
+            elif isinstance(result, Exception):
                 logger.warning(f"Embedding discovery failed: {result}")
             elif isinstance(result, list):
                 discovered.extend(result)
@@ -691,7 +907,7 @@ class ModelDiscoveryMixin:
                     ))
                     seen.add((route_name, pinned_model))
 
-        return discovered
+        return discovered, complete
 
     @staticmethod
     def _route_claims_embedding_support(route: dict) -> bool:
@@ -723,6 +939,10 @@ class ModelDiscoveryMixin:
         cached with the aggregate discovery cache) — an ERROR with traceback is
         reserved for a route that explicitly claims embedding support and then
         fails unexpectedly.
+
+        The adapter call runs under the per-route deadline (#3646). An overrun
+        raises :class:`DiscoveryStepTimeout` rather than returning ``[]``, so
+        the sweep knows the route's catalog is unknown, not empty.
         """
         adapter = route.get("adapter")
         client = route.get("client")
@@ -730,12 +950,15 @@ class ModelDiscoveryMixin:
         if adapter is None or not hasattr(adapter, "list_embedding_models"):
             return []
         try:
-            if getattr(adapter, "derives_embeddings_from_chat_listing", False):
-                models = await adapter.list_embedding_models(
-                    client, chat_models=chat_model_ids
-                )
-            else:
-                models = await adapter.list_embedding_models(client)
+            async with self._discovery_deadline(
+                vendor, route_name, "embedding discovery"
+            ):
+                if getattr(adapter, "derives_embeddings_from_chat_listing", False):
+                    models = await adapter.list_embedding_models(
+                        client, chat_models=chat_model_ids
+                    )
+                else:
+                    models = await adapter.list_embedding_models(client)
             # Retag to the vendor key so aggregation/filtering is consistent
             # even if an adapter reports its own name, AND stamp the originating
             # route so capability advertisement stays route-specific (#2338).
@@ -751,6 +974,8 @@ class ModelDiscoveryMixin:
             return models or []
         except NotImplementedError:
             return []
+        except DiscoveryStepTimeout:
+            raise
         except Exception as e:
             if self._route_claims_embedding_support(route):
                 logger.error(
@@ -1404,7 +1629,9 @@ class ModelDiscoveryMixin:
         for route in local_providers:
             vendor = route.get("vendor") or route.get("name", "").split(":", 1)[0]
             try:
-                models.extend(await self._discover_for_vendor_route(vendor, route))
+                # Bounded like the full pass: a silent local daemon leaves its
+                # route ``auto`` instead of stalling the turn (#3646).
+                models.extend(await self._discover_vendor_catalog(vendor, route))
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning(
                     "Local-only discovery failed for %s: %s", route.get("name"), exc
@@ -1758,6 +1985,9 @@ class ModelDiscoveryMixin:
         """
         try:
             models = await coro
+        except TimeoutError:
+            # The route's deadline records a timeout (#3646).
+            raise
         except Exception as e:  # noqa: BLE001 - discovery must never break init
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, e)
@@ -1811,6 +2041,10 @@ class ModelDiscoveryMixin:
             # attempted. Recording a failure would report every such vendor's
             # discovery as broken.
             logger.debug("%s: adapter.list_models not implemented", vendor)
+        except TimeoutError:
+            # An adapter's own listing bound (Ollama's, #3646): the route's
+            # deadline records it, the same as when the deadline fires first.
+            raise
         except Exception as e:
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, e)

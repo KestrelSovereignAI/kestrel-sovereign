@@ -47,6 +47,14 @@ route_priority = ["ollama:local", "openai:api"]
 # fallbacks, and who wrote each override, accepted or refused.
 #denied_providers = ["openrouter", "google"]
 
+# Model discovery deadline (#3646). Each route's discovery steps (its chat
+# catalog, its embedding listing and its decision listing) must each finish
+# within this many seconds. A step that does not is recorded as that vendor's
+# discovery failure, and the rest of discovery returns without it, so a route
+# that accepts connections and never answers cannot stall `!model-list` or a
+# turn whose route is still "auto". Default: 5.
+#discovery_route_deadline_seconds = 5
+
 # Top-level embedding channel (#2263). Selects which route embeds stored
 # memories/documents, independent of the chat route — one setting instead of
 # repeating ``embedding_sibling`` under every vendor. Value is a
