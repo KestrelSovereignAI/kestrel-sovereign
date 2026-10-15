@@ -1404,7 +1404,7 @@ class SchedulerRunner:
 
         denied = execution_denial_scopes(error)
         if (
-            denied
+            denied is not None
             and not execution_cleanup_debts(error)
             and all(
                 type(scope.fence) in (_LeaseRenewalState, _SchedulerEffectFence)

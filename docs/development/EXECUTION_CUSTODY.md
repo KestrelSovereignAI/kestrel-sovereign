@@ -46,6 +46,29 @@ before any scheduled effect begins; genuine commit uncertainty is preserved.
 when all explicit authority carriers are scoped and none carries commit
 uncertainty. Combining runtime and occurrence denials retains both scopes;
 an unscoped authority error is never reclassified as occurrence-only retirement.
+
+PostgreSQL moves only its native transaction exit and pool reset into original
+owned completion tasks. Transaction bodies, context-manager yields and token
+resets remain in the caller; arbitrary resolvers and gates are not shielded.
+Cancellation while observing a successful native ACK is delivered on the
+original cancellation object with an `AcknowledgedExecutionCommit`, not an
+invented UNKNOWN. Its commit owner and shared original-reset record are
+physical evidence, not an admission or a new generation. The checkout retains
+one latest ACK task; earlier escaped receipts observe the same reset owner
+without retaining every completed transaction in a long operational session.
+
+After ACK/reset, authority loss is checked even when the caller was cancelled.
+Only actual denied scopes retain the known-committed fact; healthy inherited
+scopes are not poisoned. `execution_denial_scopes` returns an empty tuple for
+a fully retired observer-only receipt, original scopes for a settled scoped
+denial, and `None` for pending retirement, UNKNOWN, failed closers, legacy
+unresolved commit carriers or any combined unscoped control. A known commit
+must never hide another original unscoped failure. These facts remain control
+evidence through wrappers and shutdown; they do not imply the whole external
+effect completed or permit retry without durable reconciliation. Logical task
+name prefixes aid tracing; the native owners are distinct tasks and names grant
+no authority. Genuine native ACK/reset/rollback failures still fail closed.
+
 Renewal teardown cooperatively stops the interval and physically joins its
 in-flight native transaction before releasing the original advisory exclusion.
 Concurrent cognition terminalization callbacks share one exact original-token

@@ -31,16 +31,21 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
+    AcknowledgedExecutionCommit,
+    NativeExecutionRetirement,
     ExecutionAuthorityError,
     ExecutionCustody,
     ExecutionCommitOutcomeError,
     execution_commit_outcome,
+    execution_denial_scopes,
     execution_terminal_error,
     current_execution_custody,
     lock_execution_authority,
     require_execution_backend,
+    retain_acknowledged_execution_commit,
+    is_execution_control_error,
 )
 
 from .interface import (
@@ -63,6 +68,14 @@ from .transaction_control import reject_transaction_control
 
 logger = logging.getLogger(__name__)
 
+
+def _failure_detail(error: BaseException) -> str:
+    outcome = execution_commit_outcome(error)
+    if outcome is not None:
+        return (f"{error}; execution transaction outcome is {outcome}; "
+                "the operation may have committed; reconcile durable state before retry")
+    return str(error)
+
 # Concurrent upserts of the same row (e.g. parallel agent-init writes to the
 # composite-PK ``agent_metadata`` rows) can surface a transient
 # "tuple concurrently updated" from Postgres even with ON CONFLICT DO UPDATE.
@@ -79,11 +92,18 @@ _ADVISORY_LOCK_POLL_INTERVAL_S = 0.05
 class _ExecutionCommitState:
     outcome: str | None = None
     scopes: tuple[ExecutionCustody, ...] = ()
+    acknowledgments: list[AcknowledgedExecutionCommit] = field(default_factory=list)
+    retirement: NativeExecutionRetirement = field(default_factory=NativeExecutionRetirement)
 
     def remember(self, scopes: tuple[ExecutionCustody, ...]) -> None:
         # A shared checkout can begin unbound and participate in several
         # admitted operations. Retain each admission until physical release.
         self.scopes += tuple(scope for scope in scopes if scope not in self.scopes)
+
+    def retain_acknowledgments(self, error: BaseException) -> BaseException:
+        for receipt in self.acknowledgments:
+            retain_acknowledged_execution_commit(error, receipt)
+        return error
 
 
 @dataclass
@@ -847,15 +867,29 @@ class PostgresBackend(DatabaseBackend):
         state = _ExecutionCommitState()
         state.remember(current_execution_custody(self))
         body_failure: BaseException | None = None
+        checkout = pool.acquire()
+        connection = await checkout.__aenter__()
         try:
-            async with pool.acquire() as connection:
-                try:
-                    yield connection, state
-                except BaseException as error:
-                    body_failure = error
-                    raise
-        except BaseException as exc:
-            terminal = execution_terminal_error(body_failure, exc)
+            yield connection, state
+        except BaseException as error:
+            body_failure = error
+        # Only the native reset/return is protected. The checkout body remains
+        # in its original task, including every ContextVar token and arbitrary
+        # caller await. Cancellation cannot abandon an accepted native reset.
+        retirement = create_owned_task(checkout.__aexit__(
+            type(body_failure) if body_failure is not None else None,
+            body_failure,
+            body_failure.__traceback__ if body_failure is not None else None,
+        ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset")
+        state.retirement.owner = retirement
+        retired = await await_owned_task(retirement)
+        terminal = execution_terminal_error(body_failure, retired.error, retired.cancellation)
+        if retired.error is not None:
+            assert terminal is not None
+            terminal._kestrel_native_retirement_debts = (
+                *getattr(terminal, "_kestrel_native_retirement_debts", ()),
+                (checkout, retirement),
+            )
             outcome = execution_commit_outcome(terminal) or state.outcome
             if outcome is not None:
                 for scope in state.scopes:
@@ -863,13 +897,18 @@ class PostgresBackend(DatabaseBackend):
                 if execution_commit_outcome(terminal) is None:
                     raise ExecutionCommitOutcomeError(outcome) from terminal
             raise terminal
+        if terminal is not None:
+            terminal = state.retain_acknowledgments(terminal)
+            if admit_work and state.acknowledgments:
+                terminal = self._retain_after_commit_denial(terminal, state.scopes, state.acknowledgments)
+            raise terminal
         # Release/reset is an awaited part of the operation, not an
         # authority-free epilogue. Never publish a stale read/RETURNING value
         # or imply rollback when revocation raced a successful COMMIT/reset.
         if not admit_work:
             return
         if state.outcome is not None:
-            self._require_after_authority_commit(state.scopes)
+            self._require_after_authority_commit(state.scopes, state.acknowledgments)
         else:
             require_execution_backend("postgres", state.scopes)
 
@@ -878,12 +917,43 @@ class PostgresBackend(DatabaseBackend):
         self, connection: Any, scopes: tuple[ExecutionCustody, ...],
         commit_state: _ExecutionCommitState | None = None,
     ) -> AsyncIterator[None]:
-        async with self._tracked_native_transaction(connection, scopes, commit_state):
-            await lock_execution_authority(connection, "postgres", scopes)
-            yield
-            require_execution_backend("postgres", scopes)
-            self._require_transaction_custody()
-        self._require_after_authority_commit(scopes)
+        state = commit_state if commit_state is not None else _ExecutionCommitState()
+        try:
+            async with self._tracked_native_transaction(connection, scopes, state):
+                await lock_execution_authority(connection, "postgres", scopes)
+                yield
+                require_execution_backend("postgres", scopes)
+                self._require_transaction_custody()
+        except BaseException as error:
+            if state.acknowledgments and execution_commit_outcome(error) == "committed":
+                raise self._retain_after_commit_denial(error, scopes, state.acknowledgments)
+            raise
+        self._require_after_authority_commit(scopes, state.acknowledgments)
+
+    def _retain_after_commit_denial(
+        self, original: BaseException, scopes: tuple[ExecutionCustody, ...],
+        acknowledgments: Sequence[AcknowledgedExecutionCommit],
+    ) -> BaseException:
+        """Cancellation cannot conceal authority loss racing a successful ACK."""
+        try:
+            self._require_after_authority_commit(scopes, acknowledgments)
+        except BaseException as denial:
+            if not is_execution_control_error(denial):
+                # A validator that cannot complete is not a scoped successful
+                # refusal. Preserve its exact cause and fail all original
+                # admissions closed, rather than localizing an ordinary error.
+                for scope in scopes:
+                    scope.preserve_commit_uncertainty("committed")
+                failure = ExecutionCommitOutcomeError("committed")
+                failure.__cause__ = denial
+                denial = failure
+            selected = execution_terminal_error(original, denial)
+            if selected is original and denial is not original:
+                prior = original.__cause__
+                original.__cause__ = (denial if prior is None else
+                    BaseExceptionGroup("original post-commit control evidence", [prior, denial]))
+            return selected
+        return original
 
     @asynccontextmanager
     async def _tracked_native_transaction(
@@ -899,39 +969,74 @@ class PostgresBackend(DatabaseBackend):
         # finish, a failed commit acknowledgement must instead be reconciled.
         if commit_state is not None:
             commit_state.remember(scopes)
-        committing = False
+        transaction = connection.transaction()
+        await transaction.__aenter__()
         body_failure: BaseException | None = None
         try:
-            async with connection.transaction():
-                try:
-                    yield
-                except BaseException as error:
-                    # Native __aexit__ may replace this error during rollback.
-                    # Keep the explicit original receipt, not cleanup context.
-                    body_failure = error
-                    raise
-                committing = True
-                if commit_state is not None:
-                    commit_state.outcome = "unknown"
-        except BaseException as exc:
+            yield
+        except BaseException as error:
+            body_failure = error
+        committing = body_failure is None
+        if committing and commit_state is not None:
+            commit_state.outcome = "unknown"
+        # Protect the accepted native epilogue, NOT the body above. In
+        # particular, external resolvers/gates retain normal cancellation.
+        completion = create_owned_task(transaction.__aexit__(
+            type(body_failure) if body_failure is not None else None,
+            body_failure,
+            body_failure.__traceback__ if body_failure is not None else None,
+        ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit")
+        completed = await await_owned_task(completion)
+        if completed.error is not None:
             if committing:
-                outcome = execution_commit_outcome(exc) or "unknown"
+                outcome = execution_commit_outcome(completed.error) or "unknown"
                 for scope in scopes:
                     scope.preserve_commit_uncertainty(outcome)
-                if execution_commit_outcome(exc) is not None:
-                    raise
-                raise ExecutionCommitOutcomeError(outcome) from exc
-            raise execution_terminal_error(body_failure, exc)
-        if commit_state is not None:
+                if execution_commit_outcome(completed.error) is not None:
+                    raise completed.error
+                raise ExecutionCommitOutcomeError(outcome) from completed.error
+            terminal = execution_terminal_error(body_failure, completed.error, completed.cancellation)
+            terminal._kestrel_native_retirement_debts = (
+                *getattr(terminal, "_kestrel_native_retirement_debts", ()),
+                (transaction, completion),
+            )
+            for scope in scopes:
+                scope.revoke("original native rollback acknowledgement failed")
+            raise terminal
+        receipt = (AcknowledgedExecutionCommit(completion, retirement=commit_state.retirement)
+                   if committing and commit_state is not None
+                   else AcknowledgedExecutionCommit(completion) if committing else None)
+        if committing and commit_state is not None:
             commit_state.outcome = "committed"
+            # The checkout retains one latest native fact, not every finished
+            # task from a long operational session. Earlier escaped receipts
+            # still share this SAME original reset record and settle with it.
+            commit_state.acknowledgments[:] = [receipt]
+        terminal = execution_terminal_error(body_failure, completed.cancellation)
+        if terminal is not None:
+            if receipt is not None:
+                retain_acknowledged_execution_commit(terminal, receipt)
+            raise terminal
 
     @staticmethod
-    def _require_after_authority_commit(scopes: tuple[ExecutionCustody, ...]) -> None:
+    def _require_after_authority_commit(
+        scopes: tuple[ExecutionCustody, ...],
+        acknowledgments: Sequence[AcknowledgedExecutionCommit] = (),
+    ) -> None:
         # Commit has completed. If loss raced its acknowledgement, denial here
         # does not mean rollback; callers must reconcile their idempotent write.
         try:
             require_execution_backend("postgres", scopes)
         except ExecutionAuthorityError as exc:
+            if acknowledgments:
+                denied = execution_denial_scopes(exc)
+                if denied is not None:
+                    for scope in denied:
+                        for receipt in acknowledgments:
+                            scope.retain_acknowledged_commit(receipt)
+                for receipt in acknowledgments:
+                    retain_acknowledged_execution_commit(exc, receipt)
+                raise
             for scope in scopes:
                 scope.preserve_commit_uncertainty("committed")
             raise ExecutionCommitOutcomeError("committed") from exc
@@ -998,7 +1103,7 @@ class PostgresBackend(DatabaseBackend):
                     )
                     await asyncio.sleep(retry_delay)
                     continue
-                raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
+                raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
     
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""
@@ -1026,7 +1131,7 @@ class PostgresBackend(DatabaseBackend):
             return len(params_list)  # asyncpg doesn't return affected count
             
         except Exception as e:
-            raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
+            raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
     
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
         """Fetch a single row."""
@@ -1050,7 +1155,7 @@ class PostgresBackend(DatabaseBackend):
             return tuple(row.values())
             
         except Exception as e:
-            raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
+            raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
     
     async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
         """Fetch all rows."""
@@ -1072,7 +1177,7 @@ class PostgresBackend(DatabaseBackend):
             return [tuple(row.values()) for row in rows]
             
         except Exception as e:
-            raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
+            raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
     
     async def fetch_val(self, query: str, params: Params = ()) -> Optional[Any]:
         """Fetch a single value."""
@@ -1091,7 +1196,7 @@ class PostgresBackend(DatabaseBackend):
                     return await checked.fetchval(pg_query, *params)
             
         except Exception as e:
-            raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
+            raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
@@ -1116,7 +1221,7 @@ class PostgresBackend(DatabaseBackend):
                                 await checked.execute(script)
                     
         except Exception as e:
-            raise QueryError(f"Script execution failed: {e}") from e
+            raise QueryError(f"Script execution failed: {_failure_detail(e)}") from e
 
     @staticmethod
     async def _verify_operational_cluster_identity(
@@ -1258,7 +1363,7 @@ class PostgresBackend(DatabaseBackend):
                     except ExecutionCommitOutcomeError:
                         raise
                     except Exception as e:
-                        raise TransactionError(f"Transaction failed: {e}") from e
+                        raise TransactionError(f"Transaction failed: {_failure_detail(e)}") from e
                     finally:
                         custody_var.reset(custody_token)
                         self._after_commit_context().reset(after_commit_token)
@@ -1284,7 +1389,7 @@ class PostgresBackend(DatabaseBackend):
             except ExecutionCommitOutcomeError:
                 raise
             except Exception as e:
-                raise TransactionError(f"Transaction failed: {e}") from e
+                raise TransactionError(f"Transaction failed: {_failure_detail(e)}") from e
             finally:
                 custody_var.reset(custody_token)
                 self._after_commit_context().reset(after_commit_token)

@@ -997,7 +997,7 @@ class DistributedInvocationRegistry:
     def _retain_terminal_control(self, error: BaseException) -> None:
         if is_execution_control_error(error):
             denied = execution_denial_scopes(error)
-            if (denied and not execution_cleanup_debts(error)
+            if (denied is not None and not execution_cleanup_debts(error)
                     and all(scope not in self._runtime_custody for scope in denied)):
                 # Pure external-scope refusal remains on the original caller
                 # receipt. It grants no work and cannot retire a healthy

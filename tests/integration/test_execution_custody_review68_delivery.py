@@ -33,7 +33,11 @@ async def test_delivery_disable_does_not_cancel_native_status_ack(native_pg, mon
 
     async def held_ack(transaction, error_type, error, traceback):
         result = await actual_exit(transaction, error_type, error, traceback)
-        if error_type is None and not transaction._nested and asyncio.current_task().get_name() == f"delivery-attempt:{first}":
+        name = asyncio.current_task().get_name()
+        if error_type is None and not transaction._nested and (
+            name == f"delivery-attempt:{first}"
+            or name.startswith(f"delivery-attempt:{first}:postgres-original-")
+        ):
             status = await observer.fetchval(f'SELECT status FROM "{schema}".delivery_queue WHERE id=$1', first)
             if status == "delivered":
                 commits.append(transaction)

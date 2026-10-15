@@ -120,6 +120,14 @@ admission even if a legacy caller catches its error; only trusted reconciliation
 and a new admission can reopen work. Invocation, scheduler source/dispatcher,
 tool and transport boundaries preserve this evidence, and joined parallel
 children cannot discard it in favor of an ordinary sibling error.
+Successful native COMMIT and reset are different from unresolved acknowledgement
+or retirement: an observer cancellation can carry their exact owned receipt
+without fencing healthy scopes. A local denial still permanently denies its
+original scope. Pending reset, actual ACK/reset failure, physical debt and
+unscoped control never use this settled-local classification. Only native
+epilogues are joined this way; transaction bodies remain cancellable. See
+[`EXECUTION_CUSTODY.md`](../../development/EXECUTION_CUSTODY.md) for receipt and
+scope-provenance details.
 This is an opt-in native contract, not evidence that a downstream host has
 installed it or passed live rollout acceptance.
 

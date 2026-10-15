@@ -63,14 +63,15 @@ async def test_proxy_late_native_commit_survives_actual_deadline_handoff(
         task.add_done_callback(lambda done: completed.set())
         await asyncio.wait_for(entered.wait(), 5)
         assert await observer.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects') == 1
-        await asyncio.wait_for(cancelled.wait(), 5)
         await asyncio.wait_for(completed.wait(), 5)
+        assert not cancelled.is_set(), "observer deadline interrupted the original native COMMIT ACK"
         (ownership,) = tuple(feature._terminal_lifecycle_tasks)
         operation = ownership.task
         assert not operation.done()
         operation.add_done_callback(lambda done: settled.set())
         release.set()
         await asyncio.wait_for(settled.wait(), 5)
+        assert not cancelled.is_set(), "native ACK received observer cancellation during retained retirement"
         assert not feature._terminal_lifecycle_tasks
         with pytest.raises(BaseException) as original:
             operation.result()

@@ -49,6 +49,66 @@ class ExecutionCommitOutcomeError(ExecutionAuthorityError, TransactionError):
         )
 
 
+@dataclass(eq=False)
+class NativeExecutionRetirement:
+    """One original checkout's reset owner, shared by its native receipts."""
+
+    owner: asyncio.Future | None = None
+
+
+@dataclass(eq=False)
+class AcknowledgedExecutionCommit:
+    """Original native ACK and retirement owners, never authority to work.
+
+    A caller can stop observing while COMMIT succeeds. Keep that durable fact
+    on its original exception without inventing uncertainty on healthy scopes.
+    Localization is allowed only after the SAME checkout's reset also succeeds.
+    Native ACK/reset errors still use irreversible commit/debt evidence.
+    """
+
+    commit_owner: asyncio.Future
+    retirement: NativeExecutionRetirement = field(default_factory=NativeExecutionRetirement)
+
+    @property
+    def retirement_owner(self) -> asyncio.Future | None:
+        return self.retirement.owner
+
+    @retirement_owner.setter
+    def retirement_owner(self, owner: asyncio.Future) -> None:
+        self.retirement.owner = owner
+
+    @property
+    def acknowledged(self) -> bool:
+        from kestrel_sovereign._async_ownership import owned_task_error
+        return self.commit_owner.done() and owned_task_error(self.commit_owner) is None
+
+    @property
+    def retired(self) -> bool:
+        from kestrel_sovereign._async_ownership import owned_task_error
+        return (self.acknowledged and self.retirement_owner is not None
+                and self.retirement_owner.done()
+                and owned_task_error(self.retirement_owner) is None)
+
+
+def retain_acknowledged_execution_commit(
+    error: BaseException, receipt: AcknowledgedExecutionCommit,
+) -> BaseException:
+    """Attach a native fact to the exact original carrier; grant no admission."""
+    if not isinstance(receipt, AcknowledgedExecutionCommit) or not receipt.acknowledged:
+        raise ValueError("native COMMIT acknowledgement has not settled successfully")
+    existing = vars(error).get("_kestrel_acknowledged_commits", ())
+    if receipt not in existing:
+        error._kestrel_acknowledged_commits = (*existing, receipt)
+        if not existing:
+            error.add_note("execution transaction outcome is committed; reconcile durable state before retry")
+    return error
+
+
+def _acknowledged_commits(error: BaseException) -> tuple[AcknowledgedExecutionCommit, ...]:
+    return tuple(receipt for receipt in vars(error).get("_kestrel_acknowledged_commits", ())
+                 if isinstance(receipt, AcknowledgedExecutionCommit) and receipt.acknowledged)
+
+
 def _explicit_control_chain(error: BaseException | None) -> Iterator[BaseException]:
     """Walk explicit carriers, never implicit cleanup/handling context."""
     seen: set[int] = set()
@@ -75,6 +135,8 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
             if current.commit_outcome == "unknown":
                 return "unknown"
             outcome = current.commit_outcome
+        if _acknowledged_commits(current):
+            outcome = outcome or "committed"
     return outcome
 
 
@@ -86,6 +148,7 @@ def is_execution_control_error(error: BaseException | None) -> bool:
     normalization must never erase that original ownership evidence.
     """
     return any(isinstance(current, ExecutionAuthorityError)
+               or bool(_acknowledged_commits(current))
                or bool(vars(current).get("_kestrel_native_retirement_debts"))
                for current in _explicit_control_chain(error))
 
@@ -117,23 +180,36 @@ def execution_cleanup_debts(error: BaseException | None) -> tuple:
 
 
 def execution_denial_scopes(error: BaseException | None) -> tuple | None:
-    """Exact denial provenance, or None for unscoped/irreversible control.
+    """Exact denial provenance, or None for unscoped/unsettled control.
 
     Consumers may distinguish a retired occurrence from their runtime only
     when EVERY explicit authority carrier has original typed scope evidence.
+    An empty tuple means an acknowledged, retired observer-only commit receipt:
+    no authority scope was denied. UNKNOWN or failed native retirement is
+    never localized, even alongside another successfully acknowledged commit.
     """
     scopes = []
+    settled_commit = False
+    if execution_cleanup_debts(error):
+        return None
     for carrier in _explicit_control_chain(error):
+        if vars(carrier).get("_kestrel_unscoped_execution_denial"):
+            return None
+        receipts = _acknowledged_commits(carrier)
+        if receipts:
+            if not all(receipt.retired for receipt in receipts):
+                return None
+            settled_commit = True
         if isinstance(carrier, ExecutionCommitOutcomeError):
             return None
-        if isinstance(carrier, ExecutionAuthorityError):
+        if isinstance(carrier, ExecutionAuthorityError) or vars(carrier).get("_kestrel_denied_execution_scopes"):
             if vars(carrier).get("_kestrel_unscoped_execution_denial"):
                 return None
             denied = vars(carrier).get("_kestrel_denied_execution_scopes")
             if not denied:
                 return None
             scopes.extend(scope for scope in denied if scope not in scopes)
-    return tuple(scopes) if scopes else None
+    return tuple(scopes) if scopes or settled_commit else None
 
 
 def execution_terminal_error(*errors: BaseException | None) -> BaseException | None:
@@ -142,9 +218,12 @@ def execution_terminal_error(*errors: BaseException | None) -> BaseException | N
     present = tuple(error for error in errors if error is not None)
     def retain(selected):
         debts = []
+        commits = []
         denied_scopes = []
         unscoped_denial = False
         for error in present:
+            for carrier in _explicit_control_chain(error):
+                commits.extend(receipt for receipt in _acknowledged_commits(carrier) if receipt not in commits)
             for debt in execution_cleanup_debts(error):
                 if not any(debt[0] is prior[0] and debt[1] is prior[1] for prior in debts):
                     debts.append(debt)
@@ -155,6 +234,8 @@ def execution_terminal_error(*errors: BaseException | None) -> BaseException | N
                     denied_scopes.extend(scope for scope in denied if scope not in denied_scopes)
         if debts:
             selected._kestrel_native_retirement_debts = tuple(debts)
+        if commits:
+            selected._kestrel_acknowledged_commits = tuple(commits)
         if denied_scopes:
             selected._kestrel_denied_execution_scopes = tuple(denied_scopes)
         if unscoped_denial:
@@ -258,6 +339,7 @@ class ExecutionCustody:
     fence: ExecutionFence
     _denial: str | None = field(default=None, init=False)
     _uncertain_commit: str | None = field(default=None, init=False)
+    _acknowledged_commits: tuple[AcknowledgedExecutionCommit, ...] = field(default=(), init=False)
 
     def preserve_commit_uncertainty(self, outcome: str) -> None:
         if outcome not in {"committed", "unknown"}:
@@ -268,6 +350,11 @@ class ExecutionCustody:
     def revoke(self, reason: str) -> None:
         if self._denial is None:
             self._denial = reason or "execution authority revoked"
+
+    def retain_acknowledged_commit(self, receipt: AcknowledgedExecutionCommit) -> None:
+        """Keep the denied scope's known native fact, not shared uncertainty."""
+        if receipt not in self._acknowledged_commits:
+            self._acknowledged_commits = (*self._acknowledged_commits, receipt)
 
     def _retain_denial(self, error: ExecutionAuthorityError) -> None:
         """Keep original scope provenance at both pure and native gates."""
@@ -285,6 +372,8 @@ class ExecutionCustody:
             self.fence.require_work()
         except ExecutionAuthorityError as error:
             self._retain_denial(error)
+            for receipt in self._acknowledged_commits:
+                retain_acknowledged_execution_commit(error, receipt)
             raise
 
 

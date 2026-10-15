@@ -17,6 +17,7 @@ from kestrel_sovereign.execution_custody import (
     current_execution_custody,
     execution_commit_outcome,
     execution_denial_scopes,
+    execution_cleanup_debts,
     is_execution_control_error,
 )
 
@@ -36,6 +37,13 @@ def run_after_commit(callback: AfterCommitCallback) -> None:
         callback()
     except BaseException as error:  # explicit cancellation/group carriers can contain control
         if is_execution_control_error(error):
+            if (execution_commit_outcome(error) == "committed"
+                and execution_denial_scopes(error) is not None
+                and not execution_cleanup_debts(error)):
+                # Preserve an already settled native fact/local denial. A
+                # reporting callback must not turn it into uncertainty on
+                # healthy runtime scopes. Unscoped/UNKNOWN/debt stays fatal.
+                raise
             # The original write has committed. Custody/native-close failure
             # is still control, not a logged-and-forgotten reporting error.
             # A callback's stronger unknown outcome must remain unchanged.
