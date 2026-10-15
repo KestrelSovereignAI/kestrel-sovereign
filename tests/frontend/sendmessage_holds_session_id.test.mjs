@@ -1,11 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-// On the very first turn against an agent's pane, pane.sessionId is
-// null. sendMessage must adopt the server-resolved session_id so the
-// next turn sends it back explicitly — anchoring the pane to a
-// durable conversation id and letting auto-load + context-status
-// behave correctly. Reviewer flagged the prior null-stays-null hole.
+// #3654: a chat pane never sends a turn without a session.
+//
+// A pane that held none (a cold load before auto-load committed, a purge of the
+// open conversation) used to send session_id=null and adopt whatever the
+// server's 30-minute rule picked, from the X-Session-Id header or the
+// non-streaming body. That rule picks the newest conversation, which for an
+// agent that chains its own work is its autonomous session: the operator's
+// turn, and every later turn from the pane, was filed into the chain. The pane
+// now mints a fresh session itself before it sends, and only ever sends what
+// it holds.
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const AUTONOMOUS = 'autonomous-chain-session';
 
 globalThis.window = globalThis.window || {};
 globalThis.window.SharedMarkdown = {
@@ -79,7 +87,7 @@ globalThis.CSS = { escape: (s) => String(s) };
 
 const { state, getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
 const chatModule = await import('../../kestrel_sovereign/static/js/chat.js');
-const { mountChatPane, sendMessage } = chatModule;
+const { mintChatSessionId, mountChatPane, sendMessage, wipeAgentChatPane } = chatModule;
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 
 chatModule.initChat();
@@ -103,66 +111,120 @@ function controlledStream() {
     };
 }
 
-test('first turn: sendMessage adopts server-resolved session_id onto pane.sessionId', async () => {
-    const pane = getOrCreateChatPane('first-A');
-    apiModule.default.setHostAgent('first-A');
-    mountChatPane('first-A');
-    pane.sessionId = null;  // virgin pane
-
+function captureStream() {
     const ctrl = controlledStream();
+    const sent = [];
     const origStream = apiModule.default.streamInvoke;
     const origGetSid = apiModule.default.getEffectiveSessionId;
-    apiModule.default.streamInvoke = () => ctrl.iter;
-    apiModule.default.getEffectiveSessionId = (a) =>
-        a === 'first-A' ? 'sess-from-server' : null;
+    apiModule.default.streamInvoke = (...args) => {
+        sent.push(args[2]);
+        return ctrl.iter;
+    };
+    // What the server would have answered for a session-less turn: the agent's
+    // own chain, newest conversation by the 30-minute rule.
+    apiModule.default.getEffectiveSessionId = () => AUTONOMOUS;
+    return {
+        ctrl,
+        sent,
+        restore() {
+            apiModule.default.streamInvoke = origStream;
+            apiModule.default.getEffectiveSessionId = origGetSid;
+        },
+    };
+}
 
-    messageInput.value = 'hi';
+async function streamOneTurn(text, capture, { midTurn } = {}) {
+    messageInput.value = text;
     const sendPromise = sendMessage();
     await Promise.resolve(); await Promise.resolve();
-
-    ctrl.push('hello');
+    if (midTurn) midTurn();
+    capture.ctrl.push('reply');
     await new Promise((r) => setTimeout(r, 5));
-    ctrl.end();
+    capture.ctrl.end();
     await sendPromise;
+}
 
-    apiModule.default.streamInvoke = origStream;
-    apiModule.default.getEffectiveSessionId = origGetSid;
+test('a pane with no session mints one and sends it explicitly', async () => {
+    const pane = getOrCreateChatPane('cold-A');
+    apiModule.default.setHostAgent('cold-A');
+    mountChatPane('cold-A');
+    pane.sessionId = null;  // a cold pane
 
-    assert.equal(pane.sessionId, 'sess-from-server',
-        'pane.sessionId must be adopted from API.getEffectiveSessionId on the first chunk');
+    const capture = captureStream();
+    try {
+        await streamOneTurn('hi', capture);
+    } finally {
+        capture.restore();
+    }
+
+    assert.equal(capture.sent.length, 1);
+    assert.match(capture.sent[0], UUID_V4, 'the turn carries a session of its own');
+    assert.equal(pane.sessionId, capture.sent[0], 'the pane holds the session it sent');
 });
 
-test('subsequent turn: sendMessage does NOT overwrite an existing pane.sessionId', async () => {
-    // Once a pane is anchored, the explicit session_id rides on every
-    // subsequent turn. The server echoes it back unchanged. The
-    // adoption logic must not re-write it (avoids a UI flicker if the
-    // server happened to return a different id for any reason).
+test('a UI send from a cleared pane does not adopt the autonomous session id', async () => {
+    const pane = getOrCreateChatPane('cleared-A');
+    apiModule.default.setHostAgent('cleared-A');
+    mountChatPane('cleared-A');
+    pane.sessionId = 'the-conversation-just-purged';
+    wipeAgentChatPane('cleared-A');
+    assert.equal(pane.sessionId, null, 'the wipe leaves the pane without a session');
+
+    const capture = captureStream();
+    try {
+        await streamOneTurn('first after the purge', capture);
+        await streamOneTurn('and the next one', capture);
+    } finally {
+        capture.restore();
+    }
+
+    const [first, second] = capture.sent;
+    assert.match(first, UUID_V4);
+    assert.notEqual(first, AUTONOMOUS);
+    assert.notEqual(first, 'the-conversation-just-purged');
+    assert.equal(second, first, 'later turns from the pane stay in the session it started');
+    assert.equal(pane.sessionId, first, 'the server\'s choice is never adopted');
+});
+
+test('subsequent turn: sendMessage sends and keeps an existing pane.sessionId', async () => {
     const pane = getOrCreateChatPane('anchored-A');
     apiModule.default.setHostAgent('anchored-A');
     mountChatPane('anchored-A');
     pane.sessionId = 'pre-existing-sess';
 
-    const ctrl = controlledStream();
-    const origStream = apiModule.default.streamInvoke;
-    const origGetSid = apiModule.default.getEffectiveSessionId;
-    apiModule.default.streamInvoke = () => ctrl.iter;
-    apiModule.default.getEffectiveSessionId = () => 'different-sess-the-server-derived';
+    const capture = captureStream();
+    try {
+        await streamOneTurn('hi again', capture);
+    } finally {
+        capture.restore();
+    }
 
-    messageInput.value = 'hi again';
-    const sendPromise = sendMessage();
-    await Promise.resolve(); await Promise.resolve();
-    ctrl.push('reply');
-    ctrl.end();
-    await sendPromise;
-
-    apiModule.default.streamInvoke = origStream;
-    apiModule.default.getEffectiveSessionId = origGetSid;
-
+    assert.deepEqual(capture.sent, ['pre-existing-sess']);
     assert.equal(pane.sessionId, 'pre-existing-sess',
         'an already-anchored pane.sessionId must NOT be overwritten');
 });
 
-test('non-streaming fallback also adopts session_id from response.session_id', async () => {
+test('a pane wiped mid-turn is not re-anchored to the turn it left behind', async () => {
+    const pane = getOrCreateChatPane('wiped-A');
+    apiModule.default.setHostAgent('wiped-A');
+    mountChatPane('wiped-A');
+    pane.sessionId = 'conversation-being-left';
+
+    const capture = captureStream();
+    try {
+        await streamOneTurn('long question', capture, {
+            midTurn: () => wipeAgentChatPane('wiped-A'),
+        });
+    } finally {
+        capture.restore();
+    }
+
+    assert.deepEqual(capture.sent, ['conversation-being-left']);
+    assert.equal(pane.sessionId, null,
+        'a cleared pane stays cleared until its own next send starts a session');
+});
+
+test('non-streaming path sends the pane\'s minted session and keeps it', async () => {
     const pane = getOrCreateChatPane('nonstream-A');
     apiModule.default.setHostAgent('nonstream-A');
     mountChatPane('nonstream-A');
@@ -178,7 +240,7 @@ test('non-streaming fallback also adopts session_id from response.session_id', a
         invokeArgs = args;
         return {
             response: 'plain reply',
-            session_id: 'json-sess-7',
+            session_id: AUTONOMOUS,
         };
     };
     apiModule.default.completeCurrentStreamRequestId = (...args) => {
@@ -187,19 +249,42 @@ test('non-streaming fallback also adopts session_id from response.session_id', a
     };
 
     messageInput.value = 'hi';
-    await sendMessage();
+    try {
+        await sendMessage();
+    } finally {
+        state.useStreaming = origUseStreaming;
+        apiModule.default.invokeForAgent = origInvokeForAgent;
+        apiModule.default.completeCurrentStreamRequestId = origCompleteRequest;
+    }
 
-    state.useStreaming = origUseStreaming;
-    apiModule.default.invokeForAgent = origInvokeForAgent;
-    apiModule.default.completeCurrentStreamRequestId = origCompleteRequest;
-
-    assert.equal(pane.sessionId, 'json-sess-7',
-        'non-streaming path must adopt pane.sessionId from response.session_id');
+    assert.match(invokeArgs[2], UUID_V4, 'the non-streaming turn carries a session too');
+    assert.equal(pane.sessionId, invokeArgs[2],
+        'the body\'s session_id does not replace the one the pane sent');
     assert.equal(typeof invokeArgs[5], 'string');
     assert.ok(invokeArgs[5].length > 0,
         'non-streaming chat must carry an exact Stop request id');
     assert.deepEqual(completedRequests, [['nonstream-A', invokeArgs[5]]],
         'the owning UI turn must release the exact Stop address with busy state');
+});
+
+test('mintChatSessionId builds a v4 UUID where randomUUID is unavailable', () => {
+    // A console served over plain http on a LAN address is not a secure
+    // context: it has getRandomValues but no randomUUID.
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+    const realCrypto = globalThis.crypto;
+    Object.defineProperty(globalThis, 'crypto', {
+        configurable: true,
+        value: { getRandomValues: (array) => realCrypto.getRandomValues(array) },
+    });
+    try {
+        assert.equal(typeof globalThis.crypto.randomUUID, 'undefined');
+        const minted = new Set(Array.from({ length: 64 }, () => mintChatSessionId()));
+        assert.equal(minted.size, 64);
+        for (const id of minted) assert.match(id, UUID_V4);
+    } finally {
+        Object.defineProperty(globalThis, 'crypto', original);
+    }
+    assert.match(mintChatSessionId(), UUID_V4);
 });
 
 test('a superseded non-streaming response cannot paint into the replacement turn', async () => {

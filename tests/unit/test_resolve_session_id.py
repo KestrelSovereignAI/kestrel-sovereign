@@ -49,18 +49,33 @@ async def test_resolve_derives_when_caller_passes_none():
 
 
 @pytest.mark.asyncio
-async def test_resolve_propagates_none_when_derive_returns_none():
-    """If the derivation step fails or returns None (legacy data, no
-    prior rows), the resolver returns None instead of fabricating
-    a value. The endpoint then omits the X-Session-Id header — caller
-    sees the absence and knows no session_id is available yet."""
+async def test_resolve_starts_a_fresh_session_when_derivation_fails(caplog):
+    """A failed lookup still answers with a session, and says so (#3654).
+
+    Answering ``None`` sent the endpoint into the turn with no session: its
+    opening row was filed under none and its reply minted another, so one
+    turn was split across two conversations.
+    """
+    import logging
+    import uuid
+
     from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 
-    store = AsyncConversationStore.__new__(AsyncConversationStore)
-    store._derive_implicit_session_id = AsyncMock(return_value=None)
+    db = MagicMock()
+    db.fetchall = AsyncMock(side_effect=RuntimeError("db hiccup"))
+    store = AsyncConversationStore(db, agent_id="test-agent")
 
-    out = await store.resolve_session_id(None)
-    assert out is None
+    with caplog.at_level(logging.WARNING):
+        out = await store.resolve_session_id(None)
+
+    assert uuid.UUID(out).version == 4
+    db.fetchall.assert_awaited_once()
+    assert any(
+        record.levelno == logging.WARNING
+        and "Implicit session derivation failed" in record.getMessage()
+        and "db hiccup" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

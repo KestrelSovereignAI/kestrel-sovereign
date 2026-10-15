@@ -872,6 +872,35 @@ When a message is added without an explicit `session_id`,
   its `session_id`
 - Otherwise mint a fresh UUID4
 
+The derivation always answers with a session. A previous message whose
+metadata cannot be read, is not a JSON object, or names no usable
+`session_id` is treated like a legacy row with none, and mints a fresh one.
+So does a failure of the lookup itself, logged at WARNING: answering with no
+session would file a turn's opening row under none and let its reply mint
+another, splitting the turn.
+
+A row that opens a turn, and `resolve_session_id` answering for a new turn,
+must also clear a second test (#3654): the previous message's session is
+reused only when a person opened that session's latest turn. The store walks
+back from the newest row to the user row that opened the turn, skipping
+replies, system rows and operator-signal notices (which are injected into a
+turn after its own prompt), and reads that row's stored metadata. The agent
+stamps every row that opens a turn, through the normal turn body, the streamed
+one and the bootstrap discovery flow alike: a signal wake with its
+`signal_wake` tag, every other turn with `turn_opener: "person"`. A
+`signal_wake` tag marks an autonomous wake, so an agent's self-chaining
+session is never joined this way; only the `turn_opener: "person"` stamp marks
+a person's turn. Anything else is not evidence of either and mints a fresh
+session: an opener carrying neither mark (every row written before the stamp
+existed, when an untagged wake looked exactly like a person's turn),
+unreadable metadata, or no opening row among the newest
+`LATEST_TURN_SCAN_ROWS` rows. The rows that complete a turn (its reply, an
+operator notice) and rows outside any turn keep the plain time-gap rule. A
+session-less operator turn sent within 30 minutes of a deploy that adds the
+stamp therefore starts a fresh session once. The chat console never
+relies on any of this for its own turns: a pane about to send without a
+session mints one first.
+
 The `session_id` is stored in the message's metadata JSON. Callers that
 need session-scoped retrieval can pass the same `session_id` to
 `get_conversation_history(session_id=...)`. Explicit `session_id` from

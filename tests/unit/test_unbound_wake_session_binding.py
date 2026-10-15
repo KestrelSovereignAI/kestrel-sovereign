@@ -20,9 +20,12 @@ autonomous chain.
 
 Only the agent body is a double, and it does exactly what
 ``KestrelAgent.process_input`` does with its ``session_id``: binds it as the
-turn's session under the turn lifecycle and threads it into every write. The
-dispatcher, the turn lifecycle, the source registration and the conversation
-store are production code.
+turn's session under the turn lifecycle and threads it into every write. It
+also stamps the turn's opening row through the same
+``turn_opener_metadata`` the agent uses, which is what the store reads to keep
+an operator's session-less turn out of the chain (#3654). The dispatcher, the
+turn lifecycle, the source registration and the conversation store are
+production code.
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ from kestrel_sovereign.signals.sources.wait import (
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.session_id_column import is_stampable_session_id
+from kestrel_sovereign.storage.turn_provenance import turn_opener_metadata
 
 AGENT_DID = "did:test:3429"
 OPERATOR_SESSION = "operator-chat-1"
@@ -73,12 +77,15 @@ class _WakeAgent(TurnLifecycleMixin, OrchestratorEngineMixin, EventManagerMixin)
         # (Talon's ``_origin_session_id``, request_restart, self_followup).
         self.dispatch_origins: list = []
 
-    async def process_input(self, prompt: str, session_id=None, **_kwargs):
+    async def process_input(
+        self, prompt: str, session_id=None, signal_wake=None, **_kwargs
+    ):
         async with self._turn_lifecycle():
             self._active_session_id = session_id
             self.turn_sessions.append(session_id)
+            user_meta = {"sent_form": True, **turn_opener_metadata(signal_wake)}
             await self.conversation.add_conversation(
-                "user", prompt, session_id=session_id
+                "user", prompt, metadata=user_meta, session_id=session_id
             )
             self.dispatch_origins.append(self.get_turn_bound_session_id())
             await self.conversation.add_conversation(
@@ -160,7 +167,10 @@ async def test_unbound_wake_runs_in_one_fresh_session_not_the_time_gap_one(rig):
     operator's chat — asserted first, so the test cannot pass vacuously.
     """
     await rig.conversation.add_conversation(
-        "user", "operator turn", session_id=OPERATOR_SESSION
+        "user",
+        "operator turn",
+        metadata=turn_opener_metadata(None),
+        session_id=OPERATOR_SESSION,
     )
     assert await rig.conversation.resolve_session_id(None) == OPERATOR_SESSION
 
@@ -238,3 +248,38 @@ async def test_autonomous_chain_stays_in_one_session(rig):
     assert {sid for _, sid in await _sessions_by_role(rig.conversation)} == {
         origin
     }
+
+
+@pytest.mark.asyncio
+async def test_bound_wake_returns_to_its_chain_after_an_operator_turn(rig):
+    """#3654 changes where an operator's turn goes, never where a wake goes.
+
+    The operator's session-less turn is refused the chain and gets a session
+    of its own, which is then the newest conversation. The chain's next wake
+    carries the chain's session and binds there all the same.
+    """
+    await rig.dispatcher.dispatch_signal(_wake("job-1"))
+    [chain] = rig.agent.dispatch_origins
+
+    operator = await rig.conversation.resolve_session_id(None)
+    assert is_stampable_session_id(operator)
+    assert operator != chain
+    await rig.conversation.add_conversation(
+        "user",
+        "operator turn",
+        metadata={"sent_form": True, **turn_opener_metadata(None)},
+        session_id=operator,
+    )
+    assert await rig.conversation.resolve_session_id(None) == operator
+
+    result = await rig.dispatcher.dispatch_signal(_wake("job-2", session_id=chain))
+
+    assert result.status == Status.OK
+    assert rig.agent.turn_sessions == [chain, chain]
+    assert await _sessions_by_role(rig.conversation) == [
+        ("user", chain),
+        ("assistant", chain),
+        ("user", operator),
+        ("user", chain),
+        ("assistant", chain),
+    ]

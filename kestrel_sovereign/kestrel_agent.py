@@ -142,6 +142,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
+from kestrel_sovereign.storage.turn_provenance import turn_opener_metadata
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
@@ -7190,10 +7191,16 @@ Expected Duration: {expected_duration}
         user_input: str,
         session_id: str = None,
         *,
+        signal_wake: Optional[dict] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
     ) -> Optional[str]:
         """
         Handle bootstrap/discovery flow for first-time agent wake-up.
+
+        ``signal_wake`` is the wake tag ``process_input`` received, ``None``
+        for a turn sent to the agent. The user row bootstrap persists opens
+        the turn, so it carries the same provenance as the normal path's
+        (#3654): an untagged wake would read as a person's conversation.
 
         Returns:
             Response string if in bootstrap mode, None if should continue to normal processing
@@ -7223,7 +7230,11 @@ Expected Duration: {expected_duration}
             # reference it. Matches the shape of the adjacent
             # DISCOVERY branch (below) and the normal process_input
             # path.
-            await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
+            await self.privacy_agent.add_conversation(
+                "user", user_input,
+                metadata=turn_opener_metadata(signal_wake),
+                session_id=session_id,
+            )
             await self._persist_assistant_conversation(
                 wake_up_msg, session_id=session_id,
             )
@@ -7303,7 +7314,11 @@ Expected Duration: {expected_duration}
                 return None
 
             # Store user message and response in conversation history
-            await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
+            await self.privacy_agent.add_conversation(
+                "user", user_input,
+                metadata=turn_opener_metadata(signal_wake),
+                session_id=session_id,
+            )
             await self._persist_assistant_conversation(
                 response,
                 session_id=session_id,
@@ -7619,6 +7634,7 @@ Expected Duration: {expected_duration}
                             else:
                                 bootstrap_response = await self._handle_bootstrap(
                                     user_input, session_id,
+                                    signal_wake=signal_wake,
                                     invocation_context=invocation_context,
                                 )
                                 if bootstrap_response:
@@ -8246,10 +8262,14 @@ Expected Duration: {expected_duration}
         # compact "Autonomous wake" chip on reload instead of printing the raw
         # internal instruction block — matching the live path, which shows only
         # the wake's response bubble and never the prompt. rendered_content is
-        # untouched, so LLM replay + cache stability are unaffected.
-        user_meta = {"sent_form": True, **semantic_recall_metadata}
-        if signal_wake:
-            user_meta["signal_wake"] = signal_wake
+        # untouched, so LLM replay + cache stability are unaffected. Every other
+        # turn is stamped as opened by a person, the positive evidence a later
+        # session-less turn needs before it joins this session (#3654).
+        user_meta = {
+            "sent_form": True,
+            **semantic_recall_metadata,
+            **turn_opener_metadata(signal_wake),
+        }
         try:
             await self.privacy_agent.add_conversation(
                 "user", wrapped_user,

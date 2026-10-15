@@ -235,7 +235,10 @@ def new_session_id() -> str:
     The one spelling every writer that STARTS a session uses: the store's
     implicit time-gap rollover, a ``new_session`` marker, ``POST
     /api/conversations/new``, and an unbound COGNITION wake (#3429). A minted
-    id therefore always satisfies :func:`is_stampable_session_id`.
+    id therefore always satisfies :func:`is_stampable_session_id`. The chat
+    console mints the same spelling in the browser (``mintChatSessionId`` in
+    ``static/js/chat.js``) for a pane that is about to send without a session
+    (#3654).
     """
     return str(uuid.uuid4())
 
