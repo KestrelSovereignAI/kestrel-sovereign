@@ -192,10 +192,13 @@ async def _with_one_deadline(call, *silent, deadline: float = DEADLINE):
     """Run ``call`` on a pinned clock, moved one ``deadline`` once every
     ``silent`` route (anything with a ``parked`` event) has parked.
 
-    Returns the call's result and the loop seconds it took. A call that waits
-    on a second silent step never finishes, and the hang guard names it. So
-    does one whose silent routes do not all wait at once, as a listing that
-    blocks the event loop would not.
+    Returns the call's result and the loop seconds it took. The pinned clock
+    starts at the loop's real time, so that difference carries float rounding
+    (5.000000000000057 on one runner): compare it with ``pytest.approx``.
+
+    A call that waits on a second silent step never finishes, and the hang
+    guard names it. So does one whose silent routes do not all wait at once,
+    as a listing that blocks the event loop would not.
     """
     with pinned_loop_clock() as clock:
         started = clock.time()
@@ -242,7 +245,7 @@ async def test_a_silent_chat_catalog_is_the_vendors_failure_and_not_asked_again(
         service.discover_all_models(use_cache=False), silent
     )
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert [m.id for m in models] == ["answering-chat"]
     assert _failures() == {
         "silent": f"DiscoveryStepTimeout: chat catalog on silent:api did not finish within {DEADLINE:g}s",
@@ -269,7 +272,7 @@ async def test_a_silent_embedding_listing_times_out_on_its_own(caplog):
         service.discover_all_models(use_cache=False), silent
     )
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     # Its catalog answered; only the embedding step overran.
     assert sorted(m.id for m in models) == ["answering-chat", "silent-chat"]
     assert _failures() == {
@@ -297,7 +300,7 @@ async def test_a_silent_decision_listing_times_out_on_its_own(caplog):
         service.discover_all_models(use_cache=False), silent
     )
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert sorted(m.id for m in models) == ["answering-chat", "silent-chat"]
     assert _failures() == {
         "silent": f"DiscoveryStepTimeout: decision discovery on silent:api did not finish within {DEADLINE:g}s",
@@ -334,7 +337,7 @@ async def test_a_pinned_route_that_did_not_answer_gets_no_canary(silent_step):
 
     _, took = await _with_one_deadline(service.discover_all_models(use_cache=False), silent)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert silent.calls[DECISION] == (1 if silent_step == DECISION else 0)
     assert silent.calls[CANARY] == 0
     silent_state = _route_of(service, silent)["decision_state"]
@@ -388,7 +391,7 @@ async def test_a_task_created_during_a_call_does_not_inherit_its_silence():
     answering.list_models = list_and_spawn
 
     _, took = await _with_one_deadline(service.discover_all_models(use_cache=False), silent)
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert silent.calls[CHAT] == 1
 
     silent.silent.clear()
@@ -429,7 +432,7 @@ async def test_a_task_created_during_a_pass_records_its_later_overrun(caplog):
     later.set()
     _, took = await _with_one_deadline(spawned[0], late)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert _failures() == {
         "late": f"DiscoveryStepTimeout: decision discovery on late:api did not finish within {DEADLINE:g}s",
     }
@@ -469,7 +472,7 @@ async def test_the_configured_deadline_is_the_one_applied():
         service.discover_all_models(use_cache=False), silent, deadline=2.5
     )
 
-    assert took == 2.5
+    assert took == pytest.approx(2.5)
     assert _failures()["silent"].endswith("did not finish within 2.5s")
 
 
@@ -480,7 +483,7 @@ async def test_a_later_overrun_does_not_replace_the_vendors_first_failure():
 
     _, took = await _with_one_deadline(service.discover_all_models(use_cache=False), silent)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert _failures() == {"silent": "RuntimeError: 401 Unauthorized"}
 
 
@@ -516,7 +519,7 @@ async def test_a_cache_hits_overrun_reaches_the_health_check_with_the_catalog_it
         service.discover_all_models(use_cache=True), silent
     )
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert sorted(m.id for m in models) == ["answering-chat", "silent-chat"]
     assert silent.cancelled[EMBEDDING] == 1
     assert silent.calls[DECISION] == 0
@@ -654,7 +657,7 @@ async def test_two_services_failures_against_one_catalog_both_reach_the_health_c
 
     _, took = await _with_one_deadline(both_hit_the_cache(), first_silent, second_silent)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     failures = {
         name: f"DiscoveryStepTimeout: embedding discovery on {name}:api did not finish within {DEADLINE:g}s"
         for name in ("first", "second")
@@ -685,7 +688,7 @@ async def test_local_only_auto_resolution_is_bounded_and_amends_the_current_cata
 
     _, took = await _with_one_deadline(service._resolve_local_auto_routes(), silent)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert service.providers[0]["model"] == "auto"
     assert cache.snapshot().catalog_version == served.catalog_version
     assert _failures() == {
@@ -705,7 +708,7 @@ async def test_an_overrun_with_no_catalog_published_says_it_was_not_recorded(cap
 
     _, took = await _with_one_deadline(service._resolve_local_auto_routes(), silent)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert get_shared_model_cache().snapshot() is None
     assert [r.getMessage() for r in caplog.records if r.name == DISCOVERY_LOGGER] == [
         f"silent: chat catalog on silent:api did not finish within {DEADLINE:g}s; "
@@ -734,7 +737,7 @@ async def test_a_reconcile_called_on_its_own_records_its_overrun(step, reconcile
 
     _, took = await _with_one_deadline(reconcile(service), silent)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert silent.cancelled[step] == 1
     # Resolving the answering route reused the sweep: nothing was asked twice.
     assert silent.calls[step] == 1
@@ -854,7 +857,7 @@ async def test_a_silent_gemini_listing_is_cut_off_without_blocking_other_routes(
         service.discover_all_models(use_cache=False), transport, other
     )
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert [m.id for m in models] == ["answering-chat"]
     assert len(transport.paths) == 1 and transport.paths[0].endswith("/models")
     assert transport.sync.paths == []
@@ -879,7 +882,7 @@ async def test_coalesced_waiters_are_released_and_the_overrun_is_not_cached():
 
     results, took = await _with_one_deadline(three_waiters(), silent)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert [[m.id for m in models] for models in results] == [["answering-embed"]] * 3
     # One shared sweep, not one per waiter.
     assert silent.calls[EMBEDDING] == answering.calls[EMBEDDING] == 1
@@ -917,7 +920,7 @@ async def test_the_embedding_settings_read_asks_a_silent_route_once():
 
     settings, took = await _with_one_deadline(service.aget_embedding_settings(), silent)
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert settings["resolved_route"] == "answering:api"
     assert settings["embedding_model"] == "answering-embed"
     assert silent.calls[EMBEDDING] == answering.calls[EMBEDDING] == 1
@@ -968,7 +971,7 @@ async def test_a_pass_that_joins_another_callers_sweep_takes_on_its_overrun(capl
             mover.cancel()
         took = clock.time() - started
 
-    assert took == DEADLINE
+    assert took == pytest.approx(DEADLINE)
     assert [m.id for m in swept] == ["answering-embed"]
     assert sorted(m.id for m in refreshed) == ["answering-chat", "silent-chat"]
     # One sweep, reused by the refresh; it did not ask the silent route
