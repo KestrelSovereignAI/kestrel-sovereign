@@ -7,10 +7,11 @@ bootstrap discovery flow):
 
 * a signal wake carries ``signal_wake = {"source", "mode"}``, as the
   dispatcher hands it to ``process_input`` (#2204). The turn belongs to the
-  agent's own autonomous chain.
-* every other turn was sent to the agent, by a person in the console or on a
-  channel, or by a client acting for one (an API caller, a parent agent
-  delegating a task). It carries ``turn_opener = "person"``.
+  agent's own autonomous chain, except a ``channel.message`` wake: a message a
+  person sent on a channel reaches the agent that way (#3653).
+* every other turn was sent to the agent, by a person in the console, or by a
+  client acting for one (an API caller, a parent agent delegating a task). It
+  carries ``turn_opener = "person"``.
 
 The store reads this back when a turn arrives with no session
 (:func:`latest_turn_opened_by_person`): it joins the newest session only when a
@@ -18,6 +19,11 @@ person opened that session's latest turn. Rows written before the tag existed
 carry neither mark, and neither does anything else that never recorded who
 opened its turn. They are not evidence of a person, so the turn starts a fresh
 session instead of guessing from timing.
+
+What counts as a person's turn at all is not decided here.
+:func:`~kestrel_sovereign.storage.session_grouping.is_human_turn` is the one
+definition, shared with the conversation list (#3653); this module adds only
+the demand for positive evidence on top of it.
 """
 
 from __future__ import annotations
@@ -25,7 +31,11 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-from kestrel_sovereign.storage.session_grouping import signal_wake_source
+from kestrel_sovereign.storage.session_grouping import (
+    is_human_turn,
+    opens_turn,
+    signal_wake_source,
+)
 from kestrel_sovereign.storage.session_id_column import SESSION_ID_KEY
 
 #: Metadata key a non-wake turn's opening row is stamped with.
@@ -58,28 +68,21 @@ def turn_opener_metadata(signal_wake: Optional[Dict[str, Any]]) -> Dict[str, Any
     return {TURN_OPENER_KEY: PERSON_OPENER}
 
 
-def opens_turn(role: Optional[str], metadata: Dict[str, Any]) -> bool:
-    """Whether a row is the one that opened a turn.
+def opened_by_person(role: Optional[str], metadata: Dict[str, Any]) -> bool:
+    """Whether a row says, positively, that a person opened its turn.
 
-    Every turn opens with one ``user`` row: what was sent, or a signal wake's
-    rendered prompt. An operator-signal notice is persisted as ``user`` too, so
-    that it replays, but ``inject_operator_turn`` adds it to a turn that has
-    already opened, after that turn's own row. It opens nothing; it belongs to
-    the turn it was injected into, whoever opened that one.
+    The row must be a human turn (:func:`is_human_turn`, the definition the
+    conversation list shares), and it must carry the evidence: a wake from a
+    person's channel message names its source in its own ``signal_wake`` tag,
+    and every other person's turn carries the ``turn_opener`` stamp. An
+    autonomous ``signal_wake`` tag wins over any stamp beside it. A row with
+    neither mark (written before the tag existed, or by a writer that never
+    recorded who opened its turn) is not evidence of a person.
     """
-    return role == "user" and not metadata.get("operator_signal")
-
-
-def opened_by_person(metadata: Dict[str, Any]) -> bool:
-    """Whether an opening row's metadata says a person opened its turn.
-
-    Only the positive tag counts. A ``signal_wake`` tag is an autonomous wake,
-    whatever else the row carries. A row with neither mark (written before the
-    tag existed, or by a writer that never recorded who opened its turn) is
-    not evidence of a person.
-    """
-    if signal_wake_source(metadata) is not None:
+    if not is_human_turn(role, metadata):
         return False
+    if signal_wake_source(metadata) is not None:
+        return True  # a person's message, by is_human_turn's own sources
     return metadata.get(TURN_OPENER_KEY) == PERSON_OPENER
 
 
@@ -118,5 +121,5 @@ def latest_turn_opened_by_person(
             continue
         if not opens_turn(role, metadata):
             continue
-        return opened_by_person(metadata)
+        return opened_by_person(role, metadata)
     return False

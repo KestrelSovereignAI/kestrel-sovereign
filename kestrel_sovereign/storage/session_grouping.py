@@ -79,6 +79,61 @@ def autonomous_wake_preview(source: Optional[str]) -> str:
     return f"Autonomous wake — {source or 'signal'}"
 
 
+#: Wake sources whose turn carries a message a person sent (#3653).
+#:
+#: An inbound channel message (Telegram, WhatsApp) reaches cognition as a
+#: ``channel.message`` COGNITION wake, so its row carries a ``signal_wake`` tag
+#: like any autonomous wake. But the channel feature dispatches only what its
+#: sender policy admitted (Telegram is default-deny on an allowlist), so the
+#: turn was opened by a person writing to the agent. A2A inbound
+#: (``a2a.task_submitted``) is another agent's work, and every other source is
+#: the agent's own chain; neither is listed here.
+PERSON_MESSAGE_WAKE_SOURCES = frozenset({"channel.message"})
+
+
+def inbound_message_preview(source: str) -> str:
+    """Title a session whose first human turn arrived as a wake (#3653).
+
+    The row a channel message persists holds the wake's rendered instruction
+    template, not the words the person sent, so it is no more a title than an
+    autonomous wake's prompt is (#2947). Name it for how it arrived instead.
+    """
+    return f"Inbound message — {source}"
+
+
+def opens_turn(role: Optional[str], metadata: Dict[str, Any]) -> bool:
+    """Whether a row is the one that opened a turn.
+
+    Every turn opens with one ``user`` row: what was sent, or a signal wake's
+    rendered prompt. An operator-signal notice is persisted as ``user`` too, so
+    that it replays, but ``inject_operator_turn`` adds it to a turn that has
+    already opened, after that turn's own row. It opens nothing; it belongs to
+    the turn it was injected into, whoever opened that one.
+    """
+    return role == "user" and not metadata.get("operator_signal")
+
+
+def is_human_turn(role: Optional[str], metadata: Dict[str, Any]) -> bool:
+    """Whether a row is a human turn: one a person opened (#3653).
+
+    A row that opens a turn (:func:`opens_turn`, so not an operator-signal
+    notice) and is not an autonomous signal wake. A wake from one of
+    :data:`PERSON_MESSAGE_WAKE_SOURCES` carries a person's message and counts.
+
+    The one definition behind every reader that asks "did a person take part
+    in this session": the conversation preview and its "Autonomous wake" label
+    (#2947), the list's ``has_human_turn`` that the chat console's auto-load
+    reads, and the session-less join rule
+    (:func:`~kestrel_sovereign.storage.turn_provenance.opened_by_person`,
+    #3654). A row with no provenance mark at all (written before #3654 stamped
+    persons) is a human turn here; the join asks for positive evidence on top.
+    """
+    if not opens_turn(role, metadata):
+        return False
+    source = signal_wake_source(metadata)
+    return source is None or source in PERSON_MESSAGE_WAKE_SOURCES
+
+
 def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
     """Parse a stored timestamp into one comparable naive-UTC datetime.
 
@@ -485,24 +540,20 @@ def group_messages_into_sessions(
             current["user_message_count"] += 1
             # Operator-signal fallback notices (#operator_signals.py) and
             # autonomous signal wakes (#2204) are both persisted with
-            # role="user" so they replay in history, but neither is something
-            # the user typed — skip both when picking the preview so an
+            # role="user" so they replay in history, but neither is a person's
+            # turn — skip both when picking the preview so an
             # auto-mode/budget/governance notice or a `talon.job_complete`
             # wake never becomes the conversation's title (#2455, #2947).
-            # Memory retrieval already treats the two flags as one class
-            # (memory_retriever.py); the preview picker had only learned half
-            # the pair.
+            # The preview row is the session's first HUMAN turn, by the one
+            # definition every reader shares (#3653): a session with no
+            # preview row is exactly a session no person took part in.
             wake_source = signal_wake_source(meta)
             if wake_source is not None and current["preview_wake_source"] is None:
                 # Remember the first wake so a session with NO human turn can
                 # be labeled for the autonomous work it actually ran, instead
                 # of falling through to an empty "New conversation" title.
                 current["preview_wake_source"] = wake_source
-            if (
-                current["preview_content"] is None
-                and not meta.get("operator_signal")
-                and wake_source is None
-            ):
+            if current["preview_content"] is None and is_human_turn(role, meta):
                 current["preview_content"] = content
                 current["preview_metadata"] = meta
 
@@ -825,9 +876,14 @@ def summarize_sessions(
     sessions = grouped[:limit]
     for session in sessions:
         preview = session.pop("preview_content", None) or ""
-        session.pop("preview_metadata", None)
+        inbound_source = signal_wake_source(session.pop("preview_metadata", None) or {})
         wake_source = session.pop("preview_wake_source", None)
-        if preview and preview_transform is not None:
+        if preview and inbound_source is not None:
+            # The first human turn arrived as a wake (a channel message), and
+            # its row holds the wake's template rather than what was sent. The
+            # UI twin applies the same label.
+            preview = inbound_message_preview(inbound_source)
+        elif preview and preview_transform is not None:
             # e.g. unwrap sent-form so the preview is the raw user text.
             preview = preview_transform(preview)
         if preview:
