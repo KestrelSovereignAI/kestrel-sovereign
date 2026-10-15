@@ -332,6 +332,25 @@ In practice, current tools already use descriptive names (`list_models`, `memory
 
 Regression coverage: `tests/unit/test_tool_allowlist_registry.py`.
 
+### Same-turn allowlist shrink (#2935)
+
+**Risk**: The orchestrator loops re-derive `_known_tool_names()` at the top of every tool iteration, so the set is rebuilt mid-turn by design. After #2929 one input could still shrink it with no configuration change. Exploring a feature mid-turn mounts its tools, and LRU eviction can then unmount an owner whose tools no feature's `get_tools()` carries: an MCP server's tools, or a tool renamed `<owner>__<name>` on a collision. That name leaves the registry. A tool that answered at call N was refused at call N+1 as not in the allowlist. Evicting a feature's own tools is harmless, since they stay resolvable through the feature.
+
+**Mitigation**: while the agent's turn is live, `_maybe_evict_direct_tools` skips an owner holding a tool that turn was already allowed to call that no loaded feature provides. It reads the agent's live turn, not the calling task's, so a background MCP remount cannot unmount it either. Both routes a turn's tools take record what they let through: `_dispatch_tool_call` for the orchestrator loops and `execute_named_tool` for the codex inline executor, so a codex turn's MCP tool is held as well. A call a running tool makes by name (a workflow runner, `signal_dispatch`) is recorded at that tool's own call index, not counted as a new call, and is held too. When only the newest owner is evictable it goes, as with pinning. If no owner is evictable, eviction stops with a warning and the direct-tool count stays over the cap until the first registration after the turn. LRU applies normally to the next turn.
+
+**Evidence**: every `_dispatch_tool_call` refusal carries what the allowlist held at that instant, built by `kestrel_sovereign.agent.tool_allowlist`. It goes into the `tool_guardrails` audit row (`tool_validation` or `tool_resolution`), ahead of the masked `args=`, and is logged at WARNING. It holds names, counts and digests only, never arguments:
+
+- `in_set`, `size`, and a 16-hex SHA-256 digest of the sorted name set;
+- `registry_generation`, the counter of registry changes that produced the set, and `registry_generation_now`. Mount, unmount, eviction, the constitution receipt tool, and feature load, enable and teardown each advance the counter;
+- `features_enabled` (enabled/loaded) and `unreadable_features`, the features whose `get_tools()` raised and so dropped their names without any registry change;
+- `turn`, `call` (how many tool calls into the turn), and `accepted_earlier_this_turn`. When it is `yes`, the call index, size, digest and generation of the most recent acceptance follow, so the transition is visible in one row.
+
+On the `execute_named_tool` route the allowlist is the registry it resolves against (`_registered_tool_names()`). Its argument-check refusal writes the same evidence into its audit row. A name it cannot resolve raises `ToolNotRegisteredError` as before and logs the evidence: at WARNING when the turn already called that name, at INFO otherwise, since callers also probe for optional tools this way.
+
+Feature enable and disable through the endpoints set `enabled` directly in places, so the feature counts, not only the generation, show a feature-map change.
+
+Regression coverage: `tests.unit.test_tool_allowlist_turn_evidence`.
+
 ### Dispatcher arguments carried to direct tools (#3396)
 
 **Risk**: A feature dispatcher takes `task` and `context`, and callers keep passing them after a feature's tools become direct. A `@tool` method that does not declare them raised `TypeError` before running, losing the rest of the call (a `shell` call's `capture_output=true`, for one). A misspelt argument is the opposite risk: dropping it would run the tool with a default.

@@ -9,9 +9,89 @@ individual tools with LRU eviction.
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List
 
+from kestrel_sovereign.agent.tool_allowlist import (
+    KnownToolNames,
+    bump_registry_generation,
+    names_held_by_live_turn,
+    registry_generation,
+    safe_evidence_token,
+)
 from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
+
+
+@dataclass(frozen=True)
+class _RegistryNames:
+    """Every name the live registry resolves, split by where it comes from."""
+
+    #: Dispatcher names and ``@tool`` names of enabled, loaded features. These
+    #: stay resolvable whether or not they are mounted as direct tools.
+    feature_backed: frozenset
+    #: Names currently mounted in ``_direct_tools``, including those (MCP
+    #: tools, collision-renamed tools) that no feature's ``get_tools()`` carries.
+    mounted: frozenset
+    #: Features whose ``get_tools()`` raised, so their ``@tool`` names are absent.
+    unreadable_features: tuple
+    features_loaded: int
+    features_enabled: int
+
+
+def _derive_registry_names(agent: Any) -> _RegistryNames:
+    """Derive the registry's names from what is actually loaded (#2929).
+
+    A module function rather than a method so the orchestrator's test doubles,
+    which bind a fixed list of real methods onto a ``MagicMock``, reach it
+    through the methods they do bind.
+    """
+    mounted = frozenset(
+        name for name in (getattr(agent, "_direct_tools", None) or {})
+        if isinstance(name, str)
+    )
+    backed = {
+        name for name in agent._registered_features_by_tool_name()
+        if isinstance(name, str)
+    }
+    unreadable = []
+    features = list((getattr(agent, "features", None) or {}).items())
+    enabled = 0
+    for key, feature in features:
+        if not bool(getattr(feature, "enabled", True)):
+            continue
+        enabled += 1
+        get_tools = getattr(feature, "get_tools", None)
+        if not callable(get_tools):
+            continue
+        try:
+            for tool in get_tools() or []:
+                name = getattr(tool, "name", None)
+                if isinstance(name, str) and name:
+                    backed.add(name)
+        except Exception:  # noqa: BLE001 — one broken feature mustn't
+            # shrink the allowlist for every other feature; it is named in the
+            # refusal evidence instead, since its own names DO drop out (#2935).
+            unreadable.append(safe_evidence_token(key))
+    return _RegistryNames(
+        feature_backed=frozenset(backed),
+        mounted=mounted,
+        unreadable_features=tuple(sorted(unreadable)),
+        features_loaded=len(features),
+        features_enabled=enabled,
+    )
+
+
+def _resolvable_tool_names(agent: Any) -> KnownToolNames:
+    """Every name the live registry resolves, stamped with its provenance."""
+    generation = registry_generation(agent)
+    names = _derive_registry_names(agent)
+    return KnownToolNames(
+        names.feature_backed | names.mounted,
+        registry_generation=generation,
+        features_loaded=names.features_loaded,
+        features_enabled=names.features_enabled,
+        unreadable_features=names.unreadable_features,
+    )
 
 
 class ToolRegistryMixin:
@@ -193,7 +273,7 @@ class ToolRegistryMixin:
             and self._feature_supports_subagent_dispatch(feature)
         }
 
-    def _registered_tool_names(self) -> set[str]:
+    def _registered_tool_names(self) -> KnownToolNames:
         """Return every tool name the live registry can resolve.
 
         Derived from what is actually loaded, never hand-maintained (#2929):
@@ -205,28 +285,13 @@ class ToolRegistryMixin:
         * every ``@tool`` name those features expose, promoted or not,
         * every direct tool currently mounted, including dynamically-mounted
           ones (MCP servers etc.) that belong to no feature.
-        """
-        names: set[str] = {
-            name for name in (getattr(self, "_direct_tools", None) or {})
-            if isinstance(name, str)
-        }
-        names.update(self._registered_features_by_tool_name())
-        for feature in (getattr(self, "features", None) or {}).values():
-            if not bool(getattr(feature, "enabled", True)):
-                continue
-            get_tools = getattr(feature, "get_tools", None)
-            if not callable(get_tools):
-                continue
-            try:
-                for tool in get_tools() or []:
-                    name = getattr(tool, "name", None)
-                    if isinstance(name, str) and name:
-                        names.add(name)
-            except Exception:  # noqa: BLE001 — one broken feature mustn't
-                continue      # shrink the allowlist for every other feature
-        return names
 
-    def _known_tool_names(self) -> set[str]:
+        This is the set ``execute_named_tool`` resolves against, so it is what
+        that path records as its allowlist (#2935).
+        """
+        return _resolvable_tool_names(self)
+
+    def _known_tool_names(self) -> KnownToolNames:
         """Return the guardrail allowlist for this turn.
 
         The union of what the LLM is currently shown
@@ -236,8 +301,13 @@ class ToolRegistryMixin:
         mid-turn as exploration, eviction, or a context profile changes the
         advertised view — both of which produced pre-permission, unaudited
         bounces of legitimately registered tools (#2929).
+
+        The result carries the registry generation and feature counts it was
+        derived from, so a refusal can say what produced the set (#2935).
         """
-        return self._visible_known_tool_names() | self._registered_tool_names()
+        return _resolvable_tool_names(self).widened(
+            self._visible_known_tool_names()
+        )
 
     def register_dynamic_tools(self, owner: str, tools, *, pin: bool = False) -> int:
         """Mount runtime tools owned by ``owner`` into the direct-tool registry.
@@ -287,6 +357,7 @@ class ToolRegistryMixin:
             self._direct_tool_defs.append(tool_def)
             self._tool_to_feature[name] = owner
             registered += 1
+        bump_registry_generation(self)
         self._maybe_evict_direct_tools()
         logging.info(
             f"[DYNAMIC-TOOLS] Registered {registered} direct tools for "
@@ -314,8 +385,10 @@ class ToolRegistryMixin:
                 tool_def for tool_def in self._direct_tool_defs
                 if tool_def.get("function", {}).get("name") not in removed
             ]
-        self._explored_features.pop(owner, None)
+        was_mounted = self._explored_features.pop(owner, None) is not None
         self._pinned_features.discard(owner)
+        if to_remove or was_mounted:
+            bump_registry_generation(self)
         return len(to_remove)
 
     def _register_explored_feature_tools(self, feature) -> None:
@@ -348,23 +421,59 @@ class ToolRegistryMixin:
         basic orchestration. Logged eviction lists the actual tool
         names (not just a count) so the operator can spot a
         regression in the audit trail.
+
+        Also skips, while the agent's turn is live, an owner holding a tool
+        that turn has already been allowed to call that no feature's
+        ``get_tools()`` carries (#2935). Evicting a feature's tools leaves them
+        resolvable through the feature; evicting an MCP tool or a
+        collision-renamed one unmounts the only copy, and exploration runs
+        mid-turn, so the next call to a tool that just answered was refused as
+        not in the allowlist. When nothing else is evictable the newest
+        unpinned owner goes, as with pinning; when nothing at all is, the
+        count stays over the cap until an eviction after the turn.
         """
         pinned = getattr(self, "_pinned_features", set())
+        in_use = names_held_by_live_turn(self)
+        feature_backed = None
+
+        def _held_by_live_turn(owner) -> bool:
+            nonlocal feature_backed
+            at_risk = [
+                name for name, tool_owner in self._tool_to_feature.items()
+                if tool_owner == owner and name in in_use
+            ]
+            if not at_risk:
+                return False
+            if feature_backed is None:
+                feature_backed = _derive_registry_names(self).feature_backed
+            return any(name not in feature_backed for name in at_risk)
+
         while len(self._direct_tools) > self.MAX_DIRECT_TOOLS:
-            # Find oldest UNPINNED feature.
+            # Find oldest UNPINNED feature the live turn is not holding.
             oldest = next(
-                (k for k in self._explored_features if k not in pinned),
+                (
+                    k for k in self._explored_features
+                    if k not in pinned and not _held_by_live_turn(k)
+                ),
                 None,
             )
             if oldest is None:
-                # Every remaining feature is pinned — eviction is
-                # impossible. Log and bail so we don't loop forever.
+                # Every remaining feature is pinned or held by the live
+                # turn — eviction is impossible. Log and bail so we don't
+                # loop forever. A held owner is evictable again by the
+                # first registration after its turn ends; a pinned one never.
                 logging.warning(
-                    "[DYNAMIC-TOOLS] Cannot evict: all %d explored "
-                    "features are pinned (%s). Direct-tool count %d "
-                    "exceeds cap %d; raise MAX_DIRECT_TOOLS or unpin.",
+                    "[DYNAMIC-TOOLS] Cannot evict: all %d explored owners "
+                    "are pinned or hold a tool this turn used (pinned: %s; "
+                    "held by this turn: %s). Direct-tool count %d exceeds "
+                    "cap %d.",
                     len(self._explored_features),
-                    sorted(pinned), len(self._direct_tools),
+                    sorted(pinned),
+                    sorted(
+                        k for k in self._explored_features
+                        if k not in pinned and _held_by_live_turn(k)
+                    ),
+                    len(self._direct_tools),
                     self.MAX_DIRECT_TOOLS,
                 )
                 return
@@ -377,6 +486,7 @@ class ToolRegistryMixin:
                 d for d in self._direct_tool_defs
                 if d["function"]["name"] not in to_remove
             ]
+            bump_registry_generation(self)
             # Log the actual evicted names, not just a count (#1580 /
             # D). Without names, regressions are impossible to spot
             # in retro audit.

@@ -83,6 +83,14 @@ from kestrel_sovereign.agent.streaming import (
 from kestrel_sovereign.agent.direct_tool_arguments import (
     normalize_direct_tool_arguments,
 )
+from kestrel_sovereign.agent.tool_allowlist import (
+    ToolCallContext,
+    allowlist_evidence,
+    begin_named_tool_call,
+    begin_tool_call,
+    record_tool_acceptance,
+    tool_call_scope,
+)
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_RESOLUTION,
@@ -1321,6 +1329,37 @@ class OrchestratorEngineMixin:
                 )
             return await handler(**(args or {}))
 
+        # #2935: count the call into its turn, as ``_dispatch_tool_call`` does
+        # for the orchestrator loops, so the codex inline executor's calls
+        # reach the same ledger (and an MCP tool it called is not evicted by a
+        # later exploration). This path resolves against the registry, so the
+        # registry is the allowlist recorded for it.
+        registered = getattr(self, "_registered_tool_names", None)
+        call_context = begin_named_tool_call(
+            self, registered() if callable(registered) else frozenset()
+        )
+        with tool_call_scope(self, call_context):
+            return await self._dispatch_named_tool(
+                tool_name, args, session_id=session_id, source=source,
+                _capture=_capture, call_context=call_context,
+            )
+
+    async def _dispatch_named_tool(
+        self,
+        tool_name: str,
+        args: dict,
+        *,
+        session_id: str,
+        source: str,
+        _capture: Optional[Dict[str, Any]],
+        call_context: ToolCallContext,
+    ) -> Any:
+        """Resolve and run one :meth:`execute_named_tool` call.
+
+        ``call_context`` is the call's place in its turn. The name is recorded
+        as accepted once the guardrails let it through, exactly where the chat
+        path records it (#2935).
+        """
         found_tool, found_feature = self._resolve_named_tool(tool_name)
         direct_tool_feature_name: Optional[str] = None
         if found_tool is None and tool_name in getattr(self, "_direct_tools", {}):
@@ -1363,6 +1402,19 @@ class OrchestratorEngineMixin:
                 return await self._execute_named_subagent(
                     subagent_feature, tool_name=tool_name, args=args,
                     session_id=session_id, source=source, _capture=_capture,
+                    call_context=call_context,
+                )
+            evidence = allowlist_evidence(self, call_context, tool_name)
+            if evidence is not None:
+                # Say what the registry held at that instant. A caller may
+                # probe for an optional tool this way, so only the #2935
+                # symptom (a name this turn already called) is a WARNING.
+                logging.log(
+                    logging.WARNING if evidence.accepted_earlier_this_turn
+                    else logging.INFO,
+                    "[GOVERNED-DISPATCH] source=%s refused tool %r: not "
+                    "registered | %s",
+                    source, tool_name, evidence.describe(),
                 )
             raise ToolNotRegisteredError(
                 f"Tool {tool_name!r} is not registered with any enabled "
@@ -1407,8 +1459,11 @@ class OrchestratorEngineMixin:
                 reason=argument_error,
                 action=ACTION_TOOL_VALIDATION,
                 args=args,
+                evidence=allowlist_evidence(self, call_context, tool_name),
             )
             return {"success": False, "error": f"Invalid tool arguments: {argument_error}"}
+        # The argument check is the last guardrail, as in ``_dispatch_direct_tool``.
+        record_tool_acceptance(self, call_context, tool_name)
 
         logging.info(
             "[GOVERNED-DISPATCH] source=%s session=%s tool=%s feature=%s",
@@ -1578,6 +1633,7 @@ class OrchestratorEngineMixin:
         session_id: str,
         source: str,
         _capture: Optional[Dict[str, Any]] = None,
+        call_context: Optional[ToolCallContext] = None,
     ) -> Any:
         """Run a feature subagent through the governance stack.
 
@@ -1598,6 +1654,9 @@ class OrchestratorEngineMixin:
                 ``task`` (required) and ``context`` (optional); we
                 surface both.
             session_id / source / _capture: Same as ``execute_named_tool``.
+            call_context: The call's place in its turn (#2935), recorded as
+                accepted once the argument guardrail passes, before the
+                permission hooks, as the chat path records a subagent call.
         """
         feature_name = type(feature).__name__
 
@@ -1609,6 +1668,7 @@ class OrchestratorEngineMixin:
                 source, feature_name, validation_error,
             )
             return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
+        record_tool_acceptance(self, call_context, tool_name)
 
         logging.info(
             "[GOVERNED-DISPATCH] source=%s session=%s subagent=%s",
@@ -1958,6 +2018,10 @@ class OrchestratorEngineMixin:
                 )
             return result
 
+        # #2935: count this call into its turn, so a refusal can say where in
+        # the turn it happened and whether the name was accepted earlier.
+        call_context = begin_tool_call(self, known_tools)
+
         # Validate tool arguments before execution
         is_valid, validation_error = validate_tool_arguments(
             tool_name, args, known_tools=known_tools
@@ -1973,6 +2037,7 @@ class OrchestratorEngineMixin:
                 reason=validation_error or "tool validation failed",
                 action=ACTION_TOOL_VALIDATION,
                 args=args,
+                evidence=allowlist_evidence(self, call_context, tool_name),
             )
             result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
             # #1659: a start sentinel was already emitted for this call, so it
@@ -2045,63 +2110,72 @@ class OrchestratorEngineMixin:
                     tool_name
                 )
 
-        if feature:
-            result = await self._dispatch_feature_tool(
-                tool_call, feature, args, dispatch_start, dispatch_event_id,
-                user_message, tool_events=tool_events, streaming=streaming,
-                session_id=session_id, dispatch_meta=dispatch_meta,
-                effective_model=effective_model,
-            )
-        elif tool_name in self._direct_tools:
-            result = await self._dispatch_direct_tool(
-                tool_call, tool_name, args, dispatch_start, dispatch_event_id,
-                tool_events=tool_events, streaming=streaming,
-                session_id=session_id, dispatch_meta=dispatch_meta,
-            )
-        elif registered_tool is not None:
-            result = await self._dispatch_direct_tool(
-                tool_call, tool_name, args, dispatch_start, dispatch_event_id,
-                tool_events=tool_events, streaming=streaming,
-                session_id=session_id, dispatch_meta=dispatch_meta,
-                tool=registered_tool,
-                feature_name=(
-                    getattr(registered_feature, "name", None)
-                    or type(registered_feature).__name__
-                ),
-            )
-        else:
-            result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
-            dispatch_meta.update({
-                "status": "error",
-                "error_class": "UnknownToolError",
-                "error_message": f"Unknown feature tool: {tool_name}",
-            })
-            dispatch_duration = int((time.time() - dispatch_start) * 1000)
-            await self.observability_store.log_tool_response(
-                event_id=dispatch_event_id,
-                success=False,
-                duration_ms=dispatch_duration,
-                error_message=f"Unknown feature tool: {tool_name}",
-            )
-            if not streaming:
-                await self.observability_store.log_error(
-                    agent_name=self.did,
-                    error_type="unknown_feature_tool",
-                    error_message=f"Unknown feature tool: {tool_name}",
-                    metadata={"tool_name": tool_name, "available": list(features_by_tool_name.keys())}
+        # A tool that dispatches another by name from here makes a nested
+        # call, positioned at this one rather than counted again (#2935).
+        with tool_call_scope(self, call_context):
+            if feature:
+                # The guardrails are done with a subagent dispatch; anything that
+                # refuses it from here on is the permission layer's decision.
+                record_tool_acceptance(self, call_context, tool_name)
+                result = await self._dispatch_feature_tool(
+                    tool_call, feature, args, dispatch_start, dispatch_event_id,
+                    user_message, tool_events=tool_events, streaming=streaming,
+                    session_id=session_id, dispatch_meta=dispatch_meta,
+                    effective_model=effective_model,
                 )
-            if streaming and tool_events is not None:
-                tool_events.append({'type': 'error', 'tool': tool_name, 'error': f'Unknown feature tool: {tool_name}'})
-            # #2929: a name that survived the allowlist but resolves to no
-            # loaded feature is still a refused capability request — record it
-            # in the security audit alongside the guardrail rejections.
-            await record_tool_rejection(
-                self,
-                tool_name=tool_name,
-                reason=f"Unknown feature tool: {tool_name}",
-                action=ACTION_TOOL_RESOLUTION,
-                args=args,
-            )
+            elif tool_name in self._direct_tools:
+                result = await self._dispatch_direct_tool(
+                    tool_call, tool_name, args, dispatch_start, dispatch_event_id,
+                    tool_events=tool_events, streaming=streaming,
+                    session_id=session_id, dispatch_meta=dispatch_meta,
+                    call_context=call_context,
+                )
+            elif registered_tool is not None:
+                result = await self._dispatch_direct_tool(
+                    tool_call, tool_name, args, dispatch_start, dispatch_event_id,
+                    tool_events=tool_events, streaming=streaming,
+                    session_id=session_id, dispatch_meta=dispatch_meta,
+                    tool=registered_tool,
+                    feature_name=(
+                        getattr(registered_feature, "name", None)
+                        or type(registered_feature).__name__
+                    ),
+                    call_context=call_context,
+                )
+            else:
+                result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
+                dispatch_meta.update({
+                    "status": "error",
+                    "error_class": "UnknownToolError",
+                    "error_message": f"Unknown feature tool: {tool_name}",
+                })
+                dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                await self.observability_store.log_tool_response(
+                    event_id=dispatch_event_id,
+                    success=False,
+                    duration_ms=dispatch_duration,
+                    error_message=f"Unknown feature tool: {tool_name}",
+                )
+                if not streaming:
+                    await self.observability_store.log_error(
+                        agent_name=self.did,
+                        error_type="unknown_feature_tool",
+                        error_message=f"Unknown feature tool: {tool_name}",
+                        metadata={"tool_name": tool_name, "available": list(features_by_tool_name.keys())}
+                    )
+                if streaming and tool_events is not None:
+                    tool_events.append({'type': 'error', 'tool': tool_name, 'error': f'Unknown feature tool: {tool_name}'})
+                # #2929: a name that survived the allowlist but resolves to no
+                # loaded feature is still a refused capability request — record it
+                # in the security audit alongside the guardrail rejections.
+                await record_tool_rejection(
+                    self,
+                    tool_name=tool_name,
+                    reason=f"Unknown feature tool: {tool_name}",
+                    action=ACTION_TOOL_RESOLUTION,
+                    args=args,
+                    evidence=allowlist_evidence(self, call_context, tool_name),
+                )
 
         # Add tool result to messages (with persistence for large results)
         from kestrel_sovereign.features.base import _serialize_tool_result
@@ -2478,6 +2552,7 @@ class OrchestratorEngineMixin:
         self, tool_call, tool_name, args, dispatch_start, dispatch_event_id,
         *, tool_events=None, streaming=False, session_id="orchestrator",
         dispatch_meta=None, tool=None, feature_name=None,
+        call_context: Optional[ToolCallContext] = None,
     ):
         """Dispatch a direct tool call (no subagent LLM hop).
 
@@ -2486,6 +2561,10 @@ class OrchestratorEngineMixin:
         entered ``_direct_tools``, and ``_security_feature_name_for_tool``
         would fall back to the tool's own name for it, silently detaching the
         permission lookup from the feature that owns the tool.
+
+        ``call_context`` is the call's place in its turn (#2935): the argument
+        check below is the last guardrail, so the name is recorded as accepted
+        only once it passes, and its refusal carries the allowlist evidence.
         """
         tool = tool if tool is not None else self._direct_tools[tool_name]
         hook_feature_name = (
@@ -2521,8 +2600,10 @@ class OrchestratorEngineMixin:
                 reason=argument_error,
                 action=ACTION_TOOL_VALIDATION,
                 args=args,
+                evidence=allowlist_evidence(self, call_context, tool_name),
             )
             return await _failed(argument_error, error_class="ToolArgumentError")
+        record_tool_acceptance(self, call_context, tool_name)
 
         async def _exec_direct(effective_args, t=tool):
             return await t.execute(**effective_args)
