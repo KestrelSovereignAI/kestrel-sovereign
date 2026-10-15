@@ -54,6 +54,7 @@ from .session_id_column import (
 )
 from .turn_provenance import (
     LATEST_TURN_SCAN_ROWS,
+    SIGNAL_WAKE_REPLY_KEY,
     latest_turn_opened_by_person,
     opens_turn,
 )
@@ -5541,6 +5542,44 @@ class AsyncConversationStore:
             }
             history.append(entry)
         return history
+
+    #: How many of the newest rows stamped with a wake's id are read back.
+    #: One wake's turn writes one reply; a redelivered wake writes another
+    #: under the same id, newer than the first.
+    _WAKE_REPLY_SCAN_ROWS = 5
+
+    async def find_signal_wake_reply_id(self, signal_id: str) -> Optional[int]:
+        """The id of the newest live ``assistant`` row replying to ``signal_id``.
+
+        The row is the one stamped ``signal_wake_reply = signal_id`` by the
+        wake's own turn (#3655), never "the newest reply in the session": in an
+        autonomous chain another wake's reply can land in the same session
+        between the two. The ``LIKE`` pair only narrows the scan; each
+        candidate's metadata must carry the id exactly.
+        """
+        if not signal_id:
+            return None
+        # The key's underscores are LIKE wildcards too; the value is
+        # JSON-escaped, then LIKE-escaped, as a session id is.
+        spaced, packed = _metadata_like_forms(
+            SIGNAL_WAKE_REPLY_KEY.replace("_", "\\_"),
+            f'"{_escape_like_session_value(signal_id)}"',
+        )
+        rows = await self.db.fetchall(
+            "SELECT id, metadata FROM conversation_history "
+            "WHERE agent_id = ? AND role = 'assistant' AND deleted_at IS NULL "
+            "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
+            "ORDER BY id DESC LIMIT ?",
+            (self.agent_id, spaced, packed, self._WAKE_REPLY_SCAN_ROWS),
+        )
+        for row_id, meta_json in rows:
+            try:
+                meta = json.loads(meta_json) if meta_json else None
+            except (TypeError, ValueError):
+                continue
+            if isinstance(meta, dict) and meta.get(SIGNAL_WAKE_REPLY_KEY) == signal_id:
+                return int(row_id)
+        return None
 
     async def get_messages_around(
         self,

@@ -1391,15 +1391,17 @@ function resolvePaneElement(paneElement) {
 // pane is mounted now. Pinning to the mounted pane leaked another agent's
 // wake/notification into the visible pane when the user switched agents
 // mid-turn. Fall back to the mounted pane when no stream agent is set
-// (single-agent hosts / pre-connect).
-function notificationPaneObject() {
-    if (notificationAgent != null) {
-        return deps().getOrCreateChatPane(notificationAgent) || resolvePaneObject();
+// (single-agent hosts / pre-connect). A handler that awaits before it is done
+// passes the agent it captured on entry: a reconnect for another agent can
+// rebind `notificationAgent` while it waits.
+function notificationPaneObject(agent = notificationAgent) {
+    if (agent != null) {
+        return deps().getOrCreateChatPane(agent) || resolvePaneObject();
     }
     return resolvePaneObject();
 }
-function notificationPaneElement() {
-    const pane = notificationPaneObject();
+function notificationPaneElement(agent = notificationAgent) {
+    const pane = notificationPaneObject(agent);
     return pane ? pane.element : resolvePaneElement();
 }
 
@@ -2119,6 +2121,94 @@ function showTaskNotification(message, type) {
 // double-painting one wake.
 const renderedWakeSignalIds = new Set();
 
+// #3655: how long to keep asking for a wake's stored reply when it is not
+// readable yet. The event can reach the browser before the row it names can
+// be read; past the last delay the bubble says it holds a truncated preview.
+const WAKE_REPLY_RETRY_DELAYS_MS = [250, 750, 1500];
+
+function waitMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Read a wake's stored reply by its row id, retrying briefly (#3655).
+ *
+ * Returns the reply text, or null once every attempt has failed. Any failed
+ * read is retried: a 404 is the commonest (the row is not readable yet), but
+ * a transient error deserves the same short second chance.
+ */
+async function fetchWakeReply(messageId, agent) {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            const message = await deps().api.getMessage(messageId, agent);
+            if (message && message.role === 'assistant'
+                && typeof message.content === 'string') {
+                return message.content;
+            }
+        } catch (err) {
+            // Not readable yet, or failed: retried below while attempts last.
+        }
+        if (attempt >= WAKE_REPLY_RETRY_DELAYS_MS.length) return null;
+        await waitMs(WAKE_REPLY_RETRY_DELAYS_MS[attempt]);
+    }
+}
+
+/** Whether ``target`` already shows the stored row ``messageId``. */
+function paneShowsMessage(target, messageId) {
+    const id = String(messageId);
+    return Array.from(target.children || []).some(
+        (child) => child.dataset && child.dataset.messageId === id);
+}
+
+/**
+ * Fill a wake bubble whose event summary is not the whole reply (#3655).
+ *
+ * The summary is shown as a labelled preview, never as the reply. When the
+ * event names the stored row, the full reply replaces it; otherwise, or when
+ * the row cannot be read, the label stays and offers to load the message.
+ */
+async function resolveWakeReply(wake) {
+    const { div, contentDiv, notice, messageId, agent, sessionId, target } = wake;
+    notice.innerHTML = '';
+    const label = document.createElement('span');
+    notice.appendChild(label);
+
+    if (messageId != null) {
+        label.textContent = 'Truncated preview. Loading the full reply…';
+        const full = await fetchWakeReply(messageId, agent);
+        if (full !== null) {
+            div.dataset.messageId = String(messageId);
+            contentDiv.classList.remove('signal-wake-preview');
+            await finalizeAgentContent(contentDiv, full);
+            notice.remove();
+            noteChatAppend(target);
+            return;
+        }
+        label.textContent = 'Truncated preview. The full reply could not be loaded.';
+    } else if (sessionId) {
+        label.textContent = 'Truncated preview. The full reply is in this conversation.';
+    } else {
+        label.textContent = 'Truncated preview. The full reply is not available here.';
+        return;
+    }
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'signal-wake-load-full';
+    button.textContent = 'Load full message';
+    button.addEventListener('click', () => {
+        if (messageId != null) {
+            resolveWakeReply(wake);
+        } else if (typeof window !== 'undefined'
+            && typeof window.loadConversation === 'function') {
+            // No row to read by id: reload the conversation the reply was
+            // stored in, which replaces this bubble with the transcript.
+            window.loadConversation(sessionId, { force: true, expectedAgent: agent });
+        }
+    });
+    notice.appendChild(button);
+}
+
 /**
  * Render an autonomous cognition wake into the active chat pane (#1522).
  *
@@ -2150,6 +2240,13 @@ const renderedWakeSignalIds = new Set();
  * conversation on reload. A session-less wake (unattended cron/CLI work)
  * still renders into the pane, the pre-#2877 behavior; so does one that
  * arrives before the pane has bound a conversation.
+ *
+ * `result_summary` is capped (#3655): 2 KB on the event, less for sources
+ * that shorten it themselves. Only a summary the dispatcher marks
+ * `result_summary_complete` is rendered as the reply. Any other is shown as
+ * a labelled preview while the full reply loads from the stored row the
+ * event names (`reply_message_id`). A pane that already shows that row
+ * (history loaded after the reply was stored) gets no second copy.
  */
 export async function handleSignalCompleted(payload) {
     if (!payload || typeof payload !== 'object') return;
@@ -2158,7 +2255,13 @@ export async function handleSignalCompleted(payload) {
     const body = payload.result_summary;
     if (!body) return;
 
-    const paneObject = notificationPaneObject();
+    // The agent whose stream announced this wake, captured before the first
+    // await. Switching agents while the bubble renders reconnects the stream
+    // and rebinds `notificationAgent`; the reply must still be read from the
+    // agent that wrote it, since another agent's database can hold a
+    // different message under the same id (#3655).
+    const wakeAgent = notificationAgent;
+    const paneObject = notificationPaneObject(wakeAgent);
     const paneSession = (paneObject && paneObject.sessionId) || null;
     const wakeSession = payload.session_id || null;
     if (wakeSession && paneSession && wakeSession !== paneSession) return;
@@ -2169,8 +2272,11 @@ export async function handleSignalCompleted(payload) {
         renderedWakeSignalIds.add(sigId);
     }
 
-    const target = (paneObject && paneObject.element) || notificationPaneElement();
+    const target = (paneObject && paneObject.element) || notificationPaneElement(wakeAgent);
     if (!target) return;
+
+    const messageId = payload.reply_message_id ?? null;
+    if (messageId != null && paneShowsMessage(target, messageId)) return;
 
     const div = document.createElement('div');
     div.className = 'message agent-message signal-wake-message';
@@ -2183,14 +2289,36 @@ export async function handleSignalCompleted(payload) {
         `${deps().kicon('bird')} <span>Autonomous wake (${deps().escapeHtml(source)}${deps().escapeHtml(caller)})</span>`;
     div.appendChild(attribution);
 
+    const complete = payload.result_summary_complete === true;
+    let notice = null;
+    if (!complete) {
+        notice = document.createElement('div');
+        notice.className = 'signal-wake-truncation';
+        div.appendChild(notice);
+    }
+
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
+    if (!complete) contentDiv.classList.add('signal-wake-preview');
     await finalizeAgentContent(contentDiv, String(body));
     div.appendChild(contentDiv);
+    if (complete && messageId != null) div.dataset.messageId = String(messageId);
 
     target.appendChild(div);
 
     noteChatAppend(target);
+
+    if (!complete) {
+        await resolveWakeReply({
+            div,
+            contentDiv,
+            notice,
+            messageId,
+            agent: wakeAgent,
+            sessionId: wakeSession,
+            target,
+        });
+    }
 }
 
 /**

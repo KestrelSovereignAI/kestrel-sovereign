@@ -1255,6 +1255,13 @@ export function createApiClient({
             `/api/conversations?decrypt=${decrypt}&view=${encodeURIComponent(view)}&q=${encodeURIComponent(query)}`,
         ),
         getConversation: (sessionId, decrypt = true) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
+        // One stored message by id (#3655). Pinned to an explicit agent: the
+        // chat console reads a live wake's full reply from the agent whose
+        // notification stream announced it, which need not be the agent
+        // selected when the read is made.
+        getMessage: (messageId, agent = state.selectedHostAgent) => client.requestForAgent(
+            `/api/conversations/messages/${encodeURIComponent(messageId)}`, {}, agent,
+        ),
         renameConversation: (sessionId, name) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, {
             method: 'PATCH',
             body: JSON.stringify({ name }),

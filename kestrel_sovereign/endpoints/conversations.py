@@ -17,6 +17,7 @@ from kestrel_sovereign.storage.conversation_sessions import (
     SessionCursorError,
 )
 from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
+from kestrel_sovereign.storage.encryption import DecryptionError
 from kestrel_sovereign.storage.session_id_column import new_session_id as mint_session_id
 from kestrel_sovereign.security.encryption import get_fernet, get_agent_fernet, decrypt_string_fernet as decrypt_string
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
@@ -513,6 +514,46 @@ async def rename_conversation(request: Request, session_id: str):
         raise HTTPException(
             status_code=500, detail="Error renaming conversation."
         )
+
+
+@router.get("/conversations/messages/{message_id}")
+async def get_message(request: Request, message_id: int):
+    """One stored message by id, decrypted (#3655).
+
+    The chat console reads a live autonomous-wake reply here: the
+    ``signal_completed`` event names the stored row (``reply_message_id``)
+    because its ``result_summary`` is capped. 404 when no live row has the id
+    (deleted, archived, or not yet readable), or when the privacy mode keeps
+    no persistent rows to address.
+    """
+    try:
+        agent = get_agent(request)
+        try:
+            message = await agent.storage.get_conversation_message(message_id)
+        except DecryptionError:
+            raise HTTPException(
+                status_code=409, detail="Message cannot be decrypted."
+            )
+        if message is None:
+            raise HTTPException(status_code=404, detail="Message not found.")
+
+        meta = message.get("metadata") or {}
+        created_at = message.get("created_at")
+        if isinstance(created_at, datetime):
+            created_at = created_at.isoformat()
+        return {
+            "id": message["id"],
+            "role": message["role"],
+            "content": message["content"],
+            "session_id": meta.get("session_id"),
+            "metadata": _public_metadata(meta),
+            "created_at": created_at,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting message {message_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving message.")
 
 
 @router.delete(
