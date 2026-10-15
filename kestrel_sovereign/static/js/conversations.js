@@ -380,8 +380,11 @@ function animateOut(rowEl) {
  *     `#trash-toggle-btn` calls `setView`).
  *   - `onSelect(conv, { agentName })` — the second arg carries the agent the
  *     list was loaded for, so the consumer can pin the load (#1358).
- *   - `onLoaded(conversations, { view, agentName })` — fires after each
- *     non-stale load; the sidebar uses it for its #714 auto-load-most-recent.
+ *   - `onLoaded(conversations, { view, agentName, nextCursor })` — fires
+ *     after each non-stale load of page one; the sidebar uses it for its #714
+ *     auto-load-most-recent. `nextCursor` is the server's token for the page
+ *     after these rows (null at the end of the list), so a consumer that must
+ *     look further back (#3653) can do so without driving the painted list.
  *   - `onMutated(action, conv)` — fires after a successful archive / unarchive
  *     / trash / purge / restore; the sidebar uses it to coordinate chat state
  *     (start a fresh session when the currently-open conversation is deleted).
@@ -891,7 +894,7 @@ export function mountConversations(containerEl, config = {}) {
             renderedForAgent = agentName;
             renderCurrent();
             if (typeof config.onLoaded === 'function') {
-                config.onLoaded(data, { view, agentName });
+                config.onLoaded(data, { view, agentName, nextCursor: page.cursor });
             }
         } catch (e) {
             if (seq !== refreshSeq) return;

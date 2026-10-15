@@ -1235,71 +1235,119 @@ function getActiveConversationIdForAgent(agentName) {
     return pane?.sessionId || activeConversationIdsByAgent.get(agentName) || null;
 }
 
-// #714 auto-load-most-recent, moved verbatim off the old bespoke loader. Fired
-// from the component's `onLoaded` hook for the active view only, pinned to the
-// agent the list was fetched for.
-function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view) {
+// #714 auto-load-most-recent, moved off the old bespoke loader. Fired from the
+// component's `onLoaded` hook for the active view only, pinned to the agent the
+// list was fetched for. That hook is the one path for both a page load and an
+// agent switch (both reach it through refreshConversationsPane), so both open
+// the same conversation: the most recent one a person took part in (#3653). An
+// agent's wake-only autonomous sessions stay listed and open on click, but are
+// never opened for the operator unasked.
+
+// The auto-load walk that owns the decision, if one is in flight (#3653). Every
+// list load starts a new one, so a walk still fetching older pages for a list
+// that has since been reloaded (agent switch, view change, mutation) stops
+// rather than opening a conversation for a list nobody is looking at.
+let autoLoadWalkSeq = 0;
+
+// Whether `agentName`'s chat pane is still the cold pane auto-load may fill.
+// Read before the first fetch and again after every await: each of these can
+// change while an older page of the list is on its way.
+//   - no currentSessionId has been set since selectAgent mounted
+//   - no in-flight stream or unconfirmed stop against this agent
+//   - no DOM activity in this agent's pane (user might have typed during the
+//     parallel /api/conversations fetch)
+//   - no new session claimed and still being minted
+//
+// Without all of them, an auto-load that lands AFTER the user started typing
+// would call wipeAgentChatPane(), bump the pane generation, and gate out the
+// in-flight stream — which surfaces user-side as "the agent keeps stopping
+// mid-answer." The {auto: true} flag makes window.loadConversation re-check
+// pane coldness post-await as well.
+//
+// NOTE: the DOM half of "cold" means literally empty. Standalone used to fail
+// it for an incidental reason — index.html shipped a welcome card that initChat
+// migrated into the boot pane, so the pane had a child before the list ever
+// loaded and #714 never ran outside multi_agent. With that card gone the boot
+// pane is genuinely empty, so standalone now reopens on the most recent
+// conversation the way an agent select always has.
+//
+// `awaitingNewSession` is the other half: a pane the user just cleared is ALSO
+// empty and session-less, so emptiness alone cannot tell "nobody has claimed
+// this" from "the user claimed it and the mint is still in flight".
+// Auto-loading into the latter drops the previous conversation back on top of
+// the New Chat they asked for.
+function autoLoadPaneIsCold(agentName) {
+    const pane = state.chatPanes.get(agentName);
+    return Boolean(pane
+        && !pane.streamingMsgDiv
+        && !pane.awaitingNewSession
+        && pane.element.children.length === 0
+        && !state.currentSessionId
+        && !state.waitingAgents.has(agentName)
+        && !state.unconfirmedStopAgents.has(agentName));
+}
+
+async function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view, nextCursor = null) {
+    // Any load of the list supersedes a walk still in flight, whatever view it
+    // is for.
+    const walk = ++autoLoadWalkSeq;
     // Only the default (active) list drives auto-load; archived/trash views must
     // never yank the chat pane onto a tidied-away or deleted session.
     if (view && view !== 'active') return;
-    // Auto-load the most recent conversation on agent select (issue #714).
-    // Only when the chat pane is truly cold:
-    //   - no currentSessionId has been set since selectAgent mounted
-    //   - no in-flight stream against this agent
-    //   - no DOM activity in this agent's pane (user might have typed
-    //     during the parallel /api/conversations fetch)
-    //
-    // Without all three checks, an auto-load that lands AFTER the user
-    // started typing would call wipeAgentChatPane(), bump the pane
-    // generation, and gate out the in-flight stream — which surfaces
-    // user-side as "the agent keeps stopping mid-answer." The {auto: true}
-    // flag makes window.loadConversation re-check pane coldness post-await.
-    //
-    // NOTE: the DOM half of "cold" means literally empty. Standalone used to
-    // fail it for an incidental reason — index.html shipped a welcome card
-    // that initChat migrated into the boot pane, so the pane had a child
-    // before the list ever loaded and #714 never ran outside multi_agent.
-    // With that card gone the boot pane is genuinely empty, so standalone now
-    // reopens on the most recent conversation the way an agent select always
-    // has.
-    //
-    // `awaitingNewSession` is the other half: a pane the user just cleared is
-    // ALSO empty and session-less, so emptiness alone cannot tell "nobody has
-    // claimed this" from "the user claimed it and the mint is still in
-    // flight". Auto-loading into the latter drops the previous conversation
-    // back on top of the New Chat they asked for.
-    const autoTargetPane = state.chatPanes.get(autoTargetAgent);
-    const paneIsCold = autoTargetPane
-        && !autoTargetPane.streamingMsgDiv
-        && !autoTargetPane.awaitingNewSession
-        && autoTargetPane.element.children.length === 0;
-    if (!state.currentSessionId
-        && !state.waitingAgents.has(autoTargetAgent)
-        && !state.unconfirmedStopAgents.has(autoTargetAgent)
-        && paneIsCold
-        && typeof window.loadConversation === 'function') {
-        const mostRecent = _pickMostRecentConversation(conversations);
-        if (mostRecent && mostRecent.session_id) {
-            // ``expectedAgent`` is pinned to the agent the LIST was fetched for —
-            // loadConversation drops the load if the host has since switched
-            // (#1358).
-            //
-            // ``expectedGeneration`` pins the pane's context the same way a
-            // stream dispatch does (chat.js `dispatchGeneration`). Every
-            // deliberate wipe — New Chat, a new conversation, trashing the open
-            // one, another load — bumps it, so a wipe that lands during this
-            // load's awaits invalidates it. Emptiness alone cannot carry that:
-            // a wipe leaves the pane empty, which is indistinguishable from
-            // the cold boot this fires on. It was only ever safe because every
-            // wipe path left a placeholder behind, which is exactly the
-            // decoration this change removed.
-            window.loadConversation(mostRecent.session_id, {
-                auto: true,
-                expectedAgent: autoTargetAgent,
-                expectedGeneration: autoTargetPane.generation,
-            });
-        }
+    if (!autoLoadPaneIsCold(autoTargetAgent) || typeof window.loadConversation !== 'function') {
+        return;
     }
+    const autoTargetPane = state.chatPanes.get(autoTargetAgent);
+    // ``generation`` pins the pane's context the same way a stream dispatch
+    // does (chat.js `dispatchGeneration`). Every deliberate wipe — New Chat, a
+    // new conversation, trashing the open one, another load — bumps it, so a
+    // wipe that lands while older pages are fetched, or during the load's own
+    // awaits, invalidates this auto-load. Emptiness alone cannot carry that: a
+    // wipe leaves the pane empty, which is indistinguishable from the cold boot
+    // this fires on.
+    const generation = autoTargetPane.generation;
+    const stillOwned = () => walk === autoLoadWalkSeq
+        && currentAgentMatches(autoTargetAgent)
+        && state.chatPanes.get(autoTargetAgent) === autoTargetPane
+        && autoTargetPane.generation === generation
+        && autoLoadPaneIsCold(autoTargetAgent);
+
+    // Page one is the newest sessions, but for an agent that chains its own
+    // work every one of them can be autonomous while the operator's
+    // conversation sits further back. The list is ordered newest first by key,
+    // so the first page holding an eligible session holds the newest one:
+    // follow the server's cursor until a page does, or the list ends. These
+    // pages are not painted; the list shows what it showed. Only the flag is
+    // read, so no plaintext is asked for.
+    let mostRecent = _pickMostRecentConversation(conversations);
+    let cursor = nextCursor;
+    const seenCursors = new Set();
+    while (!mostRecent && cursor && !seenCursors.has(cursor)) {
+        seenCursors.add(cursor);
+        // Checked before every fetch, because the request is routed to the host
+        // agent selected at the moment it is made.
+        if (!stillOwned()) return;
+        let page;
+        try {
+            page = await API.getConversations(false, 'active', cursor);
+        } catch (e) {
+            // Opening nothing is the safe direction: the list itself is painted
+            // and every conversation in it still opens on click.
+            console.warn('Auto-load could not read older conversations:', e);
+            return;
+        }
+        if (!stillOwned()) return;
+        mostRecent = _pickMostRecentConversation(page?.conversations || []);
+        cursor = page?.next_cursor || null;
+    }
+    if (!mostRecent || !mostRecent.session_id || !stillOwned()) return;
+    // ``expectedAgent`` is pinned to the agent the LIST was fetched for —
+    // loadConversation drops the load if the host has since switched (#1358).
+    window.loadConversation(mostRecent.session_id, {
+        auto: true,
+        expectedAgent: autoTargetAgent,
+        expectedGeneration: generation,
+    });
 }
 
 // Chat-state coordination for a delete of the CURRENTLY-OPEN conversation.
@@ -1412,7 +1460,7 @@ function ensureConversationsMount() {
             window.loadConversation(conv.session_id, { expectedAgent: ctx.agentName });
         },
         onLoaded: (conversations, ctx) => {
-            maybeAutoLoadMostRecent(conversations, ctx.agentName, ctx.view);
+            maybeAutoLoadMostRecent(conversations, ctx.agentName, ctx.view, ctx.nextCursor);
         },
         onMutated: (mutAction, conv) => {
             handleSidebarConversationMutation(mutAction, conv);
@@ -1468,16 +1516,23 @@ window.newConversationViaPane = function() {
 // it as internal (prefix stays ``_``).
 export function _pickMostRecentConversation(conversations) {
     // Choose the conversation with the latest `last_message_at` (fallback
-    // to `started_at` if the server doesn't surface the former).  Sorted
-    // strictly descending; ties broken by later array index.  Ephemeral
-    // sessions never appear here because the privacy wrapper doesn't
-    // persist them — so we don't need to filter.
+    // to `started_at` if the server doesn't surface the former) among those
+    // the server marks `has_human_turn` (#3653). An agent that chains its own
+    // work keeps one autonomous session per chain (#3429), and that session is
+    // nearly always its newest; opening it would show the operator the agent's
+    // wake log instead of their conversation. With no conversation a person
+    // took part in, nothing is picked and the pane stays empty, as for a new
+    // agent. The flag is the server's classification; the preview text is a
+    // label and is never read here. Sorted strictly descending; ties broken
+    // by later array index.  Ephemeral sessions never appear here because the
+    // privacy wrapper doesn't persist them — so we don't need to filter.
     if (!Array.isArray(conversations) || conversations.length === 0) {
         return null;
     }
     let best = null;
     let bestTs = -Infinity;
     for (const conv of conversations) {
+        if (!conv || conv.has_human_turn !== true) continue;
         const raw = conv.last_message_at || conv.started_at || 0;
         const ts = new Date(raw).getTime();
         if (!Number.isFinite(ts)) continue;

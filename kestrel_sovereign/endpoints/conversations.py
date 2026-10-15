@@ -9,6 +9,8 @@ from kestrel_sovereign.rate_limit import limiter
 
 from kestrel_sovereign.storage.session_grouping import (
     autonomous_wake_preview,
+    inbound_message_preview,
+    signal_wake_source,
 )
 from kestrel_sovereign.storage.conversation_sessions import (
     SESSION_CURSOR_MAX_LENGTH,
@@ -112,12 +114,18 @@ async def list_conversations(
         encrypted_at_rest = getattr(storage, 'encryption_enabled', False)
 
         def _decorate_preview(session):
-            # The shared grouper hands back the raw first-user-message content
+            # The shared grouper hands back the raw first-human-turn content
             # plus its metadata dict; the UI layer decrypts + unwraps it here.
             preview_content = session.pop("preview_content", None)
             meta = session.pop("preview_metadata", None) or {}
             wake_source = session.pop("preview_wake_source", None)
             session.setdefault("messages", [])
+            # Whether a person took part in this session (#3653): the preview
+            # row IS the session's first human turn (``is_human_turn``), so the
+            # flag and the "Autonomous wake" label below are one fact. The
+            # chat console auto-opens only a session that has one, and reads
+            # this flag rather than the preview's wording.
+            session["has_human_turn"] = preview_content is not None
             if preview_content is None:
                 # A session whose only user rows were autonomous signal wakes
                 # has no human turn to preview. Name it for the work it ran
@@ -126,6 +134,13 @@ async def list_conversations(
                 session["preview"] = (
                     autonomous_wake_preview(wake_source) if wake_source else ""
                 )
+                return
+            inbound_source = signal_wake_source(meta)
+            if inbound_source is not None:
+                # A person's channel message opened this session's first human
+                # turn, and that row holds the wake's template rather than what
+                # was sent — the agent-facing twin applies the same label.
+                session["preview"] = inbound_message_preview(inbound_source)
                 return
 
             is_encrypted = False
@@ -187,7 +202,9 @@ async def list_conversations(
             redact = (not decrypt) and encrypted_at_rest
             for session in sessions:
                 if redact:
-                    session.pop("preview_content", None)
+                    session["has_human_turn"] = (
+                        session.pop("preview_content", None) is not None
+                    )
                     session.pop("preview_metadata", None)
                     session.pop("preview_wake_source", None)
                     session.setdefault("messages", [])
