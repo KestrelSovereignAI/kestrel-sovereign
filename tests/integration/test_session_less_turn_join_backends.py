@@ -77,3 +77,48 @@ async def test_a_session_less_turn_skips_the_chain_and_joins_a_person(db_backend
         assert is_stampable_session_id(resolved)
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("raw", ["{not json", "[]", '"human-H"', "42"])
+async def test_an_unreadable_newest_row_files_the_next_turn_whole(db_backend, raw):
+    """The newest row's metadata names no session: a fresh one, never none.
+
+    The session-less turn that follows (its opening row and the reply) lands
+    whole in that fresh session, on either backend.
+    """
+    agent_id = f"did:test:3654:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
+    await storage.initialize()
+    try:
+        await _turn(storage.db, agent_id, "human-H", PERSON, minutes_ago=3)
+        await storage.db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (agent_id, "assistant", "unreadable row", raw, _minutes_ago(1)),
+        )
+        [(unreadable,)] = await storage.db.fetchall(
+            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        )
+
+        resolved = await storage.resolve_session_id(None)
+        assert resolved != "human-H"
+        assert is_stampable_session_id(resolved)
+
+        await storage.add_conversation("user", "operator turn", metadata=PERSON)
+        await storage.add_conversation("assistant", "reply")
+
+        rows = await storage.db.fetchall(
+            "SELECT metadata FROM conversation_history "
+            "WHERE agent_id = ? AND id > ? ORDER BY id",
+            (agent_id, unreadable),
+        )
+        sessions = {json.loads(metadata).get("session_id") for (metadata,) in rows}
+        assert len(rows) == 2 and len(sessions) == 1
+        [session] = sessions
+        assert session != "human-H" and is_stampable_session_id(session)
+    finally:
+        await storage.close()

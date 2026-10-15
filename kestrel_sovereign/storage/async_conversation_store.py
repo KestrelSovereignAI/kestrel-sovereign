@@ -46,6 +46,7 @@ from .session_grouping import (
 from .session_id_column import (
     SESSION_ID_KEY,
     column_session_id,
+    is_storable_session_id,
     merged_column_assignment,
     new_session_id,
 )
@@ -1314,7 +1315,7 @@ class AsyncConversationStore:
         from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
         return SESSION_GAP_MINUTES
 
-    async def _derive_implicit_session_id(self, *, for_turn: bool) -> Optional[str]:
+    async def _derive_implicit_session_id(self, *, for_turn: bool) -> str:
         """
         Derive an implicit session_id from the time-gap heuristic.
 
@@ -1339,6 +1340,11 @@ class AsyncConversationStore:
         that complete a turn (its reply, an operator notice) and rows outside
         any turn keep the plain rule: by then the previous message is the
         turn's own prompt.
+
+        Always returns a session. A newest row whose metadata cannot be read,
+        is not an object, or names no usable session mints a fresh one, and so
+        does a failure of the derivation itself: a turn whose opening row is
+        filed under no session has its reply mint a different one.
         """
         try:
             rows = await self.db.fetchall(
@@ -1352,11 +1358,16 @@ class AsyncConversationStore:
                 return self._new_session_id()
 
             _prev_role, prev_metadata_str, prev_created_at = rows[0]
-            prev_meta = json.loads(prev_metadata_str) if prev_metadata_str else {}
+            # A document no parser reads, or one that is not an object, names
+            # no session, exactly like a legacy row written without one. Both
+            # start fresh: an unreadable newest row is no evidence of whose
+            # conversation it was (#3654).
+            prev_meta = parse_message_metadata(prev_metadata_str)
 
-            # If the previous message has no session_id (legacy data), start fresh
-            prev_sid = prev_meta.get("session_id")
-            if not prev_sid:
+            # If the previous message has no session_id (legacy data), start
+            # fresh. So does one that cannot be a session key at all.
+            prev_sid = prev_meta.get(SESSION_ID_KEY)
+            if not is_storable_session_id(prev_sid):
                 return self._new_session_id()
 
             # Compare gap through the same canonical parser used by display and
@@ -1378,9 +1389,15 @@ class AsyncConversationStore:
                 return self._new_session_id()
             return prev_sid
         except Exception as e:
-            # Never let implicit-session derivation block the write
-            logger.warning(f"Implicit session derivation failed: {e}")
-            return None
+            # Never let implicit-session derivation block the write. Nor may a
+            # failure leave the turn without a session: the opening row would
+            # be filed under none and its reply would mint another (#3654).
+            logger.warning(
+                "Implicit session derivation failed; starting a fresh "
+                "session: %s",
+                e,
+            )
+            return self._new_session_id()
 
     @staticmethod
     def _new_session_id() -> str:
@@ -1428,12 +1445,10 @@ class AsyncConversationStore:
             logger.warning(f"Session canonicalization lookup failed: {e}")
             return session_id
 
-        if not row or not row[0]:
+        if not row:
             return session_id
-        try:
-            meta = json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            return session_id
+        # An unreadable or non-object document is no marker: the id is kept.
+        meta = parse_message_metadata(row[0])
 
         marker_uuid = meta.get("session_id")
         if (
@@ -1490,6 +1505,8 @@ class AsyncConversationStore:
                     meta = json.loads(meta_json)
                 except (json.JSONDecodeError, TypeError):
                     return False
+                if not isinstance(meta, dict):
+                    return False  # matched the LIKE, but carries no object
                 # Exact match (LIKE can substring-collide).
                 if meta.get("session_id") != str(uuid):
                     continue

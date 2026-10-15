@@ -805,10 +805,10 @@ export function createApiClient({
         streamAbortControllers: new Map(),
         currentStreamRequestIds: new Map(),
         // Effective session_id reported by the most recent /stream or
-        // /invoke for each agent. The server resolves this via the 30-
-        // min-gap heuristic when the caller passes null, so before this
-        // map existed the frontend pane never learned its durable
-        // session id and stayed anchored on null indefinitely.
+        // /invoke for each agent: what the server filed the turn under. The
+        // chat pane no longer reads it (#3654): it always sends an explicit
+        // session, minting one when it holds none, so the server never picks
+        // a session for it.
         effectiveSessionIds: new Map(),
         // Caller-scoped host lifecycle authority learned from the most recent
         // authenticated /api/agents response. These are reset before every
@@ -1519,10 +1519,8 @@ export function createApiClient({
         },
         // Effective session_id surfaced by the server's most recent
         // /stream or /invoke for this agent. Returns null until the
-        // first response has been received. sendMessage reads this to
-        // update pane.sessionId so each agent's pane learns its
-        // durable conversation id without relying on the prior
-        // pane.sessionId=null + server-side implicit-derive heuristic.
+        // first response has been received. sendMessage does not adopt
+        // it (#3654); see ``effectiveSessionIds``.
         getEffectiveSessionId(agent) {
             const key = agent === undefined ? state.selectedHostAgent : agent;
             return state.effectiveSessionIds.get(key) || null;
@@ -1667,11 +1665,9 @@ export function createApiClient({
                             activeRequestId,
                         );
                     }
-                    // Capture the server-resolved session_id BEFORE the body
-                    // streams. sendMessage reads it via getEffectiveSessionId
-                    // immediately so pane.sessionId can be set on the very
-                    // first turn; subsequent turns send it back as an
-                    // explicit value, anchoring the pane to a durable id.
+                    // Record the server-resolved session_id from the response
+                    // headers, before the body streams (see
+                    // ``effectiveSessionIds``).
                     const headerSid = response.headers.get('X-Session-Id');
                     if (headerSid) {
                         state.effectiveSessionIds.set(dispatchAgent, headerSid);

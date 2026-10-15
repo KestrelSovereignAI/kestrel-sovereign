@@ -872,6 +872,13 @@ When a message is added without an explicit `session_id`,
   its `session_id`
 - Otherwise mint a fresh UUID4
 
+The derivation always answers with a session. A previous message whose
+metadata cannot be read, is not a JSON object, or names no usable
+`session_id` is treated like a legacy row with none, and mints a fresh one.
+So does a failure of the lookup itself, logged at WARNING: answering with no
+session would file a turn's opening row under none and let its reply mint
+another, splitting the turn.
+
 A row that opens a turn, and `resolve_session_id` answering for a new turn,
 must also clear a second test (#3654): the previous message's session is
 reused only when a person opened that session's latest turn. The store walks

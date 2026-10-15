@@ -27,9 +27,13 @@ past, so the 30-minute window is open without any test waiting on a clock.
 from __future__ import annotations
 
 import json
+import logging
+import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from kestrel_sovereign.bootstrap import BootstrapState
@@ -84,7 +88,7 @@ async def _insert(store, role, session_id, metadata=None, *, minutes_ago, raw=No
     await store.db.execute_commit(
         "INSERT INTO conversation_history "
         "(agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-        (AGENT, role, f"{role} row", raw, created_at),
+        (store.agent_id, role, f"{role} row", raw, created_at),
     )
 
 
@@ -301,6 +305,207 @@ async def test_an_opener_outside_the_scan_window_is_not_joined(store):
     await _assert_fresh(store, HUMAN)
 
 
+# ── An unreadable newest row starts a fresh session ────────────────────────
+#
+# The newest row is read before any classification: it names the session a
+# turn might join. A document that is not an object names none, so the turn
+# starts fresh, exactly as after a legacy row with no session (#3654 review).
+# It used to raise out of the derivation, which answered ``None``: the endpoint
+# then ran the turn with no session, its opening row was filed under none, and
+# its reply minted a session of its own.
+
+#: Newest-row metadata, as stored, from which no session can be read.
+UNREADABLE_NEWEST = {
+    "malformed_json": "{not json",
+    "list": json.dumps([{"session_id": HUMAN, **PERSON}]),
+    "string": json.dumps(HUMAN),
+    "number": "42",
+}
+
+
+def _is_minted(session_id):
+    """A session the store minted: a UUID4, in its canonical spelling."""
+    return (
+        isinstance(session_id, str)
+        and str(uuid.UUID(session_id)) == session_id
+        and uuid.UUID(session_id).version == 4
+    )
+
+
+async def _sessions_after(db, row_id):
+    """``(role, session_id)`` of every row written after ``row_id``."""
+    rows = await db.fetchall(
+        "SELECT role, metadata FROM conversation_history WHERE id > ? ORDER BY id",
+        (row_id,),
+    )
+    return [(role, json.loads(metadata).get("session_id")) for role, metadata in rows]
+
+
+def _derivation_failures(caplog):
+    """WARNINGs from the derivation's exception handler."""
+    return [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "Implicit session derivation failed" in record.getMessage()
+    ]
+
+
+async def _newest_row_id(db):
+    [(row_id,)] = await db.fetchall(
+        "SELECT id FROM conversation_history ORDER BY id DESC LIMIT 1"
+    )
+    return row_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["user", "assistant"])
+@pytest.mark.parametrize(
+    "raw", UNREADABLE_NEWEST.values(), ids=UNREADABLE_NEWEST.keys()
+)
+async def test_an_unreadable_newest_row_resolves_to_a_fresh_session(
+    store, raw, role, caplog,
+):
+    """Under 30 minutes old and over a person's turn, it still proves nothing.
+
+    It is read as naming no session, not left to fail into the derivation's
+    exception handler, which is there for failures nobody anticipated.
+    """
+    await _person_turn(store, HUMAN, minutes_ago=7)
+    await _insert(store, role, None, raw=raw, minutes_ago=5)
+
+    with caplog.at_level(logging.WARNING):
+        assert _is_minted(await _assert_fresh(store, HUMAN))
+    assert not _derivation_failures(caplog)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw", UNREADABLE_NEWEST.values(), ids=UNREADABLE_NEWEST.keys()
+)
+async def test_a_session_less_turn_after_an_unreadable_newest_row_is_one_session(
+    store, raw, caplog,
+):
+    """The opening row starts a session and the reply follows it there."""
+    await _person_turn(store, HUMAN, minutes_ago=7)
+    await _insert(store, "assistant", None, raw=raw, minutes_ago=5)
+    unreadable = await _newest_row_id(store.db)
+
+    with caplog.at_level(logging.WARNING):
+        await store.add_conversation("user", "operator turn", metadata=PERSON)
+        await store.add_conversation("user", "notice", metadata=NOTICE)
+        await store.add_conversation("assistant", "reply")
+    assert not _derivation_failures(caplog)
+
+    turn = await _sessions_after(store.db, unreadable)
+    assert [role for role, _ in turn] == ["user", "user", "assistant"]
+    [session] = {sid for _, sid in turn}
+    assert _is_minted(session) and session != HUMAN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", UNREADABLE_NEWEST.values(), ids=UNREADABLE_NEWEST.keys())
+async def test_a_row_outside_any_turn_after_an_unreadable_row_gets_a_session(store, raw):
+    """The plain rule reads the same newest row, and is never left with none."""
+    await _insert(store, "assistant", None, raw=raw, minutes_ago=5)
+    unreadable = await _newest_row_id(store.db)
+
+    await store.add_conversation("system", "notice", metadata={"event": "safe_mode"})
+
+    [(role, session)] = await _sessions_after(store.db, unreadable)
+    assert role == "system" and _is_minted(session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value", [7, ["s"], {"id": "s"}, True, "", "a\x00b", "x" * 4096],
+    ids=["int", "list", "object", "bool", "empty", "nul", "oversized"],
+)
+async def test_a_newest_row_naming_no_usable_session_is_not_joined(store, value):
+    """A ``session_id`` that cannot key a session is no session to join."""
+    await _insert(
+        store, "user", None, raw=json.dumps({"session_id": value, **PERSON}),
+        minutes_ago=5,
+    )
+
+    resolved = await store.resolve_session_id(None)
+    assert _is_minted(resolved)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_still_files_the_turn_whole(store, monkeypatch, caplog):
+    """A derivation that fails starts a fresh session rather than none.
+
+    The opening row's lookup fails; the reply's succeeds and finds that row,
+    so the two share the session the failure minted.
+    """
+    await _person_turn(store, HUMAN, minutes_ago=6)
+    before = await _newest_row_id(store.db)
+    fetchall = store.db.fetchall
+    calls = {"n": 0}
+
+    async def fail_once(sql, *args, **kwargs):
+        if "ORDER BY id DESC LIMIT ?" in sql and calls["n"] == 0:
+            calls["n"] += 1
+            raise RuntimeError("db hiccup")
+        return await fetchall(sql, *args, **kwargs)
+
+    monkeypatch.setattr(store.db, "fetchall", fail_once)
+    with caplog.at_level(logging.WARNING):
+        await store.add_conversation("user", "operator turn", metadata=PERSON)
+    monkeypatch.setattr(store.db, "fetchall", fetchall)
+    await store.add_conversation("assistant", "reply")
+
+    assert calls["n"] == 1
+    turn = await _sessions_after(store.db, before)
+    [session] = {sid for _, sid in turn}
+    assert len(turn) == 2 and _is_minted(session) and session != HUMAN
+    assert len(_derivation_failures(caplog)) == 1
+
+
+# ── The other metadata reads on the resolution path ────────────────────────
+#
+# ``resolve_session_id`` with an explicit integer-shaped id looks the id up as
+# a row and reads that row's metadata, then every row naming the marker's
+# session. A document there that is not an object is no marker.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", UNREADABLE_NEWEST.values(), ids=UNREADABLE_NEWEST.keys())
+async def test_an_integer_id_naming_an_unreadable_row_is_kept(store, raw):
+    await _insert(store, "user", None, raw=raw, minutes_ago=5)
+    row_id = await _newest_row_id(store.db)
+
+    assert await store.resolve_session_id(str(row_id)) == str(row_id)
+
+
+@pytest.mark.asyncio
+async def test_a_non_object_row_naming_the_marker_session_declines_it(store, caplog):
+    """The marker is not canonicalized onto when its ownership cannot be read.
+
+    The row matches the ownership query's text pattern but is not an object.
+    It is refused as unreadable, not left to an exception handler.
+    """
+    marker = new_session_id()
+    await _insert(
+        store, "user", marker, {"new_session": True}, minutes_ago=6,
+    )
+    marker_row = await _newest_row_id(store.db)
+    await _insert(
+        store, "user", None,
+        raw=json.dumps([{"session_id": marker, "new_session": True}]),
+        minutes_ago=5,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert await store.resolve_session_id(str(marker_row)) == str(marker_row)
+    assert not [r for r in caplog.records if "Marker ownership" in r.getMessage()]
+
+    await store.db.execute_commit(
+        "DELETE FROM conversation_history WHERE id > ?", (marker_row,)
+    )
+    assert await store.resolve_session_id(str(marker_row)) == marker
+
+
 # ── Session-less writes go through the same rule ───────────────────────────
 
 
@@ -505,3 +710,69 @@ async def test_bootstrap_stamps_the_turns_it_persists(tmp_path, monkeypatch, sta
     assert wake["signal_wake"] == WAKE_TAG and wake["session_id"] == chain
     assert person["turn_opener"] == "person" and "signal_wake" not in person
     assert person["session_id"] != chain
+
+
+@asynccontextmanager
+async def _agent_doors(agent):
+    """``/api/agent/invoke`` and ``/api/agent/stream`` for ``agent``, served
+    on the test's own loop."""
+    from fastapi import FastAPI
+
+    from kestrel_sovereign.api_errors import register_api_error_handlers
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.rate_limit import limiter
+
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.state.agent = agent
+    app.include_router(router)
+    register_api_error_handlers(app)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        yield client
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_process_rate_limiter")
+@pytest.mark.parametrize("door", ["invoke", "stream"])
+@pytest.mark.parametrize(
+    "raw", UNREADABLE_NEWEST.values(), ids=UNREADABLE_NEWEST.keys()
+)
+async def test_a_door_files_the_turn_whole_under_the_session_it_returns(
+    tmp_path, monkeypatch, door, raw,
+):
+    """The session a door answers with is the one the whole turn lands in.
+
+    The newest row is unreadable, right after a person's turn. The door must
+    still answer with a session, and the turn it runs (the operator's row and
+    the agent's reply) must be filed whole under it.
+    """
+    async with booted_agent(
+        tmp_path, name="Kite", provenance="test:3654", features=frozenset()
+    ) as agent:
+        monkeypatch.setattr(agent.llm_service, "generate_with_messages", _scripted_reply)
+        monkeypatch.setattr(
+            agent.llm_service, "stream_with_tool_detection", _scripted_stream
+        )
+        human = new_session_id()
+        await agent.process_input("hello", session_id=human)
+        conversation = agent._raw_storage.conversation
+        await _insert(conversation, "assistant", None, raw=raw, minutes_ago=0)
+        unreadable = await _newest_row_id(conversation.db)
+
+        async with _agent_doors(agent) as client:
+            response = await client.post(
+                f"/api/agent/{door}", json={"input": "next question"},
+            )
+        assert response.status_code == 200, response.text
+        if door == "invoke":
+            returned = response.json()["session_id"]
+        else:
+            assert "ack" in response.text
+            returned = response.headers.get("X-Session-Id")
+        turn = await _sessions_after(conversation.db, unreadable)
+
+    assert _is_minted(returned) and returned != human
+    assert {"user", "assistant"} <= {role for role, _ in turn}
+    assert {session for _, session in turn} == {returned}
