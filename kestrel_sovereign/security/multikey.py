@@ -181,13 +181,44 @@ def public_key_to_multibase(suite, public_key) -> str:
     return MULTIBASE_BASE58BTC_PREFIX + base58btc_encode(codec + raw)
 
 
+def _decode_multikey_payload(multibase_str: object, error_cls) -> Tuple[int, bytes, bytes]:
+    """Split a Multikey ``z...`` string into ``(codec, codec_bytes, key_bytes)``.
+
+    ``publicKeyMultibase`` values arrive in external DID material, so every
+    malformation — a non-string, a wrong prefix, a non-base58btc character,
+    an empty body, a truncated or overlong varint — raises ``error_cls``
+    rather than a bare ``ValueError``/``AttributeError`` (#2487).
+    """
+    if not isinstance(multibase_str, str):
+        raise error_cls(
+            f"publicKeyMultibase must be a string; got {type(multibase_str).__name__}"
+        )
+    if not multibase_str.startswith(MULTIBASE_BASE58BTC_PREFIX):
+        raise error_cls(
+            f"Expected multibase base58btc prefix {MULTIBASE_BASE58BTC_PREFIX!r}; "
+            f"got {multibase_str[:1]!r}"
+        )
+    try:
+        raw = base58btc_decode(multibase_str[len(MULTIBASE_BASE58BTC_PREFIX):])
+    except ValueError as e:
+        raise error_cls(f"malformed multibase payload: {e}") from e
+    if not raw:
+        raise error_cls("empty multibase payload")
+    try:
+        codec_value, consumed = decode_varint(raw)
+    except ValueError as e:
+        raise error_cls(f"malformed multicodec prefix: {e}") from e
+    return codec_value, raw[:consumed], raw[consumed:]
+
+
 def multibase_to_public_key(multibase_str: str):
     """Decode a Multikey ``z...`` string back to ``(suite, public_key)``.
 
     Looks up the registered SIGNING suite by its
     ``public_key_multicodec`` prefix and routes the body through the
-    suite's ``deserialize_public_key_from_multikey``. Raises if the
-    prefix doesn't match any registered signing suite.
+    suite's ``deserialize_public_key_from_multikey``. Raises
+    ``CryptoSuiteError`` for any malformed input or a prefix that doesn't
+    match a registered signing suite.
 
     For KEM-suite codecs (x25519, ml-kem-768) use
     :func:`multibase_to_kem_public_key` — the registries are deliberately
@@ -198,19 +229,9 @@ def multibase_to_public_key(multibase_str: str):
     """
     from .crypto_suite import _REGISTRY, CryptoSuiteError
 
-    if not multibase_str.startswith(MULTIBASE_BASE58BTC_PREFIX):
-        raise CryptoSuiteError(
-            f"Expected multibase base58btc prefix {MULTIBASE_BASE58BTC_PREFIX!r}; "
-            f"got {multibase_str[:1]!r}"
-        )
-    raw = base58btc_decode(multibase_str[len(MULTIBASE_BASE58BTC_PREFIX):])
-    if not raw:
-        raise CryptoSuiteError("empty multibase payload")
-
-    # Decode the multicodec varint to find the algorithm
-    codec_value, consumed = decode_varint(raw)
-    codec_bytes = raw[:consumed]
-    pub_bytes = raw[consumed:]
+    codec_value, codec_bytes, pub_bytes = _decode_multikey_payload(
+        multibase_str, CryptoSuiteError,
+    )
 
     for suite in _REGISTRY.values():
         if getattr(suite, "public_key_multicodec", b"") == codec_bytes:
@@ -232,18 +253,9 @@ def multibase_to_kem_public_key(multibase_str: str):
     """
     from .kem_suite import _KEM_REGISTRY, KEMSuiteError
 
-    if not multibase_str.startswith(MULTIBASE_BASE58BTC_PREFIX):
-        raise KEMSuiteError(
-            f"Expected multibase base58btc prefix {MULTIBASE_BASE58BTC_PREFIX!r}; "
-            f"got {multibase_str[:1]!r}"
-        )
-    raw = base58btc_decode(multibase_str[len(MULTIBASE_BASE58BTC_PREFIX):])
-    if not raw:
-        raise KEMSuiteError("empty multibase payload")
-
-    codec_value, consumed = decode_varint(raw)
-    codec_bytes = raw[:consumed]
-    pub_bytes = raw[consumed:]
+    codec_value, codec_bytes, pub_bytes = _decode_multikey_payload(
+        multibase_str, KEMSuiteError,
+    )
 
     for suite in _KEM_REGISTRY.values():
         if getattr(suite, "public_key_multicodec", b"") == codec_bytes:

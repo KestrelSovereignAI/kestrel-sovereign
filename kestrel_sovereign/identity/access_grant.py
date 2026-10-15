@@ -78,11 +78,12 @@ from typing import Any, Iterable, List, Mapping, Optional, Tuple
 from kestrel_sovereign.identity.succession import verify_did_binding
 from kestrel_sovereign.security.crypto_suite import (
     CryptoSuite,
-    CryptoSuiteError,
     Keypair,
     get_suite,
 )
-from kestrel_sovereign.security.multikey import multibase_to_public_key
+from kestrel_sovereign.security.signature_verification import (
+    verify_signature_entries,
+)
 
 # A ``did:web:`` resolver: ``Callable[[str did], Mapping[str, Any]]``
 # returning the DID document (typically the same shape published at
@@ -361,62 +362,12 @@ def _verify_owner_signatures(
     if not bound_ok:
         return False, f"owner DID not bound to its VMs: {bound_reason}"
 
-    methods_by_kid: dict = {}
-    for vm in grant.owner_verification_methods:
-        if not isinstance(vm, Mapping):
-            continue
-        vm_id = vm.get("id") or ""
-        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
-        if kid:
-            methods_by_kid[kid] = vm
-
-    payload = signable_payload(grant)
-    any_verified = False
-    for entry in grant.owner_signatures:
-        # Tolerate malformed serialized input: a non-mapping entry
-        # (e.g. a stray string from bad deserialization) is just an
-        # invalid signature — skip it rather than crashing the
-        # caller with AttributeError on .get(). codex P2 #1273 R3.
-        if not isinstance(entry, Mapping):
-            continue
-        alg = entry.get("alg")
-        kid = entry.get("kid")
-        sig_hex = entry.get("sig")
-        if not (alg and kid and sig_hex):
-            continue
-        vm = methods_by_kid.get(kid)
-        if vm is None:
-            continue
-        multibase = vm.get("publicKeyMultibase")
-        if not isinstance(multibase, str):
-            continue
-        try:
-            suite, public_key = multibase_to_public_key(multibase)
-        except CryptoSuiteError:
-            continue
-        if suite.alg_id != alg:
-            # Signature was signed by alg A but the VM carries alg B —
-            # an attacker substituting a different VM under the same
-            # kid would land here. Reject this attempt.
-            continue
-        # ``sig_hex`` must be a hex string. A non-string truthy value
-        # (e.g. JSON 42 or true at the import boundary) would slip past
-        # the falsy guard above and raise TypeError from fromhex.
-        # codex P2 #1273 R4.
-        if not isinstance(sig_hex, str):
-            continue
-        try:
-            sig_bytes = bytes.fromhex(sig_hex)
-        except ValueError:
-            continue
-        try:
-            if suite.verify(payload, sig_bytes, public_key):
-                any_verified = True
-                break
-        except Exception:
-            continue
-
-    if not any_verified:
+    verification = verify_signature_entries(
+        signable_payload(grant),
+        grant.owner_signatures,
+        grant.owner_verification_methods,
+    )
+    if not verification.verified:
         return False, "no owner_signature verified against bound VMs"
     return True, ""
 

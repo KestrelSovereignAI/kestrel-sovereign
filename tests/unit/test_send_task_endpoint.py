@@ -440,6 +440,47 @@ def test_valid_signed_envelope_verifies(app_with_send):
     )
 
 
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda doc: doc["verificationMethod"][0].update(id=5), id="method-id-int"),
+        pytest.param(
+            lambda doc: doc["verificationMethod"][0].update(id=["unhashable"]),
+            id="method-id-list",
+        ),
+        pytest.param(
+            lambda doc: doc["verificationMethod"][0].update(publicKeyMultibase="z0OIl"),
+            id="multibase-non-base58btc",
+        ),
+        pytest.param(
+            lambda doc: doc.update(verificationMethod=["junk"]),
+            id="method-not-an-object",
+        ),
+    ],
+)
+def test_malformed_resolved_did_document_is_403_not_500(app_with_send, corrupt):
+    """#2487: a hostile sender DID document is a verification failure. Before
+    the shared verifier it escaped as TypeError/ValueError, a server error."""
+    import copy
+
+    sign, doc = _signer_and_doc()
+    bad_doc = copy.deepcopy(doc)
+    corrupt(bad_doc)
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: bad_doc if did == _SENDER_DID else None
+    _attach(app_with_send, agent)
+
+    body = _body(metadata={"sender": _SENDER_DID, "signature": sign(["do it"])})
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"].startswith(
+        "A2A sender verification failed: signature check failed:"
+    )
+    agent.task_manager.create_task.assert_not_awaited()
+
+
 def test_signed_creator_cancellation_is_verified_and_committed(app_with_send):
     sign, doc = _signer_and_doc()
     agent = _stub_agent()

@@ -59,7 +59,6 @@ from kestrel_sovereign.security.crypto_suite import (
     Secp256k1Suite,
     get_suite,
 )
-from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +577,6 @@ def test_attacker_takeover_with_forged_did_pkh_rejected(hybrid_successor):
     Post-fix: verify_did_binding rejects this — the keccak hash of the
     attacker's pubkey does NOT equal the victim's address.
     """
-    from dataclasses import replace as _replace
 
     secp = Secp256k1Suite()
     attacker_kp = secp.generate_keypair()
@@ -803,7 +801,7 @@ def test_duplicate_kid_takeover_rejected(legacy_predecessor, hybrid_successor):
     silently overwrote the victim's in ``methods_by_kid``, so the
     attacker's signature verified for the victim's DID.
 
-    Post-fix: ``_check_unique_vm_kids`` runs first in
+    Post-fix: ``index_verification_methods`` runs first in
     ``verify_did_binding`` and refuses any VM list with duplicate kid
     fragments.
     """
@@ -990,6 +988,77 @@ def test_did_binding_handles_non_mapping_vm(legacy_predecessor):
     ok, reason = verify_did_binding(legacy_predecessor["did"], bogus_vms)
     # Doesn't crash; returns failure.
     assert not ok
+
+
+@pytest.mark.parametrize(
+    "published",
+    [
+        pytest.param(5, id="verificationMethod-int"),
+        pytest.param("vm", id="verificationMethod-string"),
+        pytest.param([{"id": ["unhashable"]}, {"id": {"a": 1}}], id="published-id-unhashable"),
+    ],
+)
+def test_did_web_binding_rejects_malformed_published_document(
+    hybrid_successor, published,
+):
+    """#2487: the resolved did:web document is external material. A
+    non-list ``verificationMethod`` or an unhashable published id used to
+    raise TypeError while indexing it."""
+    from kestrel_sovereign.identity.succession import verify_did_binding
+
+    ok, reason = verify_did_binding(
+        hybrid_successor["did"],
+        hybrid_successor["vms"],
+        did_web_resolver=lambda did: {"id": did, "verificationMethod": published},
+    )
+    assert not ok
+    assert reason
+
+
+@pytest.mark.parametrize("field_name", ["predecessor_did", "successor_did"])
+@pytest.mark.parametrize("bad_did", [5, None, ["did:web:x"], {"did": "x"}])
+def test_non_string_did_is_a_rejection_not_an_exception(
+    base_statement, legacy_predecessor, hybrid_successor, field_name, bad_did,
+):
+    from dataclasses import replace
+
+    statement = sign_predecessor(
+        base_statement, [(legacy_predecessor["kp"], legacy_predecessor["kid"])],
+    )
+    statement = sign_successor(statement, [
+        (hybrid_successor["hybrid"].classical, hybrid_successor["classical_kid"]),
+        (hybrid_successor["hybrid"].pq, hybrid_successor["pq_kid"]),
+    ])
+    statement = finalize(replace(statement, **{field_name: bad_did}))
+
+    result = verify_succession(
+        statement,
+        did_web_resolver=lambda did: {
+            "id": did, "verificationMethod": hybrid_successor["vms"],
+        },
+    )
+    assert not result.ok
+    assert "DID must be a non-empty string" in result.reason
+
+
+def test_non_serializable_statement_is_a_rejection_not_an_exception(
+    legacy_predecessor, hybrid_successor,
+):
+    """A statement decoded from a non-JSON source can carry values the
+    canonical payload cannot encode; that is a malformed statement."""
+    statement = SuccessionStatement(
+        predecessor_did=legacy_predecessor["did"],
+        successor_did=hybrid_successor["did"],
+        effective_from="2026-05-04T18:00:00+00:00",
+        reason="bytes in a verification method",
+        predecessor_verification_methods=legacy_predecessor["vms"],
+        successor_verification_methods=[
+            {"id": f"{hybrid_successor['did']}#key-1", "publicKeyMultibase": b"\x00"},
+        ],
+    )
+    result = verify_succession(statement)
+    assert not result.ok
+    assert result.reason == "statement is not canonically serializable: TypeError"
 
 
 def test_adaptive_policy_promotes_hybrid_predecessor(hybrid_successor):

@@ -30,8 +30,6 @@ Covers:
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from kestrel_sovereign.identity.did_web import build_verification_methods
@@ -609,3 +607,108 @@ def test_artifact_chain_signatures_failed_propagates(
     )
     assert not result.ok
     assert "chain" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# Malformed verification methods in linkage and anchoring (#2487)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "extra_vm",
+    [
+        pytest.param({"publicKeyMultibase": "z6Mk"}, id="id-missing"),
+        pytest.param({"id": 5, "publicKeyMultibase": "z6Mk"}, id="id-int"),
+        pytest.param({"id": "x#y", "publicKeyMultibase": 5}, id="multibase-int"),
+        pytest.param("junk", id="not-an-object"),
+    ],
+)
+def test_malformed_root_vms_are_an_anchor_rejection_not_an_exception(
+    first_succession, legacy_root, extra_vm,
+):
+    """Root VMs mixing a missing or non-string id with real ones used to
+    raise TypeError from sorting (None < str) or ``vm.get`` on a string."""
+    chain = build_chain([first_succession])
+    result = verify_artifact_against_chain(
+        root_did=legacy_root["did"],
+        root_verification_methods=list(legacy_root["vms"]) + [extra_vm],
+        chain=chain,
+        artifact_timestamp="2026-06-01T00:00:00+00:00",
+        artifact_payload=b"x",
+        artifact_signatures=[],
+        did_web_resolver=_tip_resolver_for_chain(chain),
+    )
+    assert not result.ok
+    assert result.reason.startswith("chain anchor mismatch")
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda vms: vms + ["junk"], id="not-an-object"),
+        pytest.param(lambda vms: vms + [{"id": 5}], id="id-int"),
+        pytest.param(lambda vms: vms + [{"id": ["a#b"]}], id="id-list"),
+    ],
+)
+def test_build_chain_rejects_malformed_linkage_vms(
+    first_succession, second_succession, corrupt,
+):
+    """Malformed VM linkage is a SuccessionChainError, not an
+    AttributeError/TypeError out of the key comparison."""
+    from dataclasses import replace
+
+    first = replace(
+        first_succession,
+        successor_verification_methods=corrupt(
+            list(first_succession.successor_verification_methods)
+        ),
+    )
+    second = replace(
+        second_succession,
+        predecessor_verification_methods=corrupt(
+            list(second_succession.predecessor_verification_methods)
+        ),
+    )
+    with pytest.raises(SuccessionChainError, match="VM linkage broken"):
+        build_chain([first, second])
+
+
+def test_non_string_linkage_did_is_a_rejection_not_an_exception(
+    first_succession, second_succession,
+):
+    """An unhashable DID shared by two linked statements used to raise
+    TypeError while building the chain-internal resolver."""
+    from dataclasses import replace
+
+    bad_did = [first_succession.successor_did]
+    chain = build_chain([
+        replace(first_succession, successor_did=bad_did),
+        replace(second_succession, predecessor_did=bad_did),
+    ])
+    result = verify_chain_signatures(
+        chain, did_web_resolver=_tip_resolver_for_chain(chain),
+    )
+    assert not result.ok
+    assert "DID must be a non-empty string" in result.reason
+
+
+def test_build_chain_linkage_still_matches_identical_vm_sets(
+    first_succession, second_succession,
+):
+    """The type-safe linkage key keeps identical sets equal (including a VM
+    without an id) and order-insensitive."""
+    from dataclasses import replace
+
+    extra = {"publicKeyMultibase": "z6Mk"}
+    first = replace(
+        first_succession,
+        successor_verification_methods=[
+            *first_succession.successor_verification_methods, extra,
+        ],
+    )
+    second = replace(
+        second_succession,
+        predecessor_verification_methods=[
+            extra, *reversed(second_succession.predecessor_verification_methods),
+        ],
+    )
+    assert len(build_chain([first, second])) == 2

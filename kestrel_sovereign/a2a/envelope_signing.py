@@ -546,6 +546,14 @@ async def verify_inbound_envelope(
         return EnvelopeVerification(
             ok=False, reason=f"cannot resolve sender DID {sender!r}"
         )
+    # A resolved document is external material: anything but an object is a
+    # rejection, not an AttributeError the endpoint would turn into a 500.
+    # Malformed contents (verification methods, signature entries) are
+    # rejected by the shared signature verifier inside verify_envelope.
+    if not isinstance(did_document, Mapping):
+        return EnvelopeVerification(
+            ok=False, reason="sender DID document is not an object"
+        )
     try:
         document_fingerprint = verification_document_fingerprint(did_document)
     except (TypeError, ValueError, UnicodeEncodeError):
