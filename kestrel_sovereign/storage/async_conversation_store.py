@@ -37,6 +37,7 @@ from .session_grouping import (
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    is_human_turn,
     session_cursor_values,
     sort_sessions,
     summarize_sessions,
@@ -4400,6 +4401,34 @@ class AsyncConversationStore:
         body at request time, and a pointer at a row that has since gone
         resolves to nothing rather than to a stale excerpt.
 
+        **Whether a person took part is read from history, not the cache.**
+        The preview row is the session's first human turn, so its presence is
+        what the list reports as ``has_human_turn`` and what the chat console's
+        auto-open trusts (#3653). The projection is only as current as its
+        last repair, and a continuation page does not repair at all, so a
+        session whose recorded human turn is absent, or no longer live, is
+        looked up again in history (:meth:`_first_human_turns`):
+
+        * in the rows above the projection's frontier, when nothing at or below
+          it has moved since it was written
+          (:meth:`~.conversation_sessions.ConversationSessionProjection.unchanged_below`).
+          The cache is then exact about every row below, and what it does not
+          describe yet is only what was appended since;
+        * in the session's whole live history otherwise. A trashed preview row
+          leaves the session's other human turns below the frontier, and a
+          restored one puts a human turn there that the cache never saw.
+
+        Which rows are human turns is decided by the same function the
+        projection's own pick runs, and a change to that function renames the
+        projection's change triggers and so rebuilds every stored projection
+        (``conversation_sessions._grouping_source``): a cache built under an
+        older definition is not read as if it were this one's. A pointer that
+        still resolves is taken as it stands. The search only ever adds a human
+        turn the cache lacks, so a session the cache got right from rows this
+        search cannot see (legacy rows with no ``session_id`` column) keeps its
+        answer. Counts and ``last_message_at`` can still lag; that lag is the
+        cache's contract and is not repaired here.
+
         **Repair runs on the first page only.** The list must be current, and
         the projection is a cache that knows how far behind it is — three
         primary-key reads answer that, at any size of history. Repeating it per
@@ -4435,22 +4464,42 @@ class AsyncConversationStore:
         # One more than asked for, which is how "is there another page" is
         # answered without a second query and without a COUNT over the whole
         # table — the cost this table exists to remove.
-        rows, _ = await self._page_a_whole_projection(
+        rows, accounted = await self._page_a_whole_projection(
             projection, limit=bounded + 1, after=after, refresh=after is None
         )
         has_more = len(rows) > bounded
         rows = rows[:bounded]
 
+        pointers = {row["session_id"]: row["first_user_message_id"] for row in rows}
         previews = await self._preview_rows(
-            [
-                row["first_user_message_id"]
-                for row in rows
-                if row["first_user_message_id"] is not None
-            ],
+            [pointer for pointer in pointers.values() if pointer is not None],
             live_history_predicate(),
             agent_id=agent,
         )
-        sessions = [self._as_listed_session(row, previews) for row in rows]
+        missing = [sid for sid, pointer in pointers.items() if pointer not in previews]
+        if missing:
+            # Where to look for a human turn the cache does not record. Asked
+            # AFTER the pointers were resolved, so a row that left history
+            # before they were read is a movement this sees.
+            above = (
+                accounted.target
+                if await projection.unchanged_below(accounted)
+                else 0
+            )
+            found = await self._first_human_turns(missing, above=above, agent_id=agent)
+            if found:
+                previews.update(
+                    await self._preview_rows(
+                        list(found.values()), live_history_predicate(), agent_id=agent
+                    )
+                )
+                pointers.update(found)
+        sessions = [
+            self._as_listed_session(
+                row, previews, preview_id=pointers[row["session_id"]]
+            )
+            for row in rows
+        ]
         next_cursor = (
             encode_session_cursor(sessions[-1], "active")
             if has_more and sessions
@@ -4618,9 +4667,62 @@ class AsyncConversationStore:
             row[0]: (row[1], parse_message_metadata(row[2])) for row in rows
         }
 
+    async def _first_human_turns(
+        self,
+        session_ids: List[str],
+        *,
+        above: int,
+        agent_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """``{session_id: row id}`` of each session's first live human turn above ``above``.
+
+        ``above`` is a ``conversation_history.id``: the projection's frontier
+        when only the rows appended since it are in doubt, ``0`` when the
+        session's whole history is (#3653, see :meth:`list_session_page`).
+        Rows are matched by the indexed ``session_id`` column, which every
+        writer since #2958 stamps, and classified by :func:`is_human_turn`,
+        the same definition the projection's own preview pick used, so the
+        cache and this read cannot disagree about what a human turn is.
+
+        Read in bounded chunks of ``CHUNK_ROWS`` in id order, the order the
+        projection folds in, and finished the moment every session asked about
+        has an answer. Only metadata is read, never a message body. A session
+        with no human turn is read to its end, so the whole-history case costs
+        that session's history; it is taken only after rows below the frontier
+        moved since the last repair, which the next first page repairs.
+        """
+        from .conversation_sessions import CHUNK_ROWS, live_history_predicate
+
+        agent = agent_id or self.agent_id
+        remaining = set(session_ids)
+        found: Dict[str, Any] = {}
+        frontier = above
+        while remaining:
+            wanted = sorted(remaining)
+            placeholders = ",".join("?" for _ in wanted)
+            rows = await self.db.fetchall(
+                "SELECT id, session_id, role, metadata FROM conversation_history "
+                f"WHERE agent_id = ? AND id > ? AND session_id IN ({placeholders}) "
+                f"AND {live_history_predicate()} ORDER BY id LIMIT ?",
+                (agent, frontier, *wanted, CHUNK_ROWS),
+            )
+            for row_id, session_id, role, metadata in rows:
+                if session_id in remaining and is_human_turn(
+                    role, parse_message_metadata(metadata)
+                ):
+                    found[session_id] = row_id
+                    remaining.discard(session_id)
+            if len(rows) < CHUNK_ROWS:
+                break
+            frontier = rows[-1][0]
+        return found
+
     @staticmethod
     def _as_listed_session(
-        row: Dict[str, Any], previews: Dict[Any, Tuple[Any, Dict[str, Any]]]
+        row: Dict[str, Any],
+        previews: Dict[Any, Tuple[Any, Dict[str, Any]]],
+        *,
+        preview_id: Any = None,
     ) -> Dict[str, Any]:
         """One projection row shaped exactly as the grouper shapes a session.
 
@@ -4632,8 +4734,14 @@ class AsyncConversationStore:
         that cannot be read is passed through as text rather than dropped: it is
         wrong to show, but it is what the row says, and a ``None`` here would
         move the session to the end of the list on the strength of a spelling.
+
+        ``preview_id`` names the preview row when the caller found one in
+        history that the projection's pointer does not name (#3653); by default
+        the pointer is used.
         """
-        content, metadata = previews.get(row["first_user_message_id"], (None, {}))
+        if preview_id is None:
+            preview_id = row["first_user_message_id"]
+        content, metadata = previews.get(preview_id, (None, {}))
         return {
             "session_id": row["session_id"],
             "started_at": iso_session_timestamp(row["started_at"]),

@@ -889,8 +889,13 @@ stamps every row that opens a turn, through the normal turn body, the streamed
 one and the bootstrap discovery flow alike: a signal wake with its
 `signal_wake` tag, every other turn with `turn_opener: "person"`. A
 `signal_wake` tag marks an autonomous wake, so an agent's self-chaining
-session is never joined this way; only the `turn_opener: "person"` stamp marks
-a person's turn. Anything else is not evidence of either and mints a fresh
+session is never joined this way. A person's turn is marked by the
+`turn_opener: "person"` stamp, or by a `channel.message` wake: a message a
+person sent on a channel reaches the agent as that wake, and the channel
+feature dispatches only senders its policy admitted (#3653). What counts as a
+human turn at all is one definition, `session_grouping.is_human_turn`, which
+the conversation list also uses; this rule adds the demand for positive
+evidence on top of it. Anything else is not evidence of either and mints a fresh
 session: an opener carrying neither mark (every row written before the stamp
 existed, when an untagged wake looked exactly like a person's turn),
 unreadable metadata, or no opening row among the newest
@@ -900,6 +905,24 @@ session-less operator turn sent within 30 minutes of a deploy that adds the
 stamp therefore starts a fresh session once. The chat console never
 relies on any of this for its own turns: a pane about to send without a
 session mints one first.
+
+The conversation list reports, per session, `has_human_turn`: whether any of
+its live rows is a human turn by that same definition (an unstamped legacy row
+counts there; only the join asks for evidence). The flag and the "Autonomous
+wake" preview label are one fact: the preview row is the session's first human
+turn. A session whose first human turn is a channel message is titled
+"Inbound message — channel.message", because that row holds the wake's
+template rather than what was sent. The list reads the session projection,
+which can lag history, so a session it records without a live human turn is
+looked up again in history: in the rows appended above the projection's
+frontier while nothing below it has moved, and in the session's whole live
+history once something has (a trashed or restored row). The definition is part
+of what the projection is named for, so a release that changes it rebuilds
+every stored projection rather than reading one built under the old rule. The
+chat console auto-opens the most recent session with `has_human_turn: true` on
+page load and agent switch, following the list's continuation cursor past page
+one until it finds one or the list ends, and opens nothing if there is none;
+autonomous sessions stay listed and open on click (#3653).
 
 The `session_id` is stored in the message's metadata JSON. Callers that
 need session-scoped retrieval can pass the same `session_id` to

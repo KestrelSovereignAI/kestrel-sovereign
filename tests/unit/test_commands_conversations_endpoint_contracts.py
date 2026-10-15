@@ -1,12 +1,10 @@
 """Focused contract tests for commands and conversations endpoints."""
 
-import time
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -243,6 +241,265 @@ async def test_conversations_endpoint_labels_a_wake_only_session_autonomous(tmp_
         # Raw picker fields are consumed by the decorator, never serialized.
         assert "preview_wake_source" not in sessions[0]
         assert "preview_content" not in sessions[0]
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+def _person_meta(session_id):
+    return json.dumps({"session_id": session_id, "turn_opener": "person"})
+
+
+def _plain_meta(session_id):
+    return json.dumps({"session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_the_list_says_which_sessions_a_person_took_part_in(tmp_path):
+    """#3653: the chat console auto-opens the newest session a person took part
+    in, so the list must say which those are. A wake-only autonomous chain is
+    the newest session of an agent that chains its own work; it is listed like
+    any other but carries ``has_human_turn: false``.
+
+    A person's channel message reaches the agent as a ``channel.message`` wake
+    and counts; A2A inbound and the agent's own wakes do not; an operator
+    notice is never a turn; a row written before #3654 stamped persons still
+    counts.
+    """
+    now = datetime(2026, 10, 15, 9, 0, 0)
+    notice = json.dumps({"session_id": "notice-only", "operator_signal": True})
+    storage, wrapped = await _seeded_list_storage(tmp_path, "human-turn.db", [
+        ("user", "[TALON_JOB_COMPLETE] ...", _wake_meta("chain"), now + timedelta(hours=9)),
+        ("assistant", "merged it", _plain_meta("chain"), now + timedelta(hours=9, minutes=1)),
+        ("user", "can you check the deploy", _person_meta("operator"), now + timedelta(hours=7)),
+        ("assistant", "on it", _plain_meta("operator"), now + timedelta(hours=7, minutes=1)),
+        ("user", "[CHANNEL_MESSAGE] ...", _wake_meta("telegram", "channel.message"), now + timedelta(hours=5)),
+        ("assistant", "replied", _plain_meta("telegram"), now + timedelta(hours=5, minutes=1)),
+        ("user", "[A2A_TASK_SUBMITTED] ...", _wake_meta("peer", "a2a.task_submitted"), now + timedelta(hours=3)),
+        ("assistant", "done", _plain_meta("peer"), now + timedelta(hours=3, minutes=1)),
+        ("user", "[budget notice]", notice, now + timedelta(hours=2)),
+        ("user", "an old conversation", _plain_meta("legacy"), now),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        response = _listed(app, "?limit=10")
+        assert response.status_code == 200
+        listed = {s["session_id"]: s for s in response.json()["conversations"]}
+        assert {sid: s["has_human_turn"] for sid, s in listed.items()} == {
+            "chain": False,
+            "operator": True,
+            "telegram": True,
+            "peer": False,
+            "notice-only": False,
+            "legacy": True,
+        }
+        # The flag and the "Autonomous wake" label are one fact.
+        assert listed["chain"]["preview"] == "Autonomous wake — talon.job_complete"
+        assert listed["peer"]["preview"] == "Autonomous wake — a2a.task_submitted"
+        assert listed["operator"]["preview"] == "can you check the deploy"
+        # A channel message's row holds the wake template, not what was sent,
+        # so it is named for how it arrived rather than titled with it.
+        assert listed["telegram"]["preview"] == "Inbound message — channel.message"
+        # Newest first, autonomous sessions included: the list is unchanged.
+        assert [s["session_id"] for s in response.json()["conversations"]][:2] == [
+            "chain", "operator",
+        ]
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+async def _append(storage, role, content, metadata, created_at):
+    """A row written after the projection's last repair, as a writer files it."""
+    await storage.db.execute_commit(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, session_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (LIST_AGENT, role, content, metadata, column_session_id(metadata), created_at),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_human_turn_the_stale_projection_has_not_seen_still_counts(tmp_path):
+    """#3653: the flag is read from history, not from the session cache.
+
+    A continuation page does not repair the projection (moving keys under a
+    cursor skips rows), so it serves counts and ``last_message_at`` from the
+    last repair. A person's turn written into a wake-only session after that
+    repair must still mark the session, or the console would pass over the
+    conversation the operator is actually having.
+    """
+    now = datetime(2026, 10, 15, 9, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "stale-human.db", [
+        ("user", "[TALON_JOB_COMPLETE] ...", _wake_meta("older-chain"), now),
+        ("assistant", "noted", _plain_meta("older-chain"), now + timedelta(minutes=1)),
+        ("user", "[TALON_JOB_COMPLETE] ...", _wake_meta("newer-chain"), now + timedelta(hours=2)),
+        ("assistant", "noted", _plain_meta("newer-chain"), now + timedelta(hours=2, minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        first = _listed(app, "?limit=1")  # page one repairs the projection
+        assert first.status_code == 200
+        assert [s["session_id"] for s in first.json()["conversations"]] == ["newer-chain"]
+        token = first.json()["next_cursor"]
+        assert token
+
+        await _append(
+            storage, "user", "actually, hold that merge",
+            _person_meta("older-chain"), now + timedelta(hours=3),
+        )
+        await _append(
+            storage, "user", "and ping me after",
+            _person_meta("older-chain"), now + timedelta(hours=3, minutes=1),
+        )
+
+        second = _listed(app, f"?limit=1&cursor={token}")
+        assert second.status_code == 200
+        [session] = second.json()["conversations"]
+        assert session["session_id"] == "older-chain"
+        # The projection really is behind history: four rows, it counts two,
+        # and its last activity predates the appended turns.
+        assert session["message_count"] == 2
+        assert session["last_message_at"] < (now + timedelta(hours=3)).isoformat()
+        # ...and the person's first turn is found anyway, and titles it.
+        assert session["has_human_turn"] is True
+        assert session["preview"] == "actually, hold that merge"
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_human_turn_trashed_since_the_last_repair_no_longer_counts(tmp_path):
+    """The other direction: the projection still points at the session's only
+    human turn, but that row has been trashed since its last repair. The
+    pointer is resolved against live history, so the session is not reported
+    as one a person took part in on the strength of a row that is gone."""
+    now = datetime(2026, 10, 15, 9, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "stale-trashed.db", [
+        ("user", "a question", _person_meta("operator"), now),
+        ("assistant", "an answer", _plain_meta("operator"), now + timedelta(minutes=1)),
+        ("user", "[TALON_JOB_COMPLETE] ...", _wake_meta("chain"), now + timedelta(hours=2)),
+        ("assistant", "noted", _plain_meta("chain"), now + timedelta(hours=2, minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        first = _listed(app, "?limit=1")
+        assert first.status_code == 200
+        token = first.json()["next_cursor"]
+        assert token
+
+        await storage.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = ? "
+            "WHERE agent_id = ? AND content = ?",
+            (now + timedelta(hours=3), LIST_AGENT, "a question"),
+        )
+
+        second = _listed(app, f"?limit=1&cursor={token}")
+        assert second.status_code == 200
+        [session] = second.json()["conversations"]
+        assert session["session_id"] == "operator"
+        assert session["message_count"] == 2, "the projection has not been repaired"
+        assert session["has_human_turn"] is False
+
+        # A pointer that no longer resolves is not the last word either: the
+        # person asks again, still unseen by the cache, and the session counts.
+        await _append(
+            storage, "user", "asking again", _person_meta("operator"),
+            now + timedelta(hours=4),
+        )
+        third = _listed(app, f"?limit=1&cursor={token}")
+        assert third.status_code == 200
+        [session] = third.json()["conversations"]
+        assert session["message_count"] == 2, "the projection has not been repaired"
+        assert session["has_human_turn"] is True
+        assert session["preview"] == "asking again"
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_trashing_the_first_human_turn_leaves_the_others_counted(tmp_path):
+    """The projection points at a session's FIRST human turn. Trash that one
+    since its last repair and the session's other human turns are still there,
+    below the projection's frontier, where a search of only the rows appended
+    since would not look. A movement below the frontier makes the session's
+    whole live history the place to look."""
+    now = datetime(2026, 10, 15, 9, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "trash-first-human.db", [
+        ("user", "a question", _person_meta("operator"), now),
+        ("assistant", "an answer", _plain_meta("operator"), now + timedelta(minutes=1)),
+        ("user", "a follow-up", _person_meta("operator"), now + timedelta(minutes=2)),
+        ("assistant", "another answer", _plain_meta("operator"), now + timedelta(minutes=3)),
+        ("user", "[TALON_JOB_COMPLETE] ...", _wake_meta("chain"), now + timedelta(hours=2)),
+        ("assistant", "noted", _plain_meta("chain"), now + timedelta(hours=2, minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        first = _listed(app, "?limit=1")
+        assert first.status_code == 200
+        token = first.json()["next_cursor"]
+        assert token
+
+        await storage.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = ? "
+            "WHERE agent_id = ? AND content = ?",
+            (now + timedelta(hours=3), LIST_AGENT, "a question"),
+        )
+
+        second = _listed(app, f"?limit=1&cursor={token}")
+        assert second.status_code == 200
+        [session] = second.json()["conversations"]
+        assert session["session_id"] == "operator"
+        assert session["message_count"] == 4, "the projection has not been repaired"
+        assert session["has_human_turn"] is True
+        assert session["preview"] == "a follow-up"
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_human_turn_restored_since_the_last_repair_counts(tmp_path):
+    """The other movement below the frontier: a person's turn that was in the
+    Trash when the projection was built, restored since. It is not above the
+    frontier, and the cache recorded the session without it."""
+    now = datetime(2026, 10, 15, 9, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "restore-human.db", [
+        ("user", "[TALON_JOB_COMPLETE] ...", _wake_meta("older"), now),
+        ("user", "wait, stop that", _person_meta("older"), now + timedelta(minutes=1)),
+        ("assistant", "stopped", _plain_meta("older"), now + timedelta(minutes=2)),
+        ("user", "[TALON_JOB_COMPLETE] ...", _wake_meta("chain"), now + timedelta(hours=2)),
+        ("assistant", "noted", _plain_meta("chain"), now + timedelta(hours=2, minutes=1)),
+    ])
+    await storage.db.execute_commit(
+        "UPDATE conversation_history SET deleted_at = ? WHERE agent_id = ? AND content = ?",
+        (now + timedelta(hours=1), LIST_AGENT, "wait, stop that"),
+    )
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        first = _listed(app, "?limit=1")
+        assert first.status_code == 200
+        token = first.json()["next_cursor"]
+        assert token
+        peek = _listed(app, f"?limit=1&cursor={token}")
+        [session] = peek.json()["conversations"]
+        assert session["has_human_turn"] is False, "the person's turn is in the Trash"
+
+        await storage.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = NULL "
+            "WHERE agent_id = ? AND content = ?",
+            (LIST_AGENT, "wait, stop that"),
+        )
+
+        second = _listed(app, f"?limit=1&cursor={token}")
+        assert second.status_code == 200
+        [session] = second.json()["conversations"]
+        assert session["session_id"] == "older"
+        assert session["message_count"] == 2, "the projection has not been repaired"
+        assert session["has_human_turn"] is True
+        assert session["preview"] == "wait, stop that"
     finally:
         _restore_app(app, original)
         await storage.close()
