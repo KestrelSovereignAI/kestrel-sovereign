@@ -171,6 +171,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     optional_durable_persistence_gate,
 )
 from kestrel_sovereign.storage.session_id_column import new_session_id
+from kestrel_sovereign.storage.turn_provenance import WakeReplyReceipt
 from kestrel_sovereign.telemetry import (
     capture_turn_ids,
     KESTREL_AGENT_NAME,
@@ -210,6 +211,11 @@ _DURABLE_COGNITION_RETRY_DELAY = timedelta(seconds=1)
 
 
 _PROMPT_TEMPLATE_HASH_ATTR = "_kestrel_prompt_template_hash"
+# The stored row holding a COGNITION wake's reply, set by the dispatch that ran
+# the turn and read by its outcome writer for the ``signal_completed`` event
+# (#3655). Reset at the start of every cognition dispatch, so a redelivered
+# signal never carries an earlier attempt's row.
+_REPLY_MESSAGE_ID_ATTR = "_kestrel_reply_message_id"
 
 
 class _DurableDeliveryShuttingDownError(RuntimeError):
@@ -5413,6 +5419,7 @@ class SignalDispatcher:
         audit: "_ConstitutionAudit",
     ) -> SignalResult:
         route_owner_task = asyncio.current_task()
+        setattr(signal, _REPLY_MESSAGE_ID_ATTR, None)
         if audit.drift_error is not None:
             record_doctrine_bundle_drift(signal.source)
             return self._fail(
@@ -5995,6 +6002,15 @@ class SignalDispatcher:
                 "mode": signal.mode.value,
             }
 
+        # The event's ``result_summary`` is capped, so the chat console loads a
+        # long reply from the row that stores it (#3655). The turn names that
+        # row here: by this wake's own stamp, never "the newest reply in the
+        # session", which in an autonomous chain can be another wake's.
+        wake_reply: Optional[WakeReplyReceipt] = None
+        if _agent_accepts_kwarg(self._agent.process_input, "wake_reply"):
+            wake_reply = WakeReplyReceipt(signal_id=signal.id)
+            process_input_kwargs["wake_reply"] = wake_reply
+
         execution_withdrawal = None
         pre_turn_refusal: Optional[str] = None
         injection_tracking = None
@@ -6037,6 +6053,9 @@ class SignalDispatcher:
             finally:
                 if clear_chain is not None:
                     clear_chain(token)
+
+        if wake_reply is not None:
+            setattr(signal, _REPLY_MESSAGE_ID_ATTR, wake_reply.message_id)
 
         if pre_turn_refusal is not None:
             return self._fail(
@@ -6666,7 +6685,12 @@ class SignalDispatcher:
         if emit is None:
             self._record_surface(signal.id, SURFACE_NO_EMITTER)
             return
-        payload = _build_ui_event_payload(signal, result, result_summary)
+        payload = _build_ui_event_payload(
+            signal,
+            result,
+            result_summary,
+            reply_message_id=getattr(signal, _REPLY_MESSAGE_ID_ATTR, None),
+        )
         try:
             receipt = await emit("signal_completed", payload)
         except Exception:
@@ -6738,6 +6762,8 @@ def _build_ui_event_payload(
     signal: Signal,
     result: SignalResult,
     result_summary: Optional[str],
+    *,
+    reply_message_id: Optional[int] = None,
 ) -> dict:
     """Construct the JSON payload shape for the UI side-channel event.
 
@@ -6758,7 +6784,16 @@ def _build_ui_event_payload(
     The full raw artifact / action_result is NEVER included — the
     per-source `result_summary` callback controls what becomes
     user-visible, with a hard byte cap as defense in depth.
+
+    That cap, and the per-source callbacks that shorten the text further,
+    mean the summary is often not the whole result (#3655).
+    `result_summary_complete` is true only when the summary IS the result
+    text, verbatim; a consumer must not present any other summary as the
+    result. For a COGNITION wake, `reply_message_id` is the id of the stored
+    conversation row holding the reply, from which a consumer loads the
+    whole text. It is None when the reply was not stored durably.
     """
+    body = result.artifact if result.artifact is not None else result.action_result
     return {
         "signal_id": signal.id,
         "source": signal.source,
@@ -6773,6 +6808,12 @@ def _build_ui_event_payload(
         "duration_ms": result.duration_ms,
         "error": result.error,
         "result_summary": result_summary,
+        "result_summary_complete": (
+            result_summary is not None
+            and isinstance(body, str)
+            and result_summary == body
+        ),
+        "reply_message_id": reply_message_id,
         "arrived_at": signal.arrived_at.isoformat(),
     }
 

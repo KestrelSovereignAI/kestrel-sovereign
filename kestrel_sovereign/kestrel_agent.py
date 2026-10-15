@@ -142,7 +142,12 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.storage.turn_provenance import turn_opener_metadata
+from kestrel_sovereign.storage.db.interface import DatabaseError
+from kestrel_sovereign.storage.turn_provenance import (
+    WakeReplyReceipt,
+    turn_opener_metadata,
+    wake_reply_metadata,
+)
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
@@ -7193,6 +7198,7 @@ Expected Duration: {expected_duration}
         *,
         signal_wake: Optional[dict] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
+        wake_reply: Optional[WakeReplyReceipt] = None,
     ) -> Optional[str]:
         """
         Handle bootstrap/discovery flow for first-time agent wake-up.
@@ -7201,6 +7207,8 @@ Expected Duration: {expected_duration}
         for a turn sent to the agent. The user row bootstrap persists opens
         the turn, so it carries the same provenance as the normal path's
         (#3654): an untagged wake would read as a person's conversation.
+        ``wake_reply`` is stamped on the row holding the text this returns,
+        the wake's reply (#3655).
 
         Returns:
             Response string if in bootstrap mode, None if should continue to normal processing
@@ -7236,7 +7244,7 @@ Expected Duration: {expected_duration}
                 session_id=session_id,
             )
             await self._persist_assistant_conversation(
-                wake_up_msg, session_id=session_id,
+                wake_up_msg, session_id=session_id, wake_reply=wake_reply,
             )
 
             logging.info(f"[BOOTSTRAP] Agent waking up - entering discovery mode")
@@ -7324,6 +7332,9 @@ Expected Duration: {expected_duration}
                 session_id=session_id,
                 response=response,
                 use_last_identity=True,
+                # A completed discovery returns the completion message below,
+                # so that row, not this one, is the wake's reply.
+                wake_reply=None if is_complete else wake_reply,
             )
 
             if is_complete:
@@ -7347,6 +7358,7 @@ Expected Duration: {expected_duration}
 
                     await self._persist_assistant_conversation(
                         completion_msg, session_id=session_id,
+                        wake_reply=wake_reply,
                     )
                     await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                     # Reload SOUL.md into context builder
@@ -7361,6 +7373,7 @@ Expected Duration: {expected_duration}
                     completion_msg = await self.bootstrap_service.complete_bootstrap()
                     await self._persist_assistant_conversation(
                         completion_msg, session_id=session_id,
+                        wake_reply=wake_reply,
                     )
                     await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                     # Reload SOUL.md into context builder
@@ -7401,7 +7414,7 @@ Expected Duration: {expected_duration}
         return None
 
     @bind_async_invocation("invocation_id", track_request_lifecycle=True)
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, pre_turn_guard=None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, pre_turn_guard=None, *, invocation_id: Optional[str] = None, invocation_provenance=None, wake_reply: Optional[WakeReplyReceipt] = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -7449,6 +7462,10 @@ Expected Duration: {expected_duration}
             invocation_provenance: Endpoint-owned authenticated actor and
                 transport metadata. This is task-local only; tools cannot
                 provide or override it through their arguments.
+            wake_reply: Supplied by the SignalDispatcher for a COGNITION wake
+                (#3655). The row holding this turn's reply is stamped with the
+                receipt's signal id, and the receipt records that row's id, so
+                the ``signal_completed`` event can name the stored reply.
         """
         from kestrel_sovereign.hold import require_turn_start_allowed
 
@@ -7636,6 +7653,7 @@ Expected Duration: {expected_duration}
                                     user_input, session_id,
                                     signal_wake=signal_wake,
                                     invocation_context=invocation_context,
+                                    wake_reply=wake_reply,
                                 )
                                 if bootstrap_response:
                                     # Bootstrap persists real conversation rows and must
@@ -7684,6 +7702,7 @@ Expected Duration: {expected_duration}
                             anchored_doctrine=anchored_doctrine,
                             signal_wake=signal_wake,
                             invocation_context=invocation_context,
+                            wake_reply=wake_reply,
                         )
             except BaseException as exc:
                 # BaseException, not Exception: a Stop and a host shutdown
@@ -7866,13 +7885,21 @@ Expected Duration: {expected_duration}
         model: Optional[str] = None,
         provider: Optional[str] = None,
         use_last_identity: bool = False,
+        wake_reply: Optional[WakeReplyReceipt] = None,
     ) -> None:
-        """Persist an assistant row with resolved model/provider columns."""
+        """Persist an assistant row with resolved model/provider columns.
+
+        With ``wake_reply`` the row is a signal wake's reply: it is stamped
+        with the wake's signal id, and the receipt records the stored row's
+        id (#3655).
+        """
         identity = self._conversation_response_identity(
             response,
             use_last_identity=use_last_identity or response is not None,
         )
         kwargs = {"session_id": session_id}
+        if wake_reply is not None:
+            metadata = {**(metadata or {}), **wake_reply_metadata(wake_reply.signal_id)}
         if metadata:
             kwargs["metadata"] = metadata
         resolved_model = model or identity.get("model")
@@ -7887,6 +7914,34 @@ Expected Duration: {expected_duration}
             **kwargs,
         )
         mark_current_invocation_effect_checkpointed()
+        if wake_reply is not None:
+            wake_reply.message_id = await self._stored_wake_reply_id(
+                wake_reply.signal_id
+            )
+
+    async def _stored_wake_reply_id(self, signal_id: str) -> Optional[int]:
+        """The id of the row just stored as ``signal_id``'s reply, if any.
+
+        Asked only when the privacy agent stored the row durably. Otherwise a
+        row an earlier delivery of the same wake stored would answer for a
+        reply this turn kept only in memory.
+
+        The reply is already stored, and the id only tells the chat console
+        where to load it from. A read that fails leaves no id: the console
+        then shows its truncated-preview notice rather than presenting the
+        event's capped summary as the reply. It must not fail the turn, which
+        the dispatcher would record as an undelivered wake.
+        """
+        if not self.privacy_agent.can_store("conversation"):
+            return None
+        try:
+            return await self.storage.find_signal_wake_reply_id(signal_id)
+        except DatabaseError:
+            logging.warning(
+                "Could not read back the stored reply to signal %s", signal_id,
+                exc_info=True,
+            )
+            return None
 
     async def _maybe_compact_codex_thread(
         self, session_id: Optional[str],
@@ -7973,6 +8028,7 @@ Expected Duration: {expected_duration}
         anchored_doctrine=None,
         signal_wake: Optional[dict] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
+        wake_reply: Optional[WakeReplyReceipt] = None,
     ) -> str:
         """Inner process_input logic wrapped in an OTEL span.
 
@@ -8563,6 +8619,7 @@ Expected Duration: {expected_duration}
             session_id=session_id,
             metadata=semantic_recall_metadata,
             response=response,
+            wake_reply=wake_reply,
         )
 
         # Post-response memory pipeline:

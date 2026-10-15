@@ -576,6 +576,25 @@ included in the `signal_completed` SSE payload AND persisted to
 `signal_log.result_summary`. Consumers can render it inline. The raw
 artifact / action_result is NEVER on the wire.
 
+The bounded text is often not the whole result: the byte cap cuts it, and
+some callbacks shorten it further (`self_followup`, `a2a.task_complete`). The
+payload says which (#3655):
+
+- `result_summary_complete` is true only when the summary is the result text
+  verbatim. A consumer must not present any other summary as the result.
+- `reply_message_id`, on a COGNITION wake, is the id of the stored
+  conversation row holding the turn's reply. The turn stamps that row with
+  `signal_wake_reply = <signal id>`, so the id names this wake's reply even
+  when another wake's reply is newer in the same session. It is `null` when
+  the reply was not stored durably (EPHEMERAL, ISOLATED, DEIDENTIFIED).
+
+The chat console renders a complete summary as the reply. Otherwise it shows
+the summary labelled as a truncated preview, loads the full reply from
+`GET /api/conversations/messages/{reply_message_id}` (retrying briefly, since
+the event can arrive before the row is readable), and keeps the label with a
+"Load full message" action if the row cannot be read. Every source gets both
+fields from the dispatcher; no per-source change is needed.
+
 ### Session-bound wakes (routing authority is local)
 
 A COGNITION wake with no `Signal.session_id` opens a *fresh* chat

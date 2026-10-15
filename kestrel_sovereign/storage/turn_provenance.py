@@ -24,11 +24,19 @@ What counts as a person's turn at all is not decided here.
 :func:`~kestrel_sovereign.storage.session_grouping.is_human_turn` is the one
 definition, shared with the conversation list (#3653); this module adds only
 the demand for positive evidence on top of it.
+
+The reply that closes a wake's turn records its provenance too (#3655): the
+``assistant`` row carries ``signal_wake_reply = <signal id>``, so the row that
+holds one wake's reply can be found by that wake rather than by position. The
+``signal_completed`` event carries the row's id (:class:`WakeReplyReceipt`), and
+the chat console loads the full reply from it instead of showing the event's
+capped summary as the reply.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from kestrel_sovereign.storage.session_grouping import (
@@ -54,6 +62,33 @@ PERSON_OPENER = "person"
 #: A session whose opening row lies outside it cannot be classified, and is
 #: not joined.
 LATEST_TURN_SCAN_ROWS = 50
+
+#: Metadata key the ``assistant`` row replying to a signal wake is stamped
+#: with. Its value is the wake's signal id.
+SIGNAL_WAKE_REPLY_KEY = "signal_wake_reply"
+
+
+@dataclass
+class WakeReplyReceipt:
+    """Which stored row holds the reply to one signal wake (#3655).
+
+    The dispatcher hands one to ``process_input`` for a COGNITION wake. The
+    turn stamps its reply row with ``signal_id`` and records that row's id in
+    ``message_id``. It stays ``None`` when the reply was not stored (a privacy
+    mode that keeps nothing durable, a turn that ended before replying) or
+    when the row could not be read back.
+    """
+
+    signal_id: str
+    message_id: Optional[int] = None
+
+
+def wake_reply_metadata(signal_id: str) -> Dict[str, Any]:
+    """The provenance a wake's reply row is persisted with.
+
+    Returns a new dict on every call, so a caller may merge it into its own.
+    """
+    return {SIGNAL_WAKE_REPLY_KEY: signal_id}
 
 
 def turn_opener_metadata(signal_wake: Optional[Dict[str, Any]]) -> Dict[str, Any]:

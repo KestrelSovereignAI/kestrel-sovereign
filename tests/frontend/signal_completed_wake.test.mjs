@@ -39,7 +39,13 @@ function makeNode(tag = 'div') {
         },
         dataset: {}, style: {}, _innerHTML: '', textContent: '',
         scrollTop: 0, scrollHeight: 0, value: '', disabled: false,
-        addEventListener() {},
+        _listeners: {},
+        addEventListener(type, handler) {
+            (this._listeners[type] = this._listeners[type] || []).push(handler);
+        },
+        click() {
+            for (const handler of this._listeners.click || []) handler({});
+        },
         querySelector(sel) {
             if (sel === '.message-content') {
                 for (const c of this.children) {
@@ -134,6 +140,8 @@ function wakePayload(overrides = {}) {
         visibility: 'user_visible',
         status: 'ok',
         result_summary: 'Meridian says the deploy is green.',
+        result_summary_complete: true,
+        reply_message_id: null,
         ...overrides,
     };
 }
@@ -348,4 +356,323 @@ test('a filtered wake is not consumed by the dedupe set', async () => {
     assert.ok(home.element.children.find(
         (c) => c.classList && c.classList.contains('signal-wake-message')),
         'a wake dropped for a session mismatch must stay renderable');
+});
+
+// #3655: `result_summary` is capped (2 KB on the event, less for sources that
+// shorten it themselves), so a long reply arrived cut off — and the bubble
+// presented the cut-off text as the reply. The dispatcher now says whether
+// the summary is the whole reply (`result_summary_complete`) and names the
+// stored row holding it (`reply_message_id`). The bubble loads the full reply
+// from that row, retrying briefly when the row is not readable yet, and
+// otherwise labels the summary a truncated preview with a load action.
+
+const TRUNCATED = 'After a time limit...(truncated)';
+const FULL_REPLY = 'After a time limit expires, the restart proceeds. ' + 'x'.repeat(3000);
+
+function truncatedWake(overrides = {}) {
+    return wakePayload({
+        source: 'restart.completed',
+        result_summary: TRUNCATED,
+        result_summary_complete: false,
+        reply_message_id: 4242,
+        ...overrides,
+    });
+}
+
+function wakeBubbles(pane) {
+    return pane.element.children.filter(
+        (c) => c.classList && c.classList.contains('signal-wake-message'));
+}
+
+function noticeOf(bubble) {
+    return bubble.children.find(
+        (c) => c.classList && c.classList.contains('signal-wake-truncation')) || null;
+}
+
+function noticeText(notice) {
+    return notice.children.map((c) => c.textContent).join(' ');
+}
+
+function loadButtonOf(notice) {
+    return notice.children.find(
+        (c) => c.classList && c.classList.contains('signal-wake-load-full')) || null;
+}
+
+// A fake `getMessage` that answers from a script: each entry is either the
+// stored row or an Error (the row not readable yet). Records every call.
+function scriptedGetMessage(script) {
+    const calls = [];
+    const fn = async (messageId, agent) => {
+        calls.push({ messageId, agent });
+        const next = script.length > 1 ? script.shift() : script[0];
+        if (next instanceof Error) throw next;
+        return next;
+    };
+    fn.calls = calls;
+    return fn;
+}
+
+function storedReply(content = FULL_REPLY, id = 4242) {
+    return { id, role: 'assistant', content, session_id: null, metadata: {} };
+}
+
+function notFound() {
+    const err = new Error('Message not found.');
+    err.status = 404;
+    return err;
+}
+
+async function flushMicrotasks() {
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+}
+
+// Drive a handler that awaits mocked timers: flush its microtasks, then
+// advance the mocked clock, until it settles. No real time passes.
+async function settleWithMockedTimers(t, promise) {
+    let done = false;
+    promise.then(() => { done = true; }, () => { done = true; });
+    for (let i = 0; i < 20 && !done; i++) {
+        await flushMicrotasks();
+        if (!done) t.mock.timers.tick(5000);
+    }
+    await promise;
+}
+
+function withGetMessage(t, fn) {
+    const api = apiModule.default;
+    const original = api.getMessage;
+    api.getMessage = fn;
+    t.after(() => { api.getMessage = original; });
+}
+
+test('truncated summary: the bubble shows the full stored reply', async (t) => {
+    const getMessage = scriptedGetMessage([storedReply()]);
+    withGetMessage(t, getMessage);
+    const pane = mountNotificationPane('wake-full-reply');
+    pane.sessionId = null;
+
+    await handleSignalCompleted(truncatedWake({ signal_id: 'full-1' }));
+
+    const [bubble] = wakeBubbles(pane);
+    assert.ok(bubble, 'the wake must render');
+    const content = bubble.querySelector('.message-content');
+    assert.equal(content.innerHTML, FULL_REPLY,
+        'the stored reply replaces the capped summary');
+    assert.ok(!content.classList.contains('signal-wake-preview'));
+    assert.equal(noticeOf(bubble), null,
+        'a resolved reply carries no truncation notice');
+    assert.equal(bubble.dataset.messageId, '4242');
+    assert.deepEqual(getMessage.calls, [{ messageId: 4242, agent: 'wake-full-reply' }],
+        'the reply is read by the id on the event, from the stream\'s agent');
+});
+
+test('truncated summary: the row read is retried until readable, without real sleeps', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const getMessage = scriptedGetMessage([notFound(), notFound(), storedReply()]);
+    withGetMessage(t, getMessage);
+    const pane = mountNotificationPane('wake-retry');
+    pane.sessionId = null;
+
+    const handled = handleSignalCompleted(truncatedWake({ signal_id: 'retry-1' }));
+    await flushMicrotasks();
+
+    // While the row is unreadable the summary is shown, labelled a preview.
+    const [bubble] = wakeBubbles(pane);
+    const content = bubble.querySelector('.message-content');
+    assert.equal(content.innerHTML, TRUNCATED);
+    assert.ok(content.classList.contains('signal-wake-preview'));
+    assert.match(noticeText(noticeOf(bubble)), /Truncated preview/,
+        'the capped summary is never presented as the reply');
+
+    await settleWithMockedTimers(t, handled);
+
+    assert.equal(getMessage.calls.length, 3);
+    assert.equal(content.innerHTML, FULL_REPLY);
+    assert.equal(noticeOf(bubble), null);
+});
+
+test('truncated summary: an unreadable row leaves a labelled preview with a load action', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const getMessage = scriptedGetMessage([notFound()]);
+    withGetMessage(t, getMessage);
+    const pane = mountNotificationPane('wake-unreadable');
+    pane.sessionId = null;
+
+    await settleWithMockedTimers(
+        t, handleSignalCompleted(truncatedWake({ signal_id: 'unreadable-1' })));
+
+    assert.equal(getMessage.calls.length, 4,
+        'one read plus three bounded retries, then it stops');
+    const [bubble] = wakeBubbles(pane);
+    const content = bubble.querySelector('.message-content');
+    assert.equal(content.innerHTML, TRUNCATED);
+    assert.ok(content.classList.contains('signal-wake-preview'));
+    const notice = noticeOf(bubble);
+    assert.match(noticeText(notice), /Truncated preview/);
+    const button = loadButtonOf(notice);
+    assert.ok(button, 'the bubble offers to load the full message');
+    assert.equal(button.textContent, 'Load full message');
+
+    // The row becomes readable; the load action fetches it.
+    getMessage.calls.length = 0;
+    const api = apiModule.default;
+    api.getMessage = scriptedGetMessage([storedReply()]);
+    button.click();
+    await flushMicrotasks();
+    assert.equal(content.innerHTML, FULL_REPLY);
+    assert.equal(noticeOf(bubble), null);
+});
+
+test('truncated summary with no stored row: preview label, load reopens the conversation', async (t) => {
+    const getMessage = scriptedGetMessage([storedReply()]);
+    withGetMessage(t, getMessage);
+    const loads = [];
+    const originalLoad = globalThis.window.loadConversation;
+    globalThis.window.loadConversation = (sessionId, options) => {
+        loads.push({ sessionId, options });
+    };
+    t.after(() => { globalThis.window.loadConversation = originalLoad; });
+
+    const pane = mountNotificationPane('wake-unstored');
+    pane.sessionId = 'sess-W';
+    await handleSignalCompleted(truncatedWake({
+        signal_id: 'unstored-1', session_id: 'sess-W', reply_message_id: null,
+    }));
+
+    assert.equal(getMessage.calls.length, 0, 'there is no row id to read');
+    const [bubble] = wakeBubbles(pane);
+    assert.equal(bubble.querySelector('.message-content').innerHTML, TRUNCATED);
+    const notice = noticeOf(bubble);
+    assert.match(noticeText(notice), /Truncated preview/);
+    const button = loadButtonOf(notice);
+    assert.ok(button);
+    button.click();
+    assert.deepEqual(loads, [{
+        sessionId: 'sess-W',
+        options: { force: true, expectedAgent: 'wake-unstored' },
+    }]);
+});
+
+test('an untruncated summary renders as the reply with no extra request', async (t) => {
+    const getMessage = scriptedGetMessage([storedReply()]);
+    withGetMessage(t, getMessage);
+    const pane = mountNotificationPane('wake-complete');
+    pane.sessionId = null;
+
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'complete-1',
+        result_summary: 'Short and whole.',
+        result_summary_complete: true,
+        reply_message_id: 77,
+    }));
+
+    assert.equal(getMessage.calls.length, 0,
+        'a summary that is the whole reply has nothing to fetch');
+    const [bubble] = wakeBubbles(pane);
+    assert.equal(bubble.querySelector('.message-content').innerHTML, 'Short and whole.');
+    assert.equal(noticeOf(bubble), null);
+});
+
+test('a summary not marked complete is never rendered as the reply', async (t) => {
+    // An event without the flag (or with any value but true) is a preview.
+    const getMessage = scriptedGetMessage([storedReply('The whole reply.', 9)]);
+    withGetMessage(t, getMessage);
+    const pane = mountNotificationPane('wake-unflagged');
+    pane.sessionId = null;
+
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'unflagged-1',
+        result_summary: 'The whole',
+        result_summary_complete: undefined,
+        reply_message_id: 9,
+    }));
+
+    const [bubble] = wakeBubbles(pane);
+    assert.equal(bubble.querySelector('.message-content').innerHTML, 'The whole reply.');
+});
+
+test('a redelivered truncated wake renders once, while its reply is still loading', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const getMessage = scriptedGetMessage([notFound(), storedReply()]);
+    withGetMessage(t, getMessage);
+    const pane = mountNotificationPane('wake-dedupe-loading');
+    pane.sessionId = null;
+
+    const first = handleSignalCompleted(truncatedWake({ signal_id: 'dupe-loading-1' }));
+    await flushMicrotasks();
+    await handleSignalCompleted(truncatedWake({ signal_id: 'dupe-loading-1' }));
+    await settleWithMockedTimers(t, first);
+
+    assert.equal(wakeBubbles(pane).length, 1);
+    assert.equal(getMessage.calls.length, 2, 'the redelivery issues no read of its own');
+});
+
+test('a pane that already shows the stored reply gets no second copy', async (t) => {
+    // History loaded after the reply was stored and before the event arrived.
+    const getMessage = scriptedGetMessage([storedReply()]);
+    withGetMessage(t, getMessage);
+    const pane = mountNotificationPane('wake-history-first');
+    pane.sessionId = 'sess-H';
+    const historical = makeNode();
+    historical.className = 'message agent-message';
+    historical.dataset.messageId = '4242';
+    pane.element.appendChild(historical);
+
+    await handleSignalCompleted(truncatedWake({
+        signal_id: 'history-first-1', session_id: 'sess-H',
+    }));
+
+    assert.equal(wakeBubbles(pane).length, 0);
+    assert.equal(getMessage.calls.length, 0);
+});
+
+test('a row that is not an assistant reply is never shown as the reply', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const getMessage = scriptedGetMessage([{
+        id: 4242, role: 'user', content: 'a wake prompt', metadata: {},
+    }]);
+    withGetMessage(t, getMessage);
+    const pane = mountNotificationPane('wake-wrong-role');
+    pane.sessionId = null;
+
+    await settleWithMockedTimers(
+        t, handleSignalCompleted(truncatedWake({ signal_id: 'wrong-role-1' })));
+
+    const [bubble] = wakeBubbles(pane);
+    assert.equal(bubble.querySelector('.message-content').innerHTML, TRUNCATED);
+    assert.match(noticeText(noticeOf(bubble)), /could not be loaded/);
+});
+
+test('an agent switch while the bubble renders still reads the reply from the waking agent', async (t) => {
+    // The stream is rebound to another agent when the user switches agents,
+    // and the handler awaits rendering before it reads the stored row. Each
+    // agent has its own database, so the same id can name an unrelated
+    // message in the other one: the read must target the agent whose stream
+    // announced the wake, captured before the first await.
+    const replies = {
+        'wake-switch-A': storedReply('Agent A full reply.', 4242),
+        'wake-switch-B': storedReply('Agent B unrelated message.', 4242),
+    };
+    const calls = [];
+    withGetMessage(t, async (messageId, agent) => {
+        calls.push({ messageId, agent });
+        return replies[agent];
+    });
+
+    const paneA = mountNotificationPane('wake-switch-A');
+    paneA.sessionId = null;
+    const handled = handleSignalCompleted(truncatedWake({ signal_id: 'switch-1' }));
+
+    // Switch to B before the handler has read the row.
+    assert.equal(calls.length, 0, 'the switch must land before the read');
+    const paneB = mountNotificationPane('wake-switch-B');
+    paneB.sessionId = null;
+    await handled;
+
+    assert.deepEqual(calls, [{ messageId: 4242, agent: 'wake-switch-A' }],
+        'the row is read from the agent that wrote it');
+    const [bubble] = wakeBubbles(paneA);
+    assert.ok(bubble, 'the wake renders into the waking agent\'s pane');
+    assert.equal(bubble.querySelector('.message-content').innerHTML, 'Agent A full reply.');
+    assert.equal(wakeBubbles(paneB).length, 0, 'nothing lands in the other agent\'s pane');
 });
