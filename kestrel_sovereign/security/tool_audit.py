@@ -14,12 +14,21 @@ Writes are best-effort, mirroring
 running without a SecurityFeature (early startup, constrained tests) still
 surfaces the refusal through the logger instead of raising back into the tool
 loop.
+
+A refusal from ``_dispatch_tool_call`` also carries what the allowlist held at
+that instant (#2935): its size and digest, the registry generation that
+produced it, and where the call sat in its turn. Every refusal is logged at
+WARNING whether or not the row is written, so a bounce is visible without
+reading the audit table.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.agent.tool_allowlist import AllowlistEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,7 @@ async def record_tool_rejection(
     reason: str,
     action: str = ACTION_TOOL_VALIDATION,
     args: Optional[dict] = None,
+    evidence: Optional["AllowlistEvidence"] = None,
 ) -> bool:
     """Record one refused tool call in ``security_audit_log``.
 
@@ -73,6 +83,8 @@ async def record_tool_rejection(
             :data:`ACTION_TOOL_RESOLUTION`.
         args: The call's arguments; masked and truncated before they are
             written (the audit table is plaintext SQLite).
+        evidence: What the allowlist held when the call was refused. Written
+            between the reason and the arguments, and logged.
 
     Returns:
         True when a row was written, False when the audit store was
@@ -82,15 +94,26 @@ async def record_tool_rejection(
     from kestrel_sovereign.features.security.args_summary import summarize_args
 
     summary = reason
+    evidence_text = evidence.describe() if evidence is not None else None
+    if evidence_text:
+        # Before ``args=``: the audit read path parses the JSON that follows
+        # it, and this text is prose it keeps verbatim.
+        summary = f"{summary} | {evidence_text}"
     args_summary = summarize_args(args)
     if args_summary:
-        summary = f"{reason} | args={args_summary}"
+        summary = f"{summary} | args={args_summary}"
+
+    logger.warning(
+        "[TOOL-GUARDRAIL] %s refused tool %r: %s%s",
+        action, tool_name, reason,
+        f" | {evidence_text}" if evidence_text else "",
+    )
 
     store = _permission_store(agent)
     if store is None:
         logger.warning(
-            "[TOOL-GUARDRAIL] %s refused tool %r — audit store unavailable, "
-            "reason=%s", action, tool_name, reason,
+            "[TOOL-GUARDRAIL] refusal of %r not audited: audit store "
+            "unavailable", tool_name,
         )
         return False
 

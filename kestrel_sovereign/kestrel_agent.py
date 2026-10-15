@@ -127,6 +127,7 @@ from kestrel_sovereign.agent.orchestrator_engine import (
     LLMCallWatchdog,
     OrchestratorEngineMixin,
 )
+from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
@@ -1918,6 +1919,12 @@ class KestrelAgent(
         self._direct_tools: dict = {}
         self._direct_tool_defs: list = []
         self._tool_to_feature: dict = {}  # tool_name -> feature tool_name
+        # #2935: bumped by every change to the direct-tool registry or the
+        # loaded feature map, and stamped on each derived tool allowlist, so a
+        # refusal can say which registry produced the set it was checked
+        # against. The per-turn ledger behind "accepted earlier this turn"
+        # lives in kestrel_sovereign.agent.tool_allowlist.
+        self._tool_registry_generation: int = 0
         self._constitution_receipt_tool_calls: list[dict] = []
         self._constitution_receipt_expected: Optional[dict] = None
         # #1580 (D): pinned features are exempt from LRU eviction.
@@ -2025,6 +2032,7 @@ class KestrelAgent(
             if tool_def.get("function", {}).get("name")
             != PHANTOM_RECEIPT_TOOL_NAME
         ]
+        bump_registry_generation(self)
         self._direct_tool_defs.append(
             {
                 "type": "function",
@@ -2066,6 +2074,7 @@ class KestrelAgent(
             if tool_def.get("function", {}).get("name")
             != PHANTOM_RECEIPT_TOOL_NAME
         ]
+        bump_registry_generation(self)
         self._constitution_receipt_tool_calls = []
         self._constitution_receipt_expected = None
 
@@ -6536,6 +6545,7 @@ class KestrelAgent(
             )
             raise
         self.features[feature.name] = feature
+        bump_registry_generation(self)
 
         try:
             self._ensure_feature_contribution_runtime().activate(
@@ -6765,6 +6775,7 @@ class KestrelAgent(
             await feature.post_all_features_loaded(self)
             self.features[feature.name] = feature
             feature.enabled = True
+            bump_registry_generation(self)
             self._cached_features_prompt = self._build_features_prompt_section()
         except (Exception, asyncio.CancelledError):
             # Atomic activation: undo whatever partially registered so a failed
@@ -7006,6 +7017,7 @@ class KestrelAgent(
             and self.features.get(feature_key) is feature
         ):
             self.features.pop(feature_key)
+        bump_registry_generation(self)
         self._cached_features_prompt = self._build_features_prompt_section()
 
         # A failed teardown leaves the instance in the owner registry, whether
