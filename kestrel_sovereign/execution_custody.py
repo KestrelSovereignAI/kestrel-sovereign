@@ -169,7 +169,12 @@ def retained_execution_error(error: BaseException) -> BaseException:
 
 
 def execution_cleanup_debts(error: BaseException | None) -> tuple:
-    """Actual failed native closers, distinct from ordinary provider errors."""
+    """Actual failed native resources/closers, not ordinary provider errors.
+
+    An owner is None only when creation was refused before a closer existed;
+    the resource record still retains the original physical connection. This
+    absence is debt, never a fabricated successful retirement future.
+    """
     debts = []
     if error is not None:
         for carrier in _explicit_control_chain(error):
@@ -228,10 +233,15 @@ def execution_terminal_error(*errors: BaseException | None) -> BaseException | N
                 if not any(debt[0] is prior[0] and debt[1] is prior[1] for prior in debts):
                     debts.append(debt)
             for carrier in _explicit_control_chain(error):
-                if isinstance(carrier, ExecutionAuthorityError):
-                    denied = vars(carrier).get("_kestrel_denied_execution_scopes", ())
-                    unscoped_denial |= not denied or bool(vars(carrier).get("_kestrel_unscoped_execution_denial"))
-                    denied_scopes.extend(scope for scope in denied if scope not in denied_scopes)
+                # Aggregation may select an original cancellation/ordinary
+                # exception as the retained carrier. Its explicit provenance
+                # remains authoritative at EVERY later aggregation boundary.
+                state = vars(carrier)
+                denied = state.get("_kestrel_denied_execution_scopes", ())
+                unscoped_denial |= bool(state.get("_kestrel_unscoped_execution_denial"))
+                if isinstance(carrier, ExecutionAuthorityError) and not denied:
+                    unscoped_denial = True
+                denied_scopes.extend(scope for scope in denied if scope not in denied_scopes)
         if debts:
             selected._kestrel_native_retirement_debts = tuple(debts)
         if commits:

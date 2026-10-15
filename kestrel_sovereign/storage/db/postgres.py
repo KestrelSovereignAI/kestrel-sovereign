@@ -94,6 +94,10 @@ class _ExecutionCommitState:
     scopes: tuple[ExecutionCustody, ...] = ()
     acknowledgments: list[AcknowledgedExecutionCommit] = field(default_factory=list)
     retirement: NativeExecutionRetirement = field(default_factory=NativeExecutionRetirement)
+    native_owned: bool = True
+    connection: Any = None
+    checkout_open: bool = False
+    terminal: BaseException | None = None
 
     def remember(self, scopes: tuple[ExecutionCustody, ...]) -> None:
         # A shared checkout can begin unbound and participate in several
@@ -104,6 +108,41 @@ class _ExecutionCommitState:
         for receipt in self.acknowledgments:
             retain_acknowledged_execution_commit(error, receipt)
         return error
+
+
+@dataclass(eq=False)
+class _NativePostgresRetirement:
+    """Exact failed lease/transaction and connection, not authority to retry.
+
+    asyncpg clears a checkout's connection BEFORE attempting pool release.
+    Retain the original connection independently of that mutable projection.
+    The original proxy's attachment, not a raw connection reference, governs
+    whether aborting the still-held lease is safe; it may already be returned.
+    """
+
+    context_manager: Any
+    connection: Any
+    native_connection: Any
+
+
+class PostgresPoolAdapter:
+    """Cooperating caller-context wrapper around an exact native asyncpg pool.
+
+    ``wrapper`` receives a managed native checkout context manager. It must
+    enter that manager and yield its SAME connection. Both wrapper halves and
+    their ContextVar tokens run in the caller; Core owns only native epilogues.
+    Merely exposing an opaque wrapper's underlying pool is not this contract.
+    The pool is borrowed, never closed or replaced by the adapter.
+    """
+
+    def __init__(self, pool: Any, wrapper: Callable):
+        if not isinstance(pool, asyncpg.Pool):
+            raise TypeError("PostgresPoolAdapter requires the original native asyncpg pool")
+        self.native_pool = pool
+        self.wrap_checkout = wrapper
+
+    def __getattr__(self, name):
+        return getattr(self.native_pool, name)
 
 
 @dataclass
@@ -204,19 +243,17 @@ def concurrent_write_retry_delay(
     return _CONCURRENT_WRITE_BACKOFF_S * (retries_done + 1)
 
 
-async def _prove_committable(conn: Any, after_commit: AfterCommitCallbacks) -> None:
-    """Refuse to commit an aborted transaction that has after-commit work.
+async def _prove_committable(conn: Any) -> None:
+    """Refuse to mint a committed fact for an aborted transaction.
 
     A statement that fails inside a PostgreSQL transaction aborts it. If the
     caller swallows that failure, COMMIT rolls the transaction back and
     asyncpg reports no error, so ``call_after_commit`` work would run for
-    writes that never persisted (#2913). When there is such work, one trivial
-    statement first: on an aborted transaction it raises, the transaction
-    rolls back as a failure, and the work is discarded. Transactions with
-    nothing registered are left exactly as they were.
+    writes that never persisted (#2913). One trivial statement first: on an
+    aborted transaction it raises, the transaction rolls back as a failure,
+    and no committed receipt or callback is published.
     """
-    if after_commit.pending:
-        await conn.execute("SELECT 1")
+    await conn.execute("SELECT 1")
 
 
 # asyncpg is optional - only required for PostgreSQL usage
@@ -341,7 +378,7 @@ class PostgresBackend(DatabaseBackend):
     @classmethod
     def from_pool(
         cls,
-        pool: "asyncpg.Pool",
+        pool: "asyncpg.Pool | PostgresPoolAdapter",
         *,
         advisory_dsn: Optional[str] = None,
         advisory_connect_kwargs: Optional[dict[str, Any]] = None,
@@ -358,7 +395,10 @@ class PostgresBackend(DatabaseBackend):
         Note: close() will NOT close the pool since we don't own it.
 
         Args:
-            pool: Existing asyncpg.Pool instance
+            pool: Existing asyncpg.Pool or cooperating PostgresPoolAdapter.
+                Opaque acquire wrappers retain ordinary caller-context
+                behavior, but cannot admit execution custody. Compose their
+                context behavior around the adapter's managed native lease.
             advisory_dsn: Optional explicit DSN for the bounded dedicated
                 advisory-lock pool. When omitted, connection construction
                 settings are copied from asyncpg's pool construction context.
@@ -852,6 +892,8 @@ class PostgresBackend(DatabaseBackend):
         operational = self._current_operational_lease()
         if commit_state is None and operational is not None and executor is operational.connection:
             commit_state = operational.commit_state
+        if commit_state is not None and not commit_state.native_owned:
+            raise ExecutionAuthorityError("opaque pool checkout cannot admit execution custody; use PostgresPoolAdapter")
         async with self._authority_transaction(executor, scopes, commit_state):
             yield executor
 
@@ -860,35 +902,144 @@ class PostgresBackend(DatabaseBackend):
         async with self._tracked_pool_checkout(pool, admit_work=True) as owned:
             yield owned
 
+    @staticmethod
+    def _abort_native_connection(connection: Any, terminal: BaseException) -> None:
+        """Dispose only the original dirty session, retaining any abort failure."""
+        try:
+            if isinstance(connection, asyncpg.pool.PoolConnectionProxy):
+                # A detached proxy no longer names a leased connection. Never
+                # call through it or terminate a successor acquired by others.
+                connection = connection._con
+                if connection is None:
+                    return
+            if not connection.is_closed():
+                connection.terminate()
+        except BaseException as failure:
+            prior = terminal.__cause__
+            terminal.__cause__ = (failure if prior is None else
+                BaseExceptionGroup("original native abort failure", [prior, failure]))
+
+    @staticmethod
+    def _refused_native_owner(
+        connection: Any, resource: Any, refusal: BaseException,
+        scopes: tuple[ExecutionCustody, ...], body_failure: BaseException | None,
+        native_connection: Any,
+    ) -> BaseException:
+        """No created task means no native closer owner, never successful reset.
+
+        The task factory has refused the epilogue before it can start. Abort
+        the ORIGINAL native connection synchronously rather than retrying the
+        factory, inventing a completed closer or leaking its live transaction.
+        Keep the exact resource and absence of an owner as retirement debt.
+        """
+        terminal = execution_terminal_error(body_failure, refusal)
+        if terminal is not refusal:
+            prior = terminal.__cause__
+            terminal.__cause__ = (refusal if prior is None else
+                BaseExceptionGroup("native ownership refusal", [prior, refusal]))
+        if body_failure is not None and terminal is not body_failure:
+            prior = terminal.__cause__
+            terminal.__cause__ = (body_failure if prior is None else
+                BaseExceptionGroup("original native body failure", [prior, body_failure]))
+        PostgresBackend._abort_native_connection(connection, terminal)
+        terminal._kestrel_native_retirement_debts = (
+            *getattr(terminal, "_kestrel_native_retirement_debts", ()),
+            (_NativePostgresRetirement(resource, connection, native_connection), None),
+        )
+        for scope in scopes:
+            scope.revoke("original native epilogue ownership refused")
+        return terminal
+
     @asynccontextmanager
     async def _tracked_pool_checkout(self, pool: Any, *, admit_work: bool) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
-        # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
-        # state through that await so a release failure cannot imply rollback.
         state = _ExecutionCommitState()
         state.remember(current_execution_custody(self))
+        if isinstance(pool, PostgresPoolAdapter):
+            @asynccontextmanager
+            async def managed_native():
+                try:
+                    async with self._native_pool_checkout(pool.native_pool, state, admit_work=admit_work) as (connection, _):
+                        yield connection
+                except BaseException as error:
+                    state.terminal = error
+                    raise
+            native = managed_native()
+            failure = None
+            try:
+                async with pool.wrap_checkout(native) as connection:
+                    if connection is not state.connection or not state.checkout_open:
+                        raise ExecutionAuthorityError("pool adapter did not retain its original native checkout")
+                    yield connection, state
+            except BaseException as error:
+                failure = error
+            # A wrapper cannot abandon or suppress the registered native lease.
+            # This resumes our own generator in the ORIGINAL caller context;
+            # only its explicit native epilogue crosses the task boundary.
+            if state.checkout_open:
+                try:
+                    await native.__aexit__(type(failure) if failure is not None else None,
+                        failure, failure.__traceback__ if failure is not None else None)
+                except BaseException as cleanup:
+                    failure = execution_terminal_error(failure, cleanup)
+            failure = execution_terminal_error(state.terminal, failure)
+            if failure is not None:
+                if state.outcome is not None and not is_execution_control_error(failure):
+                    for scope in state.scopes:
+                        scope.preserve_commit_uncertainty(state.outcome)
+                    raise ExecutionCommitOutcomeError(state.outcome) from failure
+                raise failure
+            return
+        if not isinstance(pool, asyncpg.Pool):
+            # Preserve ordinary legacy wrapper context semantics. Strong
+            # custody cannot be inferred by inspecting an opaque generator.
+            state.native_owned = False
+            if state.scopes or not admit_work:
+                raise ExecutionAuthorityError("opaque pool checkout requires PostgresPoolAdapter for native custody")
+            async with pool.acquire() as connection:
+                yield connection, state
+            return
+        async with self._native_pool_checkout(pool, state, admit_work=admit_work) as owned:
+            yield owned
+
+    @asynccontextmanager
+    async def _native_pool_checkout(self, pool: Any, state: _ExecutionCommitState, *, admit_work: bool) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
+        # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
+        # state through that await so a release failure cannot imply rollback.
         body_failure: BaseException | None = None
         checkout = pool.acquire()
+        if not isinstance(checkout, asyncpg.pool.PoolAcquireContext):
+            raise ExecutionAuthorityError("native pool acquire is opaque; use PostgresPoolAdapter")
         connection = await checkout.__aenter__()
+        native_connection = connection._con
+        state.connection = connection
+        state.checkout_open = True
         try:
             yield connection, state
         except BaseException as error:
             body_failure = error
+        finally:
+            state.checkout_open = False
         # Only the native reset/return is protected. The checkout body remains
         # in its original task, including every ContextVar token and arbitrary
         # caller await. Cancellation cannot abandon an accepted native reset.
-        retirement = create_owned_task(checkout.__aexit__(
-            type(body_failure) if body_failure is not None else None,
-            body_failure,
-            body_failure.__traceback__ if body_failure is not None else None,
-        ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset")
+        try:
+            retirement = create_owned_task(checkout.__aexit__(
+                type(body_failure) if body_failure is not None else None,
+                body_failure,
+                body_failure.__traceback__ if body_failure is not None else None,
+            ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset")
+        except BaseException as refusal:
+            terminal = self._refused_native_owner(connection, checkout, refusal, state.scopes, body_failure, native_connection)
+            raise state.retain_acknowledgments(terminal)
         state.retirement.owner = retirement
         retired = await await_owned_task(retirement)
         terminal = execution_terminal_error(body_failure, retired.error, retired.cancellation)
         if retired.error is not None:
             assert terminal is not None
+            self._abort_native_connection(connection, terminal)
             terminal._kestrel_native_retirement_debts = (
                 *getattr(terminal, "_kestrel_native_retirement_debts", ()),
-                (checkout, retirement),
+                (_NativePostgresRetirement(checkout, connection, native_connection), retirement),
             )
             outcome = execution_commit_outcome(terminal) or state.outcome
             if outcome is not None:
@@ -918,8 +1069,12 @@ class PostgresBackend(DatabaseBackend):
         commit_state: _ExecutionCommitState | None = None,
     ) -> AsyncIterator[None]:
         state = commit_state if commit_state is not None else _ExecutionCommitState()
+        if scopes and not state.native_owned:
+            raise ExecutionAuthorityError("opaque pool checkout cannot admit execution custody; use PostgresPoolAdapter")
         try:
-            async with self._tracked_native_transaction(connection, scopes, state):
+            async with self._tracked_native_transaction(connection, scopes, state,
+                requires_commit_proof=lambda: bool(scopes) or (
+                    self._current_txn_conn() is not None and self._current_after_commit().pending)):
                 await lock_execution_authority(connection, "postgres", scopes)
                 yield
                 require_execution_backend("postgres", scopes)
@@ -959,6 +1114,7 @@ class PostgresBackend(DatabaseBackend):
     async def _tracked_native_transaction(
         self, connection: Any, scopes: tuple[ExecutionCustody, ...],
         commit_state: _ExecutionCommitState | None = None,
+        *, requires_commit_proof: bool | Callable[[], bool] = True,
     ) -> AsyncIterator[None]:
         """Classify native commit acknowledgement without granting work.
 
@@ -970,22 +1126,37 @@ class PostgresBackend(DatabaseBackend):
         if commit_state is not None:
             commit_state.remember(scopes)
         transaction = connection.transaction()
+        if not isinstance(transaction, asyncpg.transaction.Transaction):
+            raise ExecutionAuthorityError("native transaction exit is opaque; native custody requires asyncpg Transaction")
         await transaction.__aenter__()
+        native_connection = connection._con if isinstance(connection, asyncpg.pool.PoolConnectionProxy) else connection
         body_failure: BaseException | None = None
+        proven = False
         try:
             yield
+            # PostgreSQL accepts COMMIT of an aborted transaction as ROLLBACK,
+            # with no asyncpg exception. A successful exit task alone therefore
+            # cannot witness a committed receipt. Prove this SAME transaction
+            # committable before handing off its native exit, even when there
+            # are no after-commit callbacks. This remains cancellable body work.
+            if requires_commit_proof() if callable(requires_commit_proof) else requires_commit_proof:
+                await _prove_committable(connection)
+                proven = True
         except BaseException as error:
             body_failure = error
         committing = body_failure is None
-        if committing and commit_state is not None:
-            commit_state.outcome = "unknown"
         # Protect the accepted native epilogue, NOT the body above. In
         # particular, external resolvers/gates retain normal cancellation.
-        completion = create_owned_task(transaction.__aexit__(
-            type(body_failure) if body_failure is not None else None,
-            body_failure,
-            body_failure.__traceback__ if body_failure is not None else None,
-        ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit")
+        try:
+            completion = create_owned_task(transaction.__aexit__(
+                type(body_failure) if body_failure is not None else None,
+                body_failure,
+                body_failure.__traceback__ if body_failure is not None else None,
+            ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit")
+        except BaseException as refusal:
+            raise self._refused_native_owner(connection, transaction, refusal, scopes, body_failure, native_connection)
+        if committing and commit_state is not None:
+            commit_state.outcome = "unknown"
         completed = await await_owned_task(completion)
         if completed.error is not None:
             if committing:
@@ -998,24 +1169,26 @@ class PostgresBackend(DatabaseBackend):
             terminal = execution_terminal_error(body_failure, completed.error, completed.cancellation)
             terminal._kestrel_native_retirement_debts = (
                 *getattr(terminal, "_kestrel_native_retirement_debts", ()),
-                (transaction, completion),
+                (_NativePostgresRetirement(transaction, connection, native_connection), completion),
             )
             for scope in scopes:
                 scope.revoke("original native rollback acknowledgement failed")
             raise terminal
         receipt = (AcknowledgedExecutionCommit(completion, retirement=commit_state.retirement)
-                   if committing and commit_state is not None
-                   else AcknowledgedExecutionCommit(completion) if committing else None)
+                   if committing and proven and commit_state is not None
+                   else AcknowledgedExecutionCommit(completion) if committing and proven else None)
         if committing and commit_state is not None:
-            commit_state.outcome = "committed"
+            commit_state.outcome = "committed" if proven else "unknown"
             # The checkout retains one latest native fact, not every finished
             # task from a long operational session. Earlier escaped receipts
             # still share this SAME original reset record and settle with it.
-            commit_state.acknowledgments[:] = [receipt]
+            commit_state.acknowledgments[:] = [receipt] if receipt is not None else []
         terminal = execution_terminal_error(body_failure, completed.cancellation)
         if terminal is not None:
             if receipt is not None:
                 retain_acknowledged_execution_commit(terminal, receipt)
+            elif committing:
+                raise ExecutionCommitOutcomeError("unknown") from terminal
             raise terminal
 
     @staticmethod
@@ -1357,9 +1530,6 @@ class PostgresBackend(DatabaseBackend):
                     try:
                         async with self._authority_transaction(operational.connection, tuple(scopes), operational.commit_state):
                             yield
-                            await _prove_committable(
-                                operational.connection, after_commit
-                            )
                     except ExecutionCommitOutcomeError:
                         raise
                     except Exception as e:
@@ -1385,7 +1555,6 @@ class PostgresBackend(DatabaseBackend):
             try:
                 async with self._authority_transaction(conn, tuple(scopes), commit_state):
                     yield
-                    await _prove_committable(conn, after_commit)
             except ExecutionCommitOutcomeError:
                 raise
             except Exception as e:

@@ -50,6 +50,30 @@ an unscoped authority error is never reclassified as occurrence-only retirement.
 PostgreSQL moves only its native transaction exit and pool reset into original
 owned completion tasks. Transaction bodies, context-manager yields and token
 resets remain in the caller; arbitrary resolvers and gates are not shielded.
+The strong native contract accepts an actual asyncpg pool. A caller-context
+wrapper must cooperate through `PostgresPoolAdapter(pool, wrapper)`: `wrapper`
+is an async context-manager factory receiving Core's managed native checkout;
+it enters that manager and yields the same connection. Wrapper entry/exit and
+their ContextVar tokens stay in the original caller. Core independently retains
+and settles the registered native lease, even if wrapper exit omits it or tries
+to suppress its terminal control. Arbitrary wrapper awaits remain cancellable.
+Opaque legacy acquire wrappers retain ordinary caller-context behavior but
+cannot admit execution custody, including custody introduced later inside an
+initially unbound operational session. This restriction is explicit, not an
+inferred native capability or a bypass of wrapper accounting.
+
+Before issuing a committed receipt, one fixed `SELECT 1` on that same held
+transaction proves it is not aborted: PostgreSQL can otherwise accept COMMIT
+as a silent ROLLBACK. The proof is cancellable and precedes native commit
+handoff. Custody, callbacks and fixed cleanup require this proof. Unfenced,
+callback-free transactions retain their historical behavior but do not mint a
+known-commit receipt without proof. Refusal to create an epilogue owner aborts
+only its original native connection, retains the exact resource with no owner
+as physical-retirement debt, preserves the original body error explicitly,
+and denies the participating scopes. It is not a successful reset/rollback or
+permission to retry. A failed native reset likewise aborts that original dirty
+session; abort failure remains explicit evidence. The borrowed pool is never
+terminated as a substitute for retiring its one lease.
 Cancellation while observing a successful native ACK is delivered on the
 original cancellation object with an `AcknowledgedExecutionCommit`, not an
 invented UNKNOWN. Its commit owner and shared original-reset record are

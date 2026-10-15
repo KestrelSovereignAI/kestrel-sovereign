@@ -16,7 +16,7 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_custody,
     require_execution_work,
 )
-from kestrel_sovereign.storage.db.postgres import PostgresBackend
+from kestrel_sovereign.storage.db.postgres import PostgresBackend, PostgresPoolAdapter
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -662,16 +662,14 @@ async def test_pool_release_failure_preserves_committed_outcome(native_pg, expli
     backend, _, _ = native_pg
     pool = backend._pool
     class ReleaseFailurePool:
-        def __getattr__(self, name):
-            return getattr(pool, name)
         @asynccontextmanager
-        async def acquire(self):
-            async with pool.acquire() as connection:
+        async def acquire(self, native):
+            async with native as connection:
                 yield connection
             if failure == "cancel":
                 raise asyncio.CancelledError("cancelled during pool reset")
             raise OSError("pool reset acknowledgement lost")
-    backend._pool = ReleaseFailurePool()
+    backend._pool = PostgresPoolAdapter(pool, ReleaseFailurePool().acquire)
     @asynccontextmanager
     async def checkout():
         if operational:
@@ -718,12 +716,9 @@ async def test_unbound_operational_checkout_retains_participating_admission(nati
     owner = SimpleNamespace(_execution_custody=scope)
 
     class ReleaseBoundaryPool:
-        def __getattr__(self, name):
-            return getattr(pool, name)
-
         @asynccontextmanager
-        async def acquire(self):
-            async with pool.acquire() as connection:
+        async def acquire(self, native):
+            async with native as connection:
                 yield connection
                 await asyncio.sleep(0)
                 if release == "revoke":
@@ -733,7 +728,7 @@ async def test_unbound_operational_checkout_retains_participating_admission(nati
             if release == "cancel":
                 raise asyncio.CancelledError("late release cancelled")
 
-    backend._pool = ReleaseBoundaryPool()
+    backend._pool = PostgresPoolAdapter(pool, ReleaseBoundaryPool().acquire)
     try:
         with pytest.raises(Exception) as caught:
             # Shared operational sessions are deliberately unbound at entry.
@@ -766,17 +761,14 @@ async def test_successful_release_revalidates_before_publishing(native_pg, surfa
     owner = SimpleNamespace(_execution_custody=scope)
 
     class RevokingReleasePool:
-        def __getattr__(self, name):
-            return getattr(pool, name)
-
         @asynccontextmanager
-        async def acquire(self):
-            async with pool.acquire() as connection:
+        async def acquire(self, native):
+            async with native as connection:
                 yield connection
                 await asyncio.sleep(0)
                 scope.revoke("revoked while resetting physical connection")
 
-    backend._pool = RevokingReleasePool()
+    backend._pool = PostgresPoolAdapter(pool, RevokingReleasePool().acquire)
     try:
         with bind_execution_runtime(owner):
             with pytest.raises(Exception) as caught:

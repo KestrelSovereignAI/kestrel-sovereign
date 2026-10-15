@@ -33,6 +33,35 @@ async def test_settled_fact_cannot_hide_combined_unscoped_control():
     assert selected is original
     assert execution_commit_outcome(selected) == "committed"
     assert execution_denial_scopes(selected) is None
+    # Every aggregation is another boundary: a selected cancellation is an
+    # explicit provenance carrier even though it is not an AuthorityError.
+    replacement = retain_acknowledged_execution_commit(
+        asyncio.CancelledError("different original observer"), receipt
+    )
+    selected_again = execution_terminal_error(replacement, selected)
+    assert selected_again is replacement
+    assert execution_denial_scopes(selected_again) is None
+
+
+@pytest.mark.asyncio
+async def test_selected_cancel_keeps_scoped_provenance_across_reaggregation():
+    receipt = await acknowledged_receipt()
+    reset = create_owned_task(asyncio.sleep(0))
+    await await_owned_task(reset)
+    receipt.retirement_owner = reset
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("retired-original"))
+    scope.revoke("original denial")
+    with pytest.raises(ExecutionAuthorityError) as caught:
+        scope.require_work()
+    original = retain_acknowledged_execution_commit(asyncio.CancelledError(), receipt)
+    selected = execution_terminal_error(original, caught.value)
+    assert execution_denial_scopes(selected) == (scope,)
+    replacement = retain_acknowledged_execution_commit(
+        asyncio.CancelledError(), receipt
+    )
+    assert execution_denial_scopes(execution_terminal_error(replacement, selected)) == (
+        scope,
+    )
 
 
 async def acknowledged_receipt():
