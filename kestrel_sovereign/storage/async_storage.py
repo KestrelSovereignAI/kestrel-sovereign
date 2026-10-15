@@ -804,6 +804,21 @@ class AsyncStorage:
             message_id, session_id
         )
 
+    async def get_conversation_message(
+        self, message_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """One live message by id, or None — facade delegator (#3655)."""
+        if not self._initialized:
+            await self.initialize()
+        rows = await self.conversation.get_messages_by_ids([message_id])
+        return rows[0] if rows else None
+
+    async def find_signal_wake_reply_id(self, signal_id: str) -> Optional[int]:
+        """The stored reply to one signal wake — facade delegator (#3655)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.find_signal_wake_reply_id(signal_id)
+
     async def find_messages_matching(
         self, content_pattern: str, session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:

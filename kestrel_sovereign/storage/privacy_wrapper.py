@@ -6222,6 +6222,31 @@ class PrivacyEnforcingStorage:
             message_id, session_id
         )
 
+    async def get_conversation_message(
+        self, message_id: Any
+    ) -> Optional[Dict[str, Any]]:
+        """One stored message by its persistent id, respecting privacy (#3655).
+
+        EPHEMERAL keeps nothing, and an ISOLATED buffer's entries have no
+        persistent id to address, so both return ``None``. Otherwise the live
+        row, decrypted, or ``None`` when no live row has that id.
+        """
+        if self._privacy_config.is_ephemeral() or self._policy.use_session_storage:
+            return None
+        row_id = coerce_persistent_message_id(message_id)
+        if row_id is None:
+            return None
+        return await self._storage.get_conversation_message(row_id)
+
+    async def find_signal_wake_reply_id(self, signal_id: str) -> Optional[int]:
+        """The stored reply to one signal wake, respecting privacy (#3655).
+
+        ``None`` in the modes :meth:`get_conversation_message` cannot read.
+        """
+        if self._privacy_config.is_ephemeral() or self._policy.use_session_storage:
+            return None
+        return await self._storage.find_signal_wake_reply_id(signal_id)
+
     async def find_messages_matching(
         self, content_pattern: str, session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
