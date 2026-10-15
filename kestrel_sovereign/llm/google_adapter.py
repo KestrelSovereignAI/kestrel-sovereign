@@ -633,32 +633,37 @@ class GoogleAdapter(LLMAdapter):
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from Google Gemini API.
 
-        ``client`` is accepted for contract symmetry with
-        :meth:`get_response` (SDK 0.5.0). The Google generative-ai SDK
-        is module-scoped (``genai.configure`` + ``genai.list_models``)
-        rather than client-scoped, so the parameter is ignored here.
+        Lists through the route's ``google.genai.Client`` (the one the
+        registry builds and :meth:`get_response` uses), on its asynchronous
+        surface. The listing awaits, so the per-route discovery deadline can
+        cancel it (#3646). It used the deprecated, module-scoped
+        ``google.generativeai.list_models()``, a synchronous call that blocked
+        the event loop: a Gemini endpoint that never answered stalled every
+        other route's discovery and every discovery deadline with it.
 
-        Uses the google-generativeai SDK's genai.list_models().
+        Without a ``client`` (a bare ``GoogleAdapter()``), one is built from
+        ``GOOGLE_API_KEY`` or ``GEMINI_API_KEY``.
 
         Returns:
             List of ModelInfo objects for each available model
         """
         try:
-            api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-            if not api_key:
-                logger.warning("GOOGLE_API_KEY/GEMINI_API_KEY not set, returning empty model list")
-                return []
+            if client is None:
+                api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+                if not api_key:
+                    logger.warning("GOOGLE_API_KEY/GEMINI_API_KEY not set, returning empty model list")
+                    return []
 
-            try:
-                import google.generativeai as genai
-            except ImportError:
-                logger.warning("google-generativeai not installed, returning empty model list")
-                return []
+                try:
+                    from google import genai
+                except ImportError:
+                    logger.warning("google-genai not installed, returning empty model list")
+                    return []
 
-            genai.configure(api_key=api_key)
+                client = genai.Client(api_key=api_key)
             models = []
 
-            for model in genai.list_models():
+            async for model in await client.aio.models.list():
                 model_name = model.name if hasattr(model, 'name') else str(model)
                 # Remove "models/" prefix if present
                 model_id = model_name.replace("models/", "") if model_name.startswith("models/") else model_name

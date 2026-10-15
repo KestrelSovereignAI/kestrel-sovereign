@@ -50,6 +50,7 @@ except ImportError:
     ollama = None
 
 from .decisions.config import parse_route_decision_config
+from .discovery_deadline import discovery_route_deadline_seconds
 from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter, ProviderInfo
 from kestrel_sdk.llm import ProviderCapabilities
 
@@ -601,11 +602,16 @@ class ProviderRegistry:
             if embedding_dim is not None:
                 embedding_dim = int(embedding_dim)
             # Output cap sent on every chat call (#3552); the adapter's default
-            # when unset, and a non-positive value fails the route.
+            # when unset, and a non-positive value fails the route. Listing
+            # calls are bounded by the per-route discovery deadline (#3646);
+            # the chat client above deliberately carries no timeout.
             return client, adapter_cls(
                 embedding_model=embedding_model,
                 embedding_dim=embedding_dim,
                 max_output_tokens=route_cfg.get("max_output_tokens"),
+                discovery_timeout_seconds=discovery_route_deadline_seconds(
+                    self.config
+                ),
             )
 
         # --- Google Gemini (maintained google-genai SDK) ---

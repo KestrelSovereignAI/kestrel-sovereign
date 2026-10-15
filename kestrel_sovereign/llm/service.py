@@ -59,7 +59,8 @@ from .output_ceiling import (
     response_stop_reason,
 )
 from .generation_gate import UnfinishedAfterInlineToolsError
-from .model_discovery import ModelDiscoveryMixin
+from .discovery_deadline import discovery_route_deadline_seconds
+from .model_discovery import ModelDiscoveryMixin, discovery_call
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
 from .streaming import StreamingMixin, RoutingResolution
@@ -526,6 +527,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         # A malformed deny-list fails here, at startup, rather than denying
         # nothing (#2652).
         parse_denied_providers(self.config)
+        # So does a malformed discovery deadline, rather than leaving model
+        # discovery unbounded (#3646).
+        discovery_route_deadline_seconds(self.config)
         self.mandate_config = load_config("model_mandate.toml")
 
         # Initialize provider registry
@@ -1856,18 +1860,22 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         (the single resolver, funnelled through ``reconcile_embedding_capabilities``)
         so the read is self-sufficient regardless of whether the caller
         pre-reconciled. Best-effort — a discovery hiccup must never fail the read.
+
+        The reconcile and the resolution are one discovery call, so a route
+        that overran the reconcile's sweep is not asked again here (#3646).
         """
-        if hasattr(self, "reconcile_embedding_capabilities"):
-            try:
-                await self.reconcile_embedding_capabilities(use_cache=True)
-            except Exception as exc:  # pragma: no cover - never fail the read
-                logger.debug("embedding capability reconcile skipped in aget: %s", exc)
-        provider = self.resolve_embedding_provider()
-        if provider is not None:
-            try:
-                await self.resolve_route_embedding_model(provider)
-            except Exception as exc:  # pragma: no cover - never fail the read
-                logger.debug("active-route embedding resolve skipped: %s", exc)
+        with discovery_call():
+            if hasattr(self, "reconcile_embedding_capabilities"):
+                try:
+                    await self.reconcile_embedding_capabilities(use_cache=True)
+                except Exception as exc:  # pragma: no cover - never fail the read
+                    logger.debug("embedding capability reconcile skipped in aget: %s", exc)
+            provider = self.resolve_embedding_provider()
+            if provider is not None:
+                try:
+                    await self.resolve_route_embedding_model(provider)
+                except Exception as exc:  # pragma: no cover - never fail the read
+                    logger.debug("active-route embedding resolve skipped: %s", exc)
         return self.get_embedding_settings()
 
     async def aget_embedding_settings_for_route(
@@ -5251,11 +5259,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 "a concrete `model` in kestrel.toml to fix. Underlying: %s",
                 provider["name"], exc,
             )
-            raise ModelNotAvailableForRoute(
-                vendor=provider.get("vendor"),
-                route=provider.get("route"),
-                model="auto",
-            ) from exc
+            # Names the vendor's recorded discovery failure, when there is
+            # one: a route whose discovery timed out says so (#3646).
+            raise self._catalog_rejection(provider, "auto") from exc
 
     def _catalog_rejection(
         self, provider: Dict[str, Any], model: str
@@ -6601,7 +6607,11 @@ No other text or formatting.
                 continue
             last_provider_name = provider["name"]
             try:
-                model = target_model or provider["model"]
+                # The same "auto" scrub every other generation path uses
+                # (#1408): a route whose discovery failed or timed out (#3646)
+                # raises ModelNotAvailableForRoute here and the chain moves
+                # on, instead of sending the literal "auto" to the route.
+                model = self._resolve_concrete_model(target_model, provider)
                 logger.info(f"Attempting provider: {provider['name']} with model: {model}")
                 response = await self._run_provider_attempt(
                     provider["adapter"].get_response(

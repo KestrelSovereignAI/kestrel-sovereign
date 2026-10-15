@@ -8,11 +8,13 @@ Adapter for local Ollama instance with support for:
 - Structured output via JSON schema (Pydantic models)
 - API-based model discovery
 """
+import asyncio
 import json
 import logging
 from collections.abc import Mapping
 from typing import (
-    Any, AsyncIterator, Dict, List, Optional, Tuple, Type, Union, TYPE_CHECKING,
+    Any, AsyncIterator, Awaitable, Dict, List, Optional, Tuple, Type, TypeVar,
+    Union, TYPE_CHECKING,
 )
 
 import httpx
@@ -46,6 +48,11 @@ from .cancellation import (
     raise_if_cancelled,
 )
 from .decisions.http import post_systemone, systemone_body
+from .discovery_deadline import (
+    DEFAULT_DISCOVERY_ROUTE_DEADLINE_SECONDS,
+    DISCOVERY_ROUTE_DEADLINE_KEY,
+    discovery_route_deadline_seconds,
+)
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import get_base64_only
 from .output_ceiling import (
@@ -68,6 +75,8 @@ if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 #: Ollama's published ``/v1/systemone`` limits (docs.ollama.com/api/systemone,
 #: v0.35): 1–64 questions, 2–26 options, 64 KiB body without images. Ollama
@@ -188,6 +197,7 @@ class OllamaAdapter(LLMAdapter):
         embedding_model: Optional[str] = None,
         embedding_dim: Optional[int] = None,
         max_output_tokens: Optional[int] = None,
+        discovery_timeout_seconds: Optional[float] = None,
     ):
         """Ollama is a local runtime; embeddings default to nomic-embed-text.
 
@@ -200,7 +210,17 @@ class OllamaAdapter(LLMAdapter):
         ``max_output_tokens`` is the route's output cap (#3552). Ollama itself
         applies none, so without one a small model stuck in a repetition loop
         generates until its context is exhausted while the turn waits on it.
+
+        ``discovery_timeout_seconds`` bounds each listing operation (the chat,
+        embedding and decision catalogs), defaulting to the per-route discovery
+        deadline (#3646). Only listing: the route's chat client carries no
+        timeout, and generation is bounded elsewhere.
         """
+        if discovery_timeout_seconds is None:
+            discovery_timeout_seconds = DEFAULT_DISCOVERY_ROUTE_DEADLINE_SECONDS
+        self._discovery_timeout_seconds = discovery_route_deadline_seconds(
+            {DISCOVERY_ROUTE_DEADLINE_KEY: discovery_timeout_seconds}
+        )
         if max_output_tokens is None:
             max_output_tokens = self.DEFAULT_MAX_OUTPUT_TOKENS
         cap = reported_token_limit(max_output_tokens)
@@ -1038,6 +1058,28 @@ class OllamaAdapter(LLMAdapter):
             tools=tools
         )
 
+    async def _bounded_listing(self, listing: Awaitable[T], what: str) -> T:
+        """Await one listing operation within the discovery timeout (#3646).
+
+        The route's chat ``AsyncClient`` deliberately carries no timeout: a
+        long generation is bounded by the cancellable generation path and the
+        call watchdog, never cut off by a read timeout. A listing is not a
+        generation. A daemon that accepts the connection and has not answered
+        ``/api/tags`` or ``/api/show`` by now is down for discovery, so the
+        listing raises ``TimeoutError`` for discovery to record, instead of
+        leaving its caller waiting.
+        """
+        seconds = self._discovery_timeout_seconds
+        try:
+            async with asyncio.timeout(seconds) as scope:
+                return await listing
+        except TimeoutError as exc:
+            if not scope.expired():
+                raise
+            raise TimeoutError(
+                f"Ollama {what} did not answer within {seconds:g}s"
+            ) from exc
+
     @staticmethod
     def _is_decision_only(info: Any) -> bool:
         """The runtime reports decision capability and no chat (completion).
@@ -1089,15 +1131,20 @@ class OllamaAdapter(LLMAdapter):
         return supports
 
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
-        """List available models from the local Ollama instance.
+        """List available models from the route's Ollama daemon.
 
-        ``client`` is accepted for contract symmetry with
-        :meth:`get_response` (SDK 0.5.0). Ollama's discovery uses its
-        own ``ollama.AsyncClient()`` against a fixed local endpoint, so
-        the parameter is ignored here.
+        Uses the caller-provided ``client`` (built during provider init from
+        the route's ``host``/``OLLAMA_HOST``) so the catalog comes from the
+        daemon the route serves from, as embedding and decision discovery do.
+        Only falls back to a default ``AsyncClient()`` when no client is
+        passed. Before #3646 this always used that default, so a route whose
+        own daemon never answered still resolved ``auto`` from another one and
+        its turn then waited on a chat the route could not serve.
 
         Uses ollama.list() to discover locally available models,
         then ollama.show() per model to detect tool calling capability.
+        The whole listing is bounded by the discovery timeout, and an overrun
+        raises ``TimeoutError`` rather than reading as an empty catalog.
 
         Returns:
             List of ModelInfo objects for each available model
@@ -1105,10 +1152,15 @@ class OllamaAdapter(LLMAdapter):
         if not OLLAMA_AVAILABLE:
             logger.warning("Ollama library not available, returning empty model list")
             return []
+        return await self._bounded_listing(
+            self._list_chat_models(client), "model listing"
+        )
 
+    async def _list_chat_models(self, client: Any) -> List[ModelInfo]:
+        """:meth:`list_models` without its timeout."""
         try:
-            # Use async client to list models
-            client = ollama.AsyncClient()
+            if client is None:
+                client = ollama.AsyncClient()
             response = await client.list()
 
             # Handle both dict response (older ollama) and Pydantic model (newer ollama)
@@ -1234,6 +1286,12 @@ class OllamaAdapter(LLMAdapter):
         """
         if not OLLAMA_AVAILABLE or client is None:
             return []
+        return await self._bounded_listing(
+            self._list_decision_models(client), "decision model listing"
+        )
+
+    async def _list_decision_models(self, client: Any) -> List[DecisionModelInfo]:
+        """:meth:`list_decision_models` without its timeout."""
         response = await client.list()
         raw_models = getattr(response, "models", None)
         if raw_models is None and isinstance(response, dict):
@@ -1299,14 +1357,25 @@ class OllamaAdapter(LLMAdapter):
         the route serves from. Only falls back to a default ``AsyncClient()``
         when no client was passed — otherwise a route pointed at a remote or
         non-default Ollama would be silently probed against localhost (#2338).
-        """
-        from .embedding_discovery import EmbeddingModelInfo
 
+        The whole listing is bounded by the discovery timeout. An overrun
+        raises ``TimeoutError`` (#3646): unlike an error answer, it is not an
+        empty catalog, and discovery records it as the route's failure.
+        """
         if not OLLAMA_AVAILABLE:
             logger.warning(
                 "Ollama library not available, returning empty embedding model list"
             )
             return []
+        return await self._bounded_listing(
+            self._list_embedding_models(client), "embedding model listing"
+        )
+
+    async def _list_embedding_models(
+        self, client: Any
+    ) -> List["EmbeddingModelInfo"]:
+        """:meth:`list_embedding_models` without its timeout."""
+        from .embedding_discovery import EmbeddingModelInfo
 
         try:
             if client is None:

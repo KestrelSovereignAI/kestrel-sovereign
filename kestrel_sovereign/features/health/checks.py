@@ -1177,7 +1177,7 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
                 else "No vendor's model catalog has been fetched"
             ),
             "details": {
-                "catalog_version": snapshot.version if snapshot is not None else None,
+                "catalog_version": snapshot.catalog_version if snapshot is not None else None,
             },
             "duration_ms": _elapsed(start),
         }
@@ -1219,7 +1219,7 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
         "status": "fail" if pinned_at_risk else "warn",
         "message": message,
         "details": {
-            "catalog_version": snapshot.version,
+            "catalog_version": snapshot.catalog_version,
             "failed_vendors": {v: failures[v] for v in vendors},
             # The publication of this snapshot issued no request for these
             # vendors; the failure is the last one observed for each.
