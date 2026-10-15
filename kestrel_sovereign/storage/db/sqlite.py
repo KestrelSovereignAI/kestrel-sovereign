@@ -1370,15 +1370,21 @@ class SQLiteBackend(DatabaseBackend):
                 else None,
             )
             try:
-                try:
-                    await _close_aiosqlite_connection(
-                        conn,
-                        retained_closes=self._retired_connection_closes,
-                        deadline=close_deadline,
-                        diagnostics=diagnostics,
-                    )
-                finally:
-                    self._hand_worker_exit_hooks_to_retirement(conn)
+                await _close_aiosqlite_connection(
+                    conn,
+                    retained_closes=self._retired_connection_closes,
+                    deadline=close_deadline,
+                    diagnostics=diagnostics,
+                )
+            except BaseException as error:
+                failure = execution_terminal_error(failure, error)
+            # Handoff cannot replace an already-retained native close error
+            # through implicit exception context. Both owners settle first.
+            try:
+                self._hand_worker_exit_hooks_to_retirement(conn)
+            except BaseException as error:
+                failure = execution_terminal_error(failure, error)
+            try:
                 self._raise_if_connection_retirement_pending()
             except BaseException as error:
                 failure = execution_terminal_error(failure, error)

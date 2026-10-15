@@ -6,8 +6,12 @@ import aiosqlite
 import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
+)
 from kestrel_sovereign.storage.db.sqlite import (
+    SQLiteBackend,
     _prune_retained_aiosqlite_closes,
     _retain_aiosqlite_close,
     _wait_for_aiosqlite_worker_shutdown,
@@ -58,3 +62,44 @@ async def test_native_worker_exit_hooks_keep_original_unreported_control(tmp_pat
         await await_owned_task(close_task)
         await await_owned_task(record.retirement_task)
         await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_cancellation", [False, True])
+async def test_actual_close_and_hook_failures_keep_strongest_original(
+    tmp_path, monkeypatch, hook_cancellation,
+):
+    backend = SQLiteBackend(str(tmp_path / "combined-close.db"))
+    await backend.connect()
+    connection = backend._connection
+    native_close = connection.close
+    original = ExecutionCommitOutcomeError("unknown")
+    hook_error = (
+        asyncio.CancelledError("worker exit hook cancelled")
+        if hook_cancellation else ExecutionAuthorityError("worker exit hook denied")
+    )
+    calls = []
+
+    async def close_with_original_receipt():
+        await native_close()
+        await _wait_for_aiosqlite_worker_shutdown(connection)
+        raise original
+
+    def failing_hook():
+        calls.append("failing")
+        raise hook_error
+
+    backend._worker_exit_hooks[connection] = [
+        failing_hook, lambda: calls.append("joined"),
+    ]
+    monkeypatch.setattr(connection, "close", close_with_original_receipt)
+    owner = create_owned_task(backend.close())
+    try:
+        outcome = await asyncio.wait_for(await_owned_task(owner), 3)
+        assert outcome.error is original
+        assert calls == ["failing", "joined"]
+        assert backend._connection is None
+        assert not backend.connection_retirement_pending
+    finally:
+        await await_owned_task(owner)
+        await native_close()

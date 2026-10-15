@@ -233,6 +233,9 @@ only progress/attempt timing, not authority, privacy reentry or turn ownership.
 The watchdog recognizes the explicit iterator forwarding lineage; an arbitrary
 child copied from a producer cannot claim it. An already-pinned observation
 scope is never combined with another consumer's listeners or attempt bound.
+Timeouts carrying native commit uncertainty, authority denial or retained
+cleanup debt are control outcomes, not ordinary discovery outages; their
+original carrier propagates instead of becoming an empty catalog.
 
 The deadline can only cancel a step that awaits. A listing that blocks the
 event loop cannot be cut off and holds every other route's step and deadline

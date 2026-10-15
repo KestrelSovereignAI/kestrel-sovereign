@@ -1,6 +1,7 @@
 """Real PostgreSQL COMMIT acknowledgment faults reach public owners (#3569)."""
 
 import asyncio
+import json
 import asyncpg
 import pytest
 
@@ -21,6 +22,28 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from types import SimpleNamespace
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+
+
+async def assert_native_preference_rows(observer, schema, route, *, mandate=None):
+    """Check the whole acknowledged write, including atomic provenance (#2652)."""
+    rows = {
+        row["key"]: row["value"]
+        for row in await observer.fetch(f'SELECT key, value FROM "{schema}".agent_metadata')
+    }
+    if route == "model":
+        assert set(rows) == {
+            KestrelAgent.MODEL_PREFERENCE_KEY,
+            KestrelAgent.MODEL_PREFERENCE_PROVENANCE_KEY,
+        }
+        assert json.loads(rows[KestrelAgent.MODEL_PREFERENCE_KEY]) == mandate
+        assert json.loads(rows[KestrelAgent.MODEL_PREFERENCE_PROVENANCE_KEY]) == {
+            "mandate": mandate, "provenance": None,
+        }
+    elif route == "embedding":
+        assert rows == {KestrelAgent.EMBEDDING_ROUTE_KEY: "null"}
+    else:
+        assert route == "overrides"
+        assert rows == {KestrelAgent.EMBEDDING_MODEL_OVERRIDES_KEY: "{}"}
 
 
 def lose_ack(monkeypatch, *, cancelled, entered=None, release=None):
@@ -78,9 +101,9 @@ async def test_real_preference_commit_receipt_survives_callback_and_drain(
         await asyncio.wait_for(completed.wait(), 5)
     try:
         await asyncio.wait_for(completed.wait(), 5)
-        assert (
-            await observer.fetchval(f'SELECT COUNT(*) FROM "{schema}".agent_metadata')
-            == 1
+        await assert_native_preference_rows(
+            observer, schema, route,
+            mandate={"model": "model", "vendor": "local", "route": "unit"},
         )
         with pytest.raises(BaseException) as caught:
             await service.drain_preference_persistence()

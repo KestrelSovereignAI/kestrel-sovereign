@@ -337,6 +337,8 @@ class DecisionServiceMixin:
             except ExecutionAuthorityError:
                 raise
             except DiscoveryStepTimeout as exc:
+                if is_execution_control_error(exc):
+                    raise
                 # The deadline logged and recorded it; keep the last list.
                 silent = exc
                 state.record_discovery_failure()

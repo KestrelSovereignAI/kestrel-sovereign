@@ -366,6 +366,8 @@ class ModelDiscoveryMixin:
             async with asyncio.timeout(seconds) as scope:
                 yield
         except TimeoutError as exc:
+            if is_execution_control_error(exc) or execution_cleanup_debts(exc):
+                raise
             timeout = DiscoveryStepTimeout(
                 vendor=vendor,
                 route=route,
@@ -439,7 +441,9 @@ class ModelDiscoveryMixin:
                 vendor, route.get("name") or vendor, "chat catalog"
             ):
                 return await self._discover_for_vendor_route(vendor, route)
-        except DiscoveryStepTimeout:
+        except DiscoveryStepTimeout as error:
+            if is_execution_control_error(error) or execution_cleanup_debts(error):
+                raise
             return []
 
     @execution_work_operation

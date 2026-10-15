@@ -209,6 +209,9 @@ async def test_inference_tools_preserve_native_persistence_receipts(tmp_path, mo
 async def test_model_tool_keeps_completed_native_preference_receipt(tmp_path, kind):
     agent, db = await native_owner(tmp_path)
     service = service_owner()
+    # Reach the native writer-drain contract under an admitted selection;
+    # an empty chain now correctly refuses an agent-written override (#2652).
+    service.config = {"route_priority": ["local:native"]}
     service._mandate_preference = {"model": "original", "vendor": "local"}
     agent.llm_service = service
     error = receipt(kind)

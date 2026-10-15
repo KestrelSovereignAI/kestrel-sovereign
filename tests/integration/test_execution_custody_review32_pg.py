@@ -10,6 +10,7 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
 from tests.integration.test_execution_custody_review31_pg import hold_native_ack
+from tests.integration.test_execution_custody_review30_pg import assert_native_preference_rows
 from tests.unit.test_execution_custody_review29 import native_owner, retire
 from tests.unit.test_execution_custody_review30 import service_owner
 
@@ -61,7 +62,10 @@ async def test_native_commit_writer_must_settle_before_agent_storage_close(
             # Admission stays live through the actual native COMMIT. Retirement
             # starts only after it; never create a replacement for a late ACK.
             await asyncio.wait_for(committed.wait(), 5)
-        assert await observer.fetchval(f'SELECT COUNT(*) FROM "{schema}".agent_metadata') == 1
+        await assert_native_preference_rows(
+            observer, schema, route,
+            mandate={"model": "model", "vendor": "local", "route": "native"},
+        )
         shutdown = asyncio.create_task(agent.shutdown())
         await asyncio.wait_for(asyncio.shield(shutdown), 2)
         assert not writer.done() and not closed.is_set()
@@ -81,7 +85,10 @@ async def test_native_commit_writer_must_settle_before_agent_storage_close(
         assert agent._shutdown_control is original
         assert closed.is_set() and closes == [True]
         assert not service.has_pending_close_owners()
-        assert await observer.fetchval(f'SELECT COUNT(*) FROM "{schema}".agent_metadata') == 1
+        await assert_native_preference_rows(
+            observer, schema, route,
+            mandate={"model": "model", "vendor": "local", "route": "native"},
+        )
     finally:
         release.set()
         for task in (writer, shutdown, waiter, agent._durable_shutdown_continuation):
