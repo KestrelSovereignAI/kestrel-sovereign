@@ -1327,6 +1327,8 @@ class SQLiteBackend(DatabaseBackend):
                 except BaseException as error:
                     failure = execution_terminal_error(failure, error)
             if drain is not None and drain is not asyncio.current_task():
+                caller = asyncio.current_task()
+                cancellation_count = caller.cancelling() if caller is not None else 0
                 try:
                     async with asyncio.timeout(
                         min(
@@ -1339,7 +1341,16 @@ class SQLiteBackend(DatabaseBackend):
                     # The connection close remains responsible for the queued
                     # SQLite work.  Retire the Python task so loop teardown
                     # cannot strand a backend-owned cleanup task.
-                    if isinstance(exc, asyncio.CancelledError):
+                    if (
+                        isinstance(exc, asyncio.CancelledError)
+                        and (
+                            not drain.cancelled()
+                            or (caller is not None and caller.cancelling() > cancellation_count)
+                        )
+                    ):
+                        # shield also raises CancelledError when its child is
+                        # cancelled. That is not a new cancellation of this
+                        # observer, including after an earlier caught cancel.
                         pending_cancellation = exc
                     drain.cancel()
                     try:
@@ -1349,8 +1360,7 @@ class SQLiteBackend(DatabaseBackend):
                         # drain. If the close caller itself is cancelled while
                         # awaiting a stubborn drain, preserve that cancellation
                         # and deliver it after the connection is retired.
-                        caller = asyncio.current_task()
-                        if caller is not None and caller.cancelling():
+                        if caller is not None and caller.cancelling() > cancellation_count:
                             pending_cancellation = (
                                 pending_cancellation or drain_cancelled
                             )
