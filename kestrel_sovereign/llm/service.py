@@ -20,7 +20,7 @@ from dataclasses import replace
 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.llm.retry import state_aggregate_verdicts
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
-from typing import AsyncIterator, Awaitable, Callable, List, Dict, Any, Optional, Sequence, Union, Type, TYPE_CHECKING
+from typing import AsyncIterator, Awaitable, Callable, List, Dict, Any, Mapping, Optional, Sequence, Union, Type, TYPE_CHECKING
 
 import openai
 import httpx
@@ -37,7 +37,7 @@ from .provider_registry import (
     ProviderInitializationError,
     provider_cache_body,
 )
-from .call_progress import report_call_attempt
+from .call_progress import bound_attempt_call, report_call_attempt
 from .cancellation import CancelToken
 from .error_handling import (
     handle_llm_errors,
@@ -63,7 +63,7 @@ from .discovery_deadline import discovery_route_deadline_seconds
 from .model_discovery import ModelDiscoveryMixin, discovery_call
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
-from .streaming import StreamingMixin, RoutingResolution
+from .streaming import StreamingMixin, RoutingResolution, is_harness_owned_stall
 from .invocation_context import (
     LLMInvocationContext,
     LLMInvocationContextState,
@@ -4735,6 +4735,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         publish_identity: bool = True,
         error_message_override: Optional[str] = None,
         require_completion: bool = False,
+        route: Optional[Mapping[str, Any]] = None,
     ) -> Any:
         """Await and finalize one provider call, successful or failed.
 
@@ -4745,6 +4746,16 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         adapter refused an unfinished generation itself raises with the usage
         its provider reported on the error, and is recorded with that usage
         (#3577).
+
+        ``route`` is the provider entry of the configured route the attempt
+        dispatches to. The attempt then runs under the bound the caller set
+        for that route, if any
+        (:func:`~kestrel_sovereign.llm.call_progress.bound_attempt_call`,
+        #1968): one that goes its bound without progress raises
+        :class:`~kestrel_sovereign.llm.call_progress.AttemptInactivityTimeout`,
+        recorded as a failed attempt, and a fallback loop moves on from it as
+        from any other failure, except on a route whose harness owns its
+        transport (:func:`~kestrel_sovereign.llm.streaming.is_harness_owned_stall`).
         """
 
         def recorded_error(error: Exception) -> Exception:
@@ -4765,7 +4776,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         report_call_attempt(provider_name, model)
         started = time.monotonic()
         try:
-            response = await attempt
+            response = await bound_attempt_call(route, provider_name, model, attempt)
         except asyncio.CancelledError:
             # No usage evidence exists on a non-streaming cancelled call.  Keep
             # the historical cancellation contract and do not fabricate a row.
@@ -5388,6 +5399,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             tools=tools,
             response_format=response_format,
             force_local_only=force_local_only,
+            route=provider,
         )
 
         # Return full LLMResponse if tools or structured output requested
@@ -5444,6 +5456,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             # An internal audit must not replace the visible assistant
             # response identity used by persistence.
             publish_identity=False,
+            route=provider,
         )
 
     def _audit_route_vendors(
@@ -5961,6 +5974,14 @@ No other text or formatting.
                         invocation_context, "redact_content", False
                     ),
                 )
+                if is_harness_owned_stall(provider, e):
+                    # The harness owns this route's transport and its stall
+                    # was abandoned on the route's bound (#1968): fail the
+                    # call rather than answer from another model, as the
+                    # streaming loops do (#1429).
+                    raise LLMServiceError(
+                        f"Harness-owned route {provider['name']} failed: {e}"
+                    ) from e
 
                 if self._configured_routes_exhausted(
                     available_providers, provider_index, configured_vendors
@@ -6634,6 +6655,7 @@ No other text or formatting.
                     response_format=response_format,
                     force_local_only=force_local_only,
                     require_completion=True,
+                    route=provider,
                 )
                 if tools is not None or response_format is not None:
                     return self._annotate_and_return(span, response, redact=_redact)
@@ -6647,6 +6669,12 @@ No other text or formatting.
                 raise LLMServiceError(f"Request rejected by {provider['name']}: {e}") from e
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
+                if is_harness_owned_stall(provider, e):
+                    # See get_response: a harness-owned route's stall,
+                    # abandoned on its bound (#1968), never rotates.
+                    raise LLMServiceError(
+                        f"Harness-owned route {provider['name']} failed: {e}"
+                    ) from e
                 self._maybe_disable_route(provider, e)
                 if isinstance(e, UnfinishedAfterInlineToolsError):
                     raise

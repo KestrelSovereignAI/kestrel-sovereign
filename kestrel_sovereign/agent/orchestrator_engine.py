@@ -21,7 +21,8 @@ import time
 from contextlib import aclosing, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import (
-    Any, AsyncIterator, Awaitable, Dict, Iterator, List, Optional, TypeVar, Union,
+    Any, AsyncIterator, Awaitable, Callable, Dict, Iterator, List, Mapping,
+    Optional, Tuple, TypeVar, Union,
 )
 
 from kestrel_sovereign._async_ownership import (
@@ -40,7 +41,13 @@ from kestrel_sovereign.llm.adapter import (
     ThinkingDelta,
     tool_call_history_entry,
 )
-from kestrel_sovereign.llm.call_progress import call_progress_listener
+from kestrel_sovereign.llm.call_progress import (
+    FIRST_TOKEN_PHASE,
+    INTER_CHUNK_PHASE,
+    NON_STREAMING_PHASE,
+    AttemptInactivityTimeout,
+    call_progress_listener,
+)
 from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
 from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
 from kestrel_sovereign.turn_completion import (
@@ -191,11 +198,34 @@ class LLMCallWatchdog:
     on an item does not, and neither does an inline tool the provider is
     waiting on (:meth:`tool_running`): an adapter that runs tools inside the
     call (the codex app-server) is silent for as long as the tool takes.
+
+    A call that falls back across routes is timed per candidate (#1968). The
+    service hands each candidate attempt of the call to this watchdog
+    (:meth:`attempt_stream`, :meth:`attempt_call`), which bounds it by that
+    candidate's own route (:meth:`attempt_timeout`): a streamed attempt by
+    its wait for its first item and then by each wait between items, a
+    non-streaming one by its silence until it answers. While an attempt is
+    awaited its bound replaces the call's. An attempt that goes its bound
+    without progress raises
+    :class:`~kestrel_sovereign.llm.call_progress.AttemptInactivityTimeout`
+    inside the dispatch loop, which moves on to its next admitted candidate
+    as after any other failure. So a hung cloud primary still fails at the
+    short bound, and a slow local fallback runs to its own route's. The
+    call's bound covers what happens outside the attempts.
     """
 
-    def __init__(self, timeout: float) -> None:
+    def __init__(
+        self,
+        timeout: float,
+        *,
+        attempt_timeout: Optional[Callable[[Mapping[str, Any]], float]] = None,
+    ) -> None:
         self.timeout = timeout
-        self._pending: Optional[asyncio.Timeout] = None
+        self._attempt_timeout = attempt_timeout
+        # The bounds armed on the call's task, innermost last. Only the
+        # innermost runs; each one it encloses is suspended until it ends.
+        self._deadlines: List[Tuple[asyncio.Timeout, float]] = []
+        self._owner: Optional[asyncio.Task] = None
         self._tools_running = 0
         self._provider: Optional[str] = None
         self._model: Optional[str] = None
@@ -221,8 +251,14 @@ class LLMCallWatchdog:
         progress is silent until it answers, so its client's own timeout is
         the earliest point a hang can be told from a long answer: every
         candidate's timeout lifts its bound, cloud routes included.
+
+        Each candidate attempt is bounded by the same rule applied to that
+        candidate alone (#1968): the default, lifted to the candidate's
+        client timeout when it is a local route, or when the call does not
+        stream.
         """
-        timeout = ORCHESTRATOR_TURN_TIMEOUT_SECS
+        floor = ORCHESTRATOR_TURN_TIMEOUT_SECS
+        timeout = floor
         try:
             candidates, _ = llm_service.resolve_provider_routing(
                 model_override=model_override,
@@ -240,7 +276,17 @@ class LLMCallWatchdog:
             # Routing that cannot be resolved here fails again, loudly, in the
             # call itself; the default bound still applies to it.
             pass
-        return cls(timeout)
+
+        def attempt_timeout(route: Mapping[str, Any]) -> float:
+            if streaming:
+                lifted = llm_service.effective_request_timeout([route])
+            else:
+                lifted = llm_service.effective_request_timeout(
+                    [route], completion_only=True,
+                )
+            return lifted if lifted and lifted > floor else floor
+
+        return cls(timeout, attempt_timeout=attempt_timeout)
 
     @classmethod
     async def bound_completion(
@@ -284,15 +330,14 @@ class LLMCallWatchdog:
         return await self._bounded(pending)
 
     async def _bounded(self, pending: Awaitable[_T]) -> _T:
-        deadline = asyncio.timeout(None if self._tools_running else self.timeout)
+        self._owner = asyncio.current_task()
+        deadline = asyncio.timeout(None)
         try:
             async with deadline:
-                self._pending = deadline
-                try:
-                    with call_progress_listener(self._rearm, self._attempting):
-                        return await pending
-                finally:
-                    self._pending = None
+                with self._innermost(deadline, self.timeout), call_progress_listener(
+                    self._rearm, self._attempting, self,
+                ):
+                    return await pending
         except TimeoutError as exc:
             if not deadline.expired():
                 raise
@@ -307,6 +352,116 @@ class LLMCallWatchdog:
             raise LLMCallInactivityTimeout(
                 self.timeout, provider=self._provider, model=self._model,
             ) from exc
+
+    def attempt_timeout(self, route: Mapping[str, Any]) -> float:
+        """The bound, in seconds, on one attempt at candidate ``route``."""
+        if self._attempt_timeout is None:
+            return self.timeout
+        return self._attempt_timeout(route)
+
+    def attempt_stream(
+        self,
+        route: Mapping[str, Any],
+        provider: str,
+        model: str,
+        stream: AsyncIterator[Any],
+    ) -> AsyncIterator[Any]:
+        """``stream``, a streamed attempt at candidate ``route``, its time to
+        its first item and each wait between items bounded by the route."""
+        if asyncio.current_task() is not self._owner:
+            # Not this call's attempt: an inline tool's own model call, on
+            # the task its transport runs the tool on.
+            return stream
+        return self._watch_attempt(
+            stream, self.attempt_timeout(route), provider=provider, model=model,
+        )
+
+    async def attempt_call(
+        self,
+        route: Mapping[str, Any],
+        provider: str,
+        model: str,
+        pending: Awaitable[_T],
+    ) -> _T:
+        """Await ``pending``, a non-streaming attempt at candidate ``route``,
+        bounding its silence by the route."""
+        if asyncio.current_task() is not self._owner:
+            return await pending
+        return await self._bounded_attempt(
+            pending, self.attempt_timeout(route),
+            provider=provider, model=model, phase=NON_STREAMING_PHASE,
+        )
+
+    async def _watch_attempt(
+        self,
+        stream: AsyncIterator[Any],
+        limit: float,
+        *,
+        provider: str,
+        model: str,
+    ) -> AsyncIterator[Any]:
+        iterator = stream.__aiter__()
+        phase = FIRST_TOKEN_PHASE
+        try:
+            while True:
+                try:
+                    item = await self._bounded_attempt(
+                        iterator.__anext__(), limit,
+                        provider=provider, model=model, phase=phase,
+                    )
+                except StopAsyncIteration:
+                    return
+                phase = INTER_CHUNK_PHASE
+                yield item
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    async def _bounded_attempt(
+        self,
+        pending: Awaitable[_T],
+        limit: float,
+        *,
+        provider: str,
+        model: str,
+        phase: str,
+    ) -> _T:
+        deadline = asyncio.timeout(None)
+        try:
+            async with deadline:
+                with self._innermost(deadline, limit):
+                    return await pending
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise
+            logging.warning(
+                "[ORCHESTRATOR] LLM call produced nothing for %gs (provider %s, "
+                "model %s, phase %s); abandoning this candidate as a failed "
+                "attempt", limit, provider, model, phase,
+            )
+            raise AttemptInactivityTimeout(
+                provider=provider, model=model, phase=phase, timeout=limit,
+            ) from exc
+
+    @contextmanager
+    def _innermost(self, deadline: asyncio.Timeout, limit: float) -> Iterator[None]:
+        """Make ``deadline``, re-armed to ``limit``, the bound in force,
+        suspending the one it encloses until it ends."""
+        if self._deadlines:
+            enclosing, _ = self._deadlines[-1]
+            if not enclosing.expired():
+                enclosing.reschedule(None)
+        entry = (deadline, limit)
+        self._deadlines.append(entry)
+        self._rearm()
+        try:
+            yield
+        finally:
+            self._deadlines.remove(entry)
+            # The enclosing bound resumes with its whole window: nothing it
+            # bounds was waiting while the inner bound ran.
+            self._rearm()
 
     def _attempting(self, provider: str, model: str) -> None:
         # While an inline tool runs the call is not waiting on its provider,
@@ -328,13 +483,15 @@ class LLMCallWatchdog:
             self._rearm()
 
     def _rearm(self) -> None:
-        pending = self._pending
-        if pending is None or pending.expired():
+        if not self._deadlines:
+            return
+        pending, limit = self._deadlines[-1]
+        if pending.expired():
             return
         if self._tools_running:
             pending.reschedule(None)
         else:
-            pending.reschedule(asyncio.get_running_loop().time() + self.timeout)
+            pending.reschedule(asyncio.get_running_loop().time() + limit)
 
 CONTINUATION_INTENT_RE = re.compile(
     r"\b("
