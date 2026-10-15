@@ -564,10 +564,12 @@ async def test_deadline_holds_memory_until_abandoned_aiosqlite_write_finishes(
     except ImportError:
         drain_module = None
     real_writer = getattr(drain_module, "write_consolidation_drain_record", None)
+    written_paths = []
 
     def recording_writer(path, record):
         if real_writer is not None:
             real_writer(path, record)
+        written_paths.append(path)
         if record.get("state") == "draining":
             draining_recorded.set()
 
@@ -615,8 +617,12 @@ async def test_deadline_holds_memory_until_abandoned_aiosqlite_write_finishes(
         assert locks.holder(ResourceLock.MEMORY).label == (
             "Claw MemoryFeature.memory_consolidate"
         )
-        record_path = tmp_path / "abandoned-write.db.consolidation-drain.json"
+        [record_path] = set(written_paths)
+        assert record_path.parent == (
+            tmp_path / "abandoned-write.db.consolidation-drains"
+        ).resolve()
         record = json.loads(record_path.read_text())
+        assert record_path.name == f"{record['pass_id']}.json"
         assert record["state"] == "draining"
         assert record["agent_id"] == "did:test:abandoned-write"
         assert record["deadline_seconds"] == 0.05

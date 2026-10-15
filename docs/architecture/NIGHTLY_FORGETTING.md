@@ -179,8 +179,9 @@ not observe the interrupt until it returns control to SQLite. The pass keeps
 the MEMORY lock until that rollback has run, for at most the backend's
 30-second cleanup deadline, and past it isolates the database connection
 before releasing the lock, so a later pass never runs alongside the abandoned
-statement (#2978). `<database>.consolidation-drain.json` records the work
-until it settles; see `MEMORY_SYSTEM.md`.
+statement (#2978). Each such pass records the work in its own file under
+`<database>.consolidation-drains/` until it settles, which a connection closed
+under the work does only once its worker thread exits; see `MEMORY_SYSTEM.md`.
 
 ### 2. Episode participation in the decay model
 

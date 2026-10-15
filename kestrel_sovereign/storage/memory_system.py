@@ -48,15 +48,17 @@ from .memory_consolidator import MemoryConsolidator
 from .consolidation_drain import (
     ISOLATION_CALLER_CANCELLED,
     ISOLATION_CLEANUP_DEADLINE,
+    ISOLATION_CONNECTION_CLOSED,
     ISOLATION_WAIT_FAILED,
     ConsolidationDrain,
-    reconcile_consolidation_drain,
+    reconcile_consolidation_drains,
 )
 from .db.sqlite import (
     CANCELLATION_CLEANUP_FAILED,
     CANCELLATION_CLEANUP_FINISHED,
     CANCELLATION_CLEANUP_ISOLATED,
     CANCELLATION_CLEANUP_RETIRED,
+    CANCELLATION_CLEANUP_RETIRING,
 )
 from .schema_router import SchemaRouter
 from .async_storage import AsyncStorage
@@ -77,6 +79,7 @@ ABANDONED_WORK_FINISHED = CANCELLATION_CLEANUP_FINISHED
 ABANDONED_WORK_FAILED = CANCELLATION_CLEANUP_FAILED
 ABANDONED_WORK_ISOLATED = CANCELLATION_CLEANUP_ISOLATED
 ABANDONED_WORK_RETIRED = CANCELLATION_CLEANUP_RETIRED
+ABANDONED_WORK_RETIRING = CANCELLATION_CLEANUP_RETIRING
 
 _ABANDONED_WORK_OUTCOMES = {
     None: "the pass was abandoned and in-flight database work may still be "
@@ -93,6 +96,9 @@ _ABANDONED_WORK_OUTCOMES = {
     "that work finishes",
     ABANDONED_WORK_RETIRED: "the pass was abandoned, and the database "
     "connection was closed under the work it left running",
+    ABANDONED_WORK_RETIRING: "the pass was abandoned, and the database "
+    "connection was closed under the work it left running, which keeps "
+    "running until that connection's worker thread exits",
 }
 
 
@@ -438,22 +444,29 @@ class MemorySystem:
         logger.info(f"Memory system initialized for agent {self.agent_id}")
 
     def _reconcile_consolidation_drain(self) -> None:
-        """Close out a drain record whose owner did not survive to settle it.
+        """Report drain records no pass will settle on its own (#2978).
 
         A process that dies while a timed-out pass's database work drains
-        never marks that record done, and the health check would otherwise
-        keep reporting work that died with it (#2978). Reconciling is
-        evidence-keeping, so a record that cannot be read is reported here
-        and left for the health check, never fatal to startup.
+        never marks that pass's record done. Startup reads every record for
+        the database and logs each one that does not say its work settled,
+        with who holds it. It changes none of them: the only write it can
+        cause is a pass of this very process retrying its own settlement.
         """
-        try:
-            reconcile_consolidation_drain(getattr(self.storage, "db", None))
-        except (OSError, ValueError):
+        report = reconcile_consolidation_drains(getattr(self.storage, "db", None))
+        if report is None:
+            return
+        for status in report.unsettled:
             logger.warning(
-                "Could not reconcile the memory consolidation drain record "
-                "of agent %s",
+                "Memory consolidation drain record found at startup of agent "
+                "%s: %s",
                 self.agent_id,
-                exc_info=True,
+                status.describe(),
+            )
+        for unreadable in report.unreadable:
+            logger.warning(
+                "At startup of agent %s: %s",
+                self.agent_id,
+                unreadable.describe(),
             )
 
     async def shutdown(self) -> None:
@@ -903,12 +916,19 @@ class MemorySystem:
         connection is isolated first -- every later operation fails closed
         until the work finishes -- and only then is the lock released.
 
-        A durable record beside the database file tracks the work until it
-        settles: the database itself refuses work meanwhile, so it cannot
-        hold the evidence.
+        When the connection is closed under the work before that rollback
+        runs, the work ends only with the connection's worker thread: the
+        record stays isolated until that thread has exited, however long
+        after the close that is.
+
+        This pass's own durable record, beside the database file, tracks the
+        work until it settles: the database itself refuses work meanwhile, so
+        it cannot hold the evidence. Work already pending on the connection
+        when the deadline fired is waited for and recorded the same way,
+        whoever abandoned it: the pass cannot tell it apart from its own.
 
         Returns what became of the work (an ``ABANDONED_WORK_*`` value) and
-        the record's path, or ``None`` when there is no file to hold one.
+        the record's path, or ``None`` when no record could be written.
         """
         db = getattr(self.storage, "db", None)
         if db is None or getattr(
@@ -946,11 +966,14 @@ class MemorySystem:
             raise
         if cleanup == CANCELLATION_CLEANUP_ISOLATED:
             record.isolate(ISOLATION_CLEANUP_DEADLINE)
+        elif cleanup == CANCELLATION_CLEANUP_RETIRING:
+            # Settled by the backend once the worker thread exits.
+            record.isolate(ISOLATION_CONNECTION_CLOSED)
         else:
             # The backend's settlement callback normally ran first; this is
             # a no-op then.
             record.settle(cleanup)
-        return cleanup, record.path
+        return cleanup, None if record.persisted_state is None else record.path
 
     async def _forget_decayed_episodes(self) -> int:
         """Deletion tier of the forgetting curve (#1674).

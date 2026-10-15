@@ -24,10 +24,10 @@ from kestrel_sovereign.features.storage_access import (
 )
 from kestrel_sovereign.signals import lock_manager as resource_lock_manager
 from kestrel_sovereign.storage.consolidation_drain import (
-    DRAIN_STATE_DONE,
-    DRAIN_STATE_DRAINING,
-    consolidation_drain_record_path,
-    reconcile_consolidation_drain,
+    DRAIN_STATE_ISOLATED,
+    HOLDER_CLOSED_CONNECTION,
+    HOLDER_THIS_CONNECTION,
+    reconcile_consolidation_drains,
 )
 
 logger = logging.getLogger(__name__)
@@ -398,81 +398,60 @@ async def check_memory_system(agent) -> Dict[str, Any]:
 def _consolidation_drain_check(
     db,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Report a timed-out consolidation pass whose database work is unsettled.
+    """Report every timed-out consolidation pass whose database work is unsettled.
 
-    Reads the durable record the pass left beside the database file (#2978),
-    never the database: while that work runs the database refuses or delays
-    operations, and this check must answer regardless. The record is first
-    reconciled against its owner, so one left by a process that died mid-drain
-    is closed out rather than reported as running work forever.
+    Reads the durable records timed-out passes left beside the database file
+    (#2978), never the database: while that work runs the database refuses or
+    delays operations, and this check must answer regardless. Each pass keeps
+    its own record, and every one is read: one pass settling says nothing
+    about another. A record whose owner has exited without settling it is
+    reported until an operator deletes it, never cleared here.
 
-    Returns ``(concern, settled)``: a status/message to report, or the record
-    of work that has settled, kept as history. Both ``None`` when there is no
-    record.
+    Returns ``(concern, settled)``: a status/message/details to report while
+    any record is unsettled or unreadable, else the most recent settled
+    record, kept as history. Both ``None`` when there are no records.
     """
-    path = consolidation_drain_record_path(db)
-    if path is None:
+    report = reconcile_consolidation_drains(db)
+    if report is None:
         return None, None
-    try:
-        status = reconcile_consolidation_drain(db)
-    except (OSError, ValueError) as exc:
-        return {
-            "status": "warn",
-            "message": (
-                "Could not read the memory consolidation drain record "
-                f"{path}: {exc}"
-            ),
-        }, None
-    if status is None:
-        return None, None
-    record = status.record
-    state = record.get("state")
-    if not status.unsettled:
-        if state == DRAIN_STATE_DONE:
-            return None, record
-        return {
-            "status": "warn",
-            "message": (
-                f"Memory consolidation drain record {path} has an unknown state "
-                f"{state!r}"
-            ),
-        }, None
-    details = {"consolidation_drain": record}
-    if status.holder is not None:
-        # Running, but not on the connection this agent uses: it is not
-        # isolated, though its writes may wait behind that work.
-        return {
-            "status": "warn",
-            "message": (
-                "A memory consolidation pass timed out at "
-                f"{record.get('timed_out_at')} and recorded its database work "
-                f"as {state}, held by {status.holder}; this agent's database "
-                "connection is not the one holding it, but its writes may "
-                f"wait behind that work (record: {path})"
-            ),
-            "details": details,
-        }, None
-    if state == DRAIN_STATE_DRAINING:
-        return {
-            "status": "warn",
-            "message": (
-                "A memory consolidation pass timed out at "
-                f"{record.get('timed_out_at')} and its database work is still "
-                "running; the memory lock is held until it finishes "
-                f"(record: {path})"
-            ),
-            "details": details,
-        }, None
-    # Unsettled work is draining or isolated.
+
+    concerns = []
+    for status in report.unsettled:
+        # This agent's database refuses all work: its connection is isolated,
+        # or was closed under work that only the worker thread's exit ends.
+        refusing = status.holder == HOLDER_CLOSED_CONNECTION or (
+            status.holder == HOLDER_THIS_CONNECTION
+            and status.state == DRAIN_STATE_ISOLATED
+        )
+        concerns.append(("fail" if refusing else "warn", status.describe()))
+    for unreadable in report.unreadable:
+        concerns.append(("warn", unreadable.describe()))
+    if not concerns:
+        latest = report.latest_settled
+        return None, None if latest is None else latest.record
+
+    severity = worst_status(*(level for level, _ in concerns))
+    # The most severe first; the rest are counted here and listed in details.
+    message = next(text for level, text in concerns if level == severity)
+    if len(concerns) > 1:
+        message = f"{message} (and {len(concerns) - 1} more; see details)"
     return {
-        "status": "fail",
-        "message": (
-            "A memory consolidation pass timed out at "
-            f"{record.get('timed_out_at')} and its database work is still "
-            "running; the database connection refuses all work until it "
-            f"finishes (record: {path})"
-        ),
-        "details": details,
+        "status": severity,
+        "message": message,
+        "details": {
+            "consolidation_drains": [
+                {
+                    "record_path": str(status.path),
+                    "holder": status.holder,
+                    "record": status.record,
+                }
+                for status in report.unsettled
+            ],
+            "unreadable_drain_records": [
+                {"record_path": str(unreadable.path), "error": unreadable.error}
+                for unreadable in report.unreadable
+            ],
+        },
     }, None
 
 

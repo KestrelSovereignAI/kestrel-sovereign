@@ -180,7 +180,7 @@ semantic_recall_max_tokens = 1200
 # interrupt) keeps the MEMORY lock until it returns, for at most the backend's
 # 30-second cleanup deadline; past that the database connection refuses all
 # work until it does, and only then is the lock released. While it runs,
-# <database>.consolidation-drain.json beside the agent database records it.
+# the pass's own record under <database>.consolidation-drains/ tracks it.
 # memory_consolidation_timeout_seconds = 1800
 
 # =============================================================================
