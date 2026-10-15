@@ -131,6 +131,11 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
     """Preserve the strongest commit distinction through explicit carriers."""
     outcome = None
     for current in _explicit_control_chain(error):
+        unresolved = vars(current).get("_kestrel_unresolved_commit_outcome")
+        if unresolved == "unknown":
+            return "unknown"
+        if unresolved == "committed":
+            outcome = "committed"
         if isinstance(current, ExecutionCommitOutcomeError):
             if current.commit_outcome == "unknown":
                 return "unknown"
@@ -198,6 +203,8 @@ def execution_denial_scopes(error: BaseException | None) -> tuple | None:
     if execution_cleanup_debts(error):
         return None
     for carrier in _explicit_control_chain(error):
+        if vars(carrier).get("_kestrel_unresolved_commit_outcome"):
+            return None
         if vars(carrier).get("_kestrel_unscoped_execution_denial"):
             return None
         receipts = _acknowledged_commits(carrier)
@@ -217,8 +224,14 @@ def execution_denial_scopes(error: BaseException | None) -> tuple | None:
     return tuple(scopes) if scopes or settled_commit else None
 
 
-def execution_terminal_error(*errors: BaseException | None) -> BaseException | None:
-    """Keep irreversible control evidence ahead of cancellation/cleanup noise."""
+def execution_terminal_error(*errors: BaseException | None, retain_originals: bool = False) -> BaseException | None:
+    """Keep irreversible control evidence ahead of cancellation/cleanup noise.
+
+    Native lifecycle boundaries can retain all original body/closer carriers
+    explicitly. Ordinary repeated readers retain bounded irreversible facts,
+    not a growing exception history. Unresolved legacy commit classification
+    is one such fact: a successful ACK elsewhere never settles it.
+    """
     import asyncio
     present = tuple(error for error in errors if error is not None)
     def retain(selected):
@@ -226,9 +239,15 @@ def execution_terminal_error(*errors: BaseException | None) -> BaseException | N
         commits = []
         denied_scopes = []
         unscoped_denial = False
+        unresolved_commit = None
         for error in present:
             for carrier in _explicit_control_chain(error):
                 commits.extend(receipt for receipt in _acknowledged_commits(carrier) if receipt not in commits)
+                unresolved = (carrier.commit_outcome if isinstance(carrier, ExecutionCommitOutcomeError)
+                    else vars(carrier).get("_kestrel_unresolved_commit_outcome"))
+                if unresolved in {"committed", "unknown"}:
+                    if unresolved_commit is None or unresolved == "unknown":
+                        unresolved_commit = unresolved
             for debt in execution_cleanup_debts(error):
                 if not any(debt[0] is prior[0] and debt[1] is prior[1] for prior in debts):
                     debts.append(debt)
@@ -250,6 +269,20 @@ def execution_terminal_error(*errors: BaseException | None) -> BaseException | N
             selected._kestrel_denied_execution_scopes = tuple(denied_scopes)
         if unscoped_denial:
             selected._kestrel_unscoped_execution_denial = True
+        if unresolved_commit is not None:
+            selected._kestrel_unresolved_commit_outcome = unresolved_commit
+        if retain_originals:
+            retained = tuple(_explicit_control_chain(selected))
+            others = []
+            for error in present:
+                if (error not in retained and error not in others
+                    and selected not in tuple(_explicit_control_chain(error))):
+                    others.append(error)
+            if others:
+                if selected.__cause__ is not None:
+                    others.insert(0, selected.__cause__)
+                selected.__cause__ = (others[0] if len(others) == 1 else
+                    BaseExceptionGroup("original execution terminal evidence", others))
         return selected
     for outcome in ("unknown", "committed"):
         for error in present:

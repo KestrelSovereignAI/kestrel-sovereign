@@ -61,11 +61,19 @@ Opaque legacy acquire wrappers retain ordinary caller-context behavior but
 cannot admit execution custody, including custody introduced later inside an
 initially unbound operational session. This restriction is explicit, not an
 inferred native capability or a bypass of wrapper accounting.
+The direct epilogues must be the actual native asyncpg context types, not
+context-affine subclasses. A wrapper cannot suppress the original body failure
+inside its managed lease: Core records it before invoking wrapper exit, and
+does not publish after-commit callbacks for a rolled-back cancellation. After
+the entire wrapper exit (including any post-reset await), all retained scopes
+are revalidated at the final publication boundary.
 
 Before issuing a committed receipt, one fixed `SELECT 1` on that same held
 transaction proves it is not aborted: PostgreSQL can otherwise accept COMMIT
 as a silent ROLLBACK. The proof is cancellable and precedes native commit
-handoff. Custody, callbacks and fixed cleanup require this proof. Unfenced,
+handoff. Known-commit custody must also own the top-level transaction, not
+merely release a savepoint inside a wrapper's external transaction. Custody,
+callbacks and fixed cleanup require this proof. Unfenced,
 callback-free transactions retain their historical behavior but do not mint a
 known-commit receipt without proof. Refusal to create an epilogue owner aborts
 only its original native connection, retains the exact resource with no owner
@@ -74,6 +82,12 @@ and denies the participating scopes. It is not a successful reset/rollback or
 permission to retry. A failed native reset likewise aborts that original dirty
 session; abort failure remains explicit evidence. The borrowed pool is never
 terminated as a substitute for retiring its one lease.
+Actual rollback/reset failures preserve the original body cancellation and
+closer errors as explicit carriers. Failed physical reset denies every
+participating scope even if no commit occurred. Error aggregation separately
+retains the bounded unresolved-commit classification of legacy carriers; a
+settled acknowledged receipt cannot erase unrelated reconciliation debt just
+because the selected exception object changes.
 Cancellation while observing a successful native ACK is delivered on the
 original cancellation object with an `AcknowledgedExecutionCommit`, not an
 invented UNKNOWN. Its commit owner and shared original-reset record are

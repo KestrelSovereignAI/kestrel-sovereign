@@ -24,6 +24,247 @@ native_pg = _native_pg
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
+@pytest.mark.parametrize("boundary", ["checkout", "transaction"])
+async def test_opaque_native_context_subclass_is_refused_before_body(
+    native_pg, monkeypatch, boundary
+):
+    backend, observer, schema = native_pg
+    entries = []
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("opaque native subtype"))
+    if boundary == "checkout":
+
+        class OpaqueCheckout(asyncpg.pool.PoolAcquireContext):
+            async def __aenter__(self):
+                entries.append(True)
+                return await super().__aenter__()
+
+        monkeypatch.setattr(
+            asyncpg.Pool,
+            "acquire",
+            lambda pool, timeout=None: OpaqueCheckout(pool, timeout),
+        )
+    else:
+
+        class OpaqueTransaction(asyncpg.transaction.Transaction):
+            async def __aenter__(self):
+                entries.append(True)
+                return await super().__aenter__()
+
+        monkeypatch.setattr(
+            asyncpg.Connection,
+            "transaction",
+            lambda connection, **kwargs: OpaqueTransaction(
+                connection, None, False, False
+            ),
+        )
+    with (
+        bind_execution_custody_snapshot((scope,)),
+        pytest.raises(Exception, match="opaque"),
+    ):
+        await backend.execute("INSERT INTO effects VALUES (782, 'not admitted')")
+    assert entries == []
+    assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0
+
+
+@pytest.mark.parametrize("surface", ["query", "transaction", "callback", "cleanup"])
+async def test_adapter_outer_transaction_cannot_be_a_durable_commit_witness(
+    native_pg, surface
+):
+    backend, observer, schema = native_pg
+    pool = backend._pool
+    callbacks, bodies = [], []
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("must own outer commit"))
+
+    class OuterRollback(Exception):
+        pass
+
+    @asynccontextmanager
+    async def wrapper(native):
+        async with native as connection:
+            try:
+                async with connection.transaction():
+                    yield connection
+                    raise OuterRollback()
+            except OuterRollback:
+                pass
+        raise asyncio.CancelledError("observer after actual outer rollback")
+
+    backend._pool = PostgresPoolAdapter(pool, wrapper)
+    try:
+
+        async def write():
+            if surface == "callback":
+                async with backend.transaction():
+                    bodies.append(True)
+                    backend.call_after_commit(lambda: callbacks.append(True))
+                    await backend.execute(
+                        "INSERT INTO effects VALUES (784, 'must roll back')"
+                    )
+            elif surface == "cleanup":
+                async with (
+                    backend._tracked_pool_checkout(backend._pool, admit_work=False) as (
+                        connection,
+                        state,
+                    ),
+                    backend._tracked_native_transaction(connection, (), state),
+                ):
+                    bodies.append(True)
+                    await connection.execute(
+                        "INSERT INTO effects VALUES (784, 'must roll back')"
+                    )
+            else:
+                with bind_execution_custody_snapshot((scope,)):
+                    if surface == "transaction":
+                        async with backend.transaction():
+                            bodies.append(True)
+                            await backend.execute(
+                                "INSERT INTO effects VALUES (784, 'must roll back')"
+                            )
+                    else:
+                        await backend.execute(
+                            "INSERT INTO effects VALUES (784, 'must roll back')"
+                        )
+
+        outcome = await await_owned_task(create_owned_task(write()))
+        assert outcome.error is not None
+        assert execution_commit_outcome(outcome.error) is None, (
+            "a SAVEPOINT release is not durable COMMIT"
+        )
+        assert callbacks == []
+        if surface != "callback":
+            assert bodies == []
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0
+    finally:
+        backend._pool = pool
+
+
+async def test_wrapper_cannot_suppress_original_body_cancel_inside_native_lease(
+    native_pg,
+):
+    backend, observer, schema = native_pg
+    pool = backend._pool
+    cancelled = asyncio.CancelledError("original transaction body cancellation")
+    callbacks = []
+
+    @asynccontextmanager
+    async def wrapper(native):
+        async with native as connection:
+            try:
+                yield connection
+            except asyncio.CancelledError as error:
+                assert error is cancelled
+
+    backend._pool = PostgresPoolAdapter(pool, wrapper)
+    try:
+
+        async def write():
+            async with backend.transaction():
+                backend.call_after_commit(lambda: callbacks.append(True))
+                await backend.execute(
+                    "INSERT INTO effects VALUES (785, 'cancelled body')"
+                )
+                raise cancelled
+
+        outcome = await await_owned_task(create_owned_task(write()))
+        assert outcome.error is cancelled
+        assert callbacks == []
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0
+    finally:
+        backend._pool = pool
+
+
+@pytest.mark.parametrize("surface", ["query", "transaction"])
+async def test_wrapper_late_scope_loss_is_checked_after_entire_exit(native_pg, surface):
+    backend, observer, schema = native_pg
+    pool = backend._pool
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("late wrapper original"))
+    parent = ExecutionCustody(
+        ProcessRuntimeExecutionFence("late wrapper healthy parent")
+    )
+    callbacks = []
+
+    @asynccontextmanager
+    async def wrapper(native):
+        async with native as connection:
+            yield connection
+        # Native checkout validated before this arbitrary wrapper await.
+        await asyncio.sleep(0)
+        scope.revoke("original scope retired after native reset")
+
+    backend._pool = PostgresPoolAdapter(pool, wrapper)
+    try:
+
+        async def write():
+            with bind_execution_custody_snapshot((parent, scope)):
+                if surface == "transaction":
+                    async with backend.transaction():
+                        backend.call_after_commit(lambda: callbacks.append(True))
+                        await backend.execute(
+                            "INSERT INTO effects VALUES (786, 'actually committed')"
+                        )
+                else:
+                    await backend.execute(
+                        "INSERT INTO effects VALUES (786, 'actually committed')"
+                    )
+
+        outcome = await await_owned_task(create_owned_task(write()))
+        assert outcome.error is not None
+        assert execution_commit_outcome(outcome.error) == "committed"
+        assert execution_denial_scopes(outcome.error) == (scope,)
+        assert callbacks == []
+        parent.require_work()
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 1
+    finally:
+        backend._pool = pool
+
+
+@pytest.mark.parametrize("boundary", ["rollback", "reset"])
+async def test_actual_cleanup_failure_retains_body_cancel_and_denies_all_scopes(
+    native_pg, monkeypatch, boundary
+):
+    backend, observer, schema = native_pg
+    scope = ExecutionCustody(
+        ProcessRuntimeExecutionFence("original cancelled rollback")
+    )
+    cancelled = asyncio.CancelledError("original body stopped before commit")
+    failure = OSError("actual native cleanup failed")
+    original_transaction = asyncpg.transaction.Transaction.__aexit__
+    original_reset = asyncpg.pool.PoolAcquireContext.__aexit__
+
+    async def transaction_exit(transaction, error_type, error, traceback):
+        result = await original_transaction(transaction, error_type, error, traceback)
+        if boundary == "rollback" and error is cancelled:
+            raise failure
+        return result
+
+    async def reset_exit(checkout, error_type, error, traceback):
+        result = await original_reset(checkout, error_type, error, traceback)
+        if boundary == "reset":
+            raise failure
+        return result
+
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", transaction_exit)
+    monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", reset_exit)
+
+    async def write():
+        with bind_execution_custody_snapshot((scope,)):
+            async with backend.transaction():
+                await backend.execute(
+                    "INSERT INTO effects VALUES (783, 'actual rollback')"
+                )
+                raise cancelled
+
+    outcome = await await_owned_task(create_owned_task(write()))
+    assert execution_commit_outcome(outcome.error) is None
+    assert execution_cleanup_debts(outcome.error)
+    assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0
+    with pytest.raises(ExecutionAuthorityError):
+        scope.require_work()
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+
+    assert cancelled in tuple(_explicit_control_chain(outcome.error))
+
+
 @pytest.mark.parametrize("abort_fails", [False, True])
 async def test_asyncpg_internal_reset_task_refusal_keeps_actual_debt(
     native_pg, monkeypatch, abort_fails

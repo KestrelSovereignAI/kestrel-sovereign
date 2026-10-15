@@ -98,6 +98,7 @@ class _ExecutionCommitState:
     connection: Any = None
     checkout_open: bool = False
     terminal: BaseException | None = None
+    body_failure: BaseException | None = None
 
     def remember(self, scopes: tuple[ExecutionCustody, ...]) -> None:
         # A shared checkout can begin unbound and participate in several
@@ -932,15 +933,7 @@ class PostgresBackend(DatabaseBackend):
         factory, inventing a completed closer or leaking its live transaction.
         Keep the exact resource and absence of an owner as retirement debt.
         """
-        terminal = execution_terminal_error(body_failure, refusal)
-        if terminal is not refusal:
-            prior = terminal.__cause__
-            terminal.__cause__ = (refusal if prior is None else
-                BaseExceptionGroup("native ownership refusal", [prior, refusal]))
-        if body_failure is not None and terminal is not body_failure:
-            prior = terminal.__cause__
-            terminal.__cause__ = (body_failure if prior is None else
-                BaseExceptionGroup("original native body failure", [prior, body_failure]))
+        terminal = execution_terminal_error(body_failure, refusal, retain_originals=True)
         PostgresBackend._abort_native_connection(connection, terminal)
         terminal._kestrel_native_retirement_debts = (
             *getattr(terminal, "_kestrel_native_retirement_debts", ()),
@@ -969,7 +962,13 @@ class PostgresBackend(DatabaseBackend):
                 async with pool.wrap_checkout(native) as connection:
                     if connection is not state.connection or not state.checkout_open:
                         raise ExecutionAuthorityError("pool adapter did not retain its original native checkout")
-                    yield connection, state
+                    try:
+                        yield connection, state
+                    except BaseException as error:
+                        # Capture BEFORE an arbitrary wrapper can suppress the
+                        # cancellation around its yield inside the native lease.
+                        state.body_failure = error
+                        raise
             except BaseException as error:
                 failure = error
             # A wrapper cannot abandon or suppress the registered native lease.
@@ -980,14 +979,23 @@ class PostgresBackend(DatabaseBackend):
                     await native.__aexit__(type(failure) if failure is not None else None,
                         failure, failure.__traceback__ if failure is not None else None)
                 except BaseException as cleanup:
-                    failure = execution_terminal_error(failure, cleanup)
-            failure = execution_terminal_error(state.terminal, failure)
+                    failure = execution_terminal_error(failure, cleanup, retain_originals=True)
+            failure = execution_terminal_error(state.body_failure, state.terminal, failure, retain_originals=True)
             if failure is not None:
                 if state.outcome is not None and not is_execution_control_error(failure):
                     for scope in state.scopes:
                         scope.preserve_commit_uncertainty(state.outcome)
                     raise ExecutionCommitOutcomeError(state.outcome) from failure
+                if admit_work and state.acknowledgments and execution_commit_outcome(failure) == "committed":
+                    failure = self._retain_after_commit_denial(failure, state.scopes, state.acknowledgments)
                 raise failure
+            # Arbitrary wrapper exit may await AFTER native reset validated.
+            # Recheck the retained admissions at the final publication boundary.
+            if admit_work:
+                if state.outcome is not None:
+                    self._require_after_authority_commit(state.scopes, state.acknowledgments)
+                else:
+                    require_execution_backend("postgres", state.scopes)
             return
         if not isinstance(pool, asyncpg.Pool):
             # Preserve ordinary legacy wrapper context semantics. Strong
@@ -1007,7 +1015,7 @@ class PostgresBackend(DatabaseBackend):
         # state through that await so a release failure cannot imply rollback.
         body_failure: BaseException | None = None
         checkout = pool.acquire()
-        if not isinstance(checkout, asyncpg.pool.PoolAcquireContext):
+        if type(checkout) is not asyncpg.pool.PoolAcquireContext:
             raise ExecutionAuthorityError("native pool acquire is opaque; use PostgresPoolAdapter")
         connection = await checkout.__aenter__()
         native_connection = connection._con
@@ -1033,10 +1041,12 @@ class PostgresBackend(DatabaseBackend):
             raise state.retain_acknowledgments(terminal)
         state.retirement.owner = retirement
         retired = await await_owned_task(retirement)
-        terminal = execution_terminal_error(body_failure, retired.error, retired.cancellation)
+        terminal = execution_terminal_error(body_failure, retired.error, retired.cancellation, retain_originals=True)
         if retired.error is not None:
             assert terminal is not None
             self._abort_native_connection(connection, terminal)
+            for scope in state.scopes:
+                scope.revoke("original native pool retirement failed")
             terminal._kestrel_native_retirement_debts = (
                 *getattr(terminal, "_kestrel_native_retirement_debts", ()),
                 (_NativePostgresRetirement(checkout, connection, native_connection), retirement),
@@ -1102,12 +1112,7 @@ class PostgresBackend(DatabaseBackend):
                 failure = ExecutionCommitOutcomeError("committed")
                 failure.__cause__ = denial
                 denial = failure
-            selected = execution_terminal_error(original, denial)
-            if selected is original and denial is not original:
-                prior = original.__cause__
-                original.__cause__ = (denial if prior is None else
-                    BaseExceptionGroup("original post-commit control evidence", [prior, denial]))
-            return selected
+            return execution_terminal_error(original, denial, retain_originals=True)
         return original
 
     @asynccontextmanager
@@ -1126,8 +1131,12 @@ class PostgresBackend(DatabaseBackend):
         if commit_state is not None:
             commit_state.remember(scopes)
         transaction = connection.transaction()
-        if not isinstance(transaction, asyncpg.transaction.Transaction):
+        if type(transaction) is not asyncpg.transaction.Transaction:
             raise ExecutionAuthorityError("native transaction exit is opaque; native custody requires asyncpg Transaction")
+        top_level = not connection.is_in_transaction()
+        needs_proof = requires_commit_proof() if callable(requires_commit_proof) else requires_commit_proof
+        if needs_proof and not top_level:
+            raise ExecutionAuthorityError("native known-commit custody requires its own top-level transaction")
         await transaction.__aenter__()
         native_connection = connection._con if isinstance(connection, asyncpg.pool.PoolConnectionProxy) else connection
         body_failure: BaseException | None = None
@@ -1140,6 +1149,8 @@ class PostgresBackend(DatabaseBackend):
             # committable before handing off its native exit, even when there
             # are no after-commit callbacks. This remains cancellable body work.
             if requires_commit_proof() if callable(requires_commit_proof) else requires_commit_proof:
+                if not top_level:
+                    raise ExecutionAuthorityError("native known-commit custody requires its own top-level transaction")
                 await _prove_committable(connection)
                 proven = True
         except BaseException as error:
@@ -1166,7 +1177,7 @@ class PostgresBackend(DatabaseBackend):
                 if execution_commit_outcome(completed.error) is not None:
                     raise completed.error
                 raise ExecutionCommitOutcomeError(outcome) from completed.error
-            terminal = execution_terminal_error(body_failure, completed.error, completed.cancellation)
+            terminal = execution_terminal_error(body_failure, completed.error, completed.cancellation, retain_originals=True)
             terminal._kestrel_native_retirement_debts = (
                 *getattr(terminal, "_kestrel_native_retirement_debts", ()),
                 (_NativePostgresRetirement(transaction, connection, native_connection), completion),
@@ -1183,7 +1194,7 @@ class PostgresBackend(DatabaseBackend):
             # task from a long operational session. Earlier escaped receipts
             # still share this SAME original reset record and settle with it.
             commit_state.acknowledgments[:] = [receipt] if receipt is not None else []
-        terminal = execution_terminal_error(body_failure, completed.cancellation)
+        terminal = execution_terminal_error(body_failure, completed.cancellation, retain_originals=True)
         if terminal is not None:
             if receipt is not None:
                 retain_acknowledged_execution_commit(terminal, receipt)

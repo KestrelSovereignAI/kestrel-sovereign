@@ -64,6 +64,39 @@ async def test_selected_cancel_keeps_scoped_provenance_across_reaggregation():
     )
 
 
+@pytest.mark.asyncio
+async def test_settled_fact_never_localizes_legacy_unresolved_committed_carrier():
+    receipt = await acknowledged_receipt()
+    reset = create_owned_task(asyncio.sleep(0))
+    await await_owned_task(reset)
+    receipt.retirement_owner = reset
+    selected = retain_acknowledged_execution_commit(asyncio.CancelledError(), receipt)
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("unresolved original"))
+    scope.preserve_commit_uncertainty("committed")
+    with pytest.raises(ExecutionCommitOutcomeError) as caught:
+        scope.require_work()
+    aggregate = execution_terminal_error(selected, caught.value)
+    assert aggregate is selected
+    assert execution_commit_outcome(aggregate) == "committed"
+    assert execution_denial_scopes(aggregate) is None
+    # Repeated future denials must not accumulate fresh error/traceback
+    # histories just to retain this one irreversible unresolved fact.
+    for _ in range(100):
+        with pytest.raises(ExecutionCommitOutcomeError) as repeated:
+            scope.require_work()
+        assert execution_terminal_error(aggregate, repeated.value) is aggregate
+        assert aggregate.__cause__ is None
+        assert vars(aggregate)["_kestrel_unresolved_commit_outcome"] == "committed"
+        assert execution_denial_scopes(aggregate) is None
+    replacement = retain_acknowledged_execution_commit(
+        asyncio.CancelledError(), receipt
+    )
+    assert (
+        execution_denial_scopes(execution_terminal_error(replacement, aggregate))
+        is None
+    )
+
+
 async def acknowledged_receipt():
     commit = create_owned_task(asyncio.sleep(0))
     assert (await await_owned_task(commit)).error is None
