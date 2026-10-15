@@ -6,6 +6,11 @@ This test suite verifies that the KestrelAgent correctly orchestrates its sub-ag
 
 It uses a real LLMService (which may use local Ollama or cloud providers) but focuses
 on the agent's internal wiring and command delegation.
+
+Every call that reaches a live route runs under a deadline, and the tests
+that make one skip unless that route answers within a few seconds (#3269).
+A test's probe and calls share its ``live_call_budget``, so the deadlines of
+its sequential calls together fit inside the test's timeout.
 """
 
 import os
@@ -20,8 +25,18 @@ from kestrel_sovereign.llm.generation_gate import failure_summary
 from kestrel_sovereign.llm.output_ceiling import incomplete_generation
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
+from tests.integration.live_routes import (
+    TEST_TIMEOUT_SECONDS,
+    bounded_live_call,
+    describe_chat_routes,
+    describe_discovery_routes,
+    require_answering_chat_route,
+    require_answering_discovery,
+)
 from tests.shared import no_llm_credentials, no_docker
 from tests.shared.genesis_audit import complete_deterministic_genesis_audit
+
+pytestmark = pytest.mark.timeout(TEST_TIMEOUT_SECONDS)
 
 
 def _mcp_available() -> bool:
@@ -72,17 +87,43 @@ async def kestrel_agent(temp_db):
     # Close LLM service to cleanup aiosqlite connections
     await llm_service.close()
 
+
+@pytest_asyncio.fixture
+async def usable_model_list(kestrel_agent, live_call_budget):
+    """Skip unless the discovery behind ``!model-list`` finishes within seconds."""
+    await require_answering_discovery(kestrel_agent.llm_service, budget=live_call_budget)
+
+
+@pytest_asyncio.fixture
+async def usable_chat_route(kestrel_agent, live_call_budget):
+    """Skip unless the agent's routes answer a one-word prompt within seconds."""
+    await require_answering_chat_route(kestrel_agent.llm_service, budget=live_call_budget)
+
+
+async def _bounded_input(agent, user_input: str, waiting_on: str, budget):
+    """Run one ``process_input`` under the live-route deadline ``budget`` allows."""
+    return await bounded_live_call(
+        agent.process_input(user_input),
+        budget=budget,
+        what=f"process_input({user_input!r})",
+        waiting_on=waiting_on,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for orchestration tests")
-async def test_orchestrator_model_management(kestrel_agent):
+async def test_orchestrator_model_management(kestrel_agent, usable_model_list, live_call_budget):
     """
     Test that the orchestrator correctly delegates model management commands
     to the ModelAgent.
     """
     logger.info("Testing Model Management Orchestration...")
-    
+    discovery_routes = describe_discovery_routes(kestrel_agent.llm_service)
+
     # 1. List Models - returns formatted string through command routing
-    response = await kestrel_agent.process_input("!model-list")
+    response = await _bounded_input(
+        kestrel_agent, "!model-list", discovery_routes, live_call_budget
+    )
     logger.info(f"List Models Response: {response}")
 
     # Command routing returns formatted string, not raw list
@@ -95,7 +136,7 @@ async def test_orchestrator_model_management(kestrel_agent):
     
     # 2. Show Current Model
     # The !model command shows the currently configured model
-    response = await kestrel_agent.process_input("!model")
+    response = await _bounded_input(kestrel_agent, "!model", discovery_routes, live_call_budget)
     logger.info(f"Current Model Response: {response}")
     assert isinstance(response, str), f"Expected string response, got {type(response)}"
     # Response should mention current model or provide instructions
@@ -103,7 +144,9 @@ async def test_orchestrator_model_management(kestrel_agent):
     
     # 3. Model Info
     # Query info about a non-existent model to verify error handling
-    response = await kestrel_agent.process_input("!model-info non-existent-model")
+    response = await _bounded_input(
+        kestrel_agent, "!model-info non-existent-model", discovery_routes, live_call_budget
+    )
     assert "Model not found" in response or "Error" in response or "not found" in response.lower()
 
 @pytest.mark.asyncio
@@ -111,26 +154,33 @@ async def test_orchestrator_model_management(kestrel_agent):
     no_docker() or no_llm_credentials() or not _mcp_available(),
     reason="Docker/LLM credentials/kestrel-feature-mcp not available"
 )
-async def test_orchestrator_mcp_management(kestrel_agent):
+async def test_orchestrator_mcp_management(kestrel_agent, live_call_budget):
     """
     Test that the orchestrator correctly delegates MCP commands
     to the MCPAgent.
-    
+
     Note: This test requires Docker to be available and running.
     """
     logger.info("Testing MCP Orchestration...")
-    
+
     # 1. Load Tool
     # This requires the docker image to be available.
     # We assume kestrel-mcp-test-server is built (from previous tests).
-    response = await kestrel_agent.process_input(f"!mcp-load {TEST_MCP_IMAGE}")
+    response = await _bounded_input(
+        kestrel_agent,
+        f"!mcp-load {TEST_MCP_IMAGE}",
+        f"Docker image {TEST_MCP_IMAGE}",
+        live_call_budget,
+    )
     logger.info(f"MCP Load Response: {response}")
     
     assert "✅ Loaded" in response
     assert "echo" in response # The test server exposes 'echo'
     
     # 2. List Tools
-    response = await kestrel_agent.process_input("!mcp-list")
+    response = await _bounded_input(
+        kestrel_agent, "!mcp-list", f"Docker image {TEST_MCP_IMAGE}", live_call_budget
+    )
     logger.info(f"MCP List Response: {response}")
     assert "echo" in response
     assert "add" in response
@@ -144,14 +194,18 @@ async def test_orchestrator_mcp_management(kestrel_agent):
     await asyncio.sleep(2)
     
     call_cmd = f"!mcp-call {container_name} echo {{\"message\": \"Hello Kestrel\"}}"
-    response = await kestrel_agent.process_input(call_cmd)
+    response = await _bounded_input(
+        kestrel_agent, call_cmd, f"MCP container {container_name}", live_call_budget
+    )
     logger.info(f"MCP Call Response: {response}")
     
     assert "Hello Kestrel" in response
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for natural language tool use")
-async def test_orchestrator_natural_language_tool_use(kestrel_agent):
+async def test_orchestrator_natural_language_tool_use(
+    kestrel_agent, usable_chat_route, live_call_budget
+):
     """
     The agent must respond to a natural-language tool-use prompt without
     crashing or entering safe mode, and ideally invoke ModelManagerTool.
@@ -174,7 +228,12 @@ async def test_orchestrator_natural_language_tool_use(kestrel_agent):
 
     query = "Please list all available AI models."
     try:
-        response = await kestrel_agent.process_input(query)
+        response = await _bounded_input(
+            kestrel_agent,
+            query,
+            describe_chat_routes(kestrel_agent.llm_service),
+            live_call_budget,
+        )
     except Exception as exc:
         unfinished = incomplete_generation(exc)
         if unfinished is None:
