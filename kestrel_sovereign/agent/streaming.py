@@ -47,6 +47,7 @@ from kestrel_sovereign.security.input_guardrails import (
     check_prompt_injection,
 )
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
+from kestrel_sovereign.storage.turn_provenance import turn_opener_metadata
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -1471,7 +1472,13 @@ class StreamingMixin:
         # #1662: persist attachment refs on the user turn so the composer's
         # images/docs survive reload (and a later turn can resolve them). The
         # bytes live in the encrypted file store; only the refs ride here.
-        _user_meta = {"sent_form": True, **semantic_recall_metadata}
+        # A streamed turn is never a signal wake (the dispatcher drives
+        # process_input), so it is stamped as opened by a person (#3654).
+        _user_meta = {
+            "sent_form": True,
+            **semantic_recall_metadata,
+            **turn_opener_metadata(None),
+        }
         if attachments:
             _user_meta["attachments"] = attachments
         await self.privacy_agent.add_conversation(

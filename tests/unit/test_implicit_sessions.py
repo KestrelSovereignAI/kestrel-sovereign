@@ -26,6 +26,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.turn_provenance import turn_opener_metadata
+
+# A person's turn, stamped as the agent stamps every turn it opens. A turn
+# continues a session only when its latest turn carries this stamp (#3654).
+PERSON = turn_opener_metadata(None)
 
 
 @pytest.fixture
@@ -59,9 +64,9 @@ class TestImplicitSessionDerivation:
     @pytest.mark.asyncio
     async def test_consecutive_messages_share_session(self, store):
         """Two messages in quick succession should share an implicit session."""
-        await store.add_conversation("user", "first")
+        await store.add_conversation("user", "first", metadata=PERSON)
         await store.add_conversation("assistant", "response")
-        await store.add_conversation("user", "second")
+        await store.add_conversation("user", "second", metadata=PERSON)
 
         rows = await store.db.fetchall(
             "SELECT metadata FROM conversation_history WHERE agent_id = ? ORDER BY id",
@@ -139,7 +144,7 @@ class TestSessionGapBoundary:
         recent_time = canonical_created_at(
             datetime.now(timezone.utc) - timedelta(minutes=5)
         )
-        recent_meta = {"session_id": "recent-session"}
+        recent_meta = {"session_id": "recent-session", **PERSON}
         await store.db.execute_commit(
             "INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -163,16 +168,24 @@ class TestSessionGapBoundary:
         recent = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
         monkeypatch.setattr(
             store.db,
-            "fetchone",
+            "fetchall",
             AsyncMock(
-                return_value=(
-                    json.dumps({"session_id": "postgres-session"}),
+                return_value=[(
+                    "user",
+                    json.dumps({"session_id": "postgres-session", **PERSON}),
                     recent,
-                )
+                )]
             ),
         )
 
-        assert await store._derive_implicit_session_id() == "postgres-session"
+        assert (
+            await store._derive_implicit_session_id(for_turn=True)
+            == "postgres-session"
+        )
+        assert (
+            await store._derive_implicit_session_id(for_turn=False)
+            == "postgres-session"
+        )
 
 
 class TestSessionIdRetrieval:
@@ -207,14 +220,16 @@ class TestErrorIsolation:
         """Even if the previous-message lookup fails, the message must store."""
         db = MagicMock()
         # First call (lookup) fails; second call (insert) succeeds
-        db.fetchone = AsyncMock(side_effect=RuntimeError("db hiccup"))
+        db.fetchall = AsyncMock(side_effect=RuntimeError("db hiccup"))
         db.execute_commit = AsyncMock()
 
         store = AsyncConversationStore(db, agent_id="test-agent")
         # Should not raise
         await store.add_conversation("user", "hello")
 
-        # Insert was still attempted
+        # The lookup really was the call that failed, and the insert was
+        # still attempted.
+        db.fetchall.assert_awaited_once()
         db.execute_commit.assert_called_once()
 
 
