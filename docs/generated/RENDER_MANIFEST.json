@@ -130,6 +130,7 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/features/compute/models.py",
         "kestrel_sovereign/features/compute/script_signer.py"
       ],
       "findings": [],

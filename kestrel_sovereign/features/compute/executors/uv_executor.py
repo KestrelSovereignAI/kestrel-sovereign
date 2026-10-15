@@ -18,7 +18,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 from kestrel_sovereign.kestrel_config.constants import SUBPROCESS_TIMEOUT_SHORT
 
 from ..destructive_policy import DestructiveOperationPolicy
-from ..models import ComputeScript, ExecutionRecord
+from ..models import ComputePolicy, ComputeScript, ExecutionRecord
 from .base import (
     _SAFE_ENV_VARS,
     BaseExecutor,
@@ -126,6 +126,8 @@ class UvExecutor(BaseExecutor):
         uv_path: Optional[str] = None,
         max_output_bytes: int = 1024 * 1024,  # 1MB default
         current_agent_data_path: Optional[str | Path] = None,
+        *,
+        policy: Optional[ComputePolicy] = None,
     ):
         """
         Initialize the UV executor.
@@ -133,12 +135,14 @@ class UvExecutor(BaseExecutor):
         Args:
             uv_path: Path to uv binary (default: auto-detect)
             max_output_bytes: Maximum stdout/stderr size to capture
+            policy: The compute policy whose deletable prefixes apply
         """
-        super().__init__(max_output_bytes=max_output_bytes)
+        super().__init__(max_output_bytes=max_output_bytes, policy=policy)
         self._uv_path = uv_path
         self._cached_uv_path: Optional[str] = None
         self._policy = DestructiveOperationPolicy(
-            current_agent_data_path=current_agent_data_path
+            current_agent_data_path=current_agent_data_path,
+            deletable_prefixes=self.compute_policy.deletable_prefixes,
         )
     
     @property

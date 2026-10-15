@@ -204,6 +204,12 @@ When `run_script` is called, the existing `SecurityHook` handles it:
 
 The Compute Feature adds a **pre-check hook** for script analysis, but approval uses the standard flow.
 
+Inside the tool, `run_script` asks the same `ApprovalQueue` again unless
+`ComputePolicy.requires_approval` says the script may run without asking
+(§8.1): its risk score is below `auto_approve_below_risk` and, while
+`require_approval_for_network` is set, its analysis found no network access.
+With no reachable queue it refuses rather than running.
+
 ### 3.3 Destructive Operation Policy: No `rm`, Ever
 
 **Principle:** The agent should never permanently delete user files. All deletions are soft-deletes via `mv` to a trash folder.
@@ -1318,28 +1324,54 @@ This is a CRITICAL security violation - it cannot be approved or rewritten.
 
 ### 8.1 Environment Variables
 
+These are the variables the feature reads. The first four build the
+`ComputePolicy` (`ComputePolicy.from_env()` in
+`kestrel_sovereign/features/compute/models.py`) when the feature initializes.
+
 ```bash
-# Executor selection
-KESTREL_COMPUTE_DEFAULT_EXECUTOR=uv     # uv, docker, or local
-KESTREL_ALLOW_LOCAL_COMPUTE=false       # Enable local executor (dangerous!)
-
-# Timeouts
-KESTREL_COMPUTE_DEFAULT_TIMEOUT=300     # 5 minutes
-KESTREL_COMPUTE_MAX_TIMEOUT=3600        # 1 hour max
-
-# Docker settings
-KESTREL_COMPUTE_DOCKER_NETWORK=none     # none, bridge, or custom
-KESTREL_COMPUTE_DOCKER_MEM_LIMIT=256m
-KESTREL_COMPUTE_DOCKER_CPU_LIMIT=0.5
+# ComputePolicy
+KESTREL_COMPUTE_AUTO_APPROVE_RISK=0     # run_script asks unless risk is below this (0 = always ask)
+KESTREL_COMPUTE_MAX_TIMEOUT=3600        # longest timeout run_script accepts, in seconds
+KESTREL_COMPUTE_ALLOW_DOCKER=true       # false: the Docker executor is never built
+KESTREL_ALLOW_LOCAL_COMPUTE=false       # exactly "true" builds the local executor (no isolation!)
 
 # Script signatures (§3.6)
 KESTREL_COMPUTE_ACCEPT_LEGACY_SCRIPT_SIGNATURES=true  # false refuses legacy v1 signatures
 
-# Trash/deletion policy
+# Trash
 KESTREL_TRASH_DIR=~/.kestrel/trash      # Where "deleted" files go
-KESTREL_TRASH_RETENTION_DAYS=30         # Auto-purge after 30 days
-KESTREL_TEMP_PREFIXES=/tmp/kestrel_     # Dirs where true deletion allowed
 ```
+
+`KESTREL_COMPUTE_DEFAULT_TIMEOUT` is deprecated and does nothing except log a
+warning: `run_script`'s `timeout` defaults to 300 seconds, a value fixed by the
+tool's published schema. No variable selects a default executor, sets Docker
+resource limits, or opens Docker networking: scripts always run with
+`--network=none`.
+
+#### ComputePolicy settings
+
+The feature builds one frozen `ComputePolicy` and passes that instance to the
+trash manager and to every executor; `get_compute_policy` and
+`get_compute_capabilities` report the same instance. Each setting has one
+enforcing consumer (#2483):
+
+| Setting | Enforced by |
+|---|---|
+| `auto_approve_below_risk` | `ComputePolicy.requires_approval`, asked by `run_script` before it runs a script |
+| `require_approval_for_network` | `ComputePolicy.requires_approval`: a script whose analysis finds network access (`network`, `download` findings) asks whatever its risk score |
+| `max_timeout_seconds` | `run_script` refuses a longer timeout; the Docker executor leaves an unowned staging directory alone at least this long |
+| `trash_retention_days` | `TrashManager.empty` (and so `empty_trash`, dry run included) refuses to delete trash younger than this |
+| `allow_docker`, `allow_local` | the feature builds that executor only when allowed; the local executor also requires `KESTREL_ALLOW_LOCAL_COMPUTE=true` itself |
+| `deletable_prefixes` | each executor's `DestructiveOperationPolicy`: the temp roots where deletion is real rather than a move to trash. It may only narrow the built-in set; a wider list is refused |
+
+`default_timeout_seconds` and `trash_enabled` are deprecated. Passing either to
+`ComputePolicy` logs a warning and changes nothing; reading either returns the
+value the runtime uses (300 seconds, and `True`). Trash cannot be disabled,
+because a disabled trash would turn every `rm` into a real deletion.
+
+`ComputePolicy` decides only whether `run_script` must ask. Asking, and
+recording the answer, stay with the security feature's `ApprovalQueue`
+(§3.2).
 
 ### 8.2 Trash Management
 
