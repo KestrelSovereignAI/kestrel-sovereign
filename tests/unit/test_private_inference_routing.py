@@ -50,6 +50,9 @@ class _Host(RemoteBackendMixin):
     def _remote_first_allowed(self, model_override):
         return model_override is None or "/" not in model_override
 
+    def _admit_call_override(self, model_override, *, via="model_override"):
+        """This host has no provider policy (#2652), so it admits every override."""
+
 
 def _touch_current(host: _Host, events: list[str] | None = None):
     async def touch(lease_id: str) -> InferenceLease:

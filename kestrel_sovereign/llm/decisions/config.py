@@ -110,6 +110,16 @@ class DecisionSelector:
     def route_name(self) -> Optional[str]:
         return f"{self.vendor}:{self.route}" if self.route else None
 
+    @property
+    def text(self) -> str:
+        """The selector as routing reads it: ``vendor[:route][/model]``.
+
+        Canonical, so policy admission sees exactly what routing selects
+        rather than the raw override, which may carry surrounding whitespace.
+        """
+        text = self.route_name or self.vendor
+        return f"{text}/{self.model}" if self.model else text
+
     def matches_route(self, provider: Mapping[str, Any]) -> bool:
         if provider.get("vendor") != self.vendor:
             return False

@@ -45,6 +45,10 @@ from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
 )
+from kestrel_sovereign.llm.provider_policy import (
+    OverrideProvenance,
+    named_call_override_scope,
+)
 from kestrel_sovereign.storage.conversation_created_at import parse_stored_timestamp
 from kestrel_sovereign.storage.encryption import DecryptionError
 from kestrel_sovereign.storage.memory_attestation_state import (
@@ -358,11 +362,20 @@ class ReflectionSleepHook:
         phase=SleepHookPhase.KNOWLEDGE_EXTRACTION,
     )
 
-    def __init__(self, *, backend: str = "chat", decision_model: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        *,
+        backend: str = "chat",
+        decision_model: Optional[str] = None,
+        decision_model_writer: Optional[OverrideProvenance] = None,
+    ) -> None:
         # ``[retrieval] memory_attestation_*`` (#3495), validated by
         # ``memory_system._attestation_settings``.
         self.backend = backend
         self.decision_model = decision_model
+        # Who chose ``decision_model``. Unnamed, the provider policy holds it
+        # to the approved chain as the agent's (#2652).
+        self.decision_model_writer = decision_model_writer
         # A hook instance is shared by every way an agent can sleep.  Keep its
         # pre/post handoff task-local so an overlapping scheduled and manual
         # cycle cannot consume or overwrite one another's attestation result.
@@ -621,11 +634,14 @@ class ReflectionSleepHook:
         if llm_service is None or not hasattr(llm_service, "decide"):
             outcomes: List[Any] = [DecisionError("decide is unavailable on this agent")]
         else:
-            outcomes = await await_execution_work_group(
-                agent,
-                (lambda candidate=candidate: attest(candidate) for candidate in candidates),
-                return_exceptions=True,
-            )
+            with named_call_override_scope(
+                self.decision_model, self.decision_model_writer
+            ):
+                outcomes = await await_execution_work_group(
+                    agent,
+                    (lambda candidate=candidate: attest(candidate) for candidate in candidates),
+                    return_exceptions=True,
+                )
         for outcome in outcomes:
             if isinstance(outcome, BaseException) and not isinstance(outcome, DecisionError):
                 raise outcome

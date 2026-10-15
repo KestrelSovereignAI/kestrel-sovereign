@@ -6,6 +6,12 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.llm.provider_policy import (
+    ProviderPolicyRefusal,
+    current_override_writer,
+    override_writer,
+    tool_write_provenance,
+)
 from kestrel_sovereign.security.host_authority import (
     HostAuthorityError,
     require_sovereign_caller,
@@ -21,6 +27,68 @@ def _caller_is_sovereign() -> bool:
     except HostAuthorityError:
         return False
     return True
+
+
+def _format_override(entry: Dict[str, Any]) -> str:
+    """One override as ``vendor[:route]/model by <source> (<role>) via ... at ...``."""
+    target = entry.get("vendor") or "?"
+    if entry.get("route"):
+        target += f":{entry['route']}"
+    target += f"/{entry.get('model')}"
+    provenance = entry.get("provenance", entry) or {}
+    writer = provenance.get("source") or "unknown"
+    detail = f"{target} by {writer} (role {provenance.get('role') or 'none'}"
+    if entry.get("agent"):
+        detail += f", agent {entry['agent']}"
+    detail += ")"
+    if provenance.get("via"):
+        detail += f" via {provenance['via']}"
+    if provenance.get("at"):
+        detail += f" at {provenance['at']}"
+    return detail
+
+
+# How the audit view names each kind of override decision.
+_DECISION_KINDS = {"call": "per-call", "fallback": "fallback", "mandate": "mandate"}
+
+
+def _format_provider_policy(policy: Dict[str, Any]) -> str:
+    """The provider policy audit view as a few lines of text (#2652)."""
+    chain = " → ".join(
+        f"{route['name']} [{route['state']}]"
+        for route in policy.get("chain", [])
+        if route.get("approved")
+    ) or "none"
+    declared = (
+        "[llm] route_priority"
+        if policy.get("chain_declared")
+        else "no route_priority declared: every initialized route"
+    )
+    lines = [
+        f"Approved chain ({declared}): {chain}",
+        f"Denied providers: {', '.join(policy.get('denied_providers') or []) or 'none'}",
+    ]
+    override = policy.get("override")
+    lines.append(
+        f"Override in force: {_format_override(override)}"
+        if override
+        else "Override in force: none"
+    )
+    fallbacks = policy.get("fallbacks") or []
+    if fallbacks:
+        lines.append("Mandate fallbacks:")
+        for fallback in fallbacks:
+            lines.append(f"  - {_format_override(fallback)}")
+    history = policy.get("override_history") or []
+    if history:
+        lines.append("Override decisions since start (newest last):")
+        for entry in history[-10:]:
+            verdict = "accepted" if entry.get("accepted") else (
+                f"REFUSED ({(entry.get('refusal') or {}).get('error')})"
+            )
+            kind = _DECISION_KINDS.get(entry.get("kind"), "mandate")
+            lines.append(f"  - {verdict} ({kind}): {_format_override(entry)}")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -408,13 +476,24 @@ class ModelAgent(Feature):
         vendor = selection.get("vendor")
         route = selection.get("route")
         model_name = selection.get("model_name")
+        describe = getattr(self.llm_service, "describe_provider_policy", None)
+        policy = describe() if callable(describe) else None
+        if not isinstance(policy, dict):
+            policy = None
+        confirmation = f"Current model: {model_str}"
+        if policy is not None:
+            confirmation += "\n" + _format_provider_policy(policy)
         return ToolResult.ok(
-            confirmation=f"Current model: {model_str}",
+            confirmation=confirmation,
             data={
                 "current_model": model_str,
                 "vendor": vendor,
                 "route": route,
                 "model_name": model_name,
+                # #2652: the approved chain, the deny-list, the override in
+                # force and who wrote it, and every override decision since
+                # start, accepted or refused.
+                "provider_policy": policy,
                 "message": (
                     f"Current model: {model_str}\n\n"
                     "Use `!model-set <vendor[:route]> <model>` to change. "
@@ -523,6 +602,14 @@ class ModelAgent(Feature):
                         },
                     )
 
+            # Who is choosing this provider (#2652): the caller only when the
+            # call was a typed ``!model-set``; otherwise the agent, whose
+            # choice the approved chain bounds. Checked before consent is
+            # recorded, so a refused switch records no consent to it.
+            provenance = tool_write_provenance("set_model")
+            with override_writer(provenance):
+                self.llm_service.resolve_model_preference(model_name, vendor, route)
+
             # Record agent consent before applying the change
             consent = self.agent.features.get("ConsentFeature") if hasattr(self.agent, 'features') else None
             if consent:
@@ -541,7 +628,8 @@ class ModelAgent(Feature):
             # Safe to switch. One mandate change, serialized with a
             # privacy-mode transition recording the mandate (#3554).
             async with self.llm_service.mandate_change():
-                self.llm_service.set_model_preference(model_name, vendor, route)
+                with override_writer(provenance):
+                    self.llm_service.set_model_preference(model_name, vendor, route)
             if vendor and route:
                 full_model = f"{vendor}:{route}/{model_name}"
             elif vendor:
@@ -570,6 +658,11 @@ class ModelAgent(Feature):
             # scalar-only ``data`` (per PR #1093 read-payload heuristic),
             # so the marker has to live in the confirmation itself.
             return ToolResult.ok(confirmation=message, data=data)
+        except ProviderPolicyRefusal as refusal:
+            return ToolResult.failed(
+                f"Model not changed: {refusal}",
+                data={"success": False, **refusal.to_dict()},
+            )
         except Exception as e:
             if is_execution_control_error(e):
                 raise
@@ -654,7 +747,13 @@ class ModelAgent(Feature):
             else:
                 vendor = left
 
-        self.llm_service.set_model_preference(model, vendor, route)
+        # Nothing on this path (``KestrelAgent.set_model()``) attests a
+        # principal, so the write is the agent's and the approved chain bounds
+        # it, unless the caller named its writer (#2652). A refusal raises.
+        with override_writer(
+            current_override_writer(via="ModelAgent.set_model_preference")
+        ):
+            self.llm_service.set_model_preference(model, vendor, route)
         logger.info(f"Model preference set to: {model_id}")
         return f"Model preference set to {model_id}"
 

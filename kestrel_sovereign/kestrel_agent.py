@@ -16,6 +16,13 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
 from uuid import uuid4
 
 from kestrel_sovereign.agent.model_preference import resolve_replayed_model_preference
+from kestrel_sovereign.llm.provider_policy import (
+    OverrideProvenance,
+    agent_provenance,
+    caller_call_override_scope,
+    override_writer,
+    system_provenance,
+)
 from kestrel_sovereign.agent.privacy_state import (
     PRIVACY_STATE_UNRECORDED_MESSAGE,
     PrivacyState,
@@ -114,6 +121,7 @@ from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.orchestrator_engine import (
     ContextStats,
+    LLMCallWatchdog,
     OrchestratorEngineMixin,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
@@ -127,12 +135,14 @@ from kestrel_sovereign.agent.streaming import (
     resolve_turn_invocation_context,
 )
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
+from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
     BOOTSTRAP_ALLOWED_COMMANDS,
+    bypasses_turn_queue,
     prefixed_command_token,
 )
 from kestrel_sovereign.execution_custody import (
@@ -250,6 +260,17 @@ class _PrivacyModelPlan:
     switched: Optional[dict] = None
     # Why the mandate the mode implies could not be installed, for the user.
     warning: Optional[str] = None
+    # Who wrote ``preference`` (#2652): Kestrel for the local route a
+    # local-only mode forces, the original writer for a mandate it restores.
+    # None for a mandate already in force, which keeps its own.
+    provenance: Optional[OverrideProvenance] = None
+
+
+def _live_mandate_provenance(llm) -> Optional[OverrideProvenance]:
+    """Who wrote the mandate ``llm`` has in force, when it records one."""
+    reader = getattr(llm, "get_model_preference_provenance", None)
+    provenance = reader() if callable(reader) else None
+    return provenance if isinstance(provenance, OverrideProvenance) else None
 
 
 def _mandate_triple(preference: Mapping[str, Any]) -> Dict[str, Optional[str]]:
@@ -1935,6 +1956,12 @@ class KestrelAgent(
         self._direct_tools: dict = {}
         self._direct_tool_defs: list = []
         self._tool_to_feature: dict = {}  # tool_name -> feature tool_name
+        # #2935: bumped by every change to the direct-tool registry or the
+        # loaded feature map, and stamped on each derived tool allowlist, so a
+        # refusal can say which registry produced the set it was checked
+        # against. The per-turn ledger behind "accepted earlier this turn"
+        # lives in kestrel_sovereign.agent.tool_allowlist.
+        self._tool_registry_generation: int = 0
         self._constitution_receipt_tool_calls: list[dict] = []
         self._constitution_receipt_expected: Optional[dict] = None
         # #1580 (D): pinned features are exempt from LRU eviction.
@@ -2042,6 +2069,7 @@ class KestrelAgent(
             if tool_def.get("function", {}).get("name")
             != PHANTOM_RECEIPT_TOOL_NAME
         ]
+        bump_registry_generation(self)
         self._direct_tool_defs.append(
             {
                 "type": "function",
@@ -2083,6 +2111,7 @@ class KestrelAgent(
             if tool_def.get("function", {}).get("name")
             != PHANTOM_RECEIPT_TOOL_NAME
         ]
+        bump_registry_generation(self)
         self._constitution_receipt_tool_calls = []
         self._constitution_receipt_expected = None
 
@@ -5346,7 +5375,9 @@ class KestrelAgent(
             return _PrivacyModelPlan(preference=None, saved=origin_saved)
         if not config.allows_cloud_llm():
             saved = (
-                SavedModelPreference.from_preference(llm.get_model_preference() or {})
+                SavedModelPreference.from_preference(
+                    llm.get_model_preference() or {}, _live_mandate_provenance(llm)
+                )
                 if live_config.allows_cloud_llm()
                 else origin_saved
             )
@@ -5375,10 +5406,12 @@ class KestrelAgent(
         )
         if not local_route:
             return _PrivacyModelPlan(preference=current, saved=saved)
+        provenance = system_provenance(via="privacy")
         try:
-            preference = llm.resolve_model_preference(
-                local_route["model"], local_route.get("vendor"), local_route.get("route")
-            )
+            with override_writer(provenance):
+                preference = llm.resolve_model_preference(
+                    local_route["model"], local_route.get("vendor"), local_route.get("route")
+                )
         except ValueError as exc:
             logging.error(
                 "The local route %s cannot be set as the model mandate (%s); "
@@ -5389,7 +5422,11 @@ class KestrelAgent(
             )
             return _PrivacyModelPlan(preference=current, saved=saved)
         return _PrivacyModelPlan(
-            preference=preference, saved=saved, install=True, switched=dict(preference)
+            preference=preference,
+            saved=saved,
+            install=True,
+            switched=dict(preference),
+            provenance=provenance,
         )
 
     @staticmethod
@@ -5403,6 +5440,10 @@ class KestrelAgent(
         the LLM service now refuses keeps it too, and the user is told: the
         saved copy is cleared like any other on leaving, rather than held to
         be replayed later over a mandate the operator has chosen since.
+
+        The saved mandate is restored under the authority of whoever wrote it
+        (#2652), so one the agent wrote is still held to the approved chain. A
+        saved mandate with no recorded writer is the agent's.
         """
         current = _mandate_triple(llm.get_model_preference() or {})
         if saved is None:
@@ -5414,9 +5455,14 @@ class KestrelAgent(
             return _PrivacyModelPlan(preference=current)
         if not saved.pinned:
             return _PrivacyModelPlan(preference=_mandate_triple({}), install=True)
+        provenance = saved.provenance or agent_provenance(via="privacy restore")
         try:
             preference = resolve_replayed_model_preference(
-                llm, saved.model, saved.vendor, saved.route
+                llm,
+                saved.model,
+                saved.vendor,
+                saved.route,
+                provenance=provenance,
             )
         except ValueError as exc:
             logging.error(
@@ -5435,11 +5481,18 @@ class KestrelAgent(
                 ),
             )
         return _PrivacyModelPlan(
-            preference=preference, install=True, switched=dict(preference)
+            preference=preference,
+            install=True,
+            switched=dict(preference),
+            provenance=provenance,
         )
 
     def _install_privacy_mandate(self, plan: _PrivacyModelPlan) -> None:
-        """Make ``plan``'s mandate the one in force; it is already resolved."""
+        """Make ``plan``'s mandate the one in force; it is already resolved.
+
+        It is installed under the writer the plan names (#2652), the agent
+        when it names none.
+        """
         if not plan.install:
             return
         llm = self.llm_service
@@ -5447,9 +5500,10 @@ class KestrelAgent(
         if preference["model"] is None:
             llm.clear_model_preference()
             return
-        llm.set_model_preference(
-            preference["model"], preference["vendor"], preference["route"], validate=False
-        )
+        with override_writer(plan.provenance or agent_provenance(via="privacy")):
+            llm.set_model_preference(
+                preference["model"], preference["vendor"], preference["route"], validate=False
+            )
 
     def _model_mandate_change(self):
         """The LLM service's ``mandate_change``, held by a privacy transition.
@@ -5466,8 +5520,27 @@ class KestrelAgent(
         """The database the privacy record lives in; None in a harness without one."""
         return getattr(getattr(self, "_raw_storage", None), "db", None)
 
+    def _privacy_mandate_provenance(
+        self, preference: Mapping[str, Optional[str]]
+    ) -> OverrideProvenance:
+        """Who wrote ``preference``, for the mandate row a transition writes.
+
+        The mandate in force keeps its own writer (#2652). Any other, or one
+        with no recorded writer, is the agent's: a plan that installs another
+        mandate names its writer itself.
+        """
+        llm = getattr(self, "llm_service", None)
+        in_force = _live_mandate_provenance(llm)
+        if in_force is not None and _mandate_triple(
+            llm.get_model_preference() or {}
+        ) == _mandate_triple(preference):
+            return in_force
+        return agent_provenance(via="privacy")
+
     async def _write_privacy_mandate(
-        self, preference: Optional[Mapping[str, Optional[str]]]
+        self,
+        preference: Optional[Mapping[str, Optional[str]]],
+        provenance: Optional[OverrideProvenance] = None,
     ) -> bool:
         """Persist ``preference`` as the model mandate; False if it was not written.
 
@@ -5482,7 +5555,10 @@ class KestrelAgent(
             return True
         try:
             await self._write_model_preference(
-                preference["model"], preference["vendor"], preference["route"]
+                preference["model"],
+                preference["vendor"],
+                preference["route"],
+                provenance=provenance or self._privacy_mandate_provenance(preference),
             )
         except Exception as exc:  # noqa: BLE001 - the caller refuses the transition
             if is_execution_control_error(exc):
@@ -5569,7 +5645,7 @@ class KestrelAgent(
         if not await self._record_privacy_state(pending):
             return PRIVACY_STATE_UNRECORDED_MESSAGE
         if await self._write_privacy_mandate(
-            plan.preference
+            plan.preference, plan.provenance
         ) and await self._record_privacy_state(
             PrivacyState(mode=mode, saved_preference=plan.saved)
         ):
@@ -5678,7 +5754,7 @@ class KestrelAgent(
                 return
             plan = self._plan_privacy_restored_mandate(llm, saved)
             if await self._write_privacy_mandate(
-                plan.preference
+                plan.preference, plan.provenance
             ) and await self._record_privacy_state(
                 PrivacyState(mode=self._privacy_mode, saved_preference=plan.saved)
             ):
@@ -5694,7 +5770,9 @@ class KestrelAgent(
         ):
             return
         if saved is None:
-            saved = SavedModelPreference.from_preference(current)
+            saved = SavedModelPreference.from_preference(
+                current, _live_mandate_provenance(llm)
+            )
         plan = self._plan_privacy_local_route(llm, saved)
         if not plan.install:
             logging.warning(
@@ -5718,7 +5796,7 @@ class KestrelAgent(
         elif await self._record_privacy_state(
             PrivacyState(mode=self._privacy_mode, saved_preference=saved)
         ):
-            await self._write_privacy_mandate(plan.preference)
+            await self._write_privacy_mandate(plan.preference, plan.provenance)
         self._install_privacy_mandate(plan)
 
     async def _apply_privacy_voice_transition(self, config) -> tuple[Optional[dict], Optional[str]]:
@@ -6734,6 +6812,7 @@ class KestrelAgent(
             )
             raise
         self.features[feature.name] = feature
+        bump_registry_generation(self)
 
         try:
             self._ensure_feature_contribution_runtime().activate(
@@ -6963,6 +7042,7 @@ class KestrelAgent(
             await feature.post_all_features_loaded(self)
             self.features[feature.name] = feature
             feature.enabled = True
+            bump_registry_generation(self)
             self._cached_features_prompt = self._build_features_prompt_section()
         except (Exception, asyncio.CancelledError):
             # Atomic activation: undo whatever partially registered so a failed
@@ -7219,6 +7299,7 @@ class KestrelAgent(
             and self.features.get(feature_key) is feature
         ):
             self.features.pop(feature_key)
+        bump_registry_generation(self)
         self._cached_features_prompt = self._build_features_prompt_section()
 
         # A failed teardown leaves the instance in the owner registry, whether
@@ -7660,10 +7741,23 @@ Expected Duration: {expected_duration}
 
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
+        # #2658: a read-only diagnostic (`!status`, `!help`) answers beside an
+        # in-flight turn instead of queueing behind it: an operator needs it
+        # most while a turn is stuck. It is not a turn, so beyond the turn
+        # lock it skips every step below that writes state another turn
+        # shares: the LLM key resolver, the session's tool statistics and the
+        # constitutional interaction count. The Hold, readiness, genesis and
+        # Safe Mode gates still apply. A source that supplied its own
+        # admission guard still has it evaluated inside a turn.
+        answers_beside_turn = (
+            pre_turn_guard is None and bypasses_turn_queue(user_input)
+        )
+
         # USER_BYOK credentials are a non-cognitive readiness input. Refresh
         # them before the genesis gate so a Sovereign can supply the auditor's
         # passphrase on the very first turn.
-        await self._maybe_refresh_user_byok_resolver(user_passphrase)
+        if not answers_beside_turn:
+            await self._maybe_refresh_user_byok_resolver(user_passphrase)
 
         # A restart signal can reach process_input before initialize() creates
         # storage/context. There is no durable receipt to inspect yet, so keep
@@ -7682,12 +7776,13 @@ Expected Duration: {expected_duration}
         if genesis_block is not None:
             return genesis_block
 
-        # Reset context stats on session change
-        if hasattr(self, 'context_stats') and session_id:
-            self.context_stats.check_session(session_id)
+        if not answers_beside_turn:
+            # Reset context stats on session change
+            if hasattr(self, 'context_stats') and session_id:
+                self.context_stats.check_session(session_id)
 
-        # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
-        await self._maybe_audit()
+            # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
+            await self._maybe_audit()
 
         # Check before queueing so an already-restricted turn returns promptly.
         safe_mode_block = safe_mode_cognition_block(self, user_input)
@@ -7731,8 +7826,19 @@ Expected Duration: {expected_duration}
             getattr(self, "llm_service", None),
             invocation_context,
             session_id=session_id,
+        ), caller_call_override_scope(
+            # #2652: a model the caller passed is the caller's choice for this
+            # turn; any other override the turn makes is the agent's.
+            model_override, caller, via="model_override",
         ):
             try:
+                # #2658: its handler reads agent state only, so it takes no
+                # turn lock and sets no turn state. It mints no turn id and
+                # passes no durable turn admission.
+                if answers_beside_turn:
+                    return await self.command_handler.handle(
+                        user_input, caller=caller,
+                    )
                 async with self._turn_lifecycle():
                     # Correlation is optional evidence, never cancellation
                     # authority. The observability feature may replace this
@@ -9397,8 +9503,15 @@ Expected Duration: {expected_duration}
 
     async def get_audit_response(self, text_to_audit: str) -> Dict[str, Any]:
         """Audit through the LLM service under this agent's live privacy rule:
-        a local-only mode confines it to local routes (#3491)."""
-        return await self.llm_service.get_audit_response(text_to_audit)
+        a local-only mode confines it to local routes (#3491).
+
+        This is the genesis auditor. It runs before cognition, and every first
+        turn waits on it, so it carries a turn call's inactivity bound
+        (#2658); a call abandoned on the bound leaves genesis pending."""
+        return await LLMCallWatchdog.bound_completion(
+            self.llm_service,
+            self.llm_service.get_audit_response(text_to_audit),
+        )
         
     async def create_trusted_agent(self, agent_name: str) -> str:
         """

@@ -35,10 +35,9 @@ from .presenters import (
     present_script_list,
 )
 from .script_store import ScriptStore
-from .script_signer import ScriptSigner
+from .script_signer import ScriptSigner, accept_legacy_signatures_from_env
 from .script_analyzer import ScriptAnalyzer
-from .destructive_policy import DestructiveOperationPolicy
-from .trash_manager import TrashManager
+from .trash_manager import TrashManager, TrashRetentionError
 from .executors import BaseExecutor, UvExecutor, DockerExecutor, LocalExecutor
 from .security_hook import ComputeSecurityHook, ComputeDebugHook
 from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
@@ -85,7 +84,6 @@ class ComputeFeature(Feature):
         self.policy: Optional[ComputePolicy] = None
         self.executors: Dict[str, Optional[BaseExecutor]] = {}
         self.trash_manager: Optional[TrashManager] = None
-        self._destructive_policy: Optional[DestructiveOperationPolicy] = None
     
     @property
     def tool_description(self) -> str:
@@ -120,41 +118,47 @@ class ComputeFeature(Feature):
 
         # Initialize components
         self.script_store = ScriptStore(db_path)
-        self.signer = ScriptSigner(agent_did, db_path)
+        self.signer = ScriptSigner(
+            agent_did,
+            db_path,
+            accept_legacy_signatures=accept_legacy_signatures_from_env(),
+        )
         self.analyzer = ScriptAnalyzer()
-        self.trash_manager = TrashManager(current_agent_data_path=current_agent_data_path)
-        self._destructive_policy = DestructiveOperationPolicy(
-            current_agent_data_path=current_agent_data_path
+
+        # One policy instance, built first and handed to every consumer: the
+        # trash manager, each executor, the run_script gates and the status
+        # tools all read this object, so status reports what is enforced.
+        self.policy = ComputePolicy.from_env()
+
+        self.trash_manager = TrashManager(
+            current_agent_data_path=current_agent_data_path,
+            policy=self.policy,
         )
 
         # Ensure trash directory exists
         self.trash_manager.ensure_trash_dir()
 
-        # Load policy from environment
-        self.policy = ComputePolicy(
-            auto_approve_below_risk=int(os.environ.get("KESTREL_COMPUTE_AUTO_APPROVE_RISK", "0")),
-            max_timeout_seconds=int(os.environ.get("KESTREL_COMPUTE_MAX_TIMEOUT", "3600")),
-            default_timeout_seconds=int(os.environ.get("KESTREL_COMPUTE_DEFAULT_TIMEOUT", "300")),
-            allow_docker=os.environ.get("KESTREL_COMPUTE_ALLOW_DOCKER", "true").lower() == "true",
-            allow_local=os.environ.get("KESTREL_ALLOW_LOCAL_COMPUTE", "false").lower() == "true",
-        )
-
-        # Initialize executors
+        # Initialize executors. A disallowed executor is never built, so it
+        # cannot be selected and capabilities report it unavailable.
         self.executors = {
-            "uv": UvExecutor(current_agent_data_path=current_agent_data_path),
+            "uv": UvExecutor(
+                current_agent_data_path=current_agent_data_path,
+                policy=self.policy,
+            ),
             "docker": (
                 DockerExecutor(
                     current_agent_data_path=current_agent_data_path,
-                    legacy_staging_age_seconds=self.policy.max_timeout_seconds,
+                    policy=self.policy,
                 )
-                if self._docker_available()
+                if self.policy.allow_docker and self._docker_available()
                 else None
             ),
         }
 
         if self.policy.allow_local:
             self.executors["local"] = LocalExecutor(
-                current_agent_data_path=current_agent_data_path
+                current_agent_data_path=current_agent_data_path,
+                policy=self.policy,
             )
 
         # Track initialization state - async init will complete this
@@ -582,17 +586,11 @@ class ComputeFeature(Feature):
                     },
                 )
         
-        # Demo servers (KESTREL_DEMO_SERVER=1) skip the approval queue entirely:
-        # Playwright can't click through it, and the demo agent runs in an
-        # isolated DB so the broader-grants are scoped correctly. Without this
-        # the modal still pops here even though SecurityFeature defaults to
-        # ALLOW for demo servers — ComputeFeature reaches into the queue
-        # directly rather than going through SecurityHook.get_permission().
-        _is_demo_server = os.environ.get("KESTREL_DEMO_SERVER", "").lower() in (
-            "1", "true", "yes",
-        )
-        # Request user approval unless auto-approved by policy
-        if not _is_demo_server and script.risk_score >= self.policy.auto_approve_below_risk:
+        # Request user approval unless the policy auto-approves this script.
+        # The policy decides only whether to ask; the approval queue asks.
+        if not self._demo_server_skips_approval() and self.policy.requires_approval(
+            script.risk_score, script.security_findings
+        ):
             # Need user approval - check if SecurityFeature has an approval queue
             security_feature = getattr(self.agent, 'features', {}).get('SecurityFeature')
             if security_feature and hasattr(security_feature, 'approval_queue') and security_feature.approval_queue:
@@ -759,6 +757,21 @@ class ComputeFeature(Feature):
                 data={"script_id": script.id, "state": ScriptState.FAILED.value},
             )
     
+    @staticmethod
+    def _demo_server_skips_approval() -> bool:
+        """Whether this is a demo server, where run_script never asks.
+
+        Demo servers (KESTREL_DEMO_SERVER=1) skip the approval queue entirely:
+        Playwright can't click through it, and the demo agent runs in an
+        isolated DB so the broader-grants are scoped correctly. Without this
+        the modal still pops here even though SecurityFeature defaults to
+        ALLOW for demo servers — ComputeFeature reaches into the queue
+        directly rather than going through SecurityHook.get_permission().
+        """
+        return os.environ.get("KESTREL_DEMO_SERVER", "").lower() in (
+            "1", "true", "yes",
+        )
+
     async def _execute_script(
         self,
         script: ComputeScript,
@@ -994,8 +1007,22 @@ class ComputeFeature(Feature):
             older_than_days: Delete items older than this (default: 30)
             dry_run: If True, only count what would be deleted
         """
+        try:
+            count = self.trash_manager.empty(
+                older_than_days=older_than_days, dry_run=dry_run
+            )
+        except TrashRetentionError as error:
+            return ToolResult.failed(
+                f"❌ {error}",
+                data={
+                    "dry_run": dry_run,
+                    "older_than_days": older_than_days,
+                    "retention_days": error.retention_days,
+                    "applied": False,
+                },
+            )
+
         if dry_run:
-            count = self.trash_manager.empty(older_than_days=older_than_days, dry_run=True)
             body = (
                 f"🗑️ Dry run: Would delete {count} items older than {older_than_days} days.\n"
                 f"   Run with dry_run=false to actually delete."
@@ -1019,7 +1046,6 @@ class ComputeFeature(Feature):
                 },
             )
 
-        count = self.trash_manager.empty(older_than_days=older_than_days, dry_run=False)
         return ToolResult.ok(
             confirmation=f"🗑️ Permanently deleted {count} items older than {older_than_days} days.",
             data={
@@ -1077,25 +1103,45 @@ class ComputeFeature(Feature):
         if not self.policy:
             return ToolResult.failed("Policy not initialized")
 
-        data = {
-            "policy": self.policy.to_dict(),
-            "explanation": {
-                "auto_approve_below_risk": (
-                    "Scripts with risk score below this are auto-approved. "
-                    f"Current: {self.policy.auto_approve_below_risk} (0 = always ask)"
-                ),
-                "max_timeout": f"Maximum script execution time: {self.policy.max_timeout_seconds}s",
-                "trash": (
-                    "All rm/delete operations are rewritten to move to trash. "
-                    f"Retention: {self.policy.trash_retention_days} days"
-                ),
-                "executors": {
-                    "uv": "Python scripts via project-free ephemeral uv environments",
-                    "docker": f"Sandboxed containers ({'enabled' if self.policy.allow_docker else 'disabled'})",
-                    "local": f"Direct execution ({'ENABLED - dangerous!' if self.policy.allow_local else 'disabled'})",
-                },
+        explanation = {
+            "auto_approve_below_risk": (
+                "Scripts with risk score below this are auto-approved. "
+                f"Current: {self.policy.auto_approve_below_risk} (0 = always ask)"
+            ),
+            "require_approval_for_network": (
+                "Scripts whose analysis finds network access (sockets, "
+                "HTTP, downloads) always ask, whatever their risk score."
+                if self.policy.require_approval_for_network
+                else "Network access counts only toward the risk score."
+            ),
+            "max_timeout": f"Maximum script execution time: {self.policy.max_timeout_seconds}s",
+            "default_timeout": (
+                "run_script's timeout defaults to "
+                f"{self.policy.default_timeout_seconds}s; this is fixed."
+            ),
+            "trash": (
+                "All rm/delete operations are rewritten to move to trash. "
+                f"Retention: {self.policy.trash_retention_days} days "
+                "(empty_trash cannot delete younger items)"
+            ),
+            "deletable_prefixes": (
+                "Deletion is real, not a move to trash, only inside the "
+                "executor's own workspace, this agent's data, and temp "
+                "directories named by these prefixes: "
+                f"{', '.join(self.policy.deletable_prefixes) or '(none)'}"
+            ),
+            "executors": {
+                "uv": "Python scripts via project-free ephemeral uv environments",
+                "docker": f"Sandboxed containers ({'enabled' if self.policy.allow_docker else 'disabled'})",
+                "local": f"Direct execution ({'ENABLED - dangerous!' if self.policy.allow_local else 'disabled'})",
             },
         }
+        if self._demo_server_skips_approval():
+            explanation["demo_server"] = (
+                "KESTREL_DEMO_SERVER is set: run_script never asks for "
+                "approval, whatever the approval settings above say."
+            )
+        data = {"policy": self.policy.to_dict(), "explanation": explanation}
         return ToolResult.ok(
             confirmation=(
                 f"compute policy: auto_approve_below_risk="

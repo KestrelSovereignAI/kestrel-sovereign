@@ -1,0 +1,60 @@
+"""Native SQLite worker-exit hooks must not erase retained control receipts."""
+
+import asyncio
+
+import aiosqlite
+import pytest
+
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from kestrel_sovereign.storage.db.sqlite import (
+    _prune_retained_aiosqlite_closes,
+    _retain_aiosqlite_close,
+    _wait_for_aiosqlite_worker_shutdown,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_origin", ["close", "hook"])
+async def test_native_worker_exit_hooks_keep_original_unreported_control(tmp_path, failure_origin):
+    connection = await aiosqlite.connect(tmp_path / "native-exit.db")
+    retained = {}
+    calls = []
+    original = ExecutionAuthorityError(f"original {failure_origin} control")
+
+    async def close():
+        await connection.close()
+        await _wait_for_aiosqlite_worker_shutdown(connection)
+        if failure_origin == "close":
+            raise original
+
+    def hook():
+        calls.append("first")
+        if failure_origin == "hook":
+            raise original
+
+    close_task = create_owned_task(close())
+    _retain_aiosqlite_close(connection, close_task, retained)
+    record = retained[connection]
+    record.worker_exit_hooks.extend([hook, lambda: calls.append("second")])
+    retired = asyncio.get_running_loop().create_future()
+    record.retirement_task.add_done_callback(lambda _: retired.set_result(None))
+    try:
+        outcome = await asyncio.wait_for(await_owned_task(close_task), 3)
+        await asyncio.wait_for(await_owned_task(record.retirement_task), 3)
+        await asyncio.wait_for(retired, 3)
+        assert outcome.error is (original if failure_origin == "close" else None)
+        assert calls == ["first", "second"]
+        assert retained[connection] is record
+        assert record.control_error is original
+        assert not record.control_reported
+        _prune_retained_aiosqlite_closes(retained, preserve_control_outcomes=True)
+        assert retained[connection] is record
+        assert calls == ["first", "second"], "physical-exit hooks run exactly once"
+        record.control_reported = True
+        _prune_retained_aiosqlite_closes(retained, preserve_control_outcomes=True)
+        assert not retained
+    finally:
+        await await_owned_task(close_task)
+        await await_owned_task(record.retirement_task)
+        await connection.close()

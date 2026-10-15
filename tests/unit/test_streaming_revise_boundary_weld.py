@@ -12,13 +12,23 @@ reproduces the same strip-and-weld. These tests pin:
     ``ToolCallStarted`` marker records the boundary as ``\\n\\n`` in the
     accumulated visible text so plain-text-then-tool-then-plain-text
     doesn't glue.
+  * the pre/post tool join with NO revise boundary pending (#2970) — the
+    server streams one separator and persists it as the seam, against a
+    fixture the chat client's tests assert the same text from.
 """
+import json
+from pathlib import Path
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sovereign.agent.streaming import (
     StreamingMixin,
+    TOOL_JOIN_SEPARATOR,
+    _join_separator,
+    _parse_stream_sentinels,
     _strip_and_weld_revise_sentinels,
+    _tool_parts_to_events,
     REVISE_SENTINEL_PREFIX,
     REVISE_SENTINEL_SUFFIX,
     THINKING_SENTINEL_PREFIX,
@@ -237,3 +247,159 @@ async def test_cancel_right_after_marker_persists_no_dangling_boundary():
         "a turn cancelled right after the marker records no answer — no "
         "pre-tool prose, and no dangling boundary the client never drew"
     )
+
+
+# ---------------------------------------------------------------------------
+# #2970 — the pre/post tool join when no revise boundary is pending
+# ---------------------------------------------------------------------------
+
+# Shared with tests/frontend/chat_revising_event.test.mjs: the server must
+# stream each case's ``wire`` and replay its ``text``; the client, fed the same
+# ``wire``, must render the same ``text``.
+_JOIN_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "stream_tool_join_cases.json"
+)
+_JOIN_CASES = json.loads(_JOIN_FIXTURE.read_text(encoding="utf-8"))["cases"]
+
+
+class TestJoinSeparator:
+    def test_separator_is_a_single_newline(self):
+        assert TOOL_JOIN_SEPARATOR == "\n"
+
+    def test_two_non_whitespace_chars_get_the_separator(self):
+        assert _join_separator("STRATEGY.yaml?", "Only one", "\n") == "\n"
+
+    def test_existing_whitespace_on_either_side_is_not_doubled(self):
+        assert _join_separator("STRATEGY.yaml? ", "Only one", "\n") == ""
+        assert _join_separator("STRATEGY.yaml?\n", "Only one", "\n") == ""
+        assert _join_separator("STRATEGY.yaml?", " Only one", "\n") == ""
+        assert _join_separator("STRATEGY.yaml?", "\n---\nOnly one", "\n") == ""
+
+    def test_empty_side_gets_nothing(self):
+        assert _join_separator("", "Only one", "\n") == ""
+        assert _join_separator("STRATEGY.yaml?", "", "\n") == ""
+        assert _join_separator("", "", "\n") == ""
+
+
+def _replay(content, metadata):
+    """The assistant message ContextBuilder sends the next turn's LLM."""
+    from kestrel_sovereign.agent.context_builder import ContextBuilder
+
+    class _Counter:
+        def count(self, s):
+            return max(1, len(s) // 4)
+
+        def truncate_to_tokens(self, s, n):
+            return s[: n * 4]
+
+    cb = ContextBuilder.__new__(ContextBuilder)
+    cb._llm_service = None
+    cb._model_fallback = "test-stub"
+    cb._counter = _Counter()
+    cb._counter_model = "test-stub"
+    formatted = cb.format_conversation_history(
+        [{"role": "assistant", "content": content, "metadata": metadata}],
+        max_tokens=10_000,
+    )
+    assert len(formatted) == 1
+    return formatted[0]["content"]
+
+
+async def _drive_tool_join(llm_items, orchestrator_items):
+    """Run one orchestrated tool turn; return (streamed chunks, assistant row).
+
+    ``llm_items`` are first-stream strings or ``{"tool_call_started": ...}``
+    markers, followed by one ``strategy_view`` tool call; ``orchestrator_items``
+    are the post-tool stream's chunks.
+    """
+    from kestrel_sdk.llm import ToolCallStarted
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    persisted = []
+    agent = _build_inline_agent(persisted)
+
+    async def stream(**kw):
+        for item in llm_items:
+            if isinstance(item, dict):
+                marker = item["tool_call_started"]
+                yield ToolCallStarted(
+                    index=marker["index"], id=marker["id"], name=marker["name"],
+                )
+            else:
+                yield item
+        yield LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc1", name="strategy_view", arguments={})],
+        )
+
+    async def orchestrator(*, tool_events, **kw):
+        for item in orchestrator_items:
+            # Record each tool sentinel as the real orchestrator records its
+            # batch: the persist path stamps these from the sentinel positions.
+            for event in _tool_parts_to_events(_parse_stream_sentinels(item)[1]):
+                tool_events.append({"type": event["type"], "tool": event["tool"]})
+            yield item
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = lambda **kw: stream(**kw)
+    agent._handle_orchestrator_response_streaming = orchestrator
+
+    chunks = []
+    async for c in agent.process_input_streaming("go", session_id="s"):
+        chunks.append(c)
+
+    assistant_rows = [r for r in persisted if r["role"] == "assistant"]
+    assert len(assistant_rows) == 1
+    return chunks, assistant_rows[0]
+
+
+@pytest.mark.asyncio
+async def test_no_pending_boundary_join_keeps_separator():
+    """#2970 reproduction. No ToolCallStarted marker fired, so no revise
+    boundary is pending at the join. Before the fix the seam was empty and both
+    the client and the next turn's replay read "…STRATEGY.yaml?Only one…"."""
+    tool_start = '\x1eKESTREL:TOOL:{"phase":"start","name":"strategy_view"}\x1e'
+    chunks, row = await _drive_tool_join(
+        ["Let me open STRATEGY.yaml?"],
+        [tool_start, "Only one permission is missing."],
+    )
+
+    reasoning = row["metadata"]["pre_tool_reasoning"]
+    assert reasoning["seam"] == "\n"
+    assert reasoning["context_replay"] == (
+        "Let me open STRATEGY.yaml?\nOnly one permission is missing."
+    )
+    assert "yaml?Only" not in reasoning["context_replay"]
+    # The separator streams to the live client right before the answer ...
+    assert chunks[-2:] == ["\n", "Only one permission is missing."]
+    # ... but belongs to the seam: the persisted synthesis does not start with it.
+    assert row["content"] == "Only one permission is missing."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _JOIN_CASES, ids=[c["name"] for c in _JOIN_CASES])
+async def test_tool_join_matches_shared_fixture(case):
+    chunks, row = await _drive_tool_join(case["llm"], case["orchestrator"])
+    metadata = row["metadata"]
+    pre = case["text"][: len(case["text"]) - len(case["content"]) - len(case["seam"])]
+
+    # What the live client receives.
+    assert chunks == case["wire"]
+    # What is persisted: the synthesis alone, with the pre-tool half and the
+    # seam beside it in metadata.
+    assert row["content"] == case["content"]
+    if pre:
+        assert metadata["pre_tool_reasoning"] == {
+            "content": pre,
+            "seam": case["seam"],
+            "context_replay": case["text"],
+        }
+    else:
+        assert "pre_tool_reasoning" not in metadata
+    # What the next turn replays.
+    assert _replay(row["content"], metadata) == case["text"]
+    # Every card in these cases streamed before any post-tool text, so each
+    # sits at the start of the persisted synthesis: the separator is part of
+    # the pre-half offset the positions are rebased past (#2942).
+    assert metadata["tool_events"]
+    assert all(event["pos"] == 0 for event in metadata["tool_events"])

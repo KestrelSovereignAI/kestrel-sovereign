@@ -24,6 +24,7 @@ kestrel-sovereign #1042 narration-honesty contract (see #1061).
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sdk.tools.base import ToolCategory
@@ -1177,11 +1178,18 @@ ANSWER:"""
             # LLMService.generate is keyword-only and requires user_prompt
             # (not prompt); the old call TypeError'd into the failure path
             # below (#1844 root-cause sweep).
-            response = await self.llm_service.generate(
-                system_prompt="You are answering questions about conversation context. Be concise and accurate.",
-                user_prompt=prompt,
+            #
+            # Bounded like a turn's own calls (#2658): ``!context query``
+            # runs inside a turn and holds its CONVERSATION lock.
+            response = await LLMCallWatchdog.bound_completion(
+                self.llm_service,
+                self.llm_service.generate(
+                    system_prompt="You are answering questions about conversation context. Be concise and accurate.",
+                    user_prompt=prompt,
+                    model_override=model_override,
+                    session_id=self._turn_session_id(),
+                ),
                 model_override=model_override,
-                session_id=self._turn_session_id(),
             )
         except ValueError as e:
             logger.error(f"recursive_query failed: {e}")

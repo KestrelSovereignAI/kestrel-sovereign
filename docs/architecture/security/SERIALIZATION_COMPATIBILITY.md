@@ -53,7 +53,7 @@ The foundational bug this exposes: **most artifacts today have no `{v, alg}` tag
 | Container | `script.signature: str` with prefix `ecdsa:` or `hmac:` (forgeable) | `script.signature: {alg, kid, sig, version: 2}` — single signature, no array (mandates are the multi-sig surface) |
 | Version tag? | **Implicit via prefix** (insufficient) | Explicit `version: 2` |
 | Algorithm tag? | Prefix only, no agility | Per-suite `alg` field |
-| Migration | Wave 0B: any `hmac:`-prefixed signature is **untrustworthy** and must be rejected. v1 `ecdsa:`-prefixed scripts kept-readable transitionally; new scripts produced as v2. |
+| Migration | Wave 0B: any `hmac:`-prefixed signature is **untrustworthy** and must be rejected. v1 `ecdsa:`-prefixed scripts kept-readable transitionally; new scripts produced as v2. **Shipped (#2484)** as a `v2:<scheme>:` tag over a length-framed, domain-tagged encoding rather than the container sketched here; see [Compute Feature §3.6](../COMPUTE_FEATURE_DESIGN.md#36-script-signature-format-and-versions) for the format, the v1 compatibility window and its removal plan. |
 
 ### 4. Constitution anchor
 

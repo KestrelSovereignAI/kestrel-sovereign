@@ -474,6 +474,40 @@ async def test_malformed_signature_entry_does_not_crash(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kid",
+    [["key-1"], {"kid": "key-1"}, 7, None],
+    ids=["list", "dict", "int", "null"],
+)
+async def test_malformed_signature_kid_is_rejected_not_raised(
+    package_signed_ok, owner, source, host, kid,
+):
+    """#2487: an unhashable ``kid`` used to escape as TypeError from the
+    owner-signature lookup. The shared verifier rejects the entry."""
+    from dataclasses import replace
+    grant = DataAccessGrant(
+        owner_did=owner["did"], source_did=source["did"], host_did=host["did"],
+        issued_at="2026-05-23T00:00:00+00:00",
+        owner_verification_methods=owner["vms"],
+    )
+    grant = sign_owner(grant, [(owner["kp"], owner["kid"])])
+    tampered = replace(
+        grant,
+        owner_signatures=[{**grant.owner_signatures[0], "kid": kid}],
+    )
+
+    result = await verify_import_consent(
+        _StubPackage(did=source["did"]),
+        tampered,
+        host_did=host["did"],
+    )
+
+    assert result.ok is False
+    assert result.grant_signed_by_owner is False
+    assert REJECT_GRANT_SIGNATURE in result.reason
+
+
+@pytest.mark.asyncio
 async def test_did_web_owner_requires_resolver_and_verifies_with_one(
     package_signed_ok, source, host,
 ):

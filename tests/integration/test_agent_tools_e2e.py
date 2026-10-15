@@ -8,7 +8,11 @@ Tests the complete agent tools architecture including:
 - Integration with KestrelAgent
 
 Uses REAL services (Ollama, LLM service, storage) - NO MOCKS.
-Uses small models only (qwen2.5:0.5b, ~500MB).
+
+Every call that reaches a live route runs under a deadline, and the tests
+that make one skip unless that route answers within a few seconds (#3269).
+A test's probe and calls share its ``live_call_budget``, so their deadlines
+together fit inside the test's timeout.
 """
 
 import os
@@ -21,23 +25,24 @@ from kestrel_sovereign.features.model import ModelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
+from tests.integration.live_routes import (
+    TEST_TIMEOUT_SECONDS,
+    bounded_live_call,
+    describe_chat_routes,
+    describe_discovery_routes,
+    require_answering_chat_route,
+    require_answering_discovery,
+    require_answering_ollama,
+)
 from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
-
-# Test model (supports tools, available locally)
-# llama3.2:latest supports tools and is already downloaded
-TEST_MODEL = "llama3.2:latest"
+pytestmark = pytest.mark.timeout(TEST_TIMEOUT_SECONDS)
 
 
 @pytest.fixture
 def skip_if_no_ollama():
-    """Skip test if Ollama is not available."""
-    try:
-        import ollama
-        client = ollama.Client()
-        client.list()
-    except Exception as e:
-        pytest.skip(f"Ollama not available: {e}")
+    """Skip test if the Ollama daemon does not list its models within seconds."""
+    require_answering_ollama()
 
 
 @pytest_asyncio.fixture
@@ -111,16 +116,21 @@ async def kestrel_agent(llm_service, temp_db):
 
 
 @pytest_asyncio.fixture
-async def cleanup_test_model():
-    """Cleanup test model after test completes."""
-    yield
-    # Cleanup happens after test
-    try:
-        import ollama
-        client = ollama.Client()
-        client.delete(TEST_MODEL)
-    except (ollama.ResponseError, Exception):
-        pass  # Model might not exist or Ollama unavailable, that's okay
+async def usable_model_list(skip_if_no_ollama, llm_service, live_call_budget):
+    """Skip unless the discovery behind ``!model-list`` finishes within seconds.
+
+    A live daemon is not enough (#3269): discovery contacts every configured
+    route, so one that accepts the connection and never answers stalls the
+    listing. Request it after the agent or feature fixture, so the probe sees
+    the routes those finished setting up.
+    """
+    await require_answering_discovery(llm_service, budget=live_call_budget)
+
+
+@pytest_asyncio.fixture
+async def usable_chat_route(kestrel_agent, live_call_budget):
+    """Skip unless the agent's routes answer a one-word prompt within seconds."""
+    await require_answering_chat_route(kestrel_agent.llm_service, budget=live_call_budget)
 
 
 # ============================================================================
@@ -155,7 +165,7 @@ async def test_model_agent_get_agent_card(model_agent):
 
 
 @pytest.mark.asyncio
-async def test_model_agent_list_models(model_agent, skip_if_no_ollama):
+async def test_model_agent_list_models(model_agent, usable_model_list, live_call_budget):
     """Verify listing models works via Feature."""
     # Find the list_models tool
     list_tool = None
@@ -165,7 +175,12 @@ async def test_model_agent_list_models(model_agent, skip_if_no_ollama):
             break
 
     assert list_tool is not None
-    result = await list_tool.execute()
+    result = await bounded_live_call(
+        list_tool.execute(),
+        budget=live_call_budget,
+        what="ModelAgent list_models",
+        waiting_on=describe_discovery_routes(model_agent.llm_service),
+    )
 
     # Unified flat ToolResult wire shape (#F025): envelope spread TOP-LEVEL.
     assert result["success"] is True
@@ -177,7 +192,7 @@ async def test_model_agent_list_models(model_agent, skip_if_no_ollama):
 
 
 @pytest.mark.asyncio
-async def test_model_agent_storage_status(model_agent, skip_if_no_ollama):
+async def test_model_agent_storage_status(model_agent, skip_if_no_ollama, live_call_budget):
     """Verify storage status check works."""
     # Find the storage tool
     storage_tool = None
@@ -189,7 +204,12 @@ async def test_model_agent_storage_status(model_agent, skip_if_no_ollama):
     if storage_tool is None:
         pytest.skip("check_storage tool not available")
 
-    result = await storage_tool.execute()
+    result = await bounded_live_call(
+        storage_tool.execute(),
+        budget=live_call_budget,
+        what="ModelAgent check_storage",
+        waiting_on="the Ollama daemon",
+    )
 
     assert result["success"] is True
     assert "storage" in result
@@ -229,10 +249,17 @@ async def test_kestrel_agent_tool_registered(kestrel_agent):
 
 
 @pytest.mark.asyncio
-async def test_kestrel_agent_command_execution(kestrel_agent, skip_if_no_ollama):
+async def test_kestrel_agent_command_execution(
+    kestrel_agent, usable_model_list, live_call_budget
+):
     """Verify agent can execute tool commands."""
     # Test !model-list command (ModelAgent feature)
-    response = await kestrel_agent.process_input("!model-list")
+    response = await bounded_live_call(
+        kestrel_agent.process_input("!model-list"),
+        budget=live_call_budget,
+        what="process_input('!model-list')",
+        waiting_on=describe_discovery_routes(kestrel_agent.llm_service),
+    )
 
     assert response is not None
     # Response can be a list of ModelInfo objects or formatted string
@@ -253,10 +280,17 @@ async def test_kestrel_agent_command_execution(kestrel_agent, skip_if_no_ollama)
     not os.environ.get("OPENAI_API_KEY", "").strip() and not os.environ.get("ANTHROPIC_API_KEY", "").strip(),
     reason="Requires LLM API key to process unknown command"
 )
-@pytest.mark.asyncio
-async def test_kestrel_agent_unknown_command(kestrel_agent):
+async def test_kestrel_agent_unknown_command(
+    kestrel_agent, usable_chat_route, live_call_budget
+):
     """Verify unknown commands return constitutional error message."""
-    response = await kestrel_agent.process_input("!totally-fake-command")
+    # No command handles it, so it becomes an ordinary turn on a live route.
+    response = await bounded_live_call(
+        kestrel_agent.process_input("!totally-fake-command"),
+        budget=live_call_budget,
+        what="process_input('!totally-fake-command')",
+        waiting_on=describe_chat_routes(kestrel_agent.llm_service),
+    )
 
     # Unknown commands return constitutional error messages
     assert response is not None
@@ -279,7 +313,7 @@ async def test_kestrel_agent_status_command(kestrel_agent):
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_task_manager_routes_command(kestrel_agent, skip_if_no_ollama):
+async def test_task_manager_routes_command(kestrel_agent):
     """Verify TaskManager correctly routes commands to features."""
     # Get the agent/skill for a command - actual command is !model-list
     result = kestrel_agent.task_manager.get_agent_for_command("!model-list")
@@ -291,13 +325,18 @@ async def test_task_manager_routes_command(kestrel_agent, skip_if_no_ollama):
 
 
 @pytest.mark.asyncio
-async def test_task_manager_execute_skill(kestrel_agent, skip_if_no_ollama):
+async def test_task_manager_execute_skill(kestrel_agent, usable_model_list, live_call_budget):
     """Verify TaskManager can execute skills directly."""
-    task = await kestrel_agent.task_manager.execute_skill(
-        agent_id="model_agent",
-        skill_id="list_models",
-        args={},
-        sync=True
+    task = await bounded_live_call(
+        kestrel_agent.task_manager.execute_skill(
+            agent_id="model_agent",
+            skill_id="list_models",
+            args={},
+            sync=True
+        ),
+        budget=live_call_budget,
+        what="TaskManager execute_skill(model_agent, list_models)",
+        waiting_on=describe_discovery_routes(kestrel_agent.llm_service),
     )
 
     assert task is not None
@@ -311,17 +350,22 @@ async def test_task_manager_execute_skill(kestrel_agent, skip_if_no_ollama):
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_e2e_list_models_workflow(kestrel_agent, skip_if_no_ollama):
+async def test_e2e_list_models_workflow(kestrel_agent, usable_model_list, live_call_budget):
     """Test complete workflow: list models via unified routing."""
     # Step 1: List models via command (actual command is !model-list)
-    list_response = await kestrel_agent.process_input("!model-list")
+    list_response = await bounded_live_call(
+        kestrel_agent.process_input("!model-list"),
+        budget=live_call_budget,
+        what="process_input('!model-list')",
+        waiting_on=describe_discovery_routes(kestrel_agent.llm_service),
+    )
     assert list_response is not None
     # Can be list (A2A) or string (legacy)
     assert isinstance(list_response, (list, str))
 
 
 @pytest.mark.asyncio
-async def test_e2e_feature_as_a2a_agent(kestrel_agent, skip_if_no_ollama):
+async def test_e2e_feature_as_a2a_agent(kestrel_agent, usable_model_list, live_call_budget):
     """Test that Features work as A2A agents."""
     # Get the model_agent Feature - key is class name "ModelAgent"
     model_feature = kestrel_agent.features.get("ModelAgent")
@@ -343,7 +387,12 @@ async def test_e2e_feature_as_a2a_agent(kestrel_agent, skip_if_no_ollama):
         history=[Message(role="user", parts=[TextPart(text="List models")])]
     )
 
-    result_task = await model_feature.handle_task(task)
+    result_task = await bounded_live_call(
+        model_feature.handle_task(task),
+        budget=live_call_budget,
+        what="ModelAgent handle_task(list_models)",
+        waiting_on=describe_discovery_routes(kestrel_agent.llm_service),
+    )
 
     assert result_task.status.state == TaskState.COMPLETED
     assert result_task.artifacts is not None

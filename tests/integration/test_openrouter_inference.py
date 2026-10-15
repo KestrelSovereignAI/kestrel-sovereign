@@ -11,6 +11,8 @@ import os
 import pytest
 from dotenv import load_dotenv
 
+from tests.utils.override_writers import as_operator
+
 # Load .env before checking for the key
 load_dotenv()
 
@@ -78,12 +80,15 @@ async def test_openrouter_model_override():
     service = LLMService()
 
     # Use a specific model via OpenRouter — prefix with provider name
-    # so routing sends it to the openrouter provider, not a nonexistent "deepseek" provider
-    response = await service.get_response(
-        system_prompt="You are a helpful assistant.",
-        user_prompt="Say 'hello' and nothing else.",
-        model_override="openrouter/deepseek/deepseek-chat-v3.1",
-    )
+    # so routing sends it to the openrouter provider, not a nonexistent "deepseek" provider.
+    # The operator's choice: the host config's chain need not name openrouter
+    # (#2652).
+    with as_operator():
+        response = await service.get_response(
+            system_prompt="You are a helpful assistant.",
+            user_prompt="Say 'hello' and nothing else.",
+            model_override="openrouter/deepseek/deepseek-chat-v3.1",
+        )
 
     assert response is not None
     assert len(str(response)) > 0

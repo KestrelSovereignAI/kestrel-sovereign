@@ -782,9 +782,12 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
         assert not any(marker in row for row in rows), rows
         if path.startswith("invoke"):
             assert marker not in seen["text"], seen
-        if path == "invoke_fallback" and cause in ("cap", "unknown", "missing", "timeout"):
+        if path == "invoke_fallback" and cause in (
+            "cap", "unknown", "missing", "timeout", "watchdog",
+        ):
             # The failed route contributed nothing; the other route's
-            # complete answer stands alone.
+            # complete answer stands alone. A silent route is abandoned on its
+            # own attempt's bound, so the call moves on to the other (#1968).
             assert seen["ok"] and seen["text"] == FALLBACK, seen
             assert rows == [FALLBACK]
             return

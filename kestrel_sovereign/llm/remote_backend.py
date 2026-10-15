@@ -46,6 +46,10 @@ _MANAGED_REMOTE_FAILURE_MESSAGE = (
     "private inference route failed; no cloud fallback was attempted"
 )
 
+# The provider name every call on the lease route is dispatched and recorded
+# under.
+REMOTE_ROUTE_NAME = "remote_gpu"
+
 
 @dataclass(frozen=True)
 class RemoteRouteSnapshot:
@@ -347,9 +351,17 @@ class RemoteBackendMixin:
         model_override: str | None,
         required_capabilities: Sequence[str] = (),
     ) -> AsyncIterator[RemoteRouteSnapshot | None]:
-        """Pin an active route for one call so release cannot race it."""
+        """Pin an active route for one call so release cannot race it.
+
+        The call's ``model_override`` is admitted by the host's provider policy
+        first, before the lease is read, so every entry point that may take the
+        lease route refuses a refused override before any adapter runs, lease
+        or none (#2652).
+        """
 
         from .service import LLMServiceError
+
+        self._admit_call_override(model_override)
 
         snapshot: RemoteRouteSnapshot | None = None
         selected_lease_id: str | None = None

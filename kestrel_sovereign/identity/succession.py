@@ -74,11 +74,14 @@ from kestrel_sovereign.security.crypto_suite import (
     Keypair,
     get_suite,
 )
-from kestrel_sovereign.security.multikey import multibase_to_public_key
+from kestrel_sovereign.security.signature_verification import (
+    decode_verification_method_key,
+    index_verification_methods,
+    verify_signature_entries,
+)
 from kestrel_sovereign.security.verify_policy import (
     PolicyResult,
     VerifyPolicy,
-    evaluate_signatures,
 )
 
 
@@ -479,41 +482,6 @@ def _validate_iso8601_utc(s: str) -> Tuple[bool, str]:
     return True, ""
 
 
-def _check_unique_vm_kids(vms: List[Mapping]) -> Tuple[bool, str]:
-    """Reject verification-method lists that contain duplicate kids.
-
-    W3C DID Core 5.1.1 says "the value of the id property MUST...
-    uniquely identify the verification method." But ``_verify_signatures
-    _against`` builds ``methods_by_kid`` by overwriting on duplicates,
-    and the DID-binding check accepts "any-match" — so an attacker could
-    embed the victim's real VM (to satisfy binding) AND an attacker-
-    controlled VM with the SAME kid fragment (to be the one that
-    actually verifies signatures).
-
-    Treat any duplicate kid (fragment after ``#``, or full id when no
-    fragment) as a structural error. The pattern is never legitimate,
-    and silent acceptance is the exact attack codex caught.
-    """
-    seen: dict[str, str] = {}  # kid -> first id that used it
-    for vm in vms:
-        if not isinstance(vm, Mapping):
-            continue
-        vm_id = vm.get("id") or ""
-        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
-        if not kid:
-            continue
-        if kid in seen:
-            return False, (
-                f"verification methods contain duplicate kid {kid!r} "
-                f"(ids: {seen[kid]!r} and {vm_id!r}); per W3C DID Core 5.1.1 "
-                f"every verification method id MUST be unique. Refusing to "
-                f"silently overwrite — this is the duplicate-kid takeover "
-                f"path."
-            )
-        seen[kid] = vm_id
-    return True, ""
-
-
 def _verify_did_pkh_eip155_binding(did: str, vms: List[Mapping]) -> Tuple[bool, str]:
     """did:pkh:eip155:1:0x<addr> — REQUIRE every VM to bind to the address.
 
@@ -551,16 +519,13 @@ def _verify_did_pkh_eip155_binding(did: str, vms: List[Mapping]) -> Tuple[bool, 
     for i, vm in enumerate(vms):
         if not isinstance(vm, Mapping):
             return False, f"verification method[{i}] is not a dict"
-        multibase = vm.get("publicKeyMultibase")
-        if not isinstance(multibase, str):
+        key, decode_error = decode_verification_method_key(vm)
+        if key is None:
             return False, (
-                f"verification method[{i}] is missing publicKeyMultibase; "
-                f"did:pkh:eip155 requires every VM to be a Multikey"
+                f"verification method[{i}] {decode_error}; did:pkh:eip155 "
+                f"requires every VM to be a decodable secp256k1 Multikey"
             )
-        try:
-            suite, pub = multibase_to_public_key(multibase)
-        except CryptoSuiteError as e:
-            return False, f"verification method[{i}] multikey decode failed: {e}"
+        suite, pub = key
         if suite.alg_id != "ecdsa-secp256k1-sha256":
             return False, (
                 f"verification method[{i}] alg_id is {suite.alg_id!r}; "
@@ -630,16 +595,17 @@ def verify_did_binding(
             did:web, this function refuses-by-default — callers must
             opt in to skipping resolution by passing a no-op resolver.
     """
-    if not did:
-        return False, "DID is empty"
+    if not isinstance(did, str) or not did:
+        return False, f"DID must be a non-empty string; got {type(did).__name__}"
 
-    # Duplicate-kid guard runs ahead of every method-specific check.
-    # Without this, an attacker can include the victim's legitimate VM
-    # to pass binding AND a same-kid attacker VM that the signature
-    # verifier picks up (because methods_by_kid overwrites on collision).
-    unique_ok, unique_reason = _check_unique_vm_kids(verification_methods)
-    if not unique_ok:
-        return False, unique_reason
+    # Structural guard runs ahead of every method-specific check: the VM
+    # list must be a list of objects with string ids and unique kids.
+    # Without the duplicate-kid refusal, an attacker can include the
+    # victim's legitimate VM to pass binding AND a same-kid attacker VM
+    # that the signature verifier would otherwise pick up.
+    vm_index = index_verification_methods(verification_methods)
+    if not vm_index.ok:
+        return False, vm_index.fatal_summary()
 
     if did.startswith("did:pkh:eip155:1:"):
         ok, reason = _verify_did_pkh_eip155_binding(did, verification_methods)
@@ -667,8 +633,18 @@ def verify_did_binding(
         if not isinstance(resolved, Mapping):
             return False, f"did:web resolver returned non-dict for {did!r}"
         published = resolved.get("verificationMethod") or []
+        if not isinstance(published, list):
+            return False, (
+                f"published DID document for {did!r} has a non-list "
+                f"verificationMethod"
+            )
+        # Only string ids can match an embedded VM (whose ids the index
+        # above already required to be strings); anything else in the
+        # published document is unaddressable, and unhashable as a key.
         published_by_id = {
-            m.get("id"): m for m in published if isinstance(m, Mapping)
+            m.get("id"): m
+            for m in published
+            if isinstance(m, Mapping) and isinstance(m.get("id"), str)
         }
         for vm in verification_methods:
             if not isinstance(vm, Mapping):
@@ -692,74 +668,6 @@ def verify_did_binding(
 
 # Type alias for clarity
 DidWebResolver = "Callable[[str], Mapping[str, Any]]"
-
-
-def _verify_signatures_against(
-    payload: bytes,
-    signatures: Iterable[Mapping[str, str]],
-    verification_methods: Iterable[Mapping[str, Any]],
-) -> List[dict]:
-    """Drop entries that don't crypto-verify; return survivors.
-
-    Mirrors the same crypto-check logic as
-    :func:`identity.hybrid_keypair.verify_hybrid` but isolated here
-    for clarity and to avoid a circular import.
-
-    Defense-in-depth (codex P1 follow-up): reject duplicate kids so a
-    later-listed attacker VM cannot silently overwrite the legitimate
-    one in ``methods_by_kid``. ``verify_did_binding`` is the primary
-    guard, but anything that calls ``_verify_signatures_against`` on
-    arbitrary VMs (e.g. archival side, future callers) gets the same
-    protection here.
-    """
-    vms_list = list(verification_methods)
-    unique_ok, _reason = _check_unique_vm_kids(vms_list)
-    if not unique_ok:
-        return []
-
-    methods_by_kid: dict = {}
-    for vm in vms_list:
-        # Codex P2 round 4: ``_check_unique_vm_kids`` skips non-Mapping
-        # entries, but this loop used to crash on ``vm.get(...)`` with
-        # an AttributeError when handed malformed archived/remote data.
-        # Mirror the isinstance guard.
-        if not isinstance(vm, Mapping):
-            continue
-        vm_id = vm.get("id") or ""
-        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
-        methods_by_kid[kid] = vm
-
-    verified: List[dict] = []
-    for entry in signatures:
-        if not isinstance(entry, Mapping):
-            continue
-        alg = entry.get("alg")
-        kid = entry.get("kid")
-        sig_hex = entry.get("sig")
-        if not alg or not kid or not sig_hex:
-            continue
-        vm = methods_by_kid.get(kid)
-        if not vm:
-            continue
-        multibase = vm.get("publicKeyMultibase")
-        if not isinstance(multibase, str):
-            continue
-        try:
-            suite, pub = multibase_to_public_key(multibase)
-        except CryptoSuiteError:
-            continue
-        # alg must match the resolved suite — defends against a kid spoof
-        # where an entry claims a different algorithm than the verification
-        # method's actual key type.
-        if suite.alg_id != alg:
-            continue
-        try:
-            sig_bytes = bytes.fromhex(sig_hex)
-        except ValueError:
-            continue
-        if suite.verify(payload, sig_bytes, pub):
-            verified.append(dict(entry))
-    return verified
 
 
 def _adaptive_predecessor_policy(
@@ -791,8 +699,12 @@ def _adaptive_predecessor_policy(
     """
     # For did:web predecessors with a resolver, use the resolved doc's
     # VMs as the source of truth rather than the embedded subset.
-    authoritative_vms = list(embedded_vms)
-    if predecessor_did.startswith("did:web:") and did_web_resolver is not None:
+    authoritative_vms = embedded_vms
+    if (
+        isinstance(predecessor_did, str)
+        and predecessor_did.startswith("did:web:")
+        and did_web_resolver is not None
+    ):
         try:
             resolved = did_web_resolver(predecessor_did)
         except Exception:
@@ -802,19 +714,34 @@ def _adaptive_predecessor_policy(
             if isinstance(published, list):
                 authoritative_vms = published
 
+    # DID binding and signature verification both fail closed on a
+    # malformed VM list; the policy reported alongside is the stricter one.
+    if not isinstance(authoritative_vms, (list, tuple)):
+        return VerifyPolicy.HYBRID_REQUIRED
     for vm in authoritative_vms:
         if not isinstance(vm, Mapping):
             continue
-        multibase = vm.get("publicKeyMultibase")
-        if not isinstance(multibase, str):
-            continue
-        try:
-            suite, _pub = multibase_to_public_key(multibase)
-        except CryptoSuiteError:
-            continue
-        if getattr(suite, "is_post_quantum", False):
+        key, _decode_error = decode_verification_method_key(vm)
+        if key is not None and getattr(key[0], "is_post_quantum", False):
             return VerifyPolicy.HYBRID_REQUIRED
     return VerifyPolicy.LEGACY_ALLOWED
+
+
+def _unevaluated_result(reason: str) -> SuccessionVerifyResult:
+    """A rejection decided before any signature was evaluated."""
+    not_evaluated = PolicyResult(
+        ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
+    )
+    return SuccessionVerifyResult(
+        ok=False,
+        predecessor=not_evaluated,
+        successor=not_evaluated,
+        archival=None,
+        statement_id_consistent=False,
+        predecessor_did_bound=False,
+        successor_did_bound=False,
+        reason=reason,
+    )
 
 
 def verify_succession(
@@ -878,8 +805,6 @@ def verify_succession(
             did_web_resolver=did_web_resolver,
         )
 
-    payload = signable_payload(statement)
-
     # 0) effective_from must parse as a tz-aware UTC ISO 8601 timestamp.
     # The chain walker already enforces this (its temporal-cutoff logic
     # depends on it), but a single verify_succession call without a
@@ -888,19 +813,15 @@ def verify_succession(
     # statement with a bogus cutoff is never accepted.
     eff_ok, eff_reason = _validate_iso8601_utc(statement.effective_from)
     if not eff_ok:
-        return SuccessionVerifyResult(
-            ok=False,
-            predecessor=PolicyResult(
-                ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
-            ),
-            successor=PolicyResult(
-                ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
-            ),
-            archival=None,
-            statement_id_consistent=False,
-            predecessor_did_bound=False,
-            successor_did_bound=False,
-            reason=f"effective_from invalid: {eff_reason}",
+        return _unevaluated_result(f"effective_from invalid: {eff_reason}")
+
+    # The signed fields are external material; a value JSON cannot
+    # canonicalize is a malformed statement, not a verifier crash.
+    try:
+        payload = signable_payload(statement)
+    except (TypeError, ValueError) as e:
+        return _unevaluated_result(
+            f"statement is not canonically serializable: {type(e).__name__}"
         )
 
     # 1) Predecessor DID binding — gate before predecessor signatures.
@@ -922,20 +843,18 @@ def verify_succession(
     )
 
     # 2) Predecessor signatures
-    pred_verified = _verify_signatures_against(
+    predecessor_result = verify_signature_entries(
         payload,
         statement.predecessor_signatures,
         statement.predecessor_verification_methods,
-    )
-    predecessor_result = evaluate_signatures(pred_verified, predecessor_policy)
+    ).evaluate(predecessor_policy)
 
     # Successor side
-    succ_verified = _verify_signatures_against(
+    successor_result = verify_signature_entries(
         payload,
         statement.successor_signatures,
         statement.successor_verification_methods,
-    )
-    successor_result = evaluate_signatures(succ_verified, successor_policy)
+    ).evaluate(successor_policy)
 
     # Archival side
     archival_result: Optional[PolicyResult] = None
@@ -953,14 +872,11 @@ def verify_succession(
                 alg_ids_seen=frozenset(),
             )
         else:
-            arch_verified = _verify_signatures_against(
+            archival_result = verify_signature_entries(
                 payload,
                 [statement.archival_signature],
                 [statement.archival_verification_method],
-            )
-            archival_result = evaluate_signatures(
-                arch_verified, VerifyPolicy.PQ_REQUIRED,
-            )
+            ).evaluate(VerifyPolicy.PQ_REQUIRED)
             # Guard: archival sig must specifically be SLH-DSA-128s, not
             # any post-quantum suite. Otherwise a future caller could
             # countersign with ML-DSA-65 and still pass PQ_REQUIRED.

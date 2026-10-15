@@ -1087,6 +1087,8 @@ class _ExecutionForwarder:
                     await require_native_execution_admission(self._runtime_owner)
                 if self._iterator is None:
                     from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+                    from kestrel_sovereign.llm.call_progress import inherit_call_progress
+                    inherit_call_progress(self._owner_context)
                     with self._turn_scope.bind():
                         self._iterator = OwnedAsyncIterator(
                             self._produce, operation="execution-stream-forward",

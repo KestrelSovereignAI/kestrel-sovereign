@@ -4,6 +4,13 @@ from typing import Dict, Any, Optional, List
 
 from kestrel_sovereign.config import load_config
 
+from .provider_policy import (
+    FALLBACK_WRITER_KEY,
+    current_override_writer,
+    fallback_selection,
+    public_fallback,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,22 +126,39 @@ class ModelMandateMixin:
                 "vendor": preference_vendor,
                 "route": preference_route,
             },
-            "fallbacks": self._mandate_fallbacks.copy(),
+            "fallbacks": [public_fallback(fb) for fb in self._mandate_fallbacks],
             "banned": self.mandate_config.get("defaults", {}).get("banned", []),
             "mandates": self.mandate_config.get("mandates", {})
         }
 
 
     def add_fallback_model(self, model_name: str, provider: Optional[str] = None):
-        """Add a model to the fallback list."""
+        """Add a model to the fallback list.
+
+        A fallback that names a provider is an override like the mandate it
+        backs (#2652). It is admitted under the writer named for this write
+        (the agent's when none is), refused before it is stored when the
+        provider policy refuses it, and stored with its writer so routing
+        holds it to that writer's authority.
+
+        Raises:
+            ProviderPolicyRefusal: the provider is denied, or the writer is
+                the agent and the provider is outside the approved chain.
+        """
         fallback_entry = {"model": model_name, "provider": provider}
 
-        if fallback_entry not in self._mandate_fallbacks:
-            self._mandate_fallbacks.append(fallback_entry)
-            logger.info(f"Added fallback model: {model_name}" +
-                        (f" (provider: {provider})" if provider else ""))
-        else:
+        if fallback_entry in [public_fallback(fb) for fb in self._mandate_fallbacks]:
             logger.info(f"Fallback model already exists: {model_name}")
+            return
+        selection = fallback_selection(fallback_entry)
+        if selection is not None:
+            writer = current_override_writer(via="add_fallback_model")
+            self._admit_provider_selection(selection, writer, kind="fallback")
+            self._record_override_decision(selection, writer, kind="fallback")
+            fallback_entry[FALLBACK_WRITER_KEY] = writer
+        self._mandate_fallbacks.append(fallback_entry)
+        logger.info(f"Added fallback model: {model_name}" +
+                    (f" (provider: {provider})" if provider else ""))
 
     def clear_mandate(self):
         """Reset the mandate to defaults from the TOML file."""
@@ -143,6 +167,8 @@ class ModelMandateMixin:
         # and clear_model_preference — previously left {"model", "provider"},
         # which desynced the mandate shape mid-session.
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        # The writer goes with the mandate it wrote (#2652).
+        self._mandate_provenance = None
         self._mandate_fallbacks = []
         logger.info("Model mandate cleared, reset to TOML defaults")
 

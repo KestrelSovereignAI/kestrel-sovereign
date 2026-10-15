@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
-from typing import Optional
+from typing import Iterable, Optional
 
 from kestrel_sovereign.host_features.storage import host_database_path
 from kestrel_sovereign.paths import TRASH_DIR_ENV, project_dir, runtime_path_env
@@ -24,6 +24,7 @@ from kestrel_sovereign.security.path_identity import (
 )
 
 from . import python_delete_runtime
+from .models import DEFAULT_DELETABLE_PREFIXES
 from .shell_rewriter import ShellRewriteError, ShellScriptRewriter
 
 
@@ -42,16 +43,6 @@ def default_trash_dir() -> Path:
         runtime_path_env(TRASH_DIR_ENV, os.path.expanduser("~/.kestrel/trash"))
     ).expanduser()
 
-
-# Each value denotes a parent plus a generated-directory name prefix, not an
-# arbitrary string prefix.  ``is_deletable_path`` resolves both sides and uses
-# path components so symlinks and prefix siblings cannot escape containment.
-DEFAULT_DELETABLE_PREFIXES = [
-    "/tmp/kestrel_compute_",
-    "/tmp/kestrel_scratch_",
-    "/private/tmp/kestrel_compute_",
-    "/private/tmp/kestrel_scratch_",
-]
 
 AGENT_DATA_DIR_NAME = "agent_data"
 _PYTHON_ENCODING_COOKIE = re.compile(r"coding[:=]\s*[-\w.]+")
@@ -87,7 +78,7 @@ class DestructiveOperationPolicy:
     def __init__(
         self,
         trash_dir: Optional[Path] = None,
-        deletable_prefixes: Optional[list[str]] = None,
+        deletable_prefixes: Optional[Iterable[str]] = None,
         current_agent_data_path: Optional[str | Path] = None,
     ) -> None:
         self.trash_dir = trash_dir or default_trash_dir()

@@ -17,8 +17,6 @@ was invisible. The shape of #3300, on another adapter. These tests pin:
 from __future__ import annotations
 
 import json
-import sys
-import types
 from types import SimpleNamespace
 from typing import Any, List
 from unittest.mock import AsyncMock
@@ -117,7 +115,7 @@ async def test_each_model_gets_its_own_ceiling_and_is_looked_up_once():
 
 
 @pytest.mark.asyncio
-async def test_discovered_ceiling_is_used_without_another_lookup(monkeypatch):
+async def test_discovered_ceiling_is_used_without_another_lookup():
     """Discovery already carries each model's ``output_token_limit``; it lands
     on ``ModelInfo.output_limit`` and a request uses it rather than asking."""
     listed = [
@@ -130,20 +128,17 @@ async def test_discovered_ceiling_is_used_without_another_lookup(monkeypatch):
             description=None, input_token_limit=1_048_576, output_token_limit=8_192,
         ),
     ]
-    fake_genai = types.ModuleType("google.generativeai")
-    fake_genai.configure = lambda **_: None
-    fake_genai.list_models = lambda: iter(listed)
-    # ``import google.generativeai as genai`` reads the package attribute
-    # before sys.modules, so replace both.
-    import google
 
-    monkeypatch.setitem(sys.modules, "google.generativeai", fake_genai)
-    monkeypatch.setattr(google, "generativeai", fake_genai, raising=False)
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    async def _pager():
+        for model in listed:
+            yield model
+
+    client = _client(_response([_text("ok")], finish_reason="STOP"))
+    # The route's own client lists, on its async surface (#3646).
+    client.aio.models.list = AsyncMock(side_effect=lambda **_: _pager())
 
     adapter = GoogleAdapter()
-    models = await adapter.list_models()
-    client = _client(_response([_text("ok")], finish_reason="STOP"))
+    models = await adapter.list_models(client)
     await adapter.get_response(client=client, model="gemini-2.0-flash", messages=MESSAGES)
 
     assert {m.id: (m.context_limit, m.output_limit) for m in models} == {

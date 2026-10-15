@@ -134,7 +134,9 @@ its own internal tool selection and return a result.
 When a feature has been explored, its individual `@tool` methods can be promoted
 as direct tools. Direct-tool promotion is bounded by
 `ToolRegistryMixin.MAX_DIRECT_TOOLS`; least-recently explored features are
-evicted when the direct surface grows too large.
+evicted when the direct surface grows too large. Pinned owners are never
+evicted, and an owner holding a dynamically-mounted tool the live turn has
+already called is kept until that turn ends (#2935).
 
 Some meta-features opt into direct startup promotion with
 `promote_tools_on_startup`. That opt-in lives on the feature, so startup remains

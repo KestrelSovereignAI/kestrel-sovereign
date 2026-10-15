@@ -21,7 +21,13 @@ from typing import Dict, List, Optional
 from kestrel_sovereign.kestrel_config.constants import SUBPROCESS_TIMEOUT_SHORT
 
 from ..destructive_policy import DestructiveOperationPolicy
-from ..models import ComputeCommand, ComputeScript, ExecutionRecord
+from ..models import (
+    DEFAULT_MAX_TIMEOUT_SECONDS,
+    ComputeCommand,
+    ComputePolicy,
+    ComputeScript,
+    ExecutionRecord,
+)
 from ..trash_manager import _rename_noreplace
 from .base import (
     BaseExecutor,
@@ -103,6 +109,8 @@ class DockerExecutor(BaseExecutor):
         legacy_staging_age_seconds: Optional[int] = None,
         max_snapshot_bytes: int = _DEFAULT_MAX_SNAPSHOT_BYTES,
         max_snapshot_entries: int = _DEFAULT_MAX_SNAPSHOT_ENTRIES,
+        *,
+        policy: Optional[ComputePolicy] = None,
     ):
         """
         Initialize the Docker executor.
@@ -117,8 +125,13 @@ class DockerExecutor(BaseExecutor):
             max_output_bytes: Maximum stdout/stderr size
             max_snapshot_bytes: Maximum regular-file bytes copied from a cwd
             max_snapshot_entries: Maximum entries copied from a cwd
+            legacy_staging_age_seconds: Overrides the policy's maximum
+                timeout as the age past which an unowned staging directory
+                is swept
+            policy: The compute policy whose deletable prefixes and maximum
+                timeout apply
         """
-        super().__init__(max_output_bytes=max_output_bytes)
+        super().__init__(max_output_bytes=max_output_bytes, policy=policy)
         self._docker_path = docker_path
         self._cached_docker_path: Optional[str] = None
         self._images = images or DEFAULT_IMAGES
@@ -131,14 +144,17 @@ class DockerExecutor(BaseExecutor):
         self._max_snapshot_bytes = max_snapshot_bytes
         self._max_snapshot_entries = max_snapshot_entries
         self._policy = DestructiveOperationPolicy(
-            current_agent_data_path=current_agent_data_path
+            current_agent_data_path=current_agent_data_path,
+            deletable_prefixes=self.compute_policy.deletable_prefixes,
         )
         # A record-less staging directory (made by code that wrote no record)
         # is swept once older than the longest a script may run under the
-        # policy this executor serves; the feature passes its configured
-        # maximum, the default is the policy's shipped default.
+        # policy this executor serves.
         self._legacy_staging_age_seconds = (
-            int(legacy_staging_age_seconds or self.LEGACY_STAGING_AGE_SECONDS)
+            int(
+                legacy_staging_age_seconds
+                or self.compute_policy.max_timeout_seconds
+            )
             + self.LEGACY_STAGING_GRACE_SECONDS
         )
 
@@ -1058,13 +1074,14 @@ class DockerExecutor(BaseExecutor):
     #: directories not reached this run are left for the next.
     SWEEP_INSPECT_BUDGET_SECONDS = 20.0
 
-    #: Default for ``legacy_staging_age_seconds``: the compute policy's
-    #: shipped maximum script timeout. A staging directory with NO owner
-    #: record was made by code that wrote none (the leak this ticket closes,
-    #: or a run of that older code still in flight across an upgrade) and is
-    #: swept once older than this; a record-bearing directory is judged by
-    #: its owner, never by age.
-    LEGACY_STAGING_AGE_SECONDS = 60 * 60
+    #: The legacy floor under a default policy: the shipped maximum script
+    #: timeout. The executor reads the floor from its policy's
+    #: ``max_timeout_seconds``. A staging directory with NO owner record was
+    #: made by code that wrote none (the leak this ticket closes, or a run of
+    #: that older code still in flight across an upgrade) and is swept once
+    #: older than this; a record-bearing directory is judged by its owner,
+    #: never by age.
+    LEGACY_STAGING_AGE_SECONDS = DEFAULT_MAX_TIMEOUT_SECONDS
 
     @classmethod
     def _write_staging_owner(cls, staging_dir: Path, container_name: str) -> None:

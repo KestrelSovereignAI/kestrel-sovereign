@@ -1,0 +1,189 @@
+{
+  "description": "#2970: the pre/post tool join, shared by the server (tests/unit/test_streaming_revise_boundary_weld.py) and the chat client (tests/frontend/chat_revising_event.test.mjs). `llm` is the first provider stream (strings, plus ToolCallStarted markers), ending in one tool call; `orchestrator` is the post-tool stream. The server must stream exactly `wire`, persist `content` with `seam`, and replay `text`; the client, fed `wire`, must render exactly `text`.",
+  "cases": [
+    {
+      "name": "no marker: pre-tool question and post-tool answer keep a separator (#2970 reproduction)",
+      "llm": [
+        "Let me open STRATEGY.yaml?"
+      ],
+      "orchestrator": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "wire": [
+        "Let me open STRATEGY.yaml?",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "\n",
+        "Only one permission is missing."
+      ],
+      "seam": "\n",
+      "content": "Only one permission is missing.",
+      "text": "Let me open STRATEGY.yaml?\nOnly one permission is missing."
+    },
+    {
+      "name": "marker consumed by later pre-tool text",
+      "llm": [
+        "Let me check.",
+        {
+          "tool_call_started": {
+            "index": 0,
+            "id": "tc1",
+            "name": "strategy_view"
+          }
+        },
+        "Reading STRATEGY.yaml?"
+      ],
+      "orchestrator": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "wire": [
+        "Let me check.",
+        "\u001eKESTREL:REVISE:{\"index\":0,\"tool_call_id\":\"tc1\",\"tool_name\":\"strategy_view\"}\u001e",
+        "Reading STRATEGY.yaml?",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "\n",
+        "Only one permission is missing."
+      ],
+      "seam": "\n",
+      "content": "Only one permission is missing.",
+      "text": "Let me check.\n\nReading STRATEGY.yaml?\nOnly one permission is missing."
+    },
+    {
+      "name": "follow-up revise sentinel leads the post-tool text",
+      "llm": [
+        "Let me open STRATEGY.yaml?"
+      ],
+      "orchestrator": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "\u001eKESTREL:REVISE:{\"index\":0,\"tool_call_id\":\"tc2\",\"tool_name\":\"strategy_resolve_blocker\"}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_resolve_blocker\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_resolve_blocker\",\"index\":null,\"ms\":9,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "wire": [
+        "Let me open STRATEGY.yaml?",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "\u001eKESTREL:REVISE:{\"index\":0,\"tool_call_id\":\"tc2\",\"tool_name\":\"strategy_resolve_blocker\"}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_resolve_blocker\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_resolve_blocker\",\"index\":null,\"ms\":9,\"detail\":null}\u001e",
+        "\n",
+        "Only one permission is missing."
+      ],
+      "seam": "\n",
+      "content": "Only one permission is missing.",
+      "text": "Let me open STRATEGY.yaml?\nOnly one permission is missing."
+    },
+    {
+      "name": "post-tool text opens with whitespace: no separator",
+      "llm": [
+        "Let me open STRATEGY.yaml?"
+      ],
+      "orchestrator": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "\n---\n",
+        "Only one permission is missing."
+      ],
+      "wire": [
+        "Let me open STRATEGY.yaml?",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "\n---\n",
+        "Only one permission is missing."
+      ],
+      "seam": "",
+      "content": "\n---\nOnly one permission is missing.",
+      "text": "Let me open STRATEGY.yaml?\n---\nOnly one permission is missing."
+    },
+    {
+      "name": "pre-tool text ends with whitespace: no separator",
+      "llm": [
+        "Let me open STRATEGY.yaml? "
+      ],
+      "orchestrator": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "wire": [
+        "Let me open STRATEGY.yaml? ",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "seam": "",
+      "content": "Only one permission is missing.",
+      "text": "Let me open STRATEGY.yaml? Only one permission is missing."
+    },
+    {
+      "name": "no pre-tool text: no separator",
+      "llm": [],
+      "orchestrator": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "wire": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "seam": "",
+      "content": "Only one permission is missing.",
+      "text": "Only one permission is missing."
+    },
+    {
+      "name": "no post-tool text: no separator",
+      "llm": [
+        "Let me open STRATEGY.yaml?"
+      ],
+      "orchestrator": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e"
+      ],
+      "wire": [
+        "Let me open STRATEGY.yaml?",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e"
+      ],
+      "seam": "",
+      "content": "",
+      "text": "Let me open STRATEGY.yaml?"
+    },
+    {
+      "name": "pending revise boundary: unchanged #1547 paragraph weld, done by the client",
+      "llm": [
+        "Let me open STRATEGY.yaml?",
+        {
+          "tool_call_started": {
+            "index": 0,
+            "id": "tc1",
+            "name": "strategy_view"
+          }
+        }
+      ],
+      "orchestrator": [
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "wire": [
+        "Let me open STRATEGY.yaml?",
+        "\u001eKESTREL:REVISE:{\"index\":0,\"tool_call_id\":\"tc1\",\"tool_name\":\"strategy_view\"}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"start\",\"name\":\"strategy_view\",\"index\":0,\"ms\":null,\"detail\":null}\u001e",
+        "\u001eKESTREL:TOOL:{\"phase\":\"done\",\"name\":\"strategy_view\",\"index\":null,\"ms\":7,\"detail\":null}\u001e",
+        "Only one permission is missing."
+      ],
+      "seam": "\n\n",
+      "content": "Only one permission is missing.",
+      "text": "Let me open STRATEGY.yaml?\n\nOnly one permission is missing."
+    }
+  ]
+}

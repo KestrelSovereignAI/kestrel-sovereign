@@ -56,11 +56,11 @@ class VertexAIAdapter(LLMAdapter):
     """
     Adapter for Google Vertex AI using google-genai SDK.
 
-    Key differences from GoogleAdapter (which uses google-generativeai):
+    Key differences from GoogleAdapter (the Gemini API with an API key):
     - Uses google-genai SDK with vertexai=True flag
     - Requires GCP project authentication (ADC or service account)
     - Supports both Gemini models and partner models (Claude on Vertex, Llama on Vertex)
-    - Provides API-based model discovery via client.models.list()
+    - Provides API-based model discovery via client.aio.models.list()
     """
 
     def provider_capabilities(self) -> ProviderCapabilities:
@@ -693,7 +693,11 @@ class VertexAIAdapter(LLMAdapter):
         adapter's own ``_get_client()`` (project_id + location bound at
         construction time), so the parameter is ignored here.
 
-        Uses the google-genai SDK's models.list() API.
+        Uses the google-genai SDK's asynchronous ``aio.models.list()``. The
+        listing awaits, so the per-route discovery deadline can cancel it
+        (#3646); the synchronous ``models.list()`` it used blocked the event
+        loop, so an endpoint that never answered stalled every other route's
+        discovery and every discovery deadline with it.
 
         Returns:
             List of ModelInfo objects for each available model
@@ -702,8 +706,7 @@ class VertexAIAdapter(LLMAdapter):
             genai_client = self._get_client()
             models = []
 
-            # Use the sync models.list() - async version may not be available
-            for model in genai_client.models.list():
+            async for model in await genai_client.aio.models.list():
                 model_id = model.name if hasattr(model, 'name') else str(model)
                 display_name = getattr(model, 'display_name', None) or model_id
                 description = getattr(model, 'description', None)

@@ -24,10 +24,13 @@ from typing import (
     Any,
     AsyncIterator,
     Awaitable,
+    Callable,
     Dict,
     Iterator,
     List,
+    Mapping,
     Optional,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -52,7 +55,13 @@ from kestrel_sovereign.llm.adapter import (
     ThinkingDelta,
     tool_call_history_entry,
 )
-from kestrel_sovereign.llm.call_progress import call_progress_listener
+from kestrel_sovereign.llm.call_progress import (
+    FIRST_TOKEN_PHASE,
+    INTER_CHUNK_PHASE,
+    NON_STREAMING_PHASE,
+    AttemptInactivityTimeout,
+    call_progress_listener,
+)
 from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
 from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
 from kestrel_sovereign.turn_completion import (
@@ -95,6 +104,13 @@ from kestrel_sovereign.execution_custody import (
     require_execution_work,
 )
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+from kestrel_sovereign.agent.tool_allowlist import (
+    ToolCallContext,
+    allowlist_evidence,
+    begin_tool_call,
+    record_tool_acceptance,
+    tool_call_scope,
+)
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_RESOLUTION,
@@ -149,10 +165,22 @@ _T = TypeVar("_T")
 
 
 class LLMCallInactivityTimeout(IncompleteGenerationError):
-    """An orchestrator LLM call went its whole inactivity bound without progress."""
+    """An orchestrator LLM call went its whole inactivity bound without progress.
 
-    def __init__(self, timeout: float) -> None:
+    ``provider`` and ``model`` name the attempt the call was waiting on when
+    it was abandoned, or are ``None`` if no provider attempt had started.
+    """
+
+    def __init__(
+        self,
+        timeout: float,
+        *,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
         self.timeout = timeout
+        self.provider = provider
+        self.model = model
         self.summary = f"timeout after {int(timeout)}s"
         super().__init__(
             f"LLM call produced nothing for {timeout:g}s and was abandoned"
@@ -180,17 +208,45 @@ class LLMCallWatchdog:
 
     Reported progress travels on :mod:`kestrel_sovereign.llm.call_progress`,
     never in the stream, so it re-arms the bound without reaching a consumer.
+    The same channel names the route and model each attempt waits on, so a
+    call abandoned on its bound is logged at WARNING with the provider that
+    went silent (#2658). Starting an attempt is not progress.
 
     Only time spent waiting on the provider counts. Time the consumer spends
     on an item does not, and neither does an inline tool the provider is
     waiting on (:meth:`tool_running`): an adapter that runs tools inside the
     call (the codex app-server) is silent for as long as the tool takes.
+
+    A call that falls back across routes is timed per candidate (#1968). The
+    service hands each candidate attempt of the call to this watchdog
+    (:meth:`attempt_stream`, :meth:`attempt_call`), which bounds it by that
+    candidate's own route (:meth:`attempt_timeout`): a streamed attempt by
+    its wait for its first item and then by each wait between items, a
+    non-streaming one by its silence until it answers. While an attempt is
+    awaited its bound replaces the call's. An attempt that goes its bound
+    without progress raises
+    :class:`~kestrel_sovereign.llm.call_progress.AttemptInactivityTimeout`
+    inside the dispatch loop, which moves on to its next admitted candidate
+    as after any other failure. So a hung cloud primary still fails at the
+    short bound, and a slow local fallback runs to its own route's. The
+    call's bound covers what happens outside the attempts.
     """
 
-    def __init__(self, timeout: float) -> None:
+    def __init__(
+        self,
+        timeout: float,
+        *,
+        attempt_timeout: Optional[Callable[[Mapping[str, Any]], float]] = None,
+    ) -> None:
         self.timeout = timeout
-        self._pending: Optional[asyncio.Timeout] = None
+        self._attempt_timeout = attempt_timeout
+        # The bounds armed on the call's task, innermost last. Only the
+        # innermost runs; each one it encloses is suspended until it ends.
+        self._deadlines: List[Tuple[asyncio.Timeout, float]] = []
+        self._owner: Optional[asyncio.Task] = None
         self._tools_running = 0
+        self._provider: Optional[str] = None
+        self._model: Optional[str] = None
 
     @classmethod
     def for_call(
@@ -213,8 +269,14 @@ class LLMCallWatchdog:
         progress is silent until it answers, so its client's own timeout is
         the earliest point a hang can be told from a long answer: every
         candidate's timeout lifts its bound, cloud routes included.
+
+        Each candidate attempt is bounded by the same rule applied to that
+        candidate alone (#1968): the default, lifted to the candidate's
+        client timeout when it is a local route, or when the call does not
+        stream.
         """
-        timeout = ORCHESTRATOR_TURN_TIMEOUT_SECS
+        floor = ORCHESTRATOR_TURN_TIMEOUT_SECS
+        timeout = floor
         try:
             candidates, _ = llm_service.resolve_provider_routing(
                 model_override=model_override,
@@ -232,7 +294,39 @@ class LLMCallWatchdog:
             # Routing that cannot be resolved here fails again, loudly, in the
             # call itself; the default bound still applies to it.
             pass
-        return cls(timeout)
+
+        def attempt_timeout(route: Mapping[str, Any]) -> float:
+            if streaming:
+                lifted = llm_service.effective_request_timeout([route])
+            else:
+                lifted = llm_service.effective_request_timeout(
+                    [route], completion_only=True,
+                )
+            return lifted if lifted and lifted > floor else floor
+
+        return cls(timeout, attempt_timeout=attempt_timeout)
+
+    @classmethod
+    async def bound_completion(
+        cls,
+        llm_service: Any,
+        pending: Awaitable[_T],
+        *,
+        model_override: Optional[str] = None,
+    ) -> _T:
+        """Await a non-streaming call a turn makes outside its model loop.
+
+        The genesis audit, the bootstrap SOUL.md generation, the compaction
+        and ``!context`` summaries and ``!context query`` hold a turn (or
+        every first turn) just as cognition does, so they carry the same
+        bound as its calls (#2658). The bound is resolved for the routes the
+        call itself selects: pass the ``model_override`` it was given.
+        """
+        watchdog = cls.for_call(
+            llm_service, model_override=model_override, force_local_only=False,
+            streaming=False,
+        )
+        return await watchdog.call(pending)
 
     async def watch(self, stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
         """Yield ``stream``'s items, bounding the wait for each one."""
@@ -253,24 +347,154 @@ class LLMCallWatchdog:
         """Await the non-streaming call ``pending``, bounding its silence."""
         return await self._bounded(pending)
 
+    def _owns_current_source(self) -> bool:
+        from kestrel_sovereign._async_ownership import owned_iterator_parent_tasks
+        return (
+            asyncio.current_task() is self._owner
+            or self._owner in owned_iterator_parent_tasks()
+        )
+
     async def _bounded(self, pending: Awaitable[_T]) -> _T:
-        deadline = asyncio.timeout(None if self._tools_running else self.timeout)
+        self._owner = asyncio.current_task()
+        deadline = asyncio.timeout(None)
         try:
             async with deadline:
-                self._pending = deadline
+                with self._innermost(deadline, self.timeout), call_progress_listener(
+                    self._rearm, self._attempting, self,
+                ):
+                    return await pending
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise
+            if self._provider is None:
+                waiting_on = "no provider attempt had started"
+            else:
+                waiting_on = f"provider {self._provider}, model {self._model}"
+            logging.warning(
+                "[ORCHESTRATOR] LLM call produced nothing for %ss (%s); "
+                "abandoning it as a failed attempt", self.timeout, waiting_on,
+            )
+            raise LLMCallInactivityTimeout(
+                self.timeout, provider=self._provider, model=self._model,
+            ) from exc
+
+    def attempt_timeout(self, route: Mapping[str, Any]) -> float:
+        """The bound, in seconds, on one attempt at candidate ``route``."""
+        if self._attempt_timeout is None:
+            return self.timeout
+        return self._attempt_timeout(route)
+
+    def attempt_stream(
+        self,
+        route: Mapping[str, Any],
+        provider: str,
+        model: str,
+        stream: AsyncIterator[Any],
+    ) -> AsyncIterator[Any]:
+        """``stream``, a streamed attempt at candidate ``route``, its time to
+        its first item and each wait between items bounded by the route."""
+        if not self._owns_current_source():
+            # Not this call's attempt: an inline tool's own model call, on
+            # the task its transport runs the tool on.
+            return stream
+        return self._watch_attempt(
+            stream, self.attempt_timeout(route), provider=provider, model=model,
+        )
+
+    async def attempt_call(
+        self,
+        route: Mapping[str, Any],
+        provider: str,
+        model: str,
+        pending: Awaitable[_T],
+    ) -> _T:
+        """Await ``pending``, a non-streaming attempt at candidate ``route``,
+        bounding its silence by the route."""
+        if not self._owns_current_source():
+            return await pending
+        return await self._bounded_attempt(
+            pending, self.attempt_timeout(route),
+            provider=provider, model=model, phase=NON_STREAMING_PHASE,
+        )
+
+    async def _watch_attempt(
+        self,
+        stream: AsyncIterator[Any],
+        limit: float,
+        *,
+        provider: str,
+        model: str,
+    ) -> AsyncIterator[Any]:
+        iterator = stream.__aiter__()
+        phase = FIRST_TOKEN_PHASE
+        try:
+            while True:
                 try:
-                    with call_progress_listener(self._rearm):
-                        return await pending
-                finally:
-                    self._pending = None
+                    item = await self._bounded_attempt(
+                        iterator.__anext__(), limit,
+                        provider=provider, model=model, phase=phase,
+                    )
+                except StopAsyncIteration:
+                    return
+                phase = INTER_CHUNK_PHASE
+                yield item
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    async def _bounded_attempt(
+        self,
+        pending: Awaitable[_T],
+        limit: float,
+        *,
+        provider: str,
+        model: str,
+        phase: str,
+    ) -> _T:
+        deadline = asyncio.timeout(None)
+        try:
+            async with deadline:
+                with self._innermost(deadline, limit):
+                    return await pending
         except TimeoutError as exc:
             if not deadline.expired():
                 raise
             logging.warning(
-                "[ORCHESTRATOR] LLM call produced nothing for %ss; abandoning "
-                "it as a failed attempt", self.timeout,
+                "[ORCHESTRATOR] LLM call produced nothing for %gs (provider %s, "
+                "model %s, phase %s); abandoning this candidate as a failed "
+                "attempt", limit, provider, model, phase,
             )
-            raise LLMCallInactivityTimeout(self.timeout) from exc
+            raise AttemptInactivityTimeout(
+                provider=provider, model=model, phase=phase, timeout=limit,
+            ) from exc
+
+    @contextmanager
+    def _innermost(self, deadline: asyncio.Timeout, limit: float) -> Iterator[None]:
+        """Make ``deadline``, re-armed to ``limit``, the bound in force,
+        suspending the one it encloses until it ends."""
+        if self._deadlines:
+            enclosing, _ = self._deadlines[-1]
+            if not enclosing.expired():
+                enclosing.reschedule(None)
+        entry = (deadline, limit)
+        self._deadlines.append(entry)
+        self._rearm()
+        try:
+            yield
+        finally:
+            self._deadlines.remove(entry)
+            # The enclosing bound resumes with its whole window: nothing it
+            # bounds was waiting while the inner bound ran.
+            self._rearm()
+
+    def _attempting(self, provider: str, model: str) -> None:
+        # While an inline tool runs the call is not waiting on its provider,
+        # so an attempt reported then is the tool's own nested call.
+        if self._tools_running:
+            return
+        self._provider = provider
+        self._model = model
 
     @contextmanager
     def tool_running(self) -> Iterator[None]:
@@ -284,13 +508,15 @@ class LLMCallWatchdog:
             self._rearm()
 
     def _rearm(self) -> None:
-        pending = self._pending
-        if pending is None or pending.expired():
+        if not self._deadlines:
+            return
+        pending, limit = self._deadlines[-1]
+        if pending.expired():
             return
         if self._tools_running:
             pending.reschedule(None)
         else:
-            pending.reschedule(asyncio.get_running_loop().time() + self.timeout)
+            pending.reschedule(asyncio.get_running_loop().time() + limit)
 
 CONTINUATION_INTENT_RE = re.compile(
     r"\b("
@@ -1282,6 +1508,17 @@ class OrchestratorEngineMixin:
             PHANTOM_RECEIPT_TOOL_NAME,
         )
 
+        # #2935: count the call into its turn, as ``_dispatch_tool_call`` does
+        # for the orchestrator loops, so the codex inline executor's calls
+        # reach the same ledger (and an MCP tool it called is not evicted by a
+        # later exploration). A call a running tool makes from inside its own
+        # call keeps that call's position instead. This path resolves against
+        # the registry, so the registry is the allowlist recorded for it.
+        registered = getattr(self, "_registered_tool_names", None)
+        call_context = begin_tool_call(
+            self, registered() if callable(registered) else frozenset()
+        )
+
         if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
             handler = getattr(self, "_handle_constitution_receipt_tool", None)
             if not callable(handler):
@@ -1291,6 +1528,28 @@ class OrchestratorEngineMixin:
                 )
             return await handler(**(args or {}))
 
+        with tool_call_scope(self, call_context):
+            return await self._dispatch_named_tool(
+                tool_name, args, session_id=session_id, source=source,
+                _capture=_capture, call_context=call_context,
+            )
+
+    async def _dispatch_named_tool(
+        self,
+        tool_name: str,
+        args: dict,
+        *,
+        session_id: str,
+        source: str,
+        _capture: Optional[Dict[str, Any]],
+        call_context: ToolCallContext,
+    ) -> Any:
+        """Resolve and run one :meth:`execute_named_tool` call.
+
+        ``call_context`` is the call's place in its turn. The name is recorded
+        as accepted once the guardrails let it through, exactly where the chat
+        path records it (#2935).
+        """
         found_tool, found_feature = self._resolve_named_tool(tool_name)
         direct_tool_feature_name: Optional[str] = None
         if found_tool is None and tool_name in getattr(self, "_direct_tools", {}):
@@ -1333,6 +1592,19 @@ class OrchestratorEngineMixin:
                 return await self._execute_named_subagent(
                     subagent_feature, tool_name=tool_name, args=args,
                     session_id=session_id, source=source, _capture=_capture,
+                    call_context=call_context,
+                )
+            evidence = allowlist_evidence(self, call_context, tool_name)
+            if evidence is not None:
+                # Say what the registry held at that instant. A caller may
+                # probe for an optional tool this way, so only the #2935
+                # symptom (a name this turn already called) is a WARNING.
+                logging.log(
+                    logging.WARNING if evidence.accepted_earlier_this_turn
+                    else logging.INFO,
+                    "[GOVERNED-DISPATCH] source=%s refused tool %r: not "
+                    "registered | %s",
+                    source, tool_name, evidence.describe(),
                 )
             raise ToolNotRegisteredError(
                 f"Tool {tool_name!r} is not registered with any enabled "
@@ -1377,8 +1649,11 @@ class OrchestratorEngineMixin:
                 reason=argument_error,
                 action=ACTION_TOOL_VALIDATION,
                 args=args,
+                evidence=allowlist_evidence(self, call_context, tool_name),
             )
             return {"success": False, "error": f"Invalid tool arguments: {argument_error}"}
+        # The argument check is the last guardrail, as in ``_dispatch_direct_tool``.
+        record_tool_acceptance(self, call_context, tool_name)
 
         logging.info(
             "[GOVERNED-DISPATCH] source=%s session=%s tool=%s feature=%s",
@@ -1551,6 +1826,7 @@ class OrchestratorEngineMixin:
         session_id: str,
         source: str,
         _capture: Optional[Dict[str, Any]] = None,
+        call_context: Optional[ToolCallContext] = None,
     ) -> Any:
         """Run a feature subagent through the governance stack.
 
@@ -1571,6 +1847,9 @@ class OrchestratorEngineMixin:
                 ``task`` (required) and ``context`` (optional); we
                 surface both.
             session_id / source / _capture: Same as ``execute_named_tool``.
+            call_context: The call's place in its turn (#2935), recorded as
+                accepted once the argument guardrail passes, before the
+                permission hooks, as the chat path records a subagent call.
         """
         feature_name = type(feature).__name__
 
@@ -1582,6 +1861,7 @@ class OrchestratorEngineMixin:
                 source, feature_name, validation_error,
             )
             return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
+        record_tool_acceptance(self, call_context, tool_name)
 
         logging.info(
             "[GOVERNED-DISPATCH] source=%s session=%s subagent=%s",
@@ -1909,6 +2189,11 @@ class OrchestratorEngineMixin:
             PHANTOM_RECEIPT_TOOL_NAME,
         )
 
+        # #2935: count this call into its turn, so a refusal can say where in
+        # the turn it happened and whether the name was accepted earlier. The
+        # constitution receipt call is a call of the turn too.
+        call_context = begin_tool_call(self, known_tools)
+
         if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
             handler = getattr(self, "_handle_constitution_receipt_tool", None)
             if not callable(handler):
@@ -1955,6 +2240,7 @@ class OrchestratorEngineMixin:
                 reason=validation_error or "tool validation failed",
                 action=ACTION_TOOL_VALIDATION,
                 args=args,
+                evidence=allowlist_evidence(self, call_context, tool_name),
             )
             result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
             # #1659: a start sentinel was already emitted for this call, so it
@@ -2027,63 +2313,72 @@ class OrchestratorEngineMixin:
                     tool_name
                 )
 
-        if feature:
-            result = await self._dispatch_feature_tool(
-                tool_call, feature, args, dispatch_start, dispatch_event_id,
-                user_message, tool_events=tool_events, streaming=streaming,
-                session_id=session_id, dispatch_meta=dispatch_meta,
-                effective_model=effective_model,
-            )
-        elif tool_name in self._direct_tools:
-            result = await self._dispatch_direct_tool(
-                tool_call, tool_name, args, dispatch_start, dispatch_event_id,
-                tool_events=tool_events, streaming=streaming,
-                session_id=session_id, dispatch_meta=dispatch_meta,
-            )
-        elif registered_tool is not None:
-            result = await self._dispatch_direct_tool(
-                tool_call, tool_name, args, dispatch_start, dispatch_event_id,
-                tool_events=tool_events, streaming=streaming,
-                session_id=session_id, dispatch_meta=dispatch_meta,
-                tool=registered_tool,
-                feature_name=(
-                    getattr(registered_feature, "name", None)
-                    or type(registered_feature).__name__
-                ),
-            )
-        else:
-            result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
-            dispatch_meta.update({
-                "status": "error",
-                "error_class": "UnknownToolError",
-                "error_message": f"Unknown feature tool: {tool_name}",
-            })
-            dispatch_duration = int((time.time() - dispatch_start) * 1000)
-            await self.observability_store.log_tool_response(
-                event_id=dispatch_event_id,
-                success=False,
-                duration_ms=dispatch_duration,
-                error_message=f"Unknown feature tool: {tool_name}",
-            )
-            if not streaming:
-                await self.observability_store.log_error(
-                    agent_name=self.did,
-                    error_type="unknown_feature_tool",
-                    error_message=f"Unknown feature tool: {tool_name}",
-                    metadata={"tool_name": tool_name, "available": list(features_by_tool_name.keys())}
+        # A tool that dispatches another by name from here makes a nested
+        # call, positioned at this one rather than counted again (#2935).
+        with tool_call_scope(self, call_context):
+            if feature:
+                # The guardrails are done with a subagent dispatch; anything that
+                # refuses it from here on is the permission layer's decision.
+                record_tool_acceptance(self, call_context, tool_name)
+                result = await self._dispatch_feature_tool(
+                    tool_call, feature, args, dispatch_start, dispatch_event_id,
+                    user_message, tool_events=tool_events, streaming=streaming,
+                    session_id=session_id, dispatch_meta=dispatch_meta,
+                    effective_model=effective_model,
                 )
-            if streaming and tool_events is not None:
-                tool_events.append({'type': 'error', 'tool': tool_name, 'error': f'Unknown feature tool: {tool_name}'})
-            # #2929: a name that survived the allowlist but resolves to no
-            # loaded feature is still a refused capability request — record it
-            # in the security audit alongside the guardrail rejections.
-            await record_tool_rejection(
-                self,
-                tool_name=tool_name,
-                reason=f"Unknown feature tool: {tool_name}",
-                action=ACTION_TOOL_RESOLUTION,
-                args=args,
-            )
+            elif tool_name in self._direct_tools:
+                result = await self._dispatch_direct_tool(
+                    tool_call, tool_name, args, dispatch_start, dispatch_event_id,
+                    tool_events=tool_events, streaming=streaming,
+                    session_id=session_id, dispatch_meta=dispatch_meta,
+                    call_context=call_context,
+                )
+            elif registered_tool is not None:
+                result = await self._dispatch_direct_tool(
+                    tool_call, tool_name, args, dispatch_start, dispatch_event_id,
+                    tool_events=tool_events, streaming=streaming,
+                    session_id=session_id, dispatch_meta=dispatch_meta,
+                    tool=registered_tool,
+                    feature_name=(
+                        getattr(registered_feature, "name", None)
+                        or type(registered_feature).__name__
+                    ),
+                    call_context=call_context,
+                )
+            else:
+                result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
+                dispatch_meta.update({
+                    "status": "error",
+                    "error_class": "UnknownToolError",
+                    "error_message": f"Unknown feature tool: {tool_name}",
+                })
+                dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                await self.observability_store.log_tool_response(
+                    event_id=dispatch_event_id,
+                    success=False,
+                    duration_ms=dispatch_duration,
+                    error_message=f"Unknown feature tool: {tool_name}",
+                )
+                if not streaming:
+                    await self.observability_store.log_error(
+                        agent_name=self.did,
+                        error_type="unknown_feature_tool",
+                        error_message=f"Unknown feature tool: {tool_name}",
+                        metadata={"tool_name": tool_name, "available": list(features_by_tool_name.keys())}
+                    )
+                if streaming and tool_events is not None:
+                    tool_events.append({'type': 'error', 'tool': tool_name, 'error': f'Unknown feature tool: {tool_name}'})
+                # #2929: a name that survived the allowlist but resolves to no
+                # loaded feature is still a refused capability request — record it
+                # in the security audit alongside the guardrail rejections.
+                await record_tool_rejection(
+                    self,
+                    tool_name=tool_name,
+                    reason=f"Unknown feature tool: {tool_name}",
+                    action=ACTION_TOOL_RESOLUTION,
+                    args=args,
+                    evidence=allowlist_evidence(self, call_context, tool_name),
+                )
 
         # Add tool result to messages (with persistence for large results)
         from kestrel_sovereign.features.base import _serialize_tool_result
@@ -2476,6 +2771,7 @@ class OrchestratorEngineMixin:
         self, tool_call, tool_name, args, dispatch_start, dispatch_event_id,
         *, tool_events=None, streaming=False, session_id="orchestrator",
         dispatch_meta=None, tool=None, feature_name=None,
+        call_context: Optional[ToolCallContext] = None,
     ):
         """Dispatch a direct tool call (no subagent LLM hop).
 
@@ -2484,6 +2780,10 @@ class OrchestratorEngineMixin:
         entered ``_direct_tools``, and ``_security_feature_name_for_tool``
         would fall back to the tool's own name for it, silently detaching the
         permission lookup from the feature that owns the tool.
+
+        ``call_context`` is the call's place in its turn (#2935): the argument
+        check below is the last guardrail, so the name is recorded as accepted
+        only once it passes, and its refusal carries the allowlist evidence.
         """
         tool = tool if tool is not None else self._direct_tools[tool_name]
         hook_feature_name = (
@@ -2519,8 +2819,10 @@ class OrchestratorEngineMixin:
                 reason=argument_error,
                 action=ACTION_TOOL_VALIDATION,
                 args=args,
+                evidence=allowlist_evidence(self, call_context, tool_name),
             )
             return await _failed(argument_error, error_class="ToolArgumentError")
+        record_tool_acceptance(self, call_context, tool_name)
 
         async def _exec_direct(effective_args, t=tool):
             return await t.execute(**effective_args)

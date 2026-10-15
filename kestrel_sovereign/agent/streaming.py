@@ -15,6 +15,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     raise_owned_outcome,
 )
+from kestrel_sovereign.command_policy import bypasses_turn_queue
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
@@ -36,6 +37,7 @@ from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.generation_gate import judge_generation
+from kestrel_sovereign.llm.provider_policy import caller_call_override_scope
 from kestrel_sovereign.llm.invocation_context import (
     LLMInvocationContext,
     turn_invocation_scope,
@@ -308,6 +310,28 @@ def _parse_stream_sentinels(text: str, base_offset: int = 0):
             weld_pending = True
         i = close + len(_SENTINEL_SUFFIX)
     return result, tool_parts, parts
+
+
+# #2970: the separator kept between pre-tool prose and the post-tool synthesis
+# when NO revise boundary is pending at that join (no ToolCallStarted marker
+# fired, or later pre-tool text already consumed it). The two halves stream
+# independently, so without it they weld: "…STRATEGY.yaml?Only one…". A single
+# newline: the console renders it as a line break (``breaks: true``), it ends a
+# line-scoped construct on the left (a closing code fence stays a fence), and
+# it claims no paragraph break the stream never signalled.
+TOOL_JOIN_SEPARATOR = "\n"
+
+
+def _join_separator(left: str, right: str, separator: str) -> str:
+    """``separator`` when ``left + right`` would put two non-whitespace
+    characters side by side, else ``""``.
+
+    An empty side needs nothing, and a side that already ends/starts with
+    whitespace is its own boundary, so a separator never doubles one.
+    """
+    if left and right and not left[-1].isspace() and not right[0].isspace():
+        return separator
+    return ""
 
 
 def _tool_parts_to_events(parts: list) -> list:
@@ -1065,8 +1089,12 @@ class StreamingMixin:
             yield genesis_block
             return
 
-        # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
-        await self._maybe_audit()
+        # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits. A
+        # read-only diagnostic delegated below answers beside an in-flight
+        # turn and writes no governance state, so it does not count as an
+        # interaction (#2658).
+        if not bypasses_turn_queue(user_input):
+            await self._maybe_audit()
 
         # The streaming endpoint is the primary chat path and must enforce the
         # same constitutional boundary as process_input. Commands delegate
@@ -1227,6 +1255,10 @@ class StreamingMixin:
                             getattr(self, "llm_service", None),
                             invocation_context,
                             session_id=session_id,
+                        ), caller_call_override_scope(
+                            # #2652: the caller's model is the caller's choice
+                            # for this turn, as in process_input.
+                            model_override, caller, via="model_override",
                         ):
                             # Establish the live session before capturing the
                             # task-relative turn binding for the source task.
@@ -1901,6 +1933,21 @@ class StreamingMixin:
                     require_success=checkpointed_batch,
                 )
 
+            # #1547/#1659: strip + weld in-band sentinels from the pre half and
+            # recover each tool sentinel's clean-text position. The pre half can
+            # carry codex inline tool sentinels (emitted on the LLM stream
+            # itself). ``full_response`` is complete here: the post-tool stream
+            # below accumulates into ``tool_response_chunks``.
+            pre_tool_text, pre_parts, pre_components = _parse_stream_sentinels(
+                "".join(full_response)
+            )
+            # #2970: with no revise boundary pending, the pre/post join is
+            # decided once, at the first visible post-tool text, and the chosen
+            # separator streams in-band just before it — so the live client
+            # renders exactly the bytes persisted as ``seam`` and replayed into
+            # the next turn. ``None`` until that text arrives.
+            join_separator: Optional[str] = None
+
             async with owned_execution_stream(self, self._handle_orchestrator_response_streaming(
                 response=tool_response,
                 feature_tools=feature_tools,
@@ -1935,14 +1982,20 @@ class StreamingMixin:
                         if not buffer_audit:
                             yield _build_thinking_sentinel(chunk)
                         continue
+                    if not pending_visible_boundary and join_separator is None:
+                        # Sentinel-only chunks are not the visible join.
+                        visible = _parse_stream_sentinels(chunk)[0]
+                        if visible:
+                            join_separator = _join_separator(
+                                pre_tool_text, visible, TOOL_JOIN_SEPARATOR,
+                            )
+                            # Stream the seam but don't add it to the synthesis.
+                            if join_separator and not buffer_audit:
+                                yield join_separator
                     tool_response_chunks.append(chunk)
                     if not buffer_audit:
                         yield chunk
-                    # #1256: belt-and-suspenders cancel check at the outer
-                    # boundary. The inner orchestrator generator also checks
-                    # ``is_request_cancelled`` at iteration boundaries; this
-                    # outer break stops accumulating tokens if a cancel
-                    # arrives between the inner check and the next yield.
+                    # Stop accumulation at the original request boundary.
                     if request_id and self.is_request_cancelled(request_id):
                         break
             # #2674 finding 2 / #3552: a POST-TOOL continuation stopped before
@@ -1971,14 +2024,9 @@ class StreamingMixin:
             # content makes the lie reappear on history reload. Keep that
             # prose in metadata instead; ContextBuilder replays it to the
             # next-turn LLM context so #877 self-recall is preserved.
-            # #1547/#1659: strip + weld in-band sentinels from BOTH halves
-            # and recover each tool sentinel's clean-text position. The pre
-            # half can carry codex inline tool sentinels (emitted on the LLM
-            # stream itself); the post half carries the orchestrator's
-            # per-batch start sentinels plus any follow-up revise sentinels.
-            pre_tool_text, pre_parts, pre_components = _parse_stream_sentinels(
-                "".join(full_response)
-            )
+            # #1547/#1659: the post half (parsed like the pre half above)
+            # carries the orchestrator's per-batch start sentinels plus any
+            # follow-up revise sentinels.
             post_tool_text, post_parts, post_components = _parse_stream_sentinels(
                 "".join(tool_response_chunks)
             )
@@ -1986,18 +2034,14 @@ class StreamingMixin:
             # ToolCallStarted marker — but ONLY when the marker fired
             # (`pending_visible_boundary`) and the seam would weld two
             # non-whitespace chars. This mirrors the client, which welds
-            # at the in-band revise sentinel; when no marker fired the
-            # client glues, so we glue too (plain concat).
-            if (
-                pending_visible_boundary
-                and pre_tool_text
-                and post_tool_text
-                and not pre_tool_text[-1].isspace()
-                and not post_tool_text[:1].isspace()
-            ):
-                seam = "\n\n"
+            # at the in-band revise sentinel. #2970: with no boundary
+            # pending, the seam is the separator already streamed at the
+            # first visible post-tool text (none when there was no such
+            # text, so a tool-only follow-up joins nothing).
+            if pending_visible_boundary:
+                seam = _join_separator(pre_tool_text, post_tool_text, "\n\n")
             else:
-                seam = ""
+                seam = join_separator or ""
             context_replay_text = pre_tool_text + seam + post_tool_text
             pending_visible_boundary = False
             # Position-stamp tool_events so the renderer can place each card

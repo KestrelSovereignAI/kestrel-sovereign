@@ -34,6 +34,10 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 from kestrel_sdk.llm.decisions import DecisionError, DecisionRequest, NoulQuestion
 
 from kestrel_sovereign.llm.decisions.config import parse_decision_selector
+from kestrel_sovereign.llm.provider_policy import (
+    config_provenance,
+    named_call_override_scope,
+)
 
 if TYPE_CHECKING:
     from kestrel_sovereign.llm.decisions.evaluation import Sample
@@ -207,15 +211,19 @@ async def confirm_unfinished(
         logger.warning("Continuation check: decide is unavailable; issuing the repair")
         return True
     try:
-        result = await decide(
-            continuation_decision_request(content, request),
-            caller=CONTINUATION_CALLER,
-            timeout_seconds=CONTINUATION_DECISION_TIMEOUT_SECONDS,
-            model_override=decision_model,
-            local_only=local_only,
-            session_id=session_id,
-            default_thresholds={CONTINUATION_QUESTION: CONTINUATION_DEFAULT_THRESHOLD},
-        )
+        # The model is the operator's environment setting (#2652).
+        with named_call_override_scope(
+            decision_model, config_provenance(via=CONTINUATION_CHECK_MODEL_ENV)
+        ):
+            result = await decide(
+                continuation_decision_request(content, request),
+                caller=CONTINUATION_CALLER,
+                timeout_seconds=CONTINUATION_DECISION_TIMEOUT_SECONDS,
+                model_override=decision_model,
+                local_only=local_only,
+                session_id=session_id,
+                default_thresholds={CONTINUATION_QUESTION: CONTINUATION_DEFAULT_THRESHOLD},
+            )
     except DecisionError as exc:
         logger.warning(
             "Continuation check decision failed (%s); issuing the repair", type(exc).__name__

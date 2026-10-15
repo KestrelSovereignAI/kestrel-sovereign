@@ -44,8 +44,20 @@ instead; the turn records no answer and checkpoints the tools that completed.
 
 ``stream_with_tool_detection`` holds every attempt to that gate: a stream
 ends only with a terminal response whose stop reason is a natural end.
+
+Per-candidate bounds
+--------------------
+Under a bounded call (the orchestrator's ``LLMCallWatchdog``) each candidate
+attempt runs under its own route's inactivity bound (#1968, see
+:mod:`~kestrel_sovereign.llm.call_progress`). A candidate abandoned on it
+raises ``AttemptInactivityTimeout``, which a loop handles as any other failure
+of that candidate: the rules above decide whether it moves on. A route whose
+harness owns its transport (the Codex app-server) does not rotate on it, just
+as it does not on the harness's own stall (:func:`is_harness_owned_stall`,
+which the service's non-streaming loops apply too).
 """
 import asyncio
+import inspect
 import logging
 import time
 from typing import (
@@ -55,6 +67,7 @@ from typing import (
     List,
     Dict,
     Any,
+    Mapping,
     NamedTuple,
     Optional,
     Set,
@@ -88,7 +101,14 @@ from .adapter import (
     messages_for,
     response_usage_available,
 )
+from .call_progress import (
+    AttemptInactivityTimeout,
+    bound_attempt_call,
+    bound_attempt_stream,
+    report_call_attempt,
+)
 from .cancellation import CancelToken
+from .codex_adapter import CodexAdapter
 from .codex_app_server import CodexAppServerTransportError
 from .error_handling import LLMError
 from .generation_gate import (
@@ -96,8 +116,14 @@ from .generation_gate import (
     judge_generation,
     ran_inline_tools,
 )
-from .output_ceiling import IncompleteGenerationError, reported_usage
+from .output_ceiling import (
+    IncompleteGenerationError,
+    incomplete_generation,
+    reported_usage,
+)
+from .provider_policy import ProviderPolicyRefusal, fallback_selection
 from .provider_registry import provider_cache_body
+from .remote_backend import REMOTE_ROUTE_NAME
 
 if TYPE_CHECKING:
     from .invocation_context import LLMInvocationContext
@@ -291,6 +317,36 @@ def _is_harness_owned_transport_error(exc: BaseException) -> bool:
     semantics — those *should* let the chain try the next provider.
     """
     return isinstance(exc, CodexAppServerTransportError)
+
+
+def is_harness_owned_stall(provider: Any, exc: BaseException) -> bool:
+    """True when ``provider``, a route whose harness owns its transport, was
+    abandoned on its own inactivity bound (#1968).
+
+    That is the stall the harness itself reports
+    (:func:`_is_harness_owned_transport_error`), seen first by Kestrel's
+    watchdog, and rotating away from it would answer from the wrong model just
+    the same. Before #1968 the call's one bound ended such a call outright, so
+    every dispatch loop, streaming or not, refuses to fall through on it.
+
+    ``exc`` may carry the timeout through an explicit link
+    (:func:`~kestrel_sovereign.llm.output_ceiling.incomplete_generation`):
+    ``handle_llm_errors`` wraps it as an ``LLMProviderError`` on the
+    ``get_response`` path.
+    """
+    adapter = provider.get("adapter") if isinstance(provider, Mapping) else None
+    return isinstance(adapter, CodexAdapter) and isinstance(
+        incomplete_generation(exc), AttemptInactivityTimeout
+    )
+
+
+def _is_harness_owned_failure(provider: Any, exc: BaseException) -> bool:
+    """True when ``provider`` failed in a way its harness owns: the harness's
+    own transport failure (:func:`_is_harness_owned_transport_error`), or its
+    stall abandoned on the route's bound (:func:`is_harness_owned_stall`)."""
+    return _is_harness_owned_transport_error(exc) or is_harness_owned_stall(
+        provider, exc
+    )
 
 
 class LLMStreamingError(LLMError):
@@ -789,11 +845,21 @@ class StreamingMixin:
             # NEVER fold these in for a default-routing request with no active
             # mandate, or a stale fallback list would wrongly authorize/drop
             # default providers.
+            #
+            # A host with a provider policy narrows the fallbacks to those it
+            # still admits (``_admitted_mandate_fallbacks``), so a refused
+            # fallback's vendor is never authorized (#2652). A ``vendor:route``
+            # fallback authorizes its vendor.
             if not mandate_matched:
-                for fb in (getattr(self, "_mandate_fallbacks", None) or []):
-                    fb_vendor = fb.get("vendor") or fb.get("provider")
-                    if fb_vendor:
-                        authorized_vendors.add(fb_vendor)
+                admitted_fn = getattr(self, "_admitted_mandate_fallbacks", None)
+                if callable(admitted_fn):
+                    fallbacks = admitted_fn()[0]
+                else:
+                    fallbacks = getattr(self, "_mandate_fallbacks", None) or []
+                for fb in fallbacks:
+                    selection = fallback_selection(fb)
+                    if selection is not None:
+                        authorized_vendors.add(selection["vendor"])
 
         return RoutingMeta(explicit_selection, authorized_vendors)
 
@@ -1066,6 +1132,23 @@ class StreamingMixin:
                     raise
                 logger.warning("Failed to log streamed usage: %s", exc)
 
+    def _guard_stream_dispatch(
+        self,
+        provider_name: str,
+        model: str,
+        *,
+        path: str,
+        force_local_only: Optional[bool],
+    ) -> None:
+        """Run the host's provider-policy dispatch check, when it has one (#2652).
+
+        ``LLMService._guard_dispatch``; a process-local host with no provider
+        policy has nothing to check.
+        """
+        guard = getattr(self, "_guard_dispatch", None)
+        if guard is not None:
+            guard(provider_name, model, path=path, force_local_only=force_local_only)
+
     @execution_work_stream
     async def _stream_adapter_with_usage(
         self,
@@ -1090,6 +1173,8 @@ class StreamingMixin:
         cancel_token: Optional[CancelToken] = None,
         error_message_override: Optional[str] = None,
         require_completion: bool = False,
+        force_local_only: Optional[bool] = None,
+        route: Optional[Mapping[str, Any]] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """The sole adapter streaming leaf and attempt-finalization boundary.
 
@@ -1109,7 +1194,24 @@ class StreamingMixin:
         provider reported (#3576). So is a stream whose adapter refused its
         own unfinished generation, from the usage carried on the error it
         raised (#3577).
+
+        A host with a provider policy refuses the dispatch here, before the
+        adapter is called, when the policy gives the route no authority
+        (``_guard_dispatch``, #2652); ``force_local_only`` is the call's own
+        local-only flag, which that check honors.
+
+        ``route`` is the candidate's provider entry when the attempt is one
+        candidate of a fallback chain: the adapter's stream then runs under
+        the bound the caller set for that candidate, if any
+        (:func:`~kestrel_sovereign.llm.call_progress.bound_attempt_stream`,
+        #1968). A candidate that goes its bound without progress raises
+        :class:`~kestrel_sovereign.llm.call_progress.AttemptInactivityTimeout`
+        here, and is recorded as a failed attempt like any other failure.
         """
+
+        self._guard_stream_dispatch(
+            provider_name, model, path=path, force_local_only=force_local_only
+        )
 
         common_kwargs: Dict[str, Any] = {}
         if extra_body:
@@ -1134,6 +1236,7 @@ class StreamingMixin:
         ):
             usage_kwargs["usage_sink"] = usage_sink
 
+        report_call_attempt(provider_name, model)
         started = time.monotonic()
         final_response: Optional[LLMResponse] = None
         completed = False
@@ -1190,13 +1293,16 @@ class StreamingMixin:
             require_execution_work(self)
             if use_usage_stream:
                 try:
-                    stream = adapter.get_streaming_response_with_tools(
-                        client=client,
-                        model=model,
-                        messages=messages,
-                        tools=tools,
-                        response_format=response_format,
-                        **usage_kwargs,
+                    stream = bound_attempt_stream(
+                        route, provider_name, model,
+                        adapter.get_streaming_response_with_tools(
+                            client=client,
+                            model=model,
+                            messages=messages,
+                            tools=tools,
+                            response_format=response_format,
+                            **usage_kwargs,
+                        ),
                     )
                     async with _owned_stream(self, forward(stream)) as forwarded_stream:
                         async for item in forwarded_stream:
@@ -1213,12 +1319,15 @@ class StreamingMixin:
 
             if not use_usage_stream:
                 require_execution_work(self)
-                stream = adapter.get_streaming_response(
-                    client=client,
-                    model=model,
-                    messages=messages,
-                    response_format=response_format,
-                    **common_kwargs,
+                stream = bound_attempt_stream(
+                    route, provider_name, model,
+                    adapter.get_streaming_response(
+                        client=client,
+                        model=model,
+                        messages=messages,
+                        response_format=response_format,
+                        **common_kwargs,
+                    ),
                 )
                 async with _owned_stream(self, forward(stream)) as forwarded_stream:
                     async for item in forwarded_stream:
@@ -1363,13 +1472,15 @@ class StreamingMixin:
         response_format: Optional[Type[BaseModel]] = None,
         force_local_only: Optional[bool] = None,
         require_completion: bool = False,
+        route: Optional[Mapping[str, Any]] = None,
     ) -> Any:
         """Finalize a non-streaming fallback through the same attempt runner.
 
         ``require_completion`` holds the attempt to the generation gate
         before it is finalized, as ``_run_provider_attempt`` does: a rejected
         response is recorded as a failed attempt and the gate's failure is
-        raised (#3576).
+        raised (#3576). ``route`` is the candidate's provider entry, whose
+        bound the attempt runs under (#1968), as in ``_run_provider_attempt``.
         """
 
         if (
@@ -1389,10 +1500,22 @@ class StreamingMixin:
                 force_local_only=force_local_only,
                 metadata={"streaming_fallback": True},
                 require_completion=require_completion,
+                route=route,
             )
 
+        try:
+            self._guard_stream_dispatch(
+                provider_name, model, path=path, force_local_only=force_local_only
+            )
+        except ProviderPolicyRefusal:
+            # Refused before the adapter runs: its call is never awaited.
+            if inspect.iscoroutine(attempt):
+                attempt.close()
+            raise
+
+        report_call_attempt(provider_name, model)
         started = time.monotonic()
-        response = await attempt
+        response = await bound_attempt_call(route, provider_name, model, attempt)
         rejected: Optional[IncompleteGenerationError] = None
         if require_completion:
             try:
@@ -1540,6 +1663,8 @@ class StreamingMixin:
                             response_format=response_format,
                             extra_body=provider_cache_body(provider),
                             cancel_token=cancel_token,
+                            force_local_only=force_local_only,
+                            route=provider,
                         )) as forwarded_stream:
                             async for chunk in forwarded_stream:
                                 route_emitted = True
@@ -1565,6 +1690,7 @@ class StreamingMixin:
                     user_prompt=user_prompt,
                     response_format=response_format,
                     force_local_only=force_local_only,
+                    route=provider,
                 )
                 # Yield content as string (LLMResponse.content) to match streaming behavior
                 route_emitted = True
@@ -1581,7 +1707,7 @@ class StreamingMixin:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
                 route_errors.append(e)
-                if _is_harness_owned_transport_error(e):
+                if _is_harness_owned_failure(provider, e):
                     # Harness-owned transport error (codex app-server idle
                     # stall, app-server connection closed, etc.). Don't
                     # rotate to a different provider — that would answer
@@ -1702,7 +1828,7 @@ class StreamingMixin:
                         client=remote_route.client,
                         model=model,
                         messages=messages,
-                        provider_name="remote_gpu",
+                        provider_name=REMOTE_ROUTE_NAME,
                         path="generate_stream.remote_gpu",
                         invocation_context=invocation_context,
                         expose_protocol_events=False,
@@ -1782,7 +1908,7 @@ class StreamingMixin:
                         client=remote_route.client,
                         model=model,
                         messages=messages,
-                        provider_name="remote_gpu",
+                        provider_name=REMOTE_ROUTE_NAME,
                         path="stream_with_messages.remote_gpu",
                         invocation_context=invocation_context,
                         expose_protocol_events=False,
@@ -1856,6 +1982,8 @@ class StreamingMixin:
                         extra_body=provider_cache_body(provider),
                         session_id=session_id,
                         cancel_token=cancel_token,
+                        force_local_only=force_local_only,
+                        route=provider,
                     )) as forwarded_stream:
                         async for chunk in forwarded_stream:
                             route_emitted = True
@@ -1877,6 +2005,7 @@ class StreamingMixin:
                         path="stream_with_messages.fallback",
                         invocation_context=invocation_context,
                         force_local_only=force_local_only,
+                        route=provider,
                     )
                     route_emitted = True
                     yield response.content if hasattr(response, 'content') else str(response)
@@ -1890,7 +2019,7 @@ class StreamingMixin:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
                 route_errors.append(e)
-                if _is_harness_owned_transport_error(e):
+                if _is_harness_owned_failure(provider, e):
                     # See #1429: skip _maybe_disable_route too — harness
                     # owns auth, kestrel doesn't disable the route on its
                     # behalf.
@@ -2142,7 +2271,7 @@ class StreamingMixin:
                         client=remote_route.client,
                         model=model,
                         messages=messages,
-                        provider_name="remote_gpu",
+                        provider_name=REMOTE_ROUTE_NAME,
                         path="stream_with_tool_detection",
                         invocation_context=invocation_context,
                         expose_protocol_events=True,
@@ -2241,6 +2370,8 @@ class StreamingMixin:
                         tool_executor=tool_executor,
                         cancel_token=cancel_token,
                         require_completion=True,
+                        force_local_only=force_local_only,
+                        route=provider,
                     )) as forwarded_stream:
                         async for item in forwarded_stream:
                             route_emitted = True
@@ -2269,6 +2400,7 @@ class StreamingMixin:
                             tools=tools,
                             force_local_only=force_local_only,
                             require_completion=True,
+                            route=provider,
                         )
                         route_emitted = True
                         if response.has_tool_calls:
@@ -2294,6 +2426,8 @@ class StreamingMixin:
                             keep_trailing_system=keep_trailing_system,
                             cancel_token=cancel_token,
                             require_completion=True,
+                            force_local_only=force_local_only,
+                            route=provider,
                         )) as forwarded_stream:
                             async for chunk in forwarded_stream:
                                 route_emitted = True
@@ -2310,7 +2444,7 @@ class StreamingMixin:
                 last_error = e
                 route_errors.append(e)
                 last_provider_name = provider["name"]
-                if _is_harness_owned_transport_error(e):
+                if _is_harness_owned_failure(provider, e):
                     # See #1429: skip _maybe_disable_route too — harness
                     # owns auth, kestrel doesn't disable the route on its
                     # behalf.

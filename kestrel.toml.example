@@ -15,6 +15,46 @@
 [llm]
 route_priority = ["ollama:local", "openai:api"]
 
+# Provider policy (#2652). ``route_priority`` is also the approved chain: a
+# model override the agent writes for itself (its own ``set_model`` call, or
+# any write no Sovereign or operator attested) may select only a vendor listed
+# there, and is refused otherwise; if every listed vendor is denied, it may
+# select none. An override the Sovereign or an operator sets (``!model-set``
+# typed by them, or POST /api/model/set) is not narrowed. The same holds for a
+# per-call model naming a provider ("vendor/model"): one a caller passes with
+# its request (the ``model`` field of /api/agent/invoke, /api/agent/stream or
+# /v1/chat/completions) is the caller's for that turn, and a selector this
+# host's model_mandate.toml names is the operator's; one a feature or the
+# agent passes otherwise is held to the chain. So is a mandate fallback
+# (``add_fallback_model``) no Sovereign or operator attested, when it is
+# written and again whenever the mandate falls back to it: when every
+# approved provider is down, the task fails rather than fall back outside
+# the chain. ``denied_providers`` lists vendors ("openrouter") or
+# "<vendor>:<route>" routes that are never used, whatever their health and
+# whoever set an override. It matches a route's vendor, not a model id:
+# OpenRouter's "google/..." models are the "openrouter" vendor. Default:
+# empty. Decisions admit their model override the same way; a decision model
+# read from this host's settings ([retrieval] *_decision_model, the
+# KESTREL_*_DECISION_MODEL variables, `kestrel decisions eval`) is the
+# operator's. Routing no override chose keeps to the chain too: automatic
+# decision routing (an explicit decision_route is the operator's choice), the
+# chat response audit, and the embedding route that follows chat. An active
+# private inference lease is used only after the call's override is admitted,
+# and never for a model that names a provider ("openrouter" is a vendor, not a
+# model id). Every call is checked again just before its adapter runs: a call
+# that reaches a route none of the rules above allows is refused and recorded,
+# not sent. `!model` reports the chain, the deny-list, the mandate's
+# fallbacks, and who wrote each override, accepted or refused.
+#denied_providers = ["openrouter", "google"]
+
+# Model discovery deadline (#3646). Each route's discovery steps (its chat
+# catalog, its embedding listing and its decision listing) must each finish
+# within this many seconds. A step that does not is recorded as that vendor's
+# discovery failure, and the rest of discovery returns without it, so a route
+# that accepts connections and never answers cannot stall `!model-list` or a
+# turn whose route is still "auto". Default: 5.
+#discovery_route_deadline_seconds = 5
+
 # Top-level embedding channel (#2263). Selects which route embeds stored
 # memories/documents, independent of the chat route — one setting instead of
 # repeating ``embedding_sibling`` under every vendor. Value is a
@@ -135,9 +175,12 @@ semantic_recall_work_limit = 24
 semantic_recall_result_limit = 8
 semantic_recall_max_tokens = 1200
 # Hard deadline for consolidation + forgetting. The coroutine abandons a
-# timed-out pass and releases its MEMORY lock context so queued work can run;
-# SQLite interruption and rollback are retained by the backend, though a Python
-# UDF or stalled VFS operation may still drain until it returns control to SQLite.
+# timed-out pass; SQLite interruption and rollback are retained by the backend.
+# A statement still running (a Python UDF or stalled VFS call ignores the
+# interrupt) keeps the MEMORY lock until it returns, for at most the backend's
+# 30-second cleanup deadline; past that the database connection refuses all
+# work until it does, and only then is the lock released. While it runs,
+# the pass's own record under <database>.consolidation-drains/ tracks it.
 # memory_consolidation_timeout_seconds = 1800
 
 # =============================================================================

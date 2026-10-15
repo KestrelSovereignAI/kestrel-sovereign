@@ -137,11 +137,16 @@ class MemoryFeature(Feature):
         """
         hooks = getattr(agent, "sleep_hooks", None) or []
         if not any(isinstance(hook, ReflectionSleepHook) for hook in hooks):
+            from kestrel_sovereign.llm.provider_policy import config_provenance
             from kestrel_sovereign.storage.memory_system import _attestation_settings
 
             settings = _attestation_settings()
             self._register_sleep_hook(agent, ReflectionSleepHook(
                 backend=settings.backend, decision_model=settings.decision_model,
+                # The operator's setting chose the model (#2652).
+                decision_model_writer=config_provenance(
+                    via="[retrieval] memory_attestation_decision_model"
+                ),
             ))
 
     @property
@@ -1520,7 +1525,13 @@ class MemoryFeature(Feature):
             logger.error(
                 "memory_consolidate reached its configured deadline: %s", exc
             )
-            return ToolResult.failed(str(exc))
+            return ToolResult.failed(
+                str(exc),
+                data={
+                    "abandoned_work": exc.abandoned_work,
+                    "drain_record": exc.drain_record,
+                },
+            )
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))

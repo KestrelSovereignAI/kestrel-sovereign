@@ -113,11 +113,12 @@ class _ConsumerCloseRecord:
     it as set.
     """
 
-    __slots__ = ("closed", "owner")
+    __slots__ = ("closed", "owner", "parents")
 
     def __init__(self) -> None:
         self.closed = False
         self.owner: asyncio.Task[None] | None = None
+        self.parents: tuple[asyncio.Task, ...] = ()
 
     def closed_for(self, task: asyncio.Task[object] | None) -> bool:
         return self.closed and task is not None and task is self.owner
@@ -126,6 +127,25 @@ class _ConsumerCloseRecord:
 _CONSUMER_CLOSE: contextvars.ContextVar[_ConsumerCloseRecord | None] = (
     contextvars.ContextVar("kestrel_owned_iterator_consumer_close", default=None)
 )
+
+
+def owned_iterator_parent_tasks() -> tuple[asyncio.Task, ...]:
+    """Explicit iterator forwarding lineage, never inherited task authority.
+
+    Observation such as a call watchdog follows its physical source tasks.
+    An arbitrary child copied from a producer is not itself that producer,
+    and must not claim this lineage or its parent's call-level timing scope.
+    """
+    record = _CONSUMER_CLOSE.get()
+    if record is None:
+        return ()
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        return ()
+    if record.owner is not current:
+        return ()
+    return record.parents
 
 
 def owned_consumer_closed() -> bool:
@@ -217,6 +237,10 @@ class OwnedAsyncIterator(Generic[_T]):
         self._terminal_published = False
         self._cancellation_watch_started = False
         self._consumer_close = _ConsumerCloseRecord()
+        parent = asyncio.current_task()
+        self._consumer_close.parents = (
+            () if parent is None else (parent, *owned_iterator_parent_tasks())
+        )
         # The producer runs in a copy of the constructing context in which
         # this iterator's close record is bound, so the producer can find
         # the record of ITS consumer. The record's owner binding below is

@@ -652,12 +652,37 @@ class TestInvokeTurnOverTheRealLifecycle:
         host.process_input = KestrelAgent.process_input.__get__(host)
 
         assert await host.process_input(
-            "!status", session_id=SESSION, invocation_id=REQUEST_ID
+            "!privacy-status", session_id=SESSION, invocation_id=REQUEST_ID
         ) == "command done"
 
         span = _only(span_exporter, INVOKE_SPAN)
         assert dict(span.attributes)[TURN_OUTCOME] == "completed"
         assert [outcome for _turn, outcome in seen] == [TurnOutcome.COMPLETED]
+
+    @pytest.mark.asyncio
+    async def test_a_turn_queue_bypass_command_ends_its_span_without_a_turn(
+        self, span_exporter
+    ):
+        """``!status`` answers beside any in-flight turn (#2658): it is not a
+        turn, so its span completes but no turn is minted or published."""
+        host = _real_lifecycle_host()
+        host.command_handler.handle = AsyncMock(return_value="status")
+        seen = _listen(host)
+        host._process_input_traced_locked = AsyncMock(
+            side_effect=AssertionError("body must not run")
+        )
+        host.process_input = KestrelAgent.process_input.__get__(host)
+
+        assert await host.process_input(
+            "!status", session_id=SESSION, invocation_id=REQUEST_ID
+        ) == "status"
+
+        span = _only(span_exporter, INVOKE_SPAN)
+        attributes = dict(span.attributes)
+        assert attributes[TURN_OUTCOME] == "completed"
+        assert "kestrel.turn_id" not in attributes
+        assert seen == []
+        host.await_durable_turn_admission.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_refused_pre_turn_guard_is_not_a_failure(

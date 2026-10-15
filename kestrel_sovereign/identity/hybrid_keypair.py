@@ -63,10 +63,12 @@ from kestrel_sovereign.security.crypto_suite import (
     Keypair,
     get_suite,
 )
+from kestrel_sovereign.security.signature_verification import (
+    verify_signature_entries,
+)
 from kestrel_sovereign.security.verify_policy import (
     PolicyResult,
     VerifyPolicy,
-    evaluate_signatures,
 )
 
 
@@ -190,7 +192,11 @@ def verify_hybrid(
        verify the signature against ``data`` using the entry's ``alg``.
        Any failed crypto verification drops that entry from the set
        passed to the policy evaluator — the policy never sees signatures
-       that don't actually verify.
+       that don't actually verify. This step is
+       :func:`security.signature_verification.verify_signature_entries`,
+       which fails the whole check on structurally malformed methods
+       (duplicate kids, non-object entries, non-string ids) and never
+       raises for malformed external material.
 
     2. **Policy evaluation.** :func:`evaluate_signatures` runs against
        the surviving entries with ``policy`` and
@@ -201,87 +207,7 @@ def verify_hybrid(
     Returns a :class:`PolicyResult` so callers don't have to re-run the
     policy evaluation themselves.
     """
-    # Index verification methods by kid (last fragment after '#').
-    # Reject duplicate kids — codex P1 follow-up on the succession
-    # binding check: an attacker who can include duplicate kids in the
-    # VM array can have a later attacker-controlled VM silently
-    # overwrite a legitimate one. Refusing duplicates closes that path.
-    vms_list = list(verification_methods)
-    seen_kids: dict[str, str] = {}
-    for vm in vms_list:
-        if not isinstance(vm, Mapping):
-            continue
-        vm_id = vm.get("id") or ""
-        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
-        if not kid:
-            continue
-        if kid in seen_kids:
-            return PolicyResult(
-                ok=False,
-                reason=(
-                    f"verification methods contain duplicate kid {kid!r} "
-                    f"(ids: {seen_kids[kid]!r} and {vm_id!r}); refusing "
-                    f"to silently overwrite"
-                ),
-                alg_ids_seen=frozenset(),
-            )
-        seen_kids[kid] = vm_id
-    methods_by_kid: dict = {}
-    for vm in vms_list:
-        if not isinstance(vm, Mapping):
-            continue
-        vm_id = vm.get("id") or ""
-        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
-        methods_by_kid[kid] = vm
-
-    verified: List[dict] = []
-    for entry in signatures:
-        if not isinstance(entry, Mapping):
-            continue
-        alg = entry.get("alg")
-        kid = entry.get("kid")
-        sig_hex = entry.get("sig")
-        # Entries arrive from signed artifacts an attacker can write. A
-        # non-string ``kid`` is unhashable and a non-string ``sig`` breaks
-        # ``bytes.fromhex`` with TypeError, so drop them like any other
-        # unverifiable entry instead of raising.
-        if not (
-            isinstance(alg, str) and alg
-            and isinstance(kid, str) and kid
-            and isinstance(sig_hex, str) and sig_hex
-        ):
-            continue
-
-        vm = methods_by_kid.get(kid)
-        if not vm:
-            continue
-
-        multibase = vm.get("publicKeyMultibase")
-        if not isinstance(multibase, str):
-            continue
-
-        try:
-            from kestrel_sovereign.security.multikey import multibase_to_public_key
-            suite, pub = multibase_to_public_key(multibase)
-        except CryptoSuiteError:
-            continue
-
-        # Cross-check: signature alg must match the method's algorithm.
-        # Otherwise a caller could sign with key-1 (Ed25519) but tag the
-        # entry as ml-dsa-65 and sneak past a PQ-required check.
-        if suite.alg_id != alg:
-            continue
-
-        try:
-            sig_bytes = bytes.fromhex(sig_hex)
-        except ValueError:
-            continue
-
-        if suite.verify(data, sig_bytes, pub):
-            verified.append(dict(entry))
-
-    return evaluate_signatures(
-        verified,
+    return verify_signature_entries(data, signatures, verification_methods).evaluate(
         policy,
         post_cutoff_classical_allowed=post_cutoff_classical_allowed,
     )

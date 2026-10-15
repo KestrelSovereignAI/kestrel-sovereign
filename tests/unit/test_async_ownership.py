@@ -16,9 +16,42 @@ from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
     await_owned_task,
     create_owned_task,
+    owned_iterator_parent_tasks,
     raise_owned_outcome,
     run_blocking_operation,
 )
+
+
+@pytest.mark.asyncio
+async def test_only_explicit_owned_iterator_sources_inherit_observation_lineage():
+    consumer = asyncio.current_task()
+    sources = []
+
+    async def unrelated():
+        return owned_iterator_parent_tasks()
+
+    async def inner():
+        parents = owned_iterator_parent_tasks()
+        assert parents == (sources[0], consumer)
+        assert await asyncio.create_task(unrelated()) == ()
+        assert await asyncio.to_thread(owned_iterator_parent_tasks) == ()
+        yield "joined"
+
+    async def outer():
+        sources.append(asyncio.current_task())
+        assert owned_iterator_parent_tasks() == (consumer,)
+        iterator = OwnedAsyncIterator(inner, operation="nested observation")
+        try:
+            yield await anext(iterator)
+        finally:
+            await iterator.aclose()
+
+    iterator = OwnedAsyncIterator(outer, operation="root observation")
+    try:
+        assert await anext(iterator) == "joined"
+        assert owned_iterator_parent_tasks() == ()
+    finally:
+        await iterator.aclose()
 
 
 @pytest.mark.asyncio

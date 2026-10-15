@@ -90,7 +90,15 @@ class ModelCatalogSnapshot:
     invalidation by ``clear()`` — observed no vendor, so it carries every
     failure the previous snapshot reported, as not attempted. A failure
     therefore stands until a refresh either issues a request for its vendor or
-    does not cover it.
+    does not cover it. Discovery that saw a vendor fail without publishing a
+    catalog (a cache hit's reconciliation, for one) amends the snapshot
+    (:meth:`SharedModelCache.record_failures`): the same catalog and
+    timestamp, with that failure added (#3646).
+
+    ``version`` names this publication. ``catalog_version`` names the
+    publication that produced ``models``, which an amendment keeps: two
+    snapshots with the same ``catalog_version`` hold the same catalog, whatever
+    failures each reports.
 
     ``models`` is ``None`` once ``clear()`` has invalidated the catalog.
     ``timestamp`` is ``0.0`` for a catalog restored from disk, which is
@@ -98,6 +106,7 @@ class ModelCatalogSnapshot:
     """
 
     version: int
+    catalog_version: int
     models: Optional[Tuple[ModelInfo, ...]]
     outcomes: Mapping[str, VendorDiscoveryOutcome]
     timestamp: float
@@ -178,14 +187,20 @@ class SharedModelCache:
         with self._lock:
             return self._snapshot
 
-    def get(self) -> Optional[List[ModelInfo]]:
-        """Return cached models if fresh, None if stale or empty."""
+    def fresh_snapshot(self) -> Optional[ModelCatalogSnapshot]:
+        """Return the current snapshot if its catalog is fresh, None if stale
+        or empty."""
         snapshot = self.snapshot()
         if snapshot is None or snapshot.models is None:
             return None
         if time.time() - snapshot.timestamp >= self._ttl:
             return None
-        return list(snapshot.models)
+        return snapshot
+
+    def get(self) -> Optional[List[ModelInfo]]:
+        """Return cached models if fresh, None if stale or empty."""
+        snapshot = self.fresh_snapshot()
+        return None if snapshot is None else list(snapshot.models)
 
     def get_any(self) -> Optional[List[ModelInfo]]:
         """Return cached models regardless of freshness (for pre-discovery fallback).
@@ -230,6 +245,72 @@ class SharedModelCache:
             self._publish(models, None, 0.0)
             logger.debug(f"Shared model cache pre-populated (stale): {len(models)} models")
 
+    def record_failures(
+        self,
+        catalog_version: int,
+        failures: Mapping[str, VendorDiscoveryOutcome],
+    ) -> bool:
+        """Add discovery failures observed against the catalog ``catalog_version``.
+
+        Discovery that publishes no catalog can still see a vendor fail: a
+        cache hit reconciles every route's embedding and decision capabilities,
+        and a route can overrun its discovery deadline there (#3646). That is
+        the vendor's discovery failing against the catalog it read, so the
+        snapshot gains it: a new publication with the same catalog and the same
+        age, in which each vendor in ``failures`` reports its failure.
+
+        Amendments against one catalog merge, whichever lands first: services
+        reconciling against the same catalog each add the vendors they saw
+        fail. A vendor reported failing twice reports the later failure; one
+        whose failure is already reported verbatim adds nothing, so the
+        snapshot is not republished.
+
+        Only a new catalog discards an amendment: a failure observed against a
+        catalog that a refresh, a restore or an invalidation has since replaced
+        is not recorded. A refresh observes every vendor it covers itself;
+        after a restore or an invalidation, the next refresh does. The snapshot
+        an invalidation publishes is a catalog in its own right, so a failure
+        observed against it while it is current amends it, and the health
+        check reports it.
+
+        Returns whether the snapshot reports ``failures``: ``False`` only when
+        the catalog has been replaced.
+        """
+        for vendor, outcome in failures.items():
+            if outcome.status is not DiscoveryStatus.FAILED:
+                raise ValueError(
+                    f"{vendor}: only a failed outcome amends a snapshot, "
+                    f"got {outcome.status.value}"
+                )
+        with self._lock:
+            current = self._snapshot
+            if current is None or current.catalog_version != catalog_version:
+                return False
+            changed = {
+                vendor: outcome
+                for vendor, outcome in failures.items()
+                if (prior := current.outcomes.get(vendor)) is None
+                or prior.status is not DiscoveryStatus.FAILED
+                or prior.error != outcome.error
+            }
+            if not changed:
+                return True
+            self._version += 1
+            outcomes = dict(current.outcomes)
+            for vendor, outcome in changed.items():
+                outcomes[vendor] = dataclasses.replace(
+                    outcome, observed_version=self._version
+                )
+            self._snapshot = dataclasses.replace(
+                current, version=self._version, outcomes=MappingProxyType(outcomes)
+            )
+            logger.debug(
+                "Shared model cache snapshot %d (catalog %d) records discovery "
+                "failures for %s",
+                self._version, catalog_version, sorted(changed),
+            )
+            return True
+
     def _publish(
         self,
         models: Optional[List[ModelInfo]],
@@ -240,6 +321,7 @@ class SharedModelCache:
         self._version += 1
         self._snapshot = ModelCatalogSnapshot(
             version=self._version,
+            catalog_version=self._version,
             models=None if models is None else tuple(models),
             outcomes=_settle_outcomes(outcomes, self._snapshot, self._version),
             timestamp=timestamp,

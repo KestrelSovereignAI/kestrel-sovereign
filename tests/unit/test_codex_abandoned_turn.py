@@ -30,9 +30,12 @@ from kestrel_sovereign.agent.orchestrator_engine import (
     LLMCallInactivityTimeout,
     LLMCallWatchdog,
 )
+from kestrel_sovereign.llm.call_progress import AttemptInactivityTimeout
 from kestrel_sovereign.llm.cancellation import raise_if_cancelled
 from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 from kestrel_sovereign.llm.codex_app_server import CodexAppServerError
+from kestrel_sovereign.llm.error_handling import LLMError
+from kestrel_sovereign.llm.output_ceiling import incomplete_generation
 from tests.shared.booted_agent import booted_agent
 
 #: A watchdog bound short enough to trip in a unit test.
@@ -321,13 +324,19 @@ def _plan_route(agent, app: FakeCodexAppServer, monkeypatch, tmp_path) -> dict:
 
 
 async def _streamed_turns(agent, monkeypatch) -> List[str]:
-    """Answer, stall, then the same session's next turn; the stall must fail."""
+    """Answer, stall, then the same session's next turn; the stall must fail.
+
+    The plan route is the call's only candidate: its abandoned attempt fails
+    the call as its last route (#1968)."""
     from tests.unit.test_llm_call_watchdog import _conversation_holder, _turn
 
     answers = [await asyncio.wait_for(_turn(agent, "Hello."), 30)]
     monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", BOUND)
-    with pytest.raises(LLMCallInactivityTimeout):
+    with pytest.raises(LLMError) as stalled:
         await asyncio.wait_for(_turn(agent, "Where do I work?"), 30)
+    assert isinstance(
+        incomplete_generation(stalled.value), AttemptInactivityTimeout,
+    )
     monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", 30)
     assert _conversation_holder(agent) is None
     answers.append(await asyncio.wait_for(_turn(agent, "And now?"), 30))

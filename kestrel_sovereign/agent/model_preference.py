@@ -12,12 +12,20 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.llm.provider_policy import (
+    OverrideProvenance,
+    agent_provenance,
+    override_writer,
+)
 
 
 class ModelPreferenceMixin:
     """Mixin providing model preference and solvency methods for KestrelAgent."""
 
     MODEL_PREFERENCE_KEY = "model_preference"
+    # Who wrote the stored preference (#2652), kept beside it rather than in
+    # its row, whose shape readers and backups already rely on.
+    MODEL_PREFERENCE_PROVENANCE_KEY = "model_preference_provenance"
     EMBEDDING_ROUTE_KEY = "embedding_route"
     EMBEDDING_MODEL_OVERRIDES_KEY = "embedding_model_overrides"
 
@@ -55,6 +63,10 @@ class ModelPreferenceMixin:
 
         Returns:
             Confirmation message
+
+        Raises:
+            ProviderPolicyRefusal: the override is the agent's own, so it may
+                select only a provider in the approved chain (#2652).
         """
         return self.model_agent.set_model_preference(model_id)
 
@@ -88,6 +100,7 @@ class ModelPreferenceMixin:
         model: str | None,
         vendor: str | None,
         route: str | None,
+        provenance: Optional[OverrideProvenance] = None,
     ) -> None:
         """Persist model preference to agent_metadata table.
 
@@ -96,7 +109,9 @@ class ModelPreferenceMixin:
         :meth:`_write_model_preference`.
         """
         try:
-            await self._write_model_preference(model, vendor, route)
+            await self._write_model_preference(
+                model, vendor, route, provenance=provenance
+            )
         except Exception as e:
             if is_execution_control_error(e):
                 raise
@@ -109,13 +124,32 @@ class ModelPreferenceMixin:
         model: str | None,
         vendor: str | None,
         route: str | None,
+        *,
+        provenance: Optional[OverrideProvenance] = None,
     ) -> None:
-        """Write the model preference row; a database error propagates."""
-        value = json.dumps({"vendor": vendor, "model": model, "route": route})
+        """Write the model preference row; a database error propagates.
+
+        ``provenance`` records who wrote the override, so boot replays it under
+        the same authority (#2652). It is written in the same statement as the
+        preference, with the mandate it describes; a preference written without
+        one records no writer, and is replayed as the agent's.
+        """
+        mandate = {"vendor": vendor, "model": model, "route": route}
+        record = {
+            "mandate": mandate,
+            "provenance": (
+                provenance.to_dict() if provenance is not None and model else None
+            ),
+        }
+        now = datetime.now(timezone.utc)
         await self._raw_storage.db.execute(
             """INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-               VALUES (?, ?, ?, ?)""",
-            (self.agent_id, self.MODEL_PREFERENCE_KEY, value, datetime.now(timezone.utc)),
+               VALUES (?, ?, ?, ?), (?, ?, ?, ?)""",
+            (
+                self.agent_id, self.MODEL_PREFERENCE_KEY, json.dumps(mandate), now,
+                self.agent_id, self.MODEL_PREFERENCE_PROVENANCE_KEY,
+                json.dumps(record), now,
+            ),
         )
 
     async def _load_embedding_route(self) -> None:
@@ -428,6 +462,8 @@ def replay_model_preference(
     model: str,
     vendor: Optional[str],
     route: Optional[str],
+    *,
+    provenance: Optional[OverrideProvenance] = None,
 ) -> None:
     """Re-apply a model mandate this agent already accepted.
 
@@ -467,10 +503,16 @@ def replay_model_preference(
     argument does not hold for a local server: its catalog is what it has
     actually loaded, so a populated local catalog that disagrees is evidence,
     not a discovery artefact.
+
+    The provider policy is not bypassed (#2652): ``provenance`` is who wrote
+    the mandate, and a replay is admitted for it as the write was. Without
+    one, the mandate counts as the agent's, so an unattributed override
+    outside the approved chain is refused here, not reinstated.
     """
-    llm_service.set_model_preference(
-        model, vendor, route, validate=_revalidated_on_replay(vendor)
-    )
+    with override_writer(provenance or agent_provenance(via="replay")):
+        llm_service.set_model_preference(
+            model, vendor, route, validate=_revalidated_on_replay(vendor)
+        )
 
 
 def resolve_replayed_model_preference(
@@ -478,6 +520,8 @@ def resolve_replayed_model_preference(
     model: str,
     vendor: Optional[str],
     route: Optional[str],
+    *,
+    provenance: Optional[OverrideProvenance] = None,
 ) -> Dict[str, Optional[str]]:
     """The mandate :func:`replay_model_preference` would install.
 
@@ -485,9 +529,35 @@ def resolve_replayed_model_preference(
     installing it: a privacy-mode exit records the mandate it restores before
     it takes effect (#3554).
     """
-    return llm_service.resolve_model_preference(
-        model, vendor, route, validate=_revalidated_on_replay(vendor)
-    )
+    with override_writer(provenance or agent_provenance(via="replay")):
+        return llm_service.resolve_model_preference(
+            model, vendor, route, validate=_revalidated_on_replay(vendor)
+        )
+
+
+async def _stored_provenance(
+    db: Any, agent_id: Optional[str], mandate: Dict[str, Optional[str]]
+) -> Optional[OverrideProvenance]:
+    """Who wrote the stored ``mandate``, when its record still describes it."""
+    key = ModelPreferenceMixin.MODEL_PREFERENCE_PROVENANCE_KEY
+    if agent_id:
+        rows = await db.fetchall(
+            "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+            (agent_id, key),
+        )
+    else:
+        rows = await db.fetchall(
+            "SELECT value FROM agent_metadata WHERE key = ?", (key,)
+        )
+    if not rows or len(rows) != 1:
+        return None
+    try:
+        record = json.loads(rows[0][0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("mandate") != mandate:
+        return None
+    return OverrideProvenance.from_dict(record.get("provenance"))
 
 
 def _revalidated_on_replay(vendor: Optional[str]) -> bool:
@@ -513,6 +583,9 @@ async def apply_persisted_model_preference(
     agent (#3420).
 
     Persistence schema: ``{"vendor": str, "model": str, "route": str|None}``.
+    Who wrote it is a separate ``model_preference_provenance`` row,
+    ``{"mandate": {...}, "provenance": {...}}``; see :class:`OverrideProvenance`
+    (#2652). A preference without a matching record is replayed as the agent's.
     Rows using the legacy ``{"model", "provider"}`` shape are dropped
     silently — the agent starts with no mandate and the user re-selects
     via the UI.
@@ -552,7 +625,15 @@ async def apply_persisted_model_preference(
             )
             return None
         if model and model != "auto":
-            replay_model_preference(llm_service, model, vendor, route)
+            replay_model_preference(
+                llm_service,
+                model,
+                vendor,
+                route,
+                provenance=await _stored_provenance(
+                    db, agent_id, {"vendor": vendor, "model": model, "route": route}
+                ),
+            )
             if vendor and route:
                 logging.info("Loaded persisted model preference: %s:%s/%s", vendor, route, model)
             elif vendor:

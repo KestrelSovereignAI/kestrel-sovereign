@@ -13,8 +13,7 @@ from __future__ import annotations
 
 import json
 import pytest
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
@@ -334,23 +333,39 @@ async def test_shutdown_purge_timeout_records_durable_audit():
     """#2673 shutdown-time timeout: a purge that hangs past the shutdown budget
     is bounded by the timeout and reported as a durable ``purge_failed`` audit
     (failure=shutdown-purge-timeout), never a best-effort success.
+
+    The loop clock is pinned: against the real clock, loop lag on a loaded
+    runner could eat the audit's whole slice of a 50ms budget, and the audit
+    was then abandoned unwritten.
     """
     import asyncio
+
+    from kestrel_sovereign.kestrel_agent import KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION
+    from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
     agent, storage, permission_store = _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
     )
+    purge_started = asyncio.Event()
 
     async def _never_returns(*args, **kwargs):
+        purge_started.set()
         await asyncio.sleep(10)
 
     # Replace the mock with a real hanging coroutine so wait_for times out.
     storage.purge_ephemeral_session = _never_returns
+    budget = 0.05
 
-    # This case proves the durable audit path, not a scheduler's ability to
-    # dispatch both cancellation and the audit inside a 10ms reserved tail.
-    # The next test separately proves a hung audit remains deadline-bounded.
-    await agent._purge_ephemeral_on_shutdown(timeout=0.5)
+    with pinned_loop_clock() as clock:
+        shutdown = asyncio.ensure_future(
+            agent._purge_ephemeral_on_shutdown(timeout=budget)
+        )
+        await await_within_hang_guard(
+            purge_started.wait(), step="the shutdown purge starting"
+        )
+        # Run out exactly the purge's share, leaving the audit its whole slice.
+        clock.advance(budget - budget * KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION)
+        await await_within_hang_guard(shutdown, step="the shutdown purge timing out")
 
     permission_store.log_decision.assert_awaited_once()
     kwargs = permission_store.log_decision.await_args.kwargs

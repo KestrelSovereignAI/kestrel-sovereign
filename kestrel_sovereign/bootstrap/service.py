@@ -1124,9 +1124,15 @@ Generate the SOUL.md now, following the template format."""
             {"role": "user", "content": generation_prompt},
         ]
 
+        # Bounded like the turn's own calls (#2658): this runs inside the
+        # completing discovery turn and holds its CONVERSATION lock. A call
+        # abandoned on the bound falls back to the default template.
+        from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
+
         try:
-            response = await self.llm_service.generate_with_messages(
-                messages=messages,
+            response = await LLMCallWatchdog.bound_completion(
+                self.llm_service,
+                self.llm_service.generate_with_messages(messages=messages),
             )
             return response.content if hasattr(response, 'content') else str(response)
         except Exception as e:

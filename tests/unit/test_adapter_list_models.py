@@ -355,9 +355,11 @@ class TestVertexAIAdapterListModels:
         from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
 
         adapter = VertexAIAdapter(project_id="fallback-test-project")
-        models_api = MagicMock()
-        models_api.list.side_effect = RuntimeError("Vertex discovery unavailable")
-        adapter._client = MagicMock(models=models_api)
+        adapter._client = MagicMock()
+        # Discovery lists on the async surface (#3646).
+        adapter._client.aio.models.list = AsyncMock(
+            side_effect=RuntimeError("Vertex discovery unavailable")
+        )
         return adapter
 
     @pytest.mark.asyncio
@@ -372,7 +374,7 @@ class TestVertexAIAdapterListModels:
 
         models = await adapter.list_models()
 
-        adapter._client.models.list.assert_called_once_with()
+        adapter._client.aio.models.list.assert_awaited_once_with()
         assert len(models) >= 3
         assert all(isinstance(m, ModelInfo) for m in models)
         assert models == self.VERTEX_MODELS

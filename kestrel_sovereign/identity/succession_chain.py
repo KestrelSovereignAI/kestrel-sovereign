@@ -45,19 +45,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from kestrel_sovereign.identity.succession import (
     SuccessionStatement,
     SuccessionVerifyResult,
     verify_succession,
 )
-from kestrel_sovereign.security.crypto_suite import CryptoSuiteError
-from kestrel_sovereign.security.multikey import multibase_to_public_key
+from kestrel_sovereign.security.signature_verification import (
+    verify_signature_entries,
+)
 from kestrel_sovereign.security.verify_policy import (
     PolicyResult,
     VerifyPolicy,
-    evaluate_signatures,
 )
 
 
@@ -126,14 +126,46 @@ class SuccessionChain:
         return not self.statements
 
 
-def _vm_dict_key(vm: Mapping) -> tuple:
-    """Stable identity key for a verification method (id + multibase).
+def _vm_linkage_keys(vms: Any) -> Optional[List[tuple]]:
+    """Sorted identity keys (id + multibase) for a VM set, or None if malformed.
 
-    Used by chain VM-linkage check. Compares only the fields that
-    matter for binding — ``id`` and ``publicKeyMultibase``. ``type``
-    is fixed (``Multikey``) and ``controller`` is administrative.
+    Used by the chain VM-linkage and root-anchor checks. Compares only the
+    fields that matter for binding — ``id`` and ``publicKeyMultibase``.
+    ``type`` is fixed (``Multikey``) and ``controller`` is administrative.
+
+    Each field must be a string or absent. A non-list container, a
+    non-object entry or a field of any other type is malformed external
+    material (and mixed types would not even sort), so the comparison
+    fails closed instead of raising.
     """
-    return (vm.get("id"), vm.get("publicKeyMultibase"))
+    if not isinstance(vms, (list, tuple)):
+        return None
+    keys = []
+    for vm in vms:
+        if not isinstance(vm, Mapping):
+            return None
+        key: List[Any] = []
+        for name in ("id", "publicKeyMultibase"):
+            value = vm.get(name)
+            if value is not None and not isinstance(value, str):
+                return None
+            # (absent?, text) keeps None distinct from "" and totally ordered.
+            key.extend((value is None, value or ""))
+        keys.append(tuple(key))
+    return sorted(keys)
+
+
+def _copy_vms(vms: Any) -> Any:
+    """Copy a VM list for an :class:`ActiveIdentity`.
+
+    Malformed material is carried through as-is rather than crashing
+    ``dict()`` or ``tuple()``: a non-list container stays what it is and a
+    non-object entry stays in place, so signature verification against
+    the active identity rejects the set as malformed.
+    """
+    if not isinstance(vms, (list, tuple)):
+        return vms
+    return tuple(dict(vm) if isinstance(vm, Mapping) else vm for vm in vms)
 
 
 def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
@@ -190,17 +222,14 @@ def build_chain(statements: Iterable[SuccessionStatement]) -> SuccessionChain:
                 f"predecessor_did={s.predecessor_did!r} != prev.successor_did="
                 f"{prev.successor_did!r}"
             )
-        prev_succ_keys = sorted(
-            _vm_dict_key(vm) for vm in prev.successor_verification_methods
-        )
-        cur_pred_keys = sorted(
-            _vm_dict_key(vm) for vm in s.predecessor_verification_methods
-        )
-        if prev_succ_keys != cur_pred_keys:
+        prev_succ_keys = _vm_linkage_keys(prev.successor_verification_methods)
+        cur_pred_keys = _vm_linkage_keys(s.predecessor_verification_methods)
+        if prev_succ_keys is None or prev_succ_keys != cur_pred_keys:
             raise SuccessionChainError(
                 f"chain VM linkage broken at statement[{i}]: "
                 f"predecessor_verification_methods don't match "
-                f"prev.successor_verification_methods (id + multibase). "
+                f"prev.successor_verification_methods (id + multibase), "
+                f"or either is malformed. "
                 f"This blocks an attacker from forking the chain by "
                 f"substituting their own keys at a later link."
             )
@@ -259,7 +288,7 @@ def resolve_active_identity(
     if chain.is_empty():
         return ActiveIdentity(
             did=root_did,
-            verification_methods=tuple(dict(m) for m in root_verification_methods),
+            verification_methods=_copy_vms(root_verification_methods),
             is_root=True,
             succession_index=None,
             post_cutoff=False,
@@ -278,7 +307,7 @@ def resolve_active_identity(
         # Artifact is older than the first succession — root is active.
         return ActiveIdentity(
             did=root_did,
-            verification_methods=tuple(dict(m) for m in root_verification_methods),
+            verification_methods=_copy_vms(root_verification_methods),
             is_root=True,
             succession_index=None,
             post_cutoff=False,
@@ -287,9 +316,7 @@ def resolve_active_identity(
     active = chain.statements[active_idx]
     return ActiveIdentity(
         did=active.successor_did,
-        verification_methods=tuple(
-            dict(m) for m in active.successor_verification_methods
-        ),
+        verification_methods=_copy_vms(active.successor_verification_methods),
         is_root=False,
         succession_index=active_idx,
         post_cutoff=True,
@@ -338,9 +365,12 @@ def _build_chain_internal_resolver(
     if not chain.statements:
         linkage_dids: dict = {}
     else:
+        # Only a string DID can be resolved (or used as a key); any other
+        # value falls through to verify_did_binding, which rejects it.
         linkage_dids = {
-            s.successor_did: tuple(dict(vm) for vm in s.successor_verification_methods)
+            s.successor_did: _copy_vms(s.successor_verification_methods)
             for s in chain.statements[:-1]
+            if isinstance(s.successor_did, str)
         }
 
     def _resolver(did: str) -> Mapping[str, object]:
@@ -440,69 +470,24 @@ class ArtifactChainVerifyResult:
     reason: str
 
 
-def _verify_artifact_signatures(
-    payload: bytes,
-    signatures: Iterable[Mapping[str, str]],
-    verification_methods: Iterable[Mapping[str, object]],
-) -> List[dict]:
-    """Drop entries that don't crypto-verify; return survivors. Mirrors
-    :func:`succession._verify_signatures_against` but accepts the
-    bytes-payload form artifacts use directly.
-
-    Defense-in-depth (codex P1 follow-up): refuse VM lists with
-    duplicate kid fragments. Same attack as in succession.py — a
-    later attacker-controlled VM silently overwrites a legitimate one
-    in ``methods_by_kid``.
-    """
-    vms_list = list(verification_methods)
-    seen_kids: dict = {}
-    for vm in vms_list:
-        if not isinstance(vm, Mapping):
-            continue
-        vm_id = vm.get("id") or ""
-        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
-        if not kid:
-            continue
-        if kid in seen_kids:
-            return []
-        seen_kids[kid] = vm_id
-
-    methods_by_kid: dict = {}
-    for vm in vms_list:
-        if not isinstance(vm, Mapping):
-            continue
-        vm_id = vm.get("id") or ""
-        kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
-        methods_by_kid[kid] = vm
-
-    verified: List[dict] = []
-    for entry in signatures:
-        if not isinstance(entry, Mapping):
-            continue
-        alg = entry.get("alg")
-        kid = entry.get("kid")
-        sig_hex = entry.get("sig")
-        if not alg or not kid or not sig_hex:
-            continue
-        vm = methods_by_kid.get(kid)
-        if not vm:
-            continue
-        multibase = vm.get("publicKeyMultibase")
-        if not isinstance(multibase, str):
-            continue
-        try:
-            suite, pub = multibase_to_public_key(multibase)
-        except CryptoSuiteError:
-            continue
-        if suite.alg_id != alg:
-            continue
-        try:
-            sig_bytes = bytes.fromhex(sig_hex)
-        except ValueError:
-            continue
-        if suite.verify(payload, sig_bytes, pub):
-            verified.append(dict(entry))
-    return verified
+def _unanchored_result(
+    root_did: str, *, chain_reason: str, reason: str,
+) -> ArtifactChainVerifyResult:
+    """A rejection decided before the chain or the artifact was evaluated."""
+    return ArtifactChainVerifyResult(
+        ok=False,
+        active_identity=ActiveIdentity(
+            did=root_did, verification_methods=tuple(),
+            is_root=True, succession_index=None, post_cutoff=False,
+        ),
+        chain_signatures=ChainSignaturesResult(
+            ok=False, per_statement=tuple(), reason=chain_reason,
+        ),
+        policy_result=PolicyResult(
+            ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
+        ),
+        reason=reason,
+    )
 
 
 def verify_artifact_against_chain(
@@ -567,57 +552,31 @@ def verify_artifact_against_chain(
     # Anchor rule: when chain is non-empty, statements[0].predecessor_did
     # MUST equal root_did, and statements[0].predecessor_verification_
     # methods MUST equal root_verification_methods (matched by
-    # id + multibase).
+    # id + multibase). Malformed root VMs fail that match; with an empty
+    # chain they are the active identity's VMs, and signature verification
+    # rejects them.
     if not chain.is_empty():
         first = chain.statements[0]
         if first.predecessor_did != root_did:
-            return ArtifactChainVerifyResult(
-                ok=False,
-                active_identity=ActiveIdentity(
-                    did=root_did, verification_methods=tuple(),
-                    is_root=True, succession_index=None, post_cutoff=False,
-                ),
-                chain_signatures=ChainSignaturesResult(
-                    ok=False, per_statement=tuple(),
-                    reason="chain not anchored to supplied root",
-                ),
-                policy_result=PolicyResult(
-                    ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
-                ),
+            return _unanchored_result(
+                root_did,
+                chain_reason="chain not anchored to supplied root",
                 reason=(
                     f"chain anchor mismatch: chain[0].predecessor_did="
                     f"{first.predecessor_did!r} but root_did={root_did!r}"
                 ),
             )
-        root_keys = sorted(
-            (vm.get("id"), vm.get("publicKeyMultibase"))
-            for vm in root_verification_methods
-            if isinstance(vm, Mapping)
-        )
-        first_pred_keys = sorted(
-            (vm.get("id"), vm.get("publicKeyMultibase"))
-            for vm in first.predecessor_verification_methods
-            if isinstance(vm, Mapping)
-        )
-        if root_keys != first_pred_keys:
-            return ArtifactChainVerifyResult(
-                ok=False,
-                active_identity=ActiveIdentity(
-                    did=root_did, verification_methods=tuple(),
-                    is_root=True, succession_index=None, post_cutoff=False,
-                ),
-                chain_signatures=ChainSignaturesResult(
-                    ok=False, per_statement=tuple(),
-                    reason="chain not anchored to supplied root VMs",
-                ),
-                policy_result=PolicyResult(
-                    ok=False, reason="not evaluated", alg_ids_seen=frozenset(),
-                ),
+        root_keys = _vm_linkage_keys(root_verification_methods)
+        first_pred_keys = _vm_linkage_keys(first.predecessor_verification_methods)
+        if root_keys is None or root_keys != first_pred_keys:
+            return _unanchored_result(
+                root_did,
+                chain_reason="chain not anchored to supplied root VMs",
                 reason=(
                     "chain anchor mismatch: chain[0].predecessor_verification"
                     "_methods do not match supplied root_verification_methods "
-                    "(id + multibase). Refusing to treat an unrelated chain "
-                    "as belonging to this root."
+                    "(id + multibase), or either is malformed. Refusing to "
+                    "treat an unrelated chain as belonging to this root."
                 ),
             )
 
@@ -646,16 +605,13 @@ def verify_artifact_against_chain(
         artifact_timestamp=artifact_timestamp,
     )
 
-    # Step 3: crypto-verify artifact signatures
-    verified = _verify_artifact_signatures(
+    # Step 3: crypto-verify artifact signatures, then Step 4: apply policy
+    # with the post-cutoff bit.
+    policy_result = verify_signature_entries(
         artifact_payload,
         artifact_signatures,
         active.verification_methods,
-    )
-
-    # Step 4: apply policy with post-cutoff bit
-    policy_result = evaluate_signatures(
-        verified,
+    ).evaluate(
         policy,
         post_cutoff_classical_allowed=not active.post_cutoff,
     )
