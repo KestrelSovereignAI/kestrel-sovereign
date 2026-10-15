@@ -94,6 +94,25 @@ def _here() -> tuple[str, Optional[str]]:
     return socket.gethostname(), _pid_namespace()
 
 
+def process_identity() -> dict[str, Any]:
+    """This process, as a record names it: PID, start instant, host, namespace.
+
+    Every field :func:`recorded_process_exited` checks. The start instant is
+    None when it cannot be read, and a record holding None never proves its
+    process exited.
+    """
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    pid = os.getpid()
+    host, pid_namespace = _here()
+    return {
+        "pid": pid,
+        "started_at": ProcessManager.process_start_time(pid),
+        "host": host,
+        "pid_namespace": pid_namespace,
+    }
+
+
 class ServingRecord:
     """This process's record that it serves the agent in one data directory."""
 
@@ -111,21 +130,11 @@ class ServingRecord:
         Raises:
             OSError: The record cannot be written.
         """
-        from kestrel_sovereign.multi_agent.process_manager import ProcessManager
-
         directory = Path(data_dir) / SERVING_RECORD_DIRNAME
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         _remove_stale_records(directory)
-        pid = os.getpid()
-        host, pid_namespace = _here()
-        payload = {
-            "pid": pid,
-            "started_at": ProcessManager.process_start_time(pid),
-            "host": host,
-            "pid_namespace": pid_namespace,
-            "data_dir": str(data_dir),
-        }
-        path = directory / f"{pid}-{secrets.token_hex(8)}.json"
+        payload = {**process_identity(), "data_dir": str(data_dir)}
+        path = directory / f"{payload['pid']}-{secrets.token_hex(8)}.json"
         staging = directory / f".{path.name}.tmp"
         fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -324,6 +333,21 @@ def _provably_stale(path: Path, payload) -> bool:
     and reports every other record as a process that may serve the agent.
     """
     return _record_holder(path, payload) is None
+
+
+def recorded_process_exited(path: Path, payload: Any) -> bool:
+    """Whether the process ``payload`` names has provably exited.
+
+    ``payload`` carries the fields :func:`process_identity` writes, read from
+    the record at ``path`` (named in diagnostics only). The same judgement a
+    serving record is swept by (:func:`_provably_stale`), for any record that
+    names the process owning something: True only when the record parses, was
+    written on this host and in this PID namespace, and nothing runs as its
+    PID here or what does started at another instant.
+    """
+    if not isinstance(payload, dict):
+        return False
+    return _provably_stale(path, payload)
 
 
 def _serving_record_holder(path: Path) -> Optional[AgentHolder]:

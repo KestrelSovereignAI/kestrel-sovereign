@@ -15,7 +15,7 @@ import logging
 import shutil
 import time
 from datetime import datetime
-from typing import Any, Awaitable, Dict, List, Optional
+from typing import Any, Awaitable, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import ResourceLock
 from kestrel_sovereign.features.storage_access import (
@@ -23,6 +23,12 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.signals import lock_manager as resource_lock_manager
+from kestrel_sovereign.storage.consolidation_drain import (
+    DRAIN_STATE_ISOLATED,
+    HOLDER_CLOSED_CONNECTION,
+    HOLDER_THIS_CONNECTION,
+    reconcile_consolidation_drains,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,15 +145,19 @@ async def check_database(db) -> Dict[str, Any]:
             )
             is True
         )
+        quarantined = (
+            getattr(backend, "write_connection_quarantined", False) is True
+        )
         cleanup_failed = reconnect_required or cleanup_deadline_exceeded
         return {
             "name": "database",
             # A live rollback handoff is transient and self-healing. It fences
             # reads and writes for correctness, but remains a warning only
             # inside its bounded cleanup window. Once that deadline expires,
-            # normal database operations are unavailable indefinitely and the
-            # critical database check must fail even if cleanup may eventually
-            # self-heal without reconnecting.
+            # or the owner of the abandoned work isolates the connection,
+            # normal database operations are unavailable until cleanup ends
+            # and the critical database check must fail even if cleanup may
+            # eventually self-heal without reconnecting.
             "status": "fail" if cleanup_failed else "warn",
             "message": (
                 "Database write connection is unavailable because cancellation "
@@ -155,10 +165,16 @@ async def check_database(db) -> Dict[str, Any]:
                     "cleanup failed; reconnect is required"
                     if reconnect_required
                     else (
-                        "cleanup exceeded its deadline; normal reads and writes "
+                        "cleanup is still running and the connection is "
+                        "isolated until it finishes; normal reads and writes "
                         "are unavailable"
-                        if cleanup_deadline_exceeded
-                        else "cleanup is still pending"
+                        if quarantined
+                        else (
+                            "cleanup exceeded its deadline; normal reads and "
+                            "writes are unavailable"
+                            if cleanup_deadline_exceeded
+                            else "cleanup is still pending"
+                        )
                     )
                 )
             ),
@@ -352,12 +368,24 @@ async def check_memory_system(agent) -> Dict[str, Any]:
                 "duration_ms": _elapsed(start),
             }
 
-        return {
+        drain, settled_drain = _consolidation_drain_check(db)
+        if drain is not None:
+            return {
+                "name": "memory_system",
+                **drain,
+                "duration_ms": _elapsed(start),
+            }
+
+        result = {
             "name": "memory_system",
             "status": "pass",
             "message": f"Memory system components: {', '.join(components)}",
             "duration_ms": _elapsed(start),
         }
+        if settled_drain is not None:
+            # History, not a fault: the last timed-out pass's work settled.
+            result["details"] = {"consolidation_drain": settled_drain}
+        return result
     except Exception as e:
         return {
             "name": "memory_system",
@@ -365,6 +393,66 @@ async def check_memory_system(agent) -> Dict[str, Any]:
             "message": f"Memory system check failed: {e}",
             "duration_ms": _elapsed(start),
         }
+
+
+def _consolidation_drain_check(
+    db,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Report every timed-out consolidation pass whose database work is unsettled.
+
+    Reads the durable records timed-out passes left beside the database file
+    (#2978), never the database: while that work runs the database refuses or
+    delays operations, and this check must answer regardless. Each pass keeps
+    its own record, and every one is read: one pass settling says nothing
+    about another. A record whose owner has exited without settling it is
+    reported until an operator deletes it, never cleared here.
+
+    Returns ``(concern, settled)``: a status/message/details to report while
+    any record is unsettled or unreadable, else the most recent settled
+    record, kept as history. Both ``None`` when there are no records.
+    """
+    report = reconcile_consolidation_drains(db)
+    if report is None:
+        return None, None
+
+    concerns = []
+    for status in report.unsettled:
+        # This agent's database refuses all work: its connection is isolated,
+        # or was closed under work that only the worker thread's exit ends.
+        refusing = status.holder == HOLDER_CLOSED_CONNECTION or (
+            status.holder == HOLDER_THIS_CONNECTION
+            and status.state == DRAIN_STATE_ISOLATED
+        )
+        concerns.append(("fail" if refusing else "warn", status.describe()))
+    for unreadable in report.unreadable:
+        concerns.append(("warn", unreadable.describe()))
+    if not concerns:
+        latest = report.latest_settled
+        return None, None if latest is None else latest.record
+
+    severity = worst_status(*(level for level, _ in concerns))
+    # The most severe first; the rest are counted here and listed in details.
+    message = next(text for level, text in concerns if level == severity)
+    if len(concerns) > 1:
+        message = f"{message} (and {len(concerns) - 1} more; see details)"
+    return {
+        "status": severity,
+        "message": message,
+        "details": {
+            "consolidation_drains": [
+                {
+                    "record_path": str(status.path),
+                    "holder": status.holder,
+                    "record": status.record,
+                }
+                for status in report.unsettled
+            ],
+            "unreadable_drain_records": [
+                {"record_path": str(unreadable.path), "error": unreadable.error}
+                for unreadable in report.unreadable
+            ],
+        },
+    }, None
 
 
 async def check_disk_space(threshold_mb: int = 100) -> Dict[str, Any]:

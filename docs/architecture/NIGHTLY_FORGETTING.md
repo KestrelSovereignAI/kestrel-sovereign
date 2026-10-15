@@ -172,13 +172,16 @@ Expiry raises `MemoryConsolidationTimeoutError`, so sleep records
 `consolidation_failed` and the manual tool returns an explicit failure; neither
 path reports success. Sleep also skips the remaining hooks and sovereignty
 export after this deadline because their database access would wait behind the
-same cleanup fence. Cancellation releases the coroutine-owned MEMORY lock, but
-does not itself stop a statement already running in the driver worker. The
-SQLite backend retains and interrupts that abandoned operation before rollback;
-a Python UDF or stalled VFS operation may not observe the interrupt until it
-returns control to SQLite and can still be draining as a later pass begins. The
-lock prevents overlapping live coroutines; it is not a database-worker interrupt
-primitive.
+same cleanup fence. Cancellation does not itself stop a statement already
+running in the driver worker. The SQLite backend retains and interrupts that
+abandoned operation before rollback; a Python UDF or stalled VFS operation may
+not observe the interrupt until it returns control to SQLite. The pass keeps
+the MEMORY lock until that rollback has run, for at most the backend's
+30-second cleanup deadline, and past it isolates the database connection
+before releasing the lock, so a later pass never runs alongside the abandoned
+statement (#2978). Each such pass records the work in its own file under
+`<database>.consolidation-drains/` until it settles, which a connection closed
+under the work does only once its worker thread exits; see `MEMORY_SYSTEM.md`.
 
 ### 2. Episode participation in the decay model
 

@@ -698,8 +698,72 @@ unwind in the same task. An aiosqlite statement already running in the driver's
 worker thread is not stopped by coroutine cancellation itself. The SQLite
 backend hands the abandoned operation to a retained `sqlite3_interrupt()` plus
 rollback drain, but a Python UDF or stalled VFS operation may not observe that
-interrupt until it returns control to SQLite and can therefore keep draining
-after the lock context is released.
+interrupt until it returns control to SQLite.
+
+So a timed-out pass does not release MEMORY while that statement runs (#2978).
+`MemorySystem.consolidate()` keeps the lock until the drain's rollback has run,
+which proves the statement returned, waiting no longer than the drain's own
+30-second cleanup deadline. If that deadline runs out, or the caller cancels
+the wait, the database connection is isolated first: every later read and
+write fails closed until the statement returns, and only then is the lock
+released. A later pass therefore never queues work behind, or interleaves
+with, a statement nobody owns. Caller cancellation before the deadline, and a
+provider or socket `TimeoutError` raised inside the pass, still propagate
+unchanged. `MemoryConsolidationTimeoutError.abandoned_work` says which of
+these happened.
+
+While the work runs, the pass keeps its own JSON record in a directory beside
+the database file (`<database>.consolidation-drains/<pass_id>.json`, written
+by `kestrel_sovereign.storage.consolidation_drain`). It tracks the work as
+`draining` (lock held) or `isolated` (lock released, connection refusing work),
+then `done` with how its cleanup settled. The database itself is fenced
+meanwhile, so it cannot hold this evidence.
+
+Shutting the connection down does not settle the work either. Past its
+budget, `close` cancels the drain before its rollback runs and keeps the
+still-running worker thread for later retirement, and the database cannot
+reconnect until that thread exits. A pass still waiting then returns
+`abandoned_work == "retiring"` and records `isolated` with isolation
+`connection_closed`; a record that was already `isolated` stays so. Either
+way the record becomes `done` (cleanup `retired`) only once the backend has
+seen the worker thread exit, which may be long after `close` returned. A
+drain cancelled while its connection stays open (the event loop shutting
+down) latches that connection as needing replacement, since no rollback will
+now prove the statement returned.
+
+Each record has one owner: the pass that wrote it, in the process it names
+(PID, start instant, host and PID namespace, as a serving record does, plus a
+per-process incarnation id), on the connection generation the statement runs
+on. Only that pass writes the record, and it writes no other, so two passes
+timing out on two connections, or in two processes, can never overwrite each
+other's evidence.
+
+The `memory_system` health check reads every record for the database, and
+`MemorySystem.initialize()` reads them all at startup and logs each unsettled
+one at WARNING. Any record that does not say `done` keeps the check from
+passing, whatever the others say:
+
+| Record | Health |
+|---|---|
+| this connection's pass, `draining` | `warn` (the memory lock is held) |
+| this connection's pass, `isolated` | `fail` (the connection refuses all work) |
+| a pass on a connection this database has since closed, whose worker thread is still running the work | `fail` (the database cannot reconnect until that thread exits) |
+| this process's pass whose work settled but whose `done` could not be written | `warn` (retried on every check) |
+| another connection of this process, or a process that is running or cannot be proven to have exited (another host, an unreadable start time) | `warn` |
+| a process proven to have exited (the same proof that sweeps a stale serving record) without settling it | `warn` until an operator deletes it |
+| unreadable (including anything that is not a regular file, or a directory that cannot be listed), or in a state this code never writes | `warn` |
+
+Neither reading writes any record but the reader's own: a pass in this process
+answers from memory, even when its file is missing or damaged, and retries a
+settlement it could not write; every other record is reported as read. A
+process that crashes mid-drain therefore leaves its record `draining` or
+`isolated` for good. The work ended with that process, and the health message
+says so, but the record is not cleared on the operator's behalf: review it,
+then delete the file. Once every record is `done`, the check passes and
+reports the most recent one as history in its details. A child forked from a
+process owns none of that process's passes and cannot write their records. A
+single shared record from an earlier shape of this change
+(`<database>.consolidation-drain.json`) is read as one more record.
 
 ### 1. Episode Creation
 

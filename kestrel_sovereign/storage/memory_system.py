@@ -28,6 +28,7 @@ import logging
 import math
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator, Dict, Any, List, Optional
 
 from .memory_models import MemoryMetadata, TemporalPattern, MemoryEpisode
@@ -44,6 +45,21 @@ from .memory_answerability import (
     LLMAnswerabilityGate,
 )
 from .memory_consolidator import MemoryConsolidator
+from .consolidation_drain import (
+    ISOLATION_CALLER_CANCELLED,
+    ISOLATION_CLEANUP_DEADLINE,
+    ISOLATION_CONNECTION_CLOSED,
+    ISOLATION_WAIT_FAILED,
+    ConsolidationDrain,
+    reconcile_consolidation_drains,
+)
+from .db.sqlite import (
+    CANCELLATION_CLEANUP_FAILED,
+    CANCELLATION_CLEANUP_FINISHED,
+    CANCELLATION_CLEANUP_ISOLATED,
+    CANCELLATION_CLEANUP_RETIRED,
+    CANCELLATION_CLEANUP_RETIRING,
+)
 from .schema_router import SchemaRouter
 from .async_storage import AsyncStorage
 from kestrel_sovereign.config import load_section
@@ -57,20 +73,60 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS = 30 * 60.0
 
 
+#: What became of the database work a timed-out pass left running (#2978).
+ABANDONED_WORK_NONE = "none"
+ABANDONED_WORK_FINISHED = CANCELLATION_CLEANUP_FINISHED
+ABANDONED_WORK_FAILED = CANCELLATION_CLEANUP_FAILED
+ABANDONED_WORK_ISOLATED = CANCELLATION_CLEANUP_ISOLATED
+ABANDONED_WORK_RETIRED = CANCELLATION_CLEANUP_RETIRED
+ABANDONED_WORK_RETIRING = CANCELLATION_CLEANUP_RETIRING
+
+_ABANDONED_WORK_OUTCOMES = {
+    None: "the pass was abandoned and in-flight database work may still be "
+    "draining",
+    ABANDONED_WORK_NONE: "the pass was abandoned with no database work left "
+    "running",
+    ABANDONED_WORK_FINISHED: "the pass was abandoned, and the database work "
+    "it left running finished before the memory lock was released",
+    ABANDONED_WORK_FAILED: "the pass was abandoned, and rolling back the "
+    "database work it left running failed, so the database connection "
+    "refuses all work until it is reconnected",
+    ABANDONED_WORK_ISOLATED: "the pass was abandoned while its database work "
+    "was still running, so the database connection refuses all work until "
+    "that work finishes",
+    ABANDONED_WORK_RETIRED: "the pass was abandoned, and the database "
+    "connection was closed under the work it left running",
+    ABANDONED_WORK_RETIRING: "the pass was abandoned, and the database "
+    "connection was closed under the work it left running, which keeps "
+    "running until that connection's worker thread exits",
+}
+
+
 class MemoryConsolidationTimeoutError(TimeoutError):
     """The configured consolidation deadline expired.
 
     Distinct from provider/socket ``TimeoutError`` exceptions raised by work
     inside consolidation. Callers may translate this deadline breach without
     misreporting an unrelated I/O timeout as the global maintenance bound.
+
+    ``abandoned_work`` says what became of database work the pass left
+    running (one of the ``ABANDONED_WORK_*`` values, ``None`` when unknown),
+    and ``drain_record`` names the durable record of it, if one was written.
     """
 
-    def __init__(self, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        timeout_seconds: float,
+        abandoned_work: Optional[str] = None,
+        drain_record: Optional[str] = None,
+    ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.abandoned_work = abandoned_work
+        self.drain_record = drain_record
         super().__init__(
             "Memory consolidation exceeded its configured deadline of "
-            f"{timeout_seconds:g} seconds; the pass was abandoned and "
-            "in-flight database work may still be draining"
+            f"{timeout_seconds:g} seconds; "
+            + _ABANDONED_WORK_OUTCOMES[abandoned_work]
         )
 
 
@@ -317,6 +373,8 @@ class MemorySystem:
         if self._initialized:
             return
 
+        self._reconcile_consolidation_drain()
+
         # Components that need database/graph access
         # AsyncStorage uses 'db' not 'database'.
         #
@@ -384,6 +442,32 @@ class MemorySystem:
 
         self._initialized = True
         logger.info(f"Memory system initialized for agent {self.agent_id}")
+
+    def _reconcile_consolidation_drain(self) -> None:
+        """Report drain records no pass will settle on its own (#2978).
+
+        A process that dies while a timed-out pass's database work drains
+        never marks that pass's record done. Startup reads every record for
+        the database and logs each one that does not say its work settled,
+        with who holds it. It changes none of them: the only write it can
+        cause is a pass of this very process retrying its own settlement.
+        """
+        report = reconcile_consolidation_drains(getattr(self.storage, "db", None))
+        if report is None:
+            return
+        for status in report.unsettled:
+            logger.warning(
+                "Memory consolidation drain record found at startup of agent "
+                "%s: %s",
+                self.agent_id,
+                status.describe(),
+            )
+        for unreadable in report.unreadable:
+            logger.warning(
+                "At startup of agent %s: %s",
+                self.agent_id,
+                unreadable.describe(),
+            )
 
     async def shutdown(self) -> None:
         """Shut down owned memory background work before storage closes."""
@@ -766,7 +850,10 @@ class MemorySystem:
         Raises:
             MemoryConsolidationTimeoutError: The configured consolidation and
                 forgetting deadline expired. Cancellation abandons the
-                coroutine, but an aiosqlite worker statement may still drain.
+                coroutine, but an aiosqlite statement already running on its
+                worker thread keeps running; this returns only once that work
+                has finished or the connection is isolated from later work
+                (see :meth:`_settle_abandoned_database_work`).
         """
         if not self.consolidator:
             logger.warning("Memory consolidator not initialized")
@@ -794,18 +881,99 @@ class MemorySystem:
                 )
                 return report
         except TimeoutError as exc:
+            # Only the configured deadline: a provider or socket TimeoutError
+            # raised inside the pass leaves the deadline unexpired.
             if deadline is None or not deadline.expired():
                 raise
-            # Coroutine cancellation cannot interrupt an aiosqlite statement
-            # already executing in its worker thread. Be explicit that the
-            # maintenance pass is abandoned even though database work may
-            # still be draining after the caller's lock context unwinds.
             logger.error(
                 "Memory consolidation timed out after %gs; the pass was "
-                "abandoned and in-flight database work may still be draining",
+                "abandoned",
                 timeout_seconds,
             )
-            raise MemoryConsolidationTimeoutError(timeout_seconds) from exc
+            # Still inside the caller's MEMORY lock: settle what the cancelled
+            # pass left running before the caller can release it.
+            abandoned_work, drain_record = (
+                await self._settle_abandoned_database_work(timeout_seconds)
+            )
+            raise MemoryConsolidationTimeoutError(
+                timeout_seconds,
+                abandoned_work,
+                None if drain_record is None else str(drain_record),
+            ) from exc
+
+    async def _settle_abandoned_database_work(
+        self, timeout_seconds: float
+    ) -> tuple[str, Optional[Path]]:
+        """Settle the database work a timed-out pass left running (#2978).
+
+        Cancelling an aiosqlite await does not stop a statement already
+        running on the connection's worker thread. Releasing MEMORY at once
+        would let a later pass queue its reads and writes on that same
+        connection behind work nobody owns any more. So this keeps the lock
+        until the backend's retained rollback proves the abandoned statement
+        has returned, waiting no longer than that rollback's own deadline.
+        When the wait runs out, fails, or the caller cancels it, the
+        connection is isolated first -- every later operation fails closed
+        until the work finishes -- and only then is the lock released.
+
+        When the connection is closed under the work before that rollback
+        runs, the work ends only with the connection's worker thread: the
+        record stays isolated until that thread has exited, however long
+        after the close that is.
+
+        This pass's own durable record, beside the database file, tracks the
+        work until it settles: the database itself refuses work meanwhile, so
+        it cannot hold the evidence. Work already pending on the connection
+        when the deadline fired is waited for and recorded the same way,
+        whoever abandoned it: the pass cannot tell it apart from its own.
+
+        Returns what became of the work (an ``ABANDONED_WORK_*`` value) and
+        the record's path, or ``None`` when no record could be written.
+        """
+        db = getattr(self.storage, "db", None)
+        if db is None or getattr(
+            db, "cancellation_cleanup_pending", False
+        ) is not True:
+            return ABANDONED_WORK_NONE, None
+
+        record = ConsolidationDrain(
+            db, agent_id=self.agent_id, deadline_seconds=timeout_seconds
+        )
+        # Registered while the work is still pending, so its settlement is
+        # recorded however the wait below ends, even after the lock is gone.
+        if not db.add_cancellation_cleanup_callback(record.settle):
+            return ABANDONED_WORK_NONE, None
+        record.write()
+        logger.warning(
+            "Memory consolidation timed out after %gs with database work "
+            "still running; holding the memory lock until it finishes "
+            "(record: %s)",
+            timeout_seconds,
+            record.path,
+        )
+        try:
+            cleanup = await db.await_cancellation_cleanup()
+        except BaseException as exc:
+            # The caller's cancellation (or a failed wait) still propagates
+            # unchanged; it just cannot leave the abandoned work sharing the
+            # connection.
+            db.quarantine_cancellation_cleanup()
+            record.isolate(
+                ISOLATION_CALLER_CANCELLED
+                if isinstance(exc, asyncio.CancelledError)
+                else ISOLATION_WAIT_FAILED
+            )
+            raise
+        if cleanup == CANCELLATION_CLEANUP_ISOLATED:
+            record.isolate(ISOLATION_CLEANUP_DEADLINE)
+        elif cleanup == CANCELLATION_CLEANUP_RETIRING:
+            # Settled by the backend once the worker thread exits.
+            record.isolate(ISOLATION_CONNECTION_CLOSED)
+        else:
+            # The backend's settlement callback normally ran first; this is
+            # a no-op then.
+            record.settle(cleanup)
+        return cleanup, None if record.persisted_state is None else record.path
 
     async def _forget_decayed_episodes(self) -> int:
         """Deletion tier of the forgetting curve (#1674).
