@@ -17,7 +17,9 @@ This module keeps the evidence:
   Both ways a turn's model reaches a tool feed it: the orchestrator loops'
   ``_dispatch_tool_call`` and ``execute_named_tool``, which the codex inline
   executor calls. A call a running tool makes by name is recorded at that
-  tool's own position and not counted again (:func:`begin_named_tool_call`);
+  tool's own position and not counted again (:func:`begin_tool_call`), on
+  whichever task it runs: the in-flight call is turn-scoped state, carried
+  onto a codex reader task like the turn id;
 * :class:`AllowlistEvidence` is attached to every ``_dispatch_tool_call``
   refusal. It holds names, counts and digests only, never tool arguments.
 
@@ -30,12 +32,15 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import itertools
 import json
 import re
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Collection, Iterable, Iterator, Optional
+
+from kestrel_sovereign.turn_scope import turn_scoped
 
 #: Turns whose ledgers are kept. The CONVERSATION lock serializes turns per
 #: agent, so the live turn is always the newest; the rest is slack for
@@ -47,6 +52,11 @@ MAX_TRACKED_TURNS = 8
 DIGEST_HEX_CHARS = 16
 
 _LEDGERS_ATTR = "_tool_turn_ledgers"
+
+# One id per positioned dispatch, process-wide. A nested call shares its
+# enclosing call's index, so the index alone cannot tell a sibling dispatch
+# from the refused dispatch itself.
+_DISPATCH_IDS = itertools.count(1)
 _GENERATION_ATTR = "_tool_registry_generation"
 
 # Feature names and turn ids are interpolated into the audit row, whose read
@@ -187,6 +197,7 @@ class AcceptedToolCall:
     set_size: int
     set_digest: str
     registry_generation: Optional[int]
+    dispatch_id: int
 
 
 @dataclass
@@ -205,11 +216,15 @@ class TurnToolLedger:
 @dataclass(frozen=True)
 class ToolCallContext:
     """Where one tool call sits in its turn, and the allowlist it was checked
-    against. ``turn_id`` and ``call_index`` are ``None`` outside a turn."""
+    against. ``turn_id`` and ``call_index`` are ``None`` outside a turn.
+
+    ``dispatch_id`` is unique to this dispatch, including a nested one that
+    shares its enclosing call's ``call_index``."""
 
     turn_id: Optional[str]
     call_index: Optional[int]
     known_tools: Collection[str]
+    dispatch_id: int = field(default_factory=lambda: next(_DISPATCH_IDS))
 
 
 @dataclass(frozen=True)
@@ -253,7 +268,10 @@ class AllowlistEvidence:
             "features_enabled="
             f"{_or_unknown(self.features_enabled)}/{_or_unknown(self.features_loaded)}",
             "unreadable_features="
-            + (",".join(self.unreadable_features) or "none"),
+            + (
+                ",".join(map(safe_evidence_token, self.unreadable_features))
+                or "none"
+            ),
             "turn="
             + (safe_evidence_token(self.turn_id) if self.turn_id else "none"),
             f"call={_or_unknown(self.call_index)}",
@@ -312,9 +330,14 @@ def _existing_ledger(agent: Any, turn_id: Optional[str]) -> Optional[TurnToolLed
 
 @dataclass
 class _ToolCallInFlight:
-    """Marks a task as running one counted tool call of one agent."""
+    """Marks a task as running one counted tool call of one agent.
 
-    agent_id: int
+    ``open`` is mutable on purpose: the scope that opened the call closes it,
+    and every task holding this marker (by inheritance or re-presentation)
+    sees the call end at the same moment.
+    """
+
+    agent: Any
     context: ToolCallContext
     open: bool = True
 
@@ -324,23 +347,61 @@ _TOOL_CALL_IN_FLIGHT: contextvars.ContextVar[Optional[_ToolCallInFlight]] = (
 )
 
 
+def capture_tool_call_in_flight(agent: Any) -> Optional[_ToolCallInFlight]:
+    """The call of ``agent`` the calling task runs inside, for re-presentation.
+
+    The marker itself, not a copy, so a foreign task it is re-presented on
+    sees the call close when it returns. Another agent's call, or one already
+    closed, is captured as ``None``, which clears whatever the foreign task
+    inherited.
+    """
+    marker = _TOOL_CALL_IN_FLIGHT.get()
+    if marker is None or not marker.open or marker.agent is not agent:
+        return None
+    return marker
+
+
+@contextmanager
+def bind_tool_call_in_flight(
+    marker: Optional[_ToolCallInFlight],
+) -> Iterator[None]:
+    """Run the body as part of ``marker``'s call (``None``: of no call)."""
+    token = _TOOL_CALL_IN_FLIGHT.set(marker)
+    try:
+        yield
+    finally:
+        _TOOL_CALL_IN_FLIGHT.reset(token)
+
+
+# A tool can run a nested call on a task that holds none of its context: a
+# feature subagent's codex reader task runs that feature's tools, and one of
+# them (``signal_dispatch``) dispatches another tool by name. Carried like the
+# rest of the turn's state, that call keeps its enclosing call's position
+# instead of being counted as a new call of the turn.
+turn_scoped(
+    "tool_call_in_flight",
+    variables=(_TOOL_CALL_IN_FLIGHT,),
+    capture=capture_tool_call_in_flight,
+    bind=bind_tool_call_in_flight,
+)
+
+
 @contextmanager
 def tool_call_scope(agent: Any, context: ToolCallContext) -> Iterator[None]:
     """Run the body as the dispatch of the tool call ``context`` positions.
 
     A tool that dispatches another tool by name from inside the scope (a
     workflow runner, ``signal_dispatch``) makes a nested call, which
-    :func:`begin_named_tool_call` places at this call's position.
+    :func:`begin_tool_call` places at this call's position.
     """
-    marker = _ToolCallInFlight(id(agent), context)
-    token = _TOOL_CALL_IN_FLIGHT.set(marker)
+    marker = _ToolCallInFlight(agent, context)
     try:
-        yield
+        with bind_tool_call_in_flight(marker):
+            yield
     finally:
         # A task created inside the scope keeps this marker after the scope
         # ends; closing it stops that task's later calls reading as nested.
         marker.open = False
-        _TOOL_CALL_IN_FLIGHT.reset(token)
 
 
 def enclosing_tool_call(agent: Any) -> Optional[ToolCallContext]:
@@ -351,31 +412,25 @@ def enclosing_tool_call(agent: Any) -> Optional[ToolCallContext]:
     forever, and another agent's call is not this agent's.
     """
     marker = _TOOL_CALL_IN_FLIGHT.get()
-    if marker is None or not marker.open or marker.agent_id != id(agent):
+    if marker is None or not marker.open or marker.agent is not agent:
         return None
     return marker.context
 
 
-def begin_named_tool_call(
-    agent: Any, known_tools: Collection[str]
-) -> ToolCallContext:
-    """Position one ``execute_named_tool`` call in the current turn.
-
-    A call from the turn itself (the codex inline executor's) is counted like
-    a ``_dispatch_tool_call``. A call a running tool makes by name is that
-    tool's work: it takes the enclosing call's position, so the turn's count
-    stays the model's own calls, while what it is accepted for is still
-    recorded and still held against eviction.
-    """
-    outer = enclosing_tool_call(agent)
-    if outer is None:
-        return begin_tool_call(agent, known_tools)
-    return ToolCallContext(outer.turn_id, outer.call_index, known_tools)
-
-
 def begin_tool_call(agent: Any, known_tools: Collection[str]) -> ToolCallContext:
-    """Count one tool call into the current turn and return its position."""
+    """Position one tool call in the current turn.
+
+    The one entry for both routes a turn's tools take:
+    ``_dispatch_tool_call`` and ``execute_named_tool``. A call the turn makes
+    is counted. A call a running tool makes by name from inside its own call,
+    in the same turn, is that tool's work: it takes the enclosing call's
+    position, so the count stays the turn's own calls, while what it is
+    accepted for is still recorded and still held against eviction.
+    """
     turn_id = current_turn_id(agent)
+    outer = enclosing_tool_call(agent)
+    if outer is not None and outer.turn_id == turn_id:
+        return ToolCallContext(outer.turn_id, outer.call_index, known_tools)
     if turn_id is None:
         return ToolCallContext(None, None, known_tools)
     ledgers = _ledgers(agent)
@@ -407,6 +462,7 @@ def record_tool_acceptance(
         registry_generation=(
             known.registry_generation if isinstance(known, KnownToolNames) else None
         ),
+        dispatch_id=context.dispatch_id,
     ))
 
 
@@ -441,13 +497,23 @@ def allowlist_evidence(
     accepted = None
     ledger = _existing_ledger(agent, context.turn_id)
     if ledger is not None and context.call_index is not None:
-        # The acceptance closest before this call: it brackets the change.
+        # The acceptance closest before this call: it brackets the change. A
+        # dispatch sharing this call's index is a nested call already made
+        # (a workflow runner's earlier step), so it counts; this dispatch's
+        # own acceptance would not.
         earlier = [
             candidate for candidate in ledger.accepted.get(tool_name, ())
             if candidate.call_index < context.call_index
+            or (
+                candidate.call_index == context.call_index
+                and candidate.dispatch_id != context.dispatch_id
+            )
         ]
         if earlier:
-            accepted = max(earlier, key=lambda candidate: candidate.call_index)
+            accepted = max(
+                earlier,
+                key=lambda candidate: (candidate.call_index, candidate.dispatch_id),
+            )
     return AllowlistEvidence(
         in_allowlist=tool_name in known,
         set_size=len(known),

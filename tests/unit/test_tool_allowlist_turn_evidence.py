@@ -20,6 +20,7 @@ import logging
 import pickle
 import time
 from contextlib import asynccontextmanager
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,15 +28,20 @@ from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.agent.tool_allowlist import (
     MAX_TRACKED_TURNS,
     KnownToolNames,
+    begin_tool_call,
+    enclosing_tool_call,
     registry_generation,
+    tool_call_scope,
     tool_name_set_digest,
 )
+from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.security.args_summary import remask_summary
 from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_RESOLUTION,
     ACTION_TOOL_VALIDATION,
 )
 from kestrel_sovereign.telemetry import bind_current_turn_id, turn_span_scope
+from kestrel_sovereign.turn_scope import capture_turn_scope
 from tests.unit.test_feature_runtime_lifecycle import _agent, _DispatchFeature
 from tests.unit.test_tool_allowlist_registry import (  # noqa: F401
     _attach_security_feature,
@@ -215,6 +221,45 @@ class TestMidTurnEviction:
         assert "mcp__files__read" in mcp_agent._direct_tools
         assert "Cannot evict" in caplog.text
         assert "mcp:files" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_mount_refused_for_a_held_owner_is_a_warning(
+        self, mcp_agent, caplog,
+    ):
+        """At the cap with every older owner held, the owner being mounted
+        is the one LRU can take, so an MCP server's mount is refused. It is
+        logged at WARNING naming its tools and the owner held in its place."""
+        async with _live_turn(mcp_agent, "turn_refused_mount"):
+            await _dispatch(mcp_agent, "mcp__files__read")
+            with caplog.at_level(logging.INFO):
+                mounted = mcp_agent.register_dynamic_tools(
+                    "mcp:new", [_make_tool("new_a"), _make_tool("new_b")]
+                )
+
+        assert mounted == 0
+        assert set(mcp_agent._direct_tools) == {"mcp__files__read"}
+        [warning] = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "Evicted" in r.getMessage()
+        ]
+        assert "from mcp:new in place of" in warning
+        assert "(mcp:files)" in warning
+        assert "new_a, new_b" in warning
+
+    @pytest.mark.asyncio
+    async def test_an_eviction_that_passes_over_nothing_stays_at_info(
+        self, mcp_agent, caplog,
+    ):
+        """Ordinary LRU, with no held owner skipped, is not a warning."""
+        with caplog.at_level(logging.INFO):
+            mounted = mcp_agent.register_dynamic_tools(
+                "mcp:new", [_make_tool("new_a"), _make_tool("new_b")]
+            )
+
+        assert mounted == 2
+        assert "mcp__files__read" not in mcp_agent._direct_tools
+        evictions = [r for r in caplog.records if "Evicted" in r.getMessage()]
+        assert [r.levelno for r in evictions] == [logging.INFO]
 
 
 # =============================================================================
@@ -412,6 +457,45 @@ class TestNamedToolDispatch:
         assert fields["call"] == "3"
 
     @pytest.mark.asyncio
+    async def test_a_nested_bounce_knows_its_sibling_acceptance(
+        self, mcp_agent, caplog,
+    ):
+        """A runner's two calls to one tool share the runner's call index.
+        When the second is refused after the first answered, the refusal
+        still says the name was accepted earlier this turn."""
+        refusals = []
+
+        async def _run_twice(**_kwargs):
+            await mcp_agent.execute_named_tool(
+                "mcp__files__read", {"query": "x"},
+                session_id="nested", source="workflow_runner",
+            )
+            mcp_agent.unregister_dynamic_tools("mcp:files")
+            try:
+                await mcp_agent.execute_named_tool(
+                    "mcp__files__read", {"query": "x"},
+                    session_id="nested", source="workflow_runner",
+                )
+            except ToolNotRegisteredError as exc:
+                refusals.append(exc)
+            return {"success": True}
+
+        runner = _make_tool("run_steps")
+        runner.execute.side_effect = _run_twice
+        mcp_agent.register_dynamic_tools("runner", [runner])
+        mcp_agent.MAX_DIRECT_TOOLS = 10
+
+        async with _live_turn(mcp_agent, "turn_sibling"):
+            with caplog.at_level(logging.INFO):
+                await _dispatch(mcp_agent, "run_steps")
+
+        assert len(refusals) == 1
+        [fields] = _evidence_logs(caplog, logging.WARNING)
+        assert fields["call"] == "1"
+        assert fields["accepted_earlier_this_turn"] == "yes"
+        assert fields["accepted_at_call"] == "1"
+
+    @pytest.mark.asyncio
     async def test_a_nested_call_still_holds_its_tool_against_eviction(
         self, mcp_agent,
     ):
@@ -469,6 +553,181 @@ class TestNamedToolDispatch:
 
         [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
         assert fields["call"] == "3"
+
+
+# =============================================================================
+# A nested call on a task that holds none of the turn's context
+# =============================================================================
+
+class _NestingFeature(Feature):
+    """A subagent whose one tool dispatches another tool by name, as
+    ``signal_dispatch`` dispatches ``workflow_run``.
+
+    Its tools run the way the codex app-server runs a subagent's tools: through
+    the feature's own inline executor, built inside the dispatch, on a task
+    born with an empty context."""
+
+    def __init__(self, owner, nested_tool):
+        super().__init__(owner)
+        self.name = "NestingFeature"  # dispatched as ``nesting_feature``
+        self.nested_tool = nested_tool
+        self.executor = None
+
+    @property
+    def tool_description(self) -> str:
+        return "Runs a step that calls another tool by name."
+
+    async def initialize(self):
+        return None
+
+    def get_tools(self):
+        return []
+
+    async def execute_as_subagent(self, task, context=None, **_kwargs):
+        step = MagicMock()
+        step.name = "run_step"
+        step.execute = self._run_step
+        self.executor = self._make_feature_inline_tool_executor(
+            parts_sink=None, runtime_tools=[step]
+        )
+        _, result = await _on_reader_task(self.executor, "run_step", {})
+        return {"success": True, "result": result}
+
+    async def _run_step(self, **_kwargs):
+        return await self.agent.execute_named_tool(
+            self.nested_tool, {"query": "x"},
+            session_id="nested", source="signal_dispatch",
+        )
+
+
+@pytest.fixture
+def nesting_agent(mcp_agent):
+    mcp_agent.MAX_DIRECT_TOOLS = 10
+    mcp_agent.nesting = _NestingFeature(mcp_agent, "mcp__files__read")
+    mcp_agent.features["NestingFeature"] = mcp_agent.nesting
+    return mcp_agent
+
+
+async def _dispatch_nesting(target, route):
+    """Call the nesting feature as the turn's model would, on ``route``."""
+    if route == "chat":
+        await _dispatch(target, "nesting_feature", {"task": "run"})
+    else:
+        executor = target._make_inline_tool_executor("chat-nesting")
+        await _on_reader_task(executor, "nesting_feature", {"task": "run"})
+
+
+class TestNestedCallOnForeignTask:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["chat", "inline"])
+    async def test_nested_call_on_a_subagent_reader_task_keeps_its_position(
+        self, nesting_agent, route,
+    ):
+        """The subagent's tool runs on an empty-context task and calls
+        ``execute_named_tool`` from there. The call it makes is the
+        dispatcher's work: it takes the dispatcher's call index instead of
+        being counted as the turn's second call.
+
+        Before the in-flight call was turn-scoped state, the reader task did
+        not know it ran inside call 1, so the nested call became call 2 and
+        every later refusal reported an index one too high."""
+        store = _attach_security_feature(nesting_agent)
+        async with _live_turn(nesting_agent, "turn_foreign"):
+            await _dispatch_nesting(nesting_agent, route)
+            ledger = nesting_agent._tool_turn_ledgers["turn_foreign"]
+            assert ledger.calls == 1
+            assert [
+                accepted.call_index
+                for accepted in ledger.accepted["mcp__files__read"]
+            ] == [1]
+            await _dispatch(nesting_agent, "ghost_tool", iteration=1)
+
+        assert nesting_agent.mcp_read.execute.await_count == 1
+        [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
+        assert fields["call"] == "2"
+
+    @pytest.mark.asyncio
+    async def test_a_nested_call_on_a_reader_task_holds_its_tool(
+        self, nesting_agent,
+    ):
+        """What the nested call is accepted for is held against eviction on
+        the reader task too."""
+        nesting_agent.MAX_DIRECT_TOOLS = 2
+        async with _live_turn(nesting_agent, "turn_foreign_held"):
+            await _dispatch_nesting(nesting_agent, "inline")
+            await _dispatch(
+                nesting_agent, "memory_feature", {"task": "recall"}, iteration=1
+            )
+            assert "mcp__files__read" in nesting_agent._direct_tools
+            result, _ = await _dispatch(
+                nesting_agent, "mcp__files__read", iteration=2
+            )
+
+        assert result == {"success": True, "tool": "mcp__files__read"}
+
+    @pytest.mark.asyncio
+    async def test_a_re_presented_call_ends_when_its_call_returns(
+        self, nesting_agent,
+    ):
+        """The executor keeps the call it captured after that call returns.
+        A later call through it is the turn's own, not the finished call's:
+        the carried marker is the call's own, so the call closes it for every
+        task holding it."""
+        async with _live_turn(nesting_agent, "turn_reused"):
+            await _dispatch(nesting_agent, "nesting_feature", {"task": "run"})
+            await _on_reader_task(nesting_agent.nesting.executor, "run_step", {})
+            ledger = nesting_agent._tool_turn_ledgers["turn_reused"]
+
+        assert ledger.calls == 2
+        assert [
+            accepted.call_index
+            for accepted in ledger.accepted["mcp__files__read"]
+        ] == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_only_the_capturing_agents_call_is_carried(
+        self, agent,  # noqa: F811 - the imported fixture
+    ):
+        """Another agent's executor captures no call of this one, and its
+        bind clears the marker a task inherited."""
+        async def _enclosing_after(snapshot):
+            with snapshot.bind():
+                return enclosing_tool_call(agent)
+
+        with turn_span_scope("turn_agents"):
+            context = begin_tool_call(agent, set())
+            with tool_call_scope(agent, context):
+                own = capture_turn_scope(agent)
+                other = capture_turn_scope(object())
+                on_empty_task = await asyncio.create_task(
+                    _enclosing_after(own), context=contextvars.Context()
+                )
+                for_other_agent = await asyncio.create_task(
+                    _enclosing_after(other), context=contextvars.Context()
+                )
+                inherited_then_cleared = await asyncio.create_task(
+                    _enclosing_after(other)
+                )
+
+        assert on_empty_task is context
+        assert for_other_agent is None
+        assert inherited_then_cleared is None
+
+    def test_a_call_from_another_turn_is_counted_in_that_turn(
+        self, agent,  # noqa: F811 - the imported fixture
+    ):
+        """Only a call in the same turn is nested. A call of another turn
+        made from inside this one's call is counted in its own turn."""
+        with turn_span_scope("turn_outer"):
+            outer = begin_tool_call(agent, set())
+            with tool_call_scope(agent, outer):
+                nested = begin_tool_call(agent, set())
+                with turn_span_scope("turn_inner"):
+                    inner = begin_tool_call(agent, set())
+
+        assert (nested.turn_id, nested.call_index) == ("turn_outer", 1)
+        assert (inner.turn_id, inner.call_index) == ("turn_inner", 1)
+        assert agent._tool_turn_ledgers["turn_outer"].calls == 1
 
 
 # =============================================================================
@@ -669,6 +928,33 @@ class TestRejectionEvidence:
         assert fields["accepted_earlier_this_turn"] == "no"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["chat", "inline"])
+    async def test_constitution_receipt_call_is_counted(self, mcp_agent, route):
+        """The constitution receipt tool short-circuits the allowlist, but
+        the model still made the call, so the next call is call 2."""
+        from kestrel_sovereign.signals.constitution_canary import (
+            PHANTOM_RECEIPT_TOOL_NAME,
+        )
+
+        store = _attach_security_feature(mcp_agent)
+        mcp_agent.register_constitution_receipt_tool(canary="c", signal_id="s")
+        async with _live_turn(mcp_agent, "turn_receipt"):
+            if route == "chat":
+                await _dispatch(
+                    mcp_agent, PHANTOM_RECEIPT_TOOL_NAME, {"canary": "c"}
+                )
+            else:
+                executor = mcp_agent._make_inline_tool_executor("chat-receipt")
+                await _on_reader_task(
+                    executor, PHANTOM_RECEIPT_TOOL_NAME, {"canary": "c"}
+                )
+            await _dispatch(mcp_agent, "ghost_tool", iteration=1)
+
+        assert len(mcp_agent._constitution_receipt_tool_calls) == 1
+        [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
+        assert fields["call"] == "2"
+
+    @pytest.mark.asyncio
     async def test_call_index_counts_across_iterations(
         self, dispatch_agent,  # noqa: F811 - the imported fixture
     ):
@@ -760,6 +1046,28 @@ class TestRejectionEvidence:
 
         fields = _evidence_fields(store.rows[0]["args_summary"])
         assert fields["unreadable_features"] == "GitHubFeature"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_feature_name_is_reduced_to_plain_characters(
+        self, dispatch_agent,  # noqa: F811 - the imported fixture
+    ):
+        """A feature key is written into the audit row in front of
+        ``args=``; whatever it holds, it cannot open a bracketed structure or
+        forge an ``args=`` segment there."""
+        store = _attach_security_feature(dispatch_agent)
+        broken = _make_feature("github", [])
+        broken.get_tools.side_effect = RuntimeError("client not ready")
+        dispatch_agent.features['Git[Hub] | args={"x": 1}'] = broken
+
+        async with _live_turn(dispatch_agent, "turn_hostile_key"):
+            await _dispatch(dispatch_agent, "create_github_issue")
+
+        stored = store.rows[0]["args_summary"]
+        evidence = next(p for p in stored.split(" | ") if p.startswith("allowlist "))
+        assert not set('[]{}"') & set(evidence)
+        assert stored.count(" | args=") == 1
+        assert evidence in remask_summary(stored)
+        assert _evidence_fields(stored)["unreadable_features"] == "Git_Hub____args___x_:_1_"
 
     @pytest.mark.asyncio
     async def test_evidence_holds_no_arguments(

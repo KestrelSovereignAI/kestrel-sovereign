@@ -17,7 +17,6 @@ from kestrel_sovereign.agent.tool_allowlist import (
     bump_registry_generation,
     names_held_by_live_turn,
     registry_generation,
-    safe_evidence_token,
 )
 from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
 
@@ -71,7 +70,7 @@ def _derive_registry_names(agent: Any) -> _RegistryNames:
         except Exception:  # noqa: BLE001 — one broken feature mustn't
             # shrink the allowlist for every other feature; it is named in the
             # refusal evidence instead, since its own names DO drop out (#2935).
-            unreadable.append(safe_evidence_token(key))
+            unreadable.append(str(key))
     return _RegistryNames(
         feature_backed=frozenset(backed),
         mounted=mounted,
@@ -325,7 +324,11 @@ class ToolRegistryMixin:
         ``.schema.to_openai_format()`` plus an awaitable ``.execute(**kwargs)``
         (the SDK ``AgentTool`` protocol). Names that collide with an existing
         direct tool are disambiguated as ``<owner>__<tool.name>`` (the owner is
-        sanitised to a schema-safe token first). Returns the number registered.
+        sanitised to a schema-safe token first). Returns how many of ``tools``
+        are still mounted once LRU eviction has run: fewer than offered, and
+        possibly none, when the cap is reached and every older owner is pinned
+        or held by the live turn, so the mount itself is what gets evicted
+        (#2935). That eviction is logged at WARNING.
 
         ``owner`` is recorded in ``_explored_features`` so eviction and
         :meth:`unregister_dynamic_tools` treat feature- and non-feature owners
@@ -342,7 +345,7 @@ class ToolRegistryMixin:
         self._explored_features[owner] = True
         if pin:
             self._pinned_features.add(owner)
-        registered = 0
+        mounted = []
         for tool in tools:
             name = tool.name
             if name in self._direct_tools:
@@ -356,12 +359,13 @@ class ToolRegistryMixin:
             tool_def["function"]["name"] = name
             self._direct_tool_defs.append(tool_def)
             self._tool_to_feature[name] = owner
-            registered += 1
+            mounted.append(name)
         bump_registry_generation(self)
         self._maybe_evict_direct_tools()
+        registered = sum(1 for name in mounted if name in self._direct_tools)
         logging.info(
-            f"[DYNAMIC-TOOLS] Registered {registered} direct tools for "
-            f"'{owner}'. Total: {len(self._direct_tools)}"
+            f"[DYNAMIC-TOOLS] Registered {registered} of {len(mounted)} direct "
+            f"tools for '{owner}'. Total: {len(self._direct_tools)}"
         )
         return registered
 
@@ -428,9 +432,17 @@ class ToolRegistryMixin:
         resolvable through the feature; evicting an MCP tool or a
         collision-renamed one unmounts the only copy, and exploration runs
         mid-turn, so the next call to a tool that just answered was refused as
-        not in the allowlist. When nothing else is evictable the newest
-        unpinned owner goes, as with pinning; when nothing at all is, the
-        count stays over the cap until an eviction after the turn.
+        not in the allowlist.
+
+        When every older owner is pinned or held, the owner whose registration
+        overflowed the cap is the oldest evictable one, so it goes: an explored
+        feature stays reachable through its dispatcher, while an MCP mount is
+        refused and ``register_dynamic_tools`` reports none mounted. That
+        eviction, and any other that passed over a held owner, is a WARNING
+        naming the evicted tools and the held owners.
+        When nothing at all is evictable, nothing is unmounted: the count stays
+        over the cap, with a WARNING, until the first registration after the
+        turn.
         """
         pinned = getattr(self, "_pinned_features", set())
         in_use = names_held_by_live_turn(self)
@@ -450,13 +462,16 @@ class ToolRegistryMixin:
 
         while len(self._direct_tools) > self.MAX_DIRECT_TOOLS:
             # Find oldest UNPINNED feature the live turn is not holding.
-            oldest = next(
-                (
-                    k for k in self._explored_features
-                    if k not in pinned and not _held_by_live_turn(k)
-                ),
-                None,
-            )
+            held = []
+            oldest = None
+            for owner in self._explored_features:
+                if owner in pinned:
+                    continue
+                if _held_by_live_turn(owner):
+                    held.append(owner)
+                    continue
+                oldest = owner
+                break
             if oldest is None:
                 # Every remaining feature is pinned or held by the live
                 # turn — eviction is impossible. Log and bail so we don't
@@ -469,10 +484,7 @@ class ToolRegistryMixin:
                     "cap %d.",
                     len(self._explored_features),
                     sorted(pinned),
-                    sorted(
-                        k for k in self._explored_features
-                        if k not in pinned and _held_by_live_turn(k)
-                    ),
+                    sorted(held),
                     len(self._direct_tools),
                     self.MAX_DIRECT_TOOLS,
                 )
@@ -495,10 +507,20 @@ class ToolRegistryMixin:
                 f" (+{len(to_remove) - 10} more)"
                 if len(to_remove) > 10 else ""
             )
-            logging.info(
-                "[DYNAMIC-TOOLS] Evicted %d tool(s) from %s: %s%s",
-                len(to_remove), oldest, ", ".join(preview), tail,
-            )
+            if held:
+                # LRU would have taken a held owner. What went instead may be
+                # the owner being registered right now: say so out loud.
+                logging.warning(
+                    "[DYNAMIC-TOOLS] Evicted %d tool(s) from %s in place of "
+                    "owner(s) holding a tool this turn used (%s): %s%s",
+                    len(to_remove), oldest, ", ".join(held),
+                    ", ".join(preview), tail,
+                )
+            else:
+                logging.info(
+                    "[DYNAMIC-TOOLS] Evicted %d tool(s) from %s: %s%s",
+                    len(to_remove), oldest, ", ".join(preview), tail,
+                )
 
     def _build_features_prompt_section(self) -> str:
         """

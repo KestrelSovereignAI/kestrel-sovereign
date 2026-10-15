@@ -86,7 +86,6 @@ from kestrel_sovereign.agent.direct_tool_arguments import (
 from kestrel_sovereign.agent.tool_allowlist import (
     ToolCallContext,
     allowlist_evidence,
-    begin_named_tool_call,
     begin_tool_call,
     record_tool_acceptance,
     tool_call_scope,
@@ -1320,6 +1319,17 @@ class OrchestratorEngineMixin:
             PHANTOM_RECEIPT_TOOL_NAME,
         )
 
+        # #2935: count the call into its turn, as ``_dispatch_tool_call`` does
+        # for the orchestrator loops, so the codex inline executor's calls
+        # reach the same ledger (and an MCP tool it called is not evicted by a
+        # later exploration). A call a running tool makes from inside its own
+        # call keeps that call's position instead. This path resolves against
+        # the registry, so the registry is the allowlist recorded for it.
+        registered = getattr(self, "_registered_tool_names", None)
+        call_context = begin_tool_call(
+            self, registered() if callable(registered) else frozenset()
+        )
+
         if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
             handler = getattr(self, "_handle_constitution_receipt_tool", None)
             if not callable(handler):
@@ -1329,15 +1339,6 @@ class OrchestratorEngineMixin:
                 )
             return await handler(**(args or {}))
 
-        # #2935: count the call into its turn, as ``_dispatch_tool_call`` does
-        # for the orchestrator loops, so the codex inline executor's calls
-        # reach the same ledger (and an MCP tool it called is not evicted by a
-        # later exploration). This path resolves against the registry, so the
-        # registry is the allowlist recorded for it.
-        registered = getattr(self, "_registered_tool_names", None)
-        call_context = begin_named_tool_call(
-            self, registered() if callable(registered) else frozenset()
-        )
         with tool_call_scope(self, call_context):
             return await self._dispatch_named_tool(
                 tool_name, args, session_id=session_id, source=source,
@@ -1987,6 +1988,11 @@ class OrchestratorEngineMixin:
             PHANTOM_RECEIPT_TOOL_NAME,
         )
 
+        # #2935: count this call into its turn, so a refusal can say where in
+        # the turn it happened and whether the name was accepted earlier. The
+        # constitution receipt call is a call of the turn too.
+        call_context = begin_tool_call(self, known_tools)
+
         if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
             handler = getattr(self, "_handle_constitution_receipt_tool", None)
             if not callable(handler):
@@ -2017,10 +2023,6 @@ class OrchestratorEngineMixin:
                     }
                 )
             return result
-
-        # #2935: count this call into its turn, so a refusal can say where in
-        # the turn it happened and whether the name was accepted earlier.
-        call_context = begin_tool_call(self, known_tools)
 
         # Validate tool arguments before execution
         is_valid, validation_error = validate_tool_arguments(
