@@ -1307,6 +1307,8 @@ async function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view, nex
     // this fires on.
     const generation = autoTargetPane.generation;
     const stillOwned = () => walk === autoLoadWalkSeq
+        && conversationsHandle?.view === 'active'
+        && API.hasCapability('conversations')
         && currentAgentMatches(autoTargetAgent)
         && state.chatPanes.get(autoTargetAgent) === autoTargetPane
         && autoTargetPane.generation === generation
@@ -1458,6 +1460,11 @@ function ensureConversationsMount() {
         onNewConversation: () => startNewConversationForPane(),
         onSelect: (conv, ctx) => {
             window.loadConversation(conv.session_id, { expectedAgent: ctx.agentName });
+        },
+        onLoadStart: () => {
+            // Replacement data may be slow or fail. Retire an old pagination
+            // walk at request START, not only when onLoaded later fires.
+            autoLoadWalkSeq += 1;
         },
         onLoaded: (conversations, ctx) => {
             maybeAutoLoadMostRecent(conversations, ctx.agentName, ctx.view, ctx.nextCursor);

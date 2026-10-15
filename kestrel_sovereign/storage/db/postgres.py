@@ -1039,7 +1039,7 @@ class PostgresBackend(DatabaseBackend):
                 type(body_failure) if body_failure is not None else None,
                 body_failure,
                 body_failure.__traceback__ if body_failure is not None else None,
-            ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset")
+            ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset", retain_originals=True)
         except BaseException as refusal:
             terminal = self._refused_native_owner(connection, checkout, refusal, state.scopes, body_failure, native_connection)
             raise state.retain_acknowledgments(terminal)
@@ -1167,7 +1167,7 @@ class PostgresBackend(DatabaseBackend):
                 type(body_failure) if body_failure is not None else None,
                 body_failure,
                 body_failure.__traceback__ if body_failure is not None else None,
-            ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit")
+            ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit", retain_originals=True)
         except BaseException as refusal:
             raise self._refused_native_owner(connection, transaction, refusal, scopes, body_failure, native_connection)
         if committing and commit_state is not None:

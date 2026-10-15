@@ -16,10 +16,30 @@ from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
     await_owned_task,
     create_owned_task,
+    owned_task_error,
     owned_iterator_parent_tasks,
     raise_owned_outcome,
     run_blocking_operation,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain_originals", [False, True])
+async def test_native_original_policy_keeps_caused_cancellation_without_changing_default(retain_originals):
+    cause = ValueError("original native cause")
+    cancellation = asyncio.CancelledError("original native cancellation")
+
+    async def exit():
+        raise cancellation from cause
+
+    task = create_owned_task(exit(), retain_originals=retain_originals)
+    outcome = await await_owned_task(task)
+    expected = cancellation if retain_originals else cause
+    assert outcome.error is expected
+    assert owned_task_error(task) is expected
+    assert (await await_owned_task(task)).error is expected
+    if retain_originals:
+        assert cancellation.__cause__ is cause
 
 
 @pytest.mark.asyncio

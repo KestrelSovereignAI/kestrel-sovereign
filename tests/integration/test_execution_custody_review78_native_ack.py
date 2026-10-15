@@ -79,7 +79,7 @@ async def test_wrapper_failure_after_reset_retains_known_commit_and_all_scopes(
         backend._pool = pool
 
 
-@pytest.mark.parametrize("native_cancel", [False, True])
+@pytest.mark.parametrize("native_cancel", [False, True, "caused"])
 async def test_failed_commit_keeps_original_observer_cancel_and_native_failure(
     native_pg, monkeypatch, native_cancel
 ):
@@ -94,6 +94,8 @@ async def test_failed_commit_keeps_original_observer_cancel_and_native_failure(
     native_failure = (asyncio.CancelledError if native_cancel else OSError)(
         "original native commit ACK failed"
     )
+    if native_cancel == "caused":
+        native_failure.__cause__ = ValueError("original native cancellation cause")
     cancellations = []
 
     async def join(owner, *args, **kwargs):
@@ -961,7 +963,7 @@ async def test_acknowledged_local_retirement_preserves_healthy_parent(
 
 
 @pytest.mark.parametrize("boundary", ["commit", "release"])
-@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("cancelled", [False, True, "caused"])
 async def test_actual_native_ack_failure_still_fences_original_runtime(
     native_pg,
     monkeypatch,
@@ -980,6 +982,8 @@ async def test_actual_native_ack_failure_still_fences_original_runtime(
         if cancelled
         else OSError("actual native ACK failure")
     )
+    if cancelled == "caused":
+        failure.__cause__ = ValueError("original native epilogue cancellation cause")
     failures = []
 
     async def commit(transaction, error_type, error, traceback):
@@ -1011,6 +1015,9 @@ async def test_actual_native_ack_failure_still_fences_original_runtime(
     assert execution_commit_outcome(outcome.error) == expected
     assert execution_denial_scopes(outcome.error) is None
     assert failures == [failure]
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+
+    assert failure in tuple(_explicit_control_chain(outcome.error))
     for original_scope in (parent, scope):
         with pytest.raises(ExecutionAuthorityError) as retained:
             original_scope.require_work()

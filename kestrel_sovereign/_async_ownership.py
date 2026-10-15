@@ -21,11 +21,13 @@ _ITERATOR_INTERRUPTED = object()
 _TASK_ERROR_UNSET = object()
 
 
-def create_owned_task(operation, *, name=None, context=None):
+def create_owned_task(operation, *, name=None, context=None, retain_originals=False):
     """Capture the original carrier inside a child before asyncio can erase it.
 
     Creation retains normal copied-context semantics. The caller still owns
     physical joining or a documented bounded retirement transfer.
+    Native epilogues can opt into retaining an original enclosing cancellation
+    with its explicit cause. Generic cleanup-error priority stays unchanged.
     """
     started = False
     async def run():
@@ -40,7 +42,8 @@ def create_owned_task(operation, *, name=None, context=None):
             )
             task = asyncio.current_task()
             task._kestrel_owned_terminal_error = retained_execution_error(
-                execution_terminal_error(getattr(task, "_kestrel_owned_terminal_error", None), error)
+                execution_terminal_error(getattr(task, "_kestrel_owned_terminal_error", None), error,
+                    retain_originals=retain_originals)
             )
             raise
     wrapper = run()

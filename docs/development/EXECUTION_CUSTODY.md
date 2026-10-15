@@ -92,6 +92,10 @@ Native aggregation preserves an original enclosing cancellation when its
 explicit cause would otherwise be selected; it never creates a reverse cause
 edge or drops that cancellation just to avoid a cycle. A failing COMMIT also
 retains the original observer cancellation alongside its native failure.
+PostgreSQL opts its original epilogue tasks into `create_owned_task`'s
+`retain_originals=True` policy at creation, before asyncio can reduce a caused
+native cancellation to its cause. Generic task owners keep their established
+cleanup-error priority; opting in grants no work or cleanup authority.
 Errors or cancellation in wrapper code AFTER successful native reset carry
 that same known commit receipt before classification, and all participating
 scopes are sampled on that failure path too. They do not invent uncertainty on
