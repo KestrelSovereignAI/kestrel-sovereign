@@ -31,6 +31,11 @@ from kestrel_sovereign.llm.decisions.evaluation import (
     render_threshold_snippet,
     sample_files,
 )
+from kestrel_sovereign.llm.provider_policy import (
+    OverrideProvenance,
+    OverrideSource,
+    named_call_override_scope,
+)
 
 
 def add_decisions_subparser(subparsers: argparse._SubParsersAction) -> None:
@@ -209,16 +214,22 @@ async def _eval(service: Any, args: argparse.Namespace) -> int:
             concurrency=args.concurrency,
             target_accuracy=args.target_accuracy,
         ))
+    # The operator running this command chose each model it evaluates, so the
+    # provider policy does not hold them to the agent's approved chain (#2652).
+    writer = OverrideProvenance(
+        source=OverrideSource.OPERATOR, role="cli", via="kestrel decisions eval"
+    )
     for selector in selectors:
         print(f"evaluating {selector} on {len(samples)} samples...", file=sys.stderr)
-        reports.append(await evaluate_model(
-            service, selector, samples,
-            caller=args.caller,
-            local_only=local_only,
-            timeout_seconds=args.timeout,
-            concurrency=args.concurrency,
-            target_accuracy=args.target_accuracy,
-        ))
+        with named_call_override_scope(selector, writer):
+            reports.append(await evaluate_model(
+                service, selector, samples,
+                caller=args.caller,
+                local_only=local_only,
+                timeout_seconds=args.timeout,
+                concurrency=args.concurrency,
+                target_accuracy=args.target_accuracy,
+            ))
 
     print(render_report(reports, samples=len(samples), sample_hash=digest))
     snippet = render_threshold_snippet(

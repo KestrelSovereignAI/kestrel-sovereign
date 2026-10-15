@@ -20,12 +20,31 @@ route_priority = ["ollama:local", "openai:api"]
 # any write no Sovereign or operator attested) may select only a vendor listed
 # there, and is refused otherwise; if every listed vendor is denied, it may
 # select none. An override the Sovereign or an operator sets (``!model-set``
-# typed by them, or POST /api/model/set) is not narrowed. ``denied_providers``
-# lists vendors ("openrouter") or "<vendor>:<route>" routes that are never
-# used, whatever their health and whoever set an override. It matches a
-# route's vendor, not a model id: OpenRouter's "google/..." models are the
-# "openrouter" vendor. Default: empty. `!model` reports the chain, the
-# deny-list, and who wrote each override, accepted or refused.
+# typed by them, or POST /api/model/set) is not narrowed. The same holds for a
+# per-call model naming a provider ("vendor/model"): one a caller passes with
+# its request (the ``model`` field of /api/agent/invoke, /api/agent/stream or
+# /v1/chat/completions) is the caller's for that turn, and a selector this
+# host's model_mandate.toml names is the operator's; one a feature or the
+# agent passes otherwise is held to the chain. So is a mandate fallback
+# (``add_fallback_model``) no Sovereign or operator attested, when it is
+# written and again whenever the mandate falls back to it: when every
+# approved provider is down, the task fails rather than fall back outside
+# the chain. ``denied_providers`` lists vendors ("openrouter") or
+# "<vendor>:<route>" routes that are never used, whatever their health and
+# whoever set an override. It matches a route's vendor, not a model id:
+# OpenRouter's "google/..." models are the "openrouter" vendor. Default:
+# empty. Decisions admit their model override the same way; a decision model
+# read from this host's settings ([retrieval] *_decision_model, the
+# KESTREL_*_DECISION_MODEL variables, `kestrel decisions eval`) is the
+# operator's. Routing no override chose keeps to the chain too: automatic
+# decision routing (an explicit decision_route is the operator's choice), the
+# chat response audit, and the embedding route that follows chat. An active
+# private inference lease is used only after the call's override is admitted,
+# and never for a model that names a provider ("openrouter" is a vendor, not a
+# model id). Every call is checked again just before its adapter runs: a call
+# that reaches a route none of the rules above allows is refused and recorded,
+# not sent. `!model` reports the chain, the deny-list, the mandate's
+# fallbacks, and who wrote each override, accepted or refused.
 #denied_providers = ["openrouter", "google"]
 
 # Top-level embedding channel (#2263). Selects which route embeds stored

@@ -41,6 +41,7 @@ from kestrel_sovereign.storage.memory_answerability import (
     LLMAnswerabilityGate,
 )
 from tests.utils.anthropic_client import anthropic_client
+from tests.utils.override_writers import as_operator
 
 
 def _ready_remote_lease(*, expired: bool = False) -> InferenceLease:
@@ -1126,10 +1127,12 @@ class TestCoreGeneration:
             ),
         ])
 
+        # openrouter is outside the fixture's chain, so only an override the
+        # operator names may select it (#2652).
         with patch(
             "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
             return_value=warm_cache,
-        ):
+        ), as_operator():
             response = await llm_service.get_response(
                 system_prompt="You are the visual identity subagent.",
                 user_prompt="Task: send a selfie",
@@ -2125,10 +2128,12 @@ class TestInvocationBoundary:
             "provider": "openai:api",
         }
 
+        # A route of a vendor in the fixture's chain: the audit never sends a
+        # response outside it (#2652).
         audit_provider = dict(llm_service.providers[0])
         audit_provider.update(
-            name="audit:api",
-            vendor="audit",
+            name="anthropic:api",
+            vendor="anthropic",
             route="api",
             model="audit-model",
         )

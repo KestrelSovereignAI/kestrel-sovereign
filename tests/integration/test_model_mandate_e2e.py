@@ -89,8 +89,11 @@ class TestModelMandateMethods:
 
     def test_add_fallback_model(self, llm_service):
         """add_fallback_model() adds to fallback list."""
-        llm_service.add_fallback_model("fallback-1", "provider-a")
-        llm_service.add_fallback_model("fallback-2", "provider-b")
+        # Providers outside any chain the host config declares: the
+        # operator's fallbacks (#2652).
+        with as_operator():
+            llm_service.add_fallback_model("fallback-1", "provider-a")
+            llm_service.add_fallback_model("fallback-2", "provider-b")
 
         mandate = llm_service.get_current_mandate()
         assert len(mandate["fallbacks"]) == 2
@@ -99,8 +102,9 @@ class TestModelMandateMethods:
 
     def test_add_fallback_model_no_duplicates(self, llm_service):
         """add_fallback_model() prevents duplicates."""
-        llm_service.add_fallback_model("same-model", "same-provider")
-        llm_service.add_fallback_model("same-model", "same-provider")
+        with as_operator():
+            llm_service.add_fallback_model("same-model", "same-provider")
+            llm_service.add_fallback_model("same-model", "same-provider")
 
         mandate = llm_service.get_current_mandate()
         assert len(mandate["fallbacks"]) == 1

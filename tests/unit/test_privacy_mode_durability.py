@@ -24,6 +24,7 @@ import pytest
 
 from kestrel_sovereign.agent.privacy_state import (
     FAIL_CLOSED_PRIVACY_MODE,
+    PRIVACY_SAVED_PROVENANCE_KEY,
     PRIVACY_STATE_KEY,
     PRIVACY_STATE_UNRECORDED_MESSAGE,
     PrivacyState,
@@ -639,9 +640,11 @@ async def test_write_binds_the_agent_and_key():
     db = _StoredRows()
     state = PrivacyState(mode=PrivacyMode.ANONYMOUS)
     await write_privacy_state(db, "did:example:a", state)
-    [(agent_id, key, value, _updated_at)] = db.writes
+    [(agent_id, key, value, _updated_at, *provenance_row)] = db.writes
     assert (agent_id, key) == ("did:example:a", PRIVACY_STATE_KEY)
     assert PrivacyState.decode(value) == state
+    # The saved mandate's writer is recorded in the same statement (#2652).
+    assert provenance_row[:2] == ["did:example:a", PRIVACY_SAVED_PROVENANCE_KEY]
 
 
 @pytest.mark.asyncio

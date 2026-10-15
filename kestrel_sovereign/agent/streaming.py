@@ -36,6 +36,7 @@ from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.generation_gate import judge_generation
+from kestrel_sovereign.llm.provider_policy import caller_call_override_scope
 from kestrel_sovereign.llm.invocation_context import (
     LLMInvocationContext,
     turn_invocation_scope,
@@ -1250,6 +1251,10 @@ class StreamingMixin:
                             getattr(self, "llm_service", None),
                             invocation_context,
                             session_id=session_id,
+                        ), caller_call_override_scope(
+                            # #2652: the caller's model is the caller's choice
+                            # for this turn, as in process_input.
+                            model_override, caller, via="model_override",
                         ):
                             async for chunk in self._process_input_streaming_traced_locked(
                                 user_input, model_override, session_id, _otel_span,

@@ -46,6 +46,7 @@ instead; the turn records no answer and checkpoints the tools that completed.
 ends only with a terminal response whose stop reason is a natural end.
 """
 import asyncio
+import inspect
 import logging
 import time
 from typing import (
@@ -91,7 +92,9 @@ from .generation_gate import (
     ran_inline_tools,
 )
 from .output_ceiling import IncompleteGenerationError, reported_usage
+from .provider_policy import ProviderPolicyRefusal, fallback_selection
 from .provider_registry import provider_cache_body
+from .remote_backend import REMOTE_ROUTE_NAME
 
 if TYPE_CHECKING:
     from .invocation_context import LLMInvocationContext
@@ -770,11 +773,21 @@ class StreamingMixin:
             # NEVER fold these in for a default-routing request with no active
             # mandate, or a stale fallback list would wrongly authorize/drop
             # default providers.
+            #
+            # A host with a provider policy narrows the fallbacks to those it
+            # still admits (``_admitted_mandate_fallbacks``), so a refused
+            # fallback's vendor is never authorized (#2652). A ``vendor:route``
+            # fallback authorizes its vendor.
             if not mandate_matched:
-                for fb in (getattr(self, "_mandate_fallbacks", None) or []):
-                    fb_vendor = fb.get("vendor") or fb.get("provider")
-                    if fb_vendor:
-                        authorized_vendors.add(fb_vendor)
+                admitted_fn = getattr(self, "_admitted_mandate_fallbacks", None)
+                if callable(admitted_fn):
+                    fallbacks = admitted_fn()[0]
+                else:
+                    fallbacks = getattr(self, "_mandate_fallbacks", None) or []
+                for fb in fallbacks:
+                    selection = fallback_selection(fb)
+                    if selection is not None:
+                        authorized_vendors.add(selection["vendor"])
 
         return RoutingMeta(explicit_selection, authorized_vendors)
 
@@ -1036,6 +1049,23 @@ class StreamingMixin:
             except Exception as exc:  # noqa: BLE001 - telemetry is best-effort
                 logger.warning("Failed to log streamed usage: %s", exc)
 
+    def _guard_stream_dispatch(
+        self,
+        provider_name: str,
+        model: str,
+        *,
+        path: str,
+        force_local_only: Optional[bool],
+    ) -> None:
+        """Run the host's provider-policy dispatch check, when it has one (#2652).
+
+        ``LLMService._guard_dispatch``; a process-local host with no provider
+        policy has nothing to check.
+        """
+        guard = getattr(self, "_guard_dispatch", None)
+        if guard is not None:
+            guard(provider_name, model, path=path, force_local_only=force_local_only)
+
     async def _stream_adapter_with_usage(
         self,
         *,
@@ -1059,6 +1089,7 @@ class StreamingMixin:
         cancel_token: Optional[CancelToken] = None,
         error_message_override: Optional[str] = None,
         require_completion: bool = False,
+        force_local_only: Optional[bool] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """The sole adapter streaming leaf and attempt-finalization boundary.
 
@@ -1078,7 +1109,16 @@ class StreamingMixin:
         provider reported (#3576). So is a stream whose adapter refused its
         own unfinished generation, from the usage carried on the error it
         raised (#3577).
+
+        A host with a provider policy refuses the dispatch here, before the
+        adapter is called, when the policy gives the route no authority
+        (``_guard_dispatch``, #2652); ``force_local_only`` is the call's own
+        local-only flag, which that check honors.
         """
+
+        self._guard_stream_dispatch(
+            provider_name, model, path=path, force_local_only=force_local_only
+        )
 
         common_kwargs: Dict[str, Any] = {}
         if extra_body:
@@ -1314,6 +1354,16 @@ class StreamingMixin:
                 require_completion=require_completion,
             )
 
+        try:
+            self._guard_stream_dispatch(
+                provider_name, model, path=path, force_local_only=force_local_only
+            )
+        except ProviderPolicyRefusal:
+            # Refused before the adapter runs: its call is never awaited.
+            if inspect.iscoroutine(attempt):
+                attempt.close()
+            raise
+
         report_call_attempt(provider_name, model)
         started = time.monotonic()
         response = await attempt
@@ -1462,6 +1512,7 @@ class StreamingMixin:
                             response_format=response_format,
                             extra_body=provider_cache_body(provider),
                             cancel_token=cancel_token,
+                            force_local_only=force_local_only,
                         ):
                             route_emitted = True
                             yield chunk
@@ -1617,7 +1668,7 @@ class StreamingMixin:
                         client=remote_route.client,
                         model=model,
                         messages=messages,
-                        provider_name="remote_gpu",
+                        provider_name=REMOTE_ROUTE_NAME,
                         path="generate_stream.remote_gpu",
                         invocation_context=invocation_context,
                         expose_protocol_events=False,
@@ -1690,7 +1741,7 @@ class StreamingMixin:
                         client=remote_route.client,
                         model=model,
                         messages=messages,
-                        provider_name="remote_gpu",
+                        provider_name=REMOTE_ROUTE_NAME,
                         path="stream_with_messages.remote_gpu",
                         invocation_context=invocation_context,
                         expose_protocol_events=False,
@@ -1759,6 +1810,7 @@ class StreamingMixin:
                         extra_body=provider_cache_body(provider),
                         session_id=session_id,
                         cancel_token=cancel_token,
+                        force_local_only=force_local_only,
                     ):
                         route_emitted = True
                         yield chunk
@@ -2034,7 +2086,7 @@ class StreamingMixin:
                         client=remote_route.client,
                         model=model,
                         messages=messages,
-                        provider_name="remote_gpu",
+                        provider_name=REMOTE_ROUTE_NAME,
                         path="stream_with_tool_detection",
                         invocation_context=invocation_context,
                         expose_protocol_events=True,
@@ -2128,6 +2180,7 @@ class StreamingMixin:
                         tool_executor=tool_executor,
                         cancel_token=cancel_token,
                         require_completion=True,
+                        force_local_only=force_local_only,
                     ):
                         route_emitted = True
                         yield item
@@ -2180,6 +2233,7 @@ class StreamingMixin:
                             keep_trailing_system=keep_trailing_system,
                             cancel_token=cancel_token,
                             require_completion=True,
+                            force_local_only=force_local_only,
                         ):
                             route_emitted = True
                             yield chunk

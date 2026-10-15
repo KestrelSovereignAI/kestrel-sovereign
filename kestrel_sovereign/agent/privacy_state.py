@@ -44,16 +44,30 @@ unreadable record never stands for one with no saved mandate.
 
 The record is control-plane state, not user content: it is written in every
 privacy mode, including the volatile ones.
+
+Who wrote the saved mandate is kept beside the record, in the same statement,
+as a second row (key ``privacy_saved_preference_provenance``)::
+
+    {"saved_preference": {"vendor": "anthropic", "route": "api",
+                          "model": "claude-haiku-4-5"},
+     "provenance": {"source": "sovereign", "role": "sovereign", ...}}
+
+Leaving a local-only mode restores the saved mandate under that writer's
+authority, so a mandate the agent wrote is still held to the approved provider
+chain (#2652). A saved mandate the row does not describe, including one saved
+before the row existed, is restored as the agent's. The record's own shape is
+unchanged, so an older release still reads it.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
+from kestrel_sovereign.llm.provider_policy import OverrideProvenance
 from kestrel_sovereign.privacy import (
     PRIVACY_MODES_MOST_RESTRICTIVE_FIRST,
     PrivacyMode,
@@ -64,6 +78,7 @@ from kestrel_sovereign.storage.timestamps import utc_timestamp_parameter
 logger = logging.getLogger(__name__)
 
 PRIVACY_STATE_KEY = "privacy_state"
+PRIVACY_SAVED_PROVENANCE_KEY = "privacy_saved_preference_provenance"
 PRIVACY_STATE_VERSION = 1
 FAIL_CLOSED_PRIVACY_MODE = PRIVACY_MODES_MOST_RESTRICTIVE_FIRST[0]
 
@@ -87,15 +102,24 @@ class SavedModelPreference:
 
     ``model`` ``None`` means no mandate was in force: restoring it returns the
     agent to default routing rather than pinning a route it never chose.
+
+    ``provenance`` is who wrote the mandate (#2652); None restores it as the
+    agent's. It does not take part in equality: two records of one mandate
+    are the same mandate.
     """
 
     vendor: Optional[str]
     model: Optional[str]
     route: Optional[str]
+    provenance: Optional[OverrideProvenance] = field(default=None, compare=False)
 
     @classmethod
-    def from_preference(cls, preference: Mapping[str, Any]) -> "SavedModelPreference":
-        """Capture ``LLMService.get_model_preference()`` output."""
+    def from_preference(
+        cls,
+        preference: Mapping[str, Any],
+        provenance: Optional[OverrideProvenance] = None,
+    ) -> "SavedModelPreference":
+        """Capture ``LLMService.get_model_preference()`` output, and its writer."""
         model = preference.get("model") or None
         if model is None:
             return cls(vendor=None, model=None, route=None)
@@ -103,6 +127,7 @@ class SavedModelPreference:
             vendor=preference.get("vendor") or None,
             model=model,
             route=preference.get("route") or None,
+            provenance=provenance if isinstance(provenance, OverrideProvenance) else None,
         )
 
     @property
@@ -222,7 +247,23 @@ async def load_privacy_state(db: Any, agent_id: str) -> Optional[PrivacyState]:
     rows = await _fetch_record_rows(db, agent_id)
     if not rows:
         return None
-    return PrivacyState.decode(rows[0][0])
+    state = PrivacyState.decode(rows[0][0])
+    saved = state.saved_preference
+    if saved is None or not saved.pinned:
+        return state
+    provenance = await _saved_provenance(db, agent_id, saved)
+    if provenance is None:
+        return state
+    return PrivacyState(
+        mode=state.mode,
+        saved_preference=SavedModelPreference(
+            vendor=saved.vendor,
+            model=saved.model,
+            route=saved.route,
+            provenance=provenance,
+        ),
+        transition_from=state.transition_from,
+    )
 
 
 async def _fetch_record_rows(db: Any, agent_id: str) -> list:
@@ -232,16 +273,56 @@ async def _fetch_record_rows(db: Any, agent_id: str) -> list:
     )
 
 
+async def _saved_provenance(
+    db: Any, agent_id: str, saved: SavedModelPreference
+) -> Optional[OverrideProvenance]:
+    """Who wrote ``saved``, when the provenance row still describes it."""
+    rows = await db.fetchall(
+        "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+        (agent_id, PRIVACY_SAVED_PROVENANCE_KEY),
+    )
+    if not rows or not isinstance(rows[0][0], str):
+        return None
+    try:
+        record = json.loads(rows[0][0])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(record, dict) or record.get("saved_preference") != saved.as_dict():
+        return None
+    return OverrideProvenance.from_dict(record.get("provenance"))
+
+
+def _encode_saved_provenance(state: PrivacyState) -> str:
+    saved = state.saved_preference
+    provenance = saved.provenance if saved is not None and saved.pinned else None
+    return json.dumps(
+        {
+            "saved_preference": saved.as_dict() if saved is not None else None,
+            "provenance": provenance.to_dict() if provenance is not None else None,
+        },
+        sort_keys=True,
+    )
+
+
 async def write_privacy_state(db: Any, agent_id: str, state: PrivacyState) -> None:
-    """Record ``state`` as ``agent_id``'s privacy state."""
+    """Record ``state`` as ``agent_id``'s privacy state.
+
+    The saved mandate's writer is written in the same statement, so the two
+    rows never disagree about which mandate they describe.
+    """
+    now = utc_timestamp_parameter(db.backend_type, datetime.now(timezone.utc))
     await db.execute(
         "INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at) "
-        "VALUES (?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
         (
             agent_id,
             PRIVACY_STATE_KEY,
             state.encode(),
-            utc_timestamp_parameter(db.backend_type, datetime.now(timezone.utc)),
+            now,
+            agent_id,
+            PRIVACY_SAVED_PROVENANCE_KEY,
+            _encode_saved_provenance(state),
+            now,
         ),
     )
 

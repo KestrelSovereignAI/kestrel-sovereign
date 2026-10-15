@@ -47,6 +47,10 @@ def _format_override(entry: Dict[str, Any]) -> str:
     return detail
 
 
+# How the audit view names each kind of override decision.
+_DECISION_KINDS = {"call": "per-call", "fallback": "fallback", "mandate": "mandate"}
+
+
 def _format_provider_policy(policy: Dict[str, Any]) -> str:
     """The provider policy audit view as a few lines of text (#2652)."""
     chain = " → ".join(
@@ -69,6 +73,11 @@ def _format_provider_policy(policy: Dict[str, Any]) -> str:
         if override
         else "Override in force: none"
     )
+    fallbacks = policy.get("fallbacks") or []
+    if fallbacks:
+        lines.append("Mandate fallbacks:")
+        for fallback in fallbacks:
+            lines.append(f"  - {_format_override(fallback)}")
     history = policy.get("override_history") or []
     if history:
         lines.append("Override decisions since start (newest last):")
@@ -76,7 +85,8 @@ def _format_provider_policy(policy: Dict[str, Any]) -> str:
             verdict = "accepted" if entry.get("accepted") else (
                 f"REFUSED ({(entry.get('refusal') or {}).get('error')})"
             )
-            lines.append(f"  - {verdict}: {_format_override(entry)}")
+            kind = _DECISION_KINDS.get(entry.get("kind"), "mandate")
+            lines.append(f"  - {verdict} ({kind}): {_format_override(entry)}")
     return "\n".join(lines)
 
 
