@@ -519,7 +519,7 @@ async def await_owned_task(
     task: asyncio.Future[_T],
     pending_cancellation: asyncio.CancelledError | None = None,
     *,
-    cancel_on_caller_cancellation: bool = False,
+    cancel_on_caller_cancellation: bool | Callable[[asyncio.Future[_T]], None] = False,
 ) -> OwnedTaskOutcome[_T]:
     """Retrieve ``task`` despite repeated cancellation of its caller.
 
@@ -536,6 +536,10 @@ async def await_owned_task(
     ``cancel_on_caller_cancellation`` forwards the first caller cancellation
     once to an operation that needs it to begin unwinding. Subsequent caller
     cancellations remain shielded until that same owner physically settles.
+    True uses the task's native cancel method. A synchronous callable instead
+    routes that first request through the original lifecycle owner's delivery
+    policy. A failed forwarder cannot abandon the operation: its error is
+    selected with the original task outcome only after physical joining.
     """
 
     completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -545,6 +549,7 @@ async def await_owned_task(
             completion.set_result(None)
 
     cancellation_forwarded = False
+    forwarding_error: BaseException | None = None
     task.add_done_callback(mark_complete)
     try:
         while not task.done():
@@ -553,15 +558,26 @@ async def await_owned_task(
             except asyncio.CancelledError as error:
                 if pending_cancellation is None:
                     pending_cancellation = error
-                if cancel_on_caller_cancellation and not cancellation_forwarded:
+                if (callable(cancel_on_caller_cancellation) or cancel_on_caller_cancellation) and not cancellation_forwarded:
                     # Interrupt the operation once, then own its entire unwind.
                     # Repeated caller cancellation must not interrupt cleanup.
                     cancellation_forwarded = True
-                    task.cancel()
+                    try:
+                        if callable(cancel_on_caller_cancellation):
+                            cancel_on_caller_cancellation(task)
+                        else:
+                            task.cancel()
+                    except BaseException as failure:  # noqa: BLE001 - forwarding failure cannot abandon its owner
+                        forwarding_error = failure
     finally:
         task.remove_done_callback(mark_complete)
 
     error = owned_task_error(task)
+    if forwarding_error is not None:
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        error = execution_terminal_error(error, forwarding_error)
+        if error is not forwarding_error:
+            error.add_note(f"cancellation forwarding also failed: {forwarding_error}")
     if error is not None:
         return OwnedTaskOutcome(None, error, pending_cancellation)
     return OwnedTaskOutcome(task.result(), None, pending_cancellation)

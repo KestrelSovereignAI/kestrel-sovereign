@@ -15,6 +15,7 @@ import kestrel_sovereign
 from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
     await_owned_task,
+    create_owned_task,
     raise_owned_outcome,
     run_blocking_operation,
 )
@@ -121,6 +122,143 @@ async def test_preexisting_cancellation_is_propagated_after_owned_result():
 
     with pytest.raises(asyncio.CancelledError, match="already cancelled"):
         raise_owned_outcome(outcome, operation="test operation")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_stopping", [False, True])
+@pytest.mark.parametrize("falsey", [False, True])
+async def test_owned_cancellation_forwarder_uses_original_owner_once(already_stopping, falsey):
+    entered, unwinding, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    forwards = []
+
+    async def operation():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            unwinding.set()
+            await release.wait()
+
+    task = create_owned_task(operation())
+
+    def forward(original):
+        assert original is task
+        forwards.append(original)
+        if not already_stopping:
+            original.cancel()
+
+    class FalseyForwarder:
+        def __bool__(self):
+            return False
+
+        def __call__(self, original):
+            forward(original)
+
+    policy = FalseyForwarder() if falsey else forward
+    owner = create_owned_task(await_owned_task(task, cancel_on_caller_cancellation=policy))
+    try:
+        await entered.wait()
+        if already_stopping:
+            task.cancel()
+            await asyncio.wait_for(unwinding.wait(), 1)
+        owner.cancel("original caller stop")
+        await asyncio.wait_for(unwinding.wait(), 1)
+        await asyncio.sleep(0)
+        owner.cancel("repeated caller stop")
+        await asyncio.sleep(0)
+        assert not owner.done(), "forwarding interrupted the original unwind"
+        release.set()
+        result = (await await_owned_task(owner)).result
+        assert forwards == [task]
+        assert isinstance(result.error, asyncio.CancelledError)
+        assert result.cancellation.args == ("original caller stop",)
+        assert task.cancelling() == 1
+    finally:
+        release.set()
+        if not task.done() and not task.cancelling():
+            task.cancel()
+        await await_owned_task(task)
+        await await_owned_task(owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", [False, True])
+async def test_forwarder_failure_preserves_original_owned_error(control):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+    entered, release, forwarded = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = ExecutionAuthorityError("original work denied") if control else LookupError("original work failed")
+    forwarding_failure = ValueError("original forwarding failure")
+
+    async def operation():
+        entered.set()
+        await release.wait()
+        raise original
+
+    def forward(_task):
+        forwarded.set()
+        raise forwarding_failure
+
+    task = create_owned_task(operation())
+    owner = create_owned_task(await_owned_task(task, cancel_on_caller_cancellation=forward))
+    try:
+        await entered.wait()
+        owner.cancel("original caller stop")
+        await asyncio.wait_for(forwarded.wait(), 1)
+        assert not owner.done()
+        release.set()
+        result = (await await_owned_task(owner)).result
+        assert result.error is original
+        assert any(str(forwarding_failure) in note for note in result.error.__notes__)
+        assert result.cancellation.args == ("original caller stop",)
+    finally:
+        release.set()
+        await await_owned_task(task)
+        await await_owned_task(owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", [False, True])
+async def test_failed_cancellation_forwarder_still_physically_joins(control):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+    entered, release, forwarded = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    failure = ExecutionAuthorityError("forwarder denied") if control else ValueError("forwarder failed")
+
+    async def operation():
+        entered.set()
+        await release.wait()
+        return "physically settled"
+
+    def forward(_task):
+        forwarded.set()
+        raise failure
+
+    task = create_owned_task(operation())
+    owner = create_owned_task(await_owned_task(task, cancel_on_caller_cancellation=forward))
+    try:
+        await entered.wait()
+        owner.cancel("original caller stop")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not owner.done(), "a failed forwarder abandoned the owned operation"
+        assert forwarded.is_set()
+        release.set()
+        result = (await await_owned_task(owner)).result
+        assert result.error is failure and task.result() == "physically settled"
+        assert result.cancellation.args == ("original caller stop",)
+        if control:
+            with pytest.raises(ExecutionAuthorityError) as caught:
+                raise_owned_outcome(result, operation="forwarding test")
+            assert caught.value is failure
+        else:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                raise_owned_outcome(result, operation="forwarding test")
+            assert caught.value.__cause__ is failure
+    finally:
+        release.set()
+        await await_owned_task(task)
+        await await_owned_task(owner)
 
 
 _TEARDOWN_SCENARIO = """
