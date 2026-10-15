@@ -4,17 +4,34 @@ Pytest configuration for integration tests.
 Provides fixtures and utilities specific to integration testing,
 including handling of bootstrap state for test agents.
 """
-import os
-
 import pytest
-import pytest_asyncio
 
+from tests.integration.live_routes import LiveCallBudget, record_backstop
 from tests.utils.ci_budget import refuse_unbudgeted_timeouts
 
 
 def pytest_collection_modifyitems(config, items):
     """Refuse a per-test timeout the tier's wall-clock budget cannot hold."""
     refuse_unbudgeted_timeouts(config, items, "integration")
+
+
+@pytest.hookimpl(optionalhook=True, tryfirst=True)
+def pytest_timeout_set_timer(item, settings):
+    """Start the test's live-route budget on the clock pytest-timeout arms (#3269).
+
+    Returns None, so pytest-timeout's own implementation still arms the timer.
+    """
+    record_backstop(item, settings.timeout)
+
+
+@pytest.fixture
+def live_call_budget(request):
+    """The share of this test's timeout its live-route calls and probes may spend.
+
+    One instance per test: every call and probe in it draws on the same
+    budget, so their deadlines together fit inside the timeout (#3269).
+    """
+    return LiveCallBudget.for_test(request.node)
 
 
 @pytest.fixture(autouse=True)
