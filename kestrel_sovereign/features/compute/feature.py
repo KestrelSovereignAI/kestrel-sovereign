@@ -35,7 +35,7 @@ from .presenters import (
     present_script_list,
 )
 from .script_store import ScriptStore
-from .script_signer import ScriptSigner
+from .script_signer import ScriptSigner, accept_legacy_signatures_from_env
 from .script_analyzer import ScriptAnalyzer
 from .destructive_policy import DestructiveOperationPolicy
 from .trash_manager import TrashManager
@@ -120,7 +120,11 @@ class ComputeFeature(Feature):
 
         # Initialize components
         self.script_store = ScriptStore(db_path)
-        self.signer = ScriptSigner(agent_did, db_path)
+        self.signer = ScriptSigner(
+            agent_did,
+            db_path,
+            accept_legacy_signatures=accept_legacy_signatures_from_env(),
+        )
         self.analyzer = ScriptAnalyzer()
         self.trash_manager = TrashManager(current_agent_data_path=current_agent_data_path)
         self._destructive_policy = DestructiveOperationPolicy(

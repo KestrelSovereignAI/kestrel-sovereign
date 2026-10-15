@@ -398,10 +398,10 @@ class TestScriptSigner:
 
     @pytest.mark.asyncio
     async def test_sign_produces_ecdsa_prefix(self, signer_with_ecdsa_keys, sample_script):
-        """sign() with valid keys produces an ecdsa:-prefixed signature."""
+        """sign() with valid keys produces a v2 ecdsa signature (#2484)."""
         signature = await signer_with_ecdsa_keys.sign(sample_script)
         assert signature is not None
-        assert signature.startswith("ecdsa:")
+        assert signature.startswith("v2:ecdsa:")
 
     @pytest.mark.asyncio
     async def test_verify_rejects_hmac_prefix(self, signer_with_ecdsa_keys, sample_script):
@@ -450,7 +450,7 @@ class TestScriptSigner:
         updated = await signer_with_ecdsa_keys.sign_and_update(sample_script)
 
         assert updated.signature is not None
-        assert updated.signature.startswith("ecdsa:")
+        assert updated.signature.startswith("v2:ecdsa:")
         assert updated.signed_by == "did:ethr:0xtest"
         assert updated.signed_at is not None
 

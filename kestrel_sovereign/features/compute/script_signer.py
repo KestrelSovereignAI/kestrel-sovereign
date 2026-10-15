@@ -6,25 +6,166 @@ Ensures scripts cannot be tampered with after agent creates them.
 
 Sign-or-fail: if the agent's signing keys are unavailable, signing raises
 ``ScriptSigningKeysUnavailable``. There is no fallback. Verification rejects
-any signature whose prefix is not ``ecdsa:``; the historical ``hmac:`` prefix
-used a public DID as the HMAC key and was forgeable by anyone who could read
-the script. See ``docs/architecture/security/CRYPTO_INVENTORY.md`` and the
-Wave 0B section of the Quantum Hardening epic.
+the historical ``hmac:`` prefix, which used a public DID as the HMAC key and
+was forgeable by anyone who could read the script. See
+``docs/architecture/security/CRYPTO_INVENTORY.md`` and the Wave 0B section of
+the Quantum Hardening epic.
+
+Signature versions (#2484). A signature string names the version of the
+bytes it signs:
+
+- **v2** (``v2:ecdsa:…`` / ``v2:hybrid:…``): signs
+  :func:`canonical_script_bytes_v2`, a sequence of length-framed byte strings
+  carrying a domain tag, the version, and each signed field's name and exact
+  UTF-8 value. Every new signature is v2.
+- **v1** (untagged ``ecdsa:…`` / ``hybrid:…``): signs a hash of
+  ``name|language|content|purpose``. The ``|`` is neither framed nor escaped,
+  so moving one between adjacent fields leaves the digest unchanged and a v1
+  signature over one script verifies for another. v1 is verified only during
+  the compatibility window that :data:`ACCEPT_LEGACY_SIGNATURES_ENV` closes,
+  and each v1 acceptance logs a WARNING naming the script.
+
+Any other ``v<N>:`` tag is an unknown version and is refused; it is never
+verified as v1. The removal plan for v1 is in
+``docs/architecture/COMPUTE_FEATURE_DESIGN.md`` §3.6.
 """
 
 import hashlib
 import logging
+import os
+import re
+import struct
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional, Tuple
 
 from .models import ComputeScript
 
 logger = logging.getLogger(__name__)
 
+#: Version of every signature :meth:`ScriptSigner.sign` produces.
+CURRENT_SIGNATURE_VERSION = 2
+#: Version of the untagged legacy signatures, verified only while the
+#: compatibility window is open.
+LEGACY_SIGNATURE_VERSION = 1
+
+#: Environment switch for the v1 compatibility window. Unset means open.
+ACCEPT_LEGACY_SIGNATURES_ENV = "KESTREL_COMPUTE_ACCEPT_LEGACY_SCRIPT_SIGNATURES"
+
+_V2_TAG = f"v{CURRENT_SIGNATURE_VERSION}:"
+# Matches any version tag. A tag other than _V2_TAG ("v3:", "v02:", "v1:")
+# is an unknown version: v1 signatures never carried a tag.
+_VERSION_TAG = re.compile(r"v[0-9]+:")
+_SIGNATURE_SCHEMES = frozenset({"ecdsa", "hybrid"})
+
+# The v2 canonical form. Changing any of these changes the signed bytes and
+# therefore requires a new signature version.
+_V2_DOMAIN = b"kestrel.compute.script-signature"
+_V2_FIELDS = ("name", "language", "content", "purpose")
+_V2_FRAME_LENGTH = struct.Struct(">Q")
+
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
 
 class ScriptSigningKeysUnavailable(Exception):
     """Raised when ScriptSigner.sign is invoked without usable signing keys."""
+
+
+class ScriptSignatureEncodingError(ValueError):
+    """Raised when a script's signed fields cannot be encoded canonically:
+    a field is not a ``str``, or it holds a lone surrogate that has no UTF-8
+    encoding."""
+
+
+def accept_legacy_signatures_from_env(
+    environ: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Read the v1 compatibility-window switch.
+
+    Unset or empty means the window is open (v1 accepted). An unrecognised
+    value raises rather than guessing which way a security switch was meant.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(ACCEPT_LEGACY_SIGNATURES_ENV, "").strip().lower()
+    if not raw:
+        return True
+    if raw in _TRUE_VALUES:
+        return True
+    if raw in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"{ACCEPT_LEGACY_SIGNATURES_ENV}={raw!r} is not a boolean; use one of "
+        f"{sorted(_TRUE_VALUES | _FALSE_VALUES)}."
+    )
+
+
+def _frame(data: bytes) -> bytes:
+    return _V2_FRAME_LENGTH.pack(len(data)) + data
+
+
+def _encode_signed_field(script: ComputeScript, field_name: str) -> bytes:
+    value = getattr(script, field_name)
+    if not isinstance(value, str):
+        raise ScriptSignatureEncodingError(
+            f"Script field {field_name!r} must be str to be signed, "
+            f"got {type(value).__name__}"
+        )
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ScriptSignatureEncodingError(
+            f"Script field {field_name!r} has no UTF-8 encoding: {e.reason}"
+        ) from e
+
+
+def canonical_script_bytes_v2(script: ComputeScript) -> bytes:
+    """Return the bytes a v2 script signature signs.
+
+    The layout is a sequence of frames, each an unsigned 64-bit big-endian
+    byte length followed by that many bytes::
+
+        frame(b"kestrel.compute.script-signature")
+        frame(b"2")
+        frame(b"name")     frame(utf8(name))
+        frame(b"language") frame(utf8(language))
+        frame(b"content")  frame(utf8(content))
+        frame(b"purpose")  frame(utf8(purpose))
+
+    Length framing makes the encoding injective: no choice of field values
+    can move bytes from one field into another. Values are bound exactly as
+    stored, with no Unicode normalisation, so two strings that render alike
+    but differ in code points sign differently. The leading domain tag names
+    what the bytes are, so a signature over them is not also a signature over
+    another kind of artifact unless that artifact's encoding begins with the
+    same frame. The version frame binds the version inside the signed bytes.
+
+    Raises:
+        ScriptSignatureEncodingError: a signed field is not a ``str`` or
+            cannot be encoded as UTF-8.
+    """
+    frames = [_V2_DOMAIN, str(CURRENT_SIGNATURE_VERSION).encode("ascii")]
+    for field_name in _V2_FIELDS:
+        frames.append(field_name.encode("ascii"))
+        frames.append(_encode_signed_field(script, field_name))
+    return b"".join(_frame(frame) for frame in frames)
+
+
+def _legacy_v1_signing_message(script: ComputeScript) -> bytes:
+    """Return the bytes a legacy v1 signature signs.
+
+    Kept byte-for-byte as it was signed so existing signatures verify during
+    the compatibility window. Ambiguous by construction (see module
+    docstring); never used to sign.
+    """
+    canonical = f"{script.name}|{script.language}|{script.content}|{script.purpose}"
+    try:
+        content_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    except UnicodeEncodeError as e:
+        raise ScriptSignatureEncodingError(
+            f"Script fields have no UTF-8 encoding: {e.reason}"
+        ) from e
+    return hashlib.sha256(content_hash.encode()).digest()
 
 
 class ScriptSigner:
@@ -45,16 +186,25 @@ class ScriptSigner:
         is_valid = await signer.verify(script)
     """
     
-    def __init__(self, agent_did: Optional[str], db_path: str):
+    def __init__(
+        self,
+        agent_did: Optional[str],
+        db_path: str,
+        *,
+        accept_legacy_signatures: bool = True,
+    ):
         """
         Initialize the script signer.
 
         Args:
             agent_did: The agent's DID (did:ethr:0x...)
             db_path: Path to the database (for key retrieval)
+            accept_legacy_signatures: Whether untagged v1 signatures still
+                verify. False closes the compatibility window.
         """
         self.agent_did = agent_did
         self.db_path = db_path
+        self.accept_legacy_signatures = accept_legacy_signatures
         self._private_key = None
         self._public_key = None
         self._key_id: Optional[str] = None
@@ -199,28 +349,6 @@ class ScriptSigner:
             logger.warning(f"Failed to load signing keys: {e}")
             return False
     
-    def _content_hash(self, script: ComputeScript) -> str:
-        """
-        Create a deterministic hash of script content for signing.
-        
-        The hash includes:
-        - Script name
-        - Language
-        - Content
-        - Purpose
-        
-        This ensures any modification invalidates the signature.
-        
-        Args:
-            script: The script to hash
-            
-        Returns:
-            Hex-encoded SHA-256 hash
-        """
-        # Canonical representation for hashing
-        canonical = f"{script.name}|{script.language}|{script.content}|{script.purpose}"
-        return hashlib.sha256(canonical.encode()).hexdigest()
-    
     async def sign(self, script: ComputeScript) -> str:
         """
         Sign a script's content.
@@ -228,32 +356,33 @@ class ScriptSigner:
         Sign-or-fail. If the agent's keys cannot be loaded, raises
         ``ScriptSigningKeysUnavailable``. There is no fallback.
 
+        Every signature is version 2: it signs
+        :func:`canonical_script_bytes_v2` and carries the ``v2:`` tag.
+
         Wire format:
 
         - **Hybrid agent** (post-rotation ceremony, ``self._agent_identity.is_hybrid``):
-          returns ``hybrid:<base64>`` where the base64 wraps a JSON list of
-          ``{alg, kid, sig}`` objects (Ed25519 + ML-DSA-65). Verifiers that
-          understand the new format check both signatures; older verifiers
-          will see a non-``ecdsa:`` prefix and reject — which is the correct
-          behavior for a tamper-aware system.
-        - **Legacy agent** (pre-ceremony or fallback): returns
-          ``ecdsa:<base64>`` (single secp256k1 ECDSA signature, unchanged).
+          returns ``v2:hybrid:<base64>`` where the base64 wraps a JSON list of
+          ``{alg, kid, sig}`` objects (Ed25519 + ML-DSA-65).
+        - **Legacy-key agent** (pre-ceremony): returns ``v2:ecdsa:<base64>``
+          (single secp256k1 ECDSA signature).
 
         Args:
             script: The script to sign
 
         Returns:
-            Signature string with either ``hybrid:`` or ``ecdsa:`` prefix.
+            Signature string with a ``v2:hybrid:`` or ``v2:ecdsa:`` prefix.
 
         Raises:
             ScriptSigningKeysUnavailable: when keys cannot be loaded or the
                 signing operation fails.
+            ScriptSignatureEncodingError: when a signed field cannot be
+                encoded canonically.
         """
         import base64
         import json
 
-        content_hash = self._content_hash(script)
-        content_hash_bytes = hashlib.sha256(content_hash.encode()).digest()
+        message = canonical_script_bytes_v2(script)
 
         # Either a legacy ECDSA private key OR a hybrid identity
         # capable of signing must be available. Post-destruction
@@ -299,28 +428,28 @@ class ScriptSigner:
                     vms[1]["id"].rsplit("#", 1)[-1] if len(vms) > 1 else "key-2",
                 )
                 sigs = sign_hybrid(
-                    content_hash_bytes,
+                    message,
                     identity.hybrid_keypair,
                     classical_kid=classical_kid,
                     pq_kid=pq_kid,
                 )
                 payload = base64.b64encode(json.dumps(sigs).encode()).decode()
-                return f"hybrid:{payload}"
+                return f"{_V2_TAG}hybrid:{payload}"
             except Exception as e:
                 raise ScriptSigningKeysUnavailable(
                     f"Hybrid signing failed for script {script.id[:8]}…: {e}"
                 ) from e
 
-        # Legacy path: route through Secp256k1Suite. Byte-identical to
-        # the previous direct ec.ECDSA(SHA256) call; pinned by the
-        # CryptoSuite behavior-preservation pair test.
+        # Legacy-key path: route through Secp256k1Suite. The suite call is
+        # byte-identical to the previous direct ec.ECDSA(SHA256) call;
+        # pinned by the CryptoSuite behavior-preservation pair test.
         from kestrel_sovereign.security.crypto_suite import (
             ALG_ECDSA_SECP256K1_SHA256, CryptoSuiteError, get_suite,
         )
         suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
         try:
-            signature_bytes = suite.sign(content_hash_bytes, self._private_key)
-            return "ecdsa:" + base64.b64encode(signature_bytes).decode()
+            signature_bytes = suite.sign(message, self._private_key)
+            return f"{_V2_TAG}ecdsa:" + base64.b64encode(signature_bytes).decode()
         except (CryptoSuiteError, Exception) as e:
             raise ScriptSigningKeysUnavailable(
                 f"ECDSA signing failed for script {script.id[:8]}…: {e}"
@@ -330,25 +459,28 @@ class ScriptSigner:
         """
         Verify a script's signature.
 
-        Accepts either:
+        The signature's version selects the bytes it is checked against:
 
-        - ``hybrid:<base64-of-json-array>`` — the post-ceremony format.
-          The base64 wraps a JSON list of ``{alg, kid, sig}`` objects.
-          Returns True if at least one signature in the list verifies
-          against the agent's loaded hybrid identity. (We don't require
-          BOTH halves to verify here — script signing is "did this agent
-          produce this byte sequence?" and either half answering yes is
-          a definitive yes. The chain walker enforces hybrid policy on
-          the artifacts where it matters — live identity assertion.)
+        - ``v2:<scheme>:<payload>`` — :func:`canonical_script_bytes_v2`.
+        - untagged ``<scheme>:<payload>`` — the legacy v1 message, only while
+          ``accept_legacy_signatures`` is True. Each v1 acceptance logs a
+          WARNING naming the script so it can be re-signed.
 
-        - ``ecdsa:<base64>`` — the legacy single-signature format.
-          Continues to verify against the agent's legacy ECDSA key, so
-          scripts signed before the rotation ceremony stay valid.
+        Schemes:
+
+        - ``hybrid`` — base64 of a JSON list of ``{alg, kid, sig}`` objects.
+          Every entry must verify against the agent's loaded hybrid identity,
+          and both Ed25519 and ML-DSA-65 must be present.
+        - ``ecdsa`` — base64 of a single secp256k1 signature, verified against
+          the agent's legacy ECDSA key, so scripts signed before the rotation
+          ceremony stay valid.
 
         Rejects:
 
         - ``hmac:`` — the removed fallback that used the public DID
           as the HMAC key (forgeable by any reader).
+        - Any version tag other than ``v2:`` — unknown versions are refused,
+          never verified as v1.
         - Anything else — unknown format, refuse rather than guess.
 
         Args:
@@ -370,29 +502,77 @@ class ScriptSigner:
             )
             return False
 
-        content_hash = self._content_hash(script)
-        content_hash_bytes = hashlib.sha256(content_hash.encode()).digest()
+        parsed = self._parse_signature(script)
+        if parsed is None:
+            return False
+        version, scheme, payload = parsed
+
+        if version == LEGACY_SIGNATURE_VERSION and not self.accept_legacy_signatures:
+            logger.warning(
+                f"Script {script.id} carries a legacy v1 signature and the v1 "
+                f"compatibility window is closed (see "
+                f"{ACCEPT_LEGACY_SIGNATURES_ENV}). Rejecting; re-sign the "
+                "script to give it a v2 signature."
+            )
+            return False
+
+        try:
+            if version == CURRENT_SIGNATURE_VERSION:
+                message = canonical_script_bytes_v2(script)
+            else:
+                message = _legacy_v1_signing_message(script)
+        except ScriptSignatureEncodingError as e:
+            logger.warning(f"Script {script.id[:8]}… cannot be verified: {e}")
+            return False
 
         if not await self._load_keys():
             logger.warning("Cannot verify signature: failed to load keys")
             return False
 
-        # Hybrid format
-        if script.signature.startswith("hybrid:"):
-            return self._verify_hybrid(script, content_hash_bytes)
+        if scheme == "hybrid":
+            valid = self._verify_hybrid(payload, message)
+        else:
+            valid = self._verify_ecdsa(payload, message)
 
-        # Legacy ECDSA format
-        if script.signature.startswith("ecdsa:"):
-            return self._verify_legacy_ecdsa(script, content_hash_bytes)
+        if valid and version == LEGACY_SIGNATURE_VERSION:
+            logger.warning(
+                f"Script {script.id} verified with a legacy v1 signature. v1 "
+                "signatures hash an unframed 'name|language|content|purpose' "
+                "string, so one can verify for a different script. Re-sign "
+                "the script to give it a v2 signature before the v1 "
+                f"compatibility window ({ACCEPT_LEGACY_SIGNATURES_ENV}) closes."
+            )
+        return valid
 
-        logger.warning(f"Unknown signature format: {script.signature[:10]}…")
-        return False
+    @staticmethod
+    def _parse_signature(script: ComputeScript) -> Optional[Tuple[int, str, str]]:
+        """Split a signature into ``(version, scheme, payload)``.
 
-    def _verify_legacy_ecdsa(
-        self, script: ComputeScript, content_hash_bytes: bytes,
-    ) -> bool:
-        """Verify the ``ecdsa:<base64>`` legacy format against the
-        agent's secp256k1 public key."""
+        Returns None, after logging why, for an unknown version tag or an
+        unknown scheme.
+        """
+        signature = script.signature
+        if signature.startswith(_V2_TAG):
+            version, body = CURRENT_SIGNATURE_VERSION, signature[len(_V2_TAG):]
+        else:
+            tag = _VERSION_TAG.match(signature)
+            if tag is not None:
+                logger.warning(
+                    f"Script {script.id[:8]}… carries signature version tag "
+                    f"{tag.group(0)!r}, which this verifier does not know. "
+                    "Rejecting; an unknown version is never verified as v1."
+                )
+                return None
+            version, body = LEGACY_SIGNATURE_VERSION, signature
+        scheme, separator, payload = body.partition(":")
+        if not separator or scheme not in _SIGNATURE_SCHEMES:
+            logger.warning(f"Unknown signature format: {signature[:10]}…")
+            return None
+        return version, scheme, payload
+
+    def _verify_ecdsa(self, payload: str, message: bytes) -> bool:
+        """Verify a base64 secp256k1 ECDSA signature over ``message``
+        against the agent's legacy public key."""
         import base64
         if self._public_key is None:
             logger.warning("Cannot verify ECDSA signature without public key")
@@ -401,9 +581,9 @@ class ScriptSigner:
             ALG_ECDSA_SECP256K1_SHA256, get_suite,
         )
         try:
-            signature_bytes = base64.b64decode(script.signature[len("ecdsa:"):])
+            signature_bytes = base64.b64decode(payload)
             suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
-            if suite.verify(content_hash_bytes, signature_bytes, self._public_key):
+            if suite.verify(message, signature_bytes, self._public_key):
                 return True
             logger.warning("ECDSA signature verification failed")
             return False
@@ -411,12 +591,10 @@ class ScriptSigner:
             logger.warning(f"ECDSA signature verification failed: {e}")
             return False
 
-    def _verify_hybrid(
-        self, script: ComputeScript, content_hash_bytes: bytes,
-    ) -> bool:
-        """Verify the ``hybrid:<base64-json>`` format against the
-        agent's loaded hybrid keypair. At least one signature in the
-        embedded array must verify."""
+    def _verify_hybrid(self, payload: str, message: bytes) -> bool:
+        """Verify a base64-wrapped JSON hybrid signature array over
+        ``message`` against the agent's loaded hybrid keypair. Every
+        entry must verify, and both halves must be present."""
         import base64, json
         identity = self._agent_identity
         if identity is None or not identity.is_hybrid:
@@ -427,8 +605,7 @@ class ScriptSigner:
             )
             return False
         try:
-            payload_b64 = script.signature[len("hybrid:"):]
-            sigs_json = base64.b64decode(payload_b64).decode("utf-8")
+            sigs_json = base64.b64decode(payload).decode("utf-8")
             sigs = json.loads(sigs_json)
             if not isinstance(sigs, list) or not sigs:
                 logger.warning("Hybrid signature payload is empty or not a list")
@@ -465,13 +642,17 @@ class ScriptSigner:
         #    that's the attack hybrid is here to prevent.
         algs_seen: set[str] = set()
         for entry in sigs:
-            try:
-                alg = entry["alg"]
-                kid = entry["kid"]
-                sig_hex = entry["sig"]
-            except (TypeError, KeyError):
+            # Every field is used as a dict key or parsed as hex below, so a
+            # non-string value (e.g. a list kid) must be refused here rather
+            # than raise out of verify().
+            fields = (
+                (entry.get("alg"), entry.get("kid"), entry.get("sig"))
+                if isinstance(entry, dict) else (None, None, None)
+            )
+            if not all(isinstance(value, str) for value in fields):
                 logger.warning("Hybrid signature entry malformed; rejecting")
                 return False
+            alg, kid, sig_hex = fields
             kp = kid_to_pub.get(kid)
             if kp is None or kp.suite_id != alg:
                 logger.warning(
@@ -487,7 +668,7 @@ class ScriptSigner:
                 logger.warning(f"Hybrid signature {kid} has malformed hex; rejecting")
                 return False
             suite = get_suite(alg)
-            if not suite.verify(content_hash_bytes, sig_bytes, kp.public_key):
+            if not suite.verify(message, sig_bytes, kp.public_key):
                 logger.warning(
                     f"Hybrid signature {kid} ({alg}) failed crypto verify; rejecting"
                 )
@@ -514,6 +695,10 @@ class ScriptSigner:
         Sign a script and update its signature fields.
         
         Convenience method that signs and updates the script in place.
+        Re-signing a script that carries a legacy v1 signature replaces it
+        with a v2 signature over the fields as they are now. Only re-sign a
+        script whose fields have been reviewed: a v1 signature does not prove
+        they are the fields that were originally signed.
         
         Args:
             script: The script to sign

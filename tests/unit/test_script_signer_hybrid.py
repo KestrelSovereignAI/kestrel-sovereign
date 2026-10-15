@@ -3,10 +3,10 @@ ScriptSigner hybrid-format tests — Quantum Hardening epic, signing-path
 follow-up to PR #999.
 
 Covers:
-- Pre-ceremony agent: signs ``ecdsa:`` (unchanged), verify still works
-- Post-ceremony agent: signs ``hybrid:`` and verify accepts the new format
-- Cross-format: a script signed pre-ceremony (legacy ``ecdsa:``) still
-  verifies after the agent rotates (legacy keypair is still loaded)
+- Pre-ceremony agent: signs ``v2:ecdsa:``, verify still works
+- Post-ceremony agent: signs ``v2:hybrid:`` and verify accepts the new format
+- Cross-format: a script signed pre-ceremony (legacy untagged ``ecdsa:``)
+  still verifies after the agent rotates (legacy keypair is still loaded)
 - Tamper detection: any tampered byte in the hybrid payload makes
   verify return False
 - Bad-shape rejection: ``hmac:``, unknown prefix, empty payload all
@@ -93,7 +93,7 @@ def _make_script(content: str = "print('hello')") -> ComputeScript:
 
 
 # ---------------------------------------------------------------------------
-# Pre-ceremony: ecdsa: format unchanged
+# Pre-ceremony: v2:ecdsa: format
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -103,13 +103,13 @@ async def test_legacy_agent_signs_ecdsa(legacy_agent_dir):
     signer = ScriptSigner(agent_did=f"did:ethr:{legacy_did.split(':')[-1]}", db_path=db_path)
     script = _make_script()
     sig = await signer.sign(script)
-    assert sig.startswith("ecdsa:"), f"expected ecdsa: prefix, got {sig[:20]}"
+    assert sig.startswith("v2:ecdsa:"), f"expected v2:ecdsa: prefix, got {sig[:20]}"
     script.signature = sig
     assert await signer.verify(script) is True
 
 
 # ---------------------------------------------------------------------------
-# Post-ceremony: hybrid: format
+# Post-ceremony: v2:hybrid: format
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -119,11 +119,11 @@ async def test_hybrid_agent_signs_hybrid_format(post_ceremony_agent_dir):
     signer = ScriptSigner(agent_did=f"did:ethr:{legacy_did.split(':')[-1]}", db_path=db_path)
     script = _make_script("print('hybrid world')")
     sig = await signer.sign(script)
-    assert sig.startswith("hybrid:"), f"expected hybrid: prefix, got {sig[:20]}"
+    assert sig.startswith("v2:hybrid:"), f"expected v2:hybrid: prefix, got {sig[:20]}"
 
     # Decode the wrapped JSON and confirm both algs are present
     import base64
-    payload = json.loads(base64.b64decode(sig[len("hybrid:"):]).decode())
+    payload = json.loads(base64.b64decode(sig[len("v2:hybrid:"):]).decode())
     algs = {entry["alg"] for entry in payload}
     assert "ed25519" in algs
     assert "ml-dsa-65" in algs
@@ -250,9 +250,41 @@ async def test_post_destruction_hybrid_signing_still_works(post_ceremony_agent_d
     signer = ScriptSigner(agent_did=f"did:ethr:{address}", db_path=db_path)
     script = _make_script("post-destruction signing")
     sig = await signer.sign(script)
-    assert sig.startswith("hybrid:"), f"expected hybrid, got {sig[:20]}"
+    assert sig.startswith("v2:hybrid:"), f"expected v2:hybrid, got {sig[:20]}"
     script.signature = sig
     assert await signer.verify(script) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag", ["v2:", ""])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"alg": "ed25519", "kid": [], "sig": "00"},
+        {"alg": "ed25519", "kid": "KID", "sig": 5},
+        {"alg": ["ed25519"], "kid": "KID", "sig": "00"},
+        {"alg": "ed25519", "kid": {"a": 1}, "sig": "00"},
+        {"alg": "ed25519", "sig": "00"},
+        "ed25519",
+        None,
+    ],
+)
+async def test_hybrid_entry_with_non_string_fields_rejected(
+    post_ceremony_agent_dir, tag, entry,
+):
+    """A crafted entry must make verify() return False, never raise."""
+    import base64
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    db_path = str(storage_dir / "x.db")
+    signer = ScriptSigner(agent_did=f"did:ethr:{legacy_did.split(':')[-1]}", db_path=db_path)
+    assert await signer._load_keys() is True
+    kid = signer._agent_identity.new_verification_methods[0]["id"].rsplit("#", 1)[-1]
+    if isinstance(entry, dict):
+        entry = {k: (kid if v == "KID" else v) for k, v in entry.items()}
+    script = _make_script()
+    payload = base64.b64encode(json.dumps([entry]).encode()).decode()
+    script.signature = f"{tag}hybrid:{payload}"
+    assert await signer.verify(script) is False
 
 
 @pytest.mark.asyncio
