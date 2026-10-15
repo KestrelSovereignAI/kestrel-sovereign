@@ -35,7 +35,12 @@ from kestrel_sovereign.command_policy import (
     RECOVERY_COMMANDS,
     TURN_QUEUE_BYPASS_COMMANDS,
 )
-from kestrel_sovereign.llm.call_progress import report_call_attempt
+from kestrel_sovereign.llm.call_progress import (
+    AttemptInactivityTimeout,
+    report_call_attempt,
+)
+from kestrel_sovereign.llm.error_handling import LLMError
+from kestrel_sovereign.llm.output_ceiling import incomplete_generation
 from tests.shared.booted_agent import booted_agent
 from tests.unit.test_llm_call_watchdog import _conversation_holder, _invoke_client
 from tests.utils.virtual_clock import (
@@ -294,7 +299,11 @@ async def test_a_stalled_cloud_call_fails_on_its_bound_and_frees_the_queue(
 ):
     """The incident's route, its first call never answering. The turn fails
     on the watchdog with an error naming the route and model, the request is
-    cancelled, the WARNING names them too, and the next turn is answered."""
+    cancelled, the WARNING names them too, and the next turn is answered.
+
+    The route is the call's only candidate, so its attempt's bound is the
+    call's (#1968): abandoned, it fails the way any failure of the call's
+    last route does, with that attempt as the call's verdict."""
     caplog.set_level(logging.WARNING)
     async with _agent(tmp_path) as agent:
         endpoint = _OpenRouter(HANG, _answer("Noted."))
@@ -307,7 +316,7 @@ async def test_a_stalled_cloud_call_fails_on_its_bound_and_frees_the_queue(
 
         loop = asyncio.get_running_loop()
         started = loop.time()
-        with pytest.raises(LLMCallInactivityTimeout) as raised:
+        with pytest.raises(LLMError) as raised:
             await asyncio.wait_for(
                 _turn(agent, door, "What is on my calendar?", "s1"), HANG_GUARD,
             )
@@ -315,7 +324,10 @@ async def test_a_stalled_cloud_call_fails_on_its_bound_and_frees_the_queue(
 
         assert recorded_bounds == [(TURN_BOUND, None)]
         assert TURN_BOUND <= elapsed < TURN_BOUND + 10
-        assert (raised.value.provider, raised.value.model) == (ROUTE, MODEL)
+        abandoned = incomplete_generation(raised.value)
+        assert isinstance(abandoned, AttemptInactivityTimeout)
+        assert (abandoned.provider, abandoned.model) == (ROUTE, MODEL)
+        assert abandoned.timeout == TURN_BOUND
         assert endpoint.cancelled == 1, "the provider request was left running"
         assert _conversation_holder(agent) is None
         _assert_logged_the_stuck_route(caplog)
