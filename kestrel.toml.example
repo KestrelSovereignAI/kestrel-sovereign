@@ -893,3 +893,29 @@ role = "technical_reviewer"
 # enabled = true            # default false — opt-in
 # delete_threshold = 0.02   # strength below this (and past grace) is eligible
 # delete_grace_days = 90    # minimum lifetime regardless of strength
+
+
+# ---------------------------------------------------------------------------
+# [heartbeat] — periodic HEARTBEAT.md self-check
+# ---------------------------------------------------------------------------
+# Each tick runs one agent turn over HEARTBEAT.md in the agent's data
+# directory. An empty reply or a bare HEARTBEAT_OK is an all-clear; any other
+# content is an alert. Results are kept in an in-memory heartbeat history
+# (GET /api/agent/heartbeat/status shows the latest) and alerts are logged.
+# Outside the active hours the signal dispatcher's quiet-hours policy skips
+# the tick.
+#
+# [heartbeat]
+# enabled = true                    # default false
+# interval = "30m"                  # duration string; a bare number is minutes
+# active_hours_start = "09:00"
+# active_hours_end = "22:00"
+# timezone = "America/New_York"     # default "UTC"
+# heartbeat_file = "HEARTBEAT.md"
+#
+# Deprecated (#2491), removed in 0.54.0: `target` and `suppress_ok` have no
+# effect. Heartbeat results are not routed by destination, and an exact
+# HEARTBEAT_OK is always an all-clear. Any value other than the default
+# (target = "log", suppress_ok = true) logs a warning at startup and is
+# ignored, and the status API reports `target` under `deprecated_fields`.
+# Delete both keys.

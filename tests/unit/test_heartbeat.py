@@ -5,12 +5,14 @@ Verifies HeartbeatConfig loading, HeartbeatRunner scheduling,
 response normalization, dispatcher translation, and API integration.
 """
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from kestrel_sovereign.heartbeat import (
+    DEPRECATED_SETTINGS_REMOVAL_RELEASE,
     HeartbeatConfig,
     HeartbeatRunner,
 )
@@ -465,3 +467,211 @@ class TestResponseNormalization:
         assert result.message == expected_message
         assert (result.status == "ok") is classification.is_all_clear
         assert result.message == classification.alert_text
+
+
+# --- Deprecated settings (#2491) ---
+
+
+_HEARTBEAT_LOGGER = "kestrel_sovereign.heartbeat"
+
+# Each deprecated setting with a value other than its default, as it would
+# arrive from an existing kestrel.toml.
+_LEGACY_SETTINGS = [
+    pytest.param({"target": "last_session"}, id="target-last_session"),
+    pytest.param({"target": "none"}, id="target-none"),
+    pytest.param({"suppress_ok": False}, id="suppress_ok-false"),
+    pytest.param({"target": "none", "suppress_ok": False}, id="both"),
+]
+
+
+def _heartbeat_warnings(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _HEARTBEAT_LOGGER and record.levelno >= logging.WARNING
+    ]
+
+
+def _dispatched_signal_view(signal):
+    """Every routing-relevant Signal field; ``id``/``arrived_at`` differ per tick."""
+    return {
+        "source": signal.source,
+        "kind": signal.kind,
+        "mode": signal.mode,
+        "payload": signal.payload,
+        "target_agent": signal.target_agent,
+        "visibility": signal.visibility,
+        "session_id": signal.session_id,
+        "caller": signal.caller,
+        "urgency": signal.urgency,
+        "dedupe_key": signal.dedupe_key,
+        "origin_trust": signal.origin_trust,
+        "causation_chain": signal.causation_chain,
+    }
+
+
+def _history_view(entry):
+    """A history entry without its per-tick timing."""
+    return {k: v for k, v in entry.items() if k not in {"timestamp", "duration_ms"}}
+
+
+class TestDeprecatedSettings:
+    """``target`` and ``suppress_ok`` are accepted for one compatibility
+    window, warn when set to anything but their default, and change nothing."""
+
+    @patch("kestrel_sovereign.heartbeat.load_section")
+    @pytest.mark.parametrize(
+        "section",
+        [
+            {},
+            {"enabled": True, "interval": "15m"},
+            {"enabled": True, "target": "log", "suppress_ok": True},
+        ],
+        ids=["no-section", "no-deprecated-keys", "explicit-defaults"],
+    )
+    def test_default_config_emits_no_warning(self, mock_load, section, caplog):
+        caplog.set_level(logging.DEBUG, logger=_HEARTBEAT_LOGGER)
+        mock_load.return_value = section
+
+        HeartbeatConfig()
+        cfg = HeartbeatConfig.from_config()
+
+        assert cfg.target == "log"
+        assert cfg.suppress_ok is True
+        assert _heartbeat_warnings(caplog) == []
+
+    @pytest.mark.parametrize("value", ["last_session", "none", "LOG", 7])
+    def test_non_default_target_warns_and_is_ignored(self, value, caplog):
+        caplog.set_level(logging.WARNING, logger=_HEARTBEAT_LOGGER)
+
+        cfg = HeartbeatConfig(target=value)
+
+        assert cfg.target == "log"
+        (message,) = _heartbeat_warnings(caplog)
+        assert f"target = {value!r}" in message
+        assert "has no effect and is ignored" in message
+        assert f"removed in {DEPRECATED_SETTINGS_REMOVAL_RELEASE}" in message
+
+    @pytest.mark.parametrize("value", [False, "false", None])
+    def test_non_default_suppress_ok_warns(self, value, caplog):
+        caplog.set_level(logging.WARNING, logger=_HEARTBEAT_LOGGER)
+
+        cfg = HeartbeatConfig(suppress_ok=value)
+
+        # Retained for constructor compatibility; nothing reads it.
+        assert cfg.suppress_ok is value
+        (message,) = _heartbeat_warnings(caplog)
+        assert f"suppress_ok = {value!r}" in message
+        assert "has no effect and is ignored" in message
+        assert f"removed in {DEPRECATED_SETTINGS_REMOVAL_RELEASE}" in message
+
+    @patch("kestrel_sovereign.heartbeat.load_section")
+    def test_legacy_config_still_loads_with_one_warning_per_setting(
+        self, mock_load, caplog
+    ):
+        """An existing config keeps booting: every supported setting loads,
+        and each deprecated one is reported rather than rejected."""
+        caplog.set_level(logging.WARNING, logger=_HEARTBEAT_LOGGER)
+        mock_load.return_value = {
+            "enabled": True,
+            "interval": "15m",
+            "active_hours_start": "09:00",
+            "active_hours_end": "22:00",
+            "timezone": "America/New_York",
+            "heartbeat_file": "CHECKS.md",
+            "target": "last_session",
+            "suppress_ok": False,
+        }
+
+        cfg = HeartbeatConfig.from_config()
+        messages = _heartbeat_warnings(caplog)
+
+        assert (
+            cfg.enabled,
+            cfg.interval_seconds,
+            cfg.active_hours_start,
+            cfg.active_hours_end,
+            cfg.timezone,
+            cfg.heartbeat_file,
+        ) == (True, 900, "09:00", "22:00", "America/New_York", "CHECKS.md")
+        assert cfg.target == "log"
+        assert len(messages) == 2
+        assert messages[0].startswith("[heartbeat] target = 'last_session'")
+        assert messages[1].startswith("[heartbeat] suppress_ok = False")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy", _LEGACY_SETTINGS)
+    @pytest.mark.parametrize(
+        ("response", "expected_status", "expected_message"),
+        [
+            ("HEARTBEAT_OK", "ok", None),
+            ("HEARTBEAT_OK\nDisk low", "alert", "Disk low"),
+            ("Disk low", "alert", "Disk low"),
+        ],
+    )
+    async def test_deprecated_settings_do_not_change_dispatch(
+        self, mock_agent, legacy, response, expected_status, expected_message, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger=_HEARTBEAT_LOGGER)
+        mock_agent.process_input.return_value = response
+        baseline = HeartbeatRunner(
+            mock_agent, HeartbeatConfig(enabled=True, interval_seconds=60)
+        )
+        assert _heartbeat_warnings(caplog) == []
+        configured = HeartbeatRunner(
+            mock_agent, HeartbeatConfig(enabled=True, interval_seconds=60, **legacy)
+        )
+        assert len(_heartbeat_warnings(caplog)) == len(legacy)
+
+        baseline_result = await baseline.run_once()
+        configured_result = await configured.run_once()
+
+        baseline_call, configured_call = (
+            mock_agent.dispatcher.dispatch_signal.await_args_list
+        )
+        assert _dispatched_signal_view(configured_call.args[0]) == (
+            _dispatched_signal_view(baseline_call.args[0])
+        )
+        assert configured_result.status == baseline_result.status == expected_status
+        assert configured_result.message == baseline_result.message == expected_message
+        assert _history_view(configured.history[-1]) == (
+            _history_view(baseline.history[-1])
+        )
+
+    @pytest.mark.parametrize("legacy", _LEGACY_SETTINGS)
+    def test_status_reports_target_in_use_and_marks_it_deprecated(
+        self, mock_agent, legacy
+    ):
+        baseline = HeartbeatRunner(mock_agent, HeartbeatConfig(enabled=True))
+        configured = HeartbeatRunner(
+            mock_agent, HeartbeatConfig(enabled=True, **legacy)
+        )
+
+        status = configured.get_status()
+
+        assert status == baseline.get_status()
+        assert status["target"] == "log"
+        assert set(status["deprecated_fields"]) == {"target"}
+        note = status["deprecated_fields"]["target"]
+        assert "has no effect" in note
+        assert DEPRECATED_SETTINGS_REMOVAL_RELEASE in note
+
+    @pytest.mark.asyncio
+    async def test_start_logs_the_target_in_use(self, mock_agent, caplog):
+        caplog.set_level(logging.INFO, logger=_HEARTBEAT_LOGGER)
+        runner = HeartbeatRunner(
+            mock_agent,
+            HeartbeatConfig(enabled=True, interval_seconds=3600, target="none"),
+        )
+
+        await runner.start()
+        try:
+            started = [
+                record.getMessage()
+                for record in caplog.records
+                if record.getMessage().startswith("Heartbeat started:")
+            ]
+        finally:
+            await runner.stop()
+
+        assert started == ["Heartbeat started: interval=3600s, target=log"]
