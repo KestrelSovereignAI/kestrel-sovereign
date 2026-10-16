@@ -9,7 +9,7 @@ const { chromium } = require('playwright');
 const { wsServer: WebSocketServer } = require(path.join(
   path.dirname(require.resolve('playwright-core/package.json')), 'lib/utilsBundle.js'));
 
-async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false, responseStartTimeoutMs = 30000, dropPlaybackClearAck = false } = {}) {
+async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false, responseStartTimeoutMs = 30000, dropPlaybackClearAck = false, framed = false, holdSessionAck = false, holdInputClear = false } = {}) {
   const staticRoot = process.env.KESTREL_TEST_STATIC_ROOT
     ? path.resolve(process.env.KESTREL_TEST_STATIC_ROOT)
     : path.resolve(__dirname, '../../kestrel_sovereign/static');
@@ -23,6 +23,11 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
   let pipelineFrames = 0;
   const realtimeMessages = [];
   const realtimePeers = [];
+  const framedConfig = { type: 'realtime', output_modalities: ['audio'], audio: {
+    input: { format: { type: 'audio/pcm', rate: 24000 }, turn_detection: {
+      type: 'server_vad', create_response: false, interrupt_response: false,
+    } }, output: { format: { type: 'audio/pcm', rate: 24000 }, voice: 'offline' },
+  } };
   let workletResponse;
   let workletEntered;
   const enteredWorklet = new Promise(resolve => { workletEntered = resolve; });
@@ -39,8 +44,12 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
             fallback_stt: 'offline', reason: 'offline pipeline route selected' }));
           return;
         }
-        const payload = JSON.stringify({ session_id: 'native-offline', transport,
-          client_secret: { value: 'offline-peer-only' }, endpoint: transport === 'websocket'
+        const strict = JSON.parse(Buffer.concat(chunks).toString() || '{}').output_profile;
+        const actualTransport = strict ? 'websocket' : transport;
+        const payload = JSON.stringify({ session_id: 'native-offline', transport: actualTransport,
+          ...(strict ? { output_profile: strict, vendor: 'openai', model: 'offline-model',
+            protocol: 'openai-realtime-ga-framed-v1', session_config: framedConfig } : {}),
+          client_secret: { value: 'offline-peer-only' }, endpoint: actualTransport === 'websocket'
             ? `${origin.replace('http:', 'ws:')}/realtime` : `${origin}/sdp` });
         mintResponse = { res, payload };
         mintEntered();
@@ -124,7 +133,14 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
     connection.send(JSON.stringify({ type: 'status', state: 'listening' }));
     connection.on('message', (bytes, binary) => {
       if (binary && bytes[0] === 1) pipelineFrames++;
-      if (!binary) realtimeMessages.push(JSON.parse(bytes.toString()));
+      if (!binary) {
+        const message = JSON.parse(bytes.toString());
+        realtimeMessages.push(message);
+        if (message.type === 'session.update' && !holdSessionAck) connection.send(JSON.stringify({
+          type: 'session.updated', session: { id: 'actual-socket-id', model: 'offline-model', ...framedConfig },
+        }));
+        if (message.type === 'input_audio_buffer.clear' && !holdInputClear) connection.send(JSON.stringify({ type: 'input_audio_buffer.cleared' }));
+      }
     });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -144,13 +160,31 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
     await page.route('**/*', route => new URL(route.request().url()).origin === origin
       ? route.continue() : route.abort());
     await page.goto(origin);
-    await page.evaluate(async ({ autoStart, responseStartTimeoutMs }) => {
+    await page.evaluate(async ({ autoStart, responseStartTimeoutMs, framed }) => {
       const { createRealtimeClient } = await import('/js/voice/realtime.js');
       window.nativeEvents = [];
-      window.client = await createRealtimeClient({ onEvent: event => window.nativeEvents.push(event), responseStartTimeoutMs });
+      if (framed) {
+        const NativeContext = window.AudioContext, NativeSocket = window.WebSocket, NativeNode = window.AudioWorkletNode;
+        window.nativeContexts = []; window.nativeSockets = []; window.nativeCaptureGenerations = [];
+        window.AudioContext = class extends NativeContext { constructor(...args) { super(...args); window.nativeContexts.push(this); } };
+        window.WebSocket = class extends NativeSocket { constructor(...args) { super(...args); window.nativeSockets.push(this); } };
+        window.AudioWorkletNode = class extends NativeNode { constructor(...args) {
+          super(...args);
+          if (args[1] === 'kestrel-capture') {
+            this.port.addEventListener('message', event => {
+              if (event.data?.type === 'chunk') window.nativeCaptureGenerations.push(event.data.generation);
+            });
+            this.port.start();
+          }
+        } };
+      }
+      // These long-standing RTC/xAI compatibility cases explicitly exercise
+      // the legacy API. The default Console/new client profile stays strict.
+      window.client = await createRealtimeClient({ onEvent: event => window.nativeEvents.push(event), responseStartTimeoutMs,
+        outputProfile: framed ? 'response-framed-pcm-v1' : '' });
       if (autoStart) await window.client.start();
-    }, { autoStart, responseStartTimeoutMs });
-    if (autoStart && transport === 'webrtc') await page.waitForFunction(() => window.nativeChannel?.readyState === 'open');
+    }, { autoStart, responseStartTimeoutMs, framed });
+    if (autoStart && transport === 'webrtc' && !framed) await page.waitForFunction(() => window.nativeChannel?.readyState === 'open');
     await body({ page, entered, enteredMint, enteredWorklet,
       releaseWorklet: () => {
         workletResponse.res.setHeader('Content-Type', 'text/javascript');
@@ -159,6 +193,8 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       toolPosts: () => toolPosts,
       pipelineFrames: () => pipelineFrames,
       realtimeMessages: () => realtimeMessages,
+      sessionAck: config => realtimePeers[0].send(JSON.stringify({ type: 'session.updated',
+        session: config || { id: 'actual-socket-id', model: 'offline-model', ...framedConfig } })),
       sendRealtime: payload => realtimePeers[0].send(JSON.stringify(payload)),
       releaseMint: () => mintResponse.res.end(mintResponse.payload),
       sdpRequests: () => sdpRequests,
@@ -181,6 +217,171 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
     await new Promise(resolve => wsServer.close(resolve));
     await new Promise(resolve => server.close(resolve));
   }
+}
+
+test('framed native startup withholds actual microphone PCM until effective session ACK', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, realtimeMessages, sessionAck }) => {
+    await page.evaluate(() => { window.startup = window.client.start(); });
+    await page.waitForFunction(() => window.client.micStream?.getTracks().every(track => track.readyState === 'live'));
+    await page.waitForTimeout(350);
+    assert.equal(realtimeMessages().filter(message => message.type === 'input_audio_buffer.append').length, 0);
+    assert.equal(await page.evaluate(() => window.nativeEvents.some(event => event.kind === 'session_ready')), false);
+    sessionAck();
+    await page.evaluate(() => window.startup);
+    await page.waitForTimeout(150);
+    const frames = realtimeMessages().filter(message => message.type === 'input_audio_buffer.append');
+    assert.ok(frames.length > 0);
+    assert.ok(frames.some(frame => [...Buffer.from(frame.audio, 'base64')].some(byte => byte !== 0)), 'actual original microphone did not deliver fresh nonzero PCM');
+    assert.equal(await page.evaluate(() => window.nativeEvents.find(event => event.kind === 'session_ready').session_id), 'actual-socket-id');
+  }, '{"persisted":false}', { autoStart: false, framed: true, holdSessionAck: true });
+});
+
+for (const failure of ['absent', 'incompatible']) {
+test(`framed native ${failure} config ACK automatically retires original resources`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, sessionAck, realtimeMessages }) => {
+    await page.evaluate(() => { window.startup = window.client.start().then(() => null, error => error.message); });
+    await page.waitForFunction(() => window.client.micStream?.getTracks().some(track => track.readyState === 'live'));
+    for (let step = 0; step < 100 && !realtimeMessages().some(message => message.type === 'session.update'); step++) await page.waitForTimeout(10);
+    assert.ok(realtimeMessages().some(message => message.type === 'session.update'));
+    if (failure === 'incompatible') sessionAck({ type: 'realtime', model: 'wrong-model' });
+    assert.ok(await page.evaluate(() => window.startup));
+    assert.ok(await page.evaluate(() => window.client.micStream.getTracks().every(track => track.readyState === 'ended')));
+    assert.ok(await page.evaluate(() => window.nativeContexts.length === 2 && window.nativeContexts.every(context => context.state === 'closed')));
+    await page.waitForFunction(() => window.nativeSockets.length === 1 && window.nativeSockets[0].readyState === WebSocket.CLOSED);
+    assert.equal(realtimeMessages().filter(message => message.type === 'input_audio_buffer.append').length, 0);
+  }, '{"persisted":false}', { autoStart: false, framed: true, holdSessionAck: true, responseStartTimeoutMs: 700 });
+});
+}
+
+test('framed native Stop and typed replacement exclude delayed responses and admit fresh original microphone output', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, realtimeMessages, sendRealtime }) => {
+    await page.evaluate(async () => {
+      const nativeGain = AudioContext.prototype.createGain;
+      AudioContext.prototype.createGain = function() {
+        const gain = nativeGain.call(this);
+        window.playbackGain = gain;
+        window.probe = this.createAnalyser();
+        window.probe.fftSize = 256;
+        const sink = nativeGain.call(this); sink.gain.value = 0;
+        gain.connect(window.probe); window.probe.connect(sink); sink.connect(this.destination);
+        return gain;
+      };
+      window.originalMicTracks = [];
+      window.startup = window.client.start();
+      await window.startup;
+      window.originalMicTracks = window.client.micStream.getTracks();
+      window.sample = () => { const samples = new Float32Array(window.probe.fftSize);
+        window.probe.getFloatTimeDomainData(samples); return samples.reduce((sum, x) => sum + x, 0) / samples.length; };
+    });
+    const waitRequest = async count => {
+      for (let step = 0; step < 100 && realtimeMessages().filter(message => message.type === 'response.create').length < count; step++) await page.waitForTimeout(10);
+      const requests = realtimeMessages().filter(message => message.type === 'response.create');
+      assert.equal(requests.length, count);
+      return requests.at(-1).response.metadata;
+    };
+    const pcm = value => Buffer.from(new Int16Array(24000).fill(value).buffer).toString('base64');
+    const stalePcm = pcm(19660), freshPcm = pcm(-13107);
+    const startSpeech = async id => {
+      sendRealtime({ type: 'input_audio_buffer.speech_started', item_id: id });
+      sendRealtime({ type: 'input_audio_buffer.committed', item_id: id });
+    };
+    await startSpeech('original-speech');
+    const original = await waitRequest(1);
+    sendRealtime({ type: 'response.created', response: { id: 'original', metadata: original } });
+    sendRealtime({ type: 'response.output_audio.delta', response_id: 'original', delta: stalePcm });
+    await page.waitForFunction(() => window.sample() > .4);
+    await page.evaluate(() => window.client.cancelResponse());
+    await page.waitForFunction(() => window.nativeCaptureGenerations.includes(1), null, { timeout: 3000 });
+    // Input-clear ACK intentionally withheld while actual original mic runs.
+    const beforeClear = realtimeMessages().filter(message => message.type === 'input_audio_buffer.append').length;
+    await page.waitForTimeout(160);
+    assert.equal(realtimeMessages().filter(message => message.type === 'input_audio_buffer.append').length, beforeClear);
+    sendRealtime({ type: 'response.output_audio.delta', response_id: 'original', delta: stalePcm });
+    sendRealtime({ type: 'input_audio_buffer.cleared' });
+    await page.waitForTimeout(100);
+    assert.ok(realtimeMessages().filter(message => message.type === 'input_audio_buffer.append').length > beforeClear);
+    await startSpeech('pre-id-speech');
+    const preId = await waitRequest(2);
+    assert.equal(await page.evaluate(() => Math.max(...window.nativeCaptureGenerations)), 1, 'ordinary VAD must preserve the current microphone generation');
+    await page.evaluate(() => window.client.sendText('new typed turn'));
+    await page.waitForFunction(() => window.nativeCaptureGenerations.includes(2), null, { timeout: 3000 });
+    sendRealtime({ type: 'response.created', response: { id: 'delayed-before-Stop-id', metadata: preId } });
+    sendRealtime({ type: 'response.output_audio.delta', response_id: 'delayed-before-Stop-id', delta: stalePcm });
+    sendRealtime({ type: 'input_audio_buffer.cleared' });
+    const typed = await waitRequest(3);
+    assert.notEqual(typed.kestrel_response_nonce, preId.kestrel_response_nonce);
+    sendRealtime({ type: 'response.created', response: { id: 'fresh', metadata: typed } });
+    // Missing/foreign IDs and old EOF must not publish or terminate fresh PCM.
+    for (const response_id of [undefined, 'foreign', 'original']) {
+      sendRealtime({ type: 'response.output_audio.delta', response_id, delta: stalePcm });
+      sendRealtime({ type: 'response.output_text.delta', response_id, delta: 'STALE' });
+      sendRealtime({ type: 'response.function_call_arguments.done', response_id, call_id: 'stale-call', name: 'never', arguments: '{}' });
+      sendRealtime({ type: 'response.done', response_id, response: { id: response_id, status: 'completed' } });
+    }
+    sendRealtime({ type: 'response.output_audio.delta', response_id: 'fresh', delta: freshPcm });
+    await page.waitForFunction(() => window.sample() < -.3);
+    const state = await page.evaluate(() => ({ value: window.sample(),
+      same: window.client.micStream.getTracks().every((track, index) => track === window.originalMicTracks[index] && track.readyState === 'live'),
+      stale: window.nativeEvents.some(event => event.text?.includes('STALE') || event.kind === 'tool_call_batch_requested'),
+    }));
+    assert.ok(state.same && !state.stale && state.value < -.3, JSON.stringify(state));
+    sendRealtime({ type: 'response.function_call_arguments.done', response_id: 'fresh', call_id: 'fresh-call', name: 'allowed', arguments: '{}' });
+    sendRealtime({ type: 'response.done', response: { id: 'fresh', status: 'completed' } });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'tool_call_batch_requested'));
+    await page.evaluate(() => window.client.commitToolResults([{ call_id: 'fresh-call', result: { ok: true } }]));
+    const continuation = await waitRequest(4);
+    assert.equal(continuation.kestrel_input_generation, typed.kestrel_input_generation);
+    assert.notEqual(continuation.kestrel_response_nonce, typed.kestrel_response_nonce);
+    sendRealtime({ type: 'response.created', response: { id: 'stale-continuation', metadata: typed } });
+    sendRealtime({ type: 'response.output_text.delta', response_id: 'stale-continuation', delta: 'STALE' });
+    await page.waitForTimeout(100);
+    assert.equal(await page.evaluate(() => window.nativeEvents.some(event => event.text?.includes('STALE'))), false);
+    sendRealtime({ type: 'response.created', response: { id: 'continuation', metadata: continuation } });
+    sendRealtime({ type: 'response.output_text.delta', response_id: 'continuation', delta: 'FRESH' });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.text === 'FRESH'));
+    assert.equal(await page.evaluate(() => window.nativeEvents.some(event => event.text?.includes('STALE'))), false);
+  }, '{"persisted":false}', { autoStart: false, framed: true, holdInputClear: true });
+});
+
+test('framed native unsupported bootstrap is refused before microphone or socket acquisition', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { createRealtimeClient } = await import('/js/voice/realtime.js');
+      window.client = await createRealtimeClient({ outputProfile: 'unsupported', onEvent: event => window.nativeEvents.push(event) });
+      try { await window.client.start(); return null; } catch (error) { return error.message; }
+    });
+    assert.match(result, /Required framed realtime profile/);
+    assert.equal(await page.evaluate(() => window.client.micStream), null);
+    assert.equal(await page.evaluate(() => window.nativeContexts.length + window.nativeSockets.length), 0);
+  }, '{"persisted":false}', { autoStart: false, framed: true });
+});
+
+for (const failure of ['input-clear', 'response-correlation', 'startup-overflow']) {
+test(`framed native ${failure} failure closes original capture, contexts and socket without fixture cleanup`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, realtimeMessages, sendRealtime }) => {
+    if (failure === 'startup-overflow') {
+      await page.evaluate(() => { window.startup = window.client.start().then(() => null, error => error.message); });
+      assert.match(await page.evaluate(() => window.startup), /bounded audio budget/);
+      assert.equal(realtimeMessages().filter(message => message.type === 'input_audio_buffer.append').length, 0);
+    } else {
+      await page.evaluate(() => window.client.start());
+      if (failure === 'input-clear') await page.evaluate(() => window.client.cancelResponse());
+      else {
+        sendRealtime({ type: 'input_audio_buffer.speech_started', item_id: 'fresh' });
+        sendRealtime({ type: 'input_audio_buffer.committed', item_id: 'fresh' });
+        // Uncorrelated provider output cannot turn request timeout into success.
+        sendRealtime({ type: 'response.created', response: { id: 'unproven' } });
+      }
+      await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'error' && event.fatal));
+    }
+    await page.waitForFunction(() => window.client.micStream?.getTracks().every(track => track.readyState === 'ended')
+      && window.nativeContexts.length === 2 && window.nativeContexts.every(context => context.state === 'closed')
+      && window.nativeSockets.length === 1 && window.nativeSockets[0].readyState === WebSocket.CLOSED);
+    assert.equal(await page.evaluate(() => window.nativeEvents.some(event => event.kind === 'speaking_started')), false);
+  }, '{"persisted":false}', { autoStart: false, framed: true,
+    holdInputClear: true, holdSessionAck: failure === 'startup-overflow',
+    responseStartTimeoutMs: failure === 'startup-overflow' ? 10000 : 700 });
+});
 }
 
 for (const path of ['realtime', 'pipeline']) {

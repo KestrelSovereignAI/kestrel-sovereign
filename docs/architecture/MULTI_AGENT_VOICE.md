@@ -196,8 +196,13 @@ ACK through both voice clients. Failure tests observe automatic physical
 retirement before fixture cleanup; removing the production error-callback
 close makes those assertions fail.
 These are local PCM guarantees, **not** a claim that JSON response filtering or
-an input-clear ACK fences the separate WebRTC RTP stream. The strict framed
-provider profile and end-to-end native input/output verification remain pending.
+an input-clear ACK fences the separate WebRTC RTP stream. New Console/client
+sessions explicitly require `response-framed-pcm-v1`; OpenAI implements this
+as `openai-realtime-ga-framed-v1` over its existing session WebSocket, with the
+same configured model/provider. Unsupported providers return a clear capability
+error before mint, not a silent provider/model switch or Pipeline fallback.
+Older API callers may omit the profile and retain legacy WebRTC compatibility;
+that legacy RTP path does not acquire these PCM Stop guarantees.
 
 ### Capture generation boundary (component API)
 
@@ -214,8 +219,38 @@ processor crossed that boundary. A controlled transform unit proves old
 partial samples are absent; real browser tests delay/replay an original native
 frame, require its exclusion, and require fresh non-silent PCM from the same
 still-live microphone. Ordinary VAD must not request a capture reset and lose
-the fresh utterance prefix. Strict Stop/typed-input transport integration and
-the separate provider input-clear acknowledgement barrier remain pending.
+the fresh utterance prefix. Strict Stop/typed replacement now requests capture
+reset and holds bounded fresh-generation audio until the provider's ordered
+input-clear ACK. Repeated unacknowledged clears have a fixed deadline/count
+bound. Ordinary VAD abandons output without clearing/resetting fresh input.
+
+### Explicit framed realtime contract
+
+The canonical provider mint helper requests PCM16 mono at 24kHz, retains VAD
+events, and disables provider-driven response creation/interruption. Browser
+startup waits for an actual `session.updated` with the effective model, PCM
+format and manual-response settings before sending microphone data. This is
+an effective-config acknowledgement, not an echoed `event_id`; model is not
+sent in `session.update`. Token-registration and socket-session IDs are distinct.
+
+Typed turns, positively matched speech commits and tool continuations request
+responses with input-generation plus unique per-request nonce metadata. Only
+a matching `response.created` admits that response's audio, text, arguments or
+completion. Missing/foreign IDs and delayed older completions are excluded;
+continuations cannot reuse a predecessor request nonce. Metadata does not grant
+governance/tool authority. The existing server-side execution gates still apply.
+
+Startup, input-clear and response-correlation deadlines and audio-buffer bounds
+fail closed by retiring the original microphone, both audio contexts and socket.
+Loopback browser tests exercise actual WebSocket messages, capture/playback
+worklets and post-gain output: stale positive PCM is excluded, fresh negative
+PCM renders, and fresh nonzero input uses the same live microphone. Native
+failure checks precede fixture cleanup. These offline tests do not claim live
+provider acceptance, production rollout completion or physical speaker audibility.
+
+Protocol references: [WebSocket authentication](https://developers.openai.com/api/docs/guides/voice-websockets),
+[Realtime client events](https://developers.openai.com/api/reference/resources/realtime/client-events),
+[VAD controls](https://developers.openai.com/api/docs/guides/realtime-vad).
 
 ## Appendix — source map
 

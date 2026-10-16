@@ -34,6 +34,7 @@
 import { Events, makeEvent } from './events.js';
 import { createVoiceCapture } from './capture.js';
 import { createVoicePlayback } from './playback.js';
+import { FRAMED_OUTPUT_PROFILE, requireFramedBootstrap, createFramedProtocol } from './framed.js';
 
 export async function readToolBatchResponse(response, calls) {
   // Only acknowledged results may become function outputs. A failed request,
@@ -201,6 +202,7 @@ export async function createRealtimeClient({
   sessionRequestInit = {},
   sessionRequestBody = {},
   responseStartTimeoutMs = 30000,
+  outputProfile = FRAMED_OUTPUT_PROFILE,
 } = {}) {
   if (typeof onEvent !== 'function') {
     throw new Error('createRealtimeClient requires an onEvent callback');
@@ -217,6 +219,7 @@ export async function createRealtimeClient({
   let audioSink = null;  // <audio> element for remote playback
   let capture = null;    // PCM capture for WebSocket transports
   let playback = null;   // PCM playback for WebSocket transports
+  let framed = null;     // explicit response-framing protocol on original WS
   let inputMuted = false;
   let outputMuted = false;
   let closed = false;
@@ -379,6 +382,7 @@ export async function createRealtimeClient({
    */
   function handleProviderEvent(raw) {
     if (closed) return;
+    if (framed && !framed.accept(raw)) return;
     const responseId = raw.response?.id ?? raw.response_id ?? '';
     // Input/session events are not output-response cancellation casualties.
     // A cancelled response cannot publish late audio, text, or completion.
@@ -386,7 +390,7 @@ export async function createRealtimeClient({
     switch (raw.type) {
       case 'response.created':
         if (!responseId) break;
-        {
+        if (!framed) {
           const supplied = raw.response?.metadata?.kestrel_input_generation;
           if (typedInputGeneration !== null ? supplied !== typedInputGeneration : supplied !== undefined) {
             // A new local turn or audio-clear ACK does not identify a delayed
@@ -401,6 +405,7 @@ export async function createRealtimeClient({
             responseAdmissionOpen = true;
           }
         }
+        if (framed) responseAdmissionOpen = true;
         if (!responseAdmissionOpen) {
           cancelledResponses.add(responseId);
           break;
@@ -423,6 +428,7 @@ export async function createRealtimeClient({
         // Server VAD already detected this fresh audio. Retire old output,
         // not the microphone buffer containing the new utterance.
         abandonResponse({ clearInput: false });
+        framed?.speechStarted(raw.item_id);
         speechInputItemId = raw.item_id ?? '';
         userTranscriptTracker.speechStarted();
         onEvent(makeEvent(Events.LISTENING_STARTED, {}));
@@ -432,6 +438,7 @@ export async function createRealtimeClient({
         onEvent(makeEvent(Events.LISTENING_STOPPED, {}));
         break;
       case 'input_audio_buffer.committed':
+        framed?.committed(raw.item_id);
         // An old buffered commit can arrive after cancellation but before
         // the ordered clear acknowledgement. It cannot authorize output.
         if (typedInputGeneration === null && freshInputGeneration === responseGeneration
@@ -520,6 +527,7 @@ export async function createRealtimeClient({
         { const responseId = raw.response?.id ?? raw.response_id;
         const calls = pendingToolCalls.get(responseId) || [];
         pendingToolCalls.delete(responseId);
+        framed?.completed(calls, responseAllowsToolDispatch(raw));
         if (responseAdmissionOpen && calls.length && responseAllowsToolDispatch(raw) && !cancelledResponses.has(responseId)) {
           onEvent(makeEvent(Events.TOOL_CALL_BATCH_REQUESTED, {
             batch_id: responseId,
@@ -628,6 +636,20 @@ export async function createRealtimeClient({
   }
 
   async function startWebSocket() {
+    if (outputProfile) {
+      framed = createFramedProtocol({ session,
+        send: message => sendJSON(message, { required: true }),
+        resetCapture: () => capture.reset(),
+        timeoutMs: responseStartTimeoutMs,
+        fail: error => {
+          void close();
+          onEvent(makeEvent(Events.ERROR, { message: error.message, code: 'FRAMED_PROTOCOL_FAILED', fatal: true }));
+        },
+        onReady: actual => onEvent(makeEvent(Events.SESSION_READY, {
+          session_id: actual.id, model: session.model, path: 'realtime',
+        })),
+      });
+    }
     capture = await createVoiceCapture({ targetSampleRate: 24000, onAcquire: owner => {
       capture = owner;
       if (closed) void owner.destroy();
@@ -647,6 +669,11 @@ export async function createRealtimeClient({
     playback.setMuted?.(outputMuted);
     capture.onchunk((pcm) => {
       if (inputMuted || closed) return;
+      if (framed) {
+        try { framed.audio(bytesToBase64(pcm), pcm.byteLength); }
+        catch (error) { void close(); onEvent(makeEvent(Events.ERROR, { message: error.message, fatal: true })); }
+        return;
+      }
       if (ws?.readyState === WebSocket.OPEN) {
         sendJSON({ type: 'input_audio_buffer.append', audio: bytesToBase64(pcm) });
         return;
@@ -661,19 +688,21 @@ export async function createRealtimeClient({
 
     const subprotocols = session.vendor === 'xai'
       ? [`xai-client-secret.${session.client_secret.value}`]
-      : [];
+      : framed ? ['realtime', `openai-insecure-api-key.${session.client_secret.value}`] : [];
     ws = new WebSocket(session.endpoint, subprotocols);
     ws.onmessage = (ev) => {
       try { handleProviderEvent(JSON.parse(ev.data)); }
       catch (err) {
+        if (framed) void close();
         onEvent(makeEvent(Events.ERROR, {
-          message: `Malformed realtime event: ${err.message}`, fatal: false,
+          message: `Malformed realtime event: ${err.message}`, fatal: !!framed,
         }));
       }
     };
     await new Promise((resolve, reject) => {
       ws.onopen = () => {
         if (closed) { reject(new Error('Realtime client retired during startup')); return; }
+        if (framed) { framed.start().then(resolve, reject); return; }
         if (session.session_config && Object.keys(session.session_config).length) {
           sendJSON({ type: 'session.update', session: session.session_config });
         }
@@ -721,8 +750,8 @@ export async function createRealtimeClient({
         'Content-Type': 'application/json',
         ...authHeaders,
       },
-      body: JSON.stringify(sessionRequestBody),
       ...sessionRequestInit,
+      body: JSON.stringify({ ...sessionRequestBody, output_profile: outputProfile }),
       signal: startupAbort.signal,
     });
     await requireOpen();
@@ -739,6 +768,7 @@ export async function createRealtimeClient({
     }
     session = await resp.json();
     await requireOpen();
+    if (outputProfile) requireFramedBootstrap(session, outputProfile);
 
     if (session.transport === 'websocket') await startWebSocket();
     else if (session.transport === 'webrtc' || !session.transport) await startWebRTC();
@@ -772,6 +802,7 @@ export async function createRealtimeClient({
   function close() {
     if (closeOwner) return closeOwner;
     closed = true;
+    framed?.close();
     clearTimeout(responseStartTimer);
     responseStartTimer = null;
     startupAbort.abort();
@@ -785,6 +816,16 @@ export async function createRealtimeClient({
   function sendText(text) {
     if (closed) throw new Error('Original voice transport is closed.');
     abandonResponse({ clearInput: false });
+    if (framed) {
+      framed.clearInput(() => {
+        sendJSON({ type: 'conversation.item.create', item: {
+          type: 'message', role: 'user', content: [{ type: 'input_text', text }],
+        } }, { required: true });
+        framed.request();
+      });
+      persistTurn('user', text);
+      return;
+    }
     typedInputGeneration = crypto.randomUUID();
     sendJSON({
       type: 'conversation.item.create',
@@ -807,6 +848,10 @@ export async function createRealtimeClient({
     // Fence the actual PCM sink for EVERY abandonment, including typed
     // replacement. JSON filtering alone cannot retire already queued audio.
     playback?.flush?.();
+    if (framed) {
+      framed.abandon();
+      sendJSON({ type: 'response.cancel' }, { required: true });
+    }
     clearTimeout(responseStartTimer);
     responseStartTimer = null;
     typedInputGeneration = null;
@@ -815,8 +860,11 @@ export async function createRealtimeClient({
     responseGeneration += 1;
     freshInputGeneration = clearInput ? null : responseGeneration;
     if (clearInput) {
-      pendingInputClears.push(responseGeneration);
-      sendJSON({ type: 'input_audio_buffer.clear' });
+      if (framed) framed.clearInput();
+      else {
+        pendingInputClears.push(responseGeneration);
+        sendJSON({ type: 'input_audio_buffer.clear' });
+      }
     }
     if (activeResponseId) cancelledResponses.add(activeResponseId);
     for (const id of pendingToolCalls.keys()) cancelledResponses.add(id);
@@ -825,10 +873,11 @@ export async function createRealtimeClient({
 
   function cancelResponse() {
     abandonResponse();
-    sendJSON({ type: 'response.cancel' });
+    if (!framed) sendJSON({ type: 'response.cancel' });
   }
 
   function requestResponse() {
+    if (framed) { framed.request(); return; }
     const original = typedInputGeneration;
     sendJSON(original === null ? { type: 'response.create' } : {
       type: 'response.create',
@@ -876,6 +925,7 @@ export async function createRealtimeClient({
     if (!results.length) return;
     const originalGeneration = responseGeneration;
     try {
+      framed?.reserveToolResults(results);
       for (const { call_id: callId, result } of results) {
         sendJSON({
           type: 'conversation.item.create',
