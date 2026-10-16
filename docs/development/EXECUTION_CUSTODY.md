@@ -71,7 +71,11 @@ are revalidated at the final publication boundary.
 Before issuing a committed receipt, one fixed `SELECT 1` on that same held
 transaction proves it is not aborted: PostgreSQL can otherwise accept COMMIT
 as a silent ROLLBACK. The proof is cancellable and precedes native commit
-handoff. Known-commit custody must also own the top-level transaction, not
+handoff. The proof itself is not acceptance of COMMIT: ordinary work revalidates every
+retained admission after that awaited probe and immediately before native exit
+ownership, without another await. Retirement at this boundary rolls the body
+back; fixed native cleanup retains its separate post-retirement contract.
+Known-commit custody must also own the top-level transaction, not
 merely release a savepoint inside a wrapper's external transaction. Custody,
 callbacks and fixed cleanup require this proof. Unfenced,
 callback-free transactions retain their historical behavior but do not mint a

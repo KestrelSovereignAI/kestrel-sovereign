@@ -1087,6 +1087,7 @@ class PostgresBackend(DatabaseBackend):
             raise ExecutionAuthorityError("opaque pool checkout cannot admit execution custody; use PostgresPoolAdapter")
         try:
             async with self._tracked_native_transaction(connection, scopes, state,
+                admit_work=True,
                 requires_commit_proof=lambda: bool(scopes) or (
                     self._current_txn_conn() is not None and self._current_after_commit().pending)):
                 await lock_execution_authority(connection, "postgres", scopes)
@@ -1124,6 +1125,7 @@ class PostgresBackend(DatabaseBackend):
         self, connection: Any, scopes: tuple[ExecutionCustody, ...],
         commit_state: _ExecutionCommitState | None = None,
         *, requires_commit_proof: bool | Callable[[], bool] = True,
+        admit_work: bool = False,
     ) -> AsyncIterator[None]:
         """Classify native commit acknowledgement without granting work.
 
@@ -1157,6 +1159,13 @@ class PostgresBackend(DatabaseBackend):
                     raise ExecutionAuthorityError("native known-commit custody requires its own top-level transaction")
                 await _prove_committable(connection)
                 proven = True
+            # The proof above is cancellable body work, not COMMIT acceptance.
+            # Retirement may happen while it awaits; validate ordinary work
+            # again without another await before creating the native exit.
+            # Fixed native cleanup deliberately keeps its separate contract.
+            if admit_work:
+                require_execution_backend("postgres", scopes)
+                self._require_transaction_custody()
         except BaseException as error:
             body_failure = error
         committing = body_failure is None
