@@ -1050,4 +1050,14 @@ Those mocks are not native ACK/READY evidence. Standalone startup failure tests
 use SQLite's actual schema authorizer rather than depending on which optional
 feature registrations happen to be available in a larger suite.
 
+LLM cleanup registers original clients and owned usage databases before closer
+Task admission. Refusal retains the exact resource and error, closes the fresh
+coroutine, and does not skip independent clients. Unpublished-provider refusal
+keeps the original service in its host registry. Failed native owners cannot
+be replaced by a speculative second close. Usage retirement joins the original
+preference/modality writer Tasks even if their drain-wrapper admission failed;
+the usage database reference clears only after physical close succeeds.
+Native tests use actual SDK clients with loopback HTTPX sockets and actual
+SQLite writers, not provider requests, fabricated ACKs or READY publication.
+
 These are candidate contracts, not whole-branch review or release approval.

@@ -78,7 +78,7 @@ class RemoteBackendMixin:
         # Cancellation must not destroy the native close. The outer lifecycle
         # owns its bounded admission; this dependency owns physical retirement.
         key = ("client", id(client))
-        owner = start_llm_close_task(self, key, client.close)
+        owner = start_llm_close_task(self, key, client.close, resource=client)
         outcome = await await_owned_task(owner) if owner is not None else None
         terminal = execution_terminal_error(
             vars(self).get("_llm_close_control"),

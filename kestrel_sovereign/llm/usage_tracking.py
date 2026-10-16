@@ -682,13 +682,10 @@ class UsageTrackingMixin:
         # connection after this close had found nothing to close.
         async with self._get_usage_db_lock():
             if self._usage_db:
-                try:
-                    await self._usage_db.close()
-                    logger.info("Usage tracking database closed.")
-                except Exception as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.debug(f"Error closing usage database: {e}")
-                finally:
-                    self._usage_db = None
-                    self._db_initialized = False
+                # A failed close is not physical retirement. Keep the original
+                # database reachable and preserve its exact error/debt; only a
+                # completed close can clear this owner's native inventory.
+                await self._usage_db.close()
+                logger.info("Usage tracking database closed.")
+                self._usage_db = None
+                self._db_initialized = False

@@ -6247,7 +6247,8 @@ No other text or formatting.
         # A finished writer has physically released its borrowed storage even
         # when its ordinary write failed. A failed transport close has NOT
         # proved resource retirement. Canonical controls are retained separately.
-        return (any(not task.done() for task in writers)
+        return (bool(vars(self).get("_llm_native_retirement_resources"))
+                or any(not task.done() for task in writers)
                 or any(not task.done() or owned_task_error(task) is not None for task in closers))
 
     def _retain_native_execution_retirement(self, error: BaseException) -> None:
@@ -6320,7 +6321,12 @@ No other text or formatting.
             key = (label, id(resource)) if resource is not None else label
             if key in tasks and tasks[key] is None:
                 return
-            task = start_llm_close_task(self, key, operation)
+            try:
+                task = start_llm_close_task(self, key, operation, resource=resource)
+            except BaseException as error:
+                terminal = execution_terminal_error(terminal, error, retain_originals=True)
+                interrupted = interrupted or isinstance(error, asyncio.CancelledError)
+                return
             if task is None:
                 return
             try:
@@ -6384,15 +6390,27 @@ No other text or formatting.
         await retire("remote-route", close_remote_route, cancel_on_timeout=False)
 
         async def close_usage_after_writers():
+            # Join the ORIGINAL writers even when allocation of their drain
+            # wrapper failed. A missing wrapper is not a settled native write.
+            original_writers = set(vars(self).get("_preference_persistence_tasks", ()))
+            original_writers.update(vars(self).get("_modality_record_tasks", ()))
             for key in ("preference-writers", "modality-writers"):
                 writer = tasks.get(key)
                 if writer is not None:
-                    # Its receipt is harvested separately; physical settlement
-                    # must precede closing the writer's database connection.
-                    await await_owned_task(writer)
+                    original_writers.add(writer)
+            withdrawal = None
+            for writer in original_writers:
+                # Writer receipts have their own canonical harvesters; this
+                # dependency must physically settle before database retirement.
+                outcome = await await_owned_task(writer, withdrawal)
+                withdrawal = outcome.cancellation
             await self.close_usage_db()
+            if withdrawal is not None:
+                raise withdrawal
 
-        await retire("usage-database", close_usage_after_writers, cancel_on_timeout=False)
+        await retire("usage-database", close_usage_after_writers,
+                     resource=getattr(self, "_usage_db", None) if getattr(self, "_usage_db_owned", True) else None,
+                     cancel_on_timeout=False)
         terminal = execution_terminal_error(terminal, vars(self).get("_llm_close_control"))
         if terminal is not None:
             raise terminal
