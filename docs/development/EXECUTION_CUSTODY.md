@@ -108,8 +108,12 @@ transaction/operational body or adapter remains explicit resource debt, not an
 unbounded provider join or successful physical retirement. Actual committed
 facts and hidden UNKNOWN/failed-closer evidence survive alongside that debt.
 Successful records are released promptly; unresolved resources remain retained.
-The resource also strongly retains its actual body task, so a detached body
-cannot disappear while its checkout/debt is still rooted. Bind observation
+The resource strongly retains its original checkout task and every actual
+participating body task, including children using an inherited operational
+lease. Completed participants are released by their actual task completion;
+physical checkout completion removes the remaining participant roots and
+callbacks. A detached child cannot disappear while its transaction/debt is
+still rooted. Bind observation
 before acquiring the original operational/transaction lease. A later observer
 on an inherited or already-open unobserved connection is refused before SQL,
 not silently attached to an empty inventory. Script SQL uses the same raw

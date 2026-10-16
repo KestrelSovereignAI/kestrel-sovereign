@@ -28,6 +28,39 @@ from tests.integration.test_execution_authority_postgres import native_pg as _na
 native_pg = _native_pg
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
+async def test_inherited_operational_transaction_roots_actual_child_body(native_pg):
+    backend, _control, _schema = native_pg
+    observer = NativeExecutionObserver()
+    entered = asyncio.Event()
+    owner = None
+    retained = None
+
+    async def child_body():
+        async with backend.transaction():
+            await backend.execute("INSERT INTO effects VALUES (915, 'inherited native transaction body')")
+            entered.set()
+            await asyncio.get_running_loop().create_future()
+
+    with bind_native_execution_observer(observer):
+        async with backend.operational_session():
+            record = next(iter(observer._resources))
+            owner = create_owned_task(child_body())
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                # Prove actual native body is rooted BEFORE dropping the safe
+                # test reference; a failing proof still cancels/reaps it.
+                assert owner in getattr(record, "body_owners", ()), "original child transaction body is not physically rooted"
+                retained = weakref.ref(owner)
+                owner = None
+                gc.collect()
+                assert retained() in record.body_owners
+            finally:
+                original = owner if owner is not None else retained()
+                original.cancel()
+                await await_owned_task(original)
+            assert not record.body_owners
+    assert not observer._resources
+
 
 @pytest.mark.parametrize("lease_kind", ["operational", "nested_transaction"])
 async def test_late_observer_is_refused_before_native_transaction_entry(native_pg, monkeypatch, lease_kind):

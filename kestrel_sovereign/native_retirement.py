@@ -37,8 +37,21 @@ class _NativeResourceObservation:
     body_owner: asyncio.Task = field(default_factory=asyncio.current_task)
     connection: Any = None
     native_connection: Any = None
+    body_owners: set[asyncio.Task] = field(default_factory=set)
     phases: set[_NativePhaseObservation] = field(default_factory=set)
     acknowledgments: tuple = ()
+
+    def retain_body_owner(self):
+        """An inherited lease's user is not necessarily its checkout task.
+
+        Keep every participating task while it can still use this resource.
+        Completed tasks are released immediately; finishing the physical
+        checkout removes the remaining callbacks and roots as well.
+        """
+        owner = asyncio.current_task()
+        if owner not in self.body_owners:
+            self.body_owners.add(owner)
+            owner.add_done_callback(self.body_owners.discard)
 
     def record_error(self, error):
         if error is not None and is_execution_control_error(error):
@@ -63,6 +76,9 @@ class _NativeResourceObservation:
 
     def finish(self, error):
         self.record_error(error)
+        for owner in self.body_owners:
+            owner.remove_done_callback(self.body_owners.discard)
+        self.body_owners.clear()
         for observer in self.observers:
             observer._resources.discard(self)
 
@@ -163,7 +179,10 @@ def _require_native_observation_for_connection(connection):
     an inherited operational lease cannot silently bypass that inventory.
     """
     for observer in _NATIVE_OBSERVERS.get():
-        if not any(record.connection is connection for record in observer._resources):
+        records = tuple(record for record in observer._resources if record.connection is connection)
+        if not records:
             raise ExecutionAuthorityError(
                 "bind native retirement observation before acquiring the original operational/transaction lease"
             )
+        for record in records:
+            record.retain_body_owner()
