@@ -1010,4 +1010,14 @@ The fleet-reader proof uses an unpublished actual Agent, not a fabricated
 manager roster or a claim of live fleet READY acceptance. Other component
 normalizers and full live-host acceptance still require the whole review gate.
 
+After an ordinary host opening failure, caller cancellation observed during
+original-resource cleanup remains cancellation once that cleanup joins. The
+canonical terminal selector's lifecycle opt-in preserves the opening failure
+as explicit evidence; it never outranks native authority, UNKNOWN or retirement
+debt. Standalone Hold startup invokes the shared original context drain directly
+and propagates its actual cleanup debt alongside the startup failure. Actual
+partial Agent initialization and SQLite schema/COMMIT/close faults cover these
+contracts without bypassing mandatory features or publishing READY. Other outer
+agent/server lifecycle Task-admission boundaries remain review findings.
+
 These are candidate contracts, not whole-branch review or release approval.

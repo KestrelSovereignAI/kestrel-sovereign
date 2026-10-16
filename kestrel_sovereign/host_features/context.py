@@ -288,7 +288,9 @@ async def _close_partial_host_resources(
                 )
             errors.append(record.error)
     if any(error is not None for error in errors):
-        raise execution_terminal_error(prior_error, *errors, retain_originals=True)
+        raise execution_terminal_error(
+            prior_error, *errors, retain_originals=True, prefer_cancellation=True
+        )
 
 
 async def _finish_partial_host_cleanup(
@@ -504,8 +506,8 @@ async def build_host_context(
             hold_location,
         )
     except BaseException as exc:
-        # Cleanup owns its task independently so cancellation arriving after
-        # the opening failure closes every acquired backend and then
+        # Cleanup owns each original resource independently so cancellation
+        # arriving after the opening failure closes every acquired backend and
         # propagates instead of returning a degraded context during shutdown.
         await _finish_partial_host_cleanup(
             session_factory,

@@ -282,13 +282,17 @@ def execution_denial_scopes(error: BaseException | None) -> tuple | None:
     return tuple(scopes) if scopes or settled_commit else None
 
 
-def execution_terminal_error(*errors: BaseException | None, retain_originals: bool = False) -> BaseException | None:
+def execution_terminal_error(*errors: BaseException | None, retain_originals: bool = False,
+                             prefer_cancellation: bool = False) -> BaseException | None:
     """Keep irreversible control evidence ahead of cancellation/cleanup noise.
 
     Native lifecycle boundaries can retain all original body/closer carriers
     explicitly. Ordinary repeated readers retain bounded irreversible facts,
     not a growing exception history. Unresolved legacy commit classification
     is one such fact: a successful ACK elsewhere never settles it.
+    A lifecycle drain may prefer actual caller withdrawal over an ordinary
+    opening failure after cleanup settles. Original native control still wins;
+    retain_originals keeps the opening failure as explicit evidence.
     """
     import asyncio
     present = tuple(error for error in errors if error is not None)
@@ -367,6 +371,10 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
         # of cancellation. A failed checkpoint is not a successful Stop.
         if isinstance(error, asyncio.CancelledError) and error.__cause__ is not None:
             return retain(error.__cause__)
+    if prefer_cancellation:
+        for error in present:
+            if isinstance(error, asyncio.CancelledError):
+                return retain(error)
     if present and isinstance(present[0], GeneratorExit):
         # GeneratorExit is the source's ordinary close request, not caller
         # cancellation. A later cancellation while joining that close must
