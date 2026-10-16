@@ -185,9 +185,14 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
                         "data": [
                             {
                                 "object": "embedding",
-                                "index": 0,
+                                "index": index,
                                 "embedding": [1.0, 0.0, 0.0],
                             }
+                            for index, _ in enumerate(
+                                body["input"]
+                                if isinstance(body["input"], list)
+                                else [body["input"]]
+                            )
                         ],
                         "usage": {"prompt_tokens": 3, "total_tokens": 3},
                     }

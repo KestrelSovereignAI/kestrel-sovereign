@@ -9,7 +9,7 @@ import httpx
 import openai
 import pytest
 
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task, owned_task_join_ancestors
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, bind_execution_custody,
 )
@@ -57,12 +57,27 @@ def openai_chunk():
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 @pytest.mark.parametrize("provider", ["openai", "openrouter"])
 @pytest.mark.parametrize("tools", [False, True])
-async def test_native_sdk_handle_survives_post_open_authority_denial(provider, tools):
+@pytest.mark.parametrize("acquisition_delay", [0, 1.1], ids=["immediate", "delayed"])
+async def test_native_sdk_handle_survives_post_open_authority_denial(provider, tools, acquisition_delay, monkeypatch):
     body, fence = Body(), Fence()
+    native_closes = []
+    actual_create = asyncio.create_task
+
+    def observe_close(operation, *args, **kwargs):
+        task = actual_create(operation, *args, **kwargs)
+        if getattr(operation, "cr_code", None) is httpx.Response.aclose.__code__:
+            native_closes.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", observe_close)
     original = ExecutionAuthorityError("original post-open custody denial")
     async def transport(_request):
+        # A real SDK's cold initialization or transport latency is unrelated
+        # to whether its acquired response remains owned through retirement.
+        await asyncio.sleep(acquisition_delay)
         fence.denial = original
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
     http = httpx.AsyncClient(transport=httpx.MockTransport(transport))
@@ -74,16 +89,34 @@ async def test_native_sdk_handle_survives_post_open_authority_denial(provider, t
         with bind_execution_custody(fence):
             await anext(iterator)
     task = asyncio.create_task(acquire())
+    close_observer = asyncio.create_task(body.close_entered.wait())
     try:
-        await asyncio.wait_for(body.close_entered.wait(), timeout=1)
+        # Compare lifecycle events, not SDK startup speed. A premature
+        # acquisition failure must fail immediately; an absent close remains
+        # bounded by the complete test's timeout, including its cleanup.
+        done, _ = await asyncio.wait(
+            (task, close_observer), return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert close_observer in done, "post-open denial escaped without entering native close"
         assert not task.done(), "post-open denial escaped before native close joined"
+        # OpenRouter forwards through its own accepted iterator Task; OpenAI
+        # joins directly. In either case the actual native closer must have a
+        # real implementation waiter before the fixture releases its body.
+        assert len(native_closes) == 1 and owned_task_join_ancestors(native_closes[0]), (
+            "pending native HTTP close has no physical implementation joiner"
+        )
         body.release_close.set()
         outcome = await await_owned_task(task)
         assert outcome.error is original
         assert body.closed
     finally:
         body.release_close.set()
+        if not close_observer.done():
+            close_observer.cancel()
+        await await_owned_task(close_observer)
         await await_owned_task(task)
+        for native_close in native_closes:
+            await await_owned_task(native_close)
         await iterator.aclose()
         await body.aclose()
         await client.close()

@@ -25,7 +25,7 @@ Ordinary availability failures retain their best-effort behavior and legitimate
 bounded split retry. These are component/native proofs, not full Agent READY,
 authenticated HTTP or public-provider acceptance. Explicit component DDL does
 not certify startup migrations; legacy cross-schema migration probes are tracked
-separately in #3673. Settings/CLI/background-job outer normalization and sibling
+separately in #3673. Remaining settings/CLI outer normalization and sibling
 context tools remain under the open cumulative ledger, not cleared by these
 producer tests. The task-list HTTP wrapper likewise propagates the identity
 helper's original receipt instead of replacing it with an ordinary HTTP500.
@@ -52,10 +52,32 @@ Embedding settings likewise observe the actual scheduled route-preference writer
 before returning success and preserve its retained native outcome. Shared CLI
 metadata, registry and active-profile reads and their reindex consumers preserve
 control before missing-configuration or unavailable-count fallbacks. Ordinary
-availability behavior remains unchanged. Reconcile, synchronous compatibility,
-background reindex ownership and remaining HTTP/lifecycle findings still require
-their own cumulative approval; these component tests do not establish READY or
-authenticated HTTP acceptance.
+availability behavior remains unchanged. The complete settings operation also
+observes profile writers scheduled during its asynchronous response echo, not
+only the writer scheduled by the initial route update.
+
+Endpoint-launched reindex jobs publish through the existing agent background
+owner and canonical original-preserving Task wrapper. Publication accepts fresh
+coroutines, not borrowed Tasks; refused Task creation closes unstarted work.
+The job retains its original control privately for subsequent polling while
+the agent retains its bounded terminal receipt. Neither public error strings
+nor a completed Task certify reconciliation. The existing 32-job limit refuses
+new publication when only live or control-bearing jobs remain; mutable business
+status cannot retire a physically pending owner. Ordinary caller withdrawal
+remains cancellation, not successful background completion. Native tests run
+actual PostgreSQL/pgvector reindex writes and batched loopback SDK traffic;
+Task-factory observers forward actual Tasks, including an earlier cancellation
+observer, without fabricating completion. These remain component inputs, not
+registered Agent READY or authenticated HTTP acceptance. Reconcile, synchronous
+compatibility and remaining HTTP/CLI/lifecycle sites stay open in the cumulative
+ledger; none of these local checks constitutes independent release approval.
+
+The native SDK acquisition/retirement test compares lifecycle events and the
+actual pending native-close Task's join dependency instead of demanding SDK
+startup within one second. A delayed local transport exercises that distinction;
+the complete test still has a finite 30-second deadline including cleanup.
+Both implementation and fixture observe and join the actual native Task. No
+production SDK, storage or shutdown deadline is extended by this test change.
 
 Snapshot upload retirement uses the existing native close owner, opting into
 retaining the opening cancellation and original close error together. Refused

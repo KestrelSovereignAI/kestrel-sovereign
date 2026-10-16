@@ -9221,7 +9221,13 @@ Expected Duration: {expected_duration}
 
     def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
         """Start agent-owned background work and remove it when complete."""
-        task = asyncio.create_task(coro, name=name)
+        from kestrel_sovereign._async_ownership import create_owned_task
+
+        # Keep create_task's fresh-coroutine contract: an already accepted
+        # borrowed Task must not be adopted as this agent's background child.
+        if not asyncio.iscoroutine(coro):
+            raise TypeError("agent background publication requires a fresh coroutine")
+        task = create_owned_task(coro, name=name)
         # ``asyncio.Task`` carries no creation time, and age is what separates
         # "busy" from "wedged" when something inspects this set — the restart
         # coordinator's idle gate reports it so an operator can tell a task

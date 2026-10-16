@@ -2653,6 +2653,9 @@ async def set_embedding_settings(request: Request):
         # ``stale_rows`` is absent. Mirror the GET endpoint so the button state
         # is correct immediately after a route change without a second reload.
         await _apply_stale_embedding_counts(settings, agent)
+        # Resolution during the echo can schedule another profile writer.
+        # Observe the complete change, not only its initial route write.
+        await _drain_preference_persistence(agent)
         return {"success": True, **settings}
     except HTTPException:
         raise
@@ -2808,6 +2811,11 @@ _REINDEX_JOBS_MAX = 32
 
 def _reindex_job_public(job: Dict) -> Dict:
     """The subset of a job record that is safe to return to a client."""
+    control = job.get("_control")
+    if control is not None:
+        from kestrel_sovereign.execution_custody import retained_execution_error
+
+        raise retained_execution_error(control)
     return {
         "job_id": job["job_id"],
         "status": job["status"],
@@ -2931,27 +2939,47 @@ async def _run_reindex_job(job: Dict, reindexer, tables, agent_id) -> None:
             job["stats"][tname] = stats.as_dict()
         _accumulate_reindex_stats(job)
         _finalize_reindex_status(job)
-    except Exception as e:  # pragma: no cover - defensive; surfaced via status
-        logger.error("reindex job %s failed: %s", job["job_id"], e, exc_info=True)
+    except BaseException as e:
         job["status"] = "error"
+        if is_execution_control_error(e):
+            from kestrel_sovereign.execution_custody import retained_execution_error
+
+            # This finite job owns the exact receipt, not a public error
+            # string. The agent's native Task owner also observes it at
+            # completion and shutdown; polling cannot manufacture success.
+            job["_control"] = retained_execution_error(e)
+            job["error"] = type(e).__name__
+            raise
+        if not isinstance(e, Exception):
+            job["error"] = "Reindex interrupted"
+            raise
+        logger.error("reindex job %s failed: %s", job["job_id"], e, exc_info=True)
         job["error"] = str(e)
     finally:
         job["updated_at"] = time.time()
 
 
-def _prune_reindex_jobs() -> None:
-    """Bound the registry: drop the oldest finished jobs past the cap."""
-    if len(_REINDEX_JOBS) <= _REINDEX_JOBS_MAX:
+def _prune_reindex_jobs(*, reserve: int = 0) -> None:
+    """Prune only physically finished ordinary jobs, retaining native debt.
+
+    A prospective publisher reserves space before admission. If all retained
+    slots are still running or carry control, it must refuse rather than drop
+    a live owner or the original receipt merely to make the cap appear met.
+    """
+    limit = _REINDEX_JOBS_MAX - reserve
+    if len(_REINDEX_JOBS) <= limit:
         return
     finished = sorted(
         (
             j
             for j in _REINDEX_JOBS.values()
             if j["status"] in ("done", "error", "partial")
+            and not is_execution_control_error(j.get("_control"))
+            and (j.get("_owner_task") is None or j["_owner_task"].done())
         ),
         key=lambda j: j["updated_at"],
     )
-    while len(_REINDEX_JOBS) > _REINDEX_JOBS_MAX and finished:
+    while len(_REINDEX_JOBS) > limit and finished:
         _REINDEX_JOBS.pop(finished.pop(0)["job_id"], None)
 
 
@@ -3279,13 +3307,25 @@ async def reindex_embeddings(request: Request):
             "error": None,
             "updated_at": time.time(),
         }
+        # There is no await between this final capacity check and publication,
+        # so concurrent preflights cannot over-admit the bounded native owners.
+        _prune_reindex_jobs(reserve=1)
+        if len(_REINDEX_JOBS) >= _REINDEX_JOBS_MAX:
+            raise HTTPException(status_code=503, detail="Embedding reindex job capacity is full.")
+        publish = getattr(agent, "_track_background_task", None)
+        if not callable(publish):
+            raise HTTPException(status_code=503, detail="Embedding reindex owner is unavailable.")
+        job["_owner_task"] = publish(
+            _run_reindex_job(job, reindexer, tables, agent_id),
+            name=f"embedding-reindex-{job_id}",
+        )
         _REINDEX_JOBS[job_id] = job
-        _prune_reindex_jobs()
-        asyncio.create_task(_run_reindex_job(job, reindexer, tables, agent_id))
         return {"dry_run": False, **_reindex_job_public(job)}
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error starting embedding reindex: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error starting embedding reindex.")
 
@@ -3311,6 +3351,8 @@ async def get_reindex_job(job_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error reading reindex job: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error reading reindex job.")
 
