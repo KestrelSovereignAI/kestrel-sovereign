@@ -2536,6 +2536,8 @@ async def _classify_stale_embedding_rows(agent, service=None) -> Optional[Dict[s
             agent_id=getattr(agent, "agent_id", None)
         )
     except Exception as e:  # pragma: no cover - defensive; never crash the GET
+        if is_execution_control_error(e):
+            raise
         logger.debug("stale_rows count failed: %s", e)
         return None
 
@@ -2568,6 +2570,8 @@ async def _drain_preference_persistence(agent) -> None:
         try:
             await drain()
         except Exception as e:  # pragma: no cover - persistence is best-effort
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"preference persistence drain failed: {e}")
 
 
@@ -2635,6 +2639,10 @@ async def set_embedding_settings(request: Request):
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 
+        # Observe the route writer's original outcome before a success echo,
+        # just as the per-route model setter observes its persistence writer.
+        await _drain_preference_persistence(agent)
+
         if hasattr(agent.llm_service, "aget_embedding_settings"):
             settings = await agent.llm_service.aget_embedding_settings()
         else:
@@ -2649,6 +2657,8 @@ async def set_embedding_settings(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error setting embedding route: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting embedding route.")
 
@@ -2778,6 +2788,8 @@ async def set_route_embedding_model(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error setting route embedding model: {e}", exc_info=True)
         raise HTTPException(
             status_code=500, detail="Error setting route embedding model."
@@ -2982,6 +2994,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
                 db, agent_id
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.debug("could not load persisted embedding_route: %s", exc)
             found, route = False, None
 
@@ -3013,6 +3027,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
                 db, agent_id
             )
         except Exception as exc:  # pragma: no cover - defensive
+            if is_execution_control_error(exc):
+                raise
             logger.debug("could not load persisted embedding_model pins: %s", exc)
             overrides = {}
         # Sync runtime overrides to the DB state FIRST (#2423): the DB is the

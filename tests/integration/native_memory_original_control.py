@@ -41,6 +41,7 @@ class NativeMemoryOwners:
     sqlite_factory: object
     service: object
     requests: object
+    catalog_requests: object
     lease: object
     did: object
 
@@ -65,13 +66,37 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
     server = client = local_db = None
     handlers = set()
     try:
-        requests, handlers = [], set()
+        requests, catalog_requests, handler_failures, handlers = [], [], [], set()
 
         async def serve(reader, writer):
             owner = asyncio.current_task()
             handlers.add(owner)
             try:
                 header = await reader.readuntil(b"\r\n\r\n")
+                if header.startswith(b"GET /v1/models "):
+                    catalog_requests.append("/v1/models")
+                    payload = json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "id": model,
+                                    "object": "model",
+                                    "created": 1,
+                                    "owned_by": "local-fixture",
+                                }
+                                for model in ("local-test-embedding", "gpt-4o")
+                            ],
+                        }
+                    ).encode()
+                    writer.write(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                        + str(len(payload)).encode()
+                        + b"\r\n\r\n"
+                        + payload
+                    )
+                    await writer.drain()
+                    return
                 size = next(
                     int(line.split(b":", 1)[1])
                     for line in header.split(b"\r\n")
@@ -174,6 +199,11 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
                     + payload
                 )
                 await writer.drain()
+            except Exception as error:
+                # Async server callbacks otherwise merely log their failure,
+                # allowing a defensive discovery fallback to hide a broken
+                # local fixture. The fixture owner must fail its own teardown.
+                handler_failures.append(error)
             finally:
                 writer.close()
                 await writer.wait_closed()
@@ -239,6 +269,7 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
             factory,
             service,
             requests,
+            catalog_requests,
             lease,
             did,
         )
@@ -265,6 +296,7 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
             await retire(server.wait_closed)
         if handlers:
             await asyncio.gather(*handlers, return_exceptions=True)
+        unexpected.extend(handler_failures)
         # Failed native release ACKs deliberately retain debt/control even
         # after their exact Task has finished. Do not falsify that receipt by
         # clearing the reaper or demanding an empty semantic debt inventory.

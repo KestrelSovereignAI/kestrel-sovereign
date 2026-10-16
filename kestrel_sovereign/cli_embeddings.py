@@ -77,6 +77,7 @@ import sys
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +330,8 @@ async def _load_persisted_embedding_route(
             return (False, None)
         return (True, json.loads(rows[0][0]))
     except Exception as exc:  # pragma: no cover - defensive
+        if is_execution_control_error(exc):
+            raise
         logger.debug("could not read persisted embedding_route: %s", exc)
         return (False, None)
 
@@ -362,6 +365,8 @@ async def _load_persisted_route_embedding_models(
         overrides = json.loads(rows[0][0])
         return overrides if isinstance(overrides, dict) else {}
     except Exception as exc:  # pragma: no cover - defensive
+        if is_execution_control_error(exc):
+            raise
         logger.debug("could not read persisted embedding_model_overrides: %s", exc)
         return {}
 
@@ -636,6 +641,8 @@ async def _audit(db: "Any", *, table: Optional[str], agent_id: Optional[str]) ->
                 "dim": row[3],
             }
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         logger.warning(
             "embedding_profiles registry not readable (table missing?): %s",
             exc,
@@ -672,6 +679,8 @@ async def _audit(db: "Any", *, table: Optional[str], agent_id: Optional[str]) ->
                 agent_params,
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             print(f"\n{tname}: ERROR — {exc}")
             overall_ok = False
             continue
@@ -1046,6 +1055,8 @@ async def _reindex(
     try:
         active = await load_active_embedding_profiles(db, agent_id)
     except Exception as exc:  # noqa: BLE001 - any read failure refuses
+        if is_execution_control_error(exc):
+            raise
         print(
             "ERROR: could not read the active embedding profile the agent "
             f"recorded ({type(exc).__name__}: {exc}); refusing to reindex "
@@ -1329,6 +1340,8 @@ async def _active_profile_report(
     try:
         active = await load_active_embedding_profiles(db)
     except Exception as exc:  # noqa: BLE001 - reported, never "not recorded"
+        if is_execution_control_error(exc):
+            raise
         report["error"] = f"{type(exc).__name__}: {exc}"
         return report
     report["records"] = [asdict(record) for record in active.records]

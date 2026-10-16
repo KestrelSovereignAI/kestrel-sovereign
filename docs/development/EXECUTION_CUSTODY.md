@@ -44,6 +44,19 @@ metadata. Component Agent projections still do not establish genesis/READY or
 authenticated HTTP. Other cumulative lifecycle and settings/CLI findings remain
 open until independently cleared.
 
+Pre-turn Codex-thread compaction preserves that same original control before
+either turn-entry caller can continue or reset the thread. Native component
+tests traverse actual history reads, summary insertion and metadata updates;
+the adapter occupancy is a declared cache input, not a live Codex session.
+Embedding settings likewise observe the actual scheduled route-preference writer
+before returning success and preserve its retained native outcome. Shared CLI
+metadata, registry and active-profile reads and their reindex consumers preserve
+control before missing-configuration or unavailable-count fallbacks. Ordinary
+availability behavior remains unchanged. Reconcile, synchronous compatibility,
+background reindex ownership and remaining HTTP/lifecycle findings still require
+their own cumulative approval; these component tests do not establish READY or
+authenticated HTTP acceptance.
+
 Snapshot upload retirement uses the existing native close owner, opting into
 retaining the opening cancellation and original close error together. Refused
 close admission retains the exact unstarted client; repeated caller withdrawal

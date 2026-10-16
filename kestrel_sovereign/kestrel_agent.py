@@ -8264,8 +8264,9 @@ Expected Duration: {expected_duration}
         survives — observable and recoverable — instead of codex doing it
         invisibly.
 
-        Best-effort: any failure logs and leaves the turn to proceed
-        normally (codex's own auto-compaction remains the backstop).
+        Ordinary availability failures log and leave the turn to proceed
+        (codex's own auto-compaction remains the backstop). Original native
+        control is not availability: it must stop this pre-turn gate.
         """
         if not session_id:
             return
@@ -8299,7 +8300,9 @@ Expected Duration: {expected_duration}
                 force=True,
                 session_id=session_id,
             )
-        except Exception as e:  # noqa: BLE001 - never break a turn
+        except Exception as e:  # noqa: BLE001 - ordinary availability is optional
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "openai:plan auto-compaction failed at %.1f%% occupancy: %s",
                 pct, e, exc_info=True,
