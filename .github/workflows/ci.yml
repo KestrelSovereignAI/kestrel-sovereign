@@ -485,7 +485,7 @@ jobs:
           path: junit-*.xml
           retention-days: 7
 
-  unit-logical:
+  unit-n8:
     runs-on: ubuntu-latest
     # Explicit `contents: read` so this job does NOT inherit the wider grant
     # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
@@ -577,7 +577,7 @@ jobs:
         # tripped first. --maxfail bounds a truly broken tree without hiding
         # the set. Reading a red run now means reading every failure, which is
         # what tells you flake from regression.
-        run: uv run pytest tests/unit/ -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --junitxml=junit-logical.xml
+        run: uv run pytest tests/unit/ -n 8 -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --junitxml=junit-n8.xml
         # Budgeted the way the integration tier below is (#3212), because the
         # unit tier hit the same wall for the same reason (#3330). 10 min was
         # too tight, then 20 was: at 44e77ec5 the push run passed the step in
@@ -607,7 +607,6 @@ jobs:
         # a minute; the wall clock only decides how much passing work is
         # thrown away. Runner sizing — the real fix — stays in #2795.
         #
-        # budget-basis(unit): slowest-pass=13.8 worst-runner-ratio=2.3 samples=51 longest-test=300
         timeout-minutes: 45
         env:
           KESTREL_AUDIT_MODE: skip
@@ -741,14 +740,17 @@ jobs:
           python3 - "${{ matrix.shard }}" 4 > shard-files.txt <<'EOF'
           import pathlib, sys
           shard, total = int(sys.argv[1]), int(sys.argv[2])
-          files = sorted(pathlib.Path("tests/unit").rglob("test_*.py"))
+          import json
+          dur = json.load(open(".github/unit_file_durations.json"))
+          files = sorted(str(p) for p in pathlib.Path("tests/unit").rglob("test_*.py"))
+          default = sorted(dur.values())[len(dur) // 2]
           bins = [[0, []] for _ in range(total)]
-          for f in sorted(files, key=lambda p: (-p.stat().st_size, str(p))):
-              b = min(bins, key=lambda b: b[0]); b[0] += f.stat().st_size; b[1].append(str(f))
+          for f in sorted(files, key=lambda f: (-dur.get(f, default), f)):
+              b = min(bins, key=lambda b: b[0]); b[0] += dur.get(f, default); b[1].append(f)
           print("\n".join(sorted(bins[shard][1])))
           EOF
           wc -l shard-files.txt
-          uv run pytest $(cat shard-files.txt) -n auto -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --junitxml=junit-shard-${{ matrix.shard }}.xml
+          uv run pytest $(cat shard-files.txt) -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --junitxml=junit-shard-${{ matrix.shard }}.xml
         # Budgeted the way the integration tier below is (#3212), because the
         # unit tier hit the same wall for the same reason (#3330). 10 min was
         # too tight, then 20 was: at 44e77ec5 the push run passed the step in
@@ -778,7 +780,6 @@ jobs:
         # a minute; the wall clock only decides how much passing work is
         # thrown away. Runner sizing — the real fix — stays in #2795.
         #
-        # budget-basis(unit): slowest-pass=13.8 worst-runner-ratio=2.3 samples=51 longest-test=300
         timeout-minutes: 45
         env:
           KESTREL_AUDIT_MODE: skip
