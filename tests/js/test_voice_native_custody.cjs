@@ -9,7 +9,7 @@ const { chromium } = require('playwright');
 const { wsServer: WebSocketServer } = require(path.join(
   path.dirname(require.resolve('playwright-core/package.json')), 'lib/utilsBundle.js'));
 
-async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false, responseStartTimeoutMs = 30000, dropPlaybackClearAck = false, framed = false, holdSessionAck = false, holdInputClear = false } = {}) {
+async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false, responseStartTimeoutMs = 30000, dropPlaybackClearAck = false, framed = false, holdSessionAck = false, holdInputClear = false, ackIdentity = true, socketIdentity = true } = {}) {
   const staticRoot = process.env.KESTREL_TEST_STATIC_ROOT
     ? path.resolve(process.env.KESTREL_TEST_STATIC_ROOT)
     : path.resolve(__dirname, '../../kestrel_sovereign/static');
@@ -21,6 +21,7 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
   let sdpRequests = 0;
   let toolPosts = 0;
   let pipelineFrames = 0;
+  let mintRequests = 0;
   const realtimeMessages = [];
   const realtimePeers = [];
   const framedConfig = { type: 'realtime', output_modalities: ['audio'], audio: {
@@ -38,6 +39,7 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       if (req.url === '/voice/realtime/session') {
+        mintRequests++;
         res.setHeader('Content-Type', 'application/json');
         if (declineMint) {
           res.writeHead(409).end(JSON.stringify({ path: 'pipeline', fallback_tts: 'offline',
@@ -130,6 +132,8 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
   });
   wsServer.on('connection', connection => {
     realtimePeers.push(connection);
+    connection.send(JSON.stringify({ type: 'session.created', session: { model: 'offline-model',
+      ...(socketIdentity ? { id: 'actual-socket-id' } : {}) } }));
     connection.send(JSON.stringify({ type: 'status', state: 'listening' }));
     connection.on('message', (bytes, binary) => {
       if (binary && bytes[0] === 1) pipelineFrames++;
@@ -137,7 +141,7 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
         const message = JSON.parse(bytes.toString());
         realtimeMessages.push(message);
         if (message.type === 'session.update' && !holdSessionAck) connection.send(JSON.stringify({
-          type: 'session.updated', session: { id: 'actual-socket-id', model: 'offline-model', ...framedConfig },
+          type: 'session.updated', session: { ...(ackIdentity ? { id: 'actual-socket-id' } : {}), model: 'offline-model', ...framedConfig },
         }));
         if (message.type === 'input_audio_buffer.clear' && !holdInputClear) connection.send(JSON.stringify({ type: 'input_audio_buffer.cleared' }));
       }
@@ -165,11 +169,12 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       window.nativeEvents = [];
       if (framed) {
         const NativeContext = window.AudioContext, NativeSocket = window.WebSocket, NativeNode = window.AudioWorkletNode;
-        window.nativeContexts = []; window.nativeSockets = []; window.nativeCaptureGenerations = [];
+        window.nativeContexts = []; window.nativeSockets = []; window.nativeCaptureGenerations = []; window.nativeWorkletNodes = [];
         window.AudioContext = class extends NativeContext { constructor(...args) { super(...args); window.nativeContexts.push(this); } };
         window.WebSocket = class extends NativeSocket { constructor(...args) { super(...args); window.nativeSockets.push(this); } };
         window.AudioWorkletNode = class extends NativeNode { constructor(...args) {
           super(...args);
+          window.nativeWorkletNodes.push(this);
           if (args[1] === 'kestrel-capture') {
             this.port.addEventListener('message', event => {
               if (event.data?.type === 'chunk') window.nativeCaptureGenerations.push(event.data.generation);
@@ -192,6 +197,7 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       },
       toolPosts: () => toolPosts,
       pipelineFrames: () => pipelineFrames,
+      mintRequests: () => mintRequests,
       realtimeMessages: () => realtimeMessages,
       sessionAck: config => realtimePeers[0].send(JSON.stringify({ type: 'session.updated',
         session: config || { id: 'actual-socket-id', model: 'offline-model', ...framedConfig } })),
@@ -383,6 +389,162 @@ test(`framed native ${failure} failure closes original capture, contexts and soc
     responseStartTimeoutMs: failure === 'startup-overflow' ? 10000 : 700 });
 });
 }
+
+for (const operation of ['Stop', 'typed']) {
+test(`review99 ${operation} while original mint is pending retains the latest local boundary`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, enteredMint, releaseMint, realtimeMessages }) => {
+    await page.evaluate(() => { window.startup = window.client.start().then(() => null, error => error.message); });
+    await enteredMint;
+    const errors = await page.evaluate(operation => {
+      const errors = [];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { if (operation === 'Stop') window.client.cancelResponse(); else window.client.sendText('mint-replacement-' + attempt); }
+        catch (error) { errors.push(error.message); }
+      }
+      return errors;
+    }, operation);
+    assert.deepEqual(errors, []);
+    releaseMint();
+    assert.equal(await page.evaluate(() => window.startup), null);
+    await page.waitForFunction(() => window.nativeCaptureGenerations.includes(1));
+    if (operation === 'typed') {
+      for (let step = 0; step < 100 && !realtimeMessages().some(message => message.type === 'response.create'); step++) await page.waitForTimeout(10);
+      assert.equal(realtimeMessages().filter(message => message.type === 'response.create').length, 1);
+      const items = realtimeMessages().filter(message => message.type === 'conversation.item.create');
+      assert.equal(items.length, 1);
+      assert.equal(items[0].item.content[0].text, 'mint-replacement-1');
+    }
+  }, '{"persisted":false}', { autoStart: false, framed: true, holdMint: true });
+});
+}
+
+for (const factory of ['capture', 'playback']) {
+for (const operation of ['Stop', 'typed']) {
+test(`review99 ${operation} during strict native ${factory} acquisition preserves a pending local boundary`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, enteredWorklet, releaseWorklet, realtimeMessages }) => {
+    await page.evaluate(() => { window.startup = window.client.start().then(() => null, error => error.message); });
+    await enteredWorklet;
+    const errors = await page.evaluate(operation => {
+      const errors = [];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { if (operation === 'Stop') window.client.cancelResponse(); else window.client.sendText('replacement-' + attempt); }
+        catch (error) { errors.push(error.message); }
+      }
+      return errors;
+    }, operation);
+    assert.deepEqual(errors, [], 'early local abandonment depended on an unopened transport');
+    releaseWorklet();
+    assert.equal(await page.evaluate(() => window.startup), null);
+    await page.waitForFunction(() => window.nativeCaptureGenerations.includes(2));
+    assert.ok(await page.evaluate(() => window.client.micStream.getTracks().every(track => track.readyState === 'live')));
+    if (operation === 'typed') {
+      for (let step = 0; step < 100 && !realtimeMessages().some(message => message.type === 'response.create'); step++) await page.waitForTimeout(10);
+      assert.equal(realtimeMessages().filter(message => message.type === 'response.create').length, 1);
+      const texts = realtimeMessages().filter(message => message.type === 'conversation.item.create');
+      assert.equal(texts.length, 1);
+      assert.equal(texts[0].item.content[0].text, 'replacement-1');
+    }
+  }, '{"persisted":false}', { autoStart: false, framed: true, holdWorklet: factory });
+});
+}
+for (const clientMode of ['framed', 'pipeline']) {
+test(`review99 close settles ${clientMode} public startup before native ${factory} worklet HTTP is released`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, enteredWorklet, releaseWorklet }) => {
+    await page.evaluate(async clientMode => {
+      if (clientMode === 'pipeline') {
+        const { createPipelineClient } = await import('/js/voice/pipeline.js');
+        window.client = await createPipelineClient({ onEvent: event => window.nativeEvents.push(event) });
+      }
+      window.startup = window.client.start().then(() => 'started', () => 'closed');
+    }, clientMode);
+    await enteredWorklet;
+    const state = await page.evaluate(async () => {
+      await window.client.close();
+      const outcome = await Promise.race([window.startup, new Promise(resolve => setTimeout(() => resolve('pending'), 150))]);
+      return { outcome, nodes: window.nativeWorkletNodes.length, contexts: window.nativeContexts.map(context => context.state),
+        tracks: window.client.micStream.getTracks().map(track => track.readyState) };
+    });
+    assert.equal(state.outcome, 'closed', 'public startup remained pending until fixture released HTTP');
+    assert.ok(state.contexts.every(value => value === 'closed') && state.tracks.every(value => value === 'ended'));
+    releaseWorklet();
+    const late = await page.evaluate(async () => {
+      const actual = await window.client.whenStartupSettled();
+      return { status: actual[0].status, nodes: window.nativeWorkletNodes.length,
+        sockets: window.nativeSockets.length, closed: window.nativeContexts.every(context => context.state === 'closed'),
+        tracks: window.client.micStream.getTracks().every(track => track.readyState === 'ended') };
+    });
+    assert.equal(late.status, 'rejected');
+    assert.equal(late.nodes, state.nodes, 'late native acquisition created a successor worklet');
+    assert.equal(late.sockets, 0, 'retired startup opened a late socket');
+    assert.ok(late.closed && late.tracks);
+  }, '{"persisted":false}', { autoStart: false, framed: true, holdWorklet: factory });
+});
+}
+}
+
+for (const socketIdentity of [false, true]) {
+test(`review99 schema-valid effective config ACK need not include socket identity (created ID ${socketIdentity})`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    const ready = await page.evaluate(() => window.nativeEvents.find(event => event.kind === 'session_ready'));
+    assert.equal(ready.session_id, socketIdentity ? 'actual-socket-id' : '');
+    assert.ok(await page.evaluate(() => window.client.micStream.getTracks().every(track => track.readyState === 'live')));
+  }, '{"persisted":false}', { framed: true, ackIdentity: false, socketIdentity });
+});
+}
+
+test('review99 harmless no-active-response cancel error preserves fresh native input and output', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, sendRealtime, realtimeMessages }) => {
+    await page.evaluate(() => window.client.cancelResponse());
+    sendRealtime({ type: 'error', error: { code: 'response_cancel_not_active', message: 'No response is in progress' } });
+    await page.waitForTimeout(150);
+    assert.ok(await page.evaluate(() => window.client.micStream.getTracks().every(track => track.readyState === 'live')));
+    assert.equal(await page.evaluate(() => window.nativeEvents.some(event => event.kind === 'error' && event.fatal)), false);
+    sendRealtime({ type: 'input_audio_buffer.speech_started', item_id: 'after-cancel' });
+    sendRealtime({ type: 'input_audio_buffer.committed', item_id: 'after-cancel' });
+    for (let step = 0; step < 100 && !realtimeMessages().some(message => message.type === 'response.create'); step++) await page.waitForTimeout(10);
+    const request = realtimeMessages().find(message => message.type === 'response.create');
+    assert.ok(request);
+    sendRealtime({ type: 'response.created', response: { id: 'after-cancel', metadata: request.response.metadata } });
+    sendRealtime({ type: 'response.output_text.delta', response_id: 'after-cancel', delta: 'FRESH_AFTER_CANCEL' });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.text === 'FRESH_AFTER_CANCEL'));
+  }, '{"persisted":false}', { framed: true });
+});
+
+test('review99 legacy API opt-out retains explicit fallback description without opening a microphone', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    const refusal = await page.evaluate(async () => {
+      try { await window.client.start(); return null; }
+      catch (error) { return { code: error.code, fallback: error.fallback }; }
+    });
+    assert.equal(refusal.code, 'REALTIME_UNAVAILABLE');
+    assert.equal(refusal.fallback.path, 'pipeline');
+    assert.equal(await page.evaluate(() => window.client.micStream), null);
+  }, '{}', { autoStart: false, declineMint: true });
+});
+
+test('review99 provider input protocol rejection after ready automatically retires originals', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, sendRealtime }) => {
+    sendRealtime({ type: 'error', error: { code: 'invalid_value', message: 'input audio append rejected' } });
+    await page.waitForTimeout(150);
+    assert.ok(await page.evaluate(() => window.nativeEvents.some(event => event.kind === 'error' && event.fatal)));
+    await page.waitForFunction(() => window.nativeContexts.every(context => context.state === 'closed')
+      && window.nativeSockets[0].readyState === WebSocket.CLOSED
+      && window.client.micStream.getTracks().every(track => track.readyState === 'ended'));
+  }, '{"persisted":false}', { framed: true });
+});
+
+test('review99 strict Console refusal cannot silently start a Pipeline transport', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, pipelineFrames }) => {
+    await page.evaluate(async () => {
+      const voiceUI = await import('/js/voice/ui.js');
+      window.uiSession = voiceUI.sessionForAgent(null);
+      await voiceUI.startSession(window.uiSession);
+    });
+    await page.waitForTimeout(150);
+    assert.notEqual(await page.evaluate(() => window.uiSession.path), 'pipeline');
+    assert.equal(pipelineFrames(), 0);
+  }, '{"persisted":false}', { autoStart: false, declineMint: true });
+});
 
 for (const path of ['realtime', 'pipeline']) {
 test(`native ${path} clear-ACK failure retires original microphone, playback and socket`, { timeout: 30000 }, async () => {
@@ -804,9 +966,10 @@ test('obsolete native microphone startup cannot close the replacement UI session
   }, '{}', { autoStart: false });
 });
 
-test('expected realtime refusal preserves armed microphone through native pipeline fallback', { timeout: 30000 }, async () => {
-  await nativeVoice(async ({ page, pipelineFrames }) => {
+test('explicit operator Pipeline selection preserves armed native microphone without a realtime mint', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, pipelineFrames, mintRequests }) => {
     await page.evaluate(async () => {
+      localStorage.setItem('kestrel.voice.settings', JSON.stringify({ mode: 'pipeline' }));
       const voiceUI = await import('/js/voice/ui.js');
       window.uiSession = voiceUI.sessionForAgent(null);
       await voiceUI.startSession(window.uiSession);
@@ -815,6 +978,7 @@ test('expected realtime refusal preserves armed microphone through native pipeli
     assert.equal(await page.evaluate(() => window.uiSession.path), 'pipeline');
     await page.waitForTimeout(600);
     assert.ok(pipelineFrames() > 0, 'fallback policy disarmed the actual microphone input');
+    assert.equal(mintRequests(), 0);
   }, '{}', { autoStart: false, declineMint: true });
 });
 

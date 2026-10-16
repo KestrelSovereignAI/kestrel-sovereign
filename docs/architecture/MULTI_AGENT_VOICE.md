@@ -240,8 +240,29 @@ completion. Missing/foreign IDs and delayed older completions are excluded;
 continuations cannot reuse a predecessor request nonce. Metadata does not grant
 governance/tool authority. The existing server-side execution gates still apply.
 
-Startup, input-clear and response-correlation deadlines and audio-buffer bounds
-fail closed by retiring the original microphone, both audio contexts and socket.
+Startup, input-clear and response-correlation deadlines, protocol rejection and
+audio-buffer bounds fail closed by retiring the original microphone, both audio
+contexts and socket. Only the recognized harmless no-active-response cancellation
+error remains nonfatal. Strictness also survives either route-refusal check and
+older backends returning409: automatic Pipeline fallback is not permitted for a
+required profile. Operators can still explicitly select Pipeline; legacy API
+opt-out retains its fallback description.
+
+Stop/typed input during mint or worklet loading applies its local boundary
+without depending on an already-open socket. Pre-readiness controls coalesce
+and are sent only after effective configuration ACK, with the original bounded
+clear deadline preserved. Socket identity is learned separately when actually
+supplied; a schema-valid effective-config ACK need not contain an `id`.
+
+Realtime and Pipeline share the same public startup-settlement owner. Closing
+rejects `start()` even while an unabortable permission/worklet acquisition is
+pending. This is **not** a native completion receipt: the original acquisition
+remains rooted and performs its original late cleanup. `whenStartupSettled()`
+observes that actual operation's settlement separately. Native tests first
+require public cancellation and closure of acquired resources while HTTP is
+still held, then release it and join the original operation, proving no late
+successor worklet/socket appeared.
+
 Loopback browser tests exercise actual WebSocket messages, capture/playback
 worklets and post-gain output: stale positive PCM is excluded, fresh negative
 PCM renders, and fresh nonzero input uses the same live microphone. Native

@@ -35,6 +35,7 @@
 import { Events, makeEvent } from './events.js';
 import { createVoiceCapture } from './capture.js';
 import { createVoicePlayback } from './playback.js';
+import { createStartupSettlement } from './startup.js';
 
 const FRAME_JSON = 0x00;
 const FRAME_AUDIO = 0x01;
@@ -75,6 +76,7 @@ export async function createPipelineClient({
   let playback = null;
   let closed = false;
   let closeOwner = null;
+  const startupSettlement = createStartupSettlement();
 
   async function requireOpen() {
     if (!closed) return;
@@ -158,7 +160,9 @@ export async function createPipelineClient({
     return { tag, payload };
   }
 
-  async function start() {
+  function start() { return startupSettlement.run(startNative); }
+
+  async function startNative() {
     await requireOpen();
     if (ws) throw new Error('Pipeline client already started');
     try {
@@ -260,7 +264,7 @@ export async function createPipelineClient({
       if (!closed) void close();
     };
     } catch (error) {
-      await close();
+      await close(error);
       await retireAcquired();
       throw error;
     }
@@ -272,9 +276,10 @@ export async function createPipelineClient({
     try { await playback?.destroy(); } catch (_) {}
   }
 
-  function close() {
+  function close(error) {
     if (closeOwner) return closeOwner;
     closed = true;
+    startupSettlement.close(error);
     closeOwner = retireAcquired().then(() => {
       onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
     });
@@ -323,6 +328,7 @@ export async function createPipelineClient({
   return {
     path: 'pipeline',
     start,
+    whenStartupSettled: startupSettlement.whenSettled,
     close,
     cancelResponse,
     updateInstructions,

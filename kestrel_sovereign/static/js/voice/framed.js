@@ -28,7 +28,7 @@ export function requireFramedConfiguration(config, model) {
   }
 }
 
-export function createFramedProtocol({ session, send, resetCapture, fail, onReady,
+export function createFramedProtocol({ getSession, send: nativeSend, resetCapture, fail, onReady,
   timeoutMs = 30000, maxAudioBytes = 96000 }) {
   let stopped = false;
   let ready = false;
@@ -38,6 +38,9 @@ export function createFramedProtocol({ session, send, resetCapture, fail, onRead
   let responseTimer;
   let clearTimer;
   let clears = 0;
+  let unsentClear = false;
+  let pendingCancel = false;
+  let socketSessionId = '';
   let chunks = [];
   let bytes = 0;
   let generation = crypto.randomUUID();
@@ -55,15 +58,34 @@ export function createFramedProtocol({ session, send, resetCapture, fail, onRead
     close(error);
     fail(error);
   }
+  function send(message) {
+    try { nativeSend(message); }
+    catch (error) { fatal(error); throw error; }
+  }
+  function flushControls() {
+    if (!ready || stopped) return;
+    if (pendingCancel) { pendingCancel = false; send({ type: 'response.cancel' }); }
+    if (unsentClear) {
+      unsentClear = false;
+      clears += 1;
+      if (clears > 16) return fatal(new Error('Too many unacknowledged input clears.'));
+      send({ type: 'input_audio_buffer.clear' });
+    }
+  }
+  function requestCancel() {
+    if (stopped) return;
+    pendingCancel = true;
+    flushControls();
+  }
   function flushInput() {
-    if (!ready || clears || stopped) return;
+    if (!ready || clears || unsentClear || stopped) return;
     for (const pcm of chunks) send({ type: 'input_audio_buffer.append', audio: pcm });
     chunks = [];
     bytes = 0;
   }
   function audio(base64, byteLength) {
     if (stopped) return;
-    if (ready && !clears) {
+    if (ready && !clears && !unsentClear) {
       send({ type: 'input_audio_buffer.append', audio: base64 });
     } else {
       bytes += byteLength;
@@ -81,18 +103,22 @@ export function createFramedProtocol({ session, send, resetCapture, fail, onRead
     clearTimeout(responseTimer);
   }
   function clearInput(action = null) {
-    resetCapture(); // request only; actual new-generation worklet frames prove crossing
+    if (stopped) return;
+    // Local boundary FIRST, independent of whether the original socket exists.
+    try { resetCapture(); }
+    catch (error) { fatal(error); throw error; }
     chunks = [];
     bytes = 0;
     afterClear = action;
-    clears += 1;
-    if (clears > 16) return fatal(new Error('Too many unacknowledged input clears.'));
+    // Before configuration readiness, repeated requests coalesce. Once sent,
+    // every original clear is counted until its ordered acknowledgement.
+    unsentClear = true;
     // Repeated Stop does not extend the original native acknowledgement budget.
     if (!clearTimer) clearTimer = setTimeout(() => fatal(new Error('Provider input clear was not acknowledged.')), timeoutMs);
-    send({ type: 'input_audio_buffer.clear' });
+    flushControls();
   }
   function request() {
-    if (stopped || !ready || clears || pending) throw new Error('Original framed response is not ready for admission.');
+    if (stopped || !ready || clears || unsentClear || pending) throw new Error('Original framed response is not ready for admission.');
     const nonce = crypto.randomUUID();
     pending = { generation, nonce };
     active = '';
@@ -104,24 +130,39 @@ export function createFramedProtocol({ session, send, resetCapture, fail, onRead
   }
   function accept(raw) {
     if (stopped) return false;
-    if (raw.type === 'session.created') return false;
+    if (raw.type === 'session.created') {
+      const id = raw.session?.id;
+      if (typeof id === 'string' && id) {
+        if (socketSessionId && socketSessionId !== id) fatal(new Error('Original socket session identity changed.'));
+        else socketSessionId = id;
+      }
+      return false;
+    }
     if (raw.type === 'session.updated') {
       try {
-        requireFramedConfiguration(raw.session, session.model);
-        if (!raw.session.id) throw new Error('Provider session acknowledgement lacks its actual socket identity.');
+        requireFramedConfiguration(raw.session, getSession().model);
+        if (socketSessionId && raw.session.id && raw.session.id !== socketSessionId) throw new Error('Original socket session identity changed.');
       }
       catch (error) { fatal(error); return false; }
       if (!ready) {
         ready = true;
         clearTimeout(startupTimer);
+        flushControls();
         flushInput();
         startupResolve();
-        onReady(raw.session);
+        // SessionUpdatedEvent's configuration schema does not require id.
+        // Preserve an actual created identity when supplied, never substitute
+        // the separate ephemeral-registration ID or invent an identity.
+        onReady({ ...raw.session, id: socketSessionId || raw.session.id || '' });
       }
       return false;
     }
     if (!ready) {
       if (raw.type === 'error') fatal(new Error(raw.error?.message || 'Provider rejected framed session configuration.'));
+      return false;
+    }
+    if (raw.type === 'error' && raw.error?.code !== 'response_cancel_not_active') {
+      fatal(new Error(raw.error?.message || 'Provider rejected the original framed protocol operation.'));
       return false;
     }
     if (raw.type === 'input_audio_buffer.cleared') {
@@ -139,7 +180,7 @@ export function createFramedProtocol({ session, send, resetCapture, fail, onRead
       }
       return false;
     }
-    if (raw.type.startsWith('input_audio_buffer.') && clears) return false;
+    if (raw.type.startsWith('input_audio_buffer.') && (clears || unsentClear)) return false;
     if (raw.type === 'response.created') {
       const metadata = raw.response?.metadata;
       const id = raw.response?.id;
@@ -160,7 +201,7 @@ export function createFramedProtocol({ session, send, resetCapture, fail, onRead
     speechItem = item || '';
   }
   function committed(item) {
-    if (!speechItem || speechItem !== item || clears || stopped) return;
+    if (!speechItem || speechItem !== item || clears || unsentClear || stopped) return;
     speechItem = '';
     request();
   }
@@ -184,14 +225,16 @@ export function createFramedProtocol({ session, send, resetCapture, fail, onRead
     chunks = [];
     bytes = 0;
     afterClear = null;
+    unsentClear = false;
+    pendingCancel = false;
     completedCalls.clear();
     startupReject(error);
   }
-  return { audio, accept, abandon, clearInput, request, speechStarted, committed,
+  return { audio, accept, abandon, clearInput, requestCancel, request, speechStarted, committed,
     completed, reserveToolResults, close,
-    start() {
+    async start() {
       startupTimer = setTimeout(() => fatal(new Error('Provider session configuration was not acknowledged.')), timeoutMs);
-      send({ type: 'session.update', session: session.session_config });
+      send({ type: 'session.update', session: getSession().session_config });
       return initialized;
     },
   };

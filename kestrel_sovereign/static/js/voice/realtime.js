@@ -35,6 +35,7 @@ import { Events, makeEvent } from './events.js';
 import { createVoiceCapture } from './capture.js';
 import { createVoicePlayback } from './playback.js';
 import { FRAMED_OUTPUT_PROFILE, requireFramedBootstrap, createFramedProtocol } from './framed.js';
+import { createStartupSettlement } from './startup.js';
 
 export async function readToolBatchResponse(response, calls) {
   // Only acknowledged results may become function outputs. A failed request,
@@ -225,6 +226,8 @@ export async function createRealtimeClient({
   let closed = false;
   let closeOwner = null;
   const startupAbort = new AbortController();
+  const startupSettlement = createStartupSettlement();
+  let captureResetPending = false;
 
   async function requireOpen() {
     if (!closed) return;
@@ -250,6 +253,23 @@ export async function createRealtimeClient({
   let earlyAudioChunks = [];
   let earlyAudioBytes = 0;
   const maxEarlyAudioBytes = 24000 * 2 * 2; // two seconds of mono PCM16
+  if (outputProfile) {
+    framed = createFramedProtocol({ getSession: () => session,
+      send: message => sendJSON(message, { required: true }),
+      resetCapture: () => {
+        captureResetPending = true;
+        if (capture) { capture.reset(); captureResetPending = false; }
+      },
+      timeoutMs: responseStartTimeoutMs,
+      fail: error => {
+        void close(error);
+        onEvent(makeEvent(Events.ERROR, { message: error.message, code: 'FRAMED_PROTOCOL_FAILED', fatal: true }));
+      },
+      onReady: actual => onEvent(makeEvent(Events.SESSION_READY, {
+        session_id: actual.id, model: session.model, path: 'realtime',
+      })),
+    });
+  }
 
   /**
    * Send a JSON control message through the data channel.
@@ -636,28 +656,15 @@ export async function createRealtimeClient({
   }
 
   async function startWebSocket() {
-    if (outputProfile) {
-      framed = createFramedProtocol({ session,
-        send: message => sendJSON(message, { required: true }),
-        resetCapture: () => capture.reset(),
-        timeoutMs: responseStartTimeoutMs,
-        fail: error => {
-          void close();
-          onEvent(makeEvent(Events.ERROR, { message: error.message, code: 'FRAMED_PROTOCOL_FAILED', fatal: true }));
-        },
-        onReady: actual => onEvent(makeEvent(Events.SESSION_READY, {
-          session_id: actual.id, model: session.model, path: 'realtime',
-        })),
-      });
-    }
     capture = await createVoiceCapture({ targetSampleRate: 24000, onAcquire: owner => {
       capture = owner;
-      if (closed) void owner.destroy();
+      if (closed) { void owner.destroy(); return; }
+      if (captureResetPending) { owner.reset(); captureResetPending = false; }
     } });
     await requireOpen();
     playback = await createVoicePlayback({ sampleRate: 24000, onError: error => {
       if (closed) return;
-      void close();
+      void close(error);
       onEvent(makeEvent(Events.ERROR, {
         message: error.message, code: 'AUDIO_OUTPUT_CONTROL_FAILED', fatal: true,
       }));
@@ -732,7 +739,9 @@ export async function createRealtimeClient({
     };
   }
 
-  async function start() {
+  function start() { return startupSettlement.run(startNative); }
+
+  async function startNative() {
     await requireOpen();
     if (session) throw new Error('Realtime client already started');
     try {
@@ -759,12 +768,13 @@ export async function createRealtimeClient({
       // Resolver rejected realtime — caller should fall back to pipeline.
       const body = await resp.json();
       const err = new Error(body.reason || 'Realtime unavailable');
-      err.code = 'REALTIME_UNAVAILABLE';
-      err.fallback = body;  // { path, fallback_tts, fallback_stt, reason }
+      err.code = outputProfile ? 'REALTIME_PROFILE_UNAVAILABLE' : 'REALTIME_UNAVAILABLE';
+      if (!outputProfile) err.fallback = body;
       throw err;
     }
     if (!resp.ok) {
-      throw new Error(`Session mint failed: HTTP ${resp.status}`);
+      const failure = await resp.json();
+      throw new Error(typeof failure?.detail === 'string' ? failure.detail : `Session mint failed: HTTP ${resp.status}`);
     }
     session = await resp.json();
     await requireOpen();
@@ -774,7 +784,7 @@ export async function createRealtimeClient({
     else if (session.transport === 'webrtc' || !session.transport) await startWebRTC();
     else throw new Error(`Unsupported realtime transport: ${session.transport}`);
     } catch (error) {
-      await close();
+      await close(error);
       await retireAcquired();
       throw error;
     }
@@ -799,9 +809,10 @@ export async function createRealtimeClient({
     } catch (_) {}
   }
 
-  function close() {
+  function close(error) {
     if (closeOwner) return closeOwner;
     closed = true;
+    startupSettlement.close(error);
     framed?.close();
     clearTimeout(responseStartTimer);
     responseStartTimer = null;
@@ -822,8 +833,8 @@ export async function createRealtimeClient({
           type: 'message', role: 'user', content: [{ type: 'input_text', text }],
         } }, { required: true });
         framed.request();
+        persistTurn('user', text);
       });
-      persistTurn('user', text);
       return;
     }
     typedInputGeneration = crypto.randomUUID();
@@ -850,7 +861,7 @@ export async function createRealtimeClient({
     playback?.flush?.();
     if (framed) {
       framed.abandon();
-      sendJSON({ type: 'response.cancel' }, { required: true });
+      framed.requestCancel();
     }
     clearTimeout(responseStartTimer);
     responseStartTimer = null;
@@ -872,6 +883,7 @@ export async function createRealtimeClient({
   }
 
   function cancelResponse() {
+    if (closed) return;
     abandonResponse();
     if (!framed) sendJSON({ type: 'response.cancel' });
   }
@@ -986,6 +998,7 @@ export async function createRealtimeClient({
   return {
     path: 'realtime',
     start,
+    whenStartupSettled: startupSettlement.whenSettled,
     close,
     sendText,
     cancelResponse,
