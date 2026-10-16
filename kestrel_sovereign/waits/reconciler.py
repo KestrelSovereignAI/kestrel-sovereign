@@ -60,6 +60,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, Outcome, ToolResult, WaitStatus
 
+from kestrel_sovereign.callbacks import invoke_host_callback, require_callback_result
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
 from kestrel_sovereign.signals.dispatcher import (
@@ -557,6 +558,8 @@ class WaitReconciler:
                 status_value = result.status.value
                 delivery_error = result.error or None
             except Exception as e:  # task raised
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "wait_reconcile: pending signal task raised for "
                     "%s:%s: %s", kind, handle, e,
@@ -710,8 +713,10 @@ class WaitReconciler:
         for provider in providers:
             kind = provider.kind
             try:
-                handles = await provider.active_handles()
+                handles = await invoke_host_callback(provider.active_handles)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "wait_reconcile: active_handles() raised for kind %s: %s",
                     kind, e,
@@ -839,8 +844,10 @@ class WaitReconciler:
         if not callable(lookup) or not signal_id:
             return None
         try:
-            retry_at = lookup(signal_id)
+            retry_at = require_callback_result(lookup(signal_id))
         except Exception as exc:  # a broken ledger is not advice
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "cognition_retry_at(%r) raised on the dispatcher: %s",
                 signal_id, exc,
@@ -890,8 +897,10 @@ class WaitReconciler:
         lookup = getattr(dispatcher, "surface_record", None)
         if callable(lookup) and signal_id:
             try:
-                record = lookup(signal_id)
+                record = require_callback_result(lookup(signal_id))
             except Exception as exc:  # a broken ledger is not a verdict
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "surface_record(%r) raised on the dispatcher: %s",
                     signal_id, exc,
@@ -938,8 +947,10 @@ class WaitReconciler:
         # older than it however long the harvest takes.
         observed_at = datetime.now(timezone.utc)
         try:
-            status = await provider.poll(handle)
+            status = await invoke_host_callback(provider.poll, handle)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "wait_reconcile: poll(%s:%s) raised: %s",
                 kind, handle, e,
@@ -1111,9 +1122,10 @@ class WaitReconciler:
         )
 
         try:
-            enq = dispatcher.enqueue_signal(signal)
-            handle_obj = await enq if asyncio.iscoroutine(enq) else enq
+            handle_obj = await invoke_host_callback(dispatcher.enqueue_signal, signal)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "wait_reconcile: enqueue_signal raised for %s:%s: %s",
                 kind, handle, e,
@@ -1439,9 +1451,7 @@ async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
     if not callable(verify):
         return None
     try:
-        result = verify(handle)
-        if asyncio.iscoroutine(result):
-            result = await result
+        result = await invoke_host_callback(verify, handle)
     except Exception as exc:  # provider bug — don't block on a broken check
         if is_execution_control_error(exc):
             raise
@@ -1452,7 +1462,9 @@ async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
         return None
     if result is None:
         return None
-    return bool(result)
+    if not isinstance(result, bool):
+        raise ValueError("owns_handle must return bool or None")
+    return result
 
 
 async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
@@ -1481,9 +1493,7 @@ async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
     if not callable(resolve):
         return None
     try:
-        result = resolve(handle)
-        if asyncio.iscoroutine(result):
-            result = await result
+        result = await invoke_host_callback(resolve, handle)
     except Exception as exc:  # provider bug — wake system-initiated instead
         if is_execution_control_error(exc):
             raise

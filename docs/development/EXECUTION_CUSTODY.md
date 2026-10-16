@@ -329,8 +329,8 @@ preserves any child's commit uncertainty over an ordinary sibling failure.
 Provider send and isolated-tool RPC boundaries recheck after startup, traffic,
 lock or wake awaits. Decision/embedding accounting retains the entire original
 operation's scope; aborted accounting cannot spawn ordinary usage writes.
-Every native stream forwarding layer explicitly joins its underlying iterator's
-close under cleanup-only custody, including transport-handler cleanup. EOF and
+Native stream forwarding must join its underlying iterator's close under
+cleanup-only custody, including transport-handler cleanup. EOF and
 close failures are classified before terminal invocation settlement. Boot's
 READY transition and deferred readiness likewise retain/check original custody;
 denial unwinds already committed boot phases rather than publishing readiness.
@@ -338,25 +338,38 @@ Task-status SSE forwarding closes its exact raw TaskManager subscription in the
 same advancing task on terminal frames, disconnects and aborts. It needs no new
 cleanup Task admission. The canonical closing response's inline-safe mode also
 closes on failed transport sends, and its close-aware body releases the quota
-if delivery fails before the first pull. Source closure and connection-accounting cleanup both
-run before selecting their strongest original receipt. Native control bypasses
-generic SSE error/EOF conversion, including control carried by cancellation;
+if delivery fails before the first pull. Source closure and connection-accounting
+cleanup both run before selecting their strongest original receipt. Native
+control bypasses generic SSE error/EOF conversion, including control carried
+by cancellation;
 the response raises an Exception-compatible envelope with that exact original
 as its explicit cause, so ASGI task groups cannot consume native cancellation
 as ordinary disconnect. Ordinary client withdrawal and error frames remain
-compatible. Native
-PostgreSQL store/TaskManager tests prove this helper boundary with an already-
-admitted recipient view, including actual ASGI 2.3/2.4 response execution, not
-peer signatures, full Agent startup or READY.
+compatible. Native PostgreSQL store/TaskManager tests prove this helper boundary
+using an already-admitted recipient view and actual ASGI 2.3/2.4 response
+execution, not peer signatures, full Agent startup or READY.
 
 Wait ownership and origin-session resolution retain native execution control
 before watch admission or wake construction. Task and outbound-A2A providers do
 not treat that control as unverifiable ownership or an ordinary pending poll;
 the generic ownership/origin adapters do not turn it into absent session data.
-Ordinary backend/provider
-errors retain their established availability behavior. Native store/provider
-tests also verify that failed ownership reads do not persist local watches;
+Ordinary backend/provider errors retain their established availability behavior.
+Native store/provider tests also verify that failed ownership reads do not
+persist local watches;
 their admitted recipient/provider inputs are not full Agent/READY acceptance.
+
+Core and Workflow callbacks share the canonical `kestrel_sovereign.callbacks`
+return-value contract. Only a synchronous answer or one fresh coroutine is
+driven in the original caller context. A returned Task/Future, including one
+returned by a fresh coroutine, remains with its original owner; refusal retains
+that exact unresolved awaitable and grants no watch or replacement wake.
+Ownership answers must be bool/None, not the truthiness of a task or data row.
+Public blocking/signal waits, reconciliation, monitor enumeration, enqueue and
+harvest, metadata callbacks and the fallback driver preserve original native
+control rather than rendering failure text, skipping, retrying or inventing a
+failed delivery. The fallback's feature owner retains its original failure for
+shutdown. Native callback/consumer tests exercise these helper boundaries with
+real stores and owned work, not full Agent readiness or paid cognition.
 
 A2A boot reuses the guarded native storage backend, including DSN-only agents;
 individual stores do not own its pool. Inbound verification/authorization and
