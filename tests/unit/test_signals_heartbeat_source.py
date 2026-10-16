@@ -570,6 +570,57 @@ async def test_heartbeat_dispatch_drops_quiet_hours_below_override(components):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        pytest.param({"target": "last_session"}, id="target-last_session"),
+        pytest.param({"target": "none"}, id="target-none"),
+        pytest.param({"suppress_ok": False}, id="suppress_ok-false"),
+    ],
+)
+async def test_deprecated_heartbeat_settings_keep_quiet_hours_enforcement(
+    components, legacy
+):
+    """#2491: a config still carrying the deprecated ``target`` or
+    ``suppress_ok`` gets the same quiet-hours enforcement. The source is
+    registered from the config as the boot path does, and a real runner tick
+    runs inside the active window and is dropped before the LLM outside it."""
+    from datetime import datetime, timezone
+
+    from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner
+
+    agent, registry, dispatcher, _ = components
+    config = HeartbeatConfig(
+        enabled=True,
+        active_hours_start="09:00",
+        active_hours_end="17:00",
+        timezone="UTC",
+        **legacy,
+    )
+    registry.register(
+        build_heartbeat_registration(
+            interval_seconds=config.interval_seconds,
+            active_hours_start=config.active_hours_start,
+            active_hours_end=config.active_hours_end,
+            timezone_name=config.timezone,
+        )
+    )
+    agent.dispatcher = dispatcher
+    runner = HeartbeatRunner(agent, config)
+
+    dispatcher._clock = lambda: datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    active = await runner.run_once()
+    assert active.status == "ok"
+    assert len(agent.process_input_calls) == 1
+
+    dispatcher._clock = lambda: datetime(2026, 5, 1, 20, 0, tzinfo=timezone.utc)
+    quiet = await runner.run_once()
+    assert quiet.status == "skipped"
+    assert "dropped_quiet_hours" in quiet.reason
+    assert len(agent.process_input_calls) == 1, "LLM must not be called when quiet"
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_dispatch_high_urgency_overrides_quiet_hours(components):
     from datetime import datetime, time as dtime, timezone
     from kestrel_sdk.signals import AttentionPolicy

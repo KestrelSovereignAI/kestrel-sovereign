@@ -1185,6 +1185,37 @@ def test_heartbeat_endpoints_cover_disabled_status_success_and_error_paths():
         _restore_app(app, original)
 
 
+def test_heartbeat_status_reports_deprecated_target_as_the_value_in_use(caplog):
+    """#2491: a configured ``target`` routes nothing, so the status API reports
+    the value in use and names the field deprecated instead of echoing it."""
+    from kestrel_sovereign.heartbeat import (
+        DEPRECATED_SETTINGS_REMOVAL_RELEASE,
+        HeartbeatConfig,
+        HeartbeatRunner,
+    )
+
+    with caplog.at_level("WARNING", logger="kestrel_sovereign.heartbeat"):
+        runner = HeartbeatRunner(
+            MagicMock(), HeartbeatConfig(enabled=True, target="last_session")
+        )
+    assert any("target = 'last_session'" in r.getMessage() for r in caplog.records)
+
+    app, original = _prepare_app(MagicMock(heartbeat_runner=runner))
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/agent/heartbeat/status", headers=_api_headers())
+        assert response.status_code == 200
+        body = response.json()
+        assert body["enabled"] is True
+        assert body["target"] == "log"
+        assert set(body["deprecated_fields"]) == {"target"}
+        assert "has no effect" in body["deprecated_fields"]["target"]
+        assert DEPRECATED_SETTINGS_REMOVAL_RELEASE in body["deprecated_fields"]["target"]
+    finally:
+        _restore_app(app, original)
+
+
 def test_reflection_status_scopes_execution_history_by_the_did_not_agent_id():
     """#3251: the history read binds the agent's DID through the shared
     guard; a differing ``agent_id`` must not reach the query."""

@@ -138,6 +138,27 @@ test.describe('Heartbeat API', () => {
         expect(data.last_result).not.toBeNull();
         expect(data.last_result).toHaveProperty('status');
     });
+
+    test('heartbeat status reports the deprecated target as the value in use', async ({ request }) => {
+        // `target` routes nothing (#2491): whatever kestrel.toml sets, status
+        // reports the value in use and names the field deprecated. A
+        // multi-agent host serves the route under the named agent's prefix.
+        const agent = process.env.KESTREL_E2E_AGENT;
+        const agentPrefix = agent ? `/api/agents/${encodeURIComponent(agent)}` : '';
+        const response = await request.get(
+            `${BASE_URL}${agentPrefix}/api/agent/heartbeat/status`,
+            { headers: authHeaders(apiKey) },
+        );
+        expect(response.ok()).toBeTruthy();
+
+        const data = await response.json();
+        if (data.message) {
+            test.skip();
+            return;
+        }
+        expect(data.target).toBe('log');
+        expect(data).toHaveProperty(['deprecated_fields', 'target']);
+    });
 });
 
 // ============================================================================
