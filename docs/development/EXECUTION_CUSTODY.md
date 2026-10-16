@@ -944,6 +944,13 @@ Runtime/unscoped denial, native close debt and
 committed/unknown outcomes still latch host readiness failure. After-commit
 callbacks preserve that committed distinction across explicit cancellation
 causes and exception groups; ordinary reporting errors remain nonfatal.
+Admission of a lease watcher belongs inside that original effect's physical
+join boundary. Refusing the watcher closes its unaccepted coroutine and still
+joins the already-accepted effect before its occurrence can retire. Terminal
+selection retains both the original admission failure and any stronger native
+commit/cleanup receipt. A scheduled blocking worker with real PostgreSQL
+COMMIT-acknowledgement loss exercises the original copied custody and physical
+join; it does not establish full Agent startup, genesis or READY.
 Embedding-width diagnostics likewise propagate original database control rather
 than treating authority/ACK loss as unavailable recall metadata.
 
@@ -1009,14 +1016,19 @@ Failed host-feature stop/control hooks and unsafe declarative teardown retain
 the same feature and original error in that context-owned inventory, rather
 than treating contribution deactivation as successful retirement. Stop retries
 and context cleanup report that error without replaying the failed hook; a new
-feature-start epoch
-is rejected before contribution activation. Independent peers and databases
-still receive their cleanup attempts before the retained error propagates.
+feature-start epoch is rejected before contribution activation. Independent
+peers and databases still receive cleanup attempts before that error propagates.
 Operation-qualified entries distinguish a feature's failed stop hook from its
 independent database close even when both belong to the same object. Ordinary
 optional imperative-hook failures keep their logged compatibility behavior.
 Native PostgreSQL acknowledgement-loss and actual SQLite-close tests cover
 these failed-hook retries, not concurrent lifecycle coordinators or live READY.
+The actual server startup consumer also consults that retained inventory before
+opening host-policy publication. An ordinary opening error cannot make unsafe
+declarative rollback optional, and both original errors survive propagation.
+An actual empty-roster server startup with SQLite and genuine missing-registration
+rollback validates this boundary without faking Agent readiness or calling a
+provider. Ordinary reversible optional-feature failures remain compatible.
 
 Admission-gate release is an in-memory Condition operation owned by the original
 caller, not a newly admitted cleanup Task. Cancellation can retry only lock

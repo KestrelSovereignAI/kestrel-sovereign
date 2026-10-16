@@ -3988,13 +3988,18 @@ class SchedulerRunner:
                 asyncio.current_task()._kestrel_owned_terminal_error = retained_execution_error(error)
                 raise
 
-        effect = asyncio.create_task(
-            invoke_dispatch(), name=f"scheduler-effect:{execution.id}"
+        effect = create_owned_task(
+            invoke_dispatch(), name=f"scheduler-effect:{execution.id}", retain_originals=True,
         )
-        lease_lost = asyncio.create_task(
-            renewal_state.lost.wait(), name=f"scheduler-lease-watch:{execution.id}"
-        )
+        lease_lost = None
         try:
+            # Admission of the watcher can fail after this ORIGINAL effect
+            # entered native I/O. Its admission belongs inside the physical
+            # join boundary; canonical admission also closes refused coros.
+            lease_lost = create_owned_task(
+                renewal_state.lost.wait(), name=f"scheduler-lease-watch:{execution.id}",
+                retain_originals=True,
+            )
             await asyncio.wait(
                 {effect, lease_lost}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -4032,17 +4037,21 @@ class SchedulerRunner:
             effect_outcome = await await_owned_task(effect)
             if not effect.cancelled():
                 effect.exception()
-            if not lease_lost.done():
-                lease_lost.cancel()
-            lease_outcome = await await_owned_task(lease_lost)
+            lease_error = lease_cancellation = None
+            if lease_lost is not None:
+                if not lease_lost.done():
+                    lease_lost.cancel()
+                lease_outcome = await await_owned_task(lease_lost)
+                lease_error = lease_outcome.error
+                lease_cancellation = lease_outcome.cancellation
             terminal = execution_terminal_error(
                 original, effect_outcome.error, effect_outcome.cancellation,
-                lease_outcome.error, lease_outcome.cancellation,
+                lease_error, lease_cancellation, retain_originals=True,
             )
             if terminal is not None and is_execution_control_error(terminal):
                 self._latch_protocol_failure(terminal)
                 raise terminal
-            cancellation = effect_outcome.cancellation or lease_outcome.cancellation
+            cancellation = effect_outcome.cancellation or lease_cancellation
             if cancellation is not None:
                 raise cancellation
 

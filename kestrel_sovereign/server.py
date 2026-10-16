@@ -4086,8 +4086,20 @@ async def _lifespan_startup(app: FastAPI):
             app.state.host_context = ctx
             logger.info("Host features initialized: 0")
     except BaseException as exc:  # noqa: BLE001 - close unpublished context
-        failures = [exc]
-        fatal = isinstance(
+        from kestrel_sovereign.host_features.context import (
+            _retained_host_cleanup_error,
+        )
+
+        # Terminal selection may preserve an ordinary opening error ahead of
+        # unsafe declarative rollback. Consult the SAME retained inventory,
+        # not only that error's type, before publishing host policy/readiness.
+        retained_cleanup = (
+            None
+            if candidate_ctx is None
+            else _retained_host_cleanup_error(candidate_ctx)
+        )
+        failures = [exc] if retained_cleanup is None else [exc, retained_cleanup]
+        fatal = retained_cleanup is not None or isinstance(
             exc,
             (ContributionContractError, FeatureContributionRuntimeError),
         ) or not isinstance(exc, Exception) or is_execution_control_error(exc)
@@ -4117,7 +4129,7 @@ async def _lifespan_startup(app: FastAPI):
         if fatal or len(failures) > 1:
             # Complete prospective-set rejection is a startup failure, not an
             # optional-feature warning. Prior valid state remains visible.
-            raise execution_terminal_error(*failures)
+            raise execution_terminal_error(*failures, retain_originals=True)
 
     # No cognition turn may cross startup with the agent-only clause view.
     # This includes overdue standalone schedules armed from on_agent_ready and
