@@ -395,12 +395,25 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Run unit tests
-        # ``-n auto`` parallelizes across runner cores via pytest-xdist
-        # (already a dev dep). Note that ``auto`` resolves to **2 workers**
-        # on the standard GitHub-hosted runner, not the 16 an earlier
-        # revision of this comment assumed. Runner sizing is tracked in
-        # #2795. The PYTHONHASHSEED env at the workflow level keeps
-        # parametrize ordering deterministic across workers.
+        # ``-n 8``, not ``-n auto``. The standard public-repo runner has 4
+        # vCPUs (2 cores x 2 threads), and xdist's ``auto`` counts physical
+        # cores through psutil, so it started only 2 workers. The suite
+        # mostly waits (timeouts, subprocesses, database round trips)
+        # rather than computes, so workers past the vCPU count still pay.
+        # Measured on one commit, each alongside an unchanged 2-worker job
+        # in the same workflow run (docs/research/DEVELOPMENT_THROUGHPUT.md, E1):
+        #
+        #   workers   summed test time   wall    failures beyond the baseline
+        #   2 (auto)  41.5 min           21.7    -
+        #   4         49.3 min           14.1    none
+        #   8         62.3 min           10.2    none
+        #
+        # A literal count rather than ``logical``: ``logical`` would be 4
+        # here, and the measured gain from 4 to 8 is another 28%. Each
+        # worker gets its own PostgreSQL database (see TEST_POSTGRES_URL
+        # below), so the worker count is also the number of databases the
+        # service container holds. The PYTHONHASHSEED env at the workflow
+        # level keeps parametrize ordering deterministic across workers.
         #
         # No ``-m "not bench"`` here, deliberately — but only because the
         # tier's one benchmark
@@ -413,7 +426,7 @@ jobs:
         # TestIndexUsage::test_agent_status_query_uses_index. The only tests
         # that fail are the by-name existence checks in TestJsonPathIndexes.
         # See #2798. The integration tier does exclude benchmarks; below.
-        # No -x. Under -n auto this suite has a tail of load-sensitive tests
+        # No -x. Under xdist this suite has a tail of load-sensitive tests
         # (#3276): repeated runs on ONE unchanged commit fail a different 1-3
         # each time, all passing serially. With -x the run stopped at whichever
         # test lost the race, so the reported failure was rarely the real
@@ -421,7 +434,7 @@ jobs:
         # tripped first. --maxfail bounds a truly broken tree without hiding
         # the set. Reading a red run now means reading every failure, which is
         # what tells you flake from regression.
-        run: uv run pytest tests/unit/ -n auto -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
+        run: uv run pytest tests/unit/ -n 8 -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
         # Budgeted the way the integration tier below is (#3212), because the
         # unit tier hit the same wall for the same reason (#3330). 10 min was
         # too tight, then 20 was: at 44e77ec5 the push run passed the step in
