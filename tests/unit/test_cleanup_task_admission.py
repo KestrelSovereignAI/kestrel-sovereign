@@ -434,12 +434,8 @@ async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel
         await db.close()
 
 
-@pytest.mark.asyncio
-async def test_reentrant_feature_task_keeps_its_actual_root_until_completion(tmp_path, monkeypatch):
-    from kestrel_sovereign import _async_ownership as ownership
+def _native_owned_feature(agent):
     from kestrel_sovereign.features.base import Feature
-
-    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
 
     class NativeFeature(Feature):
         async def initialize(self):
@@ -449,7 +445,17 @@ async def test_reentrant_feature_task_keeps_its_actual_root_until_completion(tmp
         def tool_description(self):
             return "native reentrant resource ownership"
 
-    feature = NativeFeature(agent)
+    return NativeFeature(agent)
+
+
+@pytest.mark.asyncio
+async def test_reentrant_feature_task_keeps_its_actual_root_until_completion(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign import _async_ownership as ownership
+
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    feature = _native_owned_feature(agent)
     original_join, self_joins = ownership.await_owned_task, []
 
     async def reject_actual_self_join(task, *args, **kwargs):
@@ -466,14 +472,143 @@ async def test_reentrant_feature_task_keeps_its_actual_root_until_completion(tmp
         return await db.fetchval("SELECT COUNT(*) FROM original_feature_effects")
 
     monkeypatch.setattr(ownership, "await_owned_task", reject_actual_self_join)
-    task = feature._track_owned_background_task(original_worker(), name="actual-feature-self-shutdown")
+    task = feature._track_owned_background_task(
+        original_worker(), name="actual-feature-self-shutdown"
+    )
     try:
         outcome = await original_join(task)
-        assert not self_joins, "the original feature Task reached an impossible self-join"
+        assert not self_joins, (
+            "the original feature Task reached an impossible self-join"
+        )
         assert outcome.error is None and outcome.result == 1
-        assert not feature._owned_background_tasks and task not in agent._background_tasks
+        assert (
+            not feature._owned_background_tasks and task not in agent._background_tasks
+        )
         assert not agent._runtime_publication_ready.is_set()
     finally:
         await original_join(task)
+        await agent.shutdown()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_resident_publisher_closes_both_coroutines_on_task_refusal(
+    tmp_path, monkeypatch
+):
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    loop, previous = (
+        asyncio.get_running_loop(),
+        asyncio.get_running_loop().get_task_factory(),
+    )
+    refused, effects = [], []
+    failure = RuntimeError("actual resident publication Task allocation refused")
+
+    async def original_resident():
+        effects.append(True)
+        await db.execute("CREATE TABLE resident_must_not_enter (id INTEGER)")
+
+    operation = original_resident()
+
+    def factory(loop, coroutine, **kwargs):
+        frame = getattr(coroutine, "cr_frame", None)
+        inner = frame.f_locals.get("operation") if frame is not None else None
+        candidate = inner if inspect.iscoroutine(inner) else coroutine
+        code = getattr(candidate, "cr_code", None)
+        if (
+            code is not None
+            and code.co_qualname == "KestrelAgent._track_runtime_task.<locals>.resident"
+        ):
+            refused.append((coroutine, candidate))
+            raise failure
+        return (
+            previous(loop, coroutine, **kwargs)
+            if previous
+            else asyncio.Task(coroutine, loop=loop, **kwargs)
+        )
+
+    try:
+        loop.set_task_factory(factory)
+        with pytest.raises(RuntimeError) as propagated:
+            agent._track_runtime_task(
+                operation, name="native-original-resident-refused"
+            )
+        assert propagated.value is failure and len(refused) == 1
+        assert inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED, (
+            "original unadmitted resident coroutine leaked"
+        )
+        assert all(
+            inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+            for pair in refused
+            for coro in pair
+        ), "original publication wrapper leaked"
+        assert not effects and not agent._background_tasks
+        assert not agent._runtime_publication_ready.is_set(), (
+            "allocation proof must not forge READY"
+        )
+        assert not await db.fetchone(
+            "SELECT name FROM sqlite_master WHERE name='resident_must_not_enter'"
+        )
+    finally:
+        loop.set_task_factory(previous)
+        operation.close()
+        for pair in refused:
+            for coroutine in pair:
+                coroutine.close()
+        await agent.shutdown()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_feature_child_shutdown_keeps_actual_waiting_parent_root(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign import _async_ownership as ownership
+
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    feature = _native_owned_feature(agent)
+    original_join, attempts = ownership.await_owned_task, []
+    parent, child = None, None
+
+    async def guard_parent_join(target, *args, **kwargs):
+        if target is parent and asyncio.current_task() is child:
+            attempts.append(target)
+            raise RuntimeError(
+                "actual feature descendant tried to join its waiting parent"
+            )
+        return await original_join(target, *args, **kwargs)
+
+    async def original_child():
+        await db.execute("CREATE TABLE descendant_native_effects (id INTEGER)")
+        await db.execute("INSERT INTO descendant_native_effects VALUES (1)")
+        await feature.shutdown()
+        assert parent in feature._owned_background_tasks
+        return await db.fetchval("SELECT COUNT(*) FROM descendant_native_effects")
+
+    async def original_parent():
+        nonlocal child
+        child = create_owned_task(original_child())
+        outcome = await original_join(child)
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.result
+
+    monkeypatch.setattr(ownership, "await_owned_task", guard_parent_join)
+    parent = feature._track_owned_background_task(
+        original_parent(), name="actual-native-feature-parent"
+    )
+    try:
+        outcome = await original_join(parent)
+        assert not attempts
+        assert outcome.error is None and outcome.result == 1
+        assert parent.done() and child.done()
+        assert (
+            not feature._owned_background_tasks
+            and parent not in agent._background_tasks
+        )
+        assert not agent._runtime_publication_ready.is_set()
+    finally:
+        await original_join(parent)
+        if child is not None:
+            await original_join(child)
         await agent.shutdown()
         await db.close()

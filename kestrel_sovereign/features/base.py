@@ -983,7 +983,9 @@ class Feature(_SdkFeature):
         """
         owned = getattr(self, "_owned_background_tasks", ()) or ()
         current = asyncio.current_task()
-        tasks = tuple(task for task in owned if task is not current)
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
+        reentrant = owned_task_join_ancestors(current) | {current}
+        tasks = tuple(task for task in owned if task not in reentrant)
         pending = [task for task in tasks if not task.done()]
         for task in pending:
             task.cancel()
@@ -1000,7 +1002,8 @@ class Feature(_SdkFeature):
         for task in tasks:
             self._remember_background_control(owned_task_error(task))
         # Reentrant shutdown can originate in one of these actual Tasks. It
-        # cannot cancel/join itself. Keep its ORIGINAL list/root so its existing
+        # cannot cancel/join itself or its actual waiting callers. Keep their
+        # ORIGINAL list/root so existing
         # completion callback removes it only when it physically finishes; do
         # not publish a fresh list that strands that callback's ownership.
         if isinstance(owned, list):

@@ -9280,7 +9280,15 @@ Expected Duration: {expected_duration}
         # Do not inherit a cognition turn's caller, Hold grant or cleanup flag.
         # This context carries the SAME irreversible original runtime object;
         # it does not mint a replacement admission or refresh a generation.
-        task = asyncio.create_task(resident(), name=name, context=context)
+        from kestrel_sovereign._async_ownership import create_owned_task
+        try:
+            task = create_owned_task(resident(), name=name, context=context)
+        except BaseException:
+            # Canonical admission closes the refused resident wrapper. Its
+            # submitted operation has not entered (READY remains separate),
+            # so this original publisher must close that fresh coroutine too.
+            coro.close()
+            raise
         task._kestrel_started_at = time.monotonic()
         self._background_tasks.add(task)
 

@@ -12,13 +12,70 @@ import asyncio
 import contextvars
 import math
 from collections.abc import AsyncIterator, Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from typing import Generic, TypeVar, cast
+from weakref import WeakKeyDictionary
 
 _T = TypeVar("_T")
 _ITERATOR_TERMINAL = object()
 _ITERATOR_INTERRUPTED = object()
 _TASK_ERROR_UNSET = object()
+
+
+@contextmanager
+def owned_task_join_dependency(target, *, waiter=None):
+    """Record an actual must-join relationship, never execution authority.
+
+    Framework coordinators may register their unconditional native joins
+    before dispatching children. Ordinary await_owned_task calls use the same
+    relationship automatically. Weak, reference-counted waiter edges disappear
+    at physical completion, including nested joins and cancellation unwind.
+    """
+    waiter = waiter if waiter is not None else asyncio.current_task()
+    if waiter is None or target is waiter or target.done():
+        yield
+        return
+    waiters = getattr(target, "_kestrel_owned_join_waiters", None)
+    if waiters is None:
+        waiters = target._kestrel_owned_join_waiters = WeakKeyDictionary()
+    waiters[waiter] = waiters.get(waiter, 0) + 1
+    try:
+        yield
+    finally:
+        remaining = waiters.get(waiter, 1) - 1
+        if remaining:
+            waiters[waiter] = remaining
+        else:
+            waiters.pop(waiter, None)
+
+
+def owned_task_join_ancestors(task=None):
+    """Physical callers waiting on this Task, not copied-context ancestors.
+
+    Reentrant shutdown cannot join those callers while they depend on its
+    return. Their existing lifecycle roots must remain until completion; this
+    observation neither settles their ACKs nor grants another admission.
+    """
+    task = task if task is not None else asyncio.current_task()
+    seen, ancestors, pending = {task}, set(), [task]
+    while pending:
+        current = pending.pop()
+        for waiter in tuple(getattr(current, "_kestrel_owned_join_waiters", ())):
+            if waiter not in seen and not waiter.done():
+                seen.add(waiter)
+                ancestors.add(waiter)
+                pending.append(waiter)
+    return ancestors
+
+
+def _tracks_owned_task_join(function):
+    @wraps(function)
+    async def joined(task, *args, **kwargs):
+        with owned_task_join_dependency(task):
+            return await function(task, *args, **kwargs)
+    return joined
 
 
 def create_owned_task(operation, *, name=None, context=None, retain_originals=False,
@@ -586,6 +643,7 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     return error
 
 
+@_tracks_owned_task_join
 async def await_owned_task(
     task: asyncio.Future[_T],
     pending_cancellation: asyncio.CancelledError | None = None,
