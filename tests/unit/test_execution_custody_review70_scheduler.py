@@ -32,7 +32,10 @@ async def test_completed_local_history_retains_first_original_receipts_with_boun
         for receipt, state in original_pairs:
             runner._latch_protocol_failure(receipt, occurrence_state=state)
         assert runner._occurrence_control_receipts == originals[:32]
-        assert len(runner._occurrence_control_scopes) == 32
+        for receipt in originals:
+            runner._latch_protocol_failure(receipt)
+            assert receipt._kestrel_original_scheduler_receipt.owner is runner
+        assert runner._occurrence_control_receipts == originals[:32]
         assert runner._execution_control_error is None
         assert runner.readiness_failure is None and not notifications
         for receipt in originals:

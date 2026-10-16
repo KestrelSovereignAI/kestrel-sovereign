@@ -687,20 +687,33 @@ async def lock_execution_authority(
 
 
 @contextmanager
-def bind_execution_custody(fence: ExecutionFence) -> Iterator[ExecutionCustody]:
+def bind_execution_custody(
+    fence: ExecutionFence, *,
+    on_scope_created: Callable[[ExecutionCustody], None] | None = None,
+) -> Iterator[ExecutionCustody]:
+    """Retain an original scope before validation, without granting admission.
+
+    A lifecycle owner may record the exact newly created scope even when its
+    first work check denies entry. Registration is not a successful admission;
+    both validation and the ordinary retirement rule still apply.
+    """
     require_execution_work()
     if fence.backend_type != "postgres":
         raise ExecutionAuthorityError(
             "transaction-bound hosted execution authority requires postgres backend"
         )
     scope = ExecutionCustody(fence)
-    scope.require_work()
-    token = _CURRENT_CUSTODY.set((*current_execution_custody(), scope))
     try:
-        yield scope
+        if on_scope_created is not None:
+            on_scope_created(scope)
+        scope.require_work()
+        token = _CURRENT_CUSTODY.set((*current_execution_custody(), scope))
+        try:
+            yield scope
+        finally:
+            _CURRENT_CUSTODY.reset(token)
     finally:
         scope.revoke("execution admission retired")
-        _CURRENT_CUSTODY.reset(token)
 
 
 @contextmanager

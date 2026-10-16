@@ -922,7 +922,15 @@ not the shared host. The runner retains at most 32 original receipts without
 reauthorizing an expired claim. Localization requires the exact scopes minted
 by that original occurrence and its actual runner, not a shared fence class,
 an inherited scope, or another admission on the same runner. Later observers
-may retain the same already-proven receipt after its context has reset.
+may retain the same already-proven receipt after its context has reset, but
+historical proof cannot override a different active occurrence. Provenance
+travels with the original carrier independently of the bounded 32-entry
+diagnostic history; filling that history does not turn a local expiry into a
+host failure. Creation is recorded through the canonical custody scope's
+pre-validation hook, so an already-expired original deadline remains attributable
+even when entry denies before yielding. Registration grants no work permission.
+Acknowledged, successfully retired COMMIT control still fences readiness;
+an empty denial tuple or a simultaneous local expiry cannot demote that fact.
 Runtime/unscoped denial, native close debt and
 committed/unknown outcomes still latch host readiness failure. After-commit
 callbacks preserve that committed distinction across explicit cancellation

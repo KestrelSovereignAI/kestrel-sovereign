@@ -55,6 +55,7 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_runtime,
     current_execution_custody,
     execution_cleanup_debts,
+    execution_commit_outcome,
     execution_denial_scopes,
     execution_terminal_error,
     is_execution_control_error,
@@ -530,10 +531,23 @@ class _LeaseRenewalState(ConfirmedLeaseDeadline):
     occurrence_scopes: tuple = ()
     backend_type: str = field(default="postgres", init=False)
 
+    def retain_scope(self, scope) -> None:
+        """Record creation, not permission: entry validation can still deny."""
+        if scope not in self.occurrence_scopes:
+            self.occurrence_scopes = (*self.occurrence_scopes, scope)
+
     async def lock_and_validate(self, connection: Any) -> None:
         # The original confirmed deadline, not a fresh claim or checkout.
         # Exact token/owner validation remains in native claim CAS.
         self.require_work()
+
+
+@dataclass(frozen=True)
+class _OriginalOccurrenceReceipt:
+    """Immutable provenance carried by its original error, not diagnostic history."""
+
+    owner: object
+    scopes: tuple
 
 
 _rollout_renewal_state: contextvars.ContextVar[_LeaseRenewalState | None] = contextvars.ContextVar(
@@ -1245,7 +1259,6 @@ class SchedulerRunner:
         self._readiness_failure: Optional[BaseException] = None
         self._execution_control_error: Optional[BaseException] = None
         self._occurrence_control_receipts: list[BaseException] = []
-        self._occurrence_control_scopes: dict[int, tuple] = {}
         self._schema_provenance: Optional[str] = None
         # ``_task`` owns the supervisor; ``_worker_task`` is the replaceable
         # polling loop it watches.  A dead worker must never become an
@@ -1386,9 +1399,10 @@ class SchedulerRunner:
             state.occurrence_scopes
             if state is not None and state.occurrence_owner is self else ()
         )
-        previous_scopes = self._occurrence_control_scopes.get(id(error), ())
+        previous = getattr(error, "_kestrel_original_scheduler_receipt", None)
         if (
-            denied is not None
+            denied
+            and execution_commit_outcome(error) is None
             and not execution_cleanup_debts(error)
             and all(
                 type(scope.fence) in (_LeaseRenewalState, _SchedulerEffectFence)
@@ -1397,24 +1411,28 @@ class SchedulerRunner:
             and (
                 all(scope in owned_scopes for scope in denied)
                 or (
-                    any(error is receipt for receipt in self._occurrence_control_receipts)
-                    and all(scope in previous_scopes for scope in denied)
+                    state is None
+                    and isinstance(previous, _OriginalOccurrenceReceipt)
+                    and previous.owner is self
+                    and all(scope in previous.scopes for scope in denied)
                 )
             )
         ):
             # Only THIS original occurrence ended: a fence's type or a scope
             # inherited from a different admission is not provenance. A later
-            # observer can retain the same already-proven scopes, but a later
-            # aggregation adding a foreign denial is not the same evidence.
+            # context-free observer can retain already-proven scopes. A new
+            # active occurrence or added foreign scope is different evidence.
             # Keep its exact denial
             # without turning one expired claim into an all-tenant outage.
             # Commit carriers, unscoped/runtime denial and physical close
             # debt are deliberately excluded from this local classification.
             receipts = vars(self).setdefault("_occurrence_control_receipts", [])
+            retained = retained_execution_error(error)
+            proof = _OriginalOccurrenceReceipt(self, tuple(denied))
+            error._kestrel_original_scheduler_receipt = proof
+            retained._kestrel_original_scheduler_receipt = proof
             if len(receipts) < 32 and not any(error is receipt for receipt in receipts):
-                retained = retained_execution_error(error)
                 receipts.append(retained)
-                self._occurrence_control_scopes[id(retained)] = tuple(denied)
             return
         if is_execution_control_error(error):
             self._execution_control_error = execution_terminal_error(
@@ -2542,13 +2560,12 @@ class SchedulerRunner:
                         renewal_state.is_live
                         if renewal_state is not None else None
                     ),
-                )) as effect_scope:
+                ), on_scope_created=(
+                    renewal_state.retain_scope
+                    if renewal_state is not None and renewal_state.occurrence_owner is self else None
+                )):
                     if renewal_state is not None:
                         renewal_state.custody = current_execution_custody()
-                        if renewal_state.occurrence_owner is self:
-                            renewal_state.occurrence_scopes = (
-                                *renewal_state.occurrence_scopes, effect_scope,
-                            )
                     try:
                         yield
                     finally:
@@ -3655,14 +3672,10 @@ class SchedulerRunner:
             # cancels AND joins its bootstrap tail; cancellation-resistant
             # descendants retain the same irrevocable deadline fence.
             with (
-                bind_execution_custody(renewal_state)
+                bind_execution_custody(renewal_state, on_scope_created=renewal_state.retain_scope)
                 if self._database_backend_type() == "postgres"
                 else nullcontext()
-            ) as occurrence_scope:
-                if occurrence_scope is not None:
-                    renewal_state.occurrence_scopes = (
-                        *renewal_state.occurrence_scopes, occurrence_scope,
-                    )
+            ):
                 completed, _ = await self._run_dispatch_while_lease_live(
                     prepare_and_dispatch, execution, renewal_state
                 )
