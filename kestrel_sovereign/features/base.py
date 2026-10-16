@@ -995,11 +995,15 @@ class Feature(_SdkFeature):
         )
         from kestrel_sovereign.execution_custody import execution_terminal_error
         cancellations = []
+        joined = []
         for task in tasks:
+            if task is current or task in owned_task_join_ancestors(current):
+                continue
             outcome = await await_owned_task(task)
+            joined.append(task)
             if outcome.cancellation is not None:
                 cancellations.append(outcome.cancellation)
-        for task in tasks:
+        for task in joined:
             self._remember_background_control(owned_task_error(task))
         # Reentrant shutdown can originate in one of these actual Tasks. It
         # cannot cancel/join itself or its actual waiting callers. Keep their
@@ -1007,7 +1011,7 @@ class Feature(_SdkFeature):
         # completion callback removes it only when it physically finishes; do
         # not publish a fresh list that strands that callback's ownership.
         if isinstance(owned, list):
-            for task in tasks:
+            for task in joined:
                 if task in owned:
                     owned.remove(task)
         terminal = execution_terminal_error(vars(self).get("_owned_background_control"), *cancellations)

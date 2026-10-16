@@ -227,6 +227,79 @@ async def test_refused_optional_disposal_still_physically_closes_primary_sqlite(
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_concurrent_feature_shutdown_rechecks_original_join_graph(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign import _async_ownership as ownership
+
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    feature = _native_owned_feature(agent)
+    await db.execute("CREATE TABLE concurrent_feature_effects (id INTEGER)")
+    ready, release, settling = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    entered, originals, attempts = [], [], []
+    original_join = ownership.await_owned_task
+
+    async def guard_actual_closing_join(target, *args, **kwargs):
+        if target in ownership.owned_task_join_ancestors():
+            attempts.append((asyncio.current_task(), target))
+            raise RuntimeError(
+                "Core feature shutdown closed an actual concurrent join cycle"
+            )
+        return await original_join(target, *args, **kwargs)
+
+    async def original(index):
+        await db.execute("INSERT INTO concurrent_feature_effects VALUES (?)", (index,))
+        entered.append(index)
+        if len(entered) == 3:
+            ready.set()
+        if index == 0:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                settling.set()
+                await original_join(create_owned_task(release.wait()))
+            return
+        try:
+            await ready.wait()
+        except asyncio.CancelledError:
+            pass
+        await feature.shutdown()
+
+    monkeypatch.setattr(ownership, "await_owned_task", guard_actual_closing_join)
+    try:
+        for index in range(3):
+            originals.append(
+                feature._track_owned_background_task(
+                    original(index), name=f"native-concurrent-owner:{index}"
+                )
+            )
+        await asyncio.wait_for(ready.wait(), 5)
+        await asyncio.wait_for(settling.wait(), 5)
+        async with asyncio.timeout(5):
+            while len(getattr(originals[0], "_kestrel_owned_join_waiters", ())) != 2:
+                await asyncio.sleep(0.01)
+        release.set()
+        _, pending = await asyncio.wait(originals, timeout=5)
+        assert not pending, (
+            "original feature Tasks formed a permanent concurrent drain cycle"
+        )
+        assert not attempts, (
+            "an entry-time ancestor snapshot became stale after a native join"
+        )
+        assert await db.fetchval("SELECT COUNT(*) FROM concurrent_feature_effects") == 3
+        assert not feature._owned_background_tasks
+        assert not agent._runtime_publication_ready.is_set()
+    finally:
+        release.set()
+        for task in originals:
+            if not task.done():
+                task.cancel()
+            await original_join(task)
+        await agent.shutdown()
+        await db.close()
+
+
 def _explicit_errors(error):
     pending, seen = [error], set()
     while pending:

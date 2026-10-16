@@ -2433,26 +2433,29 @@ async def _shutdown_host_features(app: FastAPI) -> None:
 
     host_features = getattr(app.state, "host_features", []) or []
     host_context = getattr(app.state, "host_context", None)
+    failure = None
     try:
         if host_features and host_context is not None:
             await _hf.stop_host_features(host_features, host_context)
-    except Exception as exc:  # noqa: BLE001 - preserve the existing best effort
+    except BaseException as exc:
         logger.warning("Host feature shutdown failed: %s", exc)
-    finally:
-        # Router/UI state must not outlive a failed feature shutdown. Each
-        # following cleanup is in a ``finally`` so one bad unmount cannot leave
-        # the host context's independently-owned resources live.
+        if not isinstance(exc, Exception) or is_execution_control_error(exc):
+            failure = exc
+    # Do not let either the stop catch or a later independent unmount/context
+    # close replace the original native receipt. Each original cleanup still
+    # runs, and its own failure is propagated only after the entire drain.
+    for unmount in (_hf.unmount_host_features, _unmount_feature_routers, _unmount_feature_ui_assets):
         try:
-            _hf.unmount_host_features(app)
-        finally:
-            try:
-                _unmount_feature_routers(app)
-            finally:
-                try:
-                    _unmount_feature_ui_assets(app)
-                finally:
-                    if host_context is not None:
-                        await _hf.close_host_context(host_context)
+            unmount(app)
+        except BaseException as exc:
+            failure = execution_terminal_error(failure, exc, retain_originals=True)
+    if host_context is not None:
+        try:
+            await _hf.close_host_context(host_context)
+        except BaseException as exc:
+            failure = execution_terminal_error(failure, exc, retain_originals=True)
+    if failure is not None:
+        raise failure
 
 
 _SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV = (

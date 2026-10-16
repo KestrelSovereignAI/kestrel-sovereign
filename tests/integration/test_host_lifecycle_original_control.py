@@ -2,6 +2,7 @@
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from kestrel_sdk.features.host_base import HostFeature
 
 from kestrel_sovereign.execution_custody import (
@@ -19,8 +20,9 @@ from tests.integration.test_execution_custody_review56_pg import lose_native_ack
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("through_server", [False, True])
 async def test_public_host_stop_preserves_original_native_unknown_and_closes_peers(
-    native_pg, monkeypatch
+    native_pg, monkeypatch, through_server
 ):
     backend, observer, schema = native_pg
     ctx = SovereignHostContext(db=backend)
@@ -61,7 +63,15 @@ async def test_public_host_stop_preserves_original_native_unknown_and_closes_pee
             original=OSError("original host stop COMMIT ACK lost"),
         )
         with pytest.raises(BaseException) as caught:
-            await stop_host_features([first, second], ctx)
+            if through_server:
+                from kestrel_sovereign.server import _shutdown_host_features
+
+                app = FastAPI()
+                app.state.host_features = [first, second]
+                app.state.host_context = ctx
+                await _shutdown_host_features(app)
+            else:
+                await stop_host_features([first, second], ctx)
         assert receipts == [True]
         assert execution_commit_outcome(caught.value) == "unknown"
         assert entered == ["second-native", "first-native"], (

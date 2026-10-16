@@ -1583,28 +1583,34 @@ class TaskManager:
                 f"Agent {agent_name!r} is not authorized to cancel task {task_id!r}"
             )
 
-        receipt = (task.metadata or {}).get("cancellation_receipt") or {}
-        previous_state = receipt.get("status_before")
-        if self._on_task_cancelled is not None:
-            try:
-                self._on_task_cancelled(task)
-            except Exception as exc:
-                if is_execution_control_error(exc):
-                    raise
-                logger.warning(
-                    "on_task_cancelled callback failed for %s: %s",
-                    task.id,
-                    exc,
-                    exc_info=True,
-                )
-        await self._finish_status_projection(
-            task,
-            old_state=str(previous_state or TaskState.UNKNOWN.value),
-            new_state=TaskState.CANCELED,
-            agent_name=agent_name,
-            is_final=True,
-            reason=reason,
-        )
+        try:
+            receipt = (task.metadata or {}).get("cancellation_receipt") or {}
+            previous_state = receipt.get("status_before")
+            if self._on_task_cancelled is not None:
+                try:
+                    self._on_task_cancelled(task)
+                except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
+                    logger.warning(
+                        "on_task_cancelled callback failed for %s: %s",
+                        task.id,
+                        exc,
+                        exc_info=True,
+                    )
+            await self._finish_status_projection(
+                task,
+                old_state=str(previous_state or TaskState.UNKNOWN.value),
+                new_state=TaskState.CANCELED,
+                agent_name=agent_name,
+                is_final=True,
+                reason=reason,
+            )
+        except BaseException as projection_failure:
+            # Exact actor/operation readback proves which CAS committed, not
+            # that its UNKNOWN transport outcome may be discarded. Retain the
+            # FIRST native receipt through every later callback/projection.
+            raise execution_terminal_error(store_failure, projection_failure, retain_originals=True)
 
         logger.info(
             "Task %s canceled by %s: %s -> %s",
@@ -1629,7 +1635,7 @@ class TaskManager:
     ) -> None:
         """Join post-commit projections before propagating caller cancellation."""
 
-        projection = asyncio.create_task(
+        projection = create_owned_task(
             self._project_status_transition(
                 task,
                 old_state=old_state,
