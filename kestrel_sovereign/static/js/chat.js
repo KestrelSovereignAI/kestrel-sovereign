@@ -1720,6 +1720,12 @@ export function initChat() {
     // the intent legible and keeps SharedModelSelector / autocomplete from
     // initializing in a host that doesn't render any of it.
     if (!deps().api.hasCapability('chat')) return;
+    // #2197: wire a chat surface once. An embedder mount race reached here
+    // twice for one container; the second pass re-ran the pane bootstrap and
+    // doubled every listener below. The marker sits on the #chat-container
+    // being wired, so the same DOM reached through another root is still
+    // recognised, and replaced chat markup is wired afresh.
+    if (el('chat-container')?.dataset.kestrelChatMounted) return;
     // #1914: wire the console's core typed-part renderers so component bubbles
     // (notice today; todo via #1894, citations, …) render in the standalone
     // sovereign console, not only in Frinz-style embedders.
@@ -1746,8 +1752,12 @@ export function initChat() {
         const initialPane = deps().getOrCreateChatPane(initialAgent);
         // Move existing children (welcome card, demo banners, etc.)
         // into the pane element and clear the container before mount.
-        while (chatContainer.firstChild) {
-            initialPane.element.appendChild(chatContainer.firstChild);
+        // Never the pane itself (#2197): appending a node into itself
+        // throws HierarchyRequestError and aborts init mid-way.
+        for (const child of Array.from(chatContainer.childNodes)) {
+            if (child !== initialPane.element) {
+                initialPane.element.appendChild(child);
+            }
         }
         chatContainer.appendChild(initialPane.element);
         deps().state.mountedChatAgent = initialAgent;
@@ -1826,6 +1836,8 @@ export function initChat() {
     if (footerStatusSlot) {
         UI.renderSlot('input-footer-status', { element: footerStatusSlot, api: deps().api });
     }
+
+    if (chatContainer) chatContainer.dataset.kestrelChatMounted = 'true';
 }
 
 // ============================================================================
