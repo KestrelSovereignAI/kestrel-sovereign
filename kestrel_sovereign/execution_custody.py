@@ -985,8 +985,14 @@ def retain_native_execution_http_client_close(client: Any) -> None:
     client._kestrel_native_close_hook = retain_response
 
 
-async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
-    """Physically join an acquired SDK stream close under cleanup-only custody."""
+async def close_native_execution_stream(
+    stream: Any, owner: Any = None, *, retain_originals: bool = False,
+) -> None:
+    """Physically join an acquired SDK/native close under cleanup-only custody.
+
+    Lifecycle epilogues may retain the opening cancellation and failed native
+    closer together. Legacy stream consumers keep their existing selection.
+    """
     from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
     retain_native_execution_stream_close(stream, owner)
@@ -1000,7 +1006,9 @@ async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
             if inspect.isawaitable(result):
                 await result
     try:
-        close_task = create_owned_task(owned_close(), retirement_resource=stream)
+        close_task = create_owned_task(
+            owned_close(), retirement_resource=stream, retain_originals=retain_originals,
+        )
     except BaseException as error:
         raise execution_terminal_error(original, error, retain_originals=True)
     outcome = await await_owned_task(close_task)
@@ -1012,9 +1020,13 @@ async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
             (stream, close_task),
         )
     if outcome.error is not None or outcome.cancellation is not None:
-        if outcome.error is None and outcome.cancellation is not None and not is_execution_control_error(original):
+        if (not retain_originals and outcome.error is None and outcome.cancellation is not None
+            and not is_execution_control_error(original)):
             raise outcome.cancellation
-        raise execution_terminal_error(original, outcome.error, outcome.cancellation)
+        raise execution_terminal_error(
+            original, outcome.error, outcome.cancellation,
+            retain_originals=retain_originals, prefer_cancellation=retain_originals,
+        )
 
 
 class NativeExecutionStreamOwner:

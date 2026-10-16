@@ -95,11 +95,11 @@ class AgentResourceStore:
         if not was_encrypted:
             raise RuntimeError("agent resource encryption was not applied")
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
         provenance = {
             "created_by": created_by,
             "source": source,
-            "created_at": now,
+            "created_at": now.isoformat(),
         }
         if signature:
             provenance["signature"] = signature
@@ -144,14 +144,14 @@ class AgentResourceStore:
                 resource_type,
                 version,
                 1 if make_current else 0,
-                encrypted,
+                encrypted.encode("utf-8"),
                 content_hash,
                 len(content.encode("utf-8")),
                 "agent-fernet:v1",
                 json.dumps(provenance, sort_keys=True),
                 json.dumps(safe_public, sort_keys=True),
                 json.dumps(anchoring_metadata or {}, sort_keys=True),
-                now,
+                now.replace(tzinfo=None),
             ),
         )
         resource = await self.get_version(resource_type, version=version)
@@ -265,6 +265,10 @@ class AgentResourceStore:
 
     def _row_to_resource(self, row: tuple[Any, ...]) -> AgentResourceVersion:
         ciphertext = row[6]
+        # BYTEA on PostgreSQL and BLOB on new SQLite rows. Existing SQLite
+        # databases may still contain the legacy text representation.
+        if isinstance(ciphertext, (bytes, bytearray, memoryview)):
+            ciphertext = bytes(ciphertext).decode("utf-8")
         content = decrypt_string_fernet(ciphertext, {"enc": True}, self._fernet)
         return AgentResourceVersion(
             id=row[0],

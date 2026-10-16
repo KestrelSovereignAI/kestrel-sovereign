@@ -15,6 +15,24 @@ tags:
 Core issue #3569 extends existing PostgreSQL advisory and native transaction
 custody. This is a host authority contract, not a causation-derived permission.
 
+Snapshot upload retirement uses the existing native close owner, opting into
+retaining the opening cancellation and original close error together. Refused
+close admission retains the exact unstarted client; repeated caller withdrawal
+joins the accepted closer rather than cancelling it. Snapshot, target-loop and
+periodic-loop normalization cannot turn that debt into a failed-result value.
+Shutdown retains the same failed worker for repeated observers. Ordinary HTTP
+availability errors with successful retirement retain their failed-result
+behavior. Native loopback HTTPX/httpcore/SQLite tests cover these transitions;
+they do not establish public-service/TLS deployment or Agent READY acceptance.
+
+Canonical SOUL reads, seed promotion/refresh, graph linking and database-backed
+bootstrap configuration preserve native storage control before legacy fallback.
+Private identity ciphertext is written as bytes to BLOB/BYTEA, and timestamp
+parameters as native UTC database values, while provenance remains ISO text.
+Legacy SQLite text ciphertext is still readable. Disposable-key PostgreSQL and
+SQLite round trips and post-COMMIT release-ACK fault cases prove these helper
+boundaries, not complete Agent genesis, inherited-constitution policy or READY.
+
 Native response retirement retains each failed resource and its original close
 task even when the SDK has already set an optimistic closed flag. Repeated
 shutdown joins that task; it does not retry the close or erase unresolved debt.

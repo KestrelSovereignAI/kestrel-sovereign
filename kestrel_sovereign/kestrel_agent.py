@@ -2341,6 +2341,8 @@ class KestrelAgent(
             if loaded:
                 return
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logging.warning("Canonical SOUL resource load failed: %s", exc)
 
         if not agent_data_dir:
@@ -2382,6 +2384,8 @@ class KestrelAgent(
             await self.context_builder.load_canonical_soul_resource()
             logging.info("Promoted SOUL.md seed into canonical private resource")
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logging.warning("SOUL.md seed promotion failed: %s", exc)
 
     async def _maybe_refresh_user_byok_resolver(self, user_passphrase: str | None) -> None:
