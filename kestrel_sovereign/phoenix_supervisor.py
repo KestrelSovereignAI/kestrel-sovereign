@@ -1118,9 +1118,9 @@ class PhoenixSupervisor:
     async def aclose(self) -> None:
         """Close the proxy httpx client, if opened."""
         if self._client is not None:
-            try:
-                await self._client.aclose()
-            finally:
+            client = self._client
+            await client.aclose()
+            if self._client is client:
                 self._client = None
 
     # -- proxy helpers ---------------------------------------------------

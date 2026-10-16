@@ -1030,6 +1030,18 @@ server teardown consumers with SQLite resources and PostgreSQL COMMIT-ACK
 faults, not full server startup or READY. Scheduler startup/preflight allocation
 sites remain separate findings, not covered by this shutdown repair.
 
+Independent teardown is dependency-aware. Refused or failed Scheduler/Agent
+phases leave their consumers' Hold context, Stop evidence and shared pools
+owned and live, with explicit unstarted retirement debt. They do not prevent
+independent drains such as the Phoenix proxy. Native tests exercise an actual
+partial Agent and an actual prepared/polling Scheduler, original Hold reads,
+SQLite workers and a loopback HTTPX proxy. They schedule no cognition and
+establish neither cold-agent readiness nor complete server acceptance.
+Phoenix retains the exact accepted proxy closer or its admission failure;
+failed client closure cannot clear its original supervisor/client reference.
+Process termination is still attempted independently. No Phoenix process is
+started or adopted by the native proxy tests.
+
 Health's database deadline checks original control evidence on the timeout
 carrier before producing a diagnostic. Native PostgreSQL health-query tests
 hold the original authority-transaction COMMIT acknowledgement through actual

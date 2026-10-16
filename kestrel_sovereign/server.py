@@ -2350,6 +2350,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
     re-raise cancellation only after this teardown is complete.
     """
     cancelled = False
+    failures = []
 
     phoenix_task = getattr(app.state, "phoenix_task", None)
     if phoenix_task is not None:
@@ -2360,6 +2361,8 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
                 phoenix_task
             )
             cancelled = cancelled or join_cancelled
+            if failure is not None and is_execution_control_error(failure):
+                failures.append(failure)
             if failure is not None and not isinstance(
                 failure, asyncio.CancelledError
             ):
@@ -2383,6 +2386,8 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
                 phoenix_start_task
             )
             cancelled = cancelled or join_cancelled
+            if failure is not None and is_execution_control_error(failure):
+                failures.append(failure)
             if failure is not None and not isinstance(
                 failure, asyncio.CancelledError
             ):
@@ -2397,33 +2402,62 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
 
     phoenix = getattr(app.state, "phoenix", None)
     if phoenix is None:
+        terminal = execution_terminal_error(*failures, retain_originals=True)
+        if terminal is not None:
+            raise terminal
         return cancelled
 
+    from kestrel_sovereign._async_ownership import create_owned_task
+
+    close_task = getattr(app.state, "phoenix_proxy_close_task", None)
+    close_failure = getattr(app.state, "phoenix_proxy_close_error", None)
+    resource = getattr(app.state, "phoenix_proxy_close_resource", None)
+    stop_failure = None
     try:
-        close_task = asyncio.create_task(phoenix.aclose())
-        close_cancelled, close_failure = await await_lifecycle_task_completion(
-            close_task
-        )
-        cancelled = cancelled or close_cancelled
+        if close_task is None and close_failure is None:
+            resource = getattr(phoenix, "_client", None)
+            if resource is None:
+                resource = phoenix
+            app.state.phoenix_proxy_close_resource = resource
+            try:
+                close_task = create_owned_task(
+                    phoenix.aclose(), name="server_phoenix:original_proxy_close",
+                    retain_originals=True, retirement_resource=resource,
+                )
+                app.state.phoenix_proxy_close_task = close_task
+            except BaseException as error:
+                close_failure = error
+        if close_task is not None:
+            close_cancelled, failure = await await_lifecycle_task_completion(close_task)
+            cancelled = cancelled or close_cancelled
+            close_failure = execution_terminal_error(close_failure, failure, retain_originals=True)
         if close_failure is not None:
-            logger.warning(
-                "Error closing Phoenix proxy client: %s",
-                close_failure,
-                exc_info=(
-                    type(close_failure),
-                    close_failure,
-                    close_failure.__traceback__,
-                ),
+            close_failure._kestrel_native_retirement_debts = (
+                *getattr(close_failure, "_kestrel_native_retirement_debts", ()),
+                (resource, close_task),
             )
-    except Exception as exc:  # noqa: BLE001 - stop still must reap the child
-        logger.warning("Error closing Phoenix proxy client: %s", exc)
+            app.state.phoenix_proxy_close_error = close_failure
+            failures.append(close_failure)
     finally:
         try:
             phoenix.stop()
-        except Exception as exc:  # noqa: BLE001 - complete state teardown
-            logger.warning("Error stopping Phoenix: %s", exc)
-        app.state.phoenix = None
+        except BaseException as error:
+            # stop() runs synchronously in this ORIGINAL owner, so this Task
+            # (not an unaccepted replacement) witnessed the failed retirement.
+            error._kestrel_native_retirement_debts = (
+                *getattr(error, "_kestrel_native_retirement_debts", ()),
+                (phoenix, asyncio.current_task()),
+            )
+            stop_failure = error
+            failures.append(stop_failure)
+        if close_failure is None and stop_failure is None:
+            app.state.phoenix = None
+            app.state.phoenix_proxy_close_task = None
+            app.state.phoenix_proxy_close_resource = None
 
+    terminal = execution_terminal_error(*failures, retain_originals=True)
+    if terminal is not None:
+        raise terminal
     return cancelled
 
 
@@ -3005,11 +3039,7 @@ async def _run_lifespan_shutdown_phase(
         # admission closes both fresh coroutines. Retain the ACTUAL resources
         # that remain on app.state, not the phase lambda or a successful Future.
         # Return the failure so later independent phases still get their drain.
-        error._kestrel_native_retirement_debts = (
-            *getattr(error, "_kestrel_native_retirement_debts", ()),
-            *((resource, None) for resource in resources),
-        )
-        cancelled, failure = False, error
+        cancelled, failure = False, _unstarted_lifespan_phase_error(error, resources)
     else:
         cancelled, failure = await await_lifecycle_task_completion(phase_task)
     task_had_failure = failure is not None
@@ -3026,6 +3056,15 @@ async def _run_lifespan_shutdown_phase(
     if not task_had_failure and phase_task is not None:
         result = phase_task.result()
     return cancelled, failure, result
+
+
+def _unstarted_lifespan_phase_error(error: BaseException, resources) -> BaseException:
+    """Retain original resources whose phase could not safely enter."""
+    error._kestrel_native_retirement_debts = (
+        *getattr(error, "_kestrel_native_retirement_debts", ()),
+        *((resource, None) for resource in resources),
+    )
+    return error
 
 
 def _lifespan_shutdown_phase_resources(app: FastAPI, name: str) -> tuple:
@@ -3069,6 +3108,21 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
     logger.info("Server shutting down...")
     cancelled = False
     first_failure: BaseException | None = None
+    failed_phases = set()
+    # Continue INDEPENDENT drains, not consumers' still-live dependencies.
+    # In particular an unretired scheduler can still wake agents, and agents
+    # still require their Hold context and Stop evidence until they retire.
+    prerequisites = {
+        "host-scheduler": (),
+        "stop-cleanup": ("host-scheduler",),
+        "unpublished-providers": ("host-scheduler",),
+        "agents": ("host-scheduler", "stop-cleanup"),
+        "host-features": ("host-scheduler", "agents"),
+        "distributed-stop-invocations": ("host-scheduler", "stop-cleanup", "agents"),
+        "stop-receipts": ("host-scheduler", "stop-cleanup", "agents", "distributed-stop-invocations"),
+        "shared-agent-postgres": ("host-scheduler", "stop-cleanup", "agents", "unpublished-providers"),
+        "phoenix": (),
+    }
 
     for name, operation in (
         ("host-scheduler", lambda: _shutdown_host_scheduler(app)),
@@ -3097,15 +3151,28 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         ),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
-        phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
-            name, operation, resources=_lifespan_shutdown_phase_resources(app, name),
-        )
+        resources = _lifespan_shutdown_phase_resources(app, name)
+        blocked_by = tuple(prerequisite for prerequisite in prerequisites[name]
+                           if prerequisite in failed_phases)
+        if resources and blocked_by:
+            # Do not create even a coordinator for a dependent close. The
+            # original app references and explicit unstarted debt remain live.
+            failure = _unstarted_lifespan_phase_error(
+                RuntimeError(f"Server shutdown phase {name!r} retains resources: "
+                             f"unretired prerequisites {blocked_by!r}"), resources,
+            )
+            phase_cancelled, result = False, None
+        else:
+            phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
+                name, operation, resources=resources,
+            )
         cancelled = cancelled or phase_cancelled
         if result is True:
             # ``_shutdown_phoenix`` records cancellation that it observed while
             # joining its app-owned work.
             cancelled = True
         if failure is not None:
+            failed_phases.add(name)
             first_failure = execution_terminal_error(first_failure, failure, retain_originals=True)
 
     return cancelled, first_failure

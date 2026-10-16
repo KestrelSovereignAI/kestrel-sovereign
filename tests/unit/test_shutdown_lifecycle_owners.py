@@ -588,10 +588,12 @@ async def test_phoenix_cleanup_stops_child_when_proxy_close_fails() -> None:
     app.state.phoenix = supervisor
     app.state.phoenix_task = None
 
-    assert await server._shutdown_phoenix(app) is False
+    with pytest.raises(RuntimeError, match="proxy close failed") as caught:
+        await server._shutdown_phoenix(app)
     assert supervisor.close_entered.is_set()
     assert supervisor.stopped is True
-    assert app.state.phoenix is None
+    assert app.state.phoenix is supervisor
+    assert app.state.phoenix_proxy_close_error is caught.value
 
 
 @pytest.mark.asyncio
