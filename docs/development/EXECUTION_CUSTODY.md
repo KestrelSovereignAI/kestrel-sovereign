@@ -334,6 +334,20 @@ close under cleanup-only custody, including transport-handler cleanup. EOF and
 close failures are classified before terminal invocation settlement. Boot's
 READY transition and deferred readiness likewise retain/check original custody;
 denial unwinds already committed boot phases rather than publishing readiness.
+Task-status SSE forwarding closes its exact raw TaskManager subscription in the
+same advancing task on terminal frames, disconnects and aborts. It needs no new
+cleanup Task admission. The canonical closing response's inline-safe mode also
+closes on failed transport sends, and its close-aware body releases the quota
+if delivery fails before the first pull. Source closure and connection-accounting cleanup both
+run before selecting their strongest original receipt. Native control bypasses
+generic SSE error/EOF conversion, including control carried by cancellation;
+the response raises an Exception-compatible envelope with that exact original
+as its explicit cause, so ASGI task groups cannot consume native cancellation
+as ordinary disconnect. Ordinary client withdrawal and error frames remain
+compatible. Native
+PostgreSQL store/TaskManager tests prove this helper boundary with an already-
+admitted recipient view, including actual ASGI 2.3/2.4 response execution, not
+peer signatures, full Agent startup or READY.
 
 A2A boot reuses the guarded native storage backend, including DSN-only agents;
 individual stores do not own its pool. Inbound verification/authorization and

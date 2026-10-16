@@ -3928,10 +3928,19 @@ async def _task_subscription_response(
             )
         _sse_connections[conn_key] += 1
 
+    def release_connection():
+        # No await: the same event loop cannot interleave a quota mutation.
+        # Also usable by the close-aware body before its first pull.
+        _sse_connections[conn_key] -= 1
+        if _sse_connections[conn_key] <= 0:
+            del _sse_connections[conn_key]
+
     async def event_generator():
         import json
         last_ping = time.monotonic()
         ping_interval = 10.0  # 10s heartbeat for intermediaries
+        subscription = None
+        body_error = None
         try:
             # ``TaskManager.subscribe`` already yields the current state
             # first, then streams updates, then breaks on the first
@@ -3939,10 +3948,11 @@ async def _task_subscription_response(
             # on its internal timeout — we forward those as SSE
             # comments-or-pings so the connection stays warm even when
             # the task sits in SUBMITTED for a while.
-            async for ev in agent.task_manager.subscribe(
+            subscription = agent.task_manager.subscribe(
                 task_id,
                 **subscribe_kwargs,
-            ):
+            )
+            async for ev in subscription:
                 if await request.is_disconnected():
                     logger.debug(
                         "task subscribe client disconnected (task=%s)",
@@ -3965,28 +3975,55 @@ async def _task_subscription_response(
                 if now - last_ping >= ping_interval:
                     yield f"event: ping\ndata: {json.dumps({'t': now})}\n\n"
                     last_ping = now
-        except asyncio.CancelledError:
-            logger.debug(
-                "task subscribe cancelled (task=%s)", task_id[:8],
-            )
-        except Exception as e:
-            logger.error(
-                "task subscribe error (task=%s): %s",
-                task_id[:8], e, exc_info=True,
-            )
-            yield (
-                "event: error\ndata: "
-                + json.dumps({"error": "Internal server error"})
-                + "\n\n"
-            )
+        except (Exception, asyncio.CancelledError) as error:
+            body_error = error
+            if is_execution_control_error(error):
+                # Keep the original native carrier, never generic data/EOF.
+                # ClosingStreamingResponse preserves it across ASGI's own
+                # cancellation/disconnect normalization boundary.
+                raise
+            if isinstance(error, asyncio.CancelledError):
+                logger.debug(
+                    "task subscribe cancelled (task=%s)", task_id[:8],
+                )
+            else:
+                logger.error(
+                    "task subscribe error (task=%s): %s",
+                    task_id[:8], error, exc_info=True,
+                )
+                yield (
+                    "event: error\ndata: "
+                    + json.dumps({"error": "Internal server error"})
+                    + "\n\n"
+                )
         finally:
-            async with _sse_lock:
-                _sse_connections[conn_key] -= 1
-                if _sse_connections[conn_key] <= 0:
-                    del _sse_connections[conn_key]
+            original = execution_terminal_error(
+                body_error, sys.exception(), retain_originals=True,
+            )
+            cleanup_error = None
+            try:
+                if subscription is not None:
+                    # This caller advanced the ORIGINAL raw generator. Close
+                    # it in the SAME task/context, including terminal breaks
+                    # and disconnects, without new cleanup-Task admission.
+                    await subscription.aclose()
+            except BaseException as error:
+                cleanup_error = error
+            try:
+                async with _sse_lock:
+                    release_connection()
+            except BaseException as error:
+                cleanup_error = execution_terminal_error(
+                    cleanup_error, error, retain_originals=True,
+                )
+            if cleanup_error is not None:
+                raise execution_terminal_error(
+                    original, cleanup_error, retain_originals=True,
+                )
 
-    return StreamingResponse(
-        event_generator(),
+    return ClosingStreamingResponse(
+        _CloseAwareStreamBody(event_generator(), release_connection),
+        close_in_stream_task=True,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
