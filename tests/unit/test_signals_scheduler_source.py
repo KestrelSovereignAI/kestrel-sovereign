@@ -116,6 +116,7 @@ def test_all_cron_tasks_are_classified():
         "memory_consolidate",
         "sleep",  # #1674 P3 — nightly memory-maintenance cycle
         "wait_reconcile",  # #1860 Wave 2 — generic wait→signal reconciler
+        "idle_wake",  # #3664 — opt-in idle detector; seeded only when enabled
         "restart_coordinator",  # #1512
         "github_pr_watch",  # #1618
         "ecosystem_discovery_watch",  # #2281
@@ -145,6 +146,7 @@ def test_action_vs_artifact_split_matches_design():
         "sleep",  # #1674 P3 — built-in handler (_handle_sleep); ACTION so the
                   # handler is wired (builtin_handlers are ACTION-only)
         "wait_reconcile",  # #1860 Wave 2 — polls waitables, emits signals, no LLM
+        "idle_wake",  # #3664 — reads idle state, emits queue.drained, no LLM
         "restart_coordinator",  # #1512 — scans, spawns subprocess
         "github_pr_watch",  # #1618 — polls a PR, emits signal on change
         "ecosystem_discovery_watch",  # #2281 — polls discovery, emits signal on findings

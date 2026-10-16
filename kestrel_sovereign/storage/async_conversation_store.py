@@ -5517,6 +5517,36 @@ class AsyncConversationStore:
                 return int(row_id)
         return None
 
+    async def latest_row_id(self) -> Optional[int]:
+        """The id of this agent's newest row, deleted or not, or ``None``."""
+        row = await self.db.fetchone(
+            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?",
+            (self.agent_id,),
+        )
+        if not row or row[0] is None:
+            return None
+        return int(row[0])
+
+    async def user_rows_after(
+        self, row_id: int, *, limit: int
+    ) -> List[Tuple[int, Dict[str, Any]]]:
+        """``(id, metadata)`` of this agent's ``user`` rows newer than ``row_id``.
+
+        Oldest first, at most ``limit``. Deleted rows are included: a turn
+        that arrived and was later deleted still arrived. The metadata is
+        parsed the way every reader parses it (:func:`parse_message_metadata`),
+        so the caller can classify each row with :func:`opens_turn` and
+        :func:`is_human_turn`. The idle detector reads it to tell whether an
+        operator or a peer opened a turn since it last looked (#3664).
+        """
+        rows = await self.db.fetchall(
+            "SELECT id, metadata FROM conversation_history "
+            "WHERE agent_id = ? AND role = 'user' AND id > ? "
+            "ORDER BY id ASC LIMIT ?",
+            (self.agent_id, int(row_id), int(limit)),
+        )
+        return [(int(rid), parse_message_metadata(meta)) for rid, meta in rows]
+
     async def get_messages_around(
         self,
         at: datetime,

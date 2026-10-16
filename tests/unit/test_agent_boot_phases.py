@@ -569,6 +569,9 @@ async def test_clean_boot_reaches_ready(tmp_path):
         # locked away undelivered (#3390).
         assert "wait.complete" in agent.signal_registry
         assert "wait.replay" in agent.signal_registry
+        # The idle detector's triage wake routes even before an agent opts
+        # in, so enabling [idle_wake] needs no new registration (#3664).
+        assert "queue.drained" in agent.signal_registry
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_CONSUMER,
         )

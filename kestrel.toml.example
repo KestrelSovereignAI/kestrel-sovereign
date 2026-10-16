@@ -861,6 +861,45 @@ role = "technical_reviewer"
 
 
 # ---------------------------------------------------------------------------
+# [idle_wake] — one triage wake when the work queue drains (#3664)
+# ---------------------------------------------------------------------------
+# Turns only start from wakes (a Talon completion, a restart, a wait, an
+# operator message), so an agent whose last item finished with nothing new
+# dispatched can sit silent indefinitely. With this on, the `idle_wake` cron
+# (every 5 minutes) emits one `queue.drained` COGNITION wake once the agent
+# has been idle for `idle_minutes`: no Talon job in flight, no armed wait
+# watch, no restart request it filed still pending/approved/updating/
+# executing, and no wake waiting to be delivered (an in-flight or parked wait
+# wake, an undelivered restart wake, a durable A2A or channel delivery, a
+# scheduled self_followup, or a turn in progress).
+#
+# It fires at most once per idle stretch. It does not fire again until a
+# Talon job is dispatched, a watch is armed, a restart request is filed, or
+# an operator or A2A turn arrives; the marker survives a restart. The wake
+# binds to the agent's most recent chain session (the session its newest
+# delivered wait wake was registered from), else a fresh session; it never
+# falls back to an operator's open chat. It dispatches nothing: the agent
+# triages and decides. Replicas sharing the agent's database each run the
+# cron; the wake is claimed in the database and leased by the replica that
+# dispatched it, so they still start at most one triage turn per stretch.
+# Their clocks must agree to well within two minutes (the lease's staleness).
+#
+# Off by default. Opt-in per agent: with `agents` set, only the named agents
+# (or DIDs) are enabled; without it, every agent on this host is. Requires
+# kestrel-feature-talon>=0.2.10 when Talon is installed (its read-only
+# finished_runs()); an older Talon, an unreadable job registry, a Hold, or a
+# volatile privacy mode keeps the wake from firing, and the cron result says
+# why (`!schedule history`). Enabling takes effect at the next restart, which
+# seeds the cron; disabling stops the wake at the next tick and removes the
+# cron at the next restart.
+#
+# [idle_wake]
+# enabled = true
+# agents = ["Emma"]
+# idle_minutes = 30   # minimum 5
+
+
+# ---------------------------------------------------------------------------
 # Semantic inference — bounded RDFS / approved OWL 2 RL maintenance (#2746)
 # ---------------------------------------------------------------------------
 # A managed agent's approved profile belongs in that agent's

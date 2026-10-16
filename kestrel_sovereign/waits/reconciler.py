@@ -1086,11 +1086,7 @@ class WaitReconciler:
             return
 
         attempts = attempts_so_far + 1
-        # The session that registered the watch (#3663); the provider's own
-        # record only for a row that stores none.
-        origin_session_id = (
-            state.watch_origin_session_id if state else None
-        ) or await _provider_origin_session(provider, handle)
+        origin_session_id = await wake_origin_session(provider, handle, state)
         signal = self._build_signal(
             provider, kind, handle, status, attempts,
             origin_session_id=origin_session_id,
@@ -1496,6 +1492,22 @@ async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
     if not isinstance(result, str) or not result.strip():
         return None
     return result.strip()
+
+
+async def wake_origin_session(
+    provider: Any, handle: str, state: Optional[WaitSignalState]
+) -> Optional[str]:
+    """The chat session a wake for ``handle`` binds to.
+
+    The session that registered the watch (#3663); the provider's own record
+    only for a row that stores none. Both are local, trusted state, never the
+    poll payload. ``provider`` may be ``None`` (its feature is not loaded), in
+    which case only the row can answer. The idle detector reads the agent's
+    most recent chain session through this same rule (#3664).
+    """
+    return (
+        state.watch_origin_session_id if state else None
+    ) or await _provider_origin_session(provider, handle)
 
 
 async def _resolve_owned_provider(agent: Any, ref: str) -> Tuple[str, str, Any]:

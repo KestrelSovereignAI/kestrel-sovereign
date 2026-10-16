@@ -741,6 +741,7 @@ ROUTED_MODULES = {
     "features/scheduler/feature.py",
     "services/key_resolution.py",
     "waits/reconciler.py",
+    "signals/idle_wake.py",  # the idle detector's own state and reads (#3664)
 }
 
 

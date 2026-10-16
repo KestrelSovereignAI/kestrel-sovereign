@@ -731,6 +731,49 @@ class WaitSignalStore:
         )
         return [self._row_to_dc(r) for r in rows]
 
+    async def list_parked(self) -> List[WaitSignalState]:
+        """Wakes for THIS agent parked until a provider-advised retry time
+        (#3302) and not yet re-sent.
+
+        A parked wake is owed: the reconciler re-emits it once its time
+        passes. The idle detector counts it as a wake still to be delivered
+        (#3664).
+        """
+        rows = await self._db.fetchall(
+            f"""
+            SELECT {_STATE_COLUMNS}
+            FROM wait_signal_state
+            WHERE agent_id = ? AND delivery_deferred_until IS NOT NULL
+                  AND pending_signal_id IS NULL
+            """,
+            (self._agent_id,),
+        )
+        return [self._row_to_dc(r) for r in rows]
+
+    async def list_latest_delivered(self, limit: int = 20) -> List[WaitSignalState]:
+        """The rows whose wakes were delivered most recently, newest first.
+
+        Ordered by ``last_delivered_at`` as stored, then re-sorted by its
+        parsed value, so a legacy row in another spelling cannot jump the
+        queue. The idle detector reads it for the agent's most recent chain
+        session and as evidence that a wake was delivered since it last
+        looked (#3664).
+        """
+        rows = await self._db.fetchall(
+            f"""
+            SELECT {_STATE_COLUMNS}
+            FROM wait_signal_state
+            WHERE agent_id = ? AND last_delivered_at IS NOT NULL
+            ORDER BY last_delivered_at DESC
+            LIMIT ?
+            """,
+            (self._agent_id, int(limit)),
+        )
+        states = [self._row_to_dc(r) for r in rows]
+        floor = datetime.min.replace(tzinfo=timezone.utc)
+        states.sort(key=lambda s: s.delivered_at_utc() or floor, reverse=True)
+        return states
+
     async def clear_pending(self, kind: str, handle: str) -> None:
         """Null the three ``pending_signal_*`` fields without touching the
         signaled/delivery state. Used on a restart-lost harvest so the next

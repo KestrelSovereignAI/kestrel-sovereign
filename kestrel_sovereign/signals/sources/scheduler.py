@@ -128,6 +128,12 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # the generic monitor for all providers; it's core (no feature gate).
     # Built-in handler: run_wait_reconcile(agent).
     ("wait_reconcile", SignalMode.ACTION, frozenset()),
+    # Idle detector (#3664). ACTION — no LLM cost. Checks whether the agent's
+    # work queue has drained (no Talon job, armed watch, pending restart or
+    # undelivered wake) and ENQUEUES one queue.drained COGNITION signal per
+    # idle stretch. Opt-in per agent via [idle_wake]; seeded only when on.
+    # Built-in handler: SchedulerFeature._run_idle_wake.
+    ("idle_wake", SignalMode.ACTION, frozenset()),
     # Restart coordinator (#1512). ACTION — no LLM cost. Scans the
     # restart_requests table, evaluates safety, and spawns a detached
     # subprocess to execute the restart. Idle by default; only fires

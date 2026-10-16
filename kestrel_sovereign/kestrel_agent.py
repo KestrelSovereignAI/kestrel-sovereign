@@ -3122,6 +3122,8 @@ class KestrelAgent(
         #   wait.complete        — generic wait reconciler rail (#1860)
         #   wait.replay          — a wait wake whose event predates the
         #                          handle's last delivered wake (#3390)
+        #   queue.drained        — idle-stretch triage wake (#3664); only
+        #                          emitted for agents opted in by [idle_wake]
         #   workflow rescue      — the six generic sources named by the
         #                          Workflows built-in stalled_work_rescue
         from kestrel_sovereign.signals import RegistrationPolicy
@@ -3146,6 +3148,9 @@ class KestrelAgent(
         from kestrel_sovereign.signals.sources.wait_replay import (
             build_wait_replay_registration,
         )
+        from kestrel_sovereign.signals.sources.queue_drained import (
+            build_queue_drained_registration,
+        )
         from kestrel_sovereign.signals.sources.workflow_rescue import (
             build_workflow_rescue_registrations,
         )
@@ -3158,6 +3163,7 @@ class KestrelAgent(
             build_a2a_question_answered_registration(),
             build_wait_complete_registration(),
             build_wait_replay_registration(),
+            build_queue_drained_registration(),
             # Core hosts these provider-neutral registrations because the
             # Workflows built-in names them.  The sweep is deliberately the
             # echo-only implementation: an installed domain feature may feed

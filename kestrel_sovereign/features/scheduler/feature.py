@@ -36,6 +36,9 @@ Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
     wait_reconcile        -- poll every MonitorableWaitable provider's
                              in-flight handles, wake on any terminal
                              transition (Wave 2 of #1860)
+    idle_wake             -- wake the agent once per idle stretch when its
+                             work queue has drained; seeded only for agents
+                             opted in through [idle_wake] (#3664)
     restart_coordinator   -- execute pending restart requests (#1512)
     github_pr_watch       -- poll a GitHub PR/issue, wake on relevant
                              state/comment/check/merge changes (#1618)
@@ -374,6 +377,7 @@ class SchedulerFeature(Feature):
             "ecosystem_discovery_watch": self._run_ecosystem_discovery_watch,
             "sleep": self._handle_sleep,
             "wait_reconcile": self._run_wait_reconcile,
+            "idle_wake": self._run_idle_wake,
             "bootstrap_timeout_check": self._run_bootstrap_timeout_check,
         }
 
@@ -721,6 +725,32 @@ class SchedulerFeature(Feature):
         # reconciler is core and no-ops cleanly when no monitorable
         # provider is registered.
         defaults.append(("wait_reconcile", "* * * * *", "{}"))
+
+        # Idle detector (#3664) — opt-in per agent through [idle_wake]. For an
+        # agent that is not opted in, the row core seeded earlier is removed by
+        # its exact core identity, so turning the flag off leaves no cron
+        # behind; a user's own idle_wake schedule is left alone.
+        from kestrel_sovereign.signals.idle_wake import (
+            CRON_EXPRESSION as IDLE_WAKE_CRON,
+            TASK_NAME as IDLE_WAKE_TASK,
+            load_idle_wake_config,
+        )
+
+        if load_idle_wake_config(agent).enabled:
+            defaults.append((IDLE_WAKE_TASK, IDLE_WAKE_CRON, "{}"))
+        else:
+            idle_wake_key = f"{_BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX}{IDLE_WAKE_TASK}"
+            for task in existing_tasks:
+                if (
+                    task["task_name"] == IDLE_WAKE_TASK
+                    and task.get("idempotency_key") == idle_wake_key
+                ):
+                    await self.schedule_remove(task["id"])
+                    logger.info(
+                        "Removed core idle_wake schedule (id=%s): [idle_wake] "
+                        "is not enabled for this agent",
+                        str(task["id"])[:8],
+                    )
 
         # Restart coordinator (#1512) — installs only if the
         # RestartCoordinatorFeature is loaded. Cheap (no LLM; idle
@@ -2169,6 +2199,40 @@ class SchedulerFeature(Feature):
 
         result = await run_wait_reconcile(self.agent)
         return json.dumps(result.data or {}, default=str)
+
+    async def _run_idle_wake(self, args: dict) -> str:
+        """Built-in handler for the ``idle_wake`` scheduled task (#3664).
+
+        Runs one evaluation of the agent's idle detector, which enqueues one
+        ``queue.drained`` wake per idle stretch. Returns its JSON report so
+        the task_execution_log says why the agent was, or was not, idle.
+
+        Args:
+            args: Unused (the detector reads ``[idle_wake]`` itself).
+        """
+        from kestrel_sovereign.signals.idle_wake import run_idle_wake
+
+        report = await run_idle_wake(
+            self.agent, pending_followups=self._count_pending_self_followups
+        )
+        return json.dumps(report, default=str)
+
+    async def _count_pending_self_followups(self) -> int:
+        """How many ``self_followup`` wakes this agent has scheduled that have
+        not fired yet: a deferred wake, so the agent is not idle (#3664).
+
+        A one-shot is written ``enabled = 0`` when it is claimed and when it
+        terminalizes, and a paused one is disabled too, so the enabled rows
+        are exactly the follow-ups still waiting for their deadline.
+        """
+        row = await self._db.fetchone(
+            """
+            SELECT COUNT(*) FROM scheduled_tasks
+            WHERE agent_id = ? AND task_name = ? AND enabled = 1
+            """,
+            (self._agent_id, SELF_FOLLOWUP_TASK_NAME),
+        )
+        return int(row[0] or 0) if row else 0
 
     async def _run_bootstrap_timeout_check(self, args: dict) -> str:
         """Built-in handler for the optional bootstrap timeout watchdog."""
