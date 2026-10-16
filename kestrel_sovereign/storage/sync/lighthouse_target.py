@@ -11,9 +11,12 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
+from kestrel_sovereign.storage.car_builder import (
+    CARReader,
+    single_raw_block_car_prefix,
+)
 from kestrel_sovereign.storage.sync.manifest_manager import ManifestManagerMixin
 from kestrel_sovereign.storage.sync.retention import (
     RetentionItem,
@@ -25,8 +28,11 @@ from kestrel_sovereign.storage.sync.targets import (
     SyncResult,
     SyncTarget,
     TrustTier,
-    _create_consistent_snapshot,
+    _consistent_snapshot_file,
 )
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.storage.providers.lighthouse_rest import UploadBody
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +103,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         """Upload snapshot to Lighthouse and update manifest.
 
         Uses sqlite3.backup() for a consistent snapshot and skips upload
-        if the content hash matches the previous upload.
+        if the content hash matches the previous upload. The snapshot stays
+        on disk and its CAR is streamed from the file in bounded chunks:
+        neither is ever held in memory whole (#3662).
         """
         timestamp = datetime.now(timezone.utc)
 
@@ -107,59 +115,64 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             )
 
             # Use sqlite3.backup() for consistent snapshot (safe with active WAL)
-            content = _create_consistent_snapshot(db_path)
+            with _consistent_snapshot_file(db_path) as snapshot_path:
+                with open(snapshot_path, "rb") as snapshot:
+                    digest = hashlib.file_digest(snapshot, "sha256").digest()
+                raw_size = snapshot_path.stat().st_size
 
-            # Skip upload if content unchanged
-            content_hash = hashlib.sha256(content).hexdigest()
-            manifest = self._load_local_manifest()
-            if manifest and manifest.get("content_hash") == content_hash:
-                logger.debug(f"Snapshot unchanged (hash={content_hash[:12]}), skipping upload")
-                return SyncResult(
-                    success=True,
-                    target_name=self.name,
-                    bytes_synced=0,
-                    frames_synced=0,
-                    timestamp=timestamp,
-                    metadata={"cid": manifest.get("snapshot_cid"), "skipped": True},
-                )
+                # Skip upload if content unchanged
+                content_hash = digest.hex()
+                manifest = self._load_local_manifest()
+                if manifest and manifest.get("content_hash") == content_hash:
+                    logger.debug(f"Snapshot unchanged (hash={content_hash[:12]}), skipping upload")
+                    return SyncResult(
+                        success=True,
+                        target_name=self.name,
+                        bytes_synced=0,
+                        frames_synced=0,
+                        timestamp=timestamp,
+                        metadata={"cid": manifest.get("snapshot_cid"), "skipped": True},
+                    )
 
-            client = LighthouseRestClient(api_key=self.api_key)
+                client = LighthouseRestClient(api_key=self.api_key)
+                try:
+                    tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
+                    timestamp_token = self._timestamp_token(timestamp)
+                    snapshot_filename = self._structured_snapshot_filename(timestamp_token)
+                    body, payload_cid = self._snapshot_car_body(digest, snapshot_path, raw_size)
+                    with body:
+                        result = await client.upload_car(
+                            body=body,
+                            tag=tag,
+                            filename=snapshot_filename,
+                        )
 
-            tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
-            timestamp_token = self._timestamp_token(timestamp)
-            snapshot_filename = self._structured_snapshot_filename(timestamp_token)
-            car_bytes, payload_cid = self._build_snapshot_car(content)
-            result = await client.upload_car(
-                car_bytes=car_bytes,
-                tag=tag,
-                filename=snapshot_filename,
-            )
+                    cid = result.get("Hash") or result.get("cid")
+                    size = int(result.get("Size", body.length))
 
-            cid = result.get("Hash") or result.get("cid")
-            size = int(result.get("Size", len(car_bytes)))
+                    if not cid:
+                        raise ValueError(f"No CID returned from Lighthouse upload: {result}")
 
-            if not cid:
-                raise ValueError(f"No CID returned from Lighthouse upload: {result}")
+                    logger.info(f"Uploaded snapshot to Lighthouse: {cid} ({size} bytes)")
+                    self._latest_cid = cid
+                    self._latest_size = size
 
-            logger.info(f"Uploaded snapshot to Lighthouse: {cid} ({size} bytes)")
-            self._latest_cid = cid
-            self._latest_size = size
-
-            # Upload manifest pointing to this snapshot
-            new_manifest = {
-                "agent_id": self.agent_id,
-                "snapshot_cid": cid,
-                "snapshot_size": size,
-                "snapshot_format": self.SNAPSHOT_FORMAT_CAR_V1,
-                "snapshot_payload_cid": payload_cid,
-                "raw_snapshot_size": len(content),
-                "uploaded_at": timestamp.isoformat(),
-                "upload_name": snapshot_filename,
-                "source_file": db_path.name,
-                "content_hash": content_hash,
-            }
-            await self._upload_manifest(client, new_manifest)
-            await client.close()
+                    # Upload manifest pointing to this snapshot
+                    new_manifest = {
+                        "agent_id": self.agent_id,
+                        "snapshot_cid": cid,
+                        "snapshot_size": size,
+                        "snapshot_format": self.SNAPSHOT_FORMAT_CAR_V1,
+                        "snapshot_payload_cid": payload_cid,
+                        "raw_snapshot_size": raw_size,
+                        "uploaded_at": timestamp.isoformat(),
+                        "upload_name": snapshot_filename,
+                        "source_file": db_path.name,
+                        "content_hash": content_hash,
+                    }
+                    await self._upload_manifest(client, new_manifest)
+                finally:
+                    await client.close()
 
             return SyncResult(
                 success=True,
@@ -291,12 +304,27 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 error=f"{type(e).__name__}: {e}",
             )
 
+    def _snapshot_car_body(
+        self, sha256_digest: bytes, snapshot_path: Path, raw_size: int
+    ) -> tuple["UploadBody", str]:
+        """The snapshot file as a single-block CAR, streamed from disk.
+
+        The archive is a few hundred bytes of header and block prefix
+        followed by the file itself, so the body reads the file in bounded
+        chunks as it uploads instead of building the archive in memory.
+        """
+        from kestrel_sovereign.storage.providers.lighthouse_rest import UploadBody
+
+        prefix, payload_cid = single_raw_block_car_prefix(sha256_digest, raw_size)
+        return UploadBody([prefix, snapshot_path]), payload_cid
+
     def _build_snapshot_car(self, content: bytes) -> tuple[bytes, str]:
-        """Pack a SQLite snapshot as a single-block CAR archive."""
-        builder = CARBuilder()
-        payload_cid = builder.add_raw_block(content)
-        builder.set_root(payload_cid)
-        return builder.build(), payload_cid
+        """Pack a SQLite snapshot held in memory as a single-block CAR archive:
+        the same bytes ``_snapshot_car_body`` streams for a file holding it."""
+        prefix, payload_cid = single_raw_block_car_prefix(
+            hashlib.sha256(content).digest(), len(content)
+        )
+        return prefix + content, payload_cid
 
     def _filename_agent_id(self) -> str:
         return self.agent_id.replace("/", "_")

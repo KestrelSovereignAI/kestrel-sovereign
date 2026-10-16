@@ -116,10 +116,16 @@ def _base32_decode(s: str) -> bytes:
 # =============================================================================
 
 
+def _multihash_from_sha256(digest: bytes) -> bytes:
+    """The sha2-256 multihash of a precomputed digest."""
+    if len(digest) != HASH_SHA2_256_LENGTH:
+        raise ValueError(f"sha2-256 digest must be {HASH_SHA2_256_LENGTH} bytes")
+    return encode_varint(HASH_SHA2_256) + encode_varint(HASH_SHA2_256_LENGTH) + digest
+
+
 def _build_multihash(data: bytes) -> bytes:
     """Build a sha2-256 multihash for the given data."""
-    digest = hashlib.sha256(data).digest()
-    return encode_varint(HASH_SHA2_256) + encode_varint(HASH_SHA2_256_LENGTH) + digest
+    return _multihash_from_sha256(hashlib.sha256(data).digest())
 
 
 def _verify_multihash(multihash: bytes, data: bytes) -> bool:
@@ -140,10 +146,14 @@ def _verify_multihash(multihash: bytes, data: bytes) -> bool:
 # =============================================================================
 
 
+def cid_bytes_from_sha256(codec: int, digest: bytes) -> bytes:
+    """CID v1 bytes for data whose sha2-256 ``digest`` is already known."""
+    return bytes([CID_VERSION_1]) + encode_varint(codec) + _multihash_from_sha256(digest)
+
+
 def build_cid_bytes(codec: int, data: bytes) -> bytes:
     """Build CID v1 bytes for the given codec and data."""
-    multihash = _build_multihash(data)
-    return bytes([CID_VERSION_1]) + encode_varint(codec) + multihash
+    return cid_bytes_from_sha256(codec, hashlib.sha256(data).digest())
 
 
 def cid_bytes_to_string(cid_bytes: bytes) -> str:
@@ -234,6 +244,37 @@ def make_cid_link(cid_bytes: bytes) -> object:
         raise ImportError("cbor2 is required for CAR file support.")
     # dag-cbor CID links are Tag 42 wrapping bytes(0x00 + cid_bytes)
     return cbor2.CBORTag(CBOR_TAG_CID, b"\x00" + cid_bytes)
+
+
+def car_header(root_cid_bytes: bytes) -> bytes:
+    """The CAR v1 header naming ``root_cid_bytes``, with its length prefix."""
+    header_bytes = _dag_cbor_encode(
+        {"version": 1, "roots": [make_cid_link(root_cid_bytes)]}
+    )
+    return encode_varint(len(header_bytes)) + header_bytes
+
+
+def car_block_prefix(cid_bytes: bytes, data_length: int) -> bytes:
+    """The bytes that precede a block's data in a CAR v1 archive."""
+    return encode_varint(len(cid_bytes) + data_length) + cid_bytes
+
+
+def single_raw_block_car_prefix(
+    sha256_digest: bytes, data_length: int
+) -> Tuple[bytes, str]:
+    """Everything before the data in a CAR v1 holding one raw root block.
+
+    That archive is this prefix followed by the data, byte for byte what
+    ``CARBuilder`` builds for the same single raw block set as root. A caller
+    that hashed the data in chunks can therefore stream a multi-GB archive
+    without ever holding the data or the archive in memory.
+
+    Returns:
+        (prefix, cid_string) of the raw block
+    """
+    cid_bytes = cid_bytes_from_sha256(CODEC_RAW, sha256_digest)
+    prefix = car_header(cid_bytes) + car_block_prefix(cid_bytes, data_length)
+    return prefix, cid_bytes_to_string(cid_bytes)
 
 
 # =============================================================================
@@ -343,19 +384,12 @@ class CARBuilder:
         buf = io.BytesIO()
 
         # Header: dag-cbor({"version": 1, "roots": [root_cid_link]})
-        root_link = make_cid_link(self._root_cid_bytes)
-        header_obj = {"version": 1, "roots": [root_link]}
-        header_bytes = _dag_cbor_encode(header_obj)
-
-        # Write header with length prefix
-        buf.write(encode_varint(len(header_bytes)))
-        buf.write(header_bytes)
+        buf.write(car_header(self._root_cid_bytes))
 
         # Write blocks: varint(len(cid + data)) + cid + data
         for cid_bytes, data in self._blocks:
-            block_payload = cid_bytes + data
-            buf.write(encode_varint(len(block_payload)))
-            buf.write(block_payload)
+            buf.write(car_block_prefix(cid_bytes, len(data)))
+            buf.write(data)
 
         return buf.getvalue()
 
