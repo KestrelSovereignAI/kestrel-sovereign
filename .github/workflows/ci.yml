@@ -421,7 +421,7 @@ jobs:
         # tripped first. --maxfail bounds a truly broken tree without hiding
         # the set. Reading a red run now means reading every failure, which is
         # what tells you flake from regression.
-        run: uv run pytest tests/unit/ -n auto -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
+        run: uv run pytest tests/unit/ -n auto -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --junitxml=junit-baseline.xml
         # Budgeted the way the integration tier below is (#3212), because the
         # unit tier hit the same wall for the same reason (#3330). 10 min was
         # too tight, then 20 was: at 44e77ec5 the push run passed the step in
@@ -476,6 +476,341 @@ jobs:
 
       - name: Run frontend JavaScript tests
         run: npm run test:js
+
+      - name: Upload JUnit (experiment)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: junit-*.xml
+          retention-days: 7
+
+  unit-logical:
+    runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    # The unit tier's dual-backend tests run their PostgreSQL case only when
+    # TEST_POSTGRES_URL is set. Without this service all of them skipped and
+    # the tier still reported green: 137 cases, including every PostgreSQL
+    # path #2527's crash lived on (#3381). Same image and major as the
+    # integration tier below, for the same #2958 floor.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}  # release SHA when called from publish.yml; default ref otherwise
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: uv sync
+
+      # jsdom (a devDependency) is required by tests/frontend. The lockfile's
+      # `file:../kestrel-flight` entry is a symlink npm tolerates when the
+      # sibling checkout is absent; no frontend test imports it.
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Runner facts (experiment)
+        run: |
+          nproc; lscpu | grep -E "^(CPU\(s\)|Thread|Core|Socket|Model name)"; free -g
+          uv run python -c "import os, psutil; print('os.cpu_count', os.cpu_count(), 'physical', psutil.cpu_count(logical=False), 'logical', psutil.cpu_count())"
+
+      - name: Run unit tests
+        # ``-n auto`` parallelizes across runner cores via pytest-xdist
+        # (already a dev dep). Note that ``auto`` resolves to **2 workers**
+        # on the standard GitHub-hosted runner, not the 16 an earlier
+        # revision of this comment assumed. Runner sizing is tracked in
+        # #2795. The PYTHONHASHSEED env at the workflow level keeps
+        # parametrize ordering deterministic across workers.
+        #
+        # No ``-m "not bench"`` here, deliberately — but only because the
+        # tier's one benchmark
+        # (test_50k_nodes_per_agent_query_under_50ms) costs 0.4s locally,
+        # under 0.3% of this job. It is not worth filtering out.
+        #
+        # Do NOT read that as "it guards the JSON-path indexes". Verified by
+        # mutation: with every SQLite JSON-path index removed, that
+        # benchmark still passes, and so does the structural
+        # TestIndexUsage::test_agent_status_query_uses_index. The only tests
+        # that fail are the by-name existence checks in TestJsonPathIndexes.
+        # See #2798. The integration tier does exclude benchmarks; below.
+        # No -x. Under -n auto this suite has a tail of load-sensitive tests
+        # (#3276): repeated runs on ONE unchanged commit fail a different 1-3
+        # each time, all passing serially. With -x the run stopped at whichever
+        # test lost the race, so the reported failure was rarely the real
+        # problem and a genuine regression could hide behind a flake that
+        # tripped first. --maxfail bounds a truly broken tree without hiding
+        # the set. Reading a red run now means reading every failure, which is
+        # what tells you flake from regression.
+        run: uv run pytest tests/unit/ -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --junitxml=junit-logical.xml
+        # Budgeted the way the integration tier below is (#3212), because the
+        # unit tier hit the same wall for the same reason (#3330). 10 min was
+        # too tight, then 20 was: at 44e77ec5 the push run passed the step in
+        # 12.4 min while the pull_request run of the IDENTICAL tree was killed
+        # at 20:00 with 72% done. Its progress was uniformly slow, not stalled
+        # — 2.3x the push run at the same percentage (19.2 vs 8.4 min to 72%),
+        # and 3.7x that PR run's own rerun, which passed in 8.3. That is runner
+        # speed, not event type: across 51 successful steps the push and
+        # pull_request medians are both 11.3 min (max 13.8).
+        #
+        # The runner's kill is the failure worth removing. pytest writes
+        # tracebacks and the short summary only in its epilogue, so a killed
+        # step names FAILED tests and says nothing about why — #3330's
+        # 27k-line log had no traceback at all. `--session-timeout` makes
+        # pytest stop itself first: under xdist the worker that crosses it
+        # stops, the controller shuts the others down after their current
+        # test, and the FAILURES section and summary still print.
+        #
+        # Sizing: the slowest pass observed (13.8) on the slowest runner
+        # observed (2.3x) is 31.7 min; the 35 min session deadline clears it.
+        # The deadline is checked BETWEEN tests, so a run can overshoot it by
+        # up to the longest per-test ceiling — 300s, from the unit tier's
+        # `timeout(300)` markers, which tests/unit/conftest.py now refuses to
+        # exceed. 35 + 5, plus teardown, is why the runner backstop is 45.
+        #
+        # This does not mask a hang. Per-test `--timeout=60` catches those in
+        # a minute; the wall clock only decides how much passing work is
+        # thrown away. Runner sizing — the real fix — stays in #2795.
+        #
+        # budget-basis(unit): slowest-pass=13.8 worst-runner-ratio=2.3 samples=51 longest-test=300
+        timeout-minutes: 45
+        env:
+          KESTREL_AUDIT_MODE: skip
+          # TEST_POSTGRES_URL, not DATABASE_URL: it is the one variable every
+          # dual-backend fixture reads, and it is read only by tests, so it
+          # cannot move code under test onto PostgreSQL behind its back.
+          # Each xdist worker rewrites it to a database of its own, so workers
+          # booting the core schema at once cannot race in the catalogs
+          # (#3383), nor reach each other's tables or pgvector (#3515; see
+          # tests/shared/postgres_worker_isolation.py).
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          # Fail, not skip: a PostgreSQL case that skips here is a failure,
+          # and a missing URL stops the session before collection. See
+          # tests/shared/postgres_requirement.py.
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+
+      - name: Run voice playback JavaScript tests
+        run: >-
+          node --test
+          tests/js/test_voice_playback.mjs
+          tests/js/test_voice_playback_worklet.mjs
+
+      - name: Run frontend JavaScript tests
+        run: npm run test:js
+
+      - name: Upload JUnit (experiment)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: junit-*.xml
+          retention-days: 7
+
+  unit-shard:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    # The unit tier's dual-backend tests run their PostgreSQL case only when
+    # TEST_POSTGRES_URL is set. Without this service all of them skipped and
+    # the tier still reported green: 137 cases, including every PostgreSQL
+    # path #2527's crash lived on (#3381). Same image and major as the
+    # integration tier below, for the same #2958 floor.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}  # release SHA when called from publish.yml; default ref otherwise
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: uv sync
+
+      # jsdom (a devDependency) is required by tests/frontend. The lockfile's
+      # `file:../kestrel-flight` entry is a symlink npm tolerates when the
+      # sibling checkout is absent; no frontend test imports it.
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Runner facts (experiment)
+        run: |
+          nproc; lscpu | grep -E "^(CPU\(s\)|Thread|Core|Socket|Model name)"; free -g
+          uv run python -c "import os, psutil; print('os.cpu_count', os.cpu_count(), 'physical', psutil.cpu_count(logical=False), 'logical', psutil.cpu_count())"
+
+      - name: Run unit tests
+        # ``-n auto`` parallelizes across runner cores via pytest-xdist
+        # (already a dev dep). Note that ``auto`` resolves to **2 workers**
+        # on the standard GitHub-hosted runner, not the 16 an earlier
+        # revision of this comment assumed. Runner sizing is tracked in
+        # #2795. The PYTHONHASHSEED env at the workflow level keeps
+        # parametrize ordering deterministic across workers.
+        #
+        # No ``-m "not bench"`` here, deliberately — but only because the
+        # tier's one benchmark
+        # (test_50k_nodes_per_agent_query_under_50ms) costs 0.4s locally,
+        # under 0.3% of this job. It is not worth filtering out.
+        #
+        # Do NOT read that as "it guards the JSON-path indexes". Verified by
+        # mutation: with every SQLite JSON-path index removed, that
+        # benchmark still passes, and so does the structural
+        # TestIndexUsage::test_agent_status_query_uses_index. The only tests
+        # that fail are the by-name existence checks in TestJsonPathIndexes.
+        # See #2798. The integration tier does exclude benchmarks; below.
+        # No -x. Under -n auto this suite has a tail of load-sensitive tests
+        # (#3276): repeated runs on ONE unchanged commit fail a different 1-3
+        # each time, all passing serially. With -x the run stopped at whichever
+        # test lost the race, so the reported failure was rarely the real
+        # problem and a genuine regression could hide behind a flake that
+        # tripped first. --maxfail bounds a truly broken tree without hiding
+        # the set. Reading a red run now means reading every failure, which is
+        # what tells you flake from regression.
+        run: |
+          python3 - "${{ matrix.shard }}" 4 > shard-files.txt <<'EOF'
+          import pathlib, sys
+          shard, total = int(sys.argv[1]), int(sys.argv[2])
+          files = sorted(pathlib.Path("tests/unit").rglob("test_*.py"))
+          bins = [[0, []] for _ in range(total)]
+          for f in sorted(files, key=lambda p: (-p.stat().st_size, str(p))):
+              b = min(bins, key=lambda b: b[0]); b[0] += f.stat().st_size; b[1].append(str(f))
+          print("\n".join(sorted(bins[shard][1])))
+          EOF
+          wc -l shard-files.txt
+          uv run pytest $(cat shard-files.txt) -n auto -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --junitxml=junit-shard-${{ matrix.shard }}.xml
+        # Budgeted the way the integration tier below is (#3212), because the
+        # unit tier hit the same wall for the same reason (#3330). 10 min was
+        # too tight, then 20 was: at 44e77ec5 the push run passed the step in
+        # 12.4 min while the pull_request run of the IDENTICAL tree was killed
+        # at 20:00 with 72% done. Its progress was uniformly slow, not stalled
+        # — 2.3x the push run at the same percentage (19.2 vs 8.4 min to 72%),
+        # and 3.7x that PR run's own rerun, which passed in 8.3. That is runner
+        # speed, not event type: across 51 successful steps the push and
+        # pull_request medians are both 11.3 min (max 13.8).
+        #
+        # The runner's kill is the failure worth removing. pytest writes
+        # tracebacks and the short summary only in its epilogue, so a killed
+        # step names FAILED tests and says nothing about why — #3330's
+        # 27k-line log had no traceback at all. `--session-timeout` makes
+        # pytest stop itself first: under xdist the worker that crosses it
+        # stops, the controller shuts the others down after their current
+        # test, and the FAILURES section and summary still print.
+        #
+        # Sizing: the slowest pass observed (13.8) on the slowest runner
+        # observed (2.3x) is 31.7 min; the 35 min session deadline clears it.
+        # The deadline is checked BETWEEN tests, so a run can overshoot it by
+        # up to the longest per-test ceiling — 300s, from the unit tier's
+        # `timeout(300)` markers, which tests/unit/conftest.py now refuses to
+        # exceed. 35 + 5, plus teardown, is why the runner backstop is 45.
+        #
+        # This does not mask a hang. Per-test `--timeout=60` catches those in
+        # a minute; the wall clock only decides how much passing work is
+        # thrown away. Runner sizing — the real fix — stays in #2795.
+        #
+        # budget-basis(unit): slowest-pass=13.8 worst-runner-ratio=2.3 samples=51 longest-test=300
+        timeout-minutes: 45
+        env:
+          KESTREL_AUDIT_MODE: skip
+          # TEST_POSTGRES_URL, not DATABASE_URL: it is the one variable every
+          # dual-backend fixture reads, and it is read only by tests, so it
+          # cannot move code under test onto PostgreSQL behind its back.
+          # Each xdist worker rewrites it to a database of its own, so workers
+          # booting the core schema at once cannot race in the catalogs
+          # (#3383), nor reach each other's tables or pgvector (#3515; see
+          # tests/shared/postgres_worker_isolation.py).
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          # Fail, not skip: a PostgreSQL case that skips here is a failure,
+          # and a missing URL stops the session before collection. See
+          # tests/shared/postgres_requirement.py.
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+
+      - name: Run voice playback JavaScript tests
+        run: >-
+          node --test
+          tests/js/test_voice_playback.mjs
+          tests/js/test_voice_playback_worklet.mjs
+
+      - name: Run frontend JavaScript tests
+        run: npm run test:js
+
+      - name: Upload JUnit (experiment)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: junit-*.xml
+          retention-days: 7
 
   # Fail-fast across the parallel tiers.
   #
