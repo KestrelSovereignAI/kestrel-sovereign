@@ -859,6 +859,31 @@ lease or permission. Default factory calls remain strict. Positive and negative
 reader caches cannot hide revocation, uncertainty or scoped cleanup-only
 admission; ordinary unbound vector reads still use their original factory.
 
+Memory-context retrieval retains those same originals: index DDL,
+MemoryManager, ContextManager and public emotional recall cannot turn native
+control into readiness, absent memories, warning sections or failed tools.
+Rehearsal writes use canonical owned Tasks and capture their original immutable
+scope membership before dispatch. Completion harvests one strongest opaque,
+foreign, commit or retirement receipt before releasing each Task; drains report
+that runtime control even when no Task remains pending. A pure typed denial
+proven only to that child's exact original admissions stays on its Task and
+reaches its original caller without poisoning separately admitted turns. Mixed,
+unproven, committed or debt-bearing control cannot take that local path.
+Original scoped calls join their writes before context
+publication. Legacy unbound callers keep background behavior, but later reads,
+new schedules, emotion/importance reads, application writes and shutdown still
+observe retained control. Partial Task
+admission closes the refused coroutine and cancels/joins accepted siblings.
+Ordinary write availability remains handled inside update_access; failures
+escaping the owner/admission boundary cannot authorize context publication.
+
+Finite LLM attempt accounting composes the original body withdrawal and the
+original recording outcome using the canonical classifier. An absent commit
+marker is not proof that authority or retirement control is ordinary or local
+to the cancelled caller, including an actual second accounting cancellation.
+Hot memory receipts stay bounded; a cancelled drain
+groups its finite originals without adding caller history to the hot receipt.
+
 Refusal to allocate an original physical closer is explicit resource/None
 retirement debt, not successful closure: HTTP response inventories keep the
 actual handle and database shutdown still attempts each independent backend

@@ -42,8 +42,18 @@ from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import json
 
 from kestrel_sovereign.execution_custody import (
+    current_execution_custody,
+    execution_commit_outcome,
+    execution_denial_scopes,
+    execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
+    retained_execution_error,
+)
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
 )
 
 from .memory_models import MemoryMetadata
@@ -226,6 +236,7 @@ class MemoryRetriever:
             "total_latency_ms": 0.0,
         }
         self._access_update_tasks: set[asyncio.Task[None]] = set()
+        self._access_update_control: Optional[BaseException] = None
         self._sqla_factory_unavailable = False
         self._unprofiled_lexical_scan_warned = False
 
@@ -263,6 +274,7 @@ class MemoryRetriever:
             List of message dicts with 'score' field added,
             sorted by score descending
         """
+        self._raise_access_update_control()
         # Get conversation history
         # Note: AsyncConversationStore's get_conversation_history doesn't take agent_id
         # because it's already scoped via self.agent_id in the store
@@ -580,10 +592,10 @@ class MemoryRetriever:
             results.append(result)
 
         if not read_only:
-            for result in results:
-                msg_id = result.get("id")
-                if msg_id is not None:
-                    self._schedule_access_update(msg_id, agent_id)
+            await self.record_accesses(
+                (result["id"] for result in results if result.get("id") is not None),
+                agent_id,
+            )
 
         return results
 
@@ -656,31 +668,94 @@ class MemoryRetriever:
 
     def _schedule_access_update(self, message_id: int, agent_id: str) -> asyncio.Task[None]:
         """Own rehearsal-effect bookkeeping tasks so shutdown can await them."""
-        task = asyncio.create_task(
+        self._raise_access_update_control()
+        backend = getattr(getattr(self.conversations, "db", None), "backend", None)
+        admissions = current_execution_custody(backend)
+        task = create_owned_task(
             self.update_access(message_id, agent_id),
             name=f"memory-access-update-{message_id}",
+            retain_originals=True,
         )
+        # Immutable membership captured BEFORE child dispatch, not inferred
+        # from a later reader or a callback's mutable ambient context.
+        task._kestrel_memory_access_admissions = admissions
         self._access_update_tasks.add(task)
-        task.add_done_callback(self._access_update_tasks.discard)
+        task.add_done_callback(self._access_update_done)
         return task
+
+    def _raise_access_update_control(self) -> None:
+        control = self._access_update_control
+        if control is not None:
+            raise retained_execution_error(control)
+
+    def _access_update_done(self, task: asyncio.Task[None]) -> None:
+        error = owned_task_error(task)
+        if error is not None and is_execution_control_error(error):
+            denied = execution_denial_scopes(error)
+            admissions = getattr(task, "_kestrel_memory_access_admissions", ())
+            original_scope_only = (
+                bool(denied)
+                and execution_commit_outcome(error) is None
+                and all(scope in admissions for scope in denied)
+            )
+            if not original_scope_only:
+                # Opaque/foreign, commit or retirement control is runtime
+                # evidence. A pure denial proven ONLY to this child's exact
+                # originals stays on its Task, not unrelated future turns.
+                self._access_update_control = execution_terminal_error(
+                    self._access_update_control, error
+                )
+        elif error is not None and not isinstance(error, asyncio.CancelledError):
+            logger.warning("Memory access update failed: %s", error)
+        self._access_update_tasks.discard(task)
 
     async def record_accesses(self, message_ids: Iterable[int], agent_id: str) -> None:
         """Record rehearsal only for memories a caller actually surfaced."""
-        for message_id in dict.fromkeys(message_ids):
-            self._schedule_access_update(message_id, agent_id)
+        self._raise_access_update_control()
+        try:
+            for message_id in dict.fromkeys(message_ids):
+                self._schedule_access_update(message_id, agent_id)
+            backend = getattr(getattr(self.conversations, "db", None), "backend", None)
+            if current_execution_custody(backend):
+                # Original scoped work may not outlive context publication.
+                # Legacy unbound callers retain background behavior.
+                await self.drain_access_updates()
+        except BaseException as error:
+            try:
+                await self.drain_access_updates(cancel=True)
+            except BaseException as cleanup:
+                raise execution_terminal_error(error, cleanup, retain_originals=True)
+            raise
 
     async def drain_access_updates(self, *, cancel: bool = False) -> None:
         """Wait for scheduled access-count updates before storage lifecycle changes."""
         tasks = set(self._access_update_tasks)
-        if not tasks:
-            return
-
         if cancel:
             for task in tasks:
-                task.cancel()
+                if not task.done():
+                    task.cancel()
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        cancellation = None
+        child_controls = []
+        for task in tasks:
+            outcome = await await_owned_task(
+                task, cancellation, cancel_on_caller_cancellation=True
+            )
+            cancellation = outcome.cancellation
+            self._access_update_done(task)
+            if outcome.error is not None and is_execution_control_error(outcome.error):
+                child_controls.append(outcome.error)
         self._access_update_tasks.difference_update(tasks)
+        originals = []
+        for error in (self._access_update_control, *child_controls, cancellation):
+            if error is not None and not any(error is prior for prior in originals):
+                originals.append(error)
+        if len(originals) > 1:
+            # Finite child/caller originals do not mutate the hot receipt or
+            # turn a narrow old request denial into a runtime-wide lifetime.
+            raise BaseExceptionGroup("original memory access retirement", originals)
+        if originals:
+            raise retained_execution_error(originals[0])
 
     async def shutdown(self) -> None:
         """Cancel pending rehearsal-effect writes during component shutdown."""
@@ -1154,6 +1229,7 @@ class MemoryRetriever:
         Returns:
             List of matching messages sorted by importance
         """
+        self._raise_access_update_control()
         history = await self.conversations.get_conversation_history(limit=1000)
 
         matching = []
@@ -1193,6 +1269,7 @@ class MemoryRetriever:
         Returns:
             List of important messages sorted by importance
         """
+        self._raise_access_update_control()
         history = await self.conversations.get_conversation_history(limit=1000)
 
         important = []
@@ -1237,6 +1314,7 @@ class MemoryRetriever:
             agent_id: Agent ID for verification (currently unused; store is
                       already agent-scoped)
         """
+        self._raise_access_update_control()
         if not self.conversations or message_id is None:
             return
 
@@ -1294,6 +1372,7 @@ class MemoryRetriever:
             nothing was written: no store, no id, or no row of this agent
             with that id.
         """
+        self._raise_access_update_control()
         if not self.conversations or message_id is None:
             return False
 

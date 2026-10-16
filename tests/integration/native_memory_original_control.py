@@ -78,8 +78,49 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
                     if line.lower().startswith(b"content-length:")
                 )
                 body = json.loads(await reader.readexactly(size))
-                assert header.startswith(b"POST /v1/embeddings ")
                 requests.append(body)
+                if header.startswith(b"POST /v1/chat/completions "):
+                    assert body["stream"] is True
+                    events = [
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": "local"},
+                                    "finish_reason": None,
+                                }
+                            ]
+                        },
+                        {
+                            "choices": [
+                                {"index": 0, "delta": {}, "finish_reason": "stop"}
+                            ]
+                        },
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 3,
+                                "completion_tokens": 1,
+                                "total_tokens": 4,
+                            },
+                        },
+                    ]
+                    payload = (
+                        b"".join(
+                            b"data: " + json.dumps(event).encode() + b"\n\n"
+                            for event in events
+                        )
+                        + b"data: [DONE]\n\n"
+                    )
+                    writer.write(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: "
+                        + str(len(payload)).encode()
+                        + b"\r\n\r\n"
+                        + payload
+                    )
+                    await writer.drain()
+                    return
+                assert header.startswith(b"POST /v1/embeddings ")
                 payload = json.dumps(
                     {
                         "object": "list",

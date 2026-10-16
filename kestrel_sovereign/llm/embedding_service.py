@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 import numpy as np
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
-from kestrel_sovereign.execution_custody import await_execution_work, bind_execution_cleanup, bind_execution_runtime, require_execution_work, is_execution_control_error, execution_commit_outcome, execution_terminal_error
+from kestrel_sovereign.execution_custody import await_execution_work, bind_execution_cleanup, bind_execution_runtime, require_execution_work, is_execution_control_error, execution_terminal_error
 
 from .adapter import ReportedUsage
 from .modality_recording import ModalityCall
@@ -704,14 +704,14 @@ class ProviderEmbeddingService:
                                 context=context,
                             )
                         )
-                    except Exception as accounting_error:
-                        if (
-                            error is None
-                            or not is_execution_control_error(accounting_error)
-                            or not (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error))
-                            or execution_commit_outcome(accounting_error) is not None
-                        ):
-                            raise execution_terminal_error(error, accounting_error)
+                    except BaseException as accounting_error:
+                        # A recording denial/debt is original control even
+                        # without a commit marker. Keep the finite body's
+                        # withdrawal too; do not silently localize the denial.
+                        raise execution_terminal_error(
+                            error, accounting_error, retain_originals=True,
+                            prefer_cancellation=True,
+                        )
         require_execution_work(recorder)
         return result
 

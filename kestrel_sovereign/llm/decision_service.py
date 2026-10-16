@@ -33,7 +33,7 @@ from kestrel_sdk.llm.decisions import (
 )
 
 from kestrel_sovereign.config import load_section
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, execution_work_operation, require_execution_work, is_execution_control_error, execution_commit_outcome, execution_terminal_error
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, bind_execution_cleanup, bind_execution_runtime, execution_work_operation, require_execution_work, is_execution_control_error, execution_terminal_error
 from kestrel_sovereign.execution_custody import await_execution_work_group
 
 from .adapter import ReportedUsage
@@ -655,11 +655,11 @@ class DecisionServiceMixin:
                         },
                     )
                 )
-            except Exception as accounting_error:
-                if (
-                    error is None
-                    or not is_execution_control_error(accounting_error)
-                    or not (isinstance(error, asyncio.CancelledError) or is_execution_control_error(error))
-                    or execution_commit_outcome(accounting_error) is not None
-                ):
-                    raise execution_terminal_error(error, accounting_error)
+            except BaseException as accounting_error:
+                # This finite attempt owns BOTH original body and recording
+                # outcomes. No commit marker is needed for native authority
+                # or retirement control, nor can it be assumed caller-local.
+                raise execution_terminal_error(
+                    error, accounting_error, retain_originals=True,
+                    prefer_cancellation=True,
+                )

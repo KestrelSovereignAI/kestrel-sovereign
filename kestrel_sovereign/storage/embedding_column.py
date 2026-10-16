@@ -158,6 +158,8 @@ async def ensure_embedding_vec_column(
                     (),
                 )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Could not create the HNSW index on %s.%s: %s. kNN search "
                 "still works, without the index.",

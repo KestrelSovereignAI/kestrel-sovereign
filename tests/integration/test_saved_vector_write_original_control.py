@@ -103,8 +103,9 @@ async def test_actual_saved_vector_partial_updates_keep_original_commit_control(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["column", "hnsw"])
 async def test_actual_first_vector_column_commit_keeps_original_control(
-    native_vector_store, native_pg, monkeypatch
+    native_vector_store, native_pg, monkeypatch, door
 ):
     db, store, did = native_vector_store
     observed, faulted = [], []
@@ -113,7 +114,12 @@ async def test_actual_first_vector_column_commit_keeps_original_control(
 
     async def original_ddl(connection, sql, *args, **kwargs):
         result = await actual_execute(connection, sql, *args, **kwargs)
-        if "ALTER TABLE saved_items ADD COLUMN" in sql:
+        target = (
+            "ALTER TABLE saved_items ADD COLUMN"
+            if door == "column"
+            else "CREATE INDEX IF NOT EXISTS idx_saved_items_embedding_vec_hnsw"
+        )
+        if target in sql:
             observed.append(sql)
         return result
 
@@ -141,6 +147,14 @@ async def test_actual_first_vector_column_commit_keeps_original_control(
         )
         == 1
     )
+    if door == "hnsw":
+        assert (
+            await native_pg[1].fetchval(
+                "SELECT COUNT(*) FROM pg_indexes WHERE schemaname=$1 AND indexname='idx_saved_items_embedding_vec_hnsw'",
+                native_pg[2],
+            )
+            == 1
+        )
     assert failure is not None and original in tuple(
         _explicit_control_chain(failure)
     ), f"actual first-column COMMIT control became {result!r}, failure={failure!r}"

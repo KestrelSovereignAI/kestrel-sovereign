@@ -17,6 +17,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage import AsyncStorage
@@ -310,12 +311,18 @@ class MemoryManager:
             return text
 
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Storage connection error during memory retrieval: {e}", exc_info=True)
             return None
         except (KeyError, ValueError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Data error during memory retrieval: {e}", exc_info=True)
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Memory retrieval failed: {e}", exc_info=True)
             return None
 

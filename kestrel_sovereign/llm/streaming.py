@@ -92,7 +92,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
     bind_execution_cleanup, execution_work_stream, is_execution_control_error,
-    execution_terminal_error, execution_commit_outcome,
+    execution_terminal_error,
     owned_execution_stream as _owned_stream,
 )
 from .adapter import (
@@ -1437,26 +1437,14 @@ class StreamingMixin:
                             publish_identity=False,
                             invocation_context=invocation_context,
                         )
-            except Exception as accounting_error:
-                if completed:
-                    raise execution_terminal_error(failure, accounting_error)
-                if (
-                    is_execution_control_error(failure) if failure is not None else False
-                ) or is_execution_control_error(accounting_error):
-                    terminal = execution_terminal_error(failure, accounting_error)
-                    if (
-                        terminal is failure
-                        or execution_commit_outcome(accounting_error) is not None
-                    ):
-                        raise terminal
-                    # Only ordinary cleanup denial may stay behind an aborted
-                    # body's original error; unknown/committed never does.
-                    if not isinstance(accounting_error, ExecutionAuthorityError):
-                        raise terminal
-                else:
-                    raise
-                # Aborted hosted work has cleanup-only authority. Do not turn
-                # usage/billing into ordinary work or hide its original failure.
+            except BaseException as accounting_error:
+                # Cancellation/close does not prove that accounting control
+                # belongs only to this caller. Preserve both finite originals
+                # through the canonical authority/commit/debt classifier.
+                raise execution_terminal_error(
+                    failure, accounting_error, retain_originals=True,
+                    prefer_cancellation=True,
+                )
 
     async def _run_stream_fallback_attempt(
         self,

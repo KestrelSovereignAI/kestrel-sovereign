@@ -828,9 +828,13 @@ class MemoryFeature(Feature):
                 **session_kwargs,
             )
         except (AttributeError, TypeError, KeyError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_emotional failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_emotional failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
