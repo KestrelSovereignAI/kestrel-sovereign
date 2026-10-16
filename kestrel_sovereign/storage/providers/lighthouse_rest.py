@@ -16,16 +16,35 @@ no API key: ``LighthouseGateway`` reads it alone, and ``LighthouseRestClient``
 adds the account API, which does.
 """
 
+import io
 import logging
+import os
+import time
 from collections.abc import Mapping
-from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 _DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+#: The most bytes one read of an ``UploadBody`` returns, so the most the HTTP
+#: stack hands a TLS connection in one write. httpx sends a ``bytes``
+#: multipart file as one chunk, and httpcore passes that chunk to a single
+#: ``ssl.SSLObject.write``, which encrypts all of it into OpenSSL's memory BIO
+#: before any of it reaches the socket. That BIO cannot grow past ~1.9 GB
+#: (``BUF_MEM_grow_clean``'s expansion limit): on OpenSSL 3.5.4 with TLS 1.3
+#: one write of 1,902,794,057 bytes raises ``OSError: [Errno 0] Error``, with
+#: nothing sent, and leaves a stale error on the thread's OpenSSL error queue
+#: that fails the next read of every other TLS connection on the event loop.
+#: Emma's snapshot CAR crossed that size on 2026-10-08 (#3662).
+UPLOAD_CHUNK_BYTES = 64 * 1024
+
+_CAR_CONTENT_TYPE = "application/vnd.ipld.car"
+
+UploadSegment = Union[bytes, "os.PathLike[str]"]
 
 # Fields that name one Filecoin deal in a deal_status record: its deal id
 # (chain, client or UUID) or the storage provider holding it.
@@ -101,41 +120,191 @@ async def list_all_uploads(client: Any) -> List[Dict[str, Any]]:
     return uploads
 
 
-class _ProgressBytesIO(BytesIO):
-    """BytesIO wrapper that reports file-byte progress as upload clients read."""
+class UploadBody(io.RawIOBase):
+    """A known-length upload body, read at most ``UPLOAD_CHUNK_BYTES`` at a time.
+
+    The body is its segments in order: ``bytes`` already in memory, or a file
+    on disk that is read chunk by chunk as the upload proceeds, so a
+    multi-GB file is never held in memory whole. httpx learns the length by
+    seeking (so it sends a Content-Length) and seeks back to 0 before it
+    sends. Every read returns at most ``UPLOAD_CHUNK_BYTES``, and an unsized
+    ``read()`` is refused rather than drawing the whole body into one buffer.
+    ``tell()`` is how much of the body the HTTP stack has taken so far.
+
+    A file segment's size is fixed when the body is made. A file that
+    shrinks while the body is in use fails the read instead of sending less
+    than the declared length.
+    """
 
     def __init__(
         self,
-        content: bytes,
-        on_progress: Optional[Callable[[int, int], None]],
+        segments: Sequence[UploadSegment],
         *,
-        chunk_size: int = 64 * 1024,
+        on_progress: Optional[Callable[[int, int], None]] = None,
     ):
-        super().__init__(content)
-        self._total = len(content)
-        self._sent = 0
+        super().__init__()
+        self._file_index: Optional[int] = None
+        self._file: Optional[BinaryIO] = None
+        self._segments: List[Union[bytes, Path]] = []
+        self._sizes: List[int] = []
+        for segment in segments:
+            if isinstance(segment, bytes):
+                self._segments.append(segment)
+                self._sizes.append(len(segment))
+            elif isinstance(segment, os.PathLike):
+                path = Path(segment)
+                self._segments.append(path)
+                self._sizes.append(path.stat().st_size)
+            else:
+                raise TypeError(
+                    "an upload body segment is bytes or a path, not "
+                    f"{type(segment).__name__}"
+                )
+        #: Total bytes across every segment: the upload's declared length.
+        self.length = sum(self._sizes)
+        self._position = 0
         self._on_progress = on_progress
-        self._chunk_size = chunk_size
         self._report(0)
 
     def _report(self, sent: int) -> None:
         if self._on_progress is None:
             return
         try:
-            self._on_progress(sent, self._total)
+            self._on_progress(sent, self.length)
         except Exception:
             logger.debug("Lighthouse upload progress callback failed", exc_info=True)
 
-    def read(self, size: int = -1) -> bytes:
-        if size is None:
-            size = -1
-        if size is not None and size > self._chunk_size:
-            size = self._chunk_size
-        chunk = super().read(size)
-        if chunk:
-            self._sent += len(chunk)
-            self._report(min(self._sent, self._total))
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        self._check_open()
+        return self._position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self._check_open()
+        if whence == io.SEEK_SET:
+            position = offset
+        elif whence == io.SEEK_CUR:
+            position = self._position + offset
+        elif whence == io.SEEK_END:
+            position = self.length + offset
+        else:
+            raise ValueError(f"invalid whence ({whence})")
+        if position < 0:
+            raise ValueError(f"negative seek position {position}")
+        self._position = position
+        return position
+
+    def read(self, size: Optional[int] = -1) -> bytes:
+        self._check_open()
+        if size is None or size < 0:
+            raise io.UnsupportedOperation(
+                "an UploadBody is read in bounded chunks; pass a size"
+            )
+        wanted = min(size, UPLOAD_CHUNK_BYTES, self.length - self._position)
+        if wanted <= 0:
+            return b""
+        index, offset = self._locate(self._position)
+        wanted = min(wanted, self._sizes[index] - offset)
+        segment = self._segments[index]
+        if isinstance(segment, bytes):
+            chunk = segment[offset : offset + wanted]
+        else:
+            chunk = self._read_file(index, offset, wanted)
+        self._position += len(chunk)
+        self._report(self._position)
         return chunk
+
+    def readinto(self, buffer: Any) -> int:
+        chunk = self.read(len(buffer))
+        buffer[: len(chunk)] = chunk
+        return len(chunk)
+
+    def close(self) -> None:
+        self._close_file()
+        super().close()
+
+    def _check_open(self) -> None:
+        if self.closed:
+            raise ValueError("I/O operation on a closed UploadBody")
+
+    def _locate(self, position: int) -> tuple[int, int]:
+        start = 0
+        for index, size in enumerate(self._sizes):
+            if position < start + size:
+                return index, position - start
+            start += size
+        raise ValueError(f"position {position} is past the body's end")
+
+    def _read_file(self, index: int, offset: int, wanted: int) -> bytes:
+        handle = self._file
+        if handle is None or self._file_index != index:
+            self._close_file()
+            handle = self._file = open(self._segments[index], "rb")
+            self._file_index = index
+        if handle.tell() != offset:
+            handle.seek(offset)
+        chunk = handle.read(wanted)
+        if not chunk:
+            raise ValueError(
+                f"{self._segments[index]} ended at {offset} bytes, short of the "
+                f"{self._sizes[index]} it had when the upload body was made"
+            )
+        return chunk
+
+    def _close_file(self) -> None:
+        if self._file is not None:
+            self._file.close()
+        self._file = None
+        self._file_index = None
+
+
+def _exception_chain(exc: BaseException, limit: int = 8) -> Iterator[BaseException]:
+    """``exc`` and what it was raised from, outermost first.
+
+    Follows ``__cause__``, else ``__context__`` even when suppressed: httpcore
+    re-raises with ``from None``, which would otherwise hide the socket or
+    TLS error underneath.
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen and len(seen) < limit:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def describe_upload_failure(
+    exc: BaseException, *, sent: int, total: int, elapsed: float
+) -> str:
+    """One line naming what an upload failure was and how far it got.
+
+    The type, the errno of the first ``OSError`` underneath it, the HTTP
+    status if the server answered, the body bytes the HTTP stack had taken,
+    the time the request ran, and the exception chain: enough to tell a
+    local TLS failure from a remote reset or refusal. ``OSError: [Errno 0]
+    Error`` alone named none of these (#3662).
+    """
+    chain = list(_exception_chain(exc))
+    errno = next(
+        (link.errno for link in chain if isinstance(link, OSError) and link.errno is not None),
+        None,
+    )
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    cause = " <- ".join(
+        type(link).__name__
+        if type(link).__module__ == "builtins"
+        else f"{type(link).__module__.split('.')[0]}.{type(link).__name__}"
+        for link in chain
+    )
+    return (
+        f"{type(exc).__name__} errno={errno} status={status} "
+        f"bytes_sent={sent}/{total} elapsed={elapsed:.1f}s cause={cause}: {exc}"
+    )
 
 
 class LighthouseGateway:
@@ -327,33 +496,17 @@ class LighthouseRestClient(LighthouseGateway):
         Raises:
             httpx.HTTPStatusError: On API errors
         """
-        client = await self._get_client()
-        file_content = (
-            _ProgressBytesIO(content, on_progress) if on_progress else content
-        )
-        files = {"file": (filename, file_content)}
-
-        response = await client.post(
-            f"{self.UPLOAD_URL}/api/v0/add",
-            headers=self._auth_headers,
-            files=files,
-            params={"tag": tag},
-            timeout=self.transfer_timeout(len(content)),
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        # Normalize: Lighthouse wraps in {"data": {...}} sometimes
-        if isinstance(data, dict) and "data" in data:
-            return data["data"]
-        return data
+        with UploadBody([content], on_progress=on_progress) as body:
+            return await self._post_upload(body, filename=filename, tag=tag)
 
     async def upload_car(
         self,
-        car_bytes: bytes,
+        car_bytes: Optional[bytes] = None,
         tag: str = "kestrel-storage",
         filename: str = "export.car",
         on_progress: Optional[Callable[[int, int], None]] = None,
+        *,
+        body: Optional[UploadBody] = None,
     ) -> Dict[str, Any]:
         """
         Upload CAR (Content Addressable aRchive) file.
@@ -366,26 +519,65 @@ class LighthouseRestClient(LighthouseGateway):
             tag: Tag for organizing uploads
             filename: Name for the uploaded CAR file
             on_progress: Optional callback(bytes_sent, total_bytes)
+            body: The CAR as an ``UploadBody`` instead of ``car_bytes``, for
+                an archive streamed from disk. It reports its own progress
+                and stays open for the caller to close.
 
         Returns:
             Dict with 'Hash' (CID), 'Name', and 'Size' keys
         """
+        if (car_bytes is None) == (body is None):
+            raise TypeError("upload_car takes exactly one of car_bytes or body")
+        if body is None:
+            with UploadBody([car_bytes], on_progress=on_progress) as owned:
+                return await self._post_upload(
+                    owned, filename=filename, tag=tag, content_type=_CAR_CONTENT_TYPE
+                )
+        if on_progress is not None:
+            raise TypeError("an UploadBody reports its own progress; pass on_progress to it")
+        return await self._post_upload(
+            body, filename=filename, tag=tag, content_type=_CAR_CONTENT_TYPE
+        )
+
+    async def _post_upload(
+        self,
+        body: UploadBody,
+        *,
+        filename: str,
+        tag: str,
+        content_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST ``body`` as the multipart ``file`` of ``/api/v0/add``.
+
+        A failure is logged at WARNING with ``describe_upload_failure`` and
+        re-raised.
+        """
         client = await self._get_client()
-        file_content = (
-            _ProgressBytesIO(car_bytes, on_progress) if on_progress else car_bytes
-        )
-        files = {"file": (filename, file_content, "application/vnd.ipld.car")}
-
-        response = await client.post(
-            f"{self.UPLOAD_URL}/api/v0/add",
-            headers=self._auth_headers,
-            files=files,
-            params={"tag": tag},
-            timeout=self.transfer_timeout(len(car_bytes)),
-        )
-        response.raise_for_status()
-
-        data = response.json()
+        file_field = (filename, body) if content_type is None else (filename, body, content_type)
+        started = time.monotonic()
+        try:
+            response = await client.post(
+                f"{self.UPLOAD_URL}/api/v0/add",
+                headers=self._auth_headers,
+                files={"file": file_field},
+                params={"tag": tag},
+                timeout=self.transfer_timeout(body.length),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            logger.warning(
+                "Lighthouse upload of %s failed: %s",
+                filename,
+                describe_upload_failure(
+                    exc,
+                    sent=body.tell(),
+                    total=body.length,
+                    elapsed=time.monotonic() - started,
+                ),
+            )
+            raise
+        # Normalize: Lighthouse wraps in {"data": {...}} sometimes
         if isinstance(data, dict) and "data" in data:
             return data["data"]
         return data

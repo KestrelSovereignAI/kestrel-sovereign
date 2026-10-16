@@ -70,6 +70,7 @@ from kestrel_sovereign.storage.providers.lighthouse_provider import (
     resolve_lighthouse_storage,
 )
 from kestrel_sovereign.storage.providers.lighthouse_rest import (
+    UPLOAD_CHUNK_BYTES,
     LighthouseDownloadLimitError,
 )
 from kestrel_sovereign.paths import spawned_agent_env
@@ -232,8 +233,12 @@ class _LighthouseClient:
             await self.account.after_upload()
         return {"Hash": record["cid"], "Name": filename, "Size": str(len(content))}
 
-    async def upload_car(self, car_bytes, tag="kestrel-storage", filename="export.car",
-                         on_progress=None):
+    async def upload_car(self, car_bytes=None, tag="kestrel-storage", filename="export.car",
+                         on_progress=None, *, body=None):
+        if body is not None:
+            # The snapshot target streams its CAR as an UploadBody (#3662).
+            body.seek(0)
+            car_bytes = b"".join(iter(lambda: body.read(UPLOAD_CHUNK_BYTES), b""))
         return await self.upload(car_bytes, filename, tag, on_progress)
 
     async def get_uploads(self, last_key=None):
