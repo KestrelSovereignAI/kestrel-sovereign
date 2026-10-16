@@ -13,14 +13,16 @@ Write to all configured targets. Restore from most trusted.
 
 import logging
 import os
+import shutil
 import sqlite3
 import tempfile
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Iterator, Optional
 
 from kestrel_sovereign.storage.sync.retention import RetentionPolicy
 
@@ -54,37 +56,47 @@ TIER_LABELS = {
 }
 
 
+@contextmanager
+def _consistent_snapshot_file(db_path: Path) -> Iterator[Path]:
+    """A consistent snapshot of ``db_path`` in a temporary file, removed on exit.
+
+    Uses sqlite3.backup(), so it is safe while the database is in use with an
+    active WAL. Falls back to a raw copy of the file if backup fails (e.g.
+    not a SQLite DB). A caller that streams the file never holds the snapshot
+    in memory.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        try:
+            src = sqlite3.connect(str(db_path))
+            try:
+                dst = sqlite3.connect(str(tmp_path))
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+        except sqlite3.DatabaseError:
+            logger.debug(f"sqlite3.backup() failed for {db_path}, using a raw copy")
+            shutil.copyfile(db_path, tmp_path)
+        yield tmp_path
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _create_consistent_snapshot(db_path: Path) -> bytes:
     """Create a consistent snapshot using sqlite3.backup().
 
     Safe to call while the database is in use with an active WAL.
     Falls back to raw file read if backup fails (e.g. not a SQLite DB).
     """
-    tmp_path = None
-    try:
-        src = sqlite3.connect(str(db_path))
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-                tmp_path = tmp.name
-            dst = sqlite3.connect(tmp_path)
-            try:
-                src.backup(dst)
-            finally:
-                dst.close()
-            with open(tmp_path, "rb") as f:
-                return f.read()
-        finally:
-            src.close()
-    except sqlite3.DatabaseError:
-        logger.debug(f"sqlite3.backup() failed for {db_path}, using raw read")
-        with open(db_path, "rb") as f:
-            return f.read()
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    with _consistent_snapshot_file(db_path) as snapshot_path:
+        return snapshot_path.read_bytes()
 
 
 #: The kinds of sync target this package ships. A target's ``kind`` is the
@@ -201,7 +213,7 @@ class SyncTarget(ABC):
 # Re-export provider classes for backward compatibility.
 #
 # All imports below are lazy — the individual provider modules import
-# from *this* file (SyncTarget, SyncResult, TrustTier, _create_consistent_snapshot)
+# from *this* file (SyncTarget, SyncResult, TrustTier, the snapshot helpers)
 # so there is no circular dependency.
 # ---------------------------------------------------------------------------
 
@@ -222,6 +234,7 @@ __all__ = [
     "TIER_LABELS",
     "SyncResult",
     "SyncTarget",
+    "_consistent_snapshot_file",
     "_create_consistent_snapshot",
     "DataClass",
     "RetentionItem",
