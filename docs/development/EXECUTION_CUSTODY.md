@@ -919,7 +919,11 @@ unknown/committed receipts still fence readiness and remain available at shutdow
 
 A pure, originally scoped scheduler occurrence denial retires that occurrence,
 not the shared host. The runner retains at most 32 original receipts without
-reauthorizing an expired claim. Runtime/unscoped denial, native close debt and
+reauthorizing an expired claim. Localization requires the exact scopes minted
+by that original occurrence and its actual runner, not a shared fence class,
+an inherited scope, or another admission on the same runner. Later observers
+may retain the same already-proven receipt after its context has reset.
+Runtime/unscoped denial, native close debt and
 committed/unknown outcomes still latch host readiness failure. After-commit
 callbacks preserve that committed distinction across explicit cancellation
 causes and exception groups; ordinary reporting errors remain nonfatal.

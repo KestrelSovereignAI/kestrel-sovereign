@@ -526,6 +526,8 @@ class _LeaseRenewalState(ConfirmedLeaseDeadline):
     stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
     stop_owner: Optional[Callable[[], Awaitable[None]]] = None
     custody: tuple = ()
+    occurrence_owner: object | None = None
+    occurrence_scopes: tuple = ()
     backend_type: str = field(default="postgres", init=False)
 
     async def lock_and_validate(self, connection: Any) -> None:
@@ -1243,6 +1245,7 @@ class SchedulerRunner:
         self._readiness_failure: Optional[BaseException] = None
         self._execution_control_error: Optional[BaseException] = None
         self._occurrence_control_receipts: list[BaseException] = []
+        self._occurrence_control_scopes: dict[int, tuple] = {}
         self._schema_provenance: Optional[str] = None
         # ``_task`` owns the supervisor; ``_worker_task`` is the replaceable
         # polling loop it watches.  A dead worker must never become an
@@ -1372,10 +1375,18 @@ class SchedulerRunner:
             return "executing"
         return "running"
 
-    def _latch_protocol_failure(self, error: BaseException) -> None:
+    def _latch_protocol_failure(
+        self, error: BaseException, *, occurrence_state: _LeaseRenewalState | None = None,
+    ) -> None:
         """Retain local denials; latch host-wide safety failures."""
 
         denied = execution_denial_scopes(error)
+        state = occurrence_state if occurrence_state is not None else _rollout_renewal_state.get()
+        owned_scopes = (
+            state.occurrence_scopes
+            if state is not None and state.occurrence_owner is self else ()
+        )
+        previous_scopes = self._occurrence_control_scopes.get(id(error), ())
         if (
             denied is not None
             and not execution_cleanup_debts(error)
@@ -1383,14 +1394,27 @@ class SchedulerRunner:
                 type(scope.fence) in (_LeaseRenewalState, _SchedulerEffectFence)
                 for scope in denied
             )
+            and (
+                all(scope in owned_scopes for scope in denied)
+                or (
+                    any(error is receipt for receipt in self._occurrence_control_receipts)
+                    and all(scope in previous_scopes for scope in denied)
+                )
+            )
         ):
-            # Only an original typed occurrence ended. Keep its exact denial
+            # Only THIS original occurrence ended: a fence's type or a scope
+            # inherited from a different admission is not provenance. A later
+            # observer can retain the same already-proven scopes, but a later
+            # aggregation adding a foreign denial is not the same evidence.
+            # Keep its exact denial
             # without turning one expired claim into an all-tenant outage.
             # Commit carriers, unscoped/runtime denial and physical close
             # debt are deliberately excluded from this local classification.
             receipts = vars(self).setdefault("_occurrence_control_receipts", [])
             if len(receipts) < 32 and not any(error is receipt for receipt in receipts):
-                receipts.append(retained_execution_error(error))
+                retained = retained_execution_error(error)
+                receipts.append(retained)
+                self._occurrence_control_scopes[id(retained)] = tuple(denied)
             return
         if is_execution_control_error(error):
             self._execution_control_error = execution_terminal_error(
@@ -2518,9 +2542,13 @@ class SchedulerRunner:
                         renewal_state.is_live
                         if renewal_state is not None else None
                     ),
-                )):
+                )) as effect_scope:
                     if renewal_state is not None:
                         renewal_state.custody = current_execution_custody()
+                        if renewal_state.occurrence_owner is self:
+                            renewal_state.occurrence_scopes = (
+                                *renewal_state.occurrence_scopes, effect_scope,
+                            )
                     try:
                         yield
                     finally:
@@ -3402,6 +3430,7 @@ class SchedulerRunner:
         )
         renewal_state = _LeaseRenewalState(
             confirmed_deadline=self._live_claim_deadlines.get(task.claim_execution_id),
+            occurrence_owner=self,
         )
         rollout_token = _rollout_renewal_state.set(renewal_state)
         deadline_watch = None
@@ -3629,7 +3658,11 @@ class SchedulerRunner:
                 bind_execution_custody(renewal_state)
                 if self._database_backend_type() == "postgres"
                 else nullcontext()
-            ):
+            ) as occurrence_scope:
+                if occurrence_scope is not None:
+                    renewal_state.occurrence_scopes = (
+                        *renewal_state.occurrence_scopes, occurrence_scope,
+                    )
                 completed, _ = await self._run_dispatch_while_lease_live(
                     prepare_and_dispatch, execution, renewal_state
                 )
@@ -3721,7 +3754,7 @@ class SchedulerRunner:
             terminal = execution_terminal_error(*retirement_errors)
             if terminal is not None:
                 if is_execution_control_error(terminal):
-                    self._latch_protocol_failure(terminal)
+                    self._latch_protocol_failure(terminal, occurrence_state=renewal_state)
                 raise terminal
 
     def _prepared_executor_method(self) -> Optional[Callable[[SchedulerExecution], Any]]:
