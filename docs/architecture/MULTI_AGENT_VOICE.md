@@ -199,6 +199,24 @@ These are local PCM guarantees, **not** a claim that JSON response filtering or
 an input-clear ACK fences the separate WebRTC RTP stream. The strict framed
 provider profile and end-to-end native input/output verification remain pending.
 
+### Capture generation boundary (component API)
+
+`capture.reset()` requests a new local microphone generation. The capture
+worklet discards its old partial PCM frame and resampling offset; the main
+owner rejects already queued or delayed frames from an older generation.
+`onchunk` keeps its existing PCM first argument and adds original-generation
+metadata as an optional second argument. Reset keeps the same stream and
+tracks, including when requested through `onAcquire` before worklet setup.
+
+The returned generation is a **request token, not an acknowledgement or work
+authority**. Only a matching actual native PCM frame demonstrates that the
+processor crossed that boundary. A controlled transform unit proves old
+partial samples are absent; real browser tests delay/replay an original native
+frame, require its exclusion, and require fresh non-silent PCM from the same
+still-live microphone. Ordinary VAD must not request a capture reset and lose
+the fresh utterance prefix. Strict Stop/typed-input transport integration and
+the separate provider input-clear acknowledgement barrier remain pending.
+
 ## Appendix — source map
 
 **Frontend (kestrel-sovereign):**

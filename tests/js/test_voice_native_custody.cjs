@@ -289,6 +289,67 @@ test('native WebSocket typed replacement clears actual playback without closing 
   }, '{"persisted":true}', { autoStart: false, transport: 'websocket' });
 });
 
+for (const early of [false, true]) {
+test(`native microphone reset excludes a delayed original frame and preserves fresh PCM (early=${early})`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    try {
+      await page.evaluate(async early => {
+        const NativeNode = window.AudioWorkletNode;
+        window.AudioWorkletNode = class extends NativeNode {
+          constructor(...args) {
+            super(...args);
+            if (args[1] === 'kestrel-capture') window.originalCaptureNode = this;
+          }
+        };
+        const { createVoiceCapture } = await import('/js/voice/capture.js');
+        window.captureProof = await createVoiceCapture({ onAcquire: owner => {
+          if (early) { owner.reset(); owner.reset(); }
+        } });
+        window.originalProofMic = window.captureProof.micStream;
+        window.capturedProofFrames = [];
+        window.captureProof.onchunk((pcm, metadata) => window.capturedProofFrames.push({
+          generation: metadata?.generation,
+          nonzero: [...new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2)].some(sample => sample !== 0),
+        }));
+        // Delay ONE ACTUAL native MessageEvent/PCM frame, not a fabricated
+        // frame or completion. Replay its original delivery after reset.
+        window.originalCaptureDelivery = window.originalCaptureNode.port.onmessage;
+        window.originalCaptureNode.port.onmessage = event => {
+          if (event.data?.type === 'chunk' && !window.delayedOriginalFrame) {
+            window.delayedOriginalFrame = event;
+            return;
+          }
+          window.originalCaptureDelivery(event);
+        };
+      }, early);
+      await page.waitForFunction(() => !!window.delayedOriginalFrame);
+      assert.equal(await page.evaluate(() => window.delayedOriginalFrame.data.generation), early ? 2 : 0,
+        'latest reset requested before worklet creation was not delivered');
+      await page.evaluate(() => {
+        window.capturedProofFrames = [];
+        window.requestedCaptureGeneration = window.captureProof.reset();
+      });
+      await page.waitForFunction(() => window.capturedProofFrames.some(frame =>
+        frame.generation === window.requestedCaptureGeneration && frame.nonzero));
+      const state = await page.evaluate(() => {
+        const before = window.capturedProofFrames.length;
+        window.originalCaptureDelivery(window.delayedOriginalFrame);
+        return { before, after: window.capturedProofFrames.length,
+          generations: window.capturedProofFrames.map(frame => frame.generation),
+          requested: window.requestedCaptureGeneration,
+          sameMic: window.captureProof.micStream === window.originalProofMic,
+          tracks: window.originalProofMic.getTracks().map(track => track.readyState) };
+      });
+      assert.equal(state.after, state.before, 'delayed original native microphone frame crossed reset');
+      assert.ok(state.generations.length && state.generations.every(generation => generation === state.requested));
+      assert.ok(state.sameMic && state.tracks.every(state => state === 'live'));
+    } finally {
+      await page.evaluate(() => window.captureProof?.destroy());
+    }
+  }, '{}', { autoStart: false });
+});
+}
+
 test('native WebRTC buffered old input commit cannot reopen pre-ID cancellation', { timeout: 30000 }, async () => {
   await nativeVoice(async ({ page }) => {
     await page.evaluate(() => {
