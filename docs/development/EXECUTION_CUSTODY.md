@@ -1005,6 +1005,18 @@ successful close cannot acknowledge their debt. The original caller owns this
 drain without an extra all-resource collector Task. Local SQLite constructor/
 closer fault tests cover these contracts, not live server READY publication or
 hosted Workflow acceptance.
+Failed host-feature stop/control hooks and unsafe declarative teardown retain
+the same feature and original error in that context-owned inventory, rather
+than treating contribution deactivation as successful retirement. Stop retries
+and context cleanup report that error without replaying the failed hook; a new
+feature-start epoch
+is rejected before contribution activation. Independent peers and databases
+still receive their cleanup attempts before the retained error propagates.
+Operation-qualified entries distinguish a feature's failed stop hook from its
+independent database close even when both belong to the same object. Ordinary
+optional imperative-hook failures keep their logged compatibility behavior.
+Native PostgreSQL acknowledgement-loss and actual SQLite-close tests cover
+these failed-hook retries, not concurrent lifecycle coordinators or live READY.
 
 Admission-gate release is an in-memory Condition operation owned by the original
 caller, not a newly admitted cleanup Task. Cancellation can retry only lock

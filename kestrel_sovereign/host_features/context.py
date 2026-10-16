@@ -158,7 +158,7 @@ class SovereignHostContext:
         self._hold_evidence_db = hold_evidence_db
         self._hold_boot_state = tuple(hold_boot_state)
         self._backend_error = str(backend_error or "")
-        self._native_close_owners: dict[int, _HostCloseOwner] = {}
+        self._native_close_owners: dict[object, _HostCloseOwner] = {}
 
     @property
     def db(self) -> Any:
@@ -232,13 +232,41 @@ class _HostCloseOwner:
     closed: bool = False
 
 
+def _host_close_owners(context: Any) -> dict[object, _HostCloseOwner]:
+    """One context-owned inventory for original resource retirement failures."""
+    owners = getattr(context, "_native_close_owners", None)
+    if owners is None:
+        owners = context._native_close_owners = {}
+    return owners
+
+
+def _retain_host_cleanup_failure(
+    context: Any, resource: Any, error: BaseException, *, operation: str,
+) -> None:
+    # A feature may also be a database resource. Operation-qualified keys must
+    # not confuse its failed stop hook with the independent resource.close.
+    record = _host_close_owners(context).setdefault(
+        (operation, id(resource)), _HostCloseOwner(resource)
+    )
+    record.error = execution_terminal_error(
+        record.error, error, retain_originals=True
+    )
+
+
+def _retained_host_cleanup_error(context: Any) -> BaseException | None:
+    return execution_terminal_error(
+        *(record.error for record in _host_close_owners(context).values()),
+        retain_originals=True,
+    )
+
+
 async def _close_partial_host_resources(
     session_factory: Optional[FleetSessionFactory],
     hold_evidence_db: Any,
     hold_db: Any,
     db: Any,
     *,
-    owners: dict[int, _HostCloseOwner],
+    owners: dict[object, _HostCloseOwner],
     prior_error: BaseException | None = None,
 ) -> None:
     """Retire each ORIGINAL resource independently, retaining native failures.
@@ -286,7 +314,9 @@ async def _close_partial_host_resources(
                 record.error._kestrel_native_retirement_debts = (
                     (resource, record.task),
                 )
-            errors.append(record.error)
+    # Feature stop and declarative rollback share this SAME inventory. Closing
+    # their independent databases cannot acknowledge an earlier failed hook.
+    errors.extend(record.error for record in owners.values())
     if any(error is not None for error in errors):
         raise execution_terminal_error(
             prior_error, *errors, retain_originals=True, prefer_cancellation=True
@@ -299,7 +329,7 @@ async def _finish_partial_host_cleanup(
     hold_db: Any,
     db: Any,
     *,
-    owners: dict[int, _HostCloseOwner] | None = None,
+    owners: dict[object, _HostCloseOwner] | None = None,
     prior_error: BaseException | None = None,
 ) -> None:
     """The original caller joins each resource, including repeated Stop."""
@@ -318,9 +348,7 @@ async def close_host_context_resources(context: Any) -> None:
 
     if context is None:
         return
-    owners = getattr(context, "_native_close_owners", None)
-    if owners is None:
-        owners = context._native_close_owners = {}
+    owners = _host_close_owners(context)
     await _finish_partial_host_cleanup(
         getattr(context, "session_factory", None),
         getattr(context, "hold_evidence_db", None),

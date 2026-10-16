@@ -16,7 +16,6 @@ from typing import Any, List
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-
 from kestrel_sdk.features.host_base import HostFeature
 
 from kestrel_sovereign.execution_custody import (
@@ -32,6 +31,11 @@ from kestrel_sovereign.operator import OperatorRuntimeRegistry
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
 
+from .context import (
+    _host_close_owners,
+    _retain_host_cleanup_failure,
+    _retained_host_cleanup_error,
+)
 from .start_order import order_host_features_for_start
 from .ui import compute_host_ui_manifest, host_feature_static_mounts
 
@@ -194,6 +198,11 @@ async def start_host_features(
     Typed collection failures likewise remain fatal at this host boundary;
     their sanitized wrapper crosses intact with the original failure chained.
     """
+    # A stopped contribution is not proof that its native hook retired. Do not
+    # activate a new epoch over the original context's unresolved receipt.
+    prior_failure = _retained_host_cleanup_error(ctx)
+    if prior_failure is not None:
+        raise prior_failure
     runtime = _host_contribution_runtime(ctx)
     transition = runtime.prepare_transition(features)
     for rejection in transition.rejected:
@@ -328,19 +337,25 @@ async def _retire_host_features(features, ctx, runtime, *, deactivate_first=Fals
     contract. Native control and unsafe declarative rollback failures are
     returned as ORIGINAL carriers, never consumed as warning strings.
     """
-    errors = []
+    owners = _host_close_owners(ctx)
     for feature in features:
 
         async def stop():
+            if ("host-feature-stop", id(feature)) in owners:
+                return
             try:
                 await feature.on_host_stop(ctx)
             except BaseException as error:
                 logger.warning("Host feature %s stop failed: %s", feature, error)
                 if _host_control_failure(error):
-                    errors.append(error)
+                    # Retain the original resource/error BEFORE deactivation
+                    # can remove its contribution and a repeat can skip it.
+                    _retain_host_cleanup_failure(
+                        ctx, feature, error, operation="host-feature-stop"
+                    )
 
         def deactivate():
-            if runtime is None:
+            if runtime is None or ("host-feature-deactivate", id(feature)) in owners:
                 return
             try:
                 runtime.deactivate(feature)
@@ -348,14 +363,19 @@ async def _retire_host_features(features, ctx, runtime, *, deactivate_first=Fals
                 logger.warning(
                     "Host feature %s declarative teardown failed: %s", feature, error
                 )
-                errors.append(error)
+                _retain_host_cleanup_failure(
+                    ctx, feature, error, operation="host-feature-deactivate"
+                )
 
         if deactivate_first:
             deactivate()
         await stop()
         if not deactivate_first:
             deactivate()
-    return errors
+    # Do this AFTER every independent peer, including when none are active on
+    # a repeat. Never replay an uncertain original hook merely to recover it.
+    failure = _retained_host_cleanup_error(ctx)
+    return [] if failure is None else [failure]
 
 
 async def _rollback_started_host_features(
