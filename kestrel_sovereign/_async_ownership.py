@@ -136,6 +136,23 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     return task
 
 
+def pending_owned_retirement_error(resource, tasks, *, message):
+    """Retain actual unfinished original owners, never a retirement ACK.
+
+    A bounded drain may return control, but its resource and exact Tasks
+    remain owned until physical completion. No Task is cancelled, replaced,
+    or marked complete by this snapshot.
+    """
+    pending = tuple(dict.fromkeys(task for task in tasks if not task.done()))
+    if not pending:
+        return None
+    error = TimeoutError(message)
+    error._kestrel_native_retirement_debts = tuple(
+        (resource, task) for task in pending
+    )
+    return error
+
+
 async def gather_owned(operations):
     """Join a fan-out, cancelling siblings on failure without losing receipts."""
     from kestrel_sovereign.execution_custody import (

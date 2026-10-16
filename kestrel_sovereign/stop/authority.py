@@ -13,6 +13,7 @@ from typing import Any
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     owned_task_error,
+    pending_owned_retirement_error,
     raise_owned_outcome,
 )
 from kestrel_sovereign.agent.invocation import validate_invocation_id
@@ -168,54 +169,54 @@ class StopCleanupRegistry:
         *,
         timeout_seconds: float = DEFAULT_STOP_CLEANUP_DRAIN_TIMEOUT_SECONDS,
     ) -> None:
-        """Join every retained cleanup tail, bounded, before teardown."""
-
-        pending_cancellation: asyncio.CancelledError | None = None
+        """Join retained tails within one budget; pending is not retirement."""
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds < 0
+        ):
+            raise ValueError("Stop cleanup drain timeout must be finite and nonnegative")
+        withdrawal = None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
         while self._tasks:
             task = next(iter(self._tasks))
-            remaining = deadline - loop.time()
-            if remaining > 0 and not task.done():
-                # The bound has to be owned the same way the join is: drain
-                # deliberately SURVIVES cancellation of its caller (teardown
-                # must not be interruptible), so waiting on a bare
-                # asyncio.wait here would hand that back. Wait on an owned
-                # waiter instead -- it settles when the tail finishes or the
-                # budget expires, whichever comes first, and caller
-                # cancellation is still absorbed and re-raised at the end.
-                async def _bounded_wait(
-                    tail: asyncio.Task[StopOutcome] = task,
-                    budget: float = remaining,
-                ) -> None:
-                    await asyncio.wait({tail}, timeout=budget)
-
-                waiter = asyncio.create_task(
-                    _bounded_wait(), name="stop-cleanup-drain-bound"
-                )
-                waited = await await_owned_task(waiter, pending_cancellation)
-                if pending_cancellation is None:
-                    pending_cancellation = waited.cancellation
+            # Wait in this ORIGINAL drain, never a fresh collector. Observer
+            # withdrawal cannot cancel its registry-owned native tail.
+            while not task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait({task}, timeout=remaining)
+                except asyncio.CancelledError as error:
+                    withdrawal = execution_terminal_error(
+                        withdrawal, error, retain_originals=True,
+                    )
             if not task.done():
-                # Abandon, do not cancel: `retain` installed a done-callback
-                # that consumes each outcome, so an abandoned tail stays owned
-                # and cannot surface as a never-retrieved exception.
                 logger.warning(
                     "Stop cleanup drain timed out after %.1fs with %d tail(s) "
-                    "still running; releasing teardown",
-                    timeout_seconds,
-                    len(self._tasks),
+                    "still running; retaining original retirement ownership",
+                    timeout_seconds, len(self._tasks),
                 )
                 break
-            outcome = await await_owned_task(task, pending_cancellation)
+            outcome = await await_owned_task(task)
             if outcome.error is not None and is_execution_control_error(outcome.error):
-                self._terminal_error = execution_terminal_error(self._terminal_error, outcome.error)
-            if pending_cancellation is None:
-                pending_cancellation = outcome.cancellation
-            # The callback normally removes completed work. Discard explicitly
-            # as well so drain does not depend on callback scheduling order.
+                self._terminal_error = execution_terminal_error(
+                    self._terminal_error, outcome.error, retain_originals=True,
+                )
+            withdrawal = execution_terminal_error(
+                withdrawal, outcome.cancellation, retain_originals=True,
+            )
             self._tasks.discard(task)
-        terminal = execution_terminal_error(self._terminal_error, pending_cancellation)
+        pending = pending_owned_retirement_error(
+            self, self._tasks,
+            message="Stop cleanup drain still owns unfinished original tails",
+        )
+        terminal = execution_terminal_error(
+            self._terminal_error, pending, withdrawal, retain_originals=True,
+        )
         if terminal is not None:
             raise terminal
 

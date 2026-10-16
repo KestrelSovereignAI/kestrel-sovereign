@@ -24,6 +24,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
     owned_task_error,
+    pending_owned_retirement_error,
     raise_owned_outcome,
 )
 from kestrel_sovereign.agent.invocation import (
@@ -1833,11 +1834,20 @@ class DistributedInvocationRegistry:
                 for owner_id in owner_ids
             )
         )
-        self._active.clear()
-        self._by_local_generation.clear()
-        self._cleanup_keys.clear()
-        self._completing_generation_ids.clear()
-        self._require_terminal_control()
+        pending = pending_owned_retirement_error(
+            self, (*self._registration_tasks, *self._cleanup_tasks),
+            message="Distributed Stop close still owns unfinished native settlement",
+        )
+        if pending is None:
+            self._active.clear()
+            self._by_local_generation.clear()
+            self._cleanup_keys.clear()
+            self._completing_generation_ids.clear()
+        terminal = execution_terminal_error(
+            self._terminal_control, pending, retain_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
 
 
 __all__ = [

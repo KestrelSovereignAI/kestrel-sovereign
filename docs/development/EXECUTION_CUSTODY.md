@@ -1050,6 +1050,20 @@ then refuses its original backend closer; successful independent storage
 closure is tested separately. Neither case claims a scheduled cognition or
 server READY result.
 
+Bounded Stop cleanup is not a physical-retirement acknowledgement. Cooperative
+tail drains and distributed invocation closure raise an explicit pending-owner
+timeout when their budget expires with original Tasks still unfinished. The
+receipt retains the original registry and exact Tasks without cancelling them;
+server teardown therefore keeps the registry and blocks dependent retirement.
+Distributed closure still attempts independent owner abandonment, but does not
+erase local generation bookkeeping while original settlement remains live.
+Later joins preserve any actual native COMMIT/retirement failure rather than
+replacing it with the earlier timeout. Cooperative drain budgets are finite
+and nonnegative, and observer withdrawal is handled in the original drain
+without allocating a replacement collector. Native proofs hold PostgreSQL
+acknowledgements after real COMMIT through all three server registry-close
+paths; they do not establish full startup, scheduled cognition or READY.
+
 Health's database deadline checks original control evidence on the timeout
 carrier before producing a diagnostic. Native PostgreSQL health-query tests
 hold the original authority-transaction COMMIT acknowledgement through actual
