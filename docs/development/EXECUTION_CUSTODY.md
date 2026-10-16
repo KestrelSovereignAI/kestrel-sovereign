@@ -951,6 +951,11 @@ selection retains both the original admission failure and any stronger native
 commit/cleanup receipt. A scheduled blocking worker with real PostgreSQL
 COMMIT-acknowledgement loss exercises the original copied custody and physical
 join; it does not establish full Agent startup, genesis or READY.
+The same admission failure remains infrastructure failure even when the
+original worker settles without a typed native receipt. The existing readiness
+latch prevents preparation or dispatch catches from rewriting the executing
+marker into an ordinary failed target result. Original errors are propagated
+without relabelling an observer allocation problem as missing target features.
 Embedding-width diagnostics likewise propagate original database control rather
 than treating authority/ACK loss as unavailable recall metadata.
 

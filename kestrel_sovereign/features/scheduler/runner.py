@@ -3629,7 +3629,7 @@ class SchedulerRunner:
                                     e,
                                 )
                             except Exception as e:
-                                if is_execution_control_error(e):
+                                if is_execution_control_error(e) or self._readiness_failure is not None:
                                     # Keep the pre-dispatch executing marker and
                                     # occurrence identity for reconciliation. A lost
                                     # acknowledgement is not a terminal task failure.
@@ -3706,7 +3706,7 @@ class SchedulerRunner:
                 await self._mark_effect_started(task, execution, preparation_deferred=True)
             return
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_execution_control_error(error) or self._readiness_failure is not None:
                 self._latch_protocol_failure(error)
                 logger.error("Scheduler execution %s requires authority/commit reconciliation: %s", execution.id, error)
                 return
@@ -3992,14 +3992,19 @@ class SchedulerRunner:
             invoke_dispatch(), name=f"scheduler-effect:{execution.id}", retain_originals=True,
         )
         lease_lost = None
+        watcher_admission_failure = None
         try:
             # Admission of the watcher can fail after this ORIGINAL effect
             # entered native I/O. Its admission belongs inside the physical
             # join boundary; canonical admission also closes refused coros.
-            lease_lost = create_owned_task(
-                renewal_state.lost.wait(), name=f"scheduler-lease-watch:{execution.id}",
-                retain_originals=True,
-            )
+            try:
+                lease_lost = create_owned_task(
+                    renewal_state.lost.wait(), name=f"scheduler-lease-watch:{execution.id}",
+                    retain_originals=True,
+                )
+            except BaseException as error:
+                watcher_admission_failure = error
+                raise
             await asyncio.wait(
                 {effect, lease_lost}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -4049,6 +4054,13 @@ class SchedulerRunner:
                 lease_error, lease_cancellation, retain_originals=True,
             )
             if terminal is not None and is_execution_control_error(terminal):
+                self._latch_protocol_failure(terminal)
+                raise terminal
+            if isinstance(watcher_admission_failure, Exception) and terminal is not None:
+                # An infrastructure observer could not start. Even if the
+                # original effect retired without a typed native receipt, that
+                # does not prove it never committed an external effect. Keep
+                # the executing marker, not a normalized target-failure row.
                 self._latch_protocol_failure(terminal)
                 raise terminal
             cancellation = effect_outcome.cancellation or lease_cancellation

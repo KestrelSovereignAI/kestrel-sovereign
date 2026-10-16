@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import os
 import threading
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from uuid import uuid4
 
@@ -40,12 +41,14 @@ from tests.unit.test_scheduler_occurrence_liveness import _seed_due
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lost_ack", [False, True])
+@pytest.mark.parametrize("phase", ["preparation", "dispatch"])
 @pytest.mark.skipif(
     not hasattr(asyncio, "eager_task_factory"),
     reason="native eager Tasks require Python 3.12+",
 )
 async def test_refused_lease_watcher_joins_original_native_effect(
-    native_pg, monkeypatch
+    native_pg, monkeypatch, lost_ack, phase
 ):
     backend, observer, schema = native_pg
     db = AsyncDatabase(backend)
@@ -71,7 +74,8 @@ async def test_refused_lease_watcher_joins_original_native_effect(
             assert await asyncio.to_thread(release.wait, 10), (
                 "original test ACK hold expired"
             )
-            raise native_failure
+            if lost_ack:
+                raise native_failure
         return result
 
     async def native_effect():
@@ -96,6 +100,16 @@ async def test_refused_lease_watcher_joins_original_native_effect(
         effects.append(asyncio.current_task())
         states.append(scheduler_module._rollout_renewal_state.get())
         return await run_blocking_operation(lambda: asyncio.run(native_effect()))
+
+    class Prepared:
+        @asynccontextmanager
+        async def prepare_scheduled(self, execution):
+            await executor(execution.task_name, execution.args)
+
+            async def dispatch():
+                pytest.fail("refused preparation watcher admitted a new dispatch")
+
+            yield dispatch
 
     def original_operation(coroutine):
         frame = getattr(coroutine, "cr_frame", None)
@@ -139,7 +153,9 @@ async def test_refused_lease_watcher_joins_original_native_effect(
         )
 
     await _activate_protocol_for_test_agent(db, did, monkeypatch)
-    runner = SchedulerRunner(db, did, executor, lease_seconds=20)
+    runner = SchedulerRunner(
+        db, did, Prepared() if phase == "preparation" else executor, lease_seconds=20
+    )
     await runner._ensure_tables()
     await db.execute("INSERT INTO effects VALUES (53, 'before original')")
     await _seed_due(db, uuid4().hex, "original-watcher-effect", agent_id=did)
@@ -153,7 +169,9 @@ async def test_refused_lease_watcher_joins_original_native_effect(
         await asyncio.wait_for(refused.wait(), 7)
         loop.set_task_factory(previous)
         await await_owned_task(tick)
-        assert committed.is_set() and len(parents) == 2
+        assert committed.is_set() and len(parents) == (
+            1 if phase == "preparation" else 2
+        )
         assert len(effects) == len(states) == len(workers) == 1
         assert (
             await observer.fetchval(f'SELECT value FROM "{schema}".effects WHERE id=53')
@@ -171,12 +189,25 @@ async def test_refused_lease_watcher_joins_original_native_effect(
         ]
         effect = await asyncio.wait_for(await_owned_task(effects[0]), 5)
         assert all(task.done() for task in [*parents, *effects, *workers])
-        assert execution_commit_outcome(effect.error) == "unknown"
-        assert execution_commit_outcome(parents_outcomes[-1].error) == "unknown"
-        assert carries(parents_outcomes[-1].error, original)
-        assert carries(parents_outcomes[-1].error, native_failure)
         assert runner.readiness_failure is not None
-        assert execution_commit_outcome(runner.readiness_failure) == "unknown"
+        if lost_ack:
+            assert execution_commit_outcome(effect.error) == "unknown"
+            if phase == "dispatch":
+                assert execution_commit_outcome(parents_outcomes[-1].error) == "unknown"
+            assert carries(runner.readiness_failure, original)
+            assert carries(runner.readiness_failure, native_failure)
+            assert execution_commit_outcome(runner.readiness_failure) == "unknown"
+        else:
+            # An ordinary infrastructure admission failure is not a target
+            # failure or proof that this already-committed effect did not run.
+            assert carries(runner.readiness_failure, original)
+        assert (
+            await observer.fetchval(
+                f'SELECT status FROM "{schema}".task_execution_log WHERE agent_id=$1',
+                did,
+            )
+            == "executing"
+        )
         assert all(
             inspect.getcoroutinestate(op) == inspect.CORO_CLOSED
             for pair in refusals
@@ -195,5 +226,5 @@ async def test_refused_lease_watcher_joins_original_native_effect(
         try:
             await runner.stop()
         except BaseException as error:
-            if not is_execution_control_error(error):
+            if error is not original and not is_execution_control_error(error):
                 raise
