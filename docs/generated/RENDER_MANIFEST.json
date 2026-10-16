@@ -4523,7 +4523,8 @@
     },
     {
       "existing_code_refs": [
-        "scripts/ci/throughput_report.py"
+        "scripts/ci/throughput_report.py",
+        "tests/unit/test_host_features.py"
       ],
       "findings": [],
       "missing_code_refs": [],

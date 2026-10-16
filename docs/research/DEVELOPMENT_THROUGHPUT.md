@@ -192,43 +192,241 @@ development host:
 
 ## 4. Experiments
 
-| ID | Hypothesis | Method | Status | Result |
+| ID | Hypothesis | Status | Result |
+|---|---|---|---|
+| E1 | The CI runner has more vCPUs than the 2 xdist workers use | **confirmed** | 4 vCPUs (2 cores × 2 threads). `-n auto` counts physical cores and starts 2 workers. Unit tier: 21.7 min at 2 workers, 14.1 at 4, **10.2 at 8**, with no new failures. |
+| E2 | Splitting the unit tier across 4 runners brings it under 10 minutes | **confirmed** | Split by measured time at 4 workers each: jobs take 4.2–6.5 min, so **~6.5 min wall time**. Exposed three order-dependent tests that must be fixed first. |
+| E3 | A small set of tests dominates the unit tier | **confirmed** | 547 tests (2%) take ≥1 s each and are **52%** of test time; 49 tests take ≥5 s and are 18%. |
+| E4 | The host runs the full unit suite far faster than CI | **confirmed** | 5 min 24 s at `-n 8`; **3 min 53 s at `-n 16`**, all 24,787 tests green. |
+| E5 | The host can run two full test loads at once | **partly** | Two suites at `-n 8`: 7.3 and 7.9 min, one or two load-timeout failures each. Three suites at `-n 6`: 12.5–14.1 min, four to six failures each. |
+| E6 | Parallelizing the integration tier brings it under 10 minutes | proposed (#2794) | |
+| E7 | Auto-merge plus a pre-deploy integration gate removes the post-PR wait without breaking main | needs a policy decision | |
+| E8 | Testing feature repositories against core `main` nightly catches cascade breakage before a release | proposed | |
+
+### E1 — CI worker count
+
+**Method.** On the experiment branch `experiment/ci-throughput`, the
+unit-tier job was copied with different `-n` values and dispatched with
+`workflow_dispatch`. A step printed `nproc`, `lscpu` and psutil's core
+counts. Each comparison ran in the same workflow run as an unchanged copy
+of the baseline job.
+
+**Runner.** AMD EPYC 7763, 4 vCPUs (2 cores × 2 threads), 15 GB.
+`psutil.cpu_count(logical=False)` is 2, and that is what xdist's `auto`
+uses.
+
+| Workers | Unit tier | Failures not caused by the experiment |
+|---|---|---|
+| 2 (`-n auto`, today) | 21 min 44 s | 1: `test_agent_cancellation` timeout |
+| 4 (`-n logical`) | 14 min 08 s | 0 |
+| 8 (`-n 8`) | 10 min 14 s | 0 |
+
+**What it means.** Twice as many workers as vCPUs still helps. The suite
+spends most of its time waiting (timeouts, subprocesses, sleeps, database
+round trips) rather than computing.
+
+| Workers | Summed test time | Wall time | Speedup over serial |
+|---|---|---|---|
+| 2 | 41.5 min | 21.7 min | 1.9× |
+| 4 | 49.3 min | 14.1 min | 3.5× |
+| 8 | 62.3 min | 10.2 min | 6.1× |
+
+Each test slows a little as workers contend for the CPU, but far less than
+the parallelism gained. So `-n 8` is a free, one-line change that roughly
+halves the unit tier. Higher counts are worth measuring next.
+
+### E2 — Sharding the unit tier
+
+**Round 1** split the test files into four groups of equal total file
+size, each run at `-n auto` (2 workers):
+
+| Shard | Tests | Test time | Job time |
+|---|---|---|---|
+| 0 | 6,317 | 5 min 24 s | 6 min |
+| 1 | 6,372 | 6 min 29 s | 7 min |
+| 2 | 6,244 | 8 min 55 s | 10 min |
+| 3 | 6,186 | 5 min 10 s | 5 min |
+
+- **Balance.** File size is a poor stand-in for run time; the slowest shard
+  set the wall time.
+- **Order-dependent tests.** Splitting exposed three tests that depend on
+  test order. `test_server_lifespan_wires_and_closes_host_features[False/True]`
+  and `test_server_retains_control_context_after_optional_mount_failure` (in
+  `tests/unit/test_host_features.py`) need `KESTREL_API_KEY` in the
+  environment but never set it. In a full run they pass only because
+  earlier tests assign `os.environ["KESTREL_API_KEY"]` directly and never
+  restore it: `test_bridge_router_mounted.py`,
+  `test_bridge_stream_error_boundary.py`,
+  `test_feature_route_lifecycle_gate.py` and `test_auth_decision_table.py`.
+  Under xdist this is already a latent flake. It must be fixed before any
+  sharding.
+
+**Round 2** split by measured per-file time (from the E1 JUnit output) and
+ran each shard at `-n logical` (4 workers):
+
+| Shard | Tests | Test time | Job time |
+|---|---|---|---|
+| 0 | 5,208 | 3 min 57 s | 4.8 min |
+| 1 | 6,749 | 5 min 10 s | 6.5 min |
+| 2 | 5,928 | 3 min 06 s | 4.2 min |
+| 3 | 7,235 | 5 min 08 s | 6.4 min |
+
+- **Wall time:** about 6.5 minutes, against 21.7 for today's single job.
+  It uses about 22 runner-minutes, which cost nothing on this public
+  repository.
+- **Failures:** the same three `test_host_features` tests failed again, a
+  second independent reproduction. Nothing else failed.
+- **Balance:** still uneven, because the per-file times came from one run.
+- **Next combination to try:** four shards at `-n 8` each should land near
+  4 minutes.
+
+### E3 — Where the unit tier's time goes
+
+From the CI JUnit output of the 4-worker run (25,195 tests, 49.3 min summed
+test time):
+
+- **Slow tests:** 547 tests (2%) take at least 1 s each, 25.4 min in total
+  (52%). 49 tests take at least 5 s each, 8.8 min in total (18%). The
+  slowest takes 49 s.
+- **Concentration by file:** the top 10 files hold 35% of test time, the
+  top 25 hold 51%, the top 100 hold 79%.
+- **Heaviest files:**
+  - `test_session_training_lifecycle.py` (3.4 min);
+  - `test_generation_gate.py` (2.9);
+  - `test_privacy_mode_durability.py` (2.5);
+  - `test_pytest_coverage_shutdown.py` (1.6 min for 2 tests);
+  - `test_memory_attestation_window.py` (1.5).
+
+These slow tests are also where most of the load-sensitive failures in E5
+come from. Making them coordinate on events rather than durations (#3276)
+would speed the suite up and make it steadier.
+
+### E4 — The full unit suite on the host
+
+Each run was a full `tests/unit` run in its own worktree and virtual
+environment, with the production host and agents running. PostgreSQL cases
+were skipped: 439 skipped locally against 67 in CI.
+
+| Workers | Wall time | Failures | Peak load average |
+|---|---|---|---|
+| 8 | 5 min 24 s | 0 (excluding one docs-generation miss fixed on `main`) | 17 |
+| 16 | 3 min 53 s | 0 | 24 |
+
+Memory was at least 95% free throughout.
+
+### E5 — Concurrent lanes on the host
+
+Each lane was a separate worktree running the full unit suite at once.
+
+| Lanes × workers | Wall time per lane | Failures per lane | Peak load average |
+|---|---|---|---|
+| 1 × 8 | 5 min 24 s | 0 | 17 |
+| 2 × 8 | 7 min 16 s, 7 min 51 s | 2, 1 | 22 |
+| 3 × 6 | 14 min 07 s, 12 min 29 s, 12 min 43 s | 4–6 each | 28 |
+
+- **Which tests failed.** Every failure was a timing test: subprocess-pytest
+  timeouts, watchdog and stall bounds, drain and shutdown tails. None was a
+  logic failure.
+- **Where the limit is.** Memory stayed at least 97% free throughout. The
+  limit is the suite's sensitivity to load: past about 16 workers in total,
+  timing tests start failing.
+- **Implications.** Two full suites at once are tolerable. Three are not:
+  aggregate throughput barely beats running them one after another, and the
+  flake rate makes results unreadable.
+
+So more Talon lanes fit on the host only if each lane runs the tests for its
+own ticket. The full suite belongs either in CI or in a single queued host
+job at `-n 16`, which takes about 4 minutes.
+
+## 5. Platform alternatives
+
+Researched 2026-10-16 against current vendor documentation. The full
+source list is at the end.
+
+**Verdict: stay on GitHub.** What slows us is parallelism inside CI, and
+that can be fixed on GitHub at no cost. No other forge fixes something
+GitHub cannot, and every move would mean rewriting:
+- Talon's GitHub backend;
+- the GitHub feature package and GitHub App;
+- PyPI trusted publishing;
+- release signing.
+
+| Option | What it would fix | Cost | Migration | Main risk |
 |---|---|---|---|---|
-| E1 | The CI runner has more vCPUs than the 2 xdist workers use | Print `nproc` and psutil's core counts on the runner; dispatch the unit tier at `-n logical` and `-n 4` | planned | |
-| E2 | Splitting the unit tier across N runners brings it under 10 minutes | Matrix of N shards behind an aggregator job that keeps the required check name `unit-tests`; dispatch on an experiment branch | planned | |
-| E3 | A small set of files dominates the unit tier's 25 minutes | `--durations` and per-file totals from one run | planned | |
-| E4 | The host runs the full unit suite far faster than CI | Time `tests/unit` at `-n 8`, `-n 16` and `-n 24` on the host | planned | |
-| E5 | The host can run two Talon-sized test loads at once without new flakes | Two concurrent unit suites at `-n 8` each; compare wall time, failure sets and memory pressure with a single run | planned | |
-| E6 | Parallelizing the integration tier brings it under 10 minutes | Per-worker databases for the 151 shared tests (#2794) | proposed (ticket) | |
-| E7 | Auto-merge plus a pre-deploy integration gate removes the post-PR wait without breaking main | Turn on repository auto-merge; agents arm `gh pr merge --auto --match-head-commit <sha>`; run integration as a gate on the deploy SHA | needs a policy decision | |
-| E8 | Testing feature repositories against core `main` nightly catches cascade breakage before a release | Scheduled matrix workflow that installs core `main` with each feature package's `main` | proposed | |
+| More xdist workers and sharding on GitHub's standard runners | Unit tier to ~10 min with no sharding (E1), less with it | $0 on public repositories (Free plan: 20 concurrent jobs; Team: 60) | Low | Bursts of agent PRs queueing for runners |
+| Self-hosted runner on the host | Unit tier ~4 min (E4) | $0 today | Medium | **Fork PRs execute code on the host** if used for the public repository; the host becomes a single point of failure |
+| Buildkite with an agent on the host, GitHub as the forge | Same speed as above; fork builds are off by default | Free for up to 5 users and 10 concurrent self-hosted jobs | Medium | Reports commit statuses, not check runs, so Talon's CI watcher would need to read both |
+| Third-party runners (Ubicloud, Namespace, Blacksmith, WarpBuild, Depot, RunsOn) | Faster hosted runners with no host risk | About $0.001–0.003 per vCPU-minute, not free for public repositories | Low | Vendor churn; a cost where today there is none |
+| GitHub merge queue, Graphite, Mergify, Aviator, Trunk | A main branch that is never broken | $0 (GitHub's own queue on public repositories) to ~$40 per user per month | Low | Adds a CI pass per merge; buys safety, not throughput |
+| GitLab | Merge trains | Premium at $29 per user per month for merge trains | High | Rewrites CI, Talon backend, publishing |
+| Forgejo / Codeberg | Nothing we need | Hosting time | High | PyPI trusted publishing does not support it; no merge queue; Codeberg is for free-software projects |
 
-Each experiment will be written up below with its command, raw numbers and
-conclusion as it completes.
+### Facts that bear on the choice
 
-## 5. Current recommendations
+- **Self-hosted runner fee.** GitHub's proposed per-minute fee for
+  self-hosted runners would apply only to private repositories. It was
+  postponed and had no new date as of mid-2026. Self-hosted runners on
+  public repositories remain free.
+- **Security on public repositories.** GitHub's own guidance is that
+  self-hosted runners should almost never serve public repositories. A fork
+  PR can edit the workflow file, so an `if:` condition is not a security
+  boundary. The real mitigations are:
+  - require approval to run workflows from outside contributors;
+  - ephemeral one-job runners in throwaway VMs with no secrets and no host
+    mounts;
+  - a dedicated runner group.
 
-These are provisional until the experiments report.
+  Tart (now `openai/tart`) and Apple's `container` 1.0 can both run Linux
+  VMs on the host.
+- **New on GitHub in October 2026.**
+  - Stacked pull requests are generally available, and a stack enters the
+    merge queue as one unit.
+  - An asynchronous merge API is generally available.
+  - Both fit agent workflows.
+- **What Actions costs us now.** From the billing API: $39 in August, $34
+  in September, $2 so far in October. The macOS cost from May (#1463) is
+  gone, so cost is not a reason to move.
+- **Reliability.** Actions is GitHub's most incident-prone service. The
+  2026-08-06 outage lasted 10 h 42 min, and some trigger events were lost
+  for good. A gate we run ourselves would be a hedge against this.
 
-1. **Widen the lane.** Raise Talon's `worker_concurrency` to 2, then 3,
-   within whatever E4 and E5 show the host can carry. Narrow each run's local
-   quality check to the tests for that ticket, and leave the full suite to CI.
-   Talon already gives each worktree its own database and warns about
-   overlapping files between parallel branches.
-2. **Shard CI.** Run E1 and E2 for the unit tier, and #2794 for integration.
-   Keep the required check names stable through aggregator jobs, because a
-   renamed required check blocks every PR until branch protection is edited.
-3. **Make merging fire-and-forget.** Enable auto-merge so an agent arms a PR
-   once instead of polling CI (E7).
-4. **Automate the cross-repository cascade.** Add nightly compatibility CI
-   (E8), and open the version-floor bump PRs automatically. Do not
-   consolidate into one monorepo:
-   - the open-source split (#462) keeps public and private code apart;
-   - core must never import feature packages;
-   - the cascade's cost is latency and manual steps, which automation removes.
+## 6. Current recommendations
+
+Updated with the results above.
+
+1. **Raise the unit tier to `-n 8` now** (E1). It is free, needs one line
+   changed, and cuts about 11 minutes from every PR.
+2. **Fix the order-dependent `test_host_features` tests** (E2) and the
+   direct `os.environ` writes that hide them. They are a latent flake today
+   and block sharding.
+3. **Shard both tiers once that is fixed.** Four unit shards split by
+   measured time came to about 6.5 minutes (E2). Parallelize integration
+   too (#2794). Keep the required check names stable through aggregator
+   jobs.
+4. **Widen the lane to two Talon workers, not three** (E5). Each lane runs
+   only its ticket's tests locally, and the full suite runs in CI.
+   Reconsider three lanes after the slow, load-sensitive tests (E3, #3276)
+   are reduced.
+5. **Consider the host as a CI gate, starting with private repositories.**
+   A self-hosted runner, or Buildkite with fork builds off, would bring the
+   unit tier to about 4 minutes. For the public core repository this needs
+   ephemeral VMs and outside-contributor approval, with GitHub-hosted
+   sharding kept as the fallback.
+6. **Make merging fire-and-forget.** Enable auto-merge, or use the new
+   asynchronous merge API (E7).
+7. **Automate the cross-repository cascade** (E8). Do not consolidate into
+   one monorepo.
 
 ## Sources
 
 - [Anthropic Engineering — Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control)
 - [TechSpot coverage](https://www.techspot.com/news/114209-anthropic-ditched-git-own-version-control-system-because.html)
+- [GitHub — 2026 pricing changes for Actions](https://github.com/resources/insights/2026-pricing-changes-for-github-actions); [Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions); [runner pricing](https://docs.github.com/en/billing/reference/actions-runner-pricing)
+- [GitHub — secure use of self-hosted runners](https://docs.github.com/en/actions/reference/security/secure-use); [Actions limits](https://docs.github.com/en/actions/reference/limits)
+- [GitHub changelog — stacked pull requests GA](https://github.blog/changelog/2026-10-06-stacked-pull-requests-generally-available); [async merge API GA](https://github.blog/changelog/2026-10-01-github-async-merge-api-generally-available); [merge queue GA](https://github.blog/changelog/2023-07-12-pull-request-merge-queue-is-now-generally-available)
+- [GitLab merge trains](https://docs.gitlab.com/ci/pipelines/merge_trains); [GitLab pricing](https://about.gitlab.com/pricing)
+- [Forgejo Actions vs GitHub Actions](https://forgejo.org/docs/next/user/actions/github-actions); [PyPI trusted publishers](https://docs.pypi.org/trusted-publishers/adding-a-publisher)
+- [Buildkite pricing](https://buildkite.com/pricing); [Buildkite GitHub integration](https://buildkite.com/docs/pipelines/source-control/github)
+- [Ubicloud](https://www.ubicloud.com/docs/about/pricing), [Namespace](https://namespace.so/pricing), [Blacksmith](https://www.blacksmith.sh/pricing), [WarpBuild](https://www.warpbuild.com/pricing), [Depot](https://depot.dev/pricing), [RunsOn](https://runs-on.com/pricing) pricing pages
+- [Actions outage, 2026-08-06](https://blog.incidenthub.cloud/github-actions-pages-outage-aug-6-2026)
 - Issues: #2794 (integration parallelism), #2795 (runner sizing), #2810 and #3330 (unit-tier budget), #3276 (load-sensitive test tail), #3664 (idle queue)
