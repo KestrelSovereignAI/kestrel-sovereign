@@ -391,6 +391,20 @@ This retention grants no new authority or acknowledgment. Tests use actual
 durable dispatcher/stores and Agent completion methods with native-I/O cognition
 inputs; those inputs are not full Agent genesis/READY or model acceptance.
 
+Public watch, signal-wait and durable-resume admission share that singleton's
+same serialized live operation. A failed or concurrently failing consumer
+cannot acknowledge new work. First-reference validation stays lazy and performs
+one ownership read; if another caller creates/fails the singleton during that
+read, admission still joins the existing original lifetime before writing.
+
+Audit anchoring retains original native control through initialization, anchor
+reads, file/anchor/graph writes, auto-anchoring and response-audit notification.
+It cannot report native retirement/commit control as a missing anchor, hash-only
+fallback, ordinary failed tool, or successful anchor. Ordinary availability
+failures retain their established behavior. Native tests use actual permission
+logs, content-addressed file/graph storage and guarded PostgreSQL with fresh
+disposable data keys; they are not full Agent/model/audit-verdict acceptance.
+
 A2A boot reuses the guarded native storage backend, including DSN-only agents;
 individual stores do not own its pool. Inbound verification/authorization and
 peer tools retain the original runtime throughout the operation. Operational

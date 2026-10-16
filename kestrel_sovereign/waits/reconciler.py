@@ -53,6 +53,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -473,6 +474,19 @@ class WaitReconciler:
 
     # ------------------------------------------------------------------
 
+    @asynccontextmanager
+    async def _live_operation(self):
+        """Serialize admission and delivery in this same original lifetime."""
+        async with self._reconcile_lock:
+            if self._terminal_control is not None:
+                raise self._terminal_control
+            try:
+                yield
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    self._terminal_control = error
+                raise
+
     async def reconcile(self) -> ToolResult:
         """Run one reconcile tick. ACTION — no LLM cost (the COGNITION wake
         comes from the downstream signal, not from this task).
@@ -483,16 +497,9 @@ class WaitReconciler:
         could otherwise both detect the same terminal handle and enqueue a
         duplicate wake before either recorded it pending.
         """
-        async with self._reconcile_lock:
-            if self._terminal_control is not None:
-                raise self._terminal_control
+        async with self._live_operation():
             self._last_reconcile_monotonic = time.monotonic()
-            try:
-                return await self._reconcile_once()
-            except BaseException as error:
-                if is_execution_control_error(error):
-                    self._terminal_control = error
-                raise
+            return await self._reconcile_once()
 
     def seconds_since_last_reconcile(self) -> Optional[float]:
         """Monotonic seconds since the last reconcile tick began, or ``None``
@@ -1575,6 +1582,18 @@ async def _resolve_owned_provider(agent: Any, ref: str) -> Tuple[str, str, Any]:
     return kind, handle, provider
 
 
+async def _registration_lifetime(agent: Any, ref: str):
+    """Validate a first reference without publishing an unusable singleton."""
+    resolved = None
+    if getattr(agent, "_wait_reconciler", None) is None:
+        # No lifetime exists yet. Preserve lazy validation/no state on a bad
+        # first reference, without repeating native ownership reads. Another
+        # caller may build/fail the singleton during this read; the shared
+        # operation guard below still arbitrates admission before any write.
+        resolved = await _resolve_owned_provider(agent, ref)
+    return _get_reconciler(agent), resolved
+
+
 async def register_wait_watch(agent: Any, ref: str) -> None:
     """Register an explicit watch on ``ref`` so the reconciler wakes the agent
     when that handle reaches a terminal state.
@@ -1613,8 +1632,12 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
             ``kind`` with no registered provider, or a handle the named
             provider affirmatively does not own.
     """
-    kind, handle, _provider = await _resolve_owned_provider(agent, ref)
-    await _get_reconciler(agent)._store.start_watch(kind, handle)
+    reconciler, resolved = await _registration_lifetime(agent, ref)
+    async with reconciler._live_operation():
+        kind, handle, _provider = (
+            resolved if resolved is not None else await _resolve_owned_provider(agent, ref)
+        )
+        await reconciler._store.start_watch(kind, handle)
 
 
 class DurableResumeUnsupportedError(ValueError):
@@ -1753,30 +1776,34 @@ async def register_wait_resume_consumer(
             already terminal is unknown, so the caller must not park on it;
             re-registering the same ``consumer_id`` is idempotent.
     """
-    kind, handle, provider = await _resolve_owned_provider(agent, ref)
-    dispatcher = getattr(agent, "dispatcher", None)
-    register = getattr(dispatcher, "register_durable_consumer", None)
-    elided_by = getattr(dispatcher, "durable_payload_elided_by", None)
-    if not callable(register) or not callable(elided_by):
-        raise ValueError(
-            "durable signal delivery unavailable: the agent's dispatcher "
-            "cannot register durable consumers"
+    reconciler, resolved = await _registration_lifetime(agent, ref)
+    async with reconciler._live_operation():
+        kind, handle, provider = (
+            resolved if resolved is not None else await _resolve_owned_provider(agent, ref)
         )
-    storage = require_callback_result(elided_by())
-    if storage is not None:
-        raise DurableResumeUnsupportedError(f"{kind}:{handle}", storage)
-    registration = DurableConsumerRegistration(
-        consumer_id=consumer_id,
-        source=wake_source(provider),
-        agent_id=str(getattr(agent, "did", None) or ""),
-        correlation_selector=f"payload.{WAKE_REF_PAYLOAD_KEY}={kind}:{handle}",
-        max_attempts=max_attempts,
-        lease_seconds=lease_seconds,
-    )
-    await _get_reconciler(agent)._store.start_watch(kind, handle)
-    await invoke_host_callback(register, registration)
-    status = await invoke_host_callback(provider.poll, handle)
-    return WaitResumeRegistration(
-        registration=registration,
-        already_terminal=status if status.outcome.is_terminal() else None,
-    )
+        dispatcher = getattr(agent, "dispatcher", None)
+        register = getattr(dispatcher, "register_durable_consumer", None)
+        elided_by = getattr(dispatcher, "durable_payload_elided_by", None)
+        if not callable(register) or not callable(elided_by):
+            raise ValueError(
+                "durable signal delivery unavailable: the agent's dispatcher "
+                "cannot register durable consumers"
+            )
+        storage = require_callback_result(elided_by())
+        if storage is not None:
+            raise DurableResumeUnsupportedError(f"{kind}:{handle}", storage)
+        registration = DurableConsumerRegistration(
+            consumer_id=consumer_id,
+            source=wake_source(provider),
+            agent_id=str(getattr(agent, "did", None) or ""),
+            correlation_selector=f"payload.{WAKE_REF_PAYLOAD_KEY}={kind}:{handle}",
+            max_attempts=max_attempts,
+            lease_seconds=lease_seconds,
+        )
+        await reconciler._store.start_watch(kind, handle)
+        await invoke_host_callback(register, registration)
+        status = await invoke_host_callback(provider.poll, handle)
+        return WaitResumeRegistration(
+            registration=registration,
+            already_terminal=status if status.outcome.is_terminal() else None,
+        )

@@ -19,13 +19,15 @@ from typing import Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+
+from kestrel_sovereign.audit_time import normalize_audit_timestamp
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.audit_anchor.hasher import AuditHasher
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
     resolve_scoped_agent_did,
 )
-from kestrel_sovereign.audit_time import normalize_audit_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,8 @@ class AuditAnchorFeature(Feature):
             """)
             logger.info("AuditAnchorFeature initialized - audit_anchors table ready")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"AuditAnchorFeature initialization warning: {e}")
 
     # =========================================================================
@@ -116,6 +120,8 @@ class AuditAnchorFeature(Feature):
                 serialized, f"audit_anchor_{anchor_hash[:16]}.json"
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Could not store audit entries to file storage: {e}")
             storage_failed_reason = str(e)
             # Fall back to hash-only anchor (no file storage ref)
@@ -150,6 +156,8 @@ class AuditAnchorFeature(Feature):
                      len(entries), first_entry_at, last_entry_at, now),
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Failed to record anchor: {e}")
                 return ToolResult.failed(
                     f"Failed to record anchor: {e}",
@@ -174,6 +182,8 @@ class AuditAnchorFeature(Feature):
             )
             await self.agent.storage.add_node(node)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"Could not store anchor as graph node: {e}")
 
         result = {
@@ -403,6 +413,8 @@ class AuditAnchorFeature(Feature):
                 status = (result.data or {}).get("status") if result.data else None
                 logger.info(f"Auto-anchor result: {status}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Auto-anchor failed: {e}")
 
     # =========================================================================
@@ -716,6 +728,8 @@ class AuditAnchorFeature(Feature):
             )
             return row[0] if row else None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"Could not get last anchor timestamp: {e}")
             return None
 
@@ -736,7 +750,9 @@ class AuditAnchorFeature(Feature):
                 (scope_did,),
             )
             return val or 0
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             return 0
 
     async def _get_all_anchors(self) -> list:
@@ -765,5 +781,7 @@ class AuditAnchorFeature(Feature):
             ]
             return [dict(zip(columns, row)) for row in rows]
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Could not retrieve anchors: {e}")
             return []
