@@ -26,12 +26,13 @@ import asyncio
 import contextvars
 import logging
 from collections.abc import Callable, Sequence as SequenceABC
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign.native_retirement import _begin_native_resource, _native_observation_requested
 from kestrel_sovereign.execution_custody import (
     AcknowledgedExecutionCommit,
     NativeExecutionRetirement,
@@ -99,6 +100,7 @@ class _ExecutionCommitState:
     checkout_open: bool = False
     terminal: BaseException | None = None
     body_failure: BaseException | None = None
+    native_observation: Any = None
 
     def remember(self, scopes: tuple[ExecutionCustody, ...]) -> None:
         # A shared checkout can begin unbound and participate in several
@@ -861,7 +863,7 @@ class PostgresBackend(DatabaseBackend):
     
     def _convert_query(self, query: str) -> str:
         """Convert SQLite-style ? placeholders to PostgreSQL $N style."""
-        if self._current_txn_conn() is not None or current_execution_custody(self):
+        if self._current_txn_conn() is not None or current_execution_custody(self) or _native_observation_requested():
             reject_transaction_control(query, dialect="postgres")
         converted, _ = sqlite_to_postgres(query)
         return converted
@@ -877,7 +879,15 @@ class PostgresBackend(DatabaseBackend):
 
         scopes = self._remember_transaction_custody()
         if not scopes:
-            yield executor
+            if _native_observation_requested() and executor is self._pool:
+                # Observe the real checkout/reset without turning legacy
+                # autocommit SQL (including CONCURRENTLY DDL) into a new
+                # explicit transaction. Observation grants no work authority
+                # and cannot manufacture a known implicit-COMMIT receipt.
+                async with self._authority_pool_checkout(executor) as (connection, _state):
+                    yield connection
+            else:
+                yield executor
             return
         require_execution_backend("postgres", scopes)
         if self._current_txn_conn() is not None:
@@ -1005,7 +1015,7 @@ class PostgresBackend(DatabaseBackend):
             # Preserve ordinary legacy wrapper context semantics. Strong
             # custody cannot be inferred by inspecting an opaque generator.
             state.native_owned = False
-            if state.scopes or not admit_work:
+            if state.scopes or not admit_work or _native_observation_requested():
                 raise ExecutionAuthorityError("opaque pool checkout requires PostgresPoolAdapter for native custody")
             async with pool.acquire() as connection:
                 yield connection, state
@@ -1015,14 +1025,32 @@ class PostgresBackend(DatabaseBackend):
 
     @asynccontextmanager
     async def _native_pool_checkout(self, pool: Any, state: _ExecutionCommitState, *, admit_work: bool) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
-        # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
-        # state through that await so a release failure cannot imply rollback.
-        body_failure: BaseException | None = None
         checkout = pool.acquire()
         if type(checkout) is not asyncpg.pool.PoolAcquireContext:
             raise ExecutionAuthorityError("native pool acquire is opaque; use PostgresPoolAdapter")
+        observation = _begin_native_resource(checkout)
+        state.native_observation = observation
+        failure = None
+        try:
+            async with self._native_pool_checkout_body(checkout, state, admit_work=admit_work) as owned:
+                yield owned
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            if observation is not None:
+                observation.finish(failure)
+
+    @asynccontextmanager
+    async def _native_pool_checkout_body(self, checkout: Any, state: _ExecutionCommitState, *, admit_work: bool) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
+        # asyncpg release/reset is awaited after COMMIT. Carry the exact commit
+        # state through that await so a release failure cannot imply rollback.
+        body_failure: BaseException | None = None
         connection = await checkout.__aenter__()
         native_connection = connection._con
+        observation = state.native_observation
+        if observation is not None:
+            observation.connection, observation.native_connection = connection, native_connection
         state.connection = connection
         state.checkout_open = True
         try:
@@ -1034,48 +1062,51 @@ class PostgresBackend(DatabaseBackend):
         # Only the native reset/return is protected. The checkout body remains
         # in its original task, including every ContextVar token and arbitrary
         # caller await. Cancellation cannot abandon an accepted native reset.
-        try:
-            retirement = create_owned_task(checkout.__aexit__(
-                type(body_failure) if body_failure is not None else None,
-                body_failure,
-                body_failure.__traceback__ if body_failure is not None else None,
-            ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset", retain_originals=True)
-        except BaseException as refusal:
-            terminal = self._refused_native_owner(connection, checkout, refusal, state.scopes, body_failure, native_connection)
-            raise state.retain_acknowledgments(terminal)
-        state.retirement.owner = retirement
-        retired = await await_owned_task(retirement)
-        terminal = execution_terminal_error(body_failure, retired.error, retired.cancellation, retain_originals=True)
-        if retired.error is not None:
-            assert terminal is not None
-            self._abort_native_connection(connection, terminal)
-            for scope in state.scopes:
-                scope.revoke("original native pool retirement failed")
-            terminal._kestrel_native_retirement_debts = (
-                *getattr(terminal, "_kestrel_native_retirement_debts", ()),
-                (_NativePostgresRetirement(checkout, connection, native_connection), retirement),
-            )
-            outcome = execution_commit_outcome(terminal) or state.outcome
-            if outcome is not None:
+        with observation.phase(checkout) if observation is not None else nullcontext() as phase:
+            try:
+                retirement = create_owned_task(checkout.__aexit__(
+                    type(body_failure) if body_failure is not None else None,
+                    body_failure,
+                    body_failure.__traceback__ if body_failure is not None else None,
+                ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset", retain_originals=True)
+            except BaseException as refusal:
+                terminal = self._refused_native_owner(connection, checkout, refusal, state.scopes, body_failure, native_connection)
+                raise state.retain_acknowledgments(terminal)
+            if phase is not None:
+                phase.owner = retirement
+            state.retirement.owner = retirement
+            retired = await await_owned_task(retirement)
+            terminal = execution_terminal_error(body_failure, retired.error, retired.cancellation, retain_originals=True)
+            if retired.error is not None:
+                assert terminal is not None
+                self._abort_native_connection(connection, terminal)
                 for scope in state.scopes:
-                    scope.preserve_commit_uncertainty(outcome)
-                if execution_commit_outcome(terminal) is None:
-                    raise ExecutionCommitOutcomeError(outcome) from terminal
-            raise terminal
-        if terminal is not None:
-            terminal = state.retain_acknowledgments(terminal)
-            if admit_work and state.acknowledgments:
-                terminal = self._retain_after_commit_denial(terminal, state.scopes, state.acknowledgments)
-            raise terminal
-        # Release/reset is an awaited part of the operation, not an
-        # authority-free epilogue. Never publish a stale read/RETURNING value
-        # or imply rollback when revocation raced a successful COMMIT/reset.
-        if not admit_work:
-            return
-        if state.outcome is not None:
-            self._require_after_authority_commit(state.scopes, state.acknowledgments)
-        else:
-            require_execution_backend("postgres", state.scopes)
+                    scope.revoke("original native pool retirement failed")
+                terminal._kestrel_native_retirement_debts = (
+                    *getattr(terminal, "_kestrel_native_retirement_debts", ()),
+                    (_NativePostgresRetirement(checkout, connection, native_connection), retirement),
+                )
+                outcome = execution_commit_outcome(terminal) or state.outcome
+                if outcome is not None:
+                    for scope in state.scopes:
+                        scope.preserve_commit_uncertainty(outcome)
+                    if execution_commit_outcome(terminal) is None:
+                        raise ExecutionCommitOutcomeError(outcome) from terminal
+                raise terminal
+            if terminal is not None:
+                terminal = state.retain_acknowledgments(terminal)
+                if admit_work and state.acknowledgments:
+                    terminal = self._retain_after_commit_denial(terminal, state.scopes, state.acknowledgments)
+                raise terminal
+            # Release/reset is an awaited part of the operation, not an
+            # authority-free epilogue. Never publish a stale read/RETURNING value
+            # or imply rollback when revocation raced a successful COMMIT/reset.
+            if not admit_work:
+                return
+            if state.outcome is not None:
+                self._require_after_authority_commit(state.scopes, state.acknowledgments)
+            else:
+                require_execution_backend("postgres", state.scopes)
 
     @asynccontextmanager
     async def _authority_transaction(
@@ -1088,7 +1119,7 @@ class PostgresBackend(DatabaseBackend):
         try:
             async with self._tracked_native_transaction(connection, scopes, state,
                 admit_work=True,
-                requires_commit_proof=lambda: bool(scopes) or (
+                requires_commit_proof=lambda: bool(scopes) or _native_observation_requested() or (
                     self._current_txn_conn() is not None and self._current_after_commit().pending)):
                 await lock_execution_authority(connection, "postgres", scopes)
                 yield
@@ -1171,50 +1202,56 @@ class PostgresBackend(DatabaseBackend):
         committing = body_failure is None
         # Protect the accepted native epilogue, NOT the body above. In
         # particular, external resolvers/gates retain normal cancellation.
-        try:
-            completion = create_owned_task(transaction.__aexit__(
-                type(body_failure) if body_failure is not None else None,
-                body_failure,
-                body_failure.__traceback__ if body_failure is not None else None,
-            ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit", retain_originals=True)
-        except BaseException as refusal:
-            raise self._refused_native_owner(connection, transaction, refusal, scopes, body_failure, native_connection)
-        if committing and commit_state is not None:
-            commit_state.outcome = "unknown"
-        completed = await await_owned_task(completion)
-        if completed.error is not None:
-            if committing:
-                terminal = execution_terminal_error(completed.error, completed.cancellation, retain_originals=True)
-                outcome = execution_commit_outcome(terminal) or "unknown"
+        observation = commit_state.native_observation if commit_state is not None else None
+        with observation.phase(transaction) if observation is not None else nullcontext() as phase:
+            try:
+                completion = create_owned_task(transaction.__aexit__(
+                    type(body_failure) if body_failure is not None else None,
+                    body_failure,
+                    body_failure.__traceback__ if body_failure is not None else None,
+                ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit", retain_originals=True)
+            except BaseException as refusal:
+                raise self._refused_native_owner(connection, transaction, refusal, scopes, body_failure, native_connection)
+            if phase is not None:
+                phase.owner = completion
+            if committing and commit_state is not None:
+                commit_state.outcome = "unknown"
+            completed = await await_owned_task(completion)
+            if completed.error is not None:
+                if committing:
+                    terminal = execution_terminal_error(completed.error, completed.cancellation, retain_originals=True)
+                    outcome = execution_commit_outcome(terminal) or "unknown"
+                    for scope in scopes:
+                        scope.preserve_commit_uncertainty(outcome)
+                    if execution_commit_outcome(terminal) is not None:
+                        raise terminal
+                    raise ExecutionCommitOutcomeError(outcome) from terminal
+                terminal = execution_terminal_error(body_failure, completed.error, completed.cancellation, retain_originals=True)
+                terminal._kestrel_native_retirement_debts = (
+                    *getattr(terminal, "_kestrel_native_retirement_debts", ()),
+                    (_NativePostgresRetirement(transaction, connection, native_connection), completion),
+                )
                 for scope in scopes:
-                    scope.preserve_commit_uncertainty(outcome)
-                if execution_commit_outcome(terminal) is not None:
-                    raise terminal
-                raise ExecutionCommitOutcomeError(outcome) from terminal
-            terminal = execution_terminal_error(body_failure, completed.error, completed.cancellation, retain_originals=True)
-            terminal._kestrel_native_retirement_debts = (
-                *getattr(terminal, "_kestrel_native_retirement_debts", ()),
-                (_NativePostgresRetirement(transaction, connection, native_connection), completion),
-            )
-            for scope in scopes:
-                scope.revoke("original native rollback acknowledgement failed")
-            raise terminal
-        receipt = (AcknowledgedExecutionCommit(completion, retirement=commit_state.retirement)
-                   if committing and proven and commit_state is not None
-                   else AcknowledgedExecutionCommit(completion) if committing and proven else None)
-        if committing and commit_state is not None:
-            commit_state.outcome = "committed" if proven else "unknown"
-            # The checkout retains one latest native fact, not every finished
-            # task from a long operational session. Earlier escaped receipts
-            # still share this SAME original reset record and settle with it.
-            commit_state.acknowledgments[:] = [receipt] if receipt is not None else []
-        terminal = execution_terminal_error(body_failure, completed.cancellation, retain_originals=True)
-        if terminal is not None:
-            if receipt is not None:
-                retain_acknowledged_execution_commit(terminal, receipt)
-            elif committing:
-                raise ExecutionCommitOutcomeError("unknown") from terminal
-            raise terminal
+                    scope.revoke("original native rollback acknowledgement failed")
+                raise terminal
+            receipt = (AcknowledgedExecutionCommit(completion, retirement=commit_state.retirement)
+                       if committing and proven and commit_state is not None
+                       else AcknowledgedExecutionCommit(completion) if committing and proven else None)
+            if committing and commit_state is not None:
+                commit_state.outcome = "committed" if proven else "unknown"
+                # The checkout retains one latest native fact, not every finished
+                # task from a long operational session. Earlier escaped receipts
+                # still share this SAME original reset record and settle with it.
+                commit_state.acknowledgments[:] = [receipt] if receipt is not None else []
+                if observation is not None:
+                    observation.acknowledgments = tuple(commit_state.acknowledgments)
+            terminal = execution_terminal_error(body_failure, completed.cancellation, retain_originals=True)
+            if terminal is not None:
+                if receipt is not None:
+                    retain_acknowledged_execution_commit(terminal, receipt)
+                elif committing:
+                    raise ExecutionCommitOutcomeError("unknown") from terminal
+                raise terminal
 
     @staticmethod
     def _require_after_authority_commit(

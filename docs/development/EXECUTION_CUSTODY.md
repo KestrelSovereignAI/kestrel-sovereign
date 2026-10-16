@@ -92,6 +92,26 @@ participating scope even if no commit occurred. Error aggregation separately
 retains the bounded unresolved-commit classification of legacy carriers; a
 settled acknowledged receipt cannot erase unrelated reconciliation debt just
 because the selected exception object changes.
+
+`NativeExecutionObserver` is a passive, original-lifetime inventory for hosts
+that hand off cancellation-resistant external providers. Bound observation
+adds no execution scope or capability. PostgreSQL reserves the actual checkout
+before acquisition can suspend and records only actual transaction-exit/reset
+owners, before creating those tasks. Closing new observation admission cannot
+cancel those epilogues. `join_accepted()` joins their physical owners and backend
+classification independently of the provider's later continuation or exception
+suppression; it preserves its own observer cancellation separately.
+
+Classification notifications are not native ACKs or closers. Records remain
+open across transaction exit and reset registration. A still-open acquisition,
+transaction/operational body or adapter remains explicit resource debt, not an
+unbounded provider join or successful physical retirement. Actual committed
+facts and hidden UNKNOWN/failed-closer evidence survive alongside that debt.
+Successful records are released promptly; unresolved resources remain retained.
+An unscoped legacy autocommit query retains autocommit semantics (including
+CONCURRENTLY DDL): observation owns its checkout/reset, not a fabricated
+explicit-transaction COMMIT receipt. Opaque pools and raw transaction-control
+SQL cannot bypass observation. Ordinary unobserved legacy paths are unchanged.
 Native aggregation preserves an original enclosing cancellation when its
 explicit cause would otherwise be selected; it never creates a reverse cause
 edge or drops that cancellation just to avoid a cycle. A failing COMMIT also
