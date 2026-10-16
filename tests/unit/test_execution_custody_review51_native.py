@@ -4,7 +4,7 @@ import threading
 
 import aiosqlite
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from kestrel_sovereign._async_ownership import create_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -125,8 +125,16 @@ async def test_driver_control_cause_is_not_replaced_by_ordinary_disposal(tmp_pat
 async def test_raw_close_receipt_survives_worker_liveness_pruning(tmp_path, monkeypatch, route, kind):
     db = await AsyncDatabase.sqlite(str(tmp_path / "primary.db"))
     factory = make_session_factory(db)
+    checkouts, checkins = set(), set()
+    def checkout(connection, record, proxy):
+        checkouts.add(id(record))
+    def checkin(connection, record):
+        checkins.add(id(record))
+    event.listen(factory.engine.sync_engine, "checkout", checkout)
+    event.listen(factory.engine.sync_engine, "checkin", checkin)
     session = factory._async_session()
     await session.execute(text("CREATE TABLE effects(id INTEGER)"))
+    original_connection = await session.connection()
     connection = factory._sqlite_connections[0]
     await connection.execute("INSERT INTO effects VALUES (1)")
     await connection.commit()
@@ -169,14 +177,24 @@ async def test_raw_close_receipt_survives_worker_liveness_pruning(tmp_path, monk
                 factory.finalize_retirement()
             assert raised.value is original
     finally:
-        release.set()
-        if owner is not None:
-            await join(owner)
-        monkeypatch.undo()
-        factory._active_sessions.discard(session)
-        await session.invalidate()
-        await session_close()
-        await join(create_owned_task(db.close()))
+        try:
+            release.set()
+            if owner is not None:
+                await join(owner)
+            monkeypatch.undo()
+            factory._active_sessions.discard(session)
+            # Session.invalidate can drop its own transaction bookkeeping
+            # before a fault-injected native closer raises BaseException.
+            # Retire the SAME retained public connection after removing that
+            # injection; never synthesize a pool check-in or native close ACK.
+            await original_connection.invalidate()
+            await session.invalidate()
+            await session_close()
+            await join(create_owned_task(db.close()))
+        finally:
+            event.remove(factory.engine.sync_engine, "checkout", checkout)
+            event.remove(factory.engine.sync_engine, "checkin", checkin)
+    assert checkouts and checkouts == checkins, "original checkout event has no matching physical check-in"
 
 
 @pytest.mark.asyncio

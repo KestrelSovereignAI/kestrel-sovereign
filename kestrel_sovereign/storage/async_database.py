@@ -83,9 +83,18 @@ async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseExcept
 
     from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
-    cleanup = create_owned_task(
-        db.close(), name="owned-database-retirement"
-    )
+    try:
+        cleanup = create_owned_task(
+            db.close(), name="owned-database-retirement",
+            retain_originals=True, retirement_resource=db,
+        )
+    except BaseException as error:
+        # A refused closer never entered native retirement. Keep the SAME
+        # database and operation receipt on the public recovery contract.
+        cause = execution_terminal_error(
+            operation_error, error, retain_originals=True,
+        )
+        raise DatabaseRetirementError(db, operation_error, error) from cause
     outcome = await await_owned_task(cleanup)
     close_exc = outcome.error
     if close_exc is not None:

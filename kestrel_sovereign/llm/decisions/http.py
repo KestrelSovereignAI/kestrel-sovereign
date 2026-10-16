@@ -12,7 +12,10 @@ import json
 from typing import Any, Dict, Mapping, Optional
 
 import httpx
-from kestrel_sovereign.execution_custody import owned_native_http_client
+from kestrel_sovereign.execution_custody import (
+    is_execution_control_error,
+    owned_native_http_client,
+)
 
 from kestrel_sdk._frozen_json import thaw_json
 from kestrel_sdk.llm.decisions import (
@@ -61,6 +64,8 @@ async def post_systemone(
         async with owned_native_http_client(httpx.AsyncClient(timeout=timeout)) as http:
             response = await http.post(url, content=content, headers=request_headers)
     except httpx.HTTPError as error:
+        if is_execution_control_error(error):
+            raise
         raise DecisionTransportError(
             f"{route}: decision request failed ({type(error).__name__})"
         ) from None

@@ -6296,7 +6296,12 @@ No other text or formatting.
             for key, task in tuple(closing.items()):
                 if task is not None and task.done():
                     harvest_llm_close_task(self, key, task)
-            await asyncio.sleep(0)
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError as withdrawal:
+                terminal = execution_terminal_error(
+                    terminal, withdrawal, retain_originals=True,
+                )
             if terminal is not None and all(task.done() for task in owners):
                 break
         terminal = execution_terminal_error(terminal, vars(self).get("_llm_close_control"),
