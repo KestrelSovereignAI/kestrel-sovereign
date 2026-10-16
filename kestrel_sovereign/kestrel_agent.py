@@ -9464,16 +9464,25 @@ Expected Duration: {expected_duration}
             self._durable_shutdown_continuation = continuation
             return continuation
 
-    def _remember_shutdown_control(self, error: BaseException | None) -> None:
+    def _remember_shutdown_control(
+        self, error: BaseException | None, *, retain_originals: bool = False,
+        retain_cancellation: bool = False,
+    ) -> None:
         """Retain original terminal evidence until its lifetime is reconciled."""
-        if error is None or not is_execution_control_error(error):
+        if error is None or (
+            not is_execution_control_error(error)
+            and not (retain_cancellation and isinstance(error, asyncio.CancelledError))
+        ):
             return
         self._shutdown_control = execution_terminal_error(
             vars(self).get("_shutdown_control"), error,
+            retain_originals=retain_originals,
         )
 
     def _raise_shutdown_control(self) -> None:
-        terminal = execution_terminal_error(vars(self).get("_shutdown_control"))
+        terminal = execution_terminal_error(
+            vars(self).get("_shutdown_control"), retain_originals=True,
+        )
         if terminal is not None:
             raise terminal
 
@@ -10464,13 +10473,15 @@ Expected Duration: {expected_duration}
             defer_failure_report: bool = False,
         ) -> str:
             """Read a completed task's outcome, recording degradation."""
-            try:
-                exc = task.exception()
-            except asyncio.CancelledError as cancellation:
-                self._remember_shutdown_control(cancellation)
+            from kestrel_sovereign._async_ownership import owned_task_error
+
+            exc = owned_task_error(task)
+            self._remember_shutdown_control(
+                exc, retain_originals=True, retain_cancellation=True,
+            )
+            if isinstance(exc, asyncio.CancelledError):
                 state["cancelled"] = True
                 return "cancelled"
-            self._remember_shutdown_control(exc)
             if exc is None:
                 return "ok"
             if not defer_failure_report:
@@ -10507,7 +10518,7 @@ Expected Duration: {expected_duration}
                     retirement_resource, (task,),
                     message="original native shutdown owner exceeded its observer guard",
                 )
-                self._remember_shutdown_control(retained)
+                self._remember_shutdown_control(retained, retain_originals=True)
 
                 def retain_native_terminal(completed):
                     self._remember_shutdown_control(execution_terminal_error(
@@ -10576,12 +10587,15 @@ Expected Duration: {expected_duration}
                     raise
             try:
                 done, _pending = await asyncio.wait({task}, timeout=guard)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as withdrawal:
                 # The tail's own await was cancelled externally. ``asyncio.wait``
                 # does not cancel its futures, so a shielded task is still
                 # running — give it a bounded chance to finish so data-critical
                 # steps are not aborted, then propagate via state["cancelled"].
                 state["cancelled"] = True
+                self._remember_shutdown_control(
+                    withdrawal, retain_originals=True, retain_cancellation=True,
+                )
                 if shielded:
                     cancellation_grace = min(
                         guard, max(0.0, tail_deadline - loop.time())
@@ -10590,7 +10604,10 @@ Expected Duration: {expected_duration}
                         done, _pending = await asyncio.wait(
                             {task}, timeout=cancellation_grace
                         )
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError as withdrawal:
+                        self._remember_shutdown_control(
+                            withdrawal, retain_originals=True, retain_cancellation=True,
+                        )
                         _abandon(task, retirement_resource=retirement_resource)
                         if not defer_failure_report:
                             state["degraded"] = True

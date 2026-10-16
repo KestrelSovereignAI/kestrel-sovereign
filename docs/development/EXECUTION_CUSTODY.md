@@ -44,7 +44,14 @@ The Agent's finite snapshot/stop guard stops observation, not physical ownership
 it retains the exact original Task through canonical retirement debt instead of
 closing the coroutine joining a native client. Its existing lifetime retains
 each eventual original failure, including distinct concurrent snapshot/stop
-failures. Explicit shutdown completion joins pending original owners without
+failures. Timely completion uses the canonical owned-Task receipt too, so an
+earlier exception reader cannot consume a cancelled Task's original carrier.
+The finite tail retains each actual observer cancellation, including repeated
+withdrawals, alongside native close failures; it does not reduce them to a
+boolean or substitute a child's cancellation. Reporting preserves an original
+callback cancellation even when physical close succeeded and its explicit
+cause is an ordinary HTTP error. Explicit shutdown completion joins pending
+original owners without
 cancelling them, rejoining completed owners, or joining self/actual ancestors.
 Neither a timeout, an observer notification nor a resource label is a close ACK.
 

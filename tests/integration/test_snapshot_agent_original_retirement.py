@@ -13,7 +13,10 @@ from kestrel_sovereign.execution_custody import (
 from tests.integration.test_lighthouse_snapshot_original_control import (
     native_snapshot as native_snapshot,
 )
-from tests.unit.test_cleanup_task_admission import _partial_native_agent
+from tests.unit.test_cleanup_task_admission import (
+    _operation_name,
+    _partial_native_agent,
+)
 
 
 @pytest.mark.asyncio
@@ -416,5 +419,267 @@ async def test_completion_from_original_native_join_graph_keeps_owner_fenced(
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
         await asyncio.gather(tail, return_exceptions=True)
+        await agent.llm_service.close()
+        await usage_db.close()
+
+
+# Timely native close failures at the real partial Agent boundary.
+
+
+@pytest.mark.asyncio
+async def test_timely_agent_snapshot_and_stop_retain_both_native_failures(
+    native_snapshot, tmp_path, monkeypatch
+):
+    (
+        db,
+        target,
+        service,
+        entered,
+        close_entered,
+        release_close,
+        clients,
+        source_errors,
+        close_tasks,
+        state,
+        tasks,
+    ) = native_snapshot
+    agent, usage_db = await _partial_native_agent(tmp_path, monkeypatch)
+    agent._sync_service = service
+    agent._resource_custody().acquire("sync_service")
+    state["close_errors"] = [
+        OSError("actual timely periodic native close ACK lost"),
+        OSError("actual timely final snapshot native close ACK lost"),
+    ]
+    state["release_server"].set()
+    release_close.set()
+    await service.start()
+    worker = service._poll_task
+    tasks.append(worker)
+    try:
+        for _ in range(250):
+            if worker.done():
+                break
+            await asyncio.sleep(0.01)
+        assert worker.done() and owned_task_error(worker) is state["close_errors"][0]
+        await agent._run_durable_shutdown_tail(5)
+        assert len(close_tasks) == 2 and all(owner.done() for owner in close_tasks)
+        terminal = vars(agent).get("_shutdown_control")
+        chain = tuple(_explicit_control_chain(terminal))
+        assert all(error in chain for error in state["close_errors"]), (
+            "timely harvest replaced an original native close error"
+        )
+        assert all(
+            any(
+                resource is client and owner in close_tasks
+                for resource, owner in execution_cleanup_debts(terminal)
+            )
+            for client in clients
+        )
+    finally:
+        release_close.set()
+        await asyncio.gather(worker, return_exceptions=True)
+        await agent.llm_service.close()
+        await usage_db.close()
+
+
+# Original actual tail observer cancellations survive native retirement.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat", [False, True])
+@pytest.mark.parametrize("close_cancels", [False, True])
+async def test_agent_retains_exact_original_tail_observer_cancellation(
+    native_snapshot, tmp_path, monkeypatch, repeat, close_cancels
+):
+    (
+        db,
+        target,
+        service,
+        entered,
+        close_entered,
+        release_close,
+        clients,
+        source_errors,
+        close_tasks,
+        state,
+        tasks,
+    ) = native_snapshot
+    agent, usage_db = await _partial_native_agent(tmp_path, monkeypatch)
+    agent._sync_service = service
+    agent._resource_custody().acquire("sync_service")
+    if close_cancels:
+        state["close_error"] = asyncio.CancelledError(
+            "actual native close ACK cancellation"
+        )
+        state["close_error"].__cause__ = OSError(
+            "actual original native close ACK failure"
+        )
+    actual_wait = asyncio.wait
+    observed = []
+    tail = None
+
+    async def observe_original_withdrawal(*args, **kwargs):
+        try:
+            return await actual_wait(*args, **kwargs)
+        except asyncio.CancelledError as withdrawal:
+            if asyncio.current_task() is tail:
+                observed.append(withdrawal)
+            raise
+
+    monkeypatch.setattr(asyncio, "wait", observe_original_withdrawal)
+    tail = create_owned_task(
+        agent._run_durable_shutdown_tail(0.3), retain_originals=True
+    )
+    tasks.append(tail)
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        tail.cancel("original tail observer withdrawal")
+        if repeat:
+            await asyncio.sleep(0.02)
+            tail.cancel("second original tail observer withdrawal")
+        await asyncio.wait_for(close_entered.wait(), 3)
+        for _ in range(200):
+            if tail.done():
+                break
+            await asyncio.sleep(0.01)
+        assert tail.done() and not close_tasks[0].done()
+        assert len(observed) == (2 if repeat else 1)
+        debts = execution_cleanup_debts(vars(agent).get("_shutdown_control"))
+        owners = {
+            owner
+            for resource, owner in debts
+            if resource is service and owner is not None
+        }
+        assert owners
+        release_close.set()
+        await asyncio.gather(*owners, return_exceptions=True)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        chain = tuple(_explicit_control_chain(vars(agent).get("_shutdown_control")))
+        assert all(withdrawal in chain for withdrawal in observed), (
+            "original observer object was reduced to a boolean/replaced by child cancellation"
+        )
+        assert state["close_error"] in chain
+    finally:
+        release_close.set()
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
+        await asyncio.gather(tail, return_exceptions=True)
+        await agent.llm_service.close()
+        await usage_db.close()
+
+
+# An actual earlier completion observer cannot erase native cancellation evidence.
+
+
+@pytest.mark.asyncio
+async def test_timely_native_cancel_receipt_survives_an_earlier_completion_reader(
+    native_snapshot, tmp_path, monkeypatch
+):
+    (
+        db,
+        target,
+        service,
+        entered,
+        close_entered,
+        release_close,
+        clients,
+        source_errors,
+        close_tasks,
+        state,
+        tasks,
+    ) = native_snapshot
+    agent, usage_db = await _partial_native_agent(tmp_path, monkeypatch)
+    agent._sync_service = service
+    agent._resource_custody().acquire("sync_service")
+    state["close_error"] = asyncio.CancelledError(
+        "original timely native close cancellation"
+    )
+    state["close_error"].__cause__ = OSError("actual original native close failure")
+    state["release_server"].set()
+    release_close.set()
+    loop, factory = (
+        asyncio.get_running_loop(),
+        asyncio.get_running_loop().get_task_factory(),
+    )
+    observed = []
+
+    def observe_admitted_task(loop, coroutine, **kwargs):
+        task = (
+            factory(loop, coroutine, **kwargs)
+            if factory
+            else asyncio.Task(coroutine, loop=loop, **kwargs)
+        )
+        if _operation_name(coroutine) == "SyncService.force_snapshot":
+
+            def first_reader(done):
+                try:
+                    error = done.exception()
+                except BaseException as error:
+                    observed.append(error)
+                else:
+                    observed.append(error)
+
+            task.add_done_callback(first_reader)
+        return task
+
+    loop.set_task_factory(observe_admitted_task)
+    try:
+        await agent._run_durable_shutdown_tail(5)
+        assert observed == [state["close_error"]], (
+            "first native completion reader did not observe original cancellation"
+        )
+        assert all(owner.done() for owner in close_tasks)
+        terminal = vars(agent).get("_shutdown_control")
+        assert state["close_error"] in tuple(_explicit_control_chain(terminal)), (
+            "later harvest manufactured cause-free cancellation"
+        )
+        assert any(
+            resource is clients[0] and owner is close_tasks[0]
+            for resource, owner in execution_cleanup_debts(terminal)
+        )
+    finally:
+        loop.set_task_factory(factory)
+        await agent.llm_service.close()
+        await usage_db.close()
+
+
+@pytest.mark.asyncio
+async def test_timely_original_callback_cancellation_is_raised_after_successful_close(
+    native_snapshot, tmp_path, monkeypatch
+):
+    (
+        db,
+        target,
+        service,
+        entered,
+        close_entered,
+        release_close,
+        clients,
+        source_errors,
+        close_tasks,
+        state,
+        tasks,
+    ) = native_snapshot
+    agent, usage_db = await _partial_native_agent(tmp_path, monkeypatch)
+    agent._sync_service = service
+    agent._resource_custody().acquire("sync_service")
+    state["upload_failure_as_cancel"] = True
+    state["close_error"] = None
+    state["release_server"].set()
+    release_close.set()
+    try:
+        cancelled, _ = await agent._run_durable_shutdown_tail(5)
+        assert cancelled and source_errors
+        original = source_errors[0]
+        assert isinstance(original, asyncio.CancelledError) and original.__cause__
+        assert all(owner.done() for owner in close_tasks)
+        assert not execution_cleanup_debts(vars(agent).get("_shutdown_control"))
+        with pytest.raises(asyncio.CancelledError) as result:
+            agent._raise_shutdown_control()
+        assert result.value is original, (
+            "successful close replaced original cancellation with its cause"
+        )
+    finally:
         await agent.llm_service.close()
         await usage_db.close()
