@@ -176,7 +176,7 @@ export async function createPipelineClient({
     await requireOpen();
     playback = await createVoicePlayback({ sampleRate, onError: error => {
       if (closed) return;
-      void close();
+      void close(error);
       onEvent(makeEvent(Events.ERROR, {
         message: error.message, code: 'AUDIO_OUTPUT_CONTROL_FAILED', fatal: true,
       }));

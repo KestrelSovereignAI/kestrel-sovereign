@@ -21,9 +21,10 @@ export function createStartupSettlement() {
     },
     whenSettled() { return nativeSettlement || Promise.resolve([]); },
     close(error = new Error('Original voice startup was closed.')) {
-      if (closedError) return;
+      if (closedError) return closedError;
       closedError = error;
       rejectClosed(closedError);
+      return closedError;
     },
   };
 }

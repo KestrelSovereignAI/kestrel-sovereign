@@ -69,13 +69,15 @@ export async function readToolBatchResponse(response, calls) {
 // HTTP 400".  See kestrel-voice-openai#16 (Beta -> GA migration).
 const REALTIME_SDP_URL = 'https://api.openai.com/v1/realtime/calls';
 
-export function buildRealtimeToolsSessionUpdate(tools = []) {
+export function buildRealtimeSessionUpdate(fields = {}, sessionType = '') {
   return {
     type: 'session.update',
-    session: {
-      tools: Array.isArray(tools) ? tools : [],
-    },
+    session: { ...(sessionType ? { type: sessionType } : {}), ...fields },
   };
+}
+
+export function buildRealtimeToolsSessionUpdate(tools = [], { sessionType = '' } = {}) {
+  return buildRealtimeSessionUpdate({ tools: Array.isArray(tools) ? tools : [] }, sessionType);
 }
 
 export function bytesToBase64(bytes) {
@@ -280,7 +282,11 @@ export async function createRealtimeClient({
     const channelOpen = dc && dc.readyState === 'open';
     const socketOpen = ws && ws.readyState === WebSocket.OPEN;
     if (!channelOpen && !socketOpen) {
-      if (required) throw new Error('Original voice transport is not open.');
+      if (required) {
+        const error = new Error('Original voice transport is not open.');
+        if (framed) void close(error);
+        throw error;
+      }
       return;
     }
     try {
@@ -288,11 +294,12 @@ export async function createRealtimeClient({
       if (channelOpen) dc.send(payload);
       else ws.send(payload);
     } catch (err) {
+      if (framed) void close(err);
       if (required) throw err;
       if (!closed) {
         onEvent(makeEvent(Events.ERROR, {
           message: `data channel send failed: ${err.message}`,
-          fatal: false,
+          fatal: !!framed,
         }));
       }
     }
@@ -359,7 +366,7 @@ export async function createRealtimeClient({
       })
       .catch(async (err) => {
         if (!closed) {
-          await close();
+          await close(err);
           onEvent(makeEvent(Events.ERROR, {
             message: `transcript persist failed: ${err.message}`,
             fatal: true,
@@ -625,9 +632,10 @@ export async function createRealtimeClient({
     pc.onconnectionstatechange = () => {
       if (closed || !pc) return;
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        void close();
+        const error = new Error(`RTC connection ${pc.connectionState}`);
+        void close(error);
         onEvent(makeEvent(Events.ERROR, {
-          message: `RTC connection ${pc.connectionState}`,
+          message: error.message,
           code: `rtc_${pc.connectionState}`,
           fatal: true,
         }));
@@ -678,7 +686,7 @@ export async function createRealtimeClient({
       if (inputMuted || closed) return;
       if (framed) {
         try { framed.audio(bytesToBase64(pcm), pcm.byteLength); }
-        catch (error) { void close(); onEvent(makeEvent(Events.ERROR, { message: error.message, fatal: true })); }
+        catch (error) { void close(error); onEvent(makeEvent(Events.ERROR, { message: error.message, fatal: true })); }
         return;
       }
       if (ws?.readyState === WebSocket.OPEN) {
@@ -700,7 +708,7 @@ export async function createRealtimeClient({
     ws.onmessage = (ev) => {
       try { handleProviderEvent(JSON.parse(ev.data)); }
       catch (err) {
-        if (framed) void close();
+        if (framed) void close(err);
         onEvent(makeEvent(Events.ERROR, {
           message: `Malformed realtime event: ${err.message}`, fatal: !!framed,
         }));
@@ -729,9 +737,10 @@ export async function createRealtimeClient({
     };
     ws.onerror = () => {
       if (!closed) {
-        void close();
+        const error = new Error(`${session.provider || 'Realtime'} WebSocket error`);
+        void close(error);
         onEvent(makeEvent(Events.ERROR, {
-          message: `${session.provider || 'Realtime'} WebSocket error`,
+          message: error.message,
           code: 'websocket_error',
           fatal: true,
         }));
@@ -812,8 +821,8 @@ export async function createRealtimeClient({
   function close(error) {
     if (closeOwner) return closeOwner;
     closed = true;
-    startupSettlement.close(error);
-    framed?.close();
+    const originalClose = startupSettlement.close(error);
+    framed?.close(originalClose);
     clearTimeout(responseStartTimer);
     responseStartTimer = null;
     startupAbort.abort();
@@ -914,10 +923,7 @@ export async function createRealtimeClient({
    * directives composed from canonical tags.
    */
   function updateInstructions(instructions) {
-    sendJSON({
-      type: 'session.update',
-      session: { instructions },
-    });
+    sendJSON(buildRealtimeSessionUpdate({ instructions }, framed ? 'realtime' : ''));
   }
 
   /**
@@ -926,7 +932,7 @@ export async function createRealtimeClient({
    * browser only forwards it over the existing data channel.
    */
   function updateTools(tools) {
-    sendJSON(buildRealtimeToolsSessionUpdate(tools));
+    sendJSON(buildRealtimeToolsSessionUpdate(tools, { sessionType: framed ? 'realtime' : '' }));
   }
 
   /**
@@ -956,7 +962,7 @@ export async function createRealtimeClient({
       responseAdmissionOpen = true;
       requestResponse();
     } catch (error) {
-      await close();
+      await close(error);
       throw error;
     }
   }

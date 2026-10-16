@@ -132,6 +132,7 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
   });
   wsServer.on('connection', connection => {
     realtimePeers.push(connection);
+    const effectiveConfig = JSON.parse(JSON.stringify({ model: 'offline-model', ...framedConfig }));
     connection.send(JSON.stringify({ type: 'session.created', session: { model: 'offline-model',
       ...(socketIdentity ? { id: 'actual-socket-id' } : {}) } }));
     connection.send(JSON.stringify({ type: 'status', state: 'listening' }));
@@ -140,9 +141,19 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       if (!binary) {
         const message = JSON.parse(bytes.toString());
         realtimeMessages.push(message);
-        if (message.type === 'session.update' && !holdSessionAck) connection.send(JSON.stringify({
-          type: 'session.updated', session: { ...(ackIdentity ? { id: 'actual-socket-id' } : {}), model: 'offline-model', ...framedConfig },
-        }));
+        if (message.type === 'session.update') {
+          // Actual GA SessionUpdateEventParam requires session.type. A socket
+          // fixture must not ACK a malformed update that the provider rejects.
+          if (connection.protocol === 'realtime' && (message.session?.type !== 'realtime' || Object.hasOwn(message.session, 'model'))) {
+            connection.send(JSON.stringify({ type: 'error', error: {
+              code: 'invalid_request_error', message: 'GA session update requires type and cannot change model',
+            } }));
+          } else {
+            Object.assign(effectiveConfig, message.session);
+            if (!holdSessionAck) connection.send(JSON.stringify({ type: 'session.updated',
+              session: { ...(ackIdentity ? { id: 'actual-socket-id' } : {}), ...effectiveConfig } }));
+          }
+        }
         if (message.type === 'input_audio_buffer.clear' && !holdInputClear) connection.send(JSON.stringify({ type: 'input_audio_buffer.cleared' }));
       }
     });
@@ -202,6 +213,7 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
       sessionAck: config => realtimePeers[0].send(JSON.stringify({ type: 'session.updated',
         session: config || { id: 'actual-socket-id', model: 'offline-model', ...framedConfig } })),
       sendRealtime: payload => realtimePeers[0].send(JSON.stringify(payload)),
+      sendRealtimeRaw: bytes => realtimePeers[0].send(bytes),
       releaseMint: () => mintResponse.res.end(mintResponse.payload),
       sdpRequests: () => sdpRequests,
       releaseBatch: (ack = {}) => batchResponse.end(JSON.stringify(ack)) });
@@ -389,6 +401,76 @@ test(`framed native ${failure} failure closes original capture, contexts and soc
     responseStartTimeoutMs: failure === 'startup-overflow' ? 10000 : 700 });
 });
 }
+
+for (const operation of ['tools', 'instructions']) {
+test(`review100 public strict ${operation} update satisfies native GA schema and preserves original call`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, realtimeMessages, sendRealtime }) => {
+    await page.evaluate(operation => {
+      if (operation === 'tools') window.client.updateTools([{ type: 'function', name: 'offline_no_execution', parameters: { type: 'object', properties: {} } }]);
+      else window.client.updateInstructions('new original instructions');
+    }, operation);
+    for (let step = 0; step < 100 && realtimeMessages().filter(message => message.type === 'session.update').length < 2; step++) await page.waitForTimeout(10);
+    const update = realtimeMessages().filter(message => message.type === 'session.update').at(-1);
+    assert.equal(update.session.type, 'realtime');
+    assert.equal(Object.hasOwn(update.session, 'model'), false);
+    await page.waitForTimeout(100);
+    assert.ok(await page.evaluate(() => window.client.micStream.getTracks().every(track => track.readyState === 'live')));
+    sendRealtime({ type: 'input_audio_buffer.speech_started', item_id: 'after-update' });
+    sendRealtime({ type: 'input_audio_buffer.committed', item_id: 'after-update' });
+    for (let step = 0; step < 100 && !realtimeMessages().some(message => message.type === 'response.create'); step++) await page.waitForTimeout(10);
+    const request = realtimeMessages().find(message => message.type === 'response.create');
+    assert.ok(request);
+    sendRealtime({ type: 'response.created', response: { id: 'after-update', metadata: request.response.metadata } });
+    sendRealtime({ type: 'response.output_text.delta', response_id: 'after-update', delta: 'FRESH_AFTER_UPDATE' });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.text === 'FRESH_AFTER_UPDATE'));
+  }, '{"persisted":false}', { framed: true });
+});
+}
+
+test('review100 Pipeline startup preserves original playback failure through public and late native settlement', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, enteredWorklet, releaseWorklet }) => {
+    await page.evaluate(async () => {
+      const { createPipelineClient } = await import('/js/voice/pipeline.js');
+      window.client = await createPipelineClient({ onEvent: event => window.nativeEvents.push(event) });
+      window.startup = window.client.start().then(() => null, error => { window.publicFailure = error; return error.message; });
+    });
+    await enteredWorklet;
+    await page.evaluate(() => window.client.cancelResponse());
+    const error = await page.evaluate(() => window.startup);
+    assert.match(error, /worklet did not acknowledge/);
+    releaseWorklet();
+    const native = await page.evaluate(async () => {
+      const settled = await window.client.whenStartupSettled();
+      return { same: settled[0].reason === window.publicFailure,
+        closed: window.nativeContexts.every(context => context.state === 'closed'),
+        tracks: window.client.micStream.getTracks().every(track => track.readyState === 'ended') };
+    });
+    assert.ok(native.same && native.closed && native.tracks);
+  }, '{"persisted":false}', { autoStart: false, framed: true, holdWorklet: 'playback' });
+});
+
+test('review100 malformed native socket JSON before ACK retains original parse failure', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, realtimeMessages, sendRealtimeRaw }) => {
+    await page.evaluate(() => {
+      window.startup = window.client.start().then(() => null, error => {
+        window.publicFailure = error; return { name: error.name, message: error.message };
+      });
+    });
+    for (let step = 0; step < 100 && !realtimeMessages().some(message => message.type === 'session.update'); step++) await page.waitForTimeout(10);
+    assert.ok(realtimeMessages().some(message => message.type === 'session.update'));
+    sendRealtimeRaw('{ malformed native JSON');
+    const error = await page.evaluate(() => window.startup);
+    assert.equal(error.name, 'SyntaxError');
+    assert.match(error.message, /JSON|property|Unexpected/);
+    const native = await page.evaluate(async () => {
+      const settled = await window.client.whenStartupSettled();
+      return { same: settled[0].reason === window.publicFailure,
+        closed: window.nativeContexts.every(context => context.state === 'closed'),
+        tracks: window.client.micStream.getTracks().every(track => track.readyState === 'ended') };
+    });
+    assert.ok(native.same && native.closed && native.tracks);
+  }, '{"persisted":false}', { autoStart: false, framed: true, holdSessionAck: true });
+});
 
 for (const operation of ['Stop', 'typed']) {
 test(`review99 ${operation} while original mint is pending retains the latest local boundary`, { timeout: 30000 }, async () => {
