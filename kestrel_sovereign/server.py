@@ -3913,16 +3913,19 @@ async def _lifespan_startup(app: FastAPI):
             app.state.host_context = ctx
             logger.info("Host features initialized: 0")
     except BaseException as exc:  # noqa: BLE001 - close unpublished context
+        failures = [exc]
         fatal = isinstance(
             exc,
             (ContributionContractError, FeatureContributionRuntimeError),
-        ) or not isinstance(exc, Exception)
+        ) or not isinstance(exc, Exception) or is_execution_control_error(exc)
         if not fatal:
             logger.warning("Host feature initialization failed: %s", exc)
         try:
             if candidate_ctx is not None and candidate_started:
                 await _hf.stop_host_features(candidate_started, candidate_ctx)
-        finally:
+        except BaseException as cleanup_error:
+            failures.append(cleanup_error)
+        try:
             # A future replacement context might still fail before publication;
             # close only that unpublished candidate. The boot Hold context is
             # published before agents start and remains teardown-owned even when
@@ -3936,10 +3939,12 @@ async def _lifespan_startup(app: FastAPI):
                 )
 
                 await close_host_context_resources(candidate_ctx)
-        if fatal:
+        except BaseException as cleanup_error:
+            failures.append(cleanup_error)
+        if fatal or len(failures) > 1:
             # Complete prospective-set rejection is a startup failure, not an
             # optional-feature warning. Prior valid state remains visible.
-            raise
+            raise execution_terminal_error(*failures)
 
     # No cognition turn may cross startup with the agent-only clause view.
     # This includes overdue standalone schedules armed from on_agent_ready and
