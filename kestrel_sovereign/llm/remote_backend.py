@@ -258,12 +258,25 @@ class RemoteBackendMixin:
                                 while self._remote_inflight:
                                     await self._remote_route_condition.wait()
                         except TimeoutError:
-                            self._remote_accepting = True
+                            self._remote_accepting = (
+                                not self._remote_route_closed
+                                and vars(self).get("_llm_close_control") is None
+                            )
                             activation_error = (
                                 "timed out refreshing the active private inference route"
                             )
                         else:
                             old_client = self._remote_client
+                if activation_error is None and (
+                    self._remote_route_closed
+                    or vars(self).get("_llm_close_control") is not None
+                ):
+                    # The native drain awaited above can outlive shutdown.
+                    # Retire this same unpublished client, never republish it.
+                    activation_error = (
+                        "LLM service is shutting down; the private inference route "
+                        "cannot be activated"
+                    )
                 if activation_error is None:
                     self._remote_lease = lease
                     self._remote_client = client

@@ -601,6 +601,15 @@ physically retires the newly constructed, unpublished client through that same
 registry before reporting the original strongest receipt. The pinned old route
 remains owned, and a started drain stays fail-closed; cancellation never
 certifies its release or silently re-arms it.
+The original Service close caller latches private-route admission closed before
+any cleanup await or Task allocation. Its outer route closer registers that
+same Service as the native retirement resource before admission, so refusal
+cannot hide its still-live SDK or remove its unpublished lifecycle owner.
+A rotation that was already draining rechecks shutdown before publication;
+its timeout cannot reopen admission after shutdown has won. These boundaries
+are exercised with actual loopback SDK/HTTP transports and original pinned
+requests. Trusted lease inputs in those tests do not establish a provider
+canary, GPU allocation, full Agent startup or live READY.
 
 Durable owner-heartbeat failure re-arms bounded cleanup liveness even before a
 late cognition owner or terminalization debt is installed. Re-arm retains the

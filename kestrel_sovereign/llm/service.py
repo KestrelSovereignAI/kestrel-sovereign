@@ -6320,6 +6320,10 @@ No other text or formatting.
         cancellation hands off remaining independent steps without spending
         another full timeout per resource. Usage storage waits for its writers.
         """
+        # One-way admission latches belong to this ORIGINAL close caller,
+        # before any cleanup Task can be refused or any writer can yield.
+        self._remote_route_closed = True
+        self._remote_accepting = False
         tasks = vars(self).setdefault("_llm_close_tasks", {})
         terminal = vars(self).get("_llm_close_control")
         interrupted = False
@@ -6386,16 +6390,16 @@ No other text or formatting.
             await retire("client", close_client, resource=client, cancel_on_timeout=False)
 
         async def close_remote_route():
-            # Latch closed before renewal can reactivate it. Provider capacity
-            # remains owned by the durable reconciler, not this local closer.
-            async with self._remote_route_condition:
-                self._remote_route_closed = True
+            # Provider capacity remains owned by the durable reconciler.
+            # This Service owns its original private SDK and drain lifetime.
             if self._remote_lease is not None:
                 await self.deactivate_inference_lease(
                     self._remote_lease.lease_id, require_active=False,
                 )
 
-        await retire("remote-route", close_remote_route, cancel_on_timeout=False)
+        await retire(
+            "remote-route", close_remote_route, resource=self, cancel_on_timeout=False,
+        )
 
         async def close_usage_after_writers():
             # Join the ORIGINAL writers even when allocation of their drain
