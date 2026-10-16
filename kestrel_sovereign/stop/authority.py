@@ -15,6 +15,7 @@ from kestrel_sovereign._async_ownership import (
     owned_task_error,
     pending_owned_retirement_error,
     raise_owned_outcome,
+    wait_owned_tasks_until,
 )
 from kestrel_sovereign.agent.invocation import validate_invocation_id
 from kestrel_sovereign.execution_custody import (
@@ -182,18 +183,10 @@ class StopCleanupRegistry:
         deadline = loop.time() + timeout_seconds
         while self._tasks:
             task = next(iter(self._tasks))
-            # Wait in this ORIGINAL drain, never a fresh collector. Observer
-            # withdrawal cannot cancel its registry-owned native tail.
-            while not task.done():
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                try:
-                    await asyncio.wait({task}, timeout=remaining)
-                except asyncio.CancelledError as error:
-                    withdrawal = execution_terminal_error(
-                        withdrawal, error, retain_originals=True,
-                    )
+            observation = await wait_owned_tasks_until({task}, deadline=deadline)
+            withdrawal = execution_terminal_error(
+                withdrawal, observation.cancellation, retain_originals=True,
+            )
             if not task.done():
                 logger.warning(
                     "Stop cleanup drain timed out after %.1fs with %d tail(s) "

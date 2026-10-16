@@ -23,9 +23,11 @@ from uuid import uuid4
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
+    gather_owned,
     owned_task_error,
     pending_owned_retirement_error,
     raise_owned_outcome,
+    wait_owned_tasks_until,
 )
 from kestrel_sovereign.agent.invocation import (
     InvocationSelfFencedError,
@@ -1783,14 +1785,17 @@ class DistributedInvocationRegistry:
 
     async def close(self) -> None:
         self._closing = True
+        withdrawal = None
+        failure = None
         relay = self._relay_task
         if relay is not None:
             relay.cancel()
             outcome = await await_owned_task(relay)
+            withdrawal = outcome.cancellation
             if outcome.error is not None:
                 self._retain_terminal_control(outcome.error)
                 if not isinstance(outcome.error, asyncio.CancelledError) and not is_execution_control_error(outcome.error):
-                    raise outcome.error
+                    failure = outcome.error
             self._relay_task = None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _DEFAULT_CLOSE_DRAIN_SECONDS
@@ -1798,53 +1803,53 @@ class DistributedInvocationRegistry:
             ("registration", self._registration_tasks),
             ("completion", self._cleanup_tasks),
         ):
-            # `while tasks:` alone never terminates if a task schedules more
-            # work; bound it. Outcomes stay owned either way -- registration
-            # tasks are gathered with return_exceptions and completion tasks
-            # carry `_consume_cleanup` as a done-callback -- so an abandoned
-            # tail cannot surface as a never-retrieved exception.
             while tasks:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
+                observation = await wait_owned_tasks_until(tuple(tasks), deadline=deadline)
+                withdrawal = execution_terminal_error(
+                    withdrawal, observation.cancellation, retain_originals=True,
+                )
+                done, pending = observation.result
+                for task in done:
+                    error = owned_task_error(task)
+                    if error is not None:
+                        self._retain_terminal_control(error)
+                    tasks.discard(task)
+                if pending:
                     logger.warning(
                         "Distributed Stop close timed out after %.1fs with %d "
-                        "%s task(s) still running; releasing teardown",
-                        _DEFAULT_CLOSE_DRAIN_SECONDS,
-                        len(tasks),
-                        label,
+                        "%s task(s) still running; retaining original ownership",
+                        _DEFAULT_CLOSE_DRAIN_SECONDS, len(pending), label,
                     )
                     break
-                pending = tuple(tasks)
-                done, _ = await asyncio.wait(pending, timeout=remaining)
-                if not done:
-                    continue
-        # Fenced epochs keep their own identity on rows they still hold. Each
-        # owner is attempted independently and concurrently under the one
-        # shutdown deadline: one epoch's failure must not skip the others
-        # (#3342), and one epoch that hangs must not starve the others of any
-        # attempt (#3345). The current owner is started first.
+        # Every epoch gets an independent admission attempt. A refused child
+        # cannot abandon an earlier accepted native writer, cancel a sibling,
+        # or bypass aggregation of already-known original control.
         owner_ids = [self._owner_id] + sorted(
             {target.owner_id for target in self._active.values()}
             - {self._owner_id}
         )
         abandon_deadline = max(deadline, loop.time() + 1.0)
-        await asyncio.gather(
-            *(
-                self._abandon_owner_before(owner_id, abandon_deadline)
-                for owner_id in owner_ids
+        try:
+            await gather_owned(
+                (self._abandon_owner_before(owner_id, abandon_deadline)
+                 for owner_id in owner_ids),
+                cancel_siblings_on_error=False,
+                retirement_resource=self,
+                retain_originals=True,
             )
-        )
+        except BaseException as error:
+            failure = execution_terminal_error(failure, error, retain_originals=True)
         pending = pending_owned_retirement_error(
             self, (*self._registration_tasks, *self._cleanup_tasks),
             message="Distributed Stop close still owns unfinished native settlement",
         )
-        if pending is None:
+        if pending is None and failure is None:
             self._active.clear()
             self._by_local_generation.clear()
             self._cleanup_keys.clear()
             self._completing_generation_ids.clear()
         terminal = execution_terminal_error(
-            self._terminal_control, pending, retain_originals=True,
+            self._terminal_control, pending, failure, withdrawal, retain_originals=True,
         )
         if terminal is not None:
             raise terminal

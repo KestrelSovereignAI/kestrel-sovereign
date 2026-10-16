@@ -153,8 +153,43 @@ def pending_owned_retirement_error(resource, tasks, *, message):
     return error
 
 
-async def gather_owned(operations):
-    """Join a fan-out, cancelling siblings on failure without losing receipts."""
+async def wait_owned_tasks_until(tasks, *, deadline: float):
+    """Observe original Tasks within one absolute budget, without cancelling them.
+
+    The caller retains every pending Task and selects its terminal control after
+    this observation. Repeated observer withdrawal neither resets the deadline
+    nor allocates a collector Task or interrupts an accepted native producer.
+    """
+    from kestrel_sovereign.execution_custody import execution_terminal_error
+
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+        raise ValueError("owned task deadline must be finite")
+    originals = set(tasks)
+    pending = {task for task in originals if not task.done()}
+    withdrawal = None
+    loop = asyncio.get_running_loop()
+    while pending:
+        pending = {task for task in pending if not task.done()}
+        remaining = deadline - loop.time()
+        if not pending or remaining <= 0:
+            break
+        try:
+            _, pending = await asyncio.wait(pending, timeout=remaining)
+        except asyncio.CancelledError as error:
+            withdrawal = execution_terminal_error(
+                withdrawal, error, retain_originals=True,
+            )
+    return OwnedTaskOutcome((originals - pending, pending), None, withdrawal)
+
+
+async def gather_owned(operations, *, cancel_siblings_on_error=True,
+                       retirement_resource=None, retain_originals=False):
+    """Join accepted children even if later admission or observation fails.
+
+    Independent native retirement can disable sibling cancellation: all
+    operations are attempted, refused admission retains the original resource,
+    and accepted children physically join before terminal control is selected.
+    """
     from kestrel_sovereign.execution_custody import (
         execution_terminal_error,
         is_execution_control_error,
@@ -164,7 +199,17 @@ async def gather_owned(operations):
     primary = None
     try:
         for operation in operations:
-            children.append(create_owned_task(operation))
+            try:
+                children.append(create_owned_task(
+                    operation, retirement_resource=retirement_resource,
+                    retain_originals=retain_originals,
+                ))
+            except BaseException as error:
+                if cancel_siblings_on_error:
+                    raise
+                primary = execution_terminal_error(
+                    primary, error, retain_originals=retain_originals,
+                )
         pending = set(children)
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -173,8 +218,10 @@ async def gather_owned(operations):
                 if error is not None:
                     raise error
     except BaseException as error:
-        primary = error
-    if primary is not None:
+        primary = execution_terminal_error(
+            primary, error, retain_originals=retain_originals,
+        )
+    if primary is not None and cancel_siblings_on_error:
         for child in children:
             if not child.done():
                 child.cancel()
@@ -186,7 +233,7 @@ async def gather_owned(operations):
         if outcome.error is not None and (not isinstance(outcome.error, asyncio.CancelledError) or is_execution_control_error(outcome.error)):
             errors.append(outcome.error)
         errors.append(outcome.cancellation)
-    terminal = execution_terminal_error(*errors)
+    terminal = execution_terminal_error(*errors, retain_originals=retain_originals)
     if terminal is not None:
         raise terminal
     return results
@@ -824,4 +871,5 @@ __all__ = [
     "raise_owned_outcome",
     "run_blocking_operation",
     "wait_owned_or_pending",
+    "wait_owned_tasks_until",
 ]

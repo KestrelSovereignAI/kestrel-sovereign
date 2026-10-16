@@ -1064,6 +1064,16 @@ without allocating a replacement collector. Native proofs hold PostgreSQL
 acknowledgements after real COMMIT through all three server registry-close
 paths; they do not establish full startup, scheduled cognition or READY.
 
+Both Stop drains use the same absolute-deadline observer for original Tasks.
+Direct distributed-close withdrawal is aggregated with already-known native
+control and pending-owner debt, rather than escaping as plain cancellation.
+Independent owner abandonment uses the canonical owned fan-out: a refused
+admission retains the registry, later epochs still get an attempt, and every
+accepted child joins without sibling cancellation before the terminal result.
+The native tests distinguish a pending COMMIT acknowledgement from an accepted
+abandonment producer paused before its original database operation; neither
+boundary manufactures a physical-retirement acknowledgement.
+
 Health's database deadline checks original control evidence on the timeout
 carrier before producing a diagnostic. Native PostgreSQL health-query tests
 hold the original authority-transaction COMMIT acknowledgement through actual
