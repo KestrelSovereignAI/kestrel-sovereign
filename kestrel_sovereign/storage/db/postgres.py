@@ -881,7 +881,7 @@ class PostgresBackend(DatabaseBackend):
         """
 
         scopes = self._remember_transaction_custody()
-        if executor is not self._pool:
+        if _native_observation_requested() and executor is not self._pool:
             _require_native_observation_for_connection(executor)
         if not scopes:
             if _native_observation_requested() and executor is self._pool:
@@ -1118,6 +1118,7 @@ class PostgresBackend(DatabaseBackend):
         self, connection: Any, scopes: tuple[ExecutionCustody, ...],
         commit_state: _ExecutionCommitState | None = None,
     ) -> AsyncIterator[None]:
+        _require_native_observation_for_connection(connection)
         state = commit_state if commit_state is not None else _ExecutionCommitState()
         if scopes and not state.native_owned:
             raise ExecutionAuthorityError("opaque pool checkout cannot admit execution custody; use PostgresPoolAdapter")
@@ -1509,6 +1510,7 @@ class PostgresBackend(DatabaseBackend):
 
         existing = self._current_txn_conn()
         if existing is not None:
+            _require_native_observation_for_connection(existing)
             await self._verify_operational_cluster_identity(
                 existing,
                 expected_cluster_identity,
@@ -1523,6 +1525,7 @@ class PostgresBackend(DatabaseBackend):
                     raise QueryError(
                         "PostgreSQL operational session is no longer active"
                     )
+                _require_native_observation_for_connection(existing_lease.connection)
                 await self._verify_operational_cluster_identity(
                     existing_lease.connection,
                     expected_cluster_identity,
@@ -1560,6 +1563,7 @@ class PostgresBackend(DatabaseBackend):
         existing = self._current_txn_conn()
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
+            _require_native_observation_for_connection(existing)
             after_commit = self._current_after_commit()
             after_commit.open_savepoint()
             body_failure: BaseException | None = None

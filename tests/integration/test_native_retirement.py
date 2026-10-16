@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import weakref
+from contextvars import ContextVar
 
 import asyncpg
 import pytest
@@ -26,6 +27,39 @@ from tests.integration.test_execution_authority_postgres import native_pg as _na
 
 native_pg = _native_pg
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+
+
+@pytest.mark.parametrize("lease_kind", ["operational", "nested_transaction"])
+async def test_late_observer_is_refused_before_native_transaction_entry(native_pg, monkeypatch, lease_kind):
+    backend, _control, _schema = native_pg
+    observer = NativeExecutionObserver()
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("original unobserved parent transaction"))
+    marked = ContextVar("original late observed transaction entry", default=False)
+    entries, errors = [], []
+    native_enter = asyncpg.transaction.Transaction.__aenter__
+
+    async def enter(transaction):
+        if marked.get():
+            entries.append(transaction)
+        return await native_enter(transaction)
+
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aenter__", enter)
+    with bind_execution_custody_snapshot((scope,)):
+        parent = backend.operational_session() if lease_kind == "operational" else backend.transaction()
+        async with parent:
+            token = marked.set(True)
+            try:
+                with bind_native_execution_observer(observer):
+                    async with backend.transaction():
+                        pass
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                marked.reset(token)
+            scope.require_work()
+    assert errors and is_execution_control_error(errors[0]), "late observer admitted an unobserved native transaction"
+    assert not entries, "refusal followed native BEGIN/savepoint admission"
+    assert not observer._resources
 
 
 @pytest.mark.parametrize("cancel_observer", [False, True])
