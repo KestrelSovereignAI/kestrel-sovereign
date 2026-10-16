@@ -689,8 +689,10 @@ async def test_timely_original_callback_cancellation_is_raised_after_successful_
 @pytest.mark.parametrize("door", ["tail", "completion", "outer"])
 @pytest.mark.parametrize("close_cancels", [False, True])
 @pytest.mark.parametrize("refusal_cancels", [False, True])
+@pytest.mark.parametrize("late_background", [False, True])
 async def test_actual_snapshot_failure_and_stop_refusal_keep_both_originals(
-    native_snapshot, tmp_path, monkeypatch, door, close_cancels, refusal_cancels
+    native_snapshot, tmp_path, monkeypatch, door, close_cancels, refusal_cancels,
+    late_background,
 ):
     from inspect import CORO_CLOSED, getcoroutinestate
 
@@ -766,6 +768,26 @@ async def test_actual_snapshot_failure_and_stop_refusal_keep_both_originals(
             and close_tasks[0].done()
         )
         assert all(getcoroutinestate(coro) == CORO_CLOSED for coro in refused)
+        if late_background:
+            from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+            # Declared stronger background input AFTER actual native close A
+            # and actual stop-Task refusal B; not driver-generated UNKNOWN.
+            late = ExecutionCommitOutcomeError("unknown")
+
+            async def publish_late_control():
+                raise late
+
+            completed = asyncio.Event()
+            worker = agent._track_background_task(
+                publish_late_control(), name="late-background-control"
+            )
+            worker.add_done_callback(lambda done: completed.set())
+            await asyncio.wait_for(completed.wait(), 5)
+            assert worker.done()
+            with pytest.raises(BaseException) as retained:
+                agent._raise_shutdown_control()
+            tail_failure = retained.value
         selected = tail_failure
         if door != "tail":
             selected = None

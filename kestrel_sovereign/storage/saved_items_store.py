@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .async_database import AsyncDatabase
 from .embedding_column import (
     decode_stored_embedding,
@@ -927,6 +929,8 @@ class SavedItemsStore:
             self._sqla_factory = make_session_factory(self.db)
             return self._sqla_factory
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.info(
                 "SQLAlchemy session factory unavailable for saved_items "
                 "vector search (%s); falling back to in-Python search.",
@@ -1282,6 +1286,8 @@ class SavedItemsStore:
         try:
             rows = await _run(with_profile=current_profile_id is not None)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             # Profile column missing → pre-#1477 DB. Retry without
             # the filter so the legacy behaviour still works.
             logger.debug(

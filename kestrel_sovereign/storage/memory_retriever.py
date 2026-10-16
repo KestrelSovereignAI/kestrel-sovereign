@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import json
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .memory_models import MemoryMetadata
 from .async_conversation_store import (
     AsyncConversationStore,
@@ -892,6 +894,8 @@ class MemoryRetriever:
 
             return make_session_factory(db)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.info(
                 "SQLAlchemy session factory unavailable for memory retrieval "
                 "vector search (%s); falling back to legacy row embeddings.",

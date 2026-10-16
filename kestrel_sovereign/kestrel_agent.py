@@ -146,6 +146,7 @@ from kestrel_sovereign.command_policy import (
     prefixed_command_token,
 )
 from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
     execution_terminal_error,
     execution_work_operation,
     is_execution_control_error,
@@ -9228,7 +9229,11 @@ Expected Duration: {expected_duration}
         self._background_tasks.add(task)
         def completed(done):
             from kestrel_sovereign._async_ownership import owned_task_error
-            self._remember_shutdown_control(owned_task_error(done))
+            # Unbounded publishers keep one strongest receipt, not a history
+            # of completed worker payloads. Finite lifecycle drains opt in.
+            self._remember_shutdown_control(
+                owned_task_error(done), retain_originals=False,
+            )
             self._background_tasks.discard(done)
         task.add_done_callback(completed)
         return task
@@ -9298,7 +9303,9 @@ Expected Duration: {expected_duration}
 
         def completed(done):
             from kestrel_sovereign._async_ownership import owned_task_error
-            self._remember_shutdown_control(owned_task_error(done))
+            self._remember_shutdown_control(
+                owned_task_error(done), retain_originals=False,
+            )
             self._background_tasks.discard(done)
             if not started:
                 coro.close()
@@ -9474,16 +9481,31 @@ Expected Duration: {expected_duration}
 
         This is a terminal-control inventory, not ordinary background history:
         non-control failures are still ignored unless cancellation is opted in.
-        Every entry path preserves existing and incoming original carriers.
+        Lifecycle entries preserve existing and incoming original carriers;
+        unbounded background publishers explicitly keep one strongest receipt.
         """
         if error is None or (
             not is_execution_control_error(error)
             and not (retain_cancellation and isinstance(error, asyncio.CancelledError))
         ):
             return
-        self._shutdown_control = execution_terminal_error(
-            vars(self).get("_shutdown_control"), error,
-            retain_originals=retain_originals,
+        # A late, stronger background receipt must not replace original
+        # finite native close/admission evidence. Conversely, aggregating
+        # every completed worker into that finite inventory retains an
+        # unbounded history. Keep the two ownership classes separately and
+        # project them without mutating either original carrier.
+        channel = ("_shutdown_lifecycle_control" if retain_originals
+                   else "_shutdown_background_control")
+        setattr(self, channel, execution_terminal_error(
+            vars(self).get(channel), error, retain_originals=retain_originals,
+        ))
+        lifecycle = vars(self).get("_shutdown_lifecycle_control")
+        background = vars(self).get("_shutdown_background_control")
+        self._shutdown_control = (
+            BaseExceptionGroup("agent terminal ownership evidence", [lifecycle, background])
+            if lifecycle is not None and background is not None
+            and background not in tuple(_explicit_control_chain(lifecycle))
+            else lifecycle if lifecycle is not None else background
         )
 
     def _raise_shutdown_control(self, *, control_only: bool = False) -> None:

@@ -164,6 +164,8 @@ class MemoryConsolidator:
             self._sqla_factory = make_session_factory(self._db)
             return self._sqla_factory
         except Exception as e:  # noqa: BLE001
+            if is_execution_control_error(e):
+                raise
             logger.debug("episode vector session factory unavailable: %s", e)
             self._sqla_factory_unavailable = True
             return None

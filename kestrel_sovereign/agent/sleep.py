@@ -1028,7 +1028,9 @@ class SleepMixin:
                     else:
                         report.error = unavailability_reason
                     _record_failure_code(report, unavailability_reason)
-            except MemoryConsolidationTimeoutError:
+            except MemoryConsolidationTimeoutError as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 logger.error("Consolidation timed out", exc_info=True)
                 if report.error:
                     report.error += "; consolidation_failed"

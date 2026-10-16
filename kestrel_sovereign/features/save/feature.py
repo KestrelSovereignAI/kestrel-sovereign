@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import (
@@ -486,6 +487,8 @@ class SaveFeature(Feature):
                 tags=tag_list
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"save_item failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -553,6 +556,8 @@ class SaveFeature(Feature):
                 limit=limit
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall failed: {e}")
             return ToolResult.failed(str(e))
 

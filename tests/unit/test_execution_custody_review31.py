@@ -71,9 +71,17 @@ async def test_late_native_effect_receipt_survives_facade_retirement(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["agent", "feature", "a2a"])
-async def test_completed_native_background_owners_retain_one_strongest_receipt(tmp_path, route):
+@pytest.mark.parametrize("route", ["agent", "feature", "runtime", "feature-runtime", "a2a"])
+@pytest.mark.parametrize("finite", [False, True])
+async def test_completed_native_background_owners_retain_one_strongest_receipt(tmp_path, route, finite):
     agent, db = await native_owner(tmp_path)
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+
+    # Declared finite lifecycle control alongside actual SQLite worker effects;
+    # the integration matrix separately exercises actual native close errors.
+    lifecycle = carrier("error") if finite else None
+    if lifecycle is not None:
+        agent._remember_shutdown_control(lifecycle)
 
     class Native(Feature):
         async def initialize(self):
@@ -106,6 +114,10 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
                 task = agent._track_background_task(effect(), name="native-bounded-receipt")
             elif route == "feature":
                 task = feature._track_owned_background_task(effect(), name="native-bounded-receipt")
+            elif route == "runtime":
+                task = agent._track_runtime_task(effect(), name="native-bounded-receipt")
+            elif route == "feature-runtime":
+                task = feature._track_owned_runtime_task(effect(), name="native-bounded-receipt")
             else:
                 task = manager._track_execution_task(
                     effect(), task_id=str(index), authority_agent_id=agent.did,
@@ -119,19 +131,31 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
         assert not getattr(feature, "_owned_background_tasks", ())
         assert not manager._execution_tasks
         assert sum(reference() is not None for reference in payloads) == 1
+        if finite:
+            # Re-publication of the same finite inventory is not new evidence
+            # and must not grow a wrapper history around the bounded worker.
+            size = len(tuple(_explicit_control_chain(agent._shutdown_control)))
+            for _ in range(20):
+                agent._remember_shutdown_control(agent._shutdown_control)
+            assert len(tuple(_explicit_control_chain(agent._shutdown_control))) == size
         if route == "a2a":
             assert manager._execution_control is strongest
             with pytest.raises(BaseException) as caught:
                 await manager.drain_execution_tasks()
-        elif route == "feature":
+        elif route in {"feature", "feature-runtime"}:
             assert feature._owned_background_control is strongest
             with pytest.raises(BaseException) as caught:
                 await feature._cancel_owned_background_tasks()
         else:
-            assert agent._shutdown_control is strongest
+            chain = tuple(_explicit_control_chain(agent._shutdown_control))
+            assert strongest in chain
+            if finite:
+                assert lifecycle in chain
+            else:
+                assert agent._shutdown_control is strongest
             with pytest.raises(BaseException) as caught:
                 agent._raise_shutdown_control()
-        assert caught.value is strongest
+        assert strongest in tuple(_explicit_control_chain(caught.value))
     finally:
         await retire(agent)
 
