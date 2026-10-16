@@ -1042,6 +1042,14 @@ failed client closure cannot clear its original supervisor/client reference.
 Process termination is still attempted independently. No Phoenix process is
 started or adopted by the native proxy tests.
 
+Host-Scheduler shutdown aggregates the original runner receipt with independent
+storage retirement instead of replacing it in a finally block. Each original
+application reference clears only after that owner's successful stop/close.
+The PostgreSQL proof drives a real polling runner into native COMMIT-ACK loss,
+then refuses its original backend closer; successful independent storage
+closure is tested separately. Neither case claims a scheduled cognition or
+server READY result.
+
 Health's database deadline checks original control evidence on the timeout
 carrier before producing a diagnostic. Native PostgreSQL health-query tests
 hold the original authority-transaction COMMIT acknowledgement through actual

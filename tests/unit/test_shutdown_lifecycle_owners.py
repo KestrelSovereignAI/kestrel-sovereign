@@ -981,7 +981,9 @@ async def test_host_scheduler_start_failure_closes_storage_even_when_runner_stop
     assert runner_instances[0].stop_calls == 1
     assert storage_instances[0].closed is True
     assert app.state.host_scheduler_storage is None
-    assert app.state.host_scheduler_runner is None
+    # Failed stop is not positive retirement, even when independent storage
+    # closes successfully. Preserve the original runner for reconciliation.
+    assert app.state.host_scheduler_runner is runner_instances[0]
 
 
 @pytest.mark.asyncio

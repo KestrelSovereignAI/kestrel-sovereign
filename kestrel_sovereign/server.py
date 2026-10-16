@@ -2912,22 +2912,37 @@ async def _shutdown_host_scheduler(app: FastAPI) -> None:
     runner = getattr(app.state, "host_scheduler_runner", None)
     storage = getattr(app.state, "host_scheduler_storage", None)
     manager = getattr(app.state, "agent_manager", None)
+    failures = []
     if manager is not None:
         configure_registration = getattr(
             manager, "set_scheduler_tenant_registration_hook", None
         )
         if callable(configure_registration):
-            configure_registration(None)
-    try:
-        if runner is not None:
-            await runner.stop()
-    finally:
+            try:
+                configure_registration(None)
+            except BaseException as error:
+                failures.append(error)
+    # The runner's stop owns physical joins. Attempt storage retirement too,
+    # but neither a later close failure nor state cleanup may erase its exact
+    # native receipt or a failed original owner's strong application reference.
+    for attribute, resource, method in (
+        ("host_scheduler_runner", runner, "stop"),
+        ("host_scheduler_storage", storage, "close"),
+    ):
+        if resource is None:
+            continue
         try:
-            if storage is not None:
-                await storage.close()
-        finally:
-            app.state.host_scheduler_runner = None
-            app.state.host_scheduler_storage = None
+            await getattr(resource, method)()
+        except BaseException as error:
+            failures.append(error)
+        else:
+            if getattr(app.state, attribute, None) is resource:
+                setattr(app.state, attribute, None)
+    terminal = execution_terminal_error(
+        *failures, retain_originals=True, prefer_cancellation=True,
+    )
+    if terminal is not None:
+        raise terminal
 
 
 async def _shutdown_server_agents(app: FastAPI) -> None:

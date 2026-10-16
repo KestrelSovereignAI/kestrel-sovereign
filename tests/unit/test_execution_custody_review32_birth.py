@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.execution_custody import current_execution_custody
+from kestrel_sovereign.execution_custody import (
+    current_execution_custody,
+    execution_cleanup_debts,
+    is_execution_control_error,
+)
 from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from tests.unit.test_execution_custody_review22 import stub_single_startup
@@ -93,10 +97,17 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
         state = manager
         owners_name = "_unpublished_llm_owners"
     try:
-        if kind in {"unknown", "cancel_unknown", "group"} and not late_receipt:
+        if kind in {"unknown", "cancel_unknown", "group", "ordinary"} and not late_receipt:
             with pytest.raises(BaseException) as caught:
                 await initialize()
             assert caught.value is failure
+            if kind == "ordinary":
+                # This error came from an ORIGINAL physical adapter close,
+                # not an ordinary writer. Its failed ACK now truthfully owns
+                # native retirement debt and must make startup fail closed.
+                assert is_execution_control_error(failure)
+                assert any(resource is service.providers[0]["adapter"]
+                           for resource, _ in execution_cleanup_debts(failure))
         elif surface == "manager":
             with pytest.raises(ValueError, match="constructor rejected"):
                 await initialize()

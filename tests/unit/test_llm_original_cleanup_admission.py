@@ -343,3 +343,62 @@ async def test_refused_writer_wrapper_does_not_close_original_writers_database(
         await client.close()
         await service.wait_for_close_completion()
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_sdk_failed_close_ack_keeps_unpublished_service_fatal(
+    tmp_path, monkeypatch
+):
+    # Reuse the actual loopback HTTPX lifetime fixture; its concrete supervisor
+    # never starts/adopts a process. SDK.close operates on that ORIGINAL client.
+    from tests.unit.test_server_original_shutdown_dependencies import (
+        native_phoenix_proxy,
+    )
+
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    service, owners, calls = agent.llm_service, {}, []
+    original = OSError("actual original SDK transport close ACK lost")
+    try:
+        async with native_phoenix_proxy(tmp_path) as (_supervisor, transport, closed):
+            client = openai.AsyncOpenAI(
+                api_key="inert-local-native-close-test",
+                base_url="http://127.0.0.1/unused-sdk-endpoint",
+                http_client=transport,
+            )
+            service.providers.append(
+                {"name": "original-loopback-sdk", "client": client}
+            )
+            native_close = transport.aclose
+
+            async def lost_ack():
+                await native_close()
+                calls.append(True)
+                raise original
+
+            with monkeypatch.context() as fault:
+                fault.setattr(transport, "aclose", lost_ack)
+                with pytest.raises(OSError) as caught:
+                    await retire_unpublished_llm(
+                        owners, "actual-sdk-owner", service, ()
+                    )
+                assert caught.value is original and is_execution_control_error(original)
+                assert any(
+                    resource is client
+                    for resource, _ in execution_cleanup_debts(original)
+                )
+                await asyncio.wait_for(closed.wait(), 2)
+                assert transport.is_closed and service.has_pending_close_owners()
+                assert owners["actual-sdk-owner"].provider is service
+                with pytest.raises(OSError) as repeated:
+                    await retire_unpublished_llm(
+                        owners, "actual-sdk-owner", service, (), join_native=True
+                    )
+                assert repeated.value is original and calls == [True]
+                assert not agent._runtime_publication_ready.is_set()
+    finally:
+        try:
+            await agent.shutdown()
+        except BaseException as error:
+            if error is not original:
+                raise
+        await db.close()
