@@ -183,11 +183,18 @@ clears share one owner and deadline rather than accumulating waiters or
 extending the deadline. Clear timeout or pending-audio overflow retires the
 original client with `AUDIO_OUTPUT_CONTROL_FAILED`, including its microphone,
 playback context and socket. Queued audio is not silently truncated on overflow.
+PCM/end messages retain their producer order while waiting for clear ACK;
+adjacent duplicate ends coalesce so control metadata is bounded too. A Stop
+received while the original worklet is loading is forwarded once its handler
+exists, at the latest requested generation and under the original deadline.
 
 A loopback Chromium proof measures the actual post-gain graph: stale positive
 PCM stays excluded while fresh negative-marker PCM renders after clear ACK.
 Removing the epoch or gain gate fails that native proof. Separate native client
-tests cover typed replacement and missing clear ACK through both voice clients.
+tests cover typed replacement, Stop during initialization, and missing clear
+ACK through both voice clients. Failure tests observe automatic physical
+retirement before fixture cleanup; removing the production error-callback
+close makes those assertions fail.
 These are local PCM guarantees, **not** a claim that JSON response filtering or
 an input-clear ACK fences the separate WebRTC RTP stream. The strict framed
 provider profile and end-to-end native input/output verification remain pending.

@@ -45,9 +45,8 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
   let muted = false;
   let failure = null;
   let pendingClear = null;
-  let pendingChunks = [];
+  let pendingOperations = [];
   let pendingBytes = 0;
-  let pendingEnd = false;
   const maxPendingBytes = Math.ceil(sampleRate * 2 * maxPendingAudioMs / 1000);
   const idleWaiters = new Set();
   function resolveIdleWaiters() {
@@ -84,6 +83,14 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
       node.port.postMessage({ type: 'push', generation, pcm: copy.buffer }, [copy.buffer]);
     } catch (error) { fail(error); throw error; }
   }
+  function postClear() {
+    // onAcquire publishes the owner BEFORE worklet loading can suspend.
+    // Remember an early Stop; setup forwards only its latest generation once
+    // the original node/handler exist, without restarting its deadline.
+    if (!node) return;
+    try { node.port.postMessage({ type: 'flush', generation }); }
+    catch (error) { fail(error); throw error; }
+  }
   const owner = {
     enqueue(uint8) {
       if (failure) throw failure;
@@ -95,7 +102,7 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
           fail(error);
           throw error;
         }
-        pendingChunks.push(new Uint8Array(uint8));
+        pendingOperations.push({ type: 'push', pcm: new Uint8Array(uint8) });
         pendingBytes += uint8.byteLength;
         return;
       }
@@ -103,7 +110,12 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
     },
     endOfStream() {
       if (failure) throw failure;
-      if (pendingClear) pendingEnd = true;
+      if (pendingClear) {
+        // Preserve the actual producer order (push/end/push is NOT
+        // push/push/end). Adjacent duplicate ends are idempotent and coalesce,
+        // so metadata cannot grow without the bounded PCM-byte inventory.
+        if (pendingOperations.at(-1)?.type !== 'end') pendingOperations.push({ type: 'end' });
+      }
       else if (!retired) {
         try { node?.port.postMessage({ type: 'end', generation }); }
         catch (error) { fail(error); throw error; }
@@ -120,9 +132,8 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
       if (retired) return Promise.resolve({ generation, cleared: false, retired: true });
       generation += 1;
       playing = false;
-      pendingChunks = [];
+      pendingOperations = [];
       pendingBytes = 0;
-      pendingEnd = false;
       // Repeated Stop shares ONE bounded owner, not an ever-growing waiter
       // inventory or a deadline that every new Stop can extend indefinitely.
       if (!pendingClear) {
@@ -138,8 +149,7 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
       }
       applyGain(); // Physical gate FIRST; user unmute cannot reopen it.
       const promise = pendingClear.promise;
-      try { node?.port.postMessage({ type: 'flush', generation }); }
-      catch (error) { fail(error); throw error; }
+      postClear();
       resolveIdleWaiters();
       return promise;
     },
@@ -150,7 +160,7 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
       retired = true;
       applyGain();
       settleClear(failure || new Error('Playback retired before worklet clear acknowledgement.'));
-      pendingChunks = [];
+      pendingOperations = [];
       pendingBytes = 0;
       playing = false;
       resolveIdleWaiters();
@@ -194,15 +204,16 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
     if (msg.type === 'cleared') {
       if (!pendingClear) return;
       try {
-        for (const chunk of pendingChunks) pushToWorklet(chunk);
-        if (pendingEnd) node.port.postMessage({ type: 'end', generation });
+        for (const operation of pendingOperations) {
+          if (operation.type === 'push') pushToWorklet(operation.pcm);
+          else node.port.postMessage({ type: 'end', generation });
+        }
       } catch (error) {
         fail(error);
         return;
       }
-      pendingChunks = [];
+      pendingOperations = [];
       pendingBytes = 0;
-      pendingEnd = false;
       settleClear(null);
       applyGain();
     } else if (msg.type === 'underflow') {
@@ -212,6 +223,8 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
       resolveIdleWaiters();
     }
   };
+
+  if (pendingClear) postClear();
 
   return owner;
   } catch (error) {

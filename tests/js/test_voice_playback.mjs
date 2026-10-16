@@ -155,6 +155,22 @@ test('a missing clear ACK retires playback and exposes the original failure', as
   assert.equal(lastContext.state, 'closed');
 });
 
+test('a later pending PCM push supersedes an earlier end marker before clear ACK', async () => {
+  const playback = await createVoicePlayback();
+  const clear = playback.flush();
+  try {
+    playback.enqueue(new Uint8Array([1, 2]));
+    playback.endOfStream();
+    playback.enqueue(new Uint8Array([3, 4]));
+    lastNode.port.onmessage({ data: { type: 'cleared', generation: 1 } });
+    await clear;
+    assert.deepEqual(lastNode.messages.map(message => message.type), ['flush', 'push', 'end', 'push']);
+    assert.equal(playback.isPlaying(), true);
+  } finally {
+    await playback.destroy();
+  }
+});
+
 test('pending-clear audio overflow fails explicitly instead of discarding frames', async () => {
   const playback = await createVoicePlayback({ maxPendingAudioMs: 1 });
   const clear = playback.flush();

@@ -211,8 +211,13 @@ test(`native ${path} clear-ACK failure retires original microphone, playback and
     await page.evaluate(() => window.client.cancelResponse());
     await page.waitForFunction(() => window.nativeEvents.some(event =>
       event.code === 'AUDIO_OUTPUT_CONTROL_FAILED' && event.fatal), null, { timeout: 4000 });
-    const state = await page.evaluate(async () => {
-      await window.client.close();
+    // Observe automatic retirement FIRST. The fixture's finally owns any
+    // later cleanup and must not make a broken error callback look correct.
+    await page.waitForFunction(() => window.originalMic.getTracks().every(track => track.readyState === 'ended')
+      && window.originalContexts.every(context => context.state === 'closed')
+      && window.originalSockets.length === 1
+      && window.originalSockets.every(socket => socket.readyState === WebSocket.CLOSED), null, { timeout: 2000 });
+    const state = await page.evaluate(() => {
       return { tracks: window.originalMic.getTracks().map(track => track.readyState),
         contexts: window.originalContexts.map(context => context.state) };
     });
@@ -222,6 +227,37 @@ test(`native ${path} clear-ACK failure retires original microphone, playback and
     await page.waitForFunction(() => window.originalSockets.length === 1
       && window.originalSockets.every(socket => socket.readyState === WebSocket.CLOSED), null, { timeout: 2000 });
   }, '{}', { autoStart: false, transport: 'websocket', dropPlaybackClearAck: true });
+});
+}
+
+for (const stops of [1, 2]) {
+test(`native pending playback initialization forwards latest clear after ${stops} Stop request(s)`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, enteredWorklet, releaseWorklet }) => {
+    await page.evaluate(() => {
+      const NativeNode = window.AudioWorkletNode;
+      window.initializationClearAcks = [];
+      window.AudioWorkletNode = class extends NativeNode {
+        constructor(...args) {
+          super(...args);
+          if (args[1] === 'kestrel-playback') {
+            this.port.addEventListener('message', event => {
+              if (event.data?.type === 'cleared') window.initializationClearAcks.push(event.data);
+            });
+            this.port.start();
+          }
+        }
+      };
+      window.initializing = window.client.start();
+    });
+    await enteredWorklet;
+    await page.evaluate(stops => {
+      for (let count = 0; count < stops; count++) window.client.cancelResponse();
+    }, stops);
+    releaseWorklet();
+    await page.evaluate(() => window.initializing);
+    await page.waitForFunction(stops => window.initializationClearAcks.some(ack => ack.generation === stops), stops, { timeout: 1000 });
+    assert.ok(await page.evaluate(() => window.client.micStream.getTracks().every(track => track.readyState === 'live')));
+  }, '{}', { autoStart: false, transport: 'websocket', holdWorklet: 'playback' });
 });
 }
 
