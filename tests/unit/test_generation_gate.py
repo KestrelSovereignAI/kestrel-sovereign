@@ -596,14 +596,31 @@ def _route(agent, name: str, daemon: _Daemon) -> dict:
     return provider
 
 
-def _booted_agent(tmp_path):
+@asynccontextmanager
+async def _booted_agent(tmp_path):
     """A real agent on real storage; only the daemons are scripted. Beyond
     the mandatory features it loads only the one whose tool the turns call,
     so an installed optional package adds no model call of its own."""
-    return booted_agent(
+    async with booted_agent(
         tmp_path, name="Gate", provenance="test:generation_gate",
         features={"StateOfMindFeature"},
-    )
+    ) as agent:
+        # This table tests generation/Stop outcomes, not cold database startup.
+        # Initialize the actual owned usage DB before a one-second watchdog can
+        # interrupt its native schema COMMIT on a loaded unit-test worker.
+        await agent.llm_service._ensure_db_initialized()
+        yield agent
+
+
+@pytest.mark.asyncio
+async def test_generation_fixture_opens_usage_database_before_timed_calls(tmp_path):
+    """The generation watchdog must not race unrelated usage-DB migrations."""
+    async with _booted_agent(tmp_path) as agent:
+        service = agent.llm_service
+        assert service._db_initialized and service._usage_db is not None, (
+            "generation fixture handed a cold usage database to a timed call"
+        )
+        assert await service._usage_db.fetchval("SELECT COUNT(*) FROM model_usage") == 0
 
 
 @asynccontextmanager

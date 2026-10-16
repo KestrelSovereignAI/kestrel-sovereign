@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
 from kestrel_sovereign.a2a.stores.unified import (
@@ -24,6 +24,7 @@ from kestrel_sovereign.endpoints.agent import (
     _create_a2a_task_under_lifecycle_lease,
     _scoped_agent_did_or_503,
     _task_recipient_principal,
+    list_tasks,
 )
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
@@ -52,6 +53,7 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
         "inbound-identity",
         "task-recipient",
         "task-scope",
+        "task-list",
     ],
 )
 @pytest.mark.parametrize("kind", ["native-control", "ordinary"])
@@ -168,6 +170,8 @@ async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(
                 retained = receipt
 
             class IdentityReadback:
+                task_manager = tasks
+
                 @property
                 def did(self):
                     if kind == "native-control":
@@ -187,6 +191,12 @@ async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(
                     result = authorizer._stable_agent_id(IdentityReadback())
                 elif door == "task-recipient":
                     result = _task_recipient_principal(IdentityReadback())
+                elif door == "task-list":
+                    result = await list_tasks(
+                        Request({"type": "http", "state": {"agent": IdentityReadback()}}),
+                        status=None,
+                        limit=50,
+                    )
                 else:
                     result = _scoped_agent_did_or_503(
                         IdentityReadback(), "native policy read requires"
@@ -211,7 +221,7 @@ async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(
             )
             assert sources[0] in tuple(_explicit_control_chain(failure))
             assert execution_commit_outcome(failure) == "committed"
-        elif door in {"endpoint-policy", "task-recipient", "task-scope"}:
+        elif door in {"endpoint-policy", "task-recipient", "task-scope", "task-list"}:
             assert isinstance(failure, HTTPException)
             assert failure.status_code == (403 if door == "endpoint-policy" else 503)
             assert not is_execution_control_error(failure)

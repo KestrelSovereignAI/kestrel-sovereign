@@ -15,6 +15,21 @@ tags:
 Core issue #3569 extends existing PostgreSQL advisory and native transaction
 custody. This is a host authority contract, not a causation-derived permission.
 
+Corpus-profile surveys and operator reindexing preserve original native control
+before unreadable-table/zero-count fallbacks, batch splitting, failed-row
+accounting or registry/parity success. Actual localhost SDK outputs, scoped
+PostgreSQL vector writes and post-COMMIT release-ACK failures exercise these
+producer boundaries, including the real model-preference callback wired to the
+LLM service. A committed first-row failure cannot continue into a second row.
+Ordinary availability failures retain their best-effort behavior and legitimate
+bounded split retry. These are component/native proofs, not full Agent READY,
+authenticated HTTP or public-provider acceptance. Explicit component DDL does
+not certify startup migrations; legacy cross-schema migration probes are tracked
+separately in #3673. Settings/CLI/background-job outer normalization and sibling
+context tools remain under the open cumulative ledger, not cleared by these
+producer tests. The task-list HTTP wrapper likewise propagates the identity
+helper's original receipt instead of replacing it with an ordinary HTTP500.
+
 Snapshot upload retirement uses the existing native close owner, opting into
 retaining the opening cancellation and original close error together. Refused
 close admission retains the exact unstarted client; repeated caller withdrawal

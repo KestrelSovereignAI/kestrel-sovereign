@@ -2733,6 +2733,8 @@ async def list_tasks(
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error listing tasks: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error listing tasks.")
 
