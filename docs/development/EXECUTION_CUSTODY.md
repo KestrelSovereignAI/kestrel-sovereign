@@ -963,10 +963,26 @@ transaction's committed/unknown disposition rather than implying rollback.
 These native tests exercise the original storage operations; the embedding-span
 proof does not replace signed-amendment authorization coverage.
 
-Reentrant feature shutdown excludes the current physical Task from its own
-drain without dropping that Task's original ownership root. Completion removes
-that root only when the Task actually finishes. Codex's abandoned per-thread
+Reentrant feature shutdown checks the live physical join graph before each
+join, excluding itself and actual waiting callers without dropping their
+original ownership roots. A snapshot taken before another owner enters shutdown
+is not permission to join it later. Completion removes each original root only
+when that Task actually finishes. This bookkeeping grants no execution authority.
+Codex's abandoned per-thread
 mutex acquisition releases synchronously, without requiring another Task to
 admit Lock.release. Asynchronous abandoned-result cleanup uses canonical closer
 admission, retaining its original returned resource if that admission fails.
+
+Host-context bootstrap preserves original authority/commit/retirement controls
+instead of returning them as degraded-state text. Ordinary capability failures
+retain the separately documented degraded-context behavior. Cleanup registers
+each actual resource before close-Task admission, joins accepted original close
+operations, and attempts independent resources even when another close reports
+native debt. Session factories retire before their borrowed databases. Failed
+or unaccepted original owners remain retained across retries; another resource's
+successful close cannot acknowledge their debt. The original caller owns this
+drain without an extra all-resource collector Task. Local SQLite constructor/
+closer fault tests cover these contracts, not live server READY publication or
+hosted Workflow acceptance.
+
 These are candidate contracts, not whole-branch review or release approval.

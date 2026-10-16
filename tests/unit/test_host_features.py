@@ -30,6 +30,13 @@ from kestrel_sovereign.host_features.context import (
 )
 from kestrel_sovereign.security import csrf
 
+
+@pytest.fixture
+def _local_host_auth(monkeypatch):
+    # Local Sovereign host authentication, not a paid-provider API key. These
+    # structural lifespan tests must not depend on another module's key state.
+    monkeypatch.setenv("KESTREL_API_KEY", "local-host-feature-lifecycle-test")
+
 # ---------------------------------------------------------------------------
 # A minimal host feature used across the tests.
 # ---------------------------------------------------------------------------
@@ -334,6 +341,7 @@ async def test_one_feature_start_failure_does_not_abort_others():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reject_context", [False, True])
+@pytest.mark.usefixtures("_local_host_auth")
 async def test_server_lifespan_wires_and_closes_host_features(
     monkeypatch, tmp_path: Path, reject_context: bool,
 ):
@@ -555,6 +563,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_local_host_auth")
 async def test_server_retains_control_context_after_optional_mount_failure(
     monkeypatch,
     tmp_path: Path,
