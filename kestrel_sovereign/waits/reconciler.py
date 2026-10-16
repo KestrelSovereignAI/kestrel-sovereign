@@ -1086,7 +1086,11 @@ class WaitReconciler:
             return
 
         attempts = attempts_so_far + 1
-        origin_session_id = await _provider_origin_session(provider, handle)
+        # The session that registered the watch (#3663); the provider's own
+        # record only for a row that stores none.
+        origin_session_id = (
+            state.watch_origin_session_id if state else None
+        ) or await _provider_origin_session(provider, handle)
         signal = self._build_signal(
             provider, kind, handle, status, attempts,
             origin_session_id=origin_session_id,
@@ -1455,7 +1459,8 @@ async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
 async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
     """Ask ``provider`` which chat session registered ``handle`` (#2877).
 
-    The reconciler's ONLY trusted source for wake routing. Optional and
+    The reconciler's trusted fallback for wake routing, asked only when the
+    watch row stores no registering session (#3663). Optional and
     structural, exactly like ``owns_handle``: a provider that records the
     dispatching session on its own local job/task record exposes
     ``origin_session_id(handle)`` returning that session id, or ``None`` when
@@ -1541,7 +1546,9 @@ async def _resolve_owned_provider(agent: Any, ref: str) -> Tuple[str, str, Any]:
     return kind, handle, provider
 
 
-async def register_wait_watch(agent: Any, ref: str) -> None:
+async def register_wait_watch(
+    agent: Any, ref: str, *, origin_session_id: Optional[str] = None
+) -> None:
     """Register an explicit watch on ``ref`` so the reconciler wakes the agent
     when that handle reaches a terminal state.
 
@@ -1580,7 +1587,9 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
             provider affirmatively does not own.
     """
     kind, handle, _provider = await _resolve_owned_provider(agent, ref)
-    await _get_reconciler(agent)._store.start_watch(kind, handle)
+    await _get_reconciler(agent)._store.start_watch(
+        kind, handle, origin_session_id=origin_session_id
+    )
 
 
 class DurableResumeUnsupportedError(ValueError):

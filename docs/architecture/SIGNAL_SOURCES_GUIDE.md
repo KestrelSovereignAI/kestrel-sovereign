@@ -628,10 +628,17 @@ Five rules:
    turn into whichever pane happens to be open.
 
 2. **Never take the session from caller-influenceable data.** The wait
-   reconciler resolves it through the provider's `origin_session_id(handle)`
+   reconciler takes it from the watch row: `wait(..., mode="signal")`
+   records the registering turn's session on it (#3663), captured as
+   rule 3 describes. A row with no stored session (a watch registered
+   outside any session, a handle that was never watched, or a row from
+   before #3663) falls back to the provider's `origin_session_id(handle)`
    method — a *local* lookup on the provider's own record, written when
-   the work was dispatched — and never from the `WaitStatus.data` it
-   spreads into the payload. `A2AWaitable` spreads a peer's returned
+   the work was dispatched. Of today's providers only Talon's implements
+   that method, so the `ci`, `task`, `a2a` and `workflow` kinds are bound
+   only through the watch row. Neither source reads the
+   `WaitStatus.data` the reconciler spreads into the payload.
+   `A2AWaitable` spreads a peer's returned
    task result into that dict, so a payload key would let a remote peer
    choose which local chat session a wake resumes into and, since a
    bound wake renders `USER_VISIBLE`, get its text painted there. The

@@ -34,6 +34,11 @@ one row per ``(agent_id, kind, handle)`` the reconciler has observed, tracking
     or last delivered when the agent registered it (#3399). Delivering any
     other token disarms the watch, so registering it again after it fired
     re-arms it for the next event.
+  - ``watch_origin_session_id`` — the chat session of the turn that
+    registered the watch (#3663). The reconciler binds the wake to it, so a
+    provider that keeps no record of who asked (CI, tasks, A2A, workflows)
+    still wakes the session that is waiting. Only a provider's own
+    ``origin_session_id`` answers for a row without one.
   - ``last_delivered_at`` — the time of the last wake for this handle that
     was delivered: when the reconciler began the poll that built it, not when
     a later tick harvested its result. A later transition's attempts rewrite
@@ -97,7 +102,8 @@ _STATE_COLUMNS = """
     watching, last_surface_status,
     attempts_signaled_target, last_attempt_started_at,
     delivery_deferred_until, delivery_deferrals,
-    watch_baseline, last_delivered_at, delivery_locked_attempts
+    watch_baseline, last_delivered_at, delivery_locked_attempts,
+    watch_origin_session_id
 """
 
 
@@ -191,6 +197,11 @@ class WaitSignalState:
     # The recorded attempt count this row's wake was locked at (#3391), or
     # ``None`` when it is not locked, or was locked before the column existed.
     delivery_locked_attempts: Optional[int] = None
+    # The chat session of the turn that registered the explicit watch
+    # (#3663), which the reconciler binds the wake to. ``None`` for a watch
+    # registered outside any session, for a handle never watched, and on rows
+    # predating the column.
+    watch_origin_session_id: Optional[str] = None
 
     def deferred_until_utc(self) -> Optional[datetime]:
         """``delivery_deferred_until`` as an aware UTC datetime, or ``None``.
@@ -740,7 +751,13 @@ class WaitSignalStore:
     # Explicit watched handles (wait mode="signal")
     # ------------------------------------------------------------------
 
-    async def start_watch(self, kind: str, handle: str) -> None:
+    async def start_watch(
+        self,
+        kind: str,
+        handle: str,
+        *,
+        origin_session_id: Optional[str] = None,
+    ) -> None:
         """Arm an explicit watch on ``(kind, handle)`` (set watching=1).
 
         Upsert that PRESERVES any existing delivery/signaled/pending fields:
@@ -760,7 +777,23 @@ class WaitSignalStore:
         harvested it. :meth:`record_delivery` disarms the watch only on a
         delivery other than its baseline, and the reconciler's dedup against
         ``last_signaled_outcome`` keeps it quiet on the delivered event.
+
+        ``origin_session_id`` is the chat session of the turn registering the
+        watch (#3663), written in the same statement that arms it, so no
+        reconcile tick can see the armed watch without its session. The
+        reconciler binds the wake to it. ``None`` (blank counts as ``None``)
+        keeps whatever session the row already stores. A watch re-armed from
+        an unattended context, after a restart or from a workflow, therefore
+        still wakes the session that first asked, while a registration from
+        another session moves the watch there.
         """
+        if origin_session_id is not None:
+            if not isinstance(origin_session_id, str):
+                raise TypeError(
+                    "start_watch origin_session_id must be a string or None, "
+                    f"got {type(origin_session_id).__name__}"
+                )
+            origin_session_id = origin_session_id.strip() or None
         rowcount = await self._db.execute(
             """
             UPDATE wait_signal_state
@@ -768,19 +801,23 @@ class WaitSignalStore:
                 watch_baseline = COALESCE(
                     pending_signaled_target, last_signaled_outcome
                 ),
+                watch_origin_session_id = COALESCE(
+                    ?, watch_origin_session_id
+                ),
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
-            (self._agent_id, kind, handle),
+            (origin_session_id, self._agent_id, kind, handle),
         )
         if rowcount == 0:
             await self._db.execute(
                 """
                 INSERT INTO wait_signal_state
-                    (agent_id, kind, handle, watching, updated_at)
-                VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+                    (agent_id, kind, handle, watching,
+                     watch_origin_session_id, updated_at)
+                VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
                 """,
-                (self._agent_id, kind, handle),
+                (self._agent_id, kind, handle, origin_session_id),
             )
 
     async def stop_watch(self, kind: str, handle: str) -> None:
@@ -977,4 +1014,5 @@ class WaitSignalStore:
             watch_baseline=str(r[16]) if r[16] is not None else None,
             last_delivered_at=str(r[17]) if r[17] is not None else None,
             delivery_locked_attempts=int(r[18]) if r[18] is not None else None,
+            watch_origin_session_id=str(r[19]) if r[19] is not None else None,
         )
