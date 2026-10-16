@@ -12,7 +12,11 @@ Configuration via [heartbeat] section in kestrel.toml:
     active_hours_start = "09:00"
     active_hours_end = "22:00"
     timezone = "America/New_York"
-    target = "log"
+
+``target`` and ``suppress_ok`` are deprecated (#2491) and are removed in
+0.54.0. Until then they are accepted but have no effect: heartbeat results
+are not routed by destination, and an exact ``HEARTBEAT_OK`` is always an
+all-clear. A non-default value logs a warning.
 """
 
 import asyncio
@@ -52,6 +56,11 @@ Review these items on each heartbeat. If nothing needs attention, reply HEARTBEA
 # Maximum heartbeat results to keep in history.
 MAX_HISTORY = 50
 
+# The release that removes the deprecated ``target`` and ``suppress_ok`` (#2491).
+DEPRECATED_SETTINGS_REMOVAL_RELEASE = "0.54.0"
+# The only ``target`` value in effect: results are recorded, never routed.
+_TARGET_IN_USE = "log"
+
 @dataclass
 class HeartbeatConfig:
     """Configuration for the heartbeat system."""
@@ -61,11 +70,34 @@ class HeartbeatConfig:
     active_hours_end: Optional[str] = None    # "HH:MM"
     timezone: str = "UTC"
     heartbeat_file: str = "HEARTBEAT.md"
-    target: str = "log"       # "log", "last_session", "none"
-    # Compatibility no-op: exact all-clears are always suppressed by the
-    # canonical classifier. Retain the shipped constructor/config surface
-    # until an explicit deprecation cycle removes it.
+    # Deprecated (#2491): nothing routes heartbeat results by destination.
+    # Any other value is warned about and replaced by this one, the value in
+    # use, so status never reports routing that does not happen.
+    target: str = _TARGET_IN_USE
+    # Deprecated (#2491) compatibility no-op: exact all-clears are always
+    # suppressed by the canonical classifier. A non-default value warns.
     suppress_ok: bool = True
+
+    def __post_init__(self) -> None:
+        if self.target != _TARGET_IN_USE:
+            logger.warning(
+                "[heartbeat] target = %r has no effect and is ignored: heartbeat "
+                "results are not routed by destination. The setting is "
+                "deprecated and will be removed in %s; remove it from the "
+                "[heartbeat] section.",
+                self.target,
+                DEPRECATED_SETTINGS_REMOVAL_RELEASE,
+            )
+            self.target = _TARGET_IN_USE
+        if self.suppress_ok is not True:
+            logger.warning(
+                "[heartbeat] suppress_ok = %r has no effect and is ignored: an "
+                "exact HEARTBEAT_OK reply is always an all-clear. The setting "
+                "is deprecated and will be removed in %s; remove it from the "
+                "[heartbeat] section.",
+                self.suppress_ok,
+                DEPRECATED_SETTINGS_REMOVAL_RELEASE,
+            )
 
     @classmethod
     def from_config(cls) -> "HeartbeatConfig":
@@ -202,6 +234,13 @@ class HeartbeatRunner:
                 "timezone": self.config.timezone,
             } if self.config.active_hours_start else None,
             "target": self.config.target,
+            "deprecated_fields": {
+                "target": (
+                    "Deprecated (#2491), removed in "
+                    f"{DEPRECATED_SETTINGS_REMOVAL_RELEASE}: has no effect; "
+                    "heartbeat results are not routed by destination."
+                ),
+            },
             "history_count": len(self._history),
             "last_result": self._history[-1] if self._history else None,
         }

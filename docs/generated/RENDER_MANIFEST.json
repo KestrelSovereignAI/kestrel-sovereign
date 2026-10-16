@@ -4547,6 +4547,21 @@
     },
     {
       "existing_code_refs": [
+        "scripts/ci/throughput_report.py",
+        "tests/unit/test_host_features.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/research/DEVELOPMENT_THROUGHPUT.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Development Throughput: Scion, CI, and Parallel Lanes",
+      "type": "Research Note"
+    },
+    {
+      "existing_code_refs": [
         "docker/simpletuner_api.py"
       ],
       "findings": [],
