@@ -9764,12 +9764,21 @@ Expected Duration: {expected_duration}
         if task is None:
             from kestrel_sovereign.hold import close_bound_host_context
 
-            task = asyncio.create_task(
-                close_bound_host_context(context),
-                name="agent_shutdown:standalone_hold_context",
-            )
-            self._standalone_hold_context_close_task = task
-        cancelled, failure = await await_lifecycle_task_completion(task)
+            # The context already registers and joins each original resource
+            # closer through cancellation. A second all-resource Task adds a
+            # refusal point before that inventory can even be entered.
+            cancelled, failure = False, None
+            try:
+                await close_bound_host_context(context)
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
+                    cancelled = True
+                else:
+                    failure = execution_terminal_error(error, retain_originals=True)
+        else:
+            # Join an already accepted owner from a previous lifecycle call;
+            # never replace it with a fresh observer or cancel its native work.
+            cancelled, failure = await await_lifecycle_task_completion(task)
         if failure is None:
             self._standalone_hold_context = None
         # A failed close remains retryable on a later shutdown call; a terminal

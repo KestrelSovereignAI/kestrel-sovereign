@@ -2984,6 +2984,8 @@ async def _rollback_startup_agent_manager(manager) -> bool:
 async def _run_lifespan_shutdown_phase(
     name: str,
     operation,
+    *,
+    resources=(),
 ) -> tuple[bool, BaseException | None, object | None]:
     """Own one teardown phase through repeated cancellation.
 
@@ -2991,8 +2993,25 @@ async def _run_lifespan_shutdown_phase(
     therefore records cancellation but cannot stop the next independently
     owned phase from releasing its resources.
     """
-    phase_task = asyncio.create_task(operation(), name=f"server_shutdown:{name}")
-    cancelled, failure = await await_lifecycle_task_completion(phase_task)
+    from kestrel_sovereign._async_ownership import create_owned_task
+
+    phase_task = None
+    try:
+        phase_task = create_owned_task(
+            operation(), name=f"server_shutdown:{name}", retain_originals=True,
+        )
+    except BaseException as error:
+        # No phase entered, and no native resource was released. Canonical
+        # admission closes both fresh coroutines. Retain the ACTUAL resources
+        # that remain on app.state, not the phase lambda or a successful Future.
+        # Return the failure so later independent phases still get their drain.
+        error._kestrel_native_retirement_debts = (
+            *getattr(error, "_kestrel_native_retirement_debts", ()),
+            *((resource, None) for resource in resources),
+        )
+        cancelled, failure = False, error
+    else:
+        cancelled, failure = await await_lifecycle_task_completion(phase_task)
     task_had_failure = failure is not None
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
@@ -3004,9 +3023,44 @@ async def _run_lifespan_shutdown_phase(
             exc_info=(type(failure), failure, failure.__traceback__),
         )
     result = None
-    if not task_had_failure:
+    if not task_had_failure and phase_task is not None:
         result = phase_task.result()
     return cancelled, failure, result
+
+
+def _lifespan_shutdown_phase_resources(app: FastAPI, name: str) -> tuple:
+    """Snapshot original owners immediately before a phase's Task admission.
+
+    A refused coordinator has not entered any closer. These strong references
+    describe unstarted retirement, not physical ACKs. Existing app ownership
+    remains untouched, so recovery can still reach those original resources.
+    """
+    attributes = {
+        "host-scheduler": ("host_scheduler_runner", "host_scheduler_storage"),
+        "stop-cleanup": ("stop_cleanup_registry",),
+        "unpublished-providers": (),
+        "agents": ("agent_manager", "startup_cleanup_agent_manager", "agent", "startup_cleanup_agent"),
+        "host-features": (),
+        "distributed-stop-invocations": ("distributed_invocation_registry",),
+        "stop-receipts": ("distributed_invocation_registry", "stop_receipt_db"),
+        "shared-agent-postgres": ("shared_agent_postgres_backend",),
+        "phoenix": ("phoenix", "phoenix_task", "phoenix_start_task"),
+    }[name]
+    resources = [getattr(app.state, attribute, None) for attribute in attributes]
+    if name == "unpublished-providers":
+        resources.extend(owner.provider for owner in (getattr(app.state, "unpublished_llm_owners", {}) or {}).values())
+    elif name == "host-features":
+        resources.extend(getattr(app.state, "host_features", ()) or ())
+        context = getattr(app.state, "host_context", None)
+        if context is not None:
+            resources.extend(getattr(context, attribute, None) for attribute in (
+                "session_factory", "hold_evidence_db", "hold_db", "db",
+            ))
+    original = []
+    for resource in resources:
+        if resource is not None and all(resource is not known for known in original):
+            original.append(resource)
+    return tuple(original)
 
 
 async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException | None]:
@@ -3044,7 +3098,7 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
         phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
-            name, operation
+            name, operation, resources=_lifespan_shutdown_phase_resources(app, name),
         )
         cancelled = cancelled or phase_cancelled
         if result is True:
@@ -3052,7 +3106,7 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
             # joining its app-owned work.
             cancelled = True
         if failure is not None:
-            first_failure = execution_terminal_error(first_failure, failure)
+            first_failure = execution_terminal_error(first_failure, failure, retain_originals=True)
 
     return cancelled, first_failure
 
@@ -3069,7 +3123,7 @@ async def _lifespan_teardown_owner(app: FastAPI):
     finally:
         cancelled, teardown_failure = await _shutdown_server_resources(app)
         from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-        terminal = execution_terminal_error(body_failure, teardown_failure)
+        terminal = execution_terminal_error(body_failure, teardown_failure, retain_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
         # Preserve the original failure from startup/request lifespan body.  On

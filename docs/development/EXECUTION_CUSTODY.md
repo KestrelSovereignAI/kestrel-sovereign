@@ -1017,8 +1017,18 @@ as explicit evidence; it never outranks native authority, UNKNOWN or retirement
 debt. Standalone Hold startup invokes the shared original context drain directly
 and propagates its actual cleanup debt alongside the startup failure. Actual
 partial Agent initialization and SQLite schema/COMMIT/close faults cover these
-contracts without bypassing mandatory features or publishing READY. Other outer
-agent/server lifecycle Task-admission boundaries remain review findings.
+contracts without bypassing mandatory features or publishing READY.
+
+Agent-owned standalone Hold shutdown also enters that original context drain
+directly. Caller withdrawal is reported only after the actual resource closers
+join; failed native owners remain in the original context. Server phases retain
+their separate cancellation-shielded Tasks, but canonical admission closes an
+unaccepted operation and records the actual still-owned resources as unstarted
+retirement debt. A refused phase cannot skip later independent drains or replace
+an earlier native body receipt. These tests exercise actual partial Agent and
+server teardown consumers with SQLite resources and PostgreSQL COMMIT-ACK
+faults, not full server startup or READY. Scheduler startup/preflight allocation
+sites remain separate findings, not covered by this shutdown repair.
 
 Health's database deadline checks original control evidence on the timeout
 carrier before producing a diagnostic. Native PostgreSQL health-query tests
