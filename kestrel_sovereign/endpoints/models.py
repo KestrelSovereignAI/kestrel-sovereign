@@ -16,6 +16,7 @@ import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
 from kestrel_sovereign.api_errors import rate_limited_until
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.llm.provider_policy import (
@@ -912,7 +913,9 @@ async def get_identity(request: Request):
                 )
                 if row:
                     description = row[0]
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 pass
 
         # Hybrid identity surfacing (Quantum Hardening epic, follow-up to PR #999).
@@ -960,6 +963,8 @@ async def get_identity(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error getting identity: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving identity.")
 
@@ -1007,6 +1012,8 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
             try:
                 rename_outcome = await rename_agent_core(agent, body.name)
             except ValueError as e:
+                if is_execution_control_error(e):
+                    raise
                 raise HTTPException(status_code=422, detail=str(e))
             if rename_outcome.skipped_privacy:
                 # Volatile privacy mode: the name applies to the live session only
@@ -1076,7 +1083,9 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
         # Return updated identity
         try:
             agent_node = await agent.storage.get_node(agent.agent_id)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             if rename_outcome and rename_outcome.any_written and not rename_outcome.success:
                 agent_node = None
             else:
@@ -1108,6 +1117,8 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error updating identity: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error updating identity.")
 

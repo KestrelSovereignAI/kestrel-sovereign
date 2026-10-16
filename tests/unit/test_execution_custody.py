@@ -7,6 +7,7 @@ import pytest
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCustody,
+    _explicit_control_chain,
     bind_execution_custody,
     require_execution_work,
 )
@@ -829,6 +830,14 @@ async def test_aborted_hosted_stream_cannot_issue_usage_or_billing_writes():
             yield LLMResponse(input_tokens=12, output_tokens=1)
     stream = service._stream_adapter_with_usage(adapter=Adapter(), client=None, model="test", messages=[], provider_name="local-test", path="test", invocation_context=None, expose_protocol_events=False)
     assert await anext(stream) == "first"
-    await stream.aclose()
+    # Closing a hosted stream forbids accounting writes; the accounting
+    # admission denial is still terminal evidence, not a successful close.
+    # Retain the original GeneratorExit as well as the cleanup-only denial.
+    with pytest.raises(ExecutionAuthorityError, match="cleanup-only") as caught:
+        await stream.aclose()
+    assert any(
+        isinstance(error, GeneratorExit)
+        for error in _explicit_control_chain(caught.value)
+    )
     service._track_model_usage.assert_not_awaited()
     service._log_llm_call.assert_not_awaited()

@@ -712,24 +712,41 @@ class MemoryRetriever:
     async def record_accesses(self, message_ids: Iterable[int], agent_id: str) -> None:
         """Record rehearsal only for memories a caller actually surfaced."""
         self._raise_access_update_control()
+        accepted = []
         try:
             for message_id in dict.fromkeys(message_ids):
-                self._schedule_access_update(message_id, agent_id)
+                accepted.append(self._schedule_access_update(message_id, agent_id))
             backend = getattr(getattr(self.conversations, "db", None), "backend", None)
             if current_execution_custody(backend):
                 # Original scoped work may not outlive context publication.
                 # Legacy unbound callers retain background behavior.
-                await self.drain_access_updates()
+                await self._drain_access_update_tasks(accepted, require_completed=True)
         except BaseException as error:
             try:
-                await self.drain_access_updates(cancel=True)
+                await self._drain_access_update_tasks(accepted, cancel=True)
             except BaseException as cleanup:
                 raise execution_terminal_error(error, cleanup, retain_originals=True)
             raise
 
     async def drain_access_updates(self, *, cancel: bool = False) -> None:
         """Wait for scheduled access-count updates before storage lifecycle changes."""
-        tasks = set(self._access_update_tasks)
+        await self._drain_access_update_tasks(self._access_update_tasks, cancel=cancel)
+
+    async def _drain_access_update_tasks(
+        self,
+        tasks: Iterable[asyncio.Task[None]],
+        *,
+        cancel: bool = False,
+        require_completed: bool = False,
+    ) -> None:
+        """Join only the supplied owner's children; lifecycle drains supply all.
+
+        A request cannot borrow another request's cancellation or scope-local
+        receipt. Its own child must finish successfully before publication,
+        including when a concurrent lifecycle shutdown cancelled that child.
+        Explicit lifecycle cancellation still tolerates plain child withdrawal.
+        """
+        tasks = set(tasks)
         if cancel:
             for task in tasks:
                 if not task.done():
@@ -743,7 +760,9 @@ class MemoryRetriever:
             )
             cancellation = outcome.cancellation
             self._access_update_done(task)
-            if outcome.error is not None and is_execution_control_error(outcome.error):
+            if outcome.error is not None and (
+                require_completed or is_execution_control_error(outcome.error)
+            ):
                 child_controls.append(outcome.error)
         self._access_update_tasks.difference_update(tasks)
         originals = []

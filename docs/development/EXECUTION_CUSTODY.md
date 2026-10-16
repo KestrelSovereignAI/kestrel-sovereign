@@ -1317,4 +1317,27 @@ the usage database reference clears only after physical close succeeds.
 Native tests use actual SDK clients with loopback HTTPX sockets and actual
 SQLite writers, not provider requests, fabricated ACKs or READY publication.
 
+Memory rehearsal records keep the exact accepted Task list for each call,
+including children whose completion callback already removed them from the
+runtime registry. Request joins and exceptional cancellation use only that
+list; component shutdown alone drains the runtime-wide inventory. An owned
+child cancelled by concurrent shutdown is not successful context publication.
+Finite caller/child cancellation carriers remain distinct from the bounded
+runtime receipt, and a pure original-turn denial cannot reach a peer call.
+
+Identity GET/PATCH consumers preserve native authority, COMMIT and retirement
+receipts before validation errors, optional description fallback, partial rename
+readback or ordinary HTTP shaping. Existing ordinary-error and volatile/partial
+outcomes remain unchanged. Native tests use actual initialized PostgreSQL storage
+and real COMMIT/RESET followed by a failed release acknowledgement; request/agent
+projections and partial-rename outcomes are explicit component inputs, not
+authenticated HTTP, full Agent READY or public-provider acceptance. A hosted
+stream close likewise surfaces a denied accounting admission while issuing no
+billing writes and retaining its original close carrier.
+
+Session-provenance integration tests disable unrelated conversation embeddings
+and assert that they construct no ambient LLM service. This prevents unowned
+test-only default-service writers; it does not certify the production default
+embedding getter or clear the broader private-client lifecycle finding.
+
 These are candidate contracts, not whole-branch review or release approval.
