@@ -170,7 +170,13 @@ export async function createPipelineClient({
       if (closed) void owner.destroy();
     } });
     await requireOpen();
-    playback = await createVoicePlayback({ sampleRate, onAcquire: owner => {
+    playback = await createVoicePlayback({ sampleRate, onError: error => {
+      if (closed) return;
+      void close();
+      onEvent(makeEvent(Events.ERROR, {
+        message: error.message, code: 'AUDIO_OUTPUT_CONTROL_FAILED', fatal: true,
+      }));
+    }, onAcquire: owner => {
       playback = owner;
       if (closed) void owner.destroy();
     } });

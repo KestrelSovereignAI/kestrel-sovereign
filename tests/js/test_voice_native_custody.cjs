@@ -9,7 +9,7 @@ const { chromium } = require('playwright');
 const { wsServer: WebSocketServer } = require(path.join(
   path.dirname(require.resolve('playwright-core/package.json')), 'lib/utilsBundle.js'));
 
-async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false, responseStartTimeoutMs = 30000 } = {}) {
+async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint = false, failWorklet = '', holdWorklet = '', transport = 'webrtc', declineMint = false, responseStartTimeoutMs = 30000, dropPlaybackClearAck = false } = {}) {
   const staticRoot = process.env.KESTREL_TEST_STATIC_ROOT
     ? path.resolve(process.env.KESTREL_TEST_STATIC_ROOT)
     : path.resolve(__dirname, '../../kestrel_sovereign/static');
@@ -92,6 +92,11 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
           return;
         }
         let source = await fs.readFile(target, 'utf8');
+        if (dropPlaybackClearAck && relative.endsWith('/playback-worklet.js')) {
+          const acknowledgement = "this.port.postMessage({ type: 'cleared', generation: this._generation });";
+          assert.ok(source.includes(acknowledgement), 'clear-ACK loss fixture no longer matches actual worker');
+          source = source.replace(acknowledgement, 'void 0; // deliberate offline clear-ACK loss');
+        }
         if (holdWorklet && relative.endsWith(`/${holdWorklet}-worklet.js`)) {
           workletResponse = { res, source };
           workletEntered();
@@ -177,6 +182,76 @@ async function nativeVoice(body, transcript = '{}', { autoStart = true, holdMint
     await new Promise(resolve => server.close(resolve));
   }
 }
+
+for (const path of ['realtime', 'pipeline']) {
+test(`native ${path} clear-ACK failure retires original microphone, playback and socket`, { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page }) => {
+    await page.evaluate(async path => {
+      const NativeContext = window.AudioContext;
+      const NativeSocket = window.WebSocket;
+      window.originalContexts = [];
+      window.originalSockets = [];
+      window.AudioContext = class extends NativeContext {
+        constructor(...args) { super(...args); window.originalContexts.push(this); }
+      };
+      window.WebSocket = class extends NativeSocket {
+        constructor(...args) { super(...args); window.originalSockets.push(this); }
+      };
+      if (path === 'pipeline') {
+        await window.client.close();
+        const { createPipelineClient } = await import('/js/voice/pipeline.js');
+        window.client = await createPipelineClient({
+          wsPath: '/realtime', onEvent: event => window.nativeEvents.push(event),
+        });
+      }
+      await window.client.start();
+      window.originalMic = window.client.micStream;
+    }, path);
+    await page.waitForFunction(() => window.client.session !== null);
+    await page.evaluate(() => window.client.cancelResponse());
+    await page.waitForFunction(() => window.nativeEvents.some(event =>
+      event.code === 'AUDIO_OUTPUT_CONTROL_FAILED' && event.fatal), null, { timeout: 4000 });
+    const state = await page.evaluate(async () => {
+      await window.client.close();
+      return { tracks: window.originalMic.getTracks().map(track => track.readyState),
+        contexts: window.originalContexts.map(context => context.state) };
+    });
+    assert.ok(state.tracks.length && state.tracks.every(state => state === 'ended'));
+    assert.equal(state.contexts.length, 2);
+    assert.ok(state.contexts.every(state => state === 'closed'));
+    await page.waitForFunction(() => window.originalSockets.length === 1
+      && window.originalSockets.every(socket => socket.readyState === WebSocket.CLOSED), null, { timeout: 2000 });
+  }, '{}', { autoStart: false, transport: 'websocket', dropPlaybackClearAck: true });
+});
+}
+
+test('native WebSocket typed replacement clears actual playback without closing fresh microphone', { timeout: 30000 }, async () => {
+  await nativeVoice(async ({ page, sendRealtime }) => {
+    await page.evaluate(async () => {
+      const NativeNode = window.AudioWorkletNode;
+      window.actualClearAcks = [];
+      window.AudioWorkletNode = class extends NativeNode {
+        constructor(...args) {
+          super(...args);
+          if (args[1] === 'kestrel-playback') {
+            this.port.addEventListener('message', event => {
+              if (event.data?.type === 'cleared') window.actualClearAcks.push(event.data);
+            });
+            this.port.start();
+          }
+        }
+      };
+      await window.client.start();
+    });
+    sendRealtime({ type: 'response.created', response: { id: 'old-playback' } });
+    sendRealtime({ type: 'response.output_audio.delta', response_id: 'old-playback',
+      delta: Buffer.from(new Int16Array(24000).fill(19660).buffer).toString('base64') });
+    await page.waitForFunction(() => window.nativeEvents.some(event => event.kind === 'speaking_started'));
+    await page.evaluate(() => window.client.sendText('new local input'));
+    await page.waitForFunction(() => window.actualClearAcks.length === 1, null, { timeout: 2000 });
+    assert.ok(await page.evaluate(() => window.client.micStream.getTracks().every(track => track.readyState === 'live')));
+  }, '{"persisted":true}', { autoStart: false, transport: 'websocket' });
+});
 
 test('native WebRTC buffered old input commit cannot reopen pre-ID cancellation', { timeout: 30000 }, async () => {
   await nativeVoice(async ({ page }) => {

@@ -425,7 +425,6 @@ export async function createRealtimeClient({
         abandonResponse({ clearInput: false });
         speechInputItemId = raw.item_id ?? '';
         userTranscriptTracker.speechStarted();
-        playback?.flush?.();
         onEvent(makeEvent(Events.LISTENING_STARTED, {}));
         break;
       case 'input_audio_buffer.speech_stopped':
@@ -634,7 +633,13 @@ export async function createRealtimeClient({
       if (closed) void owner.destroy();
     } });
     await requireOpen();
-    playback = await createVoicePlayback({ sampleRate: 24000, onAcquire: owner => {
+    playback = await createVoicePlayback({ sampleRate: 24000, onError: error => {
+      if (closed) return;
+      void close();
+      onEvent(makeEvent(Events.ERROR, {
+        message: error.message, code: 'AUDIO_OUTPUT_CONTROL_FAILED', fatal: true,
+      }));
+    }, onAcquire: owner => {
       playback = owner;
       if (closed) void owner.destroy();
     } });
@@ -799,6 +804,9 @@ export async function createRealtimeClient({
 
   /** Barge-in: abort the in-flight agent response. */
   function abandonResponse({ clearInput = true } = {}) {
+    // Fence the actual PCM sink for EVERY abandonment, including typed
+    // replacement. JSON filtering alone cannot retire already queued audio.
+    playback?.flush?.();
     clearTimeout(responseStartTimer);
     responseStartTimer = null;
     typedInputGeneration = null;
@@ -818,7 +826,6 @@ export async function createRealtimeClient({
   function cancelResponse() {
     abandonResponse();
     sendJSON({ type: 'response.cancel' });
-    playback?.flush?.();
   }
 
   function requestResponse() {
@@ -947,7 +954,7 @@ export async function createRealtimeClient({
     },
     /** Live mic stream — lets the UI attach an AnalyserNode for a real level meter. */
     get micStream() {
-      return micStream;
+      return micStream ?? capture?.micStream ?? null;
     },
     /** Currently-active session bundle (null before start()). */
     get session() {

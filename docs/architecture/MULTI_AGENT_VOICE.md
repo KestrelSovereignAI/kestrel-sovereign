@@ -172,6 +172,26 @@ and [Realtime VAD interruption](https://developers.openai.com/api/docs/guides/re
 contracts. Native loopback WebRTC/WebSocket tests cover cancellation, correlation,
 fresh speech preservation and bounded refusal without paid provider calls.
 
+### PCM playback clear ownership
+
+The PCM controller closes its real gain synchronously on every abandonment,
+including typed replacement, before asking the playback AudioWorklet to clear.
+Every push, end, clear acknowledgement and drain carries its original playback
+generation. Only a matching native worklet clear ACK can release buffered fresh
+PCM and reopen the gain; user mute/solo remains an independent gate. Repeated
+clears share one owner and deadline rather than accumulating waiters or
+extending the deadline. Clear timeout or pending-audio overflow retires the
+original client with `AUDIO_OUTPUT_CONTROL_FAILED`, including its microphone,
+playback context and socket. Queued audio is not silently truncated on overflow.
+
+A loopback Chromium proof measures the actual post-gain graph: stale positive
+PCM stays excluded while fresh negative-marker PCM renders after clear ACK.
+Removing the epoch or gain gate fails that native proof. Separate native client
+tests cover typed replacement and missing clear ACK through both voice clients.
+These are local PCM guarantees, **not** a claim that JSON response filtering or
+an input-clear ACK fences the separate WebRTC RTP stream. The strict framed
+provider profile and end-to-end native input/output verification remain pending.
+
 ## Appendix — source map
 
 **Frontend (kestrel-sovereign):**

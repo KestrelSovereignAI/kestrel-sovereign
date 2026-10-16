@@ -37,6 +37,9 @@ export async function createVoiceCapture({ targetSampleRate = 24000, onAcquire }
   let retired = false;
   let closeOwner;
   const owner = {
+    // Preserve the ORIGINAL stream even after retirement so consumers can
+    // inspect its ended tracks instead of borrowing a replacement capture.
+    get micStream() { return stream; },
     onchunk(fn) { chunkCallback = fn; },
     getLevel() { return currentLevel; },
     pause() { node?.port.postMessage({ type: 'pause' }); },

@@ -9,11 +9,12 @@
  * barge-in when the user starts speaking mid-response.
  *
  * Messaging contract:
- *   main → worklet:  { type: 'push', pcm: ArrayBuffer }  // Int16 samples
- *   main → worklet:  { type: 'end' }                     // response complete
- *   main → worklet:  { type: 'flush' }
- *   worklet → main:  { type: 'underflow' }               // network gap
- *   worklet → main:  { type: 'drained' }                 // ended + fully played
+ *   main → worklet:  { type: 'push', generation, pcm: ArrayBuffer }
+ *   main → worklet:  { type: 'end', generation }         // response complete
+ *   main → worklet:  { type: 'flush', generation }       // newer epoch only
+ *   worklet → main:  { type: 'cleared', generation }     // real queue cleared
+ *   worklet → main:  { type: 'underflow', generation }   // network gap
+ *   worklet → main:  { type: 'drained', generation }     // ended + fully played
  *
  * PCM remains Int16 while queued and is converted to Float32 only as the
  * browser renders it. This keeps burst buffering compact without imposing a
@@ -41,16 +42,22 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this._streamEnded = false;
     this._drainedReported = true;
     this._emptySamples = 0;
+    this._generation = 0;
 
     this.port.onmessage = (ev) => {
       const msg = ev.data;
       if (!msg) return;
-      if (msg.type === 'push') {
+      if (msg.type === 'flush') {
+        if (!Number.isSafeInteger(msg.generation) || msg.generation <= this._generation) return;
+        this._generation = msg.generation;
+        this._flush();
+        this.port.postMessage({ type: 'cleared', generation: this._generation });
+      } else if (msg.generation !== this._generation) {
+        return;
+      } else if (msg.type === 'push') {
         this._enqueue(msg.pcm);
       } else if (msg.type === 'end') {
         this._endStream();
-      } else if (msg.type === 'flush') {
-        this._flush();
       }
     };
   }
@@ -119,7 +126,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       this._chunks = [];
       this._chunkHead = 0;
       this._chunkOffset = 0;
-      this.port.postMessage({ type: 'drained' });
+      this.port.postMessage({ type: 'drained', generation: this._generation });
     }
   }
 
@@ -140,7 +147,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
           if (this._emptySamples >= this._underflowSamples) {
             this._emptySamples = 0;
             this._started = false;
-            this.port.postMessage({ type: 'underflow' });
+            this.port.postMessage({ type: 'underflow', generation: this._generation });
           }
         }
       }
