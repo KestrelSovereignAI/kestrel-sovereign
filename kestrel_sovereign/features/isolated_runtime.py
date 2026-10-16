@@ -1819,11 +1819,27 @@ class _TrafficGate:
             yield
         finally:
             original = sys.exc_info()[1]
-            release = asyncio.create_task(self._release_admission())
-            try:
-                await _await_task_until_complete(release, preserve_cancellation=False)
-            except BaseException as cleanup:
-                raise execution_terminal_error(original, cleanup)
+            cancellations = []
+            while True:
+                try:
+                    # The original caller owns this in-memory decrement. The
+                    # only suspension is acquiring our asyncio.Condition;
+                    # cancellation removes that waiter before acquisition.
+                    # Once acquired, decrement/notify cannot suspend. Retrying
+                    # acquisition therefore cannot repeat native work or
+                    # release the same admission twice, and needs no new Task.
+                    await self._release_admission()
+                    break
+                except asyncio.CancelledError as cancellation:
+                    cancellations.append(cancellation)
+                except BaseException as cleanup:
+                    raise execution_terminal_error(
+                        original, *cancellations, cleanup, retain_originals=True
+                    )
+            if cancellations:
+                raise execution_terminal_error(
+                    original, *cancellations, retain_originals=True
+                )
 
 
 _HOST_INGRESS_SUCCESS = "success"

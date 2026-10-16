@@ -985,4 +985,29 @@ drain without an extra all-resource collector Task. Local SQLite constructor/
 closer fault tests cover these contracts, not live server READY publication or
 hosted Workflow acceptance.
 
+Admission-gate release is an in-memory Condition operation owned by the original
+caller, not a newly admitted cleanup Task. Cancellation can retry only lock
+acquisition; decrement and notification do not suspend, so native work is never
+replayed and admission is released once. PostgreSQL mutation/COMMIT-ACK fault
+tests cover task refusal and repeated caller withdrawal at this gate boundary;
+they do not certify the complete isolated RPC or READY path.
+
+Health shutdown likewise drains its existing loop, finite persistence and base
+feature owners directly, preserving original native control alongside later
+cleanup/cancellation. It does not require fresh observer Tasks before either
+drain. Tests drive the actual HealthFeature public methods on an unpublished
+native SQLite agent and hold the original COMMIT acknowledgement through caller
+withdrawal. They prove physical write settlement and retained UNKNOWN, not live
+agent readiness or provider behavior.
+
+Health diagnostic normalizers preserve original execution control instead of
+turning it into fail/warn dictionaries or generic HTTP errors. Fleet probes
+retain ordinary per-agent diagnostics but use canonical original Task ownership
+for control/cancellation and accepted sibling joins. Eight actual PostgreSQL
+cases cover database, Scheduler, bootstrap, trigger, server fallback/outage and
+fleet-reader paths after a real committed mutation loses its acknowledgement.
+The fleet-reader proof uses an unpublished actual Agent, not a fabricated
+manager roster or a claim of live fleet READY acceptance. Other component
+normalizers and full live-host acceptance still require the whole review gate.
+
 These are candidate contracts, not whole-branch review or release approval.

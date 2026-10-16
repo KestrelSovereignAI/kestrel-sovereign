@@ -5102,6 +5102,27 @@ async def _agent_health_result(agent) -> dict:
     return {"status": overall, "checks": checks}
 
 
+async def _fleet_agent_health_results(agents) -> list:
+    """Join actual probes, retaining control instead of diagnostic text.
+
+    Ordinary probe failures remain per-agent diagnostics. Original control
+    and cancellation must first join accepted sibling probes and then escape.
+    Returning cause-bearing cancellation through asyncio.gather would erase
+    that carrier; canonical original Task ownership preserves it instead.
+    """
+    from kestrel_sovereign._async_ownership import gather_owned
+
+    async def inspect_agent(agent):
+        try:
+            return await _agent_detailed_health(agent)
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            return error
+
+    return await gather_owned(inspect_agent(agent) for agent in agents)
+
+
 def _roll_up_fleet_status(agent_statuses: list) -> str:
     """Three-state rollup over a managed fleet's per-agent statuses (#2698).
 
@@ -5191,7 +5212,9 @@ async def health_detailed(request: Request):
     if agent:
         try:
             result = await _agent_detailed_health(agent)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             if not scheduler_unavailable:
                 raise
             logger.warning(
@@ -5226,13 +5249,8 @@ async def health_detailed(request: Request):
     # total outage while managed agents serve traffic (#2698).
     managed = manager.list_agents() if manager is not None else {}
     if managed:
-        import asyncio
-
         names = list(managed.keys())
-        results = await asyncio.gather(
-            *(_agent_detailed_health(a) for a in managed.values()),
-            return_exceptions=True,
-        )
+        results = await _fleet_agent_health_results(managed.values())
         breakdown: dict = {}
         for name, res in zip(names, results):
             if isinstance(res, BaseException):

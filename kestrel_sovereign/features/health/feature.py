@@ -127,10 +127,13 @@ class HealthFeature(Feature):
     async def shutdown(self):
         """Stop the background loop gracefully."""
         errors = [getattr(self, "_health_persist_control", None)]
-        loop_outcome = await await_owned_task(
-            asyncio.get_running_loop().create_task(self._stop_background_loop())
-        )
-        errors.extend((loop_outcome.error, loop_outcome.cancellation))
+        # These are structured drains of already-owned Tasks, not new native
+        # operations. The original caller must not need another observer Task
+        # admitted before it can stop or join its existing resources.
+        try:
+            await self._stop_background_loop()
+        except BaseException as error:
+            errors.append(error)
 
         # Stop future ticks first, then join finite writes without forwarding
         # cancellation into native COMMIT. Feature disable leaves the agent
@@ -145,18 +148,13 @@ class HealthFeature(Feature):
             self._harvest_health_persistence(task)
             errors.append(outcome.cancellation)
         self._health_persist_tasks = set()
-        lifecycle = await await_owned_task(
-            asyncio.get_running_loop().create_task(super().shutdown())
-        )
-        errors.extend(
-            (
-                lifecycle.error,
-                lifecycle.cancellation,
-                getattr(self, "_health_persist_control", None),
-            )
-        )
+        try:
+            await super().shutdown()
+        except BaseException as error:
+            errors.append(error)
+        errors.append(getattr(self, "_health_persist_control", None))
         logger.info("HealthFeature: background loop stopped")
-        terminal = execution_terminal_error(*errors)
+        terminal = execution_terminal_error(*errors, retain_originals=True)
         if terminal is not None:
             raise terminal
 

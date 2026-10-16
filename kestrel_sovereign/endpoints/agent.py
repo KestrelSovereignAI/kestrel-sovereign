@@ -4111,6 +4111,8 @@ async def agent_health_trigger(request: Request):
     try:
         return await feature.run_once()
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Health trigger error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error running liveness check.")
 
