@@ -74,6 +74,19 @@ def _redact(payload: Dict[str, Any]) -> str:
     )
 
 
+def _result_summary(body: Any) -> str:
+    """Bounded inline body for the ``signal_completed`` UI side channel.
+
+    A wake whose watch was registered from a chat turn is bound to that
+    turn's session (#3663) and built ``USER_VISIBLE``; the frontend paints
+    it only with a non-empty ``result_summary``. For a COGNITION dispatch the
+    body is the woken turn's response. The store caps the returned text.
+    """
+    if body is None:
+        return ""
+    return body if isinstance(body, str) else str(body)
+
+
 def build_wait_complete_registration() -> SourceRegistration:
     return SourceRegistration(
         name=SOURCE_NAME,
@@ -92,6 +105,7 @@ def build_wait_complete_registration() -> SourceRegistration:
         coalescing_window=timedelta(seconds=60),
         attention_policy=AttentionPolicy(),
         resources=frozenset(),
+        result_summary=_result_summary,
         # No self-loop concern: this is a local-only signal sourced by the
         # agent's own reconciler cron, not from a peer.
         allow_self_loops=False,
