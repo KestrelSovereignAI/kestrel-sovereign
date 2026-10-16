@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, NoReturn
 
 from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskOutcome,
     await_owned_task,
+    create_owned_task,
     raise_owned_outcome,
 )
 from kestrel_sovereign.execution_custody import (
@@ -28,13 +29,25 @@ class ClosingStreamingResponse(StreamingResponse):
 
     ``close_in_stream_task`` is for inline-safe, idempotent close-aware bodies.
     It closes in the original producer (and handles unstarted bodies on outer
-    response exit) without admitting a cleanup Task. Native control retains its
-    exact cause through ASGI cancellation/disconnect normalization.
+    response exit) without admitting a cleanup Task. Both modes retain native
+    control's exact cause through ASGI cancellation/disconnect normalization.
     """
 
     def __init__(self, *args, close_in_stream_task: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._close_in_stream_task = close_in_stream_task
+
+    @staticmethod
+    def _raise_terminal(error: BaseException) -> NoReturn:
+        """Preserve native control before ASGI normalizes cancellation/OSError."""
+        if (
+            isinstance(error, (asyncio.CancelledError, OSError))
+            and is_execution_control_error(error)
+        ):
+            raise RuntimeError(
+                "Streaming execution control requires reconciliation"
+            ) from error
+        raise error
 
     async def _run_with_inline_close(self, operation: Awaitable[None]) -> None:
         """Retire an inline-safe body without admitting another cleanup Task."""
@@ -52,14 +65,7 @@ class ClosingStreamingResponse(StreamingResponse):
                     primary, error, retain_originals=True,
                 )
         if primary is not None:
-            if (
-                isinstance(primary, (asyncio.CancelledError, OSError))
-                and is_execution_control_error(primary)
-            ):
-                raise RuntimeError(
-                    "Streaming execution control requires reconciliation"
-                ) from primary
-            raise primary
+            self._raise_terminal(primary)
 
     async def stream_response(
         self, send: Callable[[dict[str, Any]], Awaitable[None]],
@@ -69,7 +75,10 @@ class ClosingStreamingResponse(StreamingResponse):
             # response's listening task. Close here before that task exits.
             await self._run_with_inline_close(super().stream_response(send))
         else:
-            await super().stream_response(send)
+            try:
+                await super().stream_response(send)
+            except BaseException as error:
+                self._raise_terminal(error)
 
     async def __call__(
         self,
@@ -95,16 +104,31 @@ class ClosingStreamingResponse(StreamingResponse):
             primary if isinstance(primary, asyncio.CancelledError) else None,
         )
         if callable(close):
-            close_task = asyncio.create_task(
-                close(),
-                name="closing_streaming_response:body",
-            )
+            try:
+                close_task = create_owned_task(
+                    close(),
+                    name="closing_streaming_response:body",
+                    retirement_resource=self.body_iterator,
+                    retain_originals=True,
+                )
+            except BaseException as error:
+                self._raise_terminal(execution_terminal_error(
+                    primary, error, retain_originals=True,
+                ))
             outcome = await await_owned_task(
                 close_task,
                 pending_cancellation=(
                     primary if isinstance(primary, asyncio.CancelledError) else None
                 ),
             )
+
+        if any(
+            error is not None and is_execution_control_error(error)
+            for error in (primary, outcome.error, outcome.cancellation)
+        ):
+            self._raise_terminal(execution_terminal_error(
+                primary, outcome.error, outcome.cancellation, retain_originals=True,
+            ))
 
         if primary is not None and not isinstance(
             primary, asyncio.CancelledError

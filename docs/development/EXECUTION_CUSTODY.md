@@ -349,6 +349,15 @@ compatible. Native PostgreSQL store/TaskManager tests prove this helper boundary
 using an already-admitted recipient view and actual ASGI 2.3/2.4 response
 execution, not peer signatures, full Agent startup or READY.
 
+Default Agent/Bridge responses retain their deferred, context-safe body close.
+Their producer uses the same ASGI control envelope as the inline-safe mode.
+Canonical close-task admission names the exact original body: refusal closes
+the unstarted coroutine/wrapper and retains that body as unresolved retirement
+debt, never a successful close. Accepted close owners physically join despite
+repeated observer withdrawal; original delivery, withdrawal and native close
+evidence are selected together. Native response tests cover these helper
+boundaries with actual PostgreSQL owners, not a paid model or full Agent.
+
 Wait ownership and origin-session resolution retain native execution control
 before watch admission or wake construction. Task and outbound-A2A providers do
 not treat that control as unverifiable ownership or an ordinary pending poll;
@@ -370,6 +379,17 @@ control rather than rendering failure text, skipping, retrying or inventing a
 failed delivery. The fallback's feature owner retains its original failure for
 shutdown. Native callback/consumer tests exercise these helper boundaries with
 real stores and owned work, not full Agent readiness or paid cognition.
+
+Durable-resume privacy, registration and poll callbacks follow that same
+contract. Completed dispatch harvest reads the canonical retained Task receipt,
+including after the actual Agent completion callback retrieved cancellation
+first. The original wake/handle remains until metadata classification and its
+durable write finish. This reconciler singleton retains unresolved native
+control for its lifetime: later ticks raise that original control before any
+new work, rather than inventing restart loss or retrying a failed admission.
+This retention grants no new authority or acknowledgment. Tests use actual
+durable dispatcher/stores and Agent completion methods with native-I/O cognition
+inputs; those inputs are not full Agent genesis/READY or model acceptance.
 
 A2A boot reuses the guarded native storage backend, including DSN-only agents;
 individual stores do not own its pool. Inbound verification/authorization and

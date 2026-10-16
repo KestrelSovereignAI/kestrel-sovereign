@@ -60,6 +60,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, Outcome, ToolResult, WaitStatus
 
+from kestrel_sovereign._async_ownership import owned_task_error
 from kestrel_sovereign.callbacks import invoke_host_callback, require_callback_result
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
@@ -460,6 +461,10 @@ class WaitReconciler:
         # ``_pending_signal_tasks`` map and both enqueue a wake for the same
         # terminal transition before either records it pending.
         self._reconcile_lock = asyncio.Lock()
+        # One original unresolved terminal for this existing singleton's
+        # lifetime. A later tick cannot classify its pending row as a restart
+        # or treat a newly successful callback as settlement of native control.
+        self._terminal_control: BaseException | None = None
         # Monotonic timestamp of the last reconcile tick's start. The
         # WaitFeature fallback driver reads it (via
         # :meth:`seconds_since_last_reconcile`) to stand down while the cron
@@ -479,8 +484,15 @@ class WaitReconciler:
         duplicate wake before either recorded it pending.
         """
         async with self._reconcile_lock:
+            if self._terminal_control is not None:
+                raise self._terminal_control
             self._last_reconcile_monotonic = time.monotonic()
-            return await self._reconcile_once()
+            try:
+                return await self._reconcile_once()
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    self._terminal_control = error
+                raise
 
     def seconds_since_last_reconcile(self) -> Optional[float]:
         """Monotonic seconds since the last reconcile tick began, or ``None``
@@ -554,6 +566,9 @@ class WaitReconciler:
             target = state.pending_signaled_target if state else None
 
             try:
+                original_error = owned_task_error(handle_obj.task)
+                if original_error is not None:
+                    raise original_error
                 result = handle_obj.task.result()
                 status_value = result.status.value
                 delivery_error = result.error or None
@@ -567,8 +582,7 @@ class WaitReconciler:
                 status_value = "dispatcher_raised"
                 delivery_error = f"{type(e).__name__}: {e}"
 
-            self._pending_signal_tasks.pop((kind, handle), None)
-            wake = self._pending_signal_wakes.pop((kind, handle), None)
+            wake = self._pending_signal_wakes.get((kind, handle))
             bound = wake.bound if wake is not None else None
 
             if status_value in _PERSISTED_STATES:
@@ -680,6 +694,12 @@ class WaitReconciler:
                     attempt_at=now,
                 )
                 signals_soft_failed += 1
+
+            # Retain the exact owner and wake until classification AND its
+            # durable write have completed. Native metadata/storage control
+            # must not turn this process's in-flight wake into restart loss.
+            self._pending_signal_tasks.pop((kind, handle), None)
+            self._pending_signal_wakes.pop((kind, handle), None)
 
         # --- Phase 1: detect terminal transitions + enqueue -------------
         # Two complementary wake sources, both routed through the SAME
@@ -1742,7 +1762,7 @@ async def register_wait_resume_consumer(
             "durable signal delivery unavailable: the agent's dispatcher "
             "cannot register durable consumers"
         )
-    storage = elided_by()
+    storage = require_callback_result(elided_by())
     if storage is not None:
         raise DurableResumeUnsupportedError(f"{kind}:{handle}", storage)
     registration = DurableConsumerRegistration(
@@ -1754,8 +1774,8 @@ async def register_wait_resume_consumer(
         lease_seconds=lease_seconds,
     )
     await _get_reconciler(agent)._store.start_watch(kind, handle)
-    await register(registration)
-    status = await provider.poll(handle)
+    await invoke_host_callback(register, registration)
+    status = await invoke_host_callback(provider.poll, handle)
     return WaitResumeRegistration(
         registration=registration,
         already_terminal=status if status.outcome.is_terminal() else None,
