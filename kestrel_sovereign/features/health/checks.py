@@ -53,7 +53,9 @@ async def _run_database_bound_check(
             DATABASE_HEALTH_CHECK_TIMEOUT_S
         ) as deadline:
             return await check
-    except TimeoutError:
+    except TimeoutError as error:
+        if is_execution_control_error(error):
+            raise
         # Do not relabel a TimeoutError raised by the check/provider itself as
         # this wrapper's deadline. This mirrors every other deadline boundary
         # on the consolidation and health paths.

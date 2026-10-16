@@ -69,6 +69,7 @@ from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolS
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
+    create_owned_task,
     owned_task_error,
     raise_owned_outcome,
 )
@@ -8359,7 +8360,11 @@ class ProxyFeature(Feature):
         remains after ``_reload_lock`` with authority to mutate admission.
         """
 
-        task = asyncio.create_task(operation, name=f"isolated-traffic-{name}:{self.name}")
+        # Preserve create_task's coroutine-only contract: wrapping an already
+        # accepted foreign Task would silently adopt an operation we do not own.
+        if not asyncio.iscoroutine(operation):
+            raise TypeError("gate lifecycle operation must be a fresh coroutine")
+        task = create_owned_task(operation, name=f"isolated-traffic-{name}:{self.name}")
         await _await_task_until_complete(
             task,
             preserve_cancellation=preserve_cancellation,

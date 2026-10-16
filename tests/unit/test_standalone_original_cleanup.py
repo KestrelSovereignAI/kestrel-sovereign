@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sovereign.hold.enforcement import initialize_with_bound_hold_context
 from kestrel_sovereign.host_features.storage import resolve_host_database_launch_context
+from kestrel_sovereign.storage.db import SQLiteBackend
 from tests.unit.test_cleanup_task_admission import _partial_native_agent
 
 
@@ -24,6 +26,29 @@ async def test_actual_standalone_startup_preserves_host_close_debt(
     monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
     monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
     agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    native_connect = SQLiteBackend.connect
+    denied_schema_actions = []
+
+    async def connect_with_actual_schema_denial(backend):
+        result = await native_connect(backend)
+        if Path(backend.db_path) == Path(agent.storage_path):
+            # Fail original initialization in SQLite itself, independently of
+            # installed feature registries or incidental Peers availability.
+            # This is a real native authorizer, not a substituted initialize
+            # method, fake genesis/READY, or fabricated database exception.
+            def deny_create_table(action, *_args):
+                if action == sqlite3.SQLITE_CREATE_TABLE:
+                    denied_schema_actions.append(action)
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            connection = backend._connection
+            await connection._execute(
+                connection._conn.set_authorizer, deny_create_table
+            )
+        return result
+
+    monkeypatch.setattr(SQLiteBackend, "connect", connect_with_actual_schema_denial)
     host_path = tmp_path / "actual-host.db"
     launch = resolve_host_database_launch_context(
         env={
@@ -79,6 +104,7 @@ async def test_actual_standalone_startup_preserves_host_close_debt(
         except BaseException as error:
             caught = error
         loop.set_task_factory(previous)
+        assert denied_schema_actions, "original native schema denial was not exercised"
         if refusal == "native":
             assert refused, (
                 "actual standalone failure cleanup never reached native host closer"

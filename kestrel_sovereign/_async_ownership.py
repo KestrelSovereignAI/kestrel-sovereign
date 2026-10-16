@@ -79,7 +79,7 @@ def _tracks_owned_task_join(function):
 
 
 def create_owned_task(operation, *, name=None, context=None, retain_originals=False,
-                      retirement_resource=None):
+                      retirement_resource=None, loop=None):
     """Capture the original carrier inside a child before asyncio can erase it.
 
     Creation retains normal copied-context semantics. The caller still owns
@@ -88,6 +88,8 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     with its explicit cause. Generic cleanup-error priority stays unchanged.
     A physical closer can name its original resource: refusal to allocate that
     closer is explicit unstarted retirement debt, never a successful close.
+    An explicit running loop preserves callers' native loop-admission surface;
+    a different loop cannot receive ownership of this caller's operation.
     """
     started = False
     async def run():
@@ -108,7 +110,12 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             raise
     wrapper = run()
     try:
-        task = asyncio.create_task(wrapper, name=name, context=context)
+        if loop is None:
+            task = asyncio.create_task(wrapper, name=name, context=context)
+        else:
+            if loop is not asyncio.get_running_loop():
+                raise RuntimeError("owned operation requires the original running loop")
+            task = loop.create_task(wrapper, name=name, context=context)
     except BaseException as error:
         wrapper.close()
         close = getattr(operation, "close", None)

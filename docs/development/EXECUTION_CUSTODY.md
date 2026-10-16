@@ -1020,4 +1020,24 @@ partial Agent initialization and SQLite schema/COMMIT/close faults cover these
 contracts without bypassing mandatory features or publishing READY. Other outer
 agent/server lifecycle Task-admission boundaries remain review findings.
 
+Health's database deadline checks original control evidence on the timeout
+carrier before producing a diagnostic. Native PostgreSQL health-query tests
+hold the original authority-transaction COMMIT acknowledgement through actual
+deadline cancellation and prove that its COMMITTED receipt and physical pool
+retirement survive both public feature and server-fallback consumers.
+
+Finite health writes and gate transitions use canonical coroutine admission,
+including closure when the original Task factory refuses admission. Health
+retains its existing running-loop creation surface; an explicit foreign loop
+is refused before work. Gate transitions preserve their coroutine-only input
+contract and do not adopt a borrowed native Task. The gate proof covers the
+actual lifecycle helper, not a complete SDK child/reload handshake.
+
+Offline evidence fixtures also own their native resources: operator-notice
+databases close in fixture teardown and assert their original worker exits;
+legacy structural Health mocks close coroutines they deliberately suppress.
+Those mocks are not native ACK/READY evidence. Standalone startup failure tests
+use SQLite's actual schema authorizer rather than depending on which optional
+feature registrations happen to be available in a larger suite.
+
 These are candidate contracts, not whole-branch review or release approval.

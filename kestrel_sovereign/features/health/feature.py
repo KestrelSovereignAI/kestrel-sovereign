@@ -39,7 +39,11 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
-from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
+)
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
@@ -542,9 +546,10 @@ class HealthFeature(Feature):
                     )
                     raise
 
-            persist_task = asyncio.get_running_loop().create_task(
+            persist_task = create_owned_task(
                 persist(),
                 name=f"health-log-persist:{self._agent_id}",
+                loop=asyncio.get_running_loop(),
             )
             pending_persists.add(persist_task)
 
