@@ -1,6 +1,8 @@
 """Observe ACTUAL native PG ACK/reset owners, never fabricated receipts."""
 
 import asyncio
+import gc
+import weakref
 
 import asyncpg
 import pytest
@@ -13,6 +15,7 @@ from kestrel_sovereign.execution_custody import (
     execution_cleanup_debts,
     execution_commit_outcome,
     execution_denial_scopes,
+    is_execution_control_error,
 )
 from kestrel_sovereign.native_retirement import (
     NativeExecutionObserver,
@@ -138,6 +141,98 @@ async def test_open_body_is_retained_debt_not_an_unbounded_native_join(native_pg
     finally:
         release.set()
         await await_owned_task(producer)
+    assert not observer._resources
+
+
+async def test_late_observer_on_inherited_operational_lease_cannot_miss_accepted_commit(native_pg, monkeypatch):
+    backend, control, schema = native_pg
+    observer = NativeExecutionObserver()
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("original inherited operational lease"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_exit = asyncpg.transaction.Transaction.__aexit__
+
+    async def held_exit(transaction, kind, error, traceback):
+        result = await original_exit(transaction, kind, error, traceback)
+        if kind is None:
+            entered.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", held_exit)
+
+    async def callback():
+        with bind_native_execution_observer(observer):
+            await backend.execute("INSERT INTO effects VALUES (915, 'inherited original native lease')")
+
+    owner = signal = join = None
+    with bind_execution_custody_snapshot((scope,)):
+        async with backend.operational_session():
+            owner, signal = create_owned_task(callback()), create_owned_task(entered.wait())
+            try:
+                done, _ = await asyncio.wait({owner, signal}, timeout=3, return_when=asyncio.FIRST_COMPLETED)
+                assert done
+                if owner.done():
+                    outcome = await await_owned_task(owner)
+                    assert is_execution_control_error(outcome.error)
+                    assert await control.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0
+                    scope.require_work()  # Refusal does not revoke the borrowed host.
+                else:
+                    join = create_owned_task(observer.join_accepted())
+                    await asyncio.sleep(.03)
+                    assert not join.done(), "late observer missed the inherited lease's actual accepted COMMIT"
+            finally:
+                release.set()
+                signal.cancel()
+                await await_owned_task(signal)
+                await await_owned_task(owner)
+                if join is not None:
+                    await await_owned_task(join)
+
+
+@pytest.mark.parametrize("raw_transaction", [False, True])
+async def test_script_observation_cannot_hide_raw_transaction_control(native_pg, raw_transaction):
+    backend, control, schema = native_pg
+    observer = NativeExecutionObserver()
+    statement = "INSERT INTO effects VALUES (916, 'observed native script');"
+    script = f"BEGIN; {statement} COMMIT;" if raw_transaction else statement
+
+    async def execute():
+        with bind_native_execution_observer(observer):
+            await backend.execute_script(script)
+
+    outcome = await await_owned_task(create_owned_task(execute()))
+    assert (outcome.error is not None) is raw_transaction
+    assert await control.fetchval(f'SELECT count(*) FROM "{schema}".effects') == (0 if raw_transaction else 1)
+
+
+async def test_native_resource_roots_its_actual_body_task_until_physical_retirement(native_pg):
+    backend, _control, _schema = native_pg
+    observer = NativeExecutionObserver()
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("original retained native body task"))
+    entered = asyncio.Event()
+
+    async def body():
+        with bind_execution_custody_snapshot((scope,)), bind_native_execution_observer(observer):
+            async with backend.transaction():
+                await backend.execute("INSERT INTO effects VALUES (917, 'original rooted body')")
+                entered.set()
+                await asyncio.Future()
+
+    owner = create_owned_task(body())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        record, = observer._resources
+        # Assert the strong link BEFORE dropping the test's link, so a
+        # failing guard still has a safe original task to cancel and reap.
+        assert getattr(record, "body_owner", None) is owner
+        retained = weakref.ref(owner)
+        owner = None
+        gc.collect()
+        assert retained() is record.body_owner
+    finally:
+        original = owner if owner is not None else retained()
+        original.cancel()
+        await await_owned_task(original)
     assert not observer._resources
 
 

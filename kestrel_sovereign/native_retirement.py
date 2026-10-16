@@ -34,6 +34,7 @@ class _NativePhaseObservation:
 class _NativeResourceObservation:
     resource: Any
     observers: tuple[NativeExecutionObserver, ...]
+    body_owner: asyncio.Task = field(default_factory=asyncio.current_task)
     connection: Any = None
     native_connection: Any = None
     phases: set[_NativePhaseObservation] = field(default_factory=set)
@@ -101,8 +102,9 @@ class NativeExecutionObserver:
                 if phase.owner is not None:
                     outcome = await await_owned_task(phase.owner)
                     cancellation = execution_terminal_error(cancellation, outcome.cancellation)
-                # The backend classifies ACK failure and registers its next
-                # physical phase before completing this notification barrier.
+                # Classification must finish before the inventory is sampled
+                # again. The resource remains rooted across subsequent phases;
+                # this notification itself proves no physical retirement.
                 classified = await await_owned_task(phase.classified)
                 cancellation = execution_terminal_error(cancellation, classified.cancellation)
         error = self._error
@@ -151,3 +153,17 @@ def _begin_native_resource(resource):
 def _native_observation_requested():
     """Backend fast-path predicate; no owner, resource or authority is minted."""
     return bool(_NATIVE_OBSERVERS.get())
+
+
+def _require_native_observation_for_connection(connection):
+    """Never attach an empty inventory to a borrowed, pre-existing lease.
+
+    Binding must precede the original physical checkout. A connection already
+    enrolled for every current observer retains its actual native lifecycle;
+    an inherited operational lease cannot silently bypass that inventory.
+    """
+    for observer in _NATIVE_OBSERVERS.get():
+        if not any(record.connection is connection for record in observer._resources):
+            raise ExecutionAuthorityError(
+                "bind native retirement observation before acquiring the original operational/transaction lease"
+            )

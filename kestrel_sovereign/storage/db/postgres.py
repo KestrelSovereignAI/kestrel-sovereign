@@ -32,7 +32,10 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
-from kestrel_sovereign.native_retirement import _begin_native_resource, _native_observation_requested
+from kestrel_sovereign.native_retirement import (
+    _begin_native_resource, _native_observation_requested,
+    _require_native_observation_for_connection,
+)
 from kestrel_sovereign.execution_custody import (
     AcknowledgedExecutionCommit,
     NativeExecutionRetirement,
@@ -878,6 +881,8 @@ class PostgresBackend(DatabaseBackend):
         """
 
         scopes = self._remember_transaction_custody()
+        if executor is not self._pool:
+            _require_native_observation_for_connection(executor)
         if not scopes:
             if _native_observation_requested() and executor is self._pool:
                 # Observe the real checkout/reset without turning legacy
@@ -1435,7 +1440,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
-        if self._current_txn_conn() is not None or current_execution_custody(self):
+        if self._current_txn_conn() is not None or current_execution_custody(self) or _native_observation_requested():
             reject_transaction_control(script, dialect="postgres")
         record_write_script(script)
         pool = self._ensure_connected()
