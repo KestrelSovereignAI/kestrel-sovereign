@@ -596,6 +596,8 @@ class SyncService:
                 metadata["prune"] = prune_result
                 result.metadata = metadata
         except Exception as e:  # noqa: BLE001
+            if is_execution_control_error(e):
+                raise
             logger.warning("Retention prune failed for %s: %s", target.name, e)
             metadata = dict(result.metadata or {})
             metadata["prune_error"] = str(e)

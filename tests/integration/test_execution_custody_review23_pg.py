@@ -69,7 +69,10 @@ async def test_actual_server_initialize_denies_native_child_during_boot_rollback
 
     task = asyncio.create_task(startup())
     try:
-        await asyncio.wait_for(undo_entered.wait(), 3)
+        # This rendezvous includes cold provider discovery/Agent construction,
+        # not the native rollback's safety deadline. Allow ordinary parallel
+        # gates to finish setup; all authority/order assertions below remain.
+        await asyncio.wait_for(undo_entered.wait(), 10)
         result = await asyncio.gather(*children, return_exceptions=True)
         assert isinstance(result[0], ExecutionAuthorityError), "native write escaped during real initializer rollback"
         assert await control.fetchval("SELECT COUNT(*) FROM effects") == 0

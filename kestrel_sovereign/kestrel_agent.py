@@ -9485,9 +9485,38 @@ Expected Duration: {expected_duration}
         joins the agent-owned continuation that performs the only permitted
         subsequent storage close.  ``shield`` preserves the work if an outer
         lifecycle wait is cancelled; a later owner can join the same task.
+        Original native snapshot/stop Tasks retained by a finite observer guard
+        are likewise joined before their terminal control is reported.
         """
         retried_failure = False
         while True:
+            # A finite tail guard may stop observing an original native close,
+            # but cannot destroy that owner's coroutine/join. Explicit shutdown
+            # completion joins those retained Tasks, without cancelling them or
+            # waiting on this caller or its actual must-join ancestors.
+            from kestrel_sovereign._async_ownership import (
+                await_owned_task,
+                owned_task_join_ancestors,
+            )
+            from kestrel_sovereign.execution_custody import execution_cleanup_debts
+
+            current = asyncio.current_task()
+            ancestors = owned_task_join_ancestors(current)
+            pending = {
+                owner for _resource, owner in execution_cleanup_debts(
+                    vars(self).get("_shutdown_control")
+                )
+                if isinstance(owner, asyncio.Future) and not owner.done()
+                and owner is not current and owner not in ancestors
+            }
+            if pending:
+                for owner in pending:
+                    outcome = await await_owned_task(owner)
+                    self._remember_shutdown_control(execution_terminal_error(
+                        vars(self).get("_shutdown_control"),
+                        outcome.error, outcome.cancellation, retain_originals=True,
+                    ))
+                continue  # Harvest any native child debt published by that owner.
             continuation = self._durable_shutdown_continuation
             if continuation is None:
                 self._raise_shutdown_control()
@@ -10454,23 +10483,44 @@ Expected Duration: {expected_duration}
                 state["degraded"] = True
             return "error"
 
-        def _abandon(task) -> None:
-            """Force-terminate an over-guard / cancelled tail step.
+        def _abandon(task, *, retirement_resource=None) -> None:
+            """Stop observing a tail step without dropping its native owners.
 
-            ``task.cancel()`` alone is not enough: a step that suppresses
-            ``CancelledError`` keeps running forever and would hang a graceful
-            event-loop teardown that awaits every still-pending task (and, in
-            production, leak past process exit). Closing the underlying
-            coroutine throws ``GeneratorExit`` — a ``BaseException`` the step
-            cannot swallow with ``except CancelledError`` — so the frame is
-            guaranteed to unwind. A done callback retrieves the resulting
-            exception so it is never surfaced as "exception never retrieved".
+            Native retirement keeps its exact original Task and eventual
+            evidence. It is never coroutine-closed while joining an accepted
+            physical closer. The legacy hard-stop fallback below applies only
+            to steps without that explicit native-retirement contract.
+
+            Legacy steps that suppress cancellation get their existing Python
+            coroutine-close attempt. That is not a native retirement ACK and
+            cannot stand in for joining an accepted physical closer. A done
+            callback harvests the legacy task's eventual exception too.
             """
             task.cancel()  # cooperative first; unblocks well-behaved steps
+            if retirement_resource is not None:
+                from kestrel_sovereign._async_ownership import (
+                    owned_task_error,
+                    pending_owned_retirement_error,
+                )
+
+                retained = pending_owned_retirement_error(
+                    retirement_resource, (task,),
+                    message="original native shutdown owner exceeded its observer guard",
+                )
+                self._remember_shutdown_control(retained)
+
+                def retain_native_terminal(completed):
+                    self._remember_shutdown_control(execution_terminal_error(
+                        vars(self).get("_shutdown_control"), retained,
+                        owned_task_error(completed), retain_originals=True,
+                    ))
+
+                task.add_done_callback(retain_native_terminal)
+                return  # NEVER close the coroutine joining its native closer.
             coro = task.get_coro()
             if coro is not None:
                 try:
-                    coro.close()  # hard stop — GeneratorExit cannot be suppressed
+                    coro.close()  # legacy Python-frame unwind, not a native ACK
                 except Exception as failure:
                     self._remember_shutdown_control(failure)
             # Retrieve the eventual exception once the task reconciles to done.
@@ -10489,26 +10539,41 @@ Expected Duration: {expected_duration}
             *,
             shielded: bool = False,
             defer_failure_report: bool = False,
+            retirement_resource=None,
         ):
             """Run one tail step bounded by ``guard``.
 
             The coroutine is scheduled as a task and awaited only up to
             ``guard`` via ``asyncio.wait`` — which, unlike ``asyncio.wait_for``,
             does NOT wait for the task's cancellation to complete on timeout.
-            If the step exceeds the guard it is CANCELLED, hard-terminated, and
-            ABANDONED (never awaited), so a step that hangs *or suppresses
-            cancellation* cannot stall the tail beyond ``guard`` (the outer
-            ``wait_for`` / CLI "forcing exit" branch stays reachable) nor leak
-            past it. When ``shielded`` the underlying task keeps running if the
+            At the guard, the tail stops waiting and records degradation; it
+            does not renew the observer budget. Legacy steps keep their old
+            cancellation/frame-unwind fallback. Native-retirement steps retain
+            their original Task and eventual physical-close evidence instead.
+            When ``shielded`` the underlying task keeps running if the
             tail's own await is cancelled externally (used for
             ``force_snapshot`` so cancellation neither aborts it nor skips the
-            following ``stop()``); it is still bounded by ``guard``.
+            following ``stop()``); it is still bounded by ``guard``. An explicit
+            retirement resource retains the Task past that observation bound;
+            completion remains owned and a later completion waiter joins it.
             """
             # Every guard and any cancellation grace shares the one live tail
             # deadline.  In particular, an externally-cancelled shielded
             # close must not receive a fresh full guard after the deadline.
             guard = min(max(0.0, guard), max(0.0, tail_deadline - loop.time()))
-            task = asyncio.ensure_future(coro)
+            if retirement_resource is None:
+                task = asyncio.ensure_future(coro)
+            else:
+                from kestrel_sovereign._async_ownership import create_owned_task
+
+                try:
+                    task = create_owned_task(
+                        coro, retirement_resource=retirement_resource,
+                        retain_originals=True,
+                    )
+                except BaseException as failure:
+                    self._remember_shutdown_control(failure)
+                    raise
             try:
                 done, _pending = await asyncio.wait({task}, timeout=guard)
             except asyncio.CancelledError:
@@ -10526,7 +10591,7 @@ Expected Duration: {expected_duration}
                             {task}, timeout=cancellation_grace
                         )
                     except asyncio.CancelledError:
-                        _abandon(task)
+                        _abandon(task, retirement_resource=retirement_resource)
                         if not defer_failure_report:
                             state["degraded"] = True
                         return "abandoned"
@@ -10536,17 +10601,17 @@ Expected Duration: {expected_duration}
                             label,
                             defer_failure_report=defer_failure_report,
                         )
-                    _abandon(task)
+                    _abandon(task, retirement_resource=retirement_resource)
                     if not defer_failure_report:
                         state["degraded"] = True
                     return "abandoned"
-                _abandon(task)  # do NOT await — may suppress cancel
+                _abandon(task, retirement_resource=retirement_resource)
                 return "cancelled"
 
             if task not in done:
                 # Exceeded the guard. Hard-terminate but do NOT await — the step
                 # may suppress cancellation and would otherwise hang us.
-                _abandon(task)
+                _abandon(task, retirement_resource=retirement_resource)
                 if not defer_failure_report:
                     logging.warning(
                         "Durable shutdown step '%s' exceeded %.2fs; abandoned "
@@ -10640,6 +10705,7 @@ Expected Duration: {expected_duration}
                 _step_guard(),
                 "sync-snapshot",
                 shielded=True,
+                retirement_resource=sync_service,
             )
             # Always attempt stop() — even if the snapshot was abandoned or
             # cancellation was observed — so the sync worker is released.
@@ -10656,6 +10722,7 @@ Expected Duration: {expected_duration}
                 custody.release("sync_service", release_sync),
                 _step_guard(),
                 "sync-stop",
+                retirement_resource=sync_service,
             )
             if status == "ok":
                 logging.info("Sync service: final snapshot flushed")

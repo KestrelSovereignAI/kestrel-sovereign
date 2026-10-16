@@ -1,6 +1,7 @@
 """Real loopback HTTP/SQLite snapshot retirement, not paid/live acceptance."""
 
 import asyncio
+import json
 import sqlite3
 from contextlib import suppress
 
@@ -38,21 +39,48 @@ async def native_snapshot(tmp_path, monkeypatch):
     handlers, clients, source_errors, close_tasks = set(), [], [], []
     state = {"close_error": OSError("native HTTP client close acknowledgement lost")}
     state["release_server"] = release_server
+    state["hold_path"] = None
 
     async def serve(reader, writer):
         task = asyncio.current_task()
         handlers.add(task)
         try:
             headers = await reader.readuntil(b"\r\n\r\n")
-            size = next(
-                int(line.split(b":", 1)[1])
-                for line in headers.split(b"\r\n")
-                if line.lower().startswith(b"content-length:")
+            size = (
+                next(
+                    int(line.split(b":", 1)[1])
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+                if b"content-length:" in headers.lower()
+                else 0
             )
             await reader.readexactly(size)
-            entered.set()
-            await release_server.wait()
-            writer.write(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n")
+            hold_path = state["hold_path"]
+            if hold_path is None or hold_path.encode() in headers.split(b"\r\n", 1)[0]:
+                entered.set()
+                await release_server.wait()
+            if hold_path is None:
+                writer.write(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n")
+            else:
+                payload = json.dumps(
+                    {
+                        "Hash": "local-loopback-cid",
+                        "Size": size,
+                        "data": {"fileList": []},
+                    }
+                ).encode()
+                # Lighthouse wraps uploads in data only when that key exists.
+                if headers.startswith(b"POST "):
+                    payload = json.dumps(
+                        {"Hash": "local-loopback-cid", "Size": size}
+                    ).encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + str(len(payload)).encode()
+                    + b"\r\n\r\n"
+                    + payload
+                )
             await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
@@ -67,6 +95,7 @@ async def native_snapshot(tmp_path, monkeypatch):
 
     class LocalClient(lighthouse_rest.LighthouseRestClient):
         UPLOAD_URL = f"http://127.0.0.1:{port}"
+        API_URL = f"http://127.0.0.1:{port}"
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -76,6 +105,23 @@ async def native_snapshot(tmp_path, monkeypatch):
             try:
                 return await original_upload(self, *args, **kwargs)
             except BaseException as error:
+                if state.get("upload_failure_as_cancel") and isinstance(
+                    error, httpx.HTTPStatusError
+                ):
+                    # An admitted native callback retains its ORIGINAL real
+                    # HTTP failure as the explicit cause of cancellation.
+                    cancellation = asyncio.CancelledError(
+                        "original native upload callback cancelled"
+                    )
+                    source_errors.append(cancellation)
+                    raise cancellation from error
+                source_errors.append(error)
+                raise
+
+        async def get_uploads(self, *args, **kwargs):
+            try:
+                return await super().get_uploads(*args, **kwargs)
+            except BaseException as error:
                 source_errors.append(error)
                 raise
 
@@ -84,9 +130,16 @@ async def native_snapshot(tmp_path, monkeypatch):
     async def close_with_lost_ack(client):
         # Forward the actual HTTPX/httpcore socket retirement before losing ACK.
         await actual_close(client)
+        if state["hold_path"] is not None and not entered.is_set():
+            return  # The preceding successful upload's client closes normally.
+        close_index = len(close_tasks)
         close_tasks.append(asyncio.current_task())
         close_entered.set()
         await release_close.wait()
+        if state.get("close_probe") is not None:
+            await state["close_probe"]()
+        if state.get("close_errors") is not None:
+            raise state["close_errors"][close_index]
         if state["close_error"] is not None:
             raise state["close_error"]
 
@@ -397,3 +450,59 @@ async def test_caller_withdrawal_during_ordinary_http_failure_close_is_not_fallb
     assert isinstance(failure, asyncio.CancelledError)
     assert source_errors[0] in tuple(_explicit_control_chain(failure))
     assert not execution_cleanup_debts(failure)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["force", "periodic", "stop"])
+@pytest.mark.parametrize("close_cancels", [False, True])
+async def test_successful_snapshot_retention_preserves_original_shutdown_control(
+    native_snapshot, door, close_cancels
+):
+    (
+        db,
+        target,
+        service,
+        entered,
+        close_entered,
+        release_close,
+        clients,
+        source_errors,
+        close_tasks,
+        state,
+        tasks,
+    ) = native_snapshot
+    state["hold_path"] = "/api/user/files_uploaded"
+    if close_cancels:
+        state["close_error"] = asyncio.CancelledError("native pruning close cancelled")
+        state["close_error"].__cause__ = OSError("native pruning close ACK failed")
+    if door in {"periodic", "stop"}:
+        await service.start()
+        worker = service._poll_task
+    else:
+        worker = create_owned_task(service.force_snapshot(), retain_originals=True)
+    tasks.append(worker)
+    await asyncio.wait_for(entered.wait(), 3)
+    assert target._latest_cid == "local-loopback-cid"
+    assert target._manifest_path.exists(), "must reach actual post-success pruning"
+    if door == "stop":
+        observer = create_owned_task(service.stop(), retain_originals=True)
+        tasks.append(observer)
+    else:
+        worker.cancel("original successful-backup pruning withdrawal")
+        observer = worker
+    await asyncio.wait_for(close_entered.wait(), 3)
+    assert len(clients) == 2 and clients[1]._client.is_closed
+    assert not observer.done()
+    release_close.set()
+    await _eventually(observer.done)
+    failure = owned_task_error(observer)
+    assert failure is not None, "pruning control became successful snapshot metadata"
+    chain = tuple(_explicit_control_chain(failure))
+    assert state["close_error"] in chain and is_execution_control_error(failure)
+    assert source_errors[0] in chain, "original pruning cancellation was replaced"
+    assert any(isinstance(error, asyncio.CancelledError) for error in chain)
+    assert any(
+        resource is clients[1] and owner is close_tasks[0]
+        for resource, owner in execution_cleanup_debts(failure)
+    )
+    assert worker.done(), "periodic worker resumed after pruning cancellation"

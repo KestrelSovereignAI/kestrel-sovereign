@@ -402,6 +402,8 @@ class ContextBuilder:
                 search_kwargs["min_score"] = min_score
             rag_results = await self.storage.search_chunks(query, **search_kwargs)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error during RAG search: {e}")
             return "Error retrieving document context."
 
@@ -491,6 +493,8 @@ class ContextBuilder:
                     }
                     return hybrid.context
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     # Capability failures are observable and never fabricate a
                     # graph result; retain the established RAG path.
                     reason = self._semantic_failure_reason(exc)

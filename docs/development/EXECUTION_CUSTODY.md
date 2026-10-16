@@ -37,6 +37,22 @@ Native response retirement retains each failed resource and its original close
 task even when the SDK has already set an optimistic closed flag. Repeated
 shutdown joins that task; it does not retry the close or erase unresolved debt.
 Ordinary caller cancellation after a successful close is not cleanup failure.
+Retention pruning after a successful snapshot uses the same native close owner
+and control classifier as the upload itself; it cannot consume shutdown
+cancellation as a `prune_error` annotation on an otherwise successful result.
+The Agent's finite snapshot/stop guard stops observation, not physical ownership:
+it retains the exact original Task through canonical retirement debt instead of
+closing the coroutine joining a native client. Its existing lifetime retains
+each eventual original failure, including distinct concurrent snapshot/stop
+failures. Explicit shutdown completion joins pending original owners without
+cancelling them, rejoining completed owners, or joining self/actual ancestors.
+Neither a timeout, an observer notification nor a resource label is a close ACK.
+
+RAG and governed semantic recall likewise propagate original native storage
+control through ContextBuilder and ContextManager rather than rendering error
+strings, unavailable metadata or warning sections as turn context. Native tests
+exercise the authenticated locally-incepted identity and PostgreSQL ledger/RAG
+paths with embeddings explicitly unavailable, not model or full READY acceptance.
 Cold initialization, ingress release and reanchor cleanup preserve original
 unknown/committed receipts ahead of cancellation. HTTP peer envelopes and
 private ingress redaction carry only safe control/outcome classifications, not

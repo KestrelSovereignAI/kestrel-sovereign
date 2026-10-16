@@ -642,7 +642,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 "skipped_missing_id": skipped_missing_id,
             }
         finally:
-            await client.close()
+            await close_native_execution_stream(client, retain_originals=True)
 
     async def health_check(self) -> bool:
         """Check Lighthouse API connectivity."""
