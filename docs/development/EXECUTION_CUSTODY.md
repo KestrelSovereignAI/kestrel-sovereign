@@ -1340,4 +1340,20 @@ and assert that they construct no ambient LLM service. This prevents unowned
 test-only default-service writers; it does not certify the production default
 embedding getter or clear the broader private-client lifecycle finding.
 
+A2A hosted legacy policy, published display identity and typed durable-identity
+consumers preserve original native control before treating identity as absent
+or returning an ordinary 403/503. Existing ordinary policy refusals stay refusals;
+propagating uncertainty does not grant a sender admission. Native tests exercise
+actual database effects, immutable policy and topology leases with explicit
+private roster/requester inputs, not registered Agent READY or peer grants.
+
+Context-status HTTP/tool consumers preserve the same original control before
+legacy constitution/reflection/salvage fallback, generic HTTP shaping or typed
+tool-error shaping. Tests use the actual dry-run context planner, native stores
+and TaskManager; cheap readers issue no model requests. Legacy governing text
+and request projections are component inputs, not constitutional anchoring or
+authenticated HTTP acceptance. Corpus-profile and embedding-settings/reindex
+producer gaps remain separate open findings; these consumer repairs do not
+waive their native ownership or publication requirements.
+
 These are candidate contracts, not whole-branch review or release approval.

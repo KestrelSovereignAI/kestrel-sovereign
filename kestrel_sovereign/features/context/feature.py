@@ -24,6 +24,7 @@ kestrel-sovereign #1042 narration-honesty contract (see #1061).
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
@@ -287,9 +288,13 @@ class ContextFeature(Feature):
             session_id = getattr(self.agent, "_active_session_id", None)
             status = await compute_context_status(self.agent, session_id, full=False)
         except (AttributeError, TypeError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_status failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_status failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 

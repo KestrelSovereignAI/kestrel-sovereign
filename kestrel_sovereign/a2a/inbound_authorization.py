@@ -310,7 +310,9 @@ class RecipientA2ASenderAuthorizer:
 
         try:
             return resolve_scoped_agent_did(agent)
-        except AgentIdentityUnavailable:
+        except AgentIdentityUnavailable as error:
+            if is_execution_control_error(error):
+                raise
             return None
 
 

@@ -2089,6 +2089,8 @@ async def _acquire_context_status_measurement(
             constitution_text = await got if hasattr(got, "__await__") else got
             constitution_text = constitution_text or ""
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.debug("constitution fetch failed for breakdown: %s", exc)
             if is_real_governing_getter:
                 raise RuntimeError(
@@ -2161,6 +2163,8 @@ async def _acquire_context_status_measurement(
                 try:
                     reflection_guidance = await getter()
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "reflection guidance fetch failed for breakdown: %s",
                         exc,
@@ -2352,6 +2356,8 @@ async def compute_context_status(
                         DEFAULT_PENDING_WARN_THRESHOLD
                     )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"salvage counts fetch failed for breakdown: {e}")
 
         # 5. Pill % = projected whole-window utilization (the design's
@@ -2533,6 +2539,8 @@ async def compute_context_status(
             "silently_pruned_path_active": silently_pruned_path_active,
         }
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error getting context status: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving context status.")
 
@@ -2621,7 +2629,9 @@ def _scoped_agent_did_or_503(agent, verb: str) -> str:
 
     try:
         return resolve_scoped_agent_did(agent)
-    except AgentIdentityUnavailable:
+    except AgentIdentityUnavailable as error:
+        if is_execution_control_error(error):
+            raise
         raise HTTPException(
             status_code=503,
             detail=f"{verb} the agent's durable identity",
@@ -2645,7 +2655,9 @@ def _task_recipient_principal(agent, *, verb: str = "reads require") -> str:
 
     try:
         return resolve_scoped_agent_did(agent)
-    except AgentIdentityUnavailable:
+    except AgentIdentityUnavailable as error:
+        if is_execution_control_error(error):
+            raise
         raise HTTPException(
             status_code=503,
             detail=f"A2A task {verb} a durable recipient identity",
@@ -3144,7 +3156,9 @@ async def _create_a2a_task_under_lifecycle_lease(
                     claimed_sender,
                     hosted_policy,
                 )
-            except Exception:  # noqa: BLE001 - manager policy boundary
+            except Exception as error:  # noqa: BLE001 - manager policy boundary
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Hosted legacy unsigned A2A sender authorization failed",
                     exc_info=True,
@@ -3734,6 +3748,8 @@ async def get_task(request: Request, task_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error loading task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error loading task.")
 

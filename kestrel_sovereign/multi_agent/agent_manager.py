@@ -1727,7 +1727,9 @@ class AgentManager:
             )
             if inspect.isawaitable(result):
                 result = await result
-        except Exception:  # noqa: BLE001 - recipient policy provider boundary
+        except Exception as error:  # noqa: BLE001 - recipient policy provider boundary
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "Hosted legacy A2A sender authorization failed",
                 exc_info=True,
@@ -2081,7 +2083,9 @@ class AgentManager:
         if callable(resolver):
             try:
                 value = resolver(default=None)
-            except Exception:  # noqa: BLE001 - fail closed at identity boundary
+            except Exception as error:  # noqa: BLE001 - fail closed at identity boundary
+                if is_execution_control_error(error):
+                    raise
                 return None
         else:
             value = getattr(agent, "_agent_name", None)
