@@ -9428,7 +9428,9 @@ Expected Duration: {expected_duration}
                 return ReleaseOutcome.RELEASED
             await custody.release("host_key_database", release_host_db)
         await custody.release("storage", close_storage)
-        self._raise_shutdown_control()
+        # A completed physical cleanup owner is not cancelled by an earlier
+        # observer withdrawal. Public completion reports that retained receipt.
+        self._raise_shutdown_control(control_only=True)
         self._release_serving_record()
 
     async def _ensure_durable_shutdown_continuation(self, dispatcher) -> asyncio.Task:
@@ -9465,10 +9467,15 @@ Expected Duration: {expected_duration}
             return continuation
 
     def _remember_shutdown_control(
-        self, error: BaseException | None, *, retain_originals: bool = False,
+        self, error: BaseException | None, *, retain_originals: bool = True,
         retain_cancellation: bool = False,
     ) -> None:
-        """Retain original terminal evidence until its lifetime is reconciled."""
+        """Retain all original terminal evidence in this agent's lifetime.
+
+        This is a terminal-control inventory, not ordinary background history:
+        non-control failures are still ignored unless cancellation is opted in.
+        Every entry path preserves existing and incoming original carriers.
+        """
         if error is None or (
             not is_execution_control_error(error)
             and not (retain_cancellation and isinstance(error, asyncio.CancelledError))
@@ -9479,11 +9486,13 @@ Expected Duration: {expected_duration}
             retain_originals=retain_originals,
         )
 
-    def _raise_shutdown_control(self) -> None:
+    def _raise_shutdown_control(self, *, control_only: bool = False) -> None:
         terminal = execution_terminal_error(
             vars(self).get("_shutdown_control"), retain_originals=True,
         )
-        if terminal is not None:
+        if terminal is not None and (
+            not control_only or is_execution_control_error(terminal)
+        ):
             raise terminal
 
     async def wait_for_shutdown_completion(self) -> None:
@@ -9536,7 +9545,7 @@ Expected Duration: {expected_duration}
                 return
             except asyncio.CancelledError as cancellation:
                 self._remember_shutdown_control(cancellation)
-                self._raise_shutdown_control()
+                self._raise_shutdown_control(control_only=True)
                 # A continuation can itself be cancelled (for example while
                 # releasing the runtime owner).  That is a retryable cleanup
                 # failure.  A cancellation of *this* waiter, on the other
@@ -9547,7 +9556,7 @@ Expected Duration: {expected_duration}
                 failure: BaseException = asyncio.CancelledError()
             except Exception as exc:
                 self._remember_shutdown_control(exc)
-                self._raise_shutdown_control()
+                self._raise_shutdown_control(control_only=True)
                 failure = exc
 
             if retried_failure:
@@ -10584,6 +10593,7 @@ Expected Duration: {expected_duration}
                     )
                 except BaseException as failure:
                     self._remember_shutdown_control(failure)
+                    self._raise_shutdown_control()
                     raise
             try:
                 done, _pending = await asyncio.wait({task}, timeout=guard)

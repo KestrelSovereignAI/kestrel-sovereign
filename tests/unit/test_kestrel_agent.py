@@ -1943,15 +1943,17 @@ class TestLifecycle:
                 await backend.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("continuation_failure", ["none", "cancel", "error"])
     async def test_cancelled_agent_shutdown_continuation_closes_storage_without_retry(
-        self, tmp_path
+        self, tmp_path, continuation_failure
     ):
         """A cancelled outer shutdown leaves one owned completion path.
 
         The caller invokes shutdown exactly once.  Once its bounded wrapper
         times out, the agent's continuation must join dispatcher release and
         close storage itself; no test-only dispatcher/agent retry may mask a
-        leaked SQLite worker.
+        leaked SQLite worker. A withdrawn cleanup observer may be retried, but
+        it must join the same dispatcher owner and close storage only once.
         """
         from kestrel_sovereign.signals import (
             OrderedLockManager,
@@ -2000,10 +2002,29 @@ class TestLifecycle:
         agent._sync_service = None
         agent.storage = _Storage()
 
+        if continuation_failure == "error":
+            original_completion = agent._complete_durable_shutdown_continuation
+            completion_attempts = 0
+
+            async def fail_first_completion(*args):
+                nonlocal completion_attempts
+                completion_attempts += 1
+                if completion_attempts == 1:
+                    # Forward the actual dispatcher join before the declared
+                    # ordinary observer callback fault; no fake native ACK.
+                    await dispatcher.wait_for_durable_shutdown_release()
+                    raise RuntimeError("original cleanup observer callback failed")
+                return await original_completion(*args)
+
+            agent._complete_durable_shutdown_continuation = fail_first_completion
+
+        shutdown = asyncio.create_task(agent.shutdown())
         try:
+            # Enter the actual tail before starting the outer observer clock;
+            # otherwise this tests prefix versus tail timing by accident.
+            await asyncio.wait_for(release_entered.wait(), timeout=3.0)
             with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(agent.shutdown(), timeout=0.05)
-            await asyncio.wait_for(release_entered.wait(), timeout=1.0)
+                await asyncio.wait_for(shutdown, timeout=0.05)
 
             # The outer agent shutdown is gone, but its shielded dispatcher
             # cleanup remains live. Storage must stay untouched until the
@@ -2012,20 +2033,43 @@ class TestLifecycle:
             assert dispatcher._durable_shutdown_completion is not None
             assert not dispatcher._durable_shutdown_completion.done()
             assert agent._durable_shutdown_continuation is not None
+            original_continuation = agent._durable_shutdown_continuation
+            original_withdrawal = agent._shutdown_control
+            assert isinstance(original_withdrawal, asyncio.CancelledError)
+            if continuation_failure == "cancel":
+                original_continuation.cancel("withdraw original cleanup observer")
+                await asyncio.gather(original_continuation, return_exceptions=True)
 
             allow_release.set()
-            await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=1.0)
+            with pytest.raises(asyncio.CancelledError) as observed:
+                await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=3.0)
+            assert observed.value is original_withdrawal
             assert storage_close_attempts == ["closed"]
             assert dispatcher._durable_shutdown_completion.done()
+            assert agent._durable_shutdown_continuation.done()
+            assert not agent._durable_shutdown_continuation.cancelled(), (
+                "physical completion must not become a cancelled owner merely "
+                "because the Agent retains an earlier observer withdrawal"
+            )
+            with pytest.raises(asyncio.CancelledError) as repeated:
+                await agent.wait_for_shutdown_completion()
+            assert repeated.value is original_withdrawal
+            assert storage_close_attempts == ["closed"]
         finally:
             allow_release.set()
             dispatcher._durable_store.release_initial_reservations = original_release
-            if agent._durable_shutdown_continuation is not None:
-                await agent.wait_for_shutdown_completion()
-            elif not dispatcher._durable_shutdown:
+            try:
+                if not shutdown.done():
+                    shutdown.cancel()
+                await asyncio.gather(shutdown, return_exceptions=True)
                 await dispatcher.shutdown_durable_delivery()
-            if backend._connection is not None:
-                await backend.close()
+                if agent._durable_shutdown_continuation is not None:
+                    await asyncio.gather(
+                        agent._durable_shutdown_continuation, return_exceptions=True
+                    )
+            finally:
+                if backend._connection is not None:
+                    await backend.close()
 
     @pytest.mark.asyncio
     async def test_boot_rollback_retries_owner_release_before_storage_close(

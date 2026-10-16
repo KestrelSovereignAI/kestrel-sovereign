@@ -683,3 +683,199 @@ async def test_timely_original_callback_cancellation_is_raised_after_successful_
     finally:
         await agent.llm_service.close()
         await usage_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["tail", "completion", "outer"])
+@pytest.mark.parametrize("close_cancels", [False, True])
+@pytest.mark.parametrize("refusal_cancels", [False, True])
+async def test_actual_snapshot_failure_and_stop_refusal_keep_both_originals(
+    native_snapshot, tmp_path, monkeypatch, door, close_cancels, refusal_cancels
+):
+    from inspect import CORO_CLOSED, getcoroutinestate
+
+    from kestrel_sovereign.kestrel_agent import await_agent_shutdown_completion
+
+    (
+        db,
+        target,
+        service,
+        entered,
+        close_entered,
+        release_close,
+        clients,
+        source_errors,
+        close_tasks,
+        state,
+        tasks,
+    ) = native_snapshot
+    agent, usage_db = await _partial_native_agent(tmp_path, monkeypatch)
+    agent._sync_service = service
+    agent._resource_custody().acquire("sync_service")
+    if close_cancels:
+        state["close_error"] = asyncio.CancelledError(
+            "actual original native close cancellation"
+        )
+        state["close_error"].__cause__ = OSError(
+            "actual original physical close ACK lost"
+        )
+    original = state["close_error"]
+    refusal = (
+        asyncio.CancelledError("original refused sync-stop admission")
+        if refusal_cancels
+        else RuntimeError("original refused sync-stop admission")
+    )
+    if refusal_cancels:
+        refusal.__cause__ = OSError("actual stop Task factory refusal")
+    state["release_server"].set()
+    release_close.set()
+    loop, factory = (
+        asyncio.get_running_loop(),
+        asyncio.get_running_loop().get_task_factory(),
+    )
+    refused = []
+
+    def refuse_stop(loop, coroutine, **kwargs):
+        frame = coroutine.cr_frame
+        operation = frame.f_locals.get("operation", coroutine) if frame else coroutine
+        operation_frame = getattr(operation, "cr_frame", None)
+        if (
+            _operation_name(coroutine) == "ResourceCustody.release"
+            and operation_frame
+            and operation_frame.f_locals.get("name") == "sync_service"
+        ):
+            refused.append(coroutine)
+            raise refusal
+        return (
+            factory(loop, coroutine, **kwargs)
+            if factory
+            else asyncio.Task(coroutine, loop=loop, **kwargs)
+        )
+
+    loop.set_task_factory(refuse_stop)
+    try:
+        tail_failure = None
+        try:
+            await agent._run_durable_shutdown_tail(5)
+        except BaseException as error:
+            tail_failure = error
+        assert (
+            tail_failure is not None
+            and refused
+            and len(close_tasks) == 1
+            and close_tasks[0].done()
+        )
+        assert all(getcoroutinestate(coro) == CORO_CLOSED for coro in refused)
+        selected = tail_failure
+        if door != "tail":
+            selected = None
+            try:
+                if door == "completion":
+                    await agent.wait_for_shutdown_completion()
+                else:
+                    await await_agent_shutdown_completion(
+                        agent, prior_error=tail_failure
+                    )
+            except BaseException as error:
+                selected = error
+        chain = tuple(_explicit_control_chain(selected))
+        assert original in chain and refusal in chain, (
+            "accepted native failure and refused subsequent stop lost an original carrier"
+        )
+        assert any(
+            resource is service and owner is None
+            for resource, owner in execution_cleanup_debts(selected)
+        )
+        assert any(
+            resource is clients[0] and owner is close_tasks[0]
+            for resource, owner in execution_cleanup_debts(selected)
+        )
+    finally:
+        loop.set_task_factory(factory)
+        await agent.llm_service.close()
+        await usage_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary", ["physical-epilogue", "cancelled-owner", "failed-owner"]
+)
+async def test_native_retirement_control_cannot_be_demoted_to_observer_withdrawal(
+    native_snapshot, tmp_path, monkeypatch, boundary
+):
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    (
+        db,
+        target,
+        service,
+        entered,
+        close_entered,
+        release_close,
+        clients,
+        source_errors,
+        close_tasks,
+        state,
+        tasks,
+    ) = native_snapshot
+    agent, usage_db = await _partial_native_agent(tmp_path, monkeypatch)
+    agent._sync_service = service
+    agent._resource_custody().acquire("sync_service")
+    state["release_server"].set()
+    release_close.set()
+    forbidden = []
+    original = state["close_error"]
+
+    def forbid_serving_release():
+        forbidden.append("serving-release")
+        raise AssertionError("native retirement control reached serving-record release")
+
+    async def forbid_replacement(*args):
+        forbidden.append("replacement")
+        raise AssertionError(
+            "unresolved native retirement admitted a replacement cleanup"
+        )
+
+    try:
+        await agent._run_durable_shutdown_tail(5)
+        assert close_tasks and all(task.done() for task in close_tasks)
+        assert original in tuple(_explicit_control_chain(agent._shutdown_control))
+        monkeypatch.setattr(agent, "_release_serving_record", forbid_serving_release)
+        if boundary == "physical-epilogue":
+            operation = create_owned_task(
+                agent._complete_durable_shutdown_continuation(None, None, None),
+                retain_originals=True,
+            )
+            tasks.append(operation)
+            failure = (await await_owned_task(operation)).error
+        else:
+            observer_entered = asyncio.Event()
+
+            async def original_observer():
+                observer_entered.set()
+                if boundary == "failed-owner":
+                    raise RuntimeError("declared original cleanup observer failure")
+                await asyncio.Event().wait()
+
+            observer = create_owned_task(original_observer(), retain_originals=True)
+            tasks.append(observer)
+            await asyncio.wait_for(observer_entered.wait(), 3)
+            if boundary == "cancelled-owner":
+                observer.cancel("withdraw cleanup observer, not native debt")
+            await asyncio.gather(observer, return_exceptions=True)
+            agent._durable_shutdown_continuation = observer
+            monkeypatch.setattr(
+                agent, "_ensure_durable_shutdown_continuation", forbid_replacement
+            )
+            failure = None
+            try:
+                await agent.wait_for_shutdown_completion()
+            except BaseException as error:
+                failure = error
+        assert original in tuple(_explicit_control_chain(failure)), (
+            "native control was classified as observer-only withdrawal"
+        )
+        assert execution_cleanup_debts(failure) and not forbidden
+    finally:
+        await agent.llm_service.close()
+        await usage_db.close()

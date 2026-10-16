@@ -1277,7 +1277,7 @@ class MemoryRetriever:
 
 
 def calculate_decay(
-    created_at: str,
+    created_at: str | datetime,
     importance: float = 0.5,
     access_count: int = 0,
     decay_protected: bool = False,
@@ -1312,7 +1312,7 @@ def calculate_decay(
     *familiar*, but doesn't punish familiarity either.
 
     Args:
-        created_at: ISO timestamp of memory creation
+        created_at: ISO text or native database datetime of memory creation
         importance: Importance score (0.0 to 1.0)
         access_count: Number of times retrieved
         decay_protected: If True, returns 1.0 (no decay)
@@ -1328,16 +1328,13 @@ def calculate_decay(
         return 1.0
 
     try:
-        # Parse timestamp
-        if isinstance(created_at, str):
-            created_at = created_at.replace("Z", "+00:00")
-            if "+" not in created_at and "-" not in created_at[10:]:
-                created = datetime.fromisoformat(created_at)
-                created = created.replace(tzinfo=timezone.utc)
-            else:
-                created = datetime.fromisoformat(created_at)
-        else:
-            created = created_at
+        # Native PostgreSQL TIMESTAMP values are naive UTC datetimes; SQLite
+        # retains ISO text. Both must decay as the same stored instant.
+        from .timestamps import timestamp_column_value
+
+        created = timestamp_column_value(created_at)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
 
         now = datetime.now(timezone.utc)
         days_old = (now - created).total_seconds() / 86400

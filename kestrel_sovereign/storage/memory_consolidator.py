@@ -30,6 +30,7 @@ from .async_conversation_store import (
 )
 from .session_grouping import timestamp_predicate, timestamp_query_param
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 # ``SalvageState`` lives in ``kestrel_sovereign.agent.salvage``;
 # importing it here would create a circular import via
@@ -250,6 +251,8 @@ class MemoryConsolidator:
             )
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Consolidation failed: {e}")
             report["error"] = str(e)
 

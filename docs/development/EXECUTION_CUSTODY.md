@@ -54,6 +54,24 @@ cause is an ordinary HTTP error. Explicit shutdown completion joins pending
 original owners without
 cancelling them, rejoining completed owners, or joining self/actual ancestors.
 Neither a timeout, an observer notification nor a resource label is a close ACK.
+All Agent terminal-inventory entry paths preserve original carriers by default,
+including a native snapshot failure followed by refused stop-Task admission.
+The immediate tail caller and later lifecycle completion observe the same full
+evidence, not different exceptions with only copied resource metadata.
+Physical continuation completion is separate from observer withdrawal: an
+ordinary retained cancellation is reported to the public waiter only after
+cleanup joins, and cannot cancel the completed owner or prevent retry of a
+withdrawn cleanup observer. Native execution control still fails closed before
+serving-record release; a successful independent close cannot clear its debt.
+
+Memory consolidation, forgetting and paired graph-node deletion propagate native
+storage control before ordinary report/zero-count/skip fallbacks. Episode cutoff
+binds use the existing native timestamp adapter, and decay accepts native naive
+UTC PostgreSQL datetimes as well as SQLite ISO text. Real PostgreSQL tests check
+post-COMMIT release-ACK faults through the consolidator, MemorySystem and partial
+Agent sleep helper, plus actual graph-node deletion with its episode row still
+retained. These are native helper/consumer proofs, not full sleep/Agent READY or
+external-provider acceptance.
 
 RAG and governed semantic recall likewise propagate original native storage
 control through ContextBuilder and ContextManager rather than rendering error
