@@ -4522,17 +4522,12 @@
       "type": "Release Note"
     },
     {
-      "existing_code_refs": [],
-      "findings": [
-        "missing_local_links",
-        "missing_code_refs"
-      ],
-      "missing_code_refs": [
+      "existing_code_refs": [
         "scripts/ci/throughput_report.py"
       ],
-      "missing_links": [
-        "../../scripts/ci/throughput_report.py"
-      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/research/DEVELOPMENT_THROUGHPUT.md",
       "privacy": "public",
       "render": "public",
