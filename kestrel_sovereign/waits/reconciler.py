@@ -60,6 +60,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, Outcome, ToolResult, WaitStatus
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
 from kestrel_sovereign.signals.dispatcher import (
     SURFACE_QUEUED,
@@ -1431,8 +1432,8 @@ async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
         so the caller fails OPEN and allows the watch.
 
     A provider with no ``owns_handle`` is treated as ``None`` (unverifiable).
-    A provider bug is swallowed to ``None`` — an ownership check must never be
-    the thing that blocks an otherwise-valid watch.
+    An ordinary provider bug is swallowed to ``None``. Native control is not
+    an ownership answer and must propagate before any watch is admitted.
     """
     verify = getattr(provider, "owns_handle", None)
     if not callable(verify):
@@ -1442,6 +1443,8 @@ async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
         if asyncio.iscoroutine(result):
             result = await result
     except Exception as exc:  # provider bug — don't block on a broken check
+        if is_execution_control_error(exc):
+            raise
         logger.debug(
             "owns_handle(%r) raised on provider %s: %s",
             handle, getattr(provider, "kind", "?"), exc,
@@ -1471,9 +1474,8 @@ async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
     USER_VISIBLE, get its text painted into that window. Routing authority
     stays with locally-owned provider state.
 
-    A provider bug is swallowed to ``None``: failing to resolve an origin must
-    degrade to the pre-#2877 behavior (a system-initiated wake), never block
-    the wake itself.
+    An ordinary provider bug is swallowed to ``None``. Native control must
+    propagate rather than authorizing a replacement system-initiated wake.
     """
     resolve = getattr(provider, "origin_session_id", None)
     if not callable(resolve):
@@ -1483,6 +1485,8 @@ async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
         if asyncio.iscoroutine(result):
             result = await result
     except Exception as exc:  # provider bug — wake system-initiated instead
+        if is_execution_control_error(exc):
+            raise
         logger.debug(
             "origin_session_id(%r) raised on provider %s: %s",
             handle, getattr(provider, "kind", "?"), exc,

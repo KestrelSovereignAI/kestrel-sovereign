@@ -349,6 +349,15 @@ PostgreSQL store/TaskManager tests prove this helper boundary with an already-
 admitted recipient view, including actual ASGI 2.3/2.4 response execution, not
 peer signatures, full Agent startup or READY.
 
+Wait ownership and origin-session resolution retain native execution control
+before watch admission or wake construction. Task and outbound-A2A providers do
+not treat that control as unverifiable ownership or an ordinary pending poll;
+the generic ownership/origin adapters do not turn it into absent session data.
+Ordinary backend/provider
+errors retain their established availability behavior. Native store/provider
+tests also verify that failed ownership reads do not persist local watches;
+their admitted recipient/provider inputs are not full Agent/READY acceptance.
+
 A2A boot reuses the guarded native storage backend, including DSN-only agents;
 individual stores do not own its pool. Inbound verification/authorization and
 peer tools retain the original runtime throughout the operation. Operational
