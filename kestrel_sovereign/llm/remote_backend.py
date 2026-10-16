@@ -24,7 +24,7 @@ from kestrel_sdk.llm import (
 from kestrel_sdk.llm.types import BackendType
 
 from kestrel_sovereign._async_ownership import await_owned_task
-from .lifecycle import start_llm_close_task
+from .lifecycle import harvest_llm_close_task, start_llm_close_task
 from kestrel_sovereign.execution_custody import (
     await_execution_work, bind_execution_custody_snapshot,
     current_execution_custody, execution_terminal_error,
@@ -80,6 +80,8 @@ class RemoteBackendMixin:
         key = ("client", id(client))
         owner = start_llm_close_task(self, key, client.close, resource=client)
         outcome = await await_owned_task(owner) if owner is not None else None
+        if owner is not None:
+            harvest_llm_close_task(self, key, owner)
         terminal = execution_terminal_error(
             vars(self).get("_llm_close_control"),
             outcome.error if outcome is not None else None,

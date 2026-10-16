@@ -43,33 +43,43 @@ def start_llm_close_task(owner, key, operation, *, resource=None):
     tasks[key] = task
 
     def completed(done):
-        error = owned_task_error(done)
-        if error is not None and resource is not None:
-            error._kestrel_native_retirement_debts = (
-                *getattr(error, "_kestrel_native_retirement_debts", ()),
-                (resource, done),
-            )
-        if error is not None and is_execution_control_error(error):
-            owner._llm_close_control = execution_terminal_error(
-                vars(owner).get("_llm_close_control"), error,
-            )
-        if tasks.get(key) is done:
-            if error is None:
-                tasks[key] = None
-                resources.pop(key, None)
-            elif key in ("preference-writers", "modality-writers"):
-                # This task joins writers; it is not a native resource close.
-                # A bounded join may have been cancelled while its original
-                # writers remained live. A later wrapper can join those SAME
-                # writers, without repeating a write or native close.
-                tasks.pop(key)
-            # ANY native failure is not proof that every transport
-            # resource retired. Keep the exact failed owner; never replace it
-            # with a speculative second close or advertise release. A control
-            # receipt describes authority/effect disposition, not retirement.
+        harvest_llm_close_task(owner, key, done)
 
     task.add_done_callback(completed)
     return task
+
+
+def harvest_llm_close_task(owner, key, task):
+    """Reconcile one ORIGINAL terminal owner before releasing its registry key.
+
+    Eager completion does not run queued callbacks before a direct join returns.
+    Both the callback and the original joiner use this same idempotent harvest.
+    """
+    if not task.done():
+        raise RuntimeError("cannot harvest an unfinished original LLM closer")
+    error = owned_task_error(task)
+    tasks = vars(owner).setdefault("_llm_close_tasks", {})
+    if tasks.get(key) is not task:
+        return error
+    resources = vars(owner).setdefault("_llm_native_retirement_resources", {})
+    resource = resources.get(key)
+    if error is not None and resource is not None:
+        debts = getattr(error, "_kestrel_native_retirement_debts", ())
+        if not any(held is resource and closer is task for held, closer in debts):
+            error._kestrel_native_retirement_debts = (*debts, (resource, task))
+    if error is not None and is_execution_control_error(error):
+        owner._llm_close_control = execution_terminal_error(
+            vars(owner).get("_llm_close_control"), error, retain_originals=True,
+        )
+    if error is None:
+        tasks[key] = None
+        resources.pop(key, None)
+    elif key in ("preference-writers", "modality-writers"):
+        # This is a writer join, not native retirement. A later wrapper may
+        # join the SAME original writers, without repeating any native effect.
+        tasks.pop(key)
+    # Failed physical closers remain exact original owners, not retryable ACKs.
+    return error
 
 
 @dataclass(slots=True)

@@ -2300,9 +2300,10 @@ async def _shutdown_stop_receipts(app: FastAPI) -> None:
     # Keep this primitive safe for focused tests and recovery callers that do
     # not drive the full ordered server teardown.
     registry = getattr(app.state, "distributed_invocation_registry", None)
-    app.state.distributed_invocation_registry = None
     if registry is not None:
         await registry.close()
+        if getattr(app.state, "distributed_invocation_registry", None) is registry:
+            app.state.distributed_invocation_registry = None
     db = getattr(app.state, "stop_receipt_db", None)
     # Teardown retires a failed startup too. Left behind, its error would make
     # an app reused without its lifespan answer 503 for a failure that belongs
@@ -2310,18 +2311,20 @@ async def _shutdown_stop_receipts(app: FastAPI) -> None:
     app.state.stop_receipt_store_error = ""
     app.state.stop_receipt_store = None
     app.state.peer_stop_circuit = None
-    app.state.stop_receipt_db = None
     if db is not None:
         await db.close()
+        if getattr(app.state, "stop_receipt_db", None) is db:
+            app.state.stop_receipt_db = None
 
 
 async def _shutdown_distributed_invocations(app: FastAPI) -> None:
     """Retire this process's ownership rows after agents finish cleanup."""
 
     registry = getattr(app.state, "distributed_invocation_registry", None)
-    app.state.distributed_invocation_registry = None
     if registry is not None:
         await registry.close()
+        if getattr(app.state, "distributed_invocation_registry", None) is registry:
+            app.state.distributed_invocation_registry = None
 
 
 async def _shutdown_stop_cleanup(app: FastAPI) -> None:
@@ -2334,9 +2337,8 @@ async def _shutdown_stop_cleanup(app: FastAPI) -> None:
         return
     if not isinstance(registry, StopCleanupRegistry):
         raise TypeError("app Stop cleanup registry has an invalid type")
-    try:
-        await registry.drain()
-    finally:
+    await registry.drain()
+    if getattr(app.state, "stop_cleanup_registry", None) is registry:
         app.state.stop_cleanup_registry = None
 
 
@@ -2412,9 +2414,18 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
     close_task = getattr(app.state, "phoenix_proxy_close_task", None)
     close_failure = getattr(app.state, "phoenix_proxy_close_error", None)
     resource = getattr(app.state, "phoenix_proxy_close_resource", None)
+    previous_supervisor = getattr(app.state, "phoenix_proxy_close_supervisor", None)
     stop_failure = None
     try:
+        if (close_task is not None or close_failure is not None) and previous_supervisor is not phoenix:
+            mismatch = _unstarted_lifespan_phase_error(
+                RuntimeError("previous Phoenix supervisor must retire before replacement"),
+                tuple(original for original in (previous_supervisor or resource, phoenix) if original is not None),
+            )
+            close_failure = execution_terminal_error(close_failure, mismatch, retain_originals=True)
+            raise close_failure
         if close_task is None and close_failure is None:
+            app.state.phoenix_proxy_close_supervisor = phoenix
             resource = getattr(phoenix, "_client", None)
             if resource is None:
                 resource = phoenix
@@ -2454,6 +2465,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             app.state.phoenix = None
             app.state.phoenix_proxy_close_task = None
             app.state.phoenix_proxy_close_resource = None
+            app.state.phoenix_proxy_close_supervisor = None
 
     terminal = execution_terminal_error(*failures, retain_originals=True)
     if terminal is not None:
@@ -2490,6 +2502,10 @@ async def _shutdown_host_features(app: FastAPI) -> None:
             failure = execution_terminal_error(failure, exc, retain_originals=True)
     if failure is not None:
         raise failure
+    if getattr(app.state, "host_context", None) is host_context:
+        app.state.host_context = None
+    if getattr(app.state, "host_features", None) is host_features:
+        app.state.host_features = []
 
 
 _SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV = (
@@ -3082,7 +3098,7 @@ def _unstarted_lifespan_phase_error(error: BaseException, resources) -> BaseExce
     return error
 
 
-def _lifespan_shutdown_phase_resources(app: FastAPI, name: str) -> tuple:
+def _lifespan_shutdown_phase_resources(app: FastAPI, name: str | None = None) -> tuple:
     """Snapshot original owners immediately before a phase's Task admission.
 
     A refused coordinator has not entered any closer. These strong references
@@ -3098,23 +3114,39 @@ def _lifespan_shutdown_phase_resources(app: FastAPI, name: str) -> tuple:
         "distributed-stop-invocations": ("distributed_invocation_registry",),
         "stop-receipts": ("distributed_invocation_registry", "stop_receipt_db"),
         "shared-agent-postgres": ("shared_agent_postgres_backend",),
-        "phoenix": ("phoenix", "phoenix_task", "phoenix_start_task"),
-    }[name]
-    resources = [getattr(app.state, attribute, None) for attribute in attributes]
-    if name == "unpublished-providers":
-        resources.extend(owner.provider for owner in (getattr(app.state, "unpublished_llm_owners", {}) or {}).values())
-    elif name == "host-features":
-        resources.extend(getattr(app.state, "host_features", ()) or ())
-        context = getattr(app.state, "host_context", None)
-        if context is not None:
-            resources.extend(getattr(context, attribute, None) for attribute in (
-                "session_factory", "hold_evidence_db", "hold_db", "db",
-            ))
+        "phoenix": ("phoenix", "phoenix_task", "phoenix_start_task",
+                    "phoenix_proxy_close_task", "phoenix_proxy_close_resource",
+                    "phoenix_proxy_close_supervisor"),
+    }
+    resources = []
+    for phase in attributes if name is None else (name,):
+        resources.extend(getattr(app.state, attribute, None) for attribute in attributes[phase])
+        if phase == "unpublished-providers":
+            resources.extend(owner.provider for owner in (getattr(app.state, "unpublished_llm_owners", {}) or {}).values())
+        elif phase == "host-features":
+            resources.extend(getattr(app.state, "host_features", ()) or ())
+            context = getattr(app.state, "host_context", None)
+            if context is not None:
+                resources.extend(getattr(context, attribute, None) for attribute in (
+                    "session_factory", "hold_evidence_db", "hold_db", "db",
+                ))
     original = []
     for resource in resources:
         if resource is not None and all(resource is not known for known in original):
             original.append(resource)
     return tuple(original)
+
+
+def _require_retired_server_resources(app: FastAPI) -> None:
+    """Reject a new lifespan BEFORE any old ownership field can be reset."""
+    previous = execution_terminal_error(
+        getattr(app.state, "_lifespan_teardown_error", None),
+        getattr(app.state, "phoenix_proxy_close_error", None), retain_originals=True,
+    )
+    if _lifespan_shutdown_phase_resources(app) or previous is not None:
+        raise RuntimeError(
+            "previous server lifecycle resources must retire before restart"
+        ) from previous
 
 
 async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException | None]:
@@ -3190,6 +3222,7 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
             failed_phases.add(name)
             first_failure = execution_terminal_error(first_failure, failure, retain_originals=True)
 
+    app.state._lifespan_teardown_error = first_failure
     return cancelled, first_failure
 
 
@@ -3238,6 +3271,7 @@ async def _build_host_control_context(app: FastAPI, host_config) -> object:
 @asynccontextmanager
 async def _lifespan_startup(app: FastAPI):
     """Initialize server resources; outer lifespan ownership handles teardown."""
+    _require_retired_server_resources(app)
     if (getattr(app.state, "unpublished_llm_owners", None)
             or getattr(app.state, "startup_cleanup_agent", None)):
         raise RuntimeError("unpublished provider/agent cleanup must retire before server restart")
@@ -4136,6 +4170,9 @@ async def _complete_deferred_agent_readiness(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup and cancellation-safe teardown for the server."""
+    # Rejected entry must not install another teardown owner over resources
+    # still owned by a previous lifecycle. Recovery drains them explicitly.
+    _require_retired_server_resources(app)
     async with _lifespan_teardown_owner(app):
         async with _lifespan_startup(app):
             yield

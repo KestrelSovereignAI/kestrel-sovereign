@@ -71,7 +71,7 @@ from .invocation_context import (
 )
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import REMOTE_ROUTE_NAME, BackendType, RemoteBackendMixin
-from .lifecycle import start_llm_close_task
+from .lifecycle import harvest_llm_close_task, start_llm_close_task
 from .decision_service import DecisionServiceMixin
 from .modality_recording import ModalityRecordingMixin
 from .provider_policy import (
@@ -6293,6 +6293,9 @@ No other text or formatting.
                     terminal = execution_terminal_error(terminal, failure)
             # Completion callbacks drop settled task graphs. Allow every
             # already-queued canonical harvester to finish before resnapshot.
+            for key, task in tuple(closing.items()):
+                if task is not None and task.done():
+                    harvest_llm_close_task(self, key, task)
             await asyncio.sleep(0)
             if terminal is not None and all(task.done() for task in owners):
                 break
@@ -6347,7 +6350,7 @@ No other text or formatting.
                     interrupted = True
             if not task.done():
                 return
-            error = owned_task_error(task)
+            error = harvest_llm_close_task(self, key, task)
             if error is not None and is_execution_control_error(error):
                 terminal = execution_terminal_error(terminal, error)
             elif error is not None:
@@ -6404,14 +6407,29 @@ No other text or formatting.
                 # dependency must physically settle before database retirement.
                 outcome = await await_owned_task(writer, withdrawal)
                 withdrawal = outcome.cancellation
-            await self.close_usage_db()
+                if outcome.error is not None and is_execution_control_error(outcome.error):
+                    self._llm_close_control = execution_terminal_error(
+                        vars(self).get("_llm_close_control"), outcome.error,
+                        retain_originals=True,
+                    )
+            # The writer's original receipt is not a failed DATABASE close.
+            # Retain it independently, allowing successful physical retirement
+            # to release the database's resource entry without losing control.
             if withdrawal is not None:
-                raise withdrawal
+                self._llm_close_control = execution_terminal_error(
+                    vars(self).get("_llm_close_control"), withdrawal,
+                    retain_originals=True,
+                )
+            await self.close_usage_db()
 
         await retire("usage-database", close_usage_after_writers,
                      resource=getattr(self, "_usage_db", None) if getattr(self, "_usage_db_owned", True) else None,
                      cancel_on_timeout=False)
-        terminal = execution_terminal_error(terminal, vars(self).get("_llm_close_control"))
+        terminal = execution_terminal_error(
+            terminal, vars(self).get("_llm_close_control"),
+            vars(self).get("_preference_persistence_control"),
+            vars(self).get("_modality_record_control"), retain_originals=True,
+        )
         if terminal is not None:
             raise terminal
         if any(task is not None and not task.done() for task in tasks.values()):
