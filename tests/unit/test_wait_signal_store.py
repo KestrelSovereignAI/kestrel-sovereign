@@ -557,6 +557,134 @@ async def test_watch_baseline_migrates_onto_a_legacy_table(
 
 
 # ---------------------------------------------------------------------------
+# The session that registered a watch (#3663)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_watch_records_the_registering_session(make_store):
+    store = await make_store()
+    await store.start_watch("ci", "o/r#1", origin_session_id="chain-1")
+    assert (await store.get("ci", "o/r#1")).watch_origin_session_id == "chain-1"
+
+
+@pytest.mark.asyncio
+async def test_rearming_without_a_session_keeps_the_stored_one(make_store):
+    """A re-arm where no session is bound — after a restart, from a workflow
+    — must not unbind a watch some session is waiting on."""
+    store = await make_store()
+    await store.start_watch("ci", "o/r#1", origin_session_id="chain-1")
+    await store.record_pending(
+        "ci", "o/r#1", signal_id="s1", target="failed", attempts=1,
+    )
+    await store.record_delivery(
+        "ci", "o/r#1", delivery_status="ok_queued", signaled_outcome="failed",
+    )
+
+    await store.start_watch("ci", "o/r#1")
+    await store.start_watch("ci", "o/r#1", origin_session_id="   ")
+
+    row = await store.get("ci", "o/r#1")
+    assert row.watching == 1
+    assert row.watch_origin_session_id == "chain-1"
+
+
+@pytest.mark.asyncio
+async def test_registering_from_another_session_moves_the_watch(make_store):
+    store = await make_store()
+    await store.start_watch("ci", "o/r#1", origin_session_id="chain-1")
+    await store.start_watch("ci", "o/r#1", origin_session_id=" operator-2 ")
+    assert (
+        await store.get("ci", "o/r#1")
+    ).watch_origin_session_id == "operator-2"
+
+
+@pytest.mark.asyncio
+async def test_a_watch_registered_outside_any_session_stores_none(make_store):
+    store = await make_store()
+    await store.start_watch("task", "t1")
+    await store.start_watch("task", "t2", origin_session_id="")
+    assert (await store.get("task", "t1")).watch_origin_session_id is None
+    assert (await store.get("task", "t2")).watch_origin_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_non_string_session_is_refused(make_store):
+    store = await make_store()
+    with pytest.raises(TypeError, match="origin_session_id"):
+        await store.start_watch("task", "t1", origin_session_id=42)
+    assert await store.get("task", "t1") is None
+
+
+@pytest.mark.asyncio
+async def test_the_session_is_scoped_to_the_owning_agent(
+    tmp_path, sqlite_database_factory,
+):
+    db = await sqlite_database_factory(tmp_path / "shared.db")
+    store_a = WaitSignalStore(db, agent_id="did:test:a")
+    store_b = WaitSignalStore(db, agent_id="did:test:b")
+    await store_a.start_watch("ci", "o/r#1", origin_session_id="a-chat")
+    await store_b.start_watch("ci", "o/r#1", origin_session_id="b-chat")
+    assert (await store_a.get("ci", "o/r#1")).watch_origin_session_id == "a-chat"
+    assert (await store_b.get("ci", "o/r#1")).watch_origin_session_id == "b-chat"
+
+
+@pytest.mark.asyncio
+async def test_watch_origin_session_migrates_onto_a_legacy_table(
+    tmp_path, sqlite_database_factory,
+):
+    """The column reaches an existing database only through the ALTER. A
+    legacy watch reads ``None`` and stays armed, so the reconciler binds it
+    exactly as before: through the provider's own record, if any."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy_wait_state.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE wait_signal_state (
+            agent_id TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            last_signaled_outcome TEXT,
+            last_delivery_status TEXT,
+            last_surface_status TEXT,
+            last_delivery_error TEXT,
+            last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_delivery_attempt_at TIMESTAMP,
+            attempts_signaled_target TEXT NOT NULL DEFAULT '',
+            last_attempt_started_at TIMESTAMP,
+            delivery_deferred_until TIMESTAMP,
+            delivery_deferrals INTEGER NOT NULL DEFAULT 0,
+            delivery_locked_attempts INTEGER,
+            pending_signal_id TEXT,
+            pending_signaled_target TEXT,
+            pending_signal_enqueued_at TIMESTAMP,
+            watching INTEGER NOT NULL DEFAULT 0,
+            watch_baseline TEXT,
+            last_delivered_at TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (agent_id, kind, handle)
+        );
+        INSERT INTO wait_signal_state (agent_id, kind, handle, watching)
+        VALUES ('did:legacy', 'ci', 'o/r#1', 1);
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    database = await sqlite_database_factory(db_path)
+    store = WaitSignalStore(database, agent_id="did:legacy")
+
+    row = await store.get("ci", "o/r#1")
+    assert row.watch_origin_session_id is None
+    assert [w.handle for w in await store.list_watched()] == ["o/r#1"]
+
+    await store.start_watch("ci", "o/r#1", origin_session_id="chain-1")
+    assert (await store.get("ci", "o/r#1")).watch_origin_session_id == "chain-1"
+
+
+# ---------------------------------------------------------------------------
 # Last successful delivery and the re-key audit (#3390)
 # ---------------------------------------------------------------------------
 

@@ -854,6 +854,12 @@ CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
 --                            Delivering any other token disarms the watch, so
 --                            re-registering a watch that has fired re-arms it
 --                            instead of leaving it inert
+--   - watch_origin_session_id the chat session of the turn that registered
+--                            the watch (#3663). The reconciler binds the wake
+--                            to it, and asks the provider only when it is
+--                            NULL. A registration made outside any session
+--                            keeps the stored value, so re-arming from an
+--                            unattended context does not unbind the chain
 --   - last_delivered_at      the time of the last delivered wake for this
 --                            handle: when the poll that built it began, never
 --                            the later harvest. Unlike
@@ -898,6 +904,7 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     pending_signal_enqueued_at TIMESTAMP,
     watching INTEGER NOT NULL DEFAULT 0,
     watch_baseline TEXT,
+    watch_origin_session_id TEXT,
     last_delivered_at TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (agent_id, kind, handle)
@@ -1696,6 +1703,13 @@ class AsyncDatabase:
         # nothing.
         await self._migrate_add_column(
             "wait_signal_state", "watch_baseline", "TEXT"
+        )
+        # The session that registered a watch (#3663). No backfill: nothing
+        # recorded which turn armed a legacy watch, so NULL is the honest
+        # answer, and a NULL row is bound exactly as before — through the
+        # provider's own ``origin_session_id``, when it has one.
+        await self._migrate_add_column(
+            "wait_signal_state", "watch_origin_session_id", "TEXT"
         )
         # Last delivered wake (#3390). Unlike the columns above, this one has
         # an honest legacy answer to backfill for some rows. Where the locked

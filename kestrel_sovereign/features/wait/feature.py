@@ -239,8 +239,18 @@ class WaitFeature(Feature):
             if mode == "signal":
                 # Register a watch and return immediately — the reconciler
                 # wakes the agent with a wait.complete signal on completion.
+                # The watch records this turn's session (#3663), so the wake
+                # returns to the session that is waiting even when the
+                # provider keeps no record of who asked (CI, tasks, A2A,
+                # workflows). Outside a turn, or from a session-less one,
+                # nothing is recorded and the watch keeps whatever session
+                # it already stores.
                 try:
-                    await register_wait_watch(self.agent, target)
+                    await register_wait_watch(
+                        self.agent,
+                        target,
+                        origin_session_id=self._turn_session_id(),
+                    )
                 except ValueError as exc:
                     return ToolResult.failed(str(exc))
                 return ToolResult.ok(
