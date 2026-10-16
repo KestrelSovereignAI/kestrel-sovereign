@@ -40,14 +40,15 @@ from kestrel_sovereign._async_ownership import (
     owned_task_error,
 )
 from kestrel_sovereign.execution_custody import (
+    current_execution_custody,
     execution_terminal_error,
     is_execution_control_error,
     refuse_unfenced_executor,
+    require_execution_work,
 )
 from kestrel_sovereign.storage.db.interface import ConnectionError
 from kestrel_sovereign.storage.db.sqlite import (
     SQLiteBackend,
-    _SQLiteCloseDiagnostics,
     _aiosqlite_worker_is_alive,
     _capture_close_diagnostics,
     _close_aiosqlite_connection,
@@ -55,6 +56,7 @@ from kestrel_sovereign.storage.db.sqlite import (
     _prune_retained_aiosqlite_closes,
     _retain_aiosqlite_close,
     _RetainedAiosqliteCloses,
+    _SQLiteCloseDiagnostics,
 )
 
 
@@ -613,9 +615,18 @@ _CACHE_ATTR = "_sovereign_sqla_factory"
 _RETIREMENT_OWNER_ATTR = "_sovereign_sqla_retirement_owner"
 
 
-def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
+def make_session_factory(
+    db: Any, *, native_read_fallback: bool = False,
+) -> SovereignSqlaSessionFactory | None:
     """Build (or reuse) a SQLAlchemy session factory pointed at the
     same database as ``db``.
+
+    Native read consumers may explicitly select their existing fenced backend
+    when execution custody is present. Validate ALL original scopes first and
+    return None BEFORE attempting an unsupported SQLAlchemy executor. This is
+    capability selection, not recovery from a caught authority denial: it
+    creates no engine, connection, replacement owner or renewed permission.
+    Default callers retain the strict unfenced-executor refusal.
 
     Caching: the factory is stashed on ``db`` under
     ``_sovereign_sqla_factory``. Subsequent calls with the same ``db``
@@ -633,10 +644,15 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
         db: An ``AsyncDatabase`` (or a subclass / mock that exposes
             ``backend_type`` and the backend-specific attributes —
             ``backend.db_path`` for SQLite or ``backend._dsn`` for PG).
+        native_read_fallback: The caller already has an original native read
+            path. Select it before SQLAlchemy construction when custody is
+            present, after validating every original admission.
 
     Returns:
         A ``SovereignSqlaSessionFactory`` — the same instance for the
-        lifetime of ``db``.
+        lifetime of ``db``. With ``native_read_fallback=True``, None means
+        a valid custody-bound caller must use its existing native backend.
+        Revocation, uncertainty and cleanup-only admission still raise.
 
     Raises:
         NotImplementedError: If ``db`` was constructed via
@@ -647,7 +663,12 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
             error message points the way.
         ValueError: If the backend type isn't recognized.
     """
-    refuse_unfenced_executor(getattr(db, "backend", None))
+    execution_owner = getattr(db, "backend", None)
+    if native_read_fallback:
+        require_execution_work(execution_owner)
+        if current_execution_custody(execution_owner):
+            return None
+    refuse_unfenced_executor(execution_owner)
     retirement_owner = getattr(db, _RETIREMENT_OWNER_ATTR, None)
     if isinstance(retirement_owner, SovereignSqlaSessionFactory):
         raise ConnectionError(

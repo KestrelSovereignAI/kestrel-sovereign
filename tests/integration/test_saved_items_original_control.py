@@ -56,7 +56,7 @@ async def native_recall(native_pg, tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("door", ["retriever", "consolidator", "saved-items"])
-async def test_native_bound_vector_factory_denial_is_not_unavailable(
+async def test_native_bound_vector_factory_selects_original_native_reads(
     native_recall, monkeypatch, door
 ):
     backend, storage, memory, agent, feature, store = native_recall
@@ -65,9 +65,9 @@ async def test_native_bound_vector_factory_denial_is_not_unavailable(
     actual = sqla.make_session_factory
     original_errors = []
 
-    def observe_actual_factory(db):
+    def observe_actual_factory(db, **options):
         try:
-            return actual(db)
+            return actual(db, **options)
         except BaseException as error:
             original_errors.append(error)
             raise
@@ -85,11 +85,14 @@ async def test_native_bound_vector_factory_denial_is_not_unavailable(
         result = owner._get_vector_session_factory()
     except BaseException as error:
         failure = error
-    assert original_errors, "actual native bound factory refusal was not reached"
-    assert failure is not None and original_errors[0] in tuple(
-        _explicit_control_chain(failure)
-    ), f"actual authority refusal became unavailable {result!r}"
-    assert is_execution_control_error(failure)
+    assert failure is None and result is None
+    assert not original_errors, "capability selection attempted a forbidden executor"
+    # The default API still refuses a custody-bound SQLAlchemy executor.
+    # Native fallback selection is explicit and never renews authority.
+    with pytest.raises(BaseException) as strict:
+        actual(storage.db)
+    assert is_execution_control_error(strict.value)
+    assert await backend.fetch_val("SELECT generation FROM authority WHERE id=1") == 1
 
 
 @pytest.mark.asyncio

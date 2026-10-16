@@ -41,7 +41,10 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import json
 
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    is_execution_control_error,
+    require_execution_work,
+)
 
 from .memory_models import MemoryMetadata
 from .async_conversation_store import (
@@ -279,6 +282,8 @@ class MemoryRetriever:
                     embedding_service_for_profile.current_profile_id()
                 )
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "current_profile_id() failed during retriever load: %s",
                     exc,
@@ -304,6 +309,8 @@ class MemoryRetriever:
             if not isinstance(salient, list):
                 salient = []
         except Exception as exc:  # noqa: BLE001 - optional candidate source
+            if is_execution_control_error(exc):
+                raise
             logger.debug("Salient memory candidate generation unavailable: %s", exc)
             salient = []
         lexical: List[Dict[str, Any]] = []
@@ -323,6 +330,8 @@ class MemoryRetriever:
             if not isinstance(lexical, list):
                 lexical = []
         except Exception as exc:  # noqa: BLE001 - candidate source is degradable
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Lexical memory candidate generation unavailable: %s", exc)
             lexical = []
         by_id = {
@@ -382,6 +391,8 @@ class MemoryRetriever:
                         missing_vector_ids
                     )
                 except Exception as exc:  # noqa: BLE001 - vector hydration fallback
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug("Could not hydrate vector memory candidates: %s", exc)
                     vector_rows = []
                 if isinstance(vector_rows, list):
@@ -399,7 +410,9 @@ class MemoryRetriever:
                 row_embeddings = await self.conversations.get_message_embeddings(
                     ids, embedding_profile_id=current_profile_id,
                 )
-            except TypeError:
+            except TypeError as error:
+                if is_execution_control_error(error):
+                    raise
                 # Older store version without the keyword (defense
                 # against in-process mismatch / tests that stub the
                 # store). Fall through to the unfiltered legacy call.
@@ -408,11 +421,15 @@ class MemoryRetriever:
                         ids
                     )
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         "Could not load row embeddings for vector cosine "
                         "(falling back to keyword overlap): %s", e,
                     )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 # Embedding load failure must NOT block retrieval —
                 # the keyword path is a complete fallback.
                 logger.warning(
@@ -881,18 +898,19 @@ class MemoryRetriever:
 
     def _get_vector_session_factory(self):
         """Build/reuse the SQLAlchemy factory backing vector search."""
-        if self._sqla_factory_unavailable:
-            return None
-
         db = getattr(self.conversations, "db", None)
+        execution_owner = getattr(db, "backend", None)
+        require_execution_work(execution_owner)
         if db is None:
             self._sqla_factory_unavailable = True
+            return None
+        if self._sqla_factory_unavailable:
             return None
 
         try:
             from kestrel_sovereign.storage.sqla import make_session_factory
 
-            return make_session_factory(db)
+            return make_session_factory(db, native_read_fallback=True)
         except Exception as e:
             if is_execution_control_error(e):
                 raise
@@ -943,6 +961,8 @@ class MemoryRetriever:
                 filter=filter_kwargs,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "Vector-backend memory retrieval failed (%s); falling back to "
                 "legacy row-embedding path.", e,
@@ -984,6 +1004,8 @@ class MemoryRetriever:
 
             embedding = await aembed_retrieval_query(service, query)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "Query embedding failed (falling back to keyword "
                 "overlap for this retrieve): %s", e,
@@ -1225,6 +1247,8 @@ class MemoryRetriever:
                 timestamp_field="last_accessed",
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Never let rehearsal-effect bookkeeping break retrieval
             logger.warning(f"update_access failed for message {message_id}: {e}")
 

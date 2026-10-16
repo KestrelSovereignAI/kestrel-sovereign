@@ -270,6 +270,8 @@ class SaveFeature(Feature):
             )
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"save_stash failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -392,6 +394,8 @@ class SaveFeature(Feature):
             )
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"save_excerpt failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -641,6 +645,8 @@ class SaveFeature(Feature):
         try:
             nodes = await getter("learned_fact")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"recall learned_fact lookup failed: {e}")
             return []
 
@@ -735,6 +741,8 @@ class SaveFeature(Feature):
                 limit=limit
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_list failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -782,6 +790,8 @@ class SaveFeature(Feature):
         try:
             item = await store.get_by_id(item_id)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_get failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -824,6 +834,8 @@ class SaveFeature(Feature):
                 )
             await store.delete_item(item_id)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_delete failed: {e}")
             return ToolResult.failed(str(e))
 

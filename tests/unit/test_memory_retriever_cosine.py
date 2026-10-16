@@ -266,7 +266,7 @@ async def test_retrieve_uses_vector_backend_for_semantic_component(monkeypatch):
     factory.engine = SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
     monkeypatch.setattr(
         "kestrel_sovereign.storage.sqla.make_session_factory",
-        lambda db: factory,
+        lambda db, **_options: factory,
     )
 
     class FakeBackend:
@@ -326,7 +326,7 @@ async def test_retrieve_pg_factory_uses_pgvector_backend(monkeypatch):
     factory.engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
     monkeypatch.setattr(
         "kestrel_sovereign.storage.sqla.make_session_factory",
-        lambda db: factory,
+        lambda db, **_options: factory,
     )
 
     spec = build_conversation_message_spec(dimension=2)

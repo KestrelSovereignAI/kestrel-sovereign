@@ -850,6 +850,15 @@ embedding/recall compatibility fallbacks and modality accounting preserve native
 control receipts before ordinary error/cancellation normalization; uncertainty
 cannot authorize another INSERT, vector rewrite or legacy retrieval retry.
 
+Memory readers select their existing fenced native path before attempting an
+unsupported SQLAlchemy executor. The canonical factory's explicit
+`native_read_fallback=True` option validates every original scope and returns
+`None` without creating an engine when custody is present. This is capability
+selection, not recovery from a caught authority error: it creates no scope,
+lease or permission. Default factory calls remain strict. Positive and negative
+reader caches cannot hide revocation, uncertainty or scoped cleanup-only
+admission; ordinary unbound vector reads still use their original factory.
+
 Refusal to allocate an original physical closer is explicit resource/None
 retirement debt, not successful closure: HTTP response inventories keep the
 actual handle and database shutdown still attempts each independent backend
