@@ -179,6 +179,10 @@ def _require_native_observation_for_connection(connection):
     an inherited operational lease cannot silently bypass that inventory.
     """
     for observer in _NATIVE_OBSERVERS.get():
+        if observer._closed:
+            raise ExecutionAuthorityError(
+                "original native retirement observation closed to new work on its retained connection"
+            )
         records = tuple(record for record in observer._resources if record.connection is connection)
         if not records:
             raise ExecutionAuthorityError(

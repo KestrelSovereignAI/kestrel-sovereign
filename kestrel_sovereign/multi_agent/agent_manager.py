@@ -7316,16 +7316,16 @@ class AgentManager:
                 # that already initialized are invisible to shutdown_all(), so
                 # this batch still owns their cleanup.  Cancellation wins only
                 # after all of those ownership transfers have settled.
-                # A second cancellation may land while recovery gather is
-                # delivering already-settled private agents. Retain and join
-                # this SAME collector before transferring their cleanup.
-                recovery = asyncio.create_task(
-                    collect_initializer_results(), name="agent-batch:recovery-results",
-                )
-                recovery_outcome = await await_owned_task(recovery)
-                if recovery_outcome.error is not None:
-                    raise execution_terminal_error(initial_failure, recovery_outcome.error)
-                settled = recovery_outcome.result
+                # These original initializer Tasks are already owned. Recovery
+                # must not depend on admitting a NEW collector before their
+                # successful private results can be retired. Join each actual
+                # result through repeated cancellation, preserving its carrier.
+                settled = []
+                for initializer in init_tasks:
+                    outcome = await await_owned_task(initializer)
+                    initial_failure = execution_terminal_error(
+                        initial_failure, outcome.cancellation, retain_originals=True)
+                    settled.append(outcome.error if outcome.error is not None else outcome.result)
                 initialized = [
                     (name, result)
                     for (name, _, _), result in zip(admitted, settled)

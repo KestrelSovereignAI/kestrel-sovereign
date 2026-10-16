@@ -1180,6 +1180,13 @@ class PostgresBackend(DatabaseBackend):
         needs_proof = requires_commit_proof() if callable(requires_commit_proof) else requires_commit_proof
         if needs_proof and not top_level:
             raise ExecutionAuthorityError("native known-commit custody requires its own top-level transaction")
+        if admit_work:
+            # Operational mutexes and checkout can suspend after the caller's
+            # initial admission. This is the LAST boundary before native BEGIN,
+            # not the later in-transaction lock/validator. Fixed cleanup exits
+            # deliberately do not acquire a new work admission here.
+            _require_native_observation_for_connection(connection)
+            require_execution_backend("postgres", scopes)
         await transaction.__aenter__()
         native_connection = connection._con if isinstance(connection, asyncpg.pool.PoolConnectionProxy) else connection
         body_failure: BaseException | None = None
@@ -1564,6 +1571,7 @@ class PostgresBackend(DatabaseBackend):
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
             _require_native_observation_for_connection(existing)
+            require_execution_backend("postgres", self._remember_transaction_custody())
             after_commit = self._current_after_commit()
             after_commit.open_savepoint()
             body_failure: BaseException | None = None

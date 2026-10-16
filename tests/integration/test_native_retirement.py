@@ -28,6 +28,94 @@ from tests.integration.test_execution_authority_postgres import native_pg as _na
 native_pg = _native_pg
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
+
+@pytest.mark.parametrize("wait_kind", ["checkout", "operational_lock"])
+@pytest.mark.parametrize("cutoff", ["custody", "observer"])
+async def test_transaction_revalidates_after_actual_native_entry_wait(
+    native_pg, monkeypatch, wait_kind, cutoff,
+):
+    backend, control, schema = native_pg
+    observer = NativeExecutionObserver()
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("original waiting transaction"))
+    marked = ContextVar("original waiting native entry", default=False)
+    entered, starts, original_enter = asyncio.Event(), [], asyncpg.transaction.Transaction.__aenter__
+    original_acquire = asyncpg.pool.PoolAcquireContext.__aenter__
+    candidate = None
+    reserves = []
+
+    async def native_enter(transaction):
+        if marked.get():
+            starts.append(transaction)
+        return await original_enter(transaction)
+
+    async def native_acquire(checkout):
+        if marked.get():
+            entered.set()
+        return await original_acquire(checkout)
+
+    async def original_work():
+        token = marked.set(True)
+        try:
+            with bind_execution_custody_snapshot((scope,)):
+                if wait_kind == "operational_lock":
+                    entered.set()
+                async with backend.transaction():
+                    await backend.execute("INSERT INTO effects VALUES (1001, 'forbidden late BEGIN')")
+        finally:
+            marked.reset(token)
+
+    async def retire_waiter():
+        await asyncio.wait_for(entered.wait(), 3)
+        await asyncio.sleep(0)
+        assert not candidate.done()
+        if cutoff == "custody":
+            scope.revoke("retired during original native entry wait")
+        else:
+            observer.close_admission()
+
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aenter__", native_enter)
+    monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aenter__", native_acquire)
+    try:
+        if wait_kind == "checkout":
+            reserves = [await backend._pool.acquire(), await backend._pool.acquire()]
+            with bind_native_execution_observer(observer):
+                candidate = create_owned_task(original_work())
+                await retire_waiter()
+                for reserved in reserves:
+                    await backend._pool.release(reserved)
+                reserves.clear()
+                outcome = await await_owned_task(candidate)
+        else:
+            try:
+                with bind_native_execution_observer(observer):
+                    async with backend.operational_session():
+                        lease = backend._current_operational_lease()
+                        await lease.lock.acquire()
+                        try:
+                            candidate = create_owned_task(original_work())
+                            await retire_waiter()
+                            assert lease.lock._waiters, "candidate did not reach the actual operational mutex"
+                        finally:
+                            lease.lock.release()
+                        outcome = await await_owned_task(candidate)
+            except BaseException as error:
+                # The original checkout may preserve the same retired scope
+                # at reset. It is not a new transaction admission or a waiver.
+                assert is_execution_control_error(error)
+        assert outcome.error is not None and is_execution_control_error(outcome.error)
+        assert not starts, "retirement cutoff occurred before native BEGIN but BEGIN was still submitted"
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects') == 0
+        # Positive control: the physical backend remains usable for an actual
+        # independent admission, not a permanently broken test connection.
+        async with backend.transaction():
+            await backend.execute("INSERT INTO effects VALUES (1002, 'fresh native admission')")
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects') == 1
+    finally:
+        for reserved in reserves:
+            await backend._pool.release(reserved)
+        if candidate is not None:
+            await await_owned_task(candidate)
+
 async def test_inherited_operational_transaction_roots_actual_child_body(native_pg):
     backend, _control, _schema = native_pg
     observer = NativeExecutionObserver()

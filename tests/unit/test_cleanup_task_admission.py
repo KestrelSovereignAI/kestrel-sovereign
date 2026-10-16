@@ -1,0 +1,428 @@
+"""Original native resources survive refusal of a new cleanup observer Task."""
+
+import asyncio
+import inspect
+
+import httpx
+import pytest
+
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign.execution_custody import (
+    ExecutionCustody,
+    ExecutionStreamLifecycle,
+    NativeExecutionStreamOwner,
+    ProcessRuntimeExecutionFence,
+    bind_execution_custody_snapshot,
+    execution_cleanup_debts,
+    execution_stream,
+    is_execution_control_error,
+)
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
+from kestrel_sovereign.storage.sqla import make_session_factory
+
+
+def _operation_name(coroutine):
+    frame = getattr(coroutine, "cr_frame", None)
+    operation = (
+        frame.f_locals.get("operation", coroutine) if frame is not None else coroutine
+    )
+    code = getattr(operation, "cr_code", None)
+    return code.co_qualname if code is not None else ""
+
+
+@pytest.mark.asyncio
+async def test_refused_native_http_close_keeps_actual_handle_and_debt():
+    peers, peer_closed = set(), {"/held": asyncio.Event(), "/other": asyncio.Event()}
+
+    async def peer(reader, writer):
+        task = asyncio.current_task()
+        peers.add(task)
+        path = None
+        try:
+            header = await reader.readuntil(b"\r\n\r\n")
+            path = header.split(b" ")[1].decode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            await writer.drain()
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            if path in peer_closed:
+                peer_closed[path].set()
+            peers.discard(task)
+
+    server = await asyncio.start_server(peer, "127.0.0.1", 0)
+    client = httpx.AsyncClient(trust_env=False)
+    inventory = NativeExecutionStreamOwner()
+    loop, refused = asyncio.get_running_loop(), []
+    factory = loop.get_task_factory()
+    refusal = RuntimeError("original native close Task refused")
+
+    def refuse_once(loop, coroutine, **kwargs):
+        if not refused and _operation_name(coroutine).endswith(".owned_close"):
+            refused.append(coroutine)
+            raise refusal
+        if factory is not None:
+            return factory(loop, coroutine, **kwargs)
+        return asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    try:
+        responses = []
+        for path in ("/other", "/held"):
+            response = await client.send(
+                client.build_request(
+                    "GET",
+                    f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}{path}",
+                ),
+                stream=True,
+            )
+            responses.append(response)
+            inventory.retain(response)
+        other, held = responses
+        loop.set_task_factory(refuse_once)
+        with pytest.raises(RuntimeError) as caught:
+            await inventory.close()
+        loop.set_task_factory(factory)
+        assert caught.value is refusal and refused
+        assert inventory.handles == [held], (
+            "unclosed actual response disappeared from native inventory"
+        )
+        assert is_execution_control_error(refusal)
+        assert (held, None) in execution_cleanup_debts(refusal)
+        assert not held.is_closed and not peer_closed["/held"].is_set()
+        await asyncio.wait_for(peer_closed["/other"].wait(), 2)
+        assert other.is_closed, "independent native handle was not physically retired"
+        assert all(
+            inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused
+        )
+        with pytest.raises(RuntimeError) as repeated:
+            await inventory.close()
+        assert repeated.value is refusal and len(refused) == 1
+    finally:
+        loop.set_task_factory(factory)
+        for coroutine in refused:
+            coroutine.close()
+        await client.aclose()
+        server.close()
+        await server.wait_closed()
+        for task in tuple(peers):
+            await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["registration", "watcher"])
+async def test_failed_stream_setup_joins_dispatch_gated_original_producer(
+    tmp_path, failure
+):
+    lock, producers, refused = ReentrantTransitionLock(), [], []
+    path = tmp_path / "must-not-dispatch.db"
+    refusal = RuntimeError("original stream " + failure + " refused")
+    loop, factory = (
+        asyncio.get_running_loop(),
+        asyncio.get_running_loop().get_task_factory(),
+    )
+
+    class Host:
+        def _get_privacy_transition_lock(self):
+            return lock
+
+    async def source():
+        # Native file creation would prove a wrongly admitted body. No fake
+        # successful source or replacement generator is supplied after failure.
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            yield b"forbidden"
+        finally:
+            await db.close()
+
+    def started(iterator, owner):
+        producers.append(owner)
+        if failure == "registration":
+            raise refusal
+
+    def refuse_watcher(loop, coroutine, **kwargs):
+        if _operation_name(coroutine).endswith("._watch_owner_cancellation"):
+            refused.append(coroutine)
+            raise refusal
+        if factory is not None:
+            return factory(loop, coroutine, **kwargs)
+        return asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    lifecycle = ExecutionStreamLifecycle(
+        lock.capture_native_work_factory(), started, lambda: None
+    )
+    stream = execution_stream(Host(), source(), lifecycle=lifecycle)
+    try:
+        if failure == "watcher":
+            loop.set_task_factory(refuse_watcher)
+        with pytest.raises(RuntimeError) as caught:
+            await anext(stream)
+        loop.set_task_factory(factory)
+        assert caught.value is refusal
+        assert producers
+        _, pending = await asyncio.wait(producers, timeout=0.1)
+        assert not pending, (
+            "original producer stranded at the constructor dispatch barrier"
+        )
+        assert not path.exists() and not lock.locked()
+        assert not execution_cleanup_debts(caught.value), (
+            "joined constructor reservation was not reconciled"
+        )
+        assert all(
+            inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused
+        )
+    finally:
+        loop.set_task_factory(factory)
+        for owner in producers:
+            if not owner.done():
+                owner.cancel()
+            await await_owned_task(owner)
+        for coroutine in refused:
+            coroutine.close()
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_refused_optional_disposal_still_physically_closes_primary_sqlite(
+    tmp_path,
+):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "primary-close.db"))
+    connection = db._backend._connection
+    worker = getattr(connection, "_thread", connection)
+    loop, factory, refused = (
+        asyncio.get_running_loop(),
+        asyncio.get_running_loop().get_task_factory(),
+        [],
+    )
+    refusal = RuntimeError("optional engine disposal Task refused")
+
+    def refuse_disposal(loop, coroutine, **kwargs):
+        if _operation_name(coroutine) == "AsyncDatabase.dispose_cached_sqla_factory":
+            refused.append(coroutine)
+            raise refusal
+        if factory is not None:
+            return factory(loop, coroutine, **kwargs)
+        return asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    try:
+        loop.set_task_factory(refuse_disposal)
+        with pytest.raises(RuntimeError) as caught:
+            await db.close()
+        loop.set_task_factory(factory)
+        assert caught.value is refusal and refused
+        assert db._backend._connection is None, (
+            "optional disposal allocation skipped the actual primary close"
+        )
+        assert not worker.is_alive(), (
+            "original aiosqlite worker still live after database close"
+        )
+        assert all(
+            inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused
+        )
+    finally:
+        loop.set_task_factory(factory)
+        for coroutine in refused:
+            coroutine.close()
+        await db.close()
+
+
+def _explicit_errors(error):
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.append(current.__cause__)
+        pending.extend(getattr(current, "exceptions", ()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,cleanup_kind", [("write", "rollback"), ("write", "close"), ("read", "close")]
+)
+async def test_native_sqla_cleanup_cannot_replace_actual_custody_denial(
+    tmp_path, monkeypatch, mode, cleanup_kind
+):
+    from sqlalchemy import text
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "session-cleanup.db"))
+    await db._backend.execute("CREATE TABLE cleanup_effects (id INTEGER PRIMARY KEY)")
+    factory = make_session_factory(db)
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("original session admission"))
+    cleanup_error = OSError(
+        "original native " + cleanup_kind + " acknowledgement failed"
+    )
+    denials, cleanup_calls = [], []
+    try:
+        with pytest.raises(BaseException) as caught:
+            context = (
+                factory.write_session() if mode == "write" else factory.read_session()
+            )
+            async with context as session:
+                await session.execute(text("INSERT INTO cleanup_effects VALUES (1)"))
+                original = getattr(session, cleanup_kind)
+
+                async def native_cleanup_then_failure():
+                    await original()
+                    cleanup_calls.append(True)
+                    raise cleanup_error
+
+                monkeypatch.setattr(session, cleanup_kind, native_cleanup_then_failure)
+                with bind_execution_custody_snapshot((scope,)):
+                    try:
+                        await session.execute(
+                            text("INSERT INTO cleanup_effects VALUES (2)")
+                        )
+                    except BaseException as error:
+                        denials.append(error)
+                        raise
+        assert len(denials) == 1 and is_execution_control_error(denials[0])
+        assert is_execution_control_error(caught.value), (
+            "native cleanup erased the actual SQLAlchemy custody refusal"
+        )
+        assert denials[0] in _explicit_errors(caught.value)
+        assert cleanup_error in _explicit_errors(caught.value) and cleanup_calls == [
+            True
+        ]
+        assert await db._backend.fetch_val("SELECT COUNT(*) FROM cleanup_effects") == 0
+        assert not factory._active_sessions
+    finally:
+        # Session fault injection has finished its actual native rollback/close;
+        # independent engine + primary retirement is still physically joined.
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_batch_joins_original_unpublished_resources_without_collector_task(
+    tmp_path, monkeypatch
+):
+    await assert_cancelled_batch_native_cleanup(
+        tmp_path, monkeypatch, cancel_again=False
+    )
+
+
+async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel_again):
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm import service as service_module
+    from kestrel_sovereign.multi_agent import agent_manager as manager_module
+    from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "unpublished-native.db"))
+    connection = db._backend._connection
+    worker = getattr(connection, "_thread", connection)
+    close_entered, close_release = asyncio.Event(), asyncio.Event()
+    if cancel_again:
+        native_close = connection.close
+
+        async def held_original_close_ack():
+            await native_close()
+            close_entered.set()
+            await close_release.wait()
+
+        monkeypatch.setattr(connection, "close", held_original_close_ack)
+    # Real provider service with no configured routes and the original native
+    # usage database. No provider calls, fake canary, genesis pass, or readiness
+    # bypass: this is private PARTIAL initialization resource cleanup only.
+    monkeypatch.setattr(service_module, "load_section", lambda _name: {})
+    service = service_module.LLMService(usage_db=db, agent_data_dir=tmp_path)
+    agent = KestrelAgent(
+        did="did:test:unpublished-cleanup",
+        storage_path=str(tmp_path / "agent.db"),
+        llm_service=service,
+        allowed_features=[],
+    )
+    storage = AsyncStorage(backend=db.backend)
+    storage.db = db
+    agent.storage = agent._raw_storage = storage
+    assert not agent._runtime_publication_ready.is_set()
+    manager = manager_module.AgentManager(base_data_dir=tmp_path)
+    beta_entered, alpha_done = asyncio.Event(), asyncio.Event()
+    loop, factory, refused = (
+        asyncio.get_running_loop(),
+        asyncio.get_running_loop().get_task_factory(),
+        [],
+    )
+    refusal = RuntimeError("new batch recovery collector Task refused")
+
+    async def original_partial_initialize(name, *_args, **_kwargs):
+        if name == "Alpha":
+            manager._initializing_agents[name] = agent
+        await manager_module._BATCH_STAGE_CALLBACK.get()(
+            name, agent if name == "Alpha" else None
+        )
+        if name == "Alpha":
+            return agent
+        beta_entered.set()
+        await asyncio.get_running_loop().create_future()
+
+    def refuse_collector(loop, coroutine, **kwargs):
+        name = _operation_name(coroutine)
+        if name.endswith(".collect_initializer_results"):
+            refused.append(coroutine)
+            raise refusal
+        task = (
+            factory(loop, coroutine, **kwargs)
+            if factory is not None
+            else asyncio.Task(coroutine, loop=loop, **kwargs)
+        )
+        # Actual completion of Alpha's original initializer, not a fabricated
+        # successful aggregate or a replacement batch observer.
+        frame = getattr(coroutine, "cr_frame", None)
+        if (
+            frame is not None
+            and frame.f_locals.get("name") == "Alpha"
+            and name.endswith("._bounded_initialize")
+        ):
+            task.add_done_callback(lambda _: alpha_done.set())
+        return task
+
+    monkeypatch.setattr(manager, "_initialize_agent", original_partial_initialize)
+    config = MultiAgentConfig(
+        agents={
+            name: LocalAgentConfig(data_dir=name.lower(), port=18901 + index)
+            for index, name in enumerate(("Alpha", "Beta"))
+        }
+    )
+    batch = None
+    try:
+        loop.set_task_factory(refuse_collector)
+        batch = create_owned_task(manager.load_from_config(config))
+        await asyncio.wait_for(beta_entered.wait(), 3)
+        await asyncio.wait_for(alpha_done.wait(), 3)
+        batch.cancel()
+        if cancel_again:
+            await asyncio.wait_for(close_entered.wait(), 5)
+            batch.cancel()
+            await asyncio.sleep(0)
+            assert not batch.done(), (
+                "second cancellation abandoned the accepted native close ACK"
+            )
+            close_release.set()
+        outcome = await await_owned_task(batch)
+        loop.set_task_factory(factory)
+        assert db.backend._connection is None, (
+            "recovery collector refusal abandoned the original unpublished database"
+        )
+        assert not worker.is_alive()
+        assert not manager._initializing_agents and not manager.list_agents()
+        assert not manager._agent_operations
+        assert isinstance(
+            outcome.error, asyncio.CancelledError
+        ) or is_execution_control_error(outcome.error)
+        assert not agent._runtime_publication_ready.is_set()
+        assert all(
+            inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused
+        )
+    finally:
+        loop.set_task_factory(factory)
+        close_release.set()
+        if batch is not None:
+            await await_owned_task(batch)
+        for coroutine in refused:
+            coroutine.close()
+        await agent.shutdown()
+        await db.close()

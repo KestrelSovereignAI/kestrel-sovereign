@@ -118,6 +118,11 @@ before acquiring the original operational/transaction lease. A later observer
 on an inherited or already-open unobserved connection is refused before SQL,
 not silently attached to an empty inventory. Script SQL uses the same raw
 transaction-control refusal as single-query SQL.
+The cutoff also applies to NEW work on an already-retained connection.
+Explicit transactions revalidate both original custody and observation after
+checkout/operational-mutex waits, immediately before native BEGIN; savepoints
+revalidate before native entry too. An already-accepted original exit/reset is
+cleanup, not a new work admission, and is still physically joined.
 An unscoped legacy autocommit query retains autocommit semantics (including
 CONCURRENTLY DDL): observation owns its checkout/reset, not a fabricated
 explicit-transaction COMMIT receipt. Opaque pools and raw transaction-control
@@ -700,11 +705,24 @@ Native SDK, HTTP transport and usage-database close owners are not cancelled
 merely because a bounded caller's join expired. The original owner remains
 pending until physical close finishes; terminal host retirement joins it before
 closing borrowed storage. Provider is_closed flags alone are not physical-close
-evidence. Batch initializer recovery likewise owns its result collector through
-repeated cancellation before retiring all unpublished agents. Inception,
+evidence. Batch initializer recovery joins the original initializer Tasks
+directly through repeated cancellation before retiring all unpublished agents;
+it does not need a new collector Task to recover a successful private result. Inception,
 embedding/recall compatibility fallbacks and modality accounting preserve native
 control receipts before ordinary error/cancellation normalization; uncertainty
 cannot authorize another INSERT, vector rewrite or legacy retrieval retry.
+
+Refusal to allocate an original physical closer is explicit resource/None
+retirement debt, not successful closure: HTTP response inventories keep the
+actual handle and database shutdown still attempts each independent backend
+owner. Refused unstarted coroutines are closed. Partial iterator registration
+or watcher startup retains and cancels its original dispatch-gated producer;
+the async forwarding boundary joins that same producer and watcher before
+reconciling only its exact constructor reservation. No source body is admitted
+on registration failure. SQLAlchemy read/write sessions use one lifecycle that
+explicitly aggregates original work/COMMIT denial with rollback and exit errors,
+instead of relying on implicit exception context. These are candidate contracts,
+not a claim of whole-branch approval or public artifact verification.
 
 Failed boot joins the original LLM preference/accounting and native provider
 owners before retiring their borrowed database. Dispatcher cleanup control is

@@ -966,7 +966,7 @@ def retain_native_execution_http_client_close(client: Any) -> None:
 
 async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
     """Physically join an acquired SDK stream close under cleanup-only custody."""
-    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
     retain_native_execution_stream_close(stream, owner)
     close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
@@ -978,7 +978,10 @@ async def close_native_execution_stream(stream: Any, owner: Any = None) -> None:
             result = close()
             if inspect.isawaitable(result):
                 await result
-    close_task = asyncio.create_task(owned_close())
+    try:
+        close_task = create_owned_task(owned_close(), retirement_resource=stream)
+    except BaseException as error:
+        raise execution_terminal_error(original, error, retain_originals=True)
     outcome = await await_owned_task(close_task)
     if outcome.error is not None:
         # Keep the exact failed attempt reachable even if the native SDK has
@@ -1310,14 +1313,20 @@ class _ExecutionForwarder:
         except BaseException as error:
             # Admission can fail while ENTERING the original binding, before
             # the next native pull. The suspended producer still has to retire.
+            failed_iterator = getattr(error, "_kestrel_failed_owned_iterator", None)
+            if self._iterator is None and failed_iterator is not None:
+                try:
+                    await failed_iterator.aclose()
+                except BaseException as cleanup_error:
+                    error = execution_terminal_error(error, cleanup_error, retain_originals=True)
             try:
                 await self.aclose()
             except BaseException as cleanup_error:
-                raise execution_terminal_error(error, cleanup_error)
+                raise execution_terminal_error(error, cleanup_error, retain_originals=True)
             if not is_execution_control_error(error):
                 with _bind_captured_custody(self._scopes):
                     require_execution_work(self._runtime_owner)
-            raise
+            raise error
         return item
 
     async def _produce(self):
@@ -1380,12 +1389,12 @@ async def close_execution_stream(
     """Join an owned source's close despite repeated caller cancellation."""
     import asyncio
 
-    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
     close = getattr(stream, "aclose", None)
     if callable(close):
         with bind_execution_cleanup(owner, captured):
-            outcome = await await_owned_task(asyncio.create_task(close()))
+            outcome = await await_owned_task(create_owned_task(close(), retirement_resource=stream))
             error = execution_terminal_error(outcome.error, outcome.cancellation)
             if error is not None:
                 raise error

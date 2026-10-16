@@ -21,13 +21,16 @@ _ITERATOR_INTERRUPTED = object()
 _TASK_ERROR_UNSET = object()
 
 
-def create_owned_task(operation, *, name=None, context=None, retain_originals=False):
+def create_owned_task(operation, *, name=None, context=None, retain_originals=False,
+                      retirement_resource=None):
     """Capture the original carrier inside a child before asyncio can erase it.
 
     Creation retains normal copied-context semantics. The caller still owns
     physical joining or a documented bounded retirement transfer.
     Native epilogues can opt into retaining an original enclosing cancellation
     with its explicit cause. Generic cleanup-error priority stays unchanged.
+    A physical closer can name its original resource: refusal to allocate that
+    closer is explicit unstarted retirement debt, never a successful close.
     """
     started = False
     async def run():
@@ -49,11 +52,16 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     wrapper = run()
     try:
         task = asyncio.create_task(wrapper, name=name, context=context)
-    except BaseException:
+    except BaseException as error:
         wrapper.close()
         close = getattr(operation, "close", None)
         if callable(close):
             close()
+        if retirement_resource is not None:
+            error._kestrel_native_retirement_debts = (
+                *getattr(error, "_kestrel_native_retirement_debts", ()),
+                (retirement_resource, None),
+            )
         raise
     def close_unstarted(_task):
         if not started:
@@ -239,6 +247,8 @@ class OwnedAsyncIterator(Generic[_T]):
         self._terminal_error: BaseException | None = None
         self._terminal_published = False
         self._cancellation_watch_started = False
+        self._construction_error = None
+        self._cancellation_owner = None
         self._consumer_close = _ConsumerCloseRecord()
         parent = asyncio.current_task()
         self._consumer_close.parents = (
@@ -255,22 +265,38 @@ class OwnedAsyncIterator(Generic[_T]):
             await dispatch.wait()
             await self._run()
         self._owner = (
-            asyncio.create_task(run_owned(), name=f"owned_async_iterator:{operation}", context=owner_context)
+            create_owned_task(run_owned(), name=f"owned_async_iterator:{operation}", context=owner_context)
             if owner_factory is None else owner_factory(run_owned, owner_context)
         )
         # Bound before the producer can run a single step: ``create_task``
         # only schedules it, so no read can observe an unowned record.
         self._consumer_close.owner = self._owner
         self._owner.add_done_callback(self._publish_owner_completion)
-        if owner_started is not None:
-            owner_started(self, self._owner)
-        self._cancellation_owner = asyncio.create_task(
-            self._watch_owner_cancellation(),
-            name=f"owned_async_iterator_cancel:{operation}",
-        )
-        self._cancellation_owner.add_done_callback(
-            self._interrupt_if_watch_never_started
-        )
+        try:
+            if owner_started is not None:
+                owner_started(self, self._owner)
+            self._cancellation_owner = create_owned_task(
+                self._watch_owner_cancellation(),
+                name=f"owned_async_iterator_cancel:{operation}",
+            )
+            self._cancellation_owner.add_done_callback(
+                self._interrupt_if_watch_never_started
+            )
+        except BaseException as error:
+            # No source body has crossed dispatch. Retain the exact partially
+            # constructed owner so the async boundary can physically join it;
+            # the synchronous constructor cannot manufacture that completion.
+            self._construction_error = error
+            error._kestrel_failed_owned_iterator = self
+            error._kestrel_native_retirement_debts = (
+                *getattr(error, "_kestrel_native_retirement_debts", ()),
+                (self, self._owner),
+            )
+            self._stop.set()
+            self._owner.cancel()
+            if self._cancellation_owner is not None:
+                self._cancellation_owner.cancel()
+            raise
         dispatch.set()
 
     def __aiter__(self) -> "OwnedAsyncIterator[_T]":
@@ -503,7 +529,7 @@ class OwnedAsyncIterator(Generic[_T]):
             outcome = OwnedTaskOutcome(None, self._terminal_error, outcome.cancellation)
         from kestrel_sovereign.execution_custody import is_execution_control_error
         if (
-            owner_cancelled_by_close
+            (owner_cancelled_by_close or self._construction_error is not None)
             and isinstance(outcome.error, asyncio.CancelledError)
             and self._cleanup_error is None
             and not is_execution_control_error(outcome.error)
@@ -513,6 +539,24 @@ class OwnedAsyncIterator(Generic[_T]):
             # the iterator, it is a successful close, while cancellation of
             # the caller itself still takes precedence below.
             outcome = OwnedTaskOutcome(None, None, outcome.cancellation)
+        if self._cancellation_owner is not None:
+            watcher = await await_owned_task(self._cancellation_owner)
+            from kestrel_sovereign.execution_custody import execution_terminal_error
+            watcher_error = watcher.error
+            if isinstance(watcher_error, asyncio.CancelledError) and not is_execution_control_error(watcher_error):
+                watcher_error = None
+            outcome = OwnedTaskOutcome(outcome.result,
+                execution_terminal_error(outcome.error, watcher_error, retain_originals=True),
+                execution_terminal_error(outcome.cancellation, watcher.cancellation, retain_originals=True))
+        if self._construction_error is not None and outcome.error is None:
+            # Reconcile ONLY the original constructor task reservation, after
+            # its actual frame/lock cleanup AND watcher have physically joined.
+            # A real owner/closer failure keeps this debt and every other debt.
+            error = self._construction_error
+            error._kestrel_native_retirement_debts = tuple(
+                debt for debt in error._kestrel_native_retirement_debts
+                if not (debt[0] is self and debt[1] is self._owner)
+            )
         raise_owned_outcome(outcome, operation=self._operation)
 
 

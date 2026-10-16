@@ -318,28 +318,40 @@ class SovereignSqlaSessionFactory:
 
     @asynccontextmanager
     async def read_session(self):
-        self._assert_session_connection_available()
-        session = self._async_session()
-        self._active_sessions.add(session)
-        try:
-            async with session:
-                yield session
-        finally:
-            self._active_sessions.discard(session)
+        async with self._session_lifetime(write=False) as session:
+            yield session
 
     @asynccontextmanager
     async def write_session(self):
+        async with self._session_lifetime(write=True) as session:
+            yield session
+
+    @asynccontextmanager
+    async def _session_lifetime(self, *, write):
+        """Keep original work/commit control through rollback AND native exit."""
         self._assert_session_connection_available()
         session = self._async_session()
         self._active_sessions.add(session)
+        original = None
         try:
-            async with session:
-                try:
-                    yield session
-                    await session.commit()
-                except BaseException:
-                    await session.rollback()
-                    raise
+            try:
+                async with session:
+                    try:
+                        yield session
+                        if write:
+                            await session.commit()
+                    except BaseException as error:
+                        original = error
+                        if write:
+                            try:
+                                await session.rollback()
+                            except BaseException as cleanup:
+                                original = execution_terminal_error(error, cleanup, retain_originals=True)
+                        raise original
+            except BaseException as cleanup:
+                # AsyncSession.__aexit__ can itself fail after the body raised.
+                # Never rely on implicit __context__ for custody provenance.
+                raise execution_terminal_error(original, cleanup, retain_originals=True)
         finally:
             self._active_sessions.discard(session)
 

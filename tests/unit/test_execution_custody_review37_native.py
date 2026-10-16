@@ -222,74 +222,12 @@ async def test_manager_create_agent_does_not_wrap_native_inception_control(tmp_p
 
 @pytest.mark.asyncio
 async def test_batch_second_cancellation_still_closes_unpublished_native_agent(tmp_path, monkeypatch):
-    from kestrel_sovereign.multi_agent import agent_manager as module
-    from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
-    agent, db = await native_owner(tmp_path)
-    manager = AgentManager(base_data_dir=tmp_path)
-    second_entered, first_cancel, alpha_done, recovery_entered, release_recovery = (asyncio.Event() for _ in range(5))
-    original_gather = asyncio.gather
-    gather_calls = 0
-    batch = None
-    recovery_delivery = None
-    async def initialize(name, *_args, **_kwargs):
-        await module._BATCH_STAGE_CALLBACK.get()(name, agent if name == "Alpha" else None)
-        if name == "Alpha":
-            return agent
-        second_entered.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            first_cancel.set()
-            raise
-    def cancel_on_recovery_gather(*args, **kwargs):
-        nonlocal gather_calls, recovery_delivery
-        if args and all(isinstance(task, asyncio.Task) and task.get_name().startswith("agent_batch_initialize:") for task in args):
-            gather_calls += 1
-            if gather_calls == 1:
-                for task in args:
-                    if task.get_name().endswith(":alpha"):
-                        task.add_done_callback(lambda _done: alpha_done.set())
-            if gather_calls == 2:
-                native_results = original_gather(*args, **kwargs)
-                async def deliver_settled_results():
-                    # Model delayed delivery of a real gather's already-owned
-                    # native initializer results, not a fabricated result list.
-                    recovery_entered.set()
-                    await release_recovery.wait()
-                    return await native_results
-                recovery_delivery = asyncio.create_task(deliver_settled_results())
-                return recovery_delivery
-        return original_gather(*args, **kwargs)
-    monkeypatch.setattr(manager, "_initialize_agent", initialize)
-    monkeypatch.setattr(module.asyncio, "gather", cancel_on_recovery_gather)
-    config = MultiAgentConfig(agents={
-        name: LocalAgentConfig(data_dir=name.lower(), port=8801+i)
-        for i, name in enumerate(("Alpha", "Beta"))
-    })
-    try:
-        batch = asyncio.create_task(manager.load_from_config(config))
-        await asyncio.wait_for(second_entered.wait(), 5)
-        await asyncio.wait_for(alpha_done.wait(), 5)
-        batch.cancel()
-        await asyncio.wait_for(recovery_entered.wait(), 5)
-        batch.cancel()
-        await asyncio.sleep(0)
-        release_recovery.set()
-        outcome = await await_owned_task(batch)
-        assert first_cancel.is_set() and gather_calls >= 2
-        assert isinstance(outcome.error, asyncio.CancelledError)
-        import traceback
-        assert db.backend._connection is None, "second cancellation abandoned a staged native agent: " + "".join(traceback.format_exception(outcome.error))
-        assert not manager.list_agents()
-    finally:
-        release_recovery.set()
-        if batch is not None:
-            await await_owned_task(batch)
-        if recovery_delivery is not None:
-            await await_owned_task(recovery_delivery)
-        await retire(agent)
-        await db.close()
+    # Recovery now joins original initializer Tasks directly, so an artificial
+    # second gather is no longer a production boundary. Hold the ACTUAL native
+    # SQLite close ACK instead and send the second cancellation at that owner.
+    from tests.unit.test_cleanup_task_admission import assert_cancelled_batch_native_cleanup
 
+    await assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, cancel_again=True)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["rag_resolver", "conversation_resolver", "rag_batch"])

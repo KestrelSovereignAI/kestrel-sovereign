@@ -4086,8 +4086,15 @@ class AsyncDatabase:
         # Independent resource retirement must finish even if an earlier owner
         # reports grouped control or the caller is cancelled during a join.
         for index, operation in enumerate((self.dispose_cached_sqla_factory, self._backend.close)):
+            try:
+                task = create_owned_task(operation(), retirement_resource=self)
+            except BaseException as error:
+                # An unaccepted optional closer cannot skip the independent
+                # primary owner. Keep the original resource/debt and continue.
+                errors.append(error)
+                continue
             outcome = await await_owned_task(
-                create_owned_task(operation()),
+                task,
                 cancel_on_caller_cancellation=index == 0,
             )
             errors.extend((outcome.error, outcome.cancellation))
@@ -4104,9 +4111,14 @@ class AsyncDatabase:
                         "pending after the primary database connection closed"
                     ))
             else:
-                outcome = await await_owned_task(create_owned_task(self.finalize_retired_sqla_factory()))
-                errors.extend((outcome.error, outcome.cancellation))
-        terminal = execution_terminal_error(*errors)
+                try:
+                    task = create_owned_task(self.finalize_retired_sqla_factory(), retirement_resource=self)
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    outcome = await await_owned_task(task)
+                    errors.extend((outcome.error, outcome.cancellation))
+        terminal = execution_terminal_error(*errors, retain_originals=True)
         if terminal is not None:
             raise terminal
 
