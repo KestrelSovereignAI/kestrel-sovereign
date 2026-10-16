@@ -951,3 +951,22 @@ stamping of the same artifact. The no-follow restrictive namespace marker surviv
 process loss and denies default provisioning in that namespace when the specific
 protected subtree can no longer be proved. It remains denial evidence, not launch
 authority, and Core never clears it or mutates the operator artifact to bypass it.
+
+Operator-notice settlement and stream closure retain the original turn failure
+alongside any independently guarded audit/cleanup failure. Observability purge
+keeps its per-table string diagnostics but also retains original exceptions in
+the explicit cause chain; an uncertain DELETE is not optional telemetry noise.
+Independent sweeps are attempted, while the original backend still refuses SQL
+after native uncertainty. Reanchor embedding cleanup records its actual service
+as unstarted retirement debt when closer allocation fails, preserving the body
+transaction's committed/unknown disposition rather than implying rollback.
+These native tests exercise the original storage operations; the embedding-span
+proof does not replace signed-amendment authorization coverage.
+
+Reentrant feature shutdown excludes the current physical Task from its own
+drain without dropping that Task's original ownership root. Completion removes
+that root only when the Task actually finishes. Codex's abandoned per-thread
+mutex acquisition releases synchronously, without requiring another Task to
+admit Lock.release. Asynchronous abandoned-result cleanup uses canonical closer
+admission, retaining its original returned resource if that admission fails.
+These are candidate contracts, not whole-branch review or release approval.

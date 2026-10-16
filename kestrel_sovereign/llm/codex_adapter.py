@@ -944,7 +944,7 @@ def _env_int(name: str) -> Optional[int]:
 
 async def _acquire_thread_turn_lock(lock: asyncio.Lock, cancel_token: Optional[CancelToken]) -> None:
     """Retain the exact successful acquisition if Stop wins its handoff."""
-    async def release_abandoned(acquired):
+    def release_abandoned(acquired):
         if acquired:
             lock.release()
     await await_or_cancelled(

@@ -40,6 +40,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from kestrel_sovereign.execution_custody import (
     close_execution_stream,
+    execution_terminal_error,
     is_execution_control_error,
     owned_execution_stream,
 )
@@ -505,7 +506,7 @@ class OperatorTurnInjectionResult(NamedTuple):
         """The provider accepted the request carrying this notice."""
         return await self.batch.settle_delivered()
 
-    async def settle_interrupted(self, exc: BaseException) -> bool:
+    async def settle_interrupted(self, exc: BaseException, *, phase: str = "turn") -> bool:
         """Settle a turn that died before the provider accepted the request.
 
         Cancellation and failure are distinct terminal states because they
@@ -513,13 +514,18 @@ class OperatorTurnInjectionResult(NamedTuple):
         vs "this broke"). Both requeue an inline notice, because neither one
         put it anywhere it could survive.
         """
-        if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
-            return await self.batch.settle_cancelled(
-                f"turn_cancelled:{type(exc).__name__}"
+        try:
+            if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                return await self.batch.settle_cancelled(
+                    f"{phase}_cancelled:{type(exc).__name__}"
+                )
+            return await self.batch.settle_failed(
+                f"{phase}_failed:{type(exc).__name__}"
             )
-        return await self.batch.settle_failed(
-            f"turn_failed:{type(exc).__name__}"
-        )
+        except BaseException as settlement_error:
+            # The audit is another guarded native operation, not a replacement
+            # owner for the provider/tool failure that made settlement necessary.
+            raise execution_terminal_error(exc, settlement_error, retain_originals=True)
 
     async def watch_stream(self, stream: Any) -> Any:
         """Iterate a provider stream, settling the notice from its lifecycle.
@@ -545,6 +551,7 @@ class OperatorTurnInjectionResult(NamedTuple):
         left to the async-generator GC hook — see :func:`_aclose_quietly`.
         """
         delivered = False
+        original_error = None
         try:
             async with owned_execution_stream(self, stream) as _owned_forwarder_542:
                 async for item in _owned_forwarder_542:
@@ -552,26 +559,27 @@ class OperatorTurnInjectionResult(NamedTuple):
                         delivered = True
                         await self.batch.settle_delivered()
                     yield item
-        except (asyncio.CancelledError, GeneratorExit) as exc:
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
             # Awaiting during GeneratorExit is legal inside an async generator
             # (that is what ``aclose()`` is for); only yielding is not. When the
             # notice already settled ``delivered`` this returns without
             # suspending at all.
-            await self.batch.settle_cancelled(
-                f"stream_cancelled:{type(exc).__name__}"
-            )
-            raise
-        except BaseException as exc:  # noqa: BLE001 - re-raised below
-            await self.batch.settle_failed(
-                f"stream_failed:{type(exc).__name__}"
-            )
+            original_error = exc
+            try:
+                await self.settle_interrupted(exc, phase="stream")
+            except BaseException as settlement_error:
+                original_error = settlement_error
+                raise
             raise
         finally:
             # Every exit path releases the provider stream, including the
             # ``break``-then-``aclose()`` stop button, which unwinds through
             # the GeneratorExit branch above and would otherwise leave the
             # cancel token and upstream connection to the asyncgen GC hook.
-            await _aclose_quietly(stream)
+            try:
+                await _aclose_quietly(stream)
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(original_error, cleanup_error, retain_originals=True)
         if not delivered:
             await self.batch.settle_failed("stream_closed_without_output")
 

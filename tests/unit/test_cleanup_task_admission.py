@@ -304,26 +304,12 @@ async def test_cancelled_batch_joins_original_unpublished_resources_without_coll
     )
 
 
-async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel_again):
+async def _partial_native_agent(tmp_path, monkeypatch):
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm import service as service_module
-    from kestrel_sovereign.multi_agent import agent_manager as manager_module
-    from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
     from kestrel_sovereign.storage.async_storage import AsyncStorage
 
     db = await AsyncDatabase.sqlite(str(tmp_path / "unpublished-native.db"))
-    connection = db._backend._connection
-    worker = getattr(connection, "_thread", connection)
-    close_entered, close_release = asyncio.Event(), asyncio.Event()
-    if cancel_again:
-        native_close = connection.close
-
-        async def held_original_close_ack():
-            await native_close()
-            close_entered.set()
-            await close_release.wait()
-
-        monkeypatch.setattr(connection, "close", held_original_close_ack)
     # Real provider service with no configured routes and the original native
     # usage database. No provider calls, fake canary, genesis pass, or readiness
     # bypass: this is private PARTIAL initialization resource cleanup only.
@@ -339,6 +325,26 @@ async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel
     storage.db = db
     agent.storage = agent._raw_storage = storage
     assert not agent._runtime_publication_ready.is_set()
+    return agent, db
+
+
+async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel_again):
+    from kestrel_sovereign.multi_agent import agent_manager as manager_module
+    from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
+
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    connection = db._backend._connection
+    worker = getattr(connection, "_thread", connection)
+    close_entered, close_release = asyncio.Event(), asyncio.Event()
+    if cancel_again:
+        native_close = connection.close
+
+        async def held_original_close_ack():
+            await native_close()
+            close_entered.set()
+            await close_release.wait()
+
+        monkeypatch.setattr(connection, "close", held_original_close_ack)
     manager = manager_module.AgentManager(base_data_dir=tmp_path)
     beta_entered, alpha_done = asyncio.Event(), asyncio.Event()
     loop, factory, refused = (
@@ -424,5 +430,50 @@ async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel
             await await_owned_task(batch)
         for coroutine in refused:
             coroutine.close()
+        await agent.shutdown()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reentrant_feature_task_keeps_its_actual_root_until_completion(tmp_path, monkeypatch):
+    from kestrel_sovereign import _async_ownership as ownership
+    from kestrel_sovereign.features.base import Feature
+
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+
+    class NativeFeature(Feature):
+        async def initialize(self):
+            return None
+
+        @property
+        def tool_description(self):
+            return "native reentrant resource ownership"
+
+    feature = NativeFeature(agent)
+    original_join, self_joins = ownership.await_owned_task, []
+
+    async def reject_actual_self_join(task, *args, **kwargs):
+        if task is asyncio.current_task():
+            self_joins.append(task)
+            raise RuntimeError("actual Core feature owner attempted to join itself")
+        return await original_join(task, *args, **kwargs)
+
+    async def original_worker():
+        await db.execute("CREATE TABLE original_feature_effects (id INTEGER)")
+        await db.execute("INSERT INTO original_feature_effects VALUES (1)")
+        await feature.shutdown()
+        assert asyncio.current_task() in feature._owned_background_tasks
+        return await db.fetchval("SELECT COUNT(*) FROM original_feature_effects")
+
+    monkeypatch.setattr(ownership, "await_owned_task", reject_actual_self_join)
+    task = feature._track_owned_background_task(original_worker(), name="actual-feature-self-shutdown")
+    try:
+        outcome = await original_join(task)
+        assert not self_joins, "the original feature Task reached an impossible self-join"
+        assert outcome.error is None and outcome.result == 1
+        assert not feature._owned_background_tasks and task not in agent._background_tasks
+        assert not agent._runtime_publication_ready.is_set()
+    finally:
+        await original_join(task)
         await agent.shutdown()
         await db.close()

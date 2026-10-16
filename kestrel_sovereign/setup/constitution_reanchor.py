@@ -1630,9 +1630,16 @@ async def _agent_embedding(
                 if close_error is not None:
                     raise close_error
 
-            closer = create_owned_task(retire())
-            outcome = await await_owned_task(closer)
-            cleanup = execution_terminal_error(outcome.error, outcome.cancellation)
+            closer = None
+            try:
+                closer = create_owned_task(retire(), retirement_resource=service)
+                outcome = await await_owned_task(closer)
+                cleanup = execution_terminal_error(outcome.error, outcome.cancellation)
+            except BaseException as error:
+                # A missing Task is not a retired service. Preserve both the
+                # original body disposition and the raw physical resource;
+                # canonical admission closes the refused fresh coroutine.
+                cleanup = error
             if cleanup is not None:
                 # The embedding span surrounds the caller's transaction. A
                 # successful body is a committed repair, NOT retry permission.
