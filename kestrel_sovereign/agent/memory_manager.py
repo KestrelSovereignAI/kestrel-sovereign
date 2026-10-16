@@ -8,6 +8,7 @@ Extracted from ContextManager to improve modularity and maintainability.
 import html
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import uuid
@@ -704,7 +705,14 @@ class MemoryManager:
             "stash_id": stash_id,
             "stash_name": stash_name,
             "message_count": len(stashed),
-            "messages": stashed
+            # PostgreSQL returns a native TIMESTAMP; SQLite already returns
+            # JSON-compatible text. Encode this known typed column without
+            # mutating the source rows or stringifying arbitrary metadata.
+            "messages": [
+                {**message, "created_at": message["created_at"].isoformat()}
+                if isinstance(message.get("created_at"), datetime) else message
+                for message in stashed
+            ]
         })
 
         source_ref = json.dumps({
@@ -765,15 +773,23 @@ class MemoryManager:
             }
 
         except ImportError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"SavedItemsStore import failed: {e}", exc_info=True)
             return {"success": False, "error": f"SavedItemsStore not available: {e}"}
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Storage connection error during stash save: {e}", exc_info=True)
             return {"success": False, "error": f"Storage error: {str(e)}"}
         except (KeyError, ValueError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Data error during stash save: {e}", exc_info=True)
             return {"success": False, "error": f"Data error: {str(e)}"}
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Stash save failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
@@ -1060,12 +1076,18 @@ class MemoryManager:
             }
 
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Network error during hierarchical compaction: {e}", exc_info=True)
             return {"success": False, "error": f"Network error: {str(e)}"}
         except (KeyError, ValueError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Data error during hierarchical compaction: {e}", exc_info=True)
             return {"success": False, "error": f"Data error: {str(e)}"}
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Hierarchical compaction failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 

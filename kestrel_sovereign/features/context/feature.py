@@ -252,6 +252,8 @@ class ContextFeature(Feature):
                     "Use 'last_N', 'search:query', or 'ids:1,2,3'"
                 )
         except (AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
+            if is_execution_control_error(e):
+                raise
             return None, str(e)
         return messages, None
 
@@ -359,9 +361,13 @@ class ContextFeature(Feature):
                 mode=mode, criteria=criteria,
             )
         except (AttributeError, TypeError, ValueError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"summarize_section selection failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"summarize_section selection failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -385,9 +391,13 @@ class ContextFeature(Feature):
                 session_id=self._turn_session_id(),
             )
         except (AttributeError, TypeError, ValueError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"summarize_section failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"summarize_section failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -451,9 +461,13 @@ class ContextFeature(Feature):
                 reason=reason,
             )
         except (AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"mark_content failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"mark_content failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -509,9 +523,13 @@ class ContextFeature(Feature):
             try:
                 status = await self.context_manager.check_compaction_needed()
             except (AttributeError, TypeError, ValueError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"compact_context dry-run failed: {e}")
                 return ToolResult.failed(str(e))
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"compact_context dry-run failed: {e}", exc_info=True)
                 return ToolResult.failed(str(e))
 
@@ -554,9 +572,13 @@ class ContextFeature(Feature):
             if context_stats is not None:
                 context_stats.reset()
         except (AttributeError, TypeError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"compact_context failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"compact_context failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -604,9 +626,13 @@ class ContextFeature(Feature):
                 message_ids=message_ids, reason=reason,
             )
         except (AttributeError, TypeError, ValueError, KeyError, IndexError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"exclude_from_context failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"exclude_from_context failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -669,12 +695,18 @@ class ContextFeature(Feature):
                     f"Invalid target: {target}. Use 'all', 'recent', or 'ids:1,2,3'"
                 )
         except ValueError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"restore_excluded failed: {e}")
             return ToolResult.failed(str(e))
         except (AttributeError, TypeError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"restore_excluded failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"restore_excluded failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -734,12 +766,18 @@ class ContextFeature(Feature):
                     f"Invalid target: {target}. Use 'last_N' or 'ids:1,2,3'"
                 )
         except ValueError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash failed: {e}")
             return ToolResult.failed(str(e))
         except (AttributeError, TypeError, IndexError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -768,9 +806,13 @@ class ContextFeature(Feature):
                 stash_id=stash_id if stash_id else None,
             )
         except (AttributeError, TypeError, ValueError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_pop failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_pop failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -803,9 +845,13 @@ class ContextFeature(Feature):
                 stash_id=stash_id if stash_id else None,
             )
         except (AttributeError, TypeError, ValueError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_apply failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_apply failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -836,9 +882,13 @@ class ContextFeature(Feature):
         try:
             result = await self.context_manager.stash_list()
         except (AttributeError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_list failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_list failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -872,9 +922,13 @@ class ContextFeature(Feature):
                 stash_id=stash_id if stash_id else None,
             )
         except (AttributeError, TypeError, ValueError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_drop failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_drop failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -917,9 +971,13 @@ class ContextFeature(Feature):
                 tags=tags_list,
             )
         except (AttributeError, TypeError, ValueError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_save failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_save failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -962,9 +1020,13 @@ class ContextFeature(Feature):
                 max_chars=max_chars_val,
             )
         except (AttributeError, TypeError, ValueError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_peek failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"context_stash_peek failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -1029,9 +1091,13 @@ class ContextFeature(Feature):
                 session_id=self._turn_session_id(),
             )
         except (AttributeError, TypeError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"hierarchical_compact failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"hierarchical_compact failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -1134,6 +1200,8 @@ class ContextFeature(Feature):
                         for m in original_messages
                     ])[:10000]
                 except (IndexError, KeyError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     return ToolResult.failed(
                         f"Invalid format: {context_source} - {e}"
                     )
@@ -1197,15 +1265,23 @@ ANSWER:"""
                 model_override=model_override,
             )
         except ValueError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recursive_query failed: {e}")
             return ToolResult.failed(str(e))
         except (IndexError, KeyError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recursive_query failed: {e}")
             return ToolResult.failed(str(e))
         except (AttributeError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recursive_query failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recursive_query failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 

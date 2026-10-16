@@ -80,6 +80,38 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
                 body = json.loads(await reader.readexactly(size))
                 requests.append(body)
                 if header.startswith(b"POST /v1/chat/completions "):
+                    if not body.get("stream"):
+                        payload = json.dumps(
+                            {
+                                "id": "local-native-chat",
+                                "object": "chat.completion",
+                                "created": 1,
+                                "model": body["model"],
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "finish_reason": "stop",
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": "local summary",
+                                        },
+                                    }
+                                ],
+                                "usage": {
+                                    "prompt_tokens": 3,
+                                    "completion_tokens": 1,
+                                    "total_tokens": 4,
+                                },
+                            }
+                        ).encode()
+                        writer.write(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                            + str(len(payload)).encode()
+                            + b"\r\n\r\n"
+                            + payload
+                        )
+                        await writer.drain()
+                        return
                     assert body["stream"] is True
                     events = [
                         {

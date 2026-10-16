@@ -30,6 +30,20 @@ context tools remain under the open cumulative ledger, not cleared by these
 producer tests. The task-list HTTP wrapper likewise propagates the identity
 helper's original receipt instead of replacing it with an ordinary HTTP500.
 
+Shared conversation history, selection, compaction, summary and stash producers
+preserve original native control through their typed and generic availability
+handlers. Context tools do the same before producing ToolResult errors, empty
+history or dry-run success. Native tests exercise actual scoped PostgreSQL reads,
+metadata/summary/saved-item writes and locally served SDK summary responses; a
+committed first mutation cannot continue into another row or an audit write.
+Compatibility carriers explicitly retain the observed original receipt, not an
+invented acknowledgement. Healthy mark/stash/list/pop operations retain the
+stored rows without model requests. Stash JSON encodes the known native
+created_at datetime without mutating source rows or stringifying arbitrary
+metadata. Component Agent projections still do not establish genesis/READY or
+authenticated HTTP. Other cumulative lifecycle and settings/CLI findings remain
+open until independently cleared.
+
 Snapshot upload retirement uses the existing native close owner, opting into
 retaining the opening cancellation and original close error together. Refused
 close admission retains the exact unstarted client; repeated caller withdrawal
