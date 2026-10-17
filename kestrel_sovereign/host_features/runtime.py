@@ -15,6 +15,7 @@ import re
 from typing import Any, List
 
 from fastapi import FastAPI
+from fastapi.routing import iter_route_contexts
 from fastapi.staticfiles import StaticFiles
 
 from kestrel_sdk.features.host_base import HostFeature
@@ -96,7 +97,7 @@ def mount_host_feature_routers(app: FastAPI, features: List[HostFeature]) -> Lis
             continue
         new_routes = app.routes[before:]
         added.extend(new_routes)
-        for route in new_routes:
+        for route in iter_route_contexts(new_routes):
             route_path = getattr(route, "path", None)
             if route_path:
                 prefixes.add(_route_prefix(route_path))

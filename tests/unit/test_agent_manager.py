@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from fastapi.routing import iter_route_contexts
 
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
@@ -12871,14 +12872,16 @@ class TestLoadFromConfig:
         assert await second is agents["Second"]
         assert manager.get_agent("Second") is agents["Second"]
         assert any(
-            getattr(route, "path", None) == "/second-candidate-route"
-            for route in app.routes
+            route.path == "/second-candidate-route"
+            for route in iter_route_contexts(app.routes)
         )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("router_prefix", ["", "/prefixed"])
+    @pytest.mark.parametrize("valid_peer_router", [True, False])
+    @pytest.mark.parametrize("route_count", [1, 2, 5])
     async def test_readiness_rollback_removes_only_its_own_host_routes(
-        self, tmp_path, router_prefix,
+        self, tmp_path, router_prefix, valid_peer_router, route_count,
     ):
         """A late ready failure cannot erase a later committed registration."""
 
@@ -12887,9 +12890,12 @@ class TestLoadFromConfig:
         def candidate(agent_id: str, route_path: str):
             router = APIRouter(prefix=router_prefix)
 
-            @router.get(route_path)
             async def route():
                 return {"agent": agent_id}
+
+            for index in range(route_count):
+                path = route_path if index == 0 else f"{route_path}-{index}"
+                router.add_api_route(path, route, methods=["GET"])
 
             feature = SimpleNamespace(
                 name="SharedReadyFeature",
@@ -12911,6 +12917,18 @@ class TestLoadFromConfig:
             "SecondReady": candidate(
                 "did:test:second-ready", "/shared-ready-route"
             ),
+        }
+        if not valid_peer_router:
+            agents["SecondReady"].features["SharedReadyFeature"].get_router = (
+                lambda: SimpleNamespace(routes=[], prefix="")
+            )
+        restored_fields = (
+            "_scoped_policy_required", "_a2a_host_manager", "a2a_did_resolver",
+            "a2a_inbound_sender_authorizer",
+        )
+        prior_agent_fields = {
+            field: vars(agents["FirstReady"])[field]
+            for field in restored_fields if field in vars(agents["FirstReady"])
         }
         manager = AgentManager(base_data_dir=tmp_path)
 
@@ -12957,24 +12975,40 @@ class TestLoadFromConfig:
 
         assert manager.get_agent("FirstReady") is None
         assert manager.get_agent("SecondReady") is agents["SecondReady"]
-        second_feature = agents["SecondReady"].features["SharedReadyFeature"]
-        second_router = second_feature.get_router()
         assert server._resolve_live_route_agent(
-            app,
-            {"state": {}},
-            agents["FirstReady"],
-            "SharedReadyFeature",
-            server._feature_router_route_selector(second_router, 0),
-        ) is agents["SecondReady"]
-        expected_path = f"{router_prefix}/shared-ready-route"
-        assert sum(
-            getattr(route, "path", None) == expected_path
-            for route in app.routes
-        ) == 1
+            app, {"state": {}}, agents["FirstReady"],
+        ) is None
+        expected_paths = [
+            f"{router_prefix}/shared-ready-route" + (f"-{index}" if index else "")
+            for index in range(route_count)
+        ]
+        # A surviving shared registration must remain callable, and retaining
+        # its key must not block remount or create duplicate physical leaves.
+        server._mount_feature_routers(app, agents=(agents["SecondReady"],))
+        for expected_path in expected_paths:
+            assert sum(
+                context.path == expected_path
+                for context in iter_route_contexts(app.routes)
+            ) == int(valid_peer_router)
+        assert {
+            field: vars(agents["FirstReady"])[field]
+            for field in restored_fields if field in vars(agents["FirstReady"])
+        } == prior_agent_fields
+        assert app.state.demo_mode is False
+        async def selected_peer(scope, receive, send):
+            if scope["type"] == "http":
+                scope.setdefault("state", {})["agent"] = agents["SecondReady"]
+            await app(scope, receive, send)
+
         with TestClient(app) as client:
-            response = client.get(expected_path)
-        assert response.status_code == 200
-        assert response.json() == {"agent": "did:test:second-ready"}
+            for expected_path in expected_paths:
+                assert client.get(expected_path).status_code == 404
+        with TestClient(selected_peer) as client:
+            for expected_path in expected_paths:
+                response = client.get(expected_path)
+                assert response.status_code == (200 if valid_peer_router else 404)
+                if valid_peer_router:
+                    assert response.json() == {"agent": "did:test:second-ready"}
 
 
     def test_preflight_reserves_spawn_cap_before_projection(self):
