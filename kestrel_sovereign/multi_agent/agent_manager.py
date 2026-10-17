@@ -9346,6 +9346,7 @@ class AgentManager:
         observed_runtime_offboardings: set[int] = set()
         observed_cleanup_tasks: set[int] = set()
         observed_budget_releases: set[str] = set()
+        refund_withdrawals: list[BaseException] = []
         # ``shutdown_all`` may have already joined and reported a release
         # before this terminal drain gets to its retained unsafe metadata.
         # That evidence must remain for a later drain, but one fleet-shutdown
@@ -9488,11 +9489,13 @@ class AgentManager:
                     if budget_release.release_id in observed_budget_releases:
                         continue
                     observed_budget_releases.add(budget_release.release_id)
-                    (
-                        join_cancelled,
-                        release_failure,
-                    ) = await await_lifecycle_task_completion(budget_release.task)
-                    cancelled = cancelled or join_cancelled
+                    release_outcome = await await_owned_task(budget_release.task)
+                    release_failure = release_outcome.error
+                    if release_outcome.cancellation is not None:
+                        cancelled = True
+                        # This actual caller belongs to this finite drain, not
+                        # the shared bounded source-control latch.
+                        refund_withdrawals.append(release_outcome.cancellation)
                     if (
                         release_failure is not None
                         and budget_release.release_id
@@ -9603,7 +9606,11 @@ class AgentManager:
         # value so callers can choose when to re-raise cancellation themselves.
         control = vars(self).get("_quarantined_shutdown_control")
         if control is not None:
-            raise execution_terminal_error(control, *failures)
+            raise execution_terminal_error(
+                control, *refund_withdrawals, *failures,
+                retain_originals=bool(refund_withdrawals),
+                isolate_control_originals=bool(refund_withdrawals),
+            )
         if cancelled and failures:
             raise BaseExceptionGroup(
                 "Quarantined shutdown drain observed cancellation and failures",

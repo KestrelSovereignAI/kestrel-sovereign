@@ -23,7 +23,7 @@ from tests.unit.test_execution_custody_review35_native import traceback_size
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["join", "completed", "remove", "registered-component", "drain"])
+@pytest.mark.parametrize("route", ["join", "completed", "remove", "registered-component", "drain", "drain-live"])
 @pytest.mark.parametrize("source_cancel", [False, True])
 @pytest.mark.parametrize("caller_cancel", [False, True])
 async def test_original_native_refund_survives_join_callback_and_terminal_drain(
@@ -64,6 +64,32 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
     entry = (delegated, parent)
     manager._child_budgets["child"] = entry
     records = []
+    drain_join = asyncio.Event()
+    withdrawals = []
+    if route == "drain-live":
+        from kestrel_sovereign.multi_agent import agent_manager as manager_module
+
+        actual_owned_join = manager_module.await_owned_task
+        actual_legacy_join = manager_module.await_lifecycle_task_completion
+
+        async def observed_owned_join(child):
+            selected = bool(records) and child is records[0].task
+            if selected:
+                assert not child.done()
+                drain_join.set()
+            outcome = await actual_owned_join(child)
+            if selected and outcome.cancellation is not None:
+                withdrawals.append(outcome.cancellation)
+            return outcome
+
+        async def observed_legacy_join(child):
+            if records and child is records[0].task:
+                assert not child.done()
+                drain_join.set()
+            return await actual_legacy_join(child)
+
+        monkeypatch.setattr(manager_module, "await_owned_task", observed_owned_join)
+        monkeypatch.setattr(manager_module, "await_lifecycle_task_completion", observed_legacy_join)
     child = child_db = None
     if route == "registered-component":
         from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -104,7 +130,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             if route in {"completed", "drain"}:
                 await await_owned_task(record.task)
                 await asyncio.sleep(0)  # Actual completion callback retires metadata.
-            if route == "drain":
+            if route in {"drain", "drain-live"}:
                 return await manager.drain_quarantined_shutdowns()
             return await manager._await_child_budget_release_cancellation_safe(record.task)
 
@@ -117,6 +143,8 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=184') == 1
             if route in {"remove", "registered-component"}:
                 records.append(manager._inflight_removal_budget_releases_by_child["child"])
+            if route == "drain-live":
+                await asyncio.wait_for(drain_join.wait(), 5)
             if source_cancel:
                 deposit_owners[0].cancel("actual original refund COMMIT observer withdrawal")
             if caller_cancel:
@@ -129,6 +157,12 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
         assert outcome.error is not None and is_execution_control_error(outcome.error), "refund completion lost original native execution control"
         assert execution_commit_outcome(outcome.error) == "unknown", "refund completion erased original COMMIT uncertainty"
         assert originals[0] in tuple(_explicit_control_chain(outcome.error)), "refund completion discarded its original native carrier"
+        if route == "drain-live" and caller_cancel:
+            chain = tuple(_explicit_control_chain(outcome.error))
+            assert any(isinstance(error, asyncio.CancelledError) and error.args == ("actual refund caller withdrawal",)
+                       for error in chain), "live terminal refund drain lost its actual caller withdrawal"
+            assert len(withdrawals) == 1 and withdrawals[0] in chain
+            assert withdrawals[0] not in tuple(_explicit_control_chain(manager._quarantined_shutdown_control)), "finite drain withdrawal leaked into shared source latch"
         assert tuple(_explicit_control_chain(originals[0])) == graphs[0], "refund completion mutated its original native source graph"
         assert records[0].task.done() and manager._child_budgets["child"] is entry
         if child_db is not None:
@@ -149,6 +183,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             assert is_execution_control_error(caught), "completed refund callback reduced native control to metadata-only failure"
             assert execution_commit_outcome(caught) == "unknown"
             assert originals[0] in tuple(_explicit_control_chain(caught))
+            assert all(withdrawal not in tuple(_explicit_control_chain(caught)) for withdrawal in withdrawals), "later drain inherited an earlier caller's private withdrawal"
             assert tuple(_explicit_control_chain(originals[0])) == graphs[0]
             assert traceback_size(originals[0]) <= original_depth + 4, "refund receipt retained unbounded terminal-reader traceback frames"
         # Acknowledging public metadata cannot settle UNKNOWN or authorize a
