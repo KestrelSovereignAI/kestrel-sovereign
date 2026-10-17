@@ -4084,9 +4084,17 @@ class KestrelAgent(
             for feature in discovered_features
             if feature.name not in disabled_features
         )
-        prepared_contributions = self._prepare_feature_contribution_transition(
-            enabled_discovered_features
-        )
+        try:
+            prepared_contributions = self._prepare_feature_contribution_transition(
+                enabled_discovered_features
+            )
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_error:
+            if is_execution_control_error(preparation_error):
+                await enter_feature_lifecycle_safe_mode(
+                    self, "Startup feature preflight reported unresolved native control",
+                    preparation_error, features=enabled_discovered_features,
+                )
+            raise
         self._record_contribution_rejections(prepared_contributions)
         for feature, prepared_item in prepared_contributions.activatable(
             enabled_discovered_features
@@ -6604,6 +6612,11 @@ class KestrelAgent(
                 features
             )
         except FeatureContributionCollectionError as exc:
+            if is_execution_control_error(exc):
+                _retain_feature_lifecycle_safe_mode(
+                    self, "Feature contribution preflight reported native uncertainty", exc,
+                )
+                raise
             feature_class_name = type(exc.feature).__name__
             cause = exc.__cause__
             if feature_class_name in MANDATORY_FEATURES:
@@ -6621,8 +6634,16 @@ class KestrelAgent(
             if cause is None:  # Defensive: collection failures always chain.
                 raise
             raise cause.with_traceback(cause.__traceback__) from cause.__cause__
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            if is_execution_control_error(exc):
+                _retain_feature_lifecycle_safe_mode(
+                    self, "Feature contribution preflight reported native uncertainty", exc,
+                )
+            raise
 
-    async def _shutdown_failed_feature(self, feature: Feature) -> None:
+    async def _shutdown_failed_feature(
+        self, feature: Feature, *, opening: BaseException | None = None,
+    ) -> None:
         """Drain EVERY registration of a feature whose registration failed mid-way.
 
         ``_register_feature`` wires a feature up in stages — ``initialize()``
@@ -6644,9 +6665,10 @@ class KestrelAgent(
         in ``self.features`` so it drains every registration (``on_disable`` →
         ``shutdown`` → hooks → A2A → dynamic tools, each independent and run
         unconditionally) BEFORE it is dropped — the exact inverse of the wiring
-        ``_register_feature`` performs. It is best-effort here: a teardown error
-        is logged, never raised, so the ORIGINAL registration failure (or its
-        ``MandatoryFeatureReadinessError`` wrap) is what surfaces to the caller.
+        ``_register_feature`` performs. Ordinary teardown failures are logged
+        without replacing the registration failure. Native execution control
+        instead latches lifecycle SafeMode and preserves both originals; it
+        must not be hidden by an ordinary readiness wrapper.
         Every teardown step is idempotent, so it is safe even when the feature
         only got as far as ``initialize()`` (never added to ``self.features``) or
         a stage left nothing to undo. ``unload=True`` drops the instance from
@@ -6656,13 +6678,30 @@ class KestrelAgent(
         and retry, until a teardown of it succeeds (#3522).
         """
         name = getattr(feature, "name", None)
+        cleanup = None
         try:
             await self._unregister_feature_runtime(feature, unload=True)
-        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            cleanup = exc
+        controls = tuple(error for error in (opening, cleanup)
+                         if is_execution_control_error(error))
+        if controls:
+            withdrawals = tuple(error for error in (opening, cleanup)
+                                if isinstance(error, asyncio.CancelledError)
+                                and not is_execution_control_error(error))
+            await enter_feature_lifecycle_safe_mode(
+                self, "Startup feature rollback reported unresolved native control",
+                *controls, *withdrawals, features=(feature,),
+            )
+        if isinstance(cleanup, asyncio.CancelledError):
+            raise cleanup
+        if isinstance(cleanup, BaseExceptionGroup) and not isinstance(cleanup, Exception):
+            raise cleanup
+        if cleanup is not None:
             logging.warning(
-                "boot rollback: failed feature '%s' teardown errored: %s",
+                "boot rollback: failed feature '%s' teardown reported %s",
                 name or type(feature).__name__,
-                exc,
+                type(cleanup).__name__,
             )
 
     async def _apply_host_feature_config(self, feature: Feature) -> None:
@@ -6916,9 +6955,9 @@ class KestrelAgent(
         self._hold_feature(feature)
         try:
             await feature.initialize()
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "initialization",
@@ -6927,16 +6966,15 @@ class KestrelAgent(
             raise
         try:
             await self._apply_host_feature_config(feature)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             # CancelledError is a BaseException, so the handler below never
             # sees it. initialize() has already run at this point and the
             # feature is not yet in self.features, so boot rollback cannot
             # find it — its tasks and signal sources would outlive the failed
             # boot. Tear down, then let the cancellation continue.
-            with contextlib.suppress(Exception):
-                await self._shutdown_failed_feature(feature)
+            await self._shutdown_failed_feature(feature, opening=exc)
             raise
-        except Exception as exc:
+        except (Exception, BaseExceptionGroup) as exc:
             # Deliberately fatal to this feature. A rejected block does NOT
             # leave the feature unconfigured — a feature that validates before
             # replacing its active config (Talon does) keeps running its
@@ -6945,7 +6983,7 @@ class KestrelAgent(
             # and believes they replaced. Silent divergence between declared
             # and running configuration is the whole subject of #3008; it must
             # not be reintroduced by its own fix.
-            await self._shutdown_failed_feature(feature)
+            await self._shutdown_failed_feature(feature, opening=exc)
             logging.error(
                 "Feature '%s' rejected the configuration declared in %s: %s. "
                 "The feature is NOT loaded, so it cannot run with settings "
@@ -6962,9 +7000,9 @@ class KestrelAgent(
             self._ensure_feature_contribution_runtime().activate(
                 prepared_contributions
             )
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "contribution registration",
@@ -6975,9 +7013,9 @@ class KestrelAgent(
         # Auto-register hooks from get_hooks() with the agent's HooksManager
         try:
             self._wire_feature_hooks(feature)
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "registration",
@@ -6988,9 +7026,9 @@ class KestrelAgent(
         # Call on_enable lifecycle hook
         try:
             await feature.on_enable()
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "enablement",
@@ -7000,9 +7038,9 @@ class KestrelAgent(
 
         try:
             self._wire_feature_a2a(feature)
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "registration",
@@ -7466,7 +7504,9 @@ class KestrelAgent(
 
         # Surface the failure only AFTER every independent cleanup step ran.
         if errors:
-            raise execution_terminal_error(*errors)
+            raise execution_terminal_error(
+                *errors, retain_originals=True, isolate_control_originals=True,
+            )
         return reported
 
     def _hold_feature(self, feature: "Feature") -> None:

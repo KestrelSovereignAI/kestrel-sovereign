@@ -909,7 +909,7 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
     cancelled first close therefore cannot safely be repaired by calling the
     original close again. Retain its task before iteration can start it.
     """
-    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
 
     response_types = (_NativeHTTPXResponse, _NativeHTTPX2Response)
     response = stream if isinstance(stream, response_types) else getattr(stream, "response", None)
@@ -920,22 +920,28 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
     native_close = response.aclose
     captured = current_execution_custody(owner)
     task = None
+    admission = None
+    opening = None
 
     async def joined_close():
-        nonlocal task
+        nonlocal task, admission, opening
         original = sys.exc_info()[1]
-        if task is None:
+        if admission is None:
+            admission = OwnedTaskAdmission()
             try:
                 with bind_execution_cleanup(owner, captured):
                     task = create_owned_task(
                         native_close(), retirement_resource=response,
-                        retain_originals=True,
+                        retain_originals=True, admission=admission,
                     )
             except BaseException as error:
-                raise execution_terminal_error(
-                    original, error, retain_originals=True,
-                    isolate_control_originals=True,
-                )
+                opening = error
+                task = admission.task
+        if task is None:
+            raise execution_terminal_error(
+                original, opening, retain_originals=True,
+                isolate_control_originals=True,
+            )
         outcome = await await_owned_task(task)
         retirement = None
         if outcome.error is not None:
@@ -944,12 +950,12 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
             # never on the source exception owned by another operation.
             retirement = RuntimeError("original native HTTP response retirement failed")
             retirement._kestrel_native_retirement_debts = ((response, task),)
-        if outcome.error is not None or outcome.cancellation is not None:
+        if opening is not None or outcome.error is not None or outcome.cancellation is not None:
             if (outcome.error is None and outcome.cancellation is not None
                 and (original is None or not is_execution_control_error(original))):
                 raise outcome.cancellation
             raise execution_terminal_error(
-                original, outcome.error, retirement, outcome.cancellation,
+                original, opening, outcome.error, retirement, outcome.cancellation,
                 retain_originals=True, prefer_cancellation=True,
                 isolate_control_originals=True,
             )

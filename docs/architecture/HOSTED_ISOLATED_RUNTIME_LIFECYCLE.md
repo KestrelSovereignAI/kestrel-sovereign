@@ -224,3 +224,18 @@ retargeting rather than replacing the previous operator-owned artifacts. A
 failed immutable validation leaves custody uncertainty sticky; validating the
 current setting does not prove ownership of the historical path or authorize
 its deletion. Reclamation remains fail-closed until explicit owner reconciliation.
+
+Finite cleanup joins preserve independent original failures and the current
+caller's withdrawal without rewriting a shared native source receipt. This
+also applies to configuration-fence finalizers, startup registration rollback,
+single-agent onboarding rollback, and SQLite worker retirement. Ordinary
+configuration body-error precedence does not suppress native finalizer control.
+An accepted SDK response/context close remains the same close task even when
+publishing its completion callback fails.
+
+Session-training acquisition and rejected-session release retain the actual
+physical hook task and session when native retirement is unresolved. A later
+close reports that evidence without issuing a replacement release. Ordinary
+provider release failures retain their existing bounded retry behavior. Local
+component tests do not prove authenticated provider termination or billing
+acceptance; those remain separate provider verification boundaries.

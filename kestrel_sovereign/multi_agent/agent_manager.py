@@ -3116,7 +3116,10 @@ class AgentManager:
                         )
                     except BaseException as error:
                         from kestrel_sovereign.execution_custody import execution_terminal_error
-                        cleanup_failure = execution_terminal_error(cleanup_failure, error)
+                        cleanup_failure = execution_terminal_error(
+                            cleanup_failure, error, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
                         logger.warning(
                             "Failed to close LLM service for uninitialized agent %r",
                             name,
@@ -3124,7 +3127,10 @@ class AgentManager:
                         )
                 if cleanup_failure is not None:
                     from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-                    terminal = execution_terminal_error(initialization_failure, cleanup_failure)
+                    terminal = execution_terminal_error(
+                        initialization_failure, cleanup_failure, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                     if terminal is not None and is_execution_control_error(terminal):
                         raise terminal
             raise
@@ -6574,16 +6580,25 @@ class AgentManager:
                                     ],
                                 )
                         else:
-                            cleanup_cancelled = (
-                                await self._discard_unpublished_initialized_agents(
-                                    [(name, agent)],
-                                    already_withdrawn=(
-                                        withdrawn_after_onboarding_failure
-                                    ),
+                            try:
+                                cleanup_cancelled = (
+                                    await self._discard_unpublished_initialized_agents(
+                                        [(name, agent)],
+                                        already_withdrawn=(
+                                            withdrawn_after_onboarding_failure
+                                        ),
+                                    )
                                 )
-                            )
+                            except BaseException as cleanup_failure:
+                                raise execution_terminal_error(
+                                    onboarding_failure, cleanup_failure,
+                                    retain_originals=True, isolate_control_originals=True,
+                                )
                             if cleanup_cancelled or rollback_cancelled:
-                                raise execution_terminal_error(onboarding_failure, asyncio.CancelledError())
+                                raise execution_terminal_error(
+                                    onboarding_failure, asyncio.CancelledError(),
+                                    retain_originals=True, isolate_control_originals=True,
+                                )
                     else:
                         # The nested load must not close the graph underneath a
                         # signed receipt whose write outcome is ambiguous. The

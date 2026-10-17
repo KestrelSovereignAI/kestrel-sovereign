@@ -8999,6 +8999,7 @@ class ProxyFeature(Feature):
 
         def release(completed_task: _HostOwnedFacadeOperation) -> None:
             self._retain_event_ingress_task_control(completed_task)
+            self._finish_terminal_stop_disposition(completed_task)
             self._terminal_lifecycle_tasks = [
                 candidate
                 for candidate in self._terminal_lifecycle_tasks
@@ -9006,6 +9007,23 @@ class ProxyFeature(Feature):
             ]
 
         task.add_done_callback(release)
+
+    def _finish_terminal_stop_disposition(self, operation: _HostOwnedFacadeOperation) -> None:
+        """Transfer late ORIGINAL stop evidence before dropping its live owner.
+
+        ACK/health operations have no stop marker and cannot manufacture one:
+        their native uncertainty must not forbid a child's first physical stop.
+        """
+        for marker in tuple(self._terminal_stop_completed_client_markers):
+            if marker.operation is not operation:
+                continue
+            source = _consume_late_lifecycle_task_outcome(operation)
+            if is_execution_control_error(source) and execution_denial_scopes(source) != ():
+                marker.failure = source
+                self._terminal_cleanup_uncertain = True
+                self._retain_execution_control(source)
+            else:
+                self._discard_terminal_stop_completion(marker)
 
     def _own_health_probe_task(self, task: _HostOwnedFacadeOperation) -> None:
         """Own one exact health task from creation until its outcome is consumed.
@@ -9205,6 +9223,7 @@ class ProxyFeature(Feature):
                     retained_tasks.append(ownership)
                     continue
                 self._retain_event_ingress_task_control(task)
+                self._finish_terminal_stop_disposition(task)
                 continue
             marked_client = (
                 ownership.client_ref() if ownership.client_ref is not None else None
@@ -9304,7 +9323,10 @@ class ProxyFeature(Feature):
                     # cancellation rather than rewriting it as a stop failure.
                     raise
                 except _FacadeLifecycleOperationTimedOut:
-                    self._discard_terminal_stop_completion(marker)
+                    if marker is None or marker.operation is None or marker.operation.done():
+                        self._discard_terminal_stop_completion(marker)
+                    # A still-live stop keeps THIS exact marker. Its late
+                    # completion transfers native failure before owner removal.
                     logger.error(
                         "Isolated feature %s terminal stop exceeded its bounded "
                         "facade lifecycle budget; the proxy remains sealed for retry",
@@ -9993,16 +10015,19 @@ class ProxyFeature(Feature):
                     finally:
                         self._config_ingress_live_turn_bypass_active = False
 
-                finalizer = asyncio.create_task(
+                finalizer = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation)
+                finalizer.start(
                     finalize(),
                     name=f"isolated-config-ingress-finalize:{self.name}",
                 )
                 try:
-                    await _await_task_until_complete(
-                        finalizer,
-                        preserve_cancellation=body_error is not None,
-                    )
-                except BaseException:  # noqa: BLE001 - preserve body outcome
+                    await finalizer.join()
+                except BaseException as finalizer_error:
+                    if any(is_execution_control_error(error) for error in (body_error, finalizer_error)):
+                        raise execution_terminal_error(
+                            body_error, finalizer_error, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
                     if body_error is None:
                         raise
 
@@ -11844,14 +11869,15 @@ class ProxyFeature(Feature):
                 require_current_client=not inherited.transition_started,
                 require_current_task=True,
             ):
-                task = asyncio.create_task(
+                task = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation)
+                task.start(
                     self._reconcile_client_to_authoritative_config(
                         config,
                         force=force,
                     ),
                     name=f"isolated-config-reconcile-owned:{self.name}",
                 )
-                await _await_task_until_complete(task, preserve_cancellation=False)
+                await task.join()
                 return
             if inherited.active:
                 raise IsolatedRuntimePreparationError(
@@ -11891,14 +11917,21 @@ class ProxyFeature(Feature):
                         )
                 except BaseException as exc:  # noqa: BLE001 - body outcome wins above
                     finalizer_error = exc
-                if finalizer_error is not None and body_error is None:
-                    raise finalizer_error
+                if finalizer_error is not None:
+                    if any(is_execution_control_error(error) for error in (body_error, finalizer_error)):
+                        raise execution_terminal_error(
+                            body_error, finalizer_error, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
+                    if body_error is None:
+                        raise finalizer_error
 
-        task = asyncio.create_task(
+        task = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation)
+        task.start(
             reconcile(),
             name=f"isolated-config-reconcile-fence:{self.name}",
         )
-        await _await_task_until_complete(task, preserve_cancellation=False)
+        await task.join()
 
     def _assert_child_start_allowed(self) -> None:
         """Refuse normal child-lifecycle work after terminal cleanup starts."""

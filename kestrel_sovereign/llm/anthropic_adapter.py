@@ -113,7 +113,7 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
             return cm, stream
 
     async def close_acquired(pair):
-        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
         from kestrel_sovereign.execution_custody import bind_execution_cleanup
         from kestrel_sovereign.execution_custody import execution_terminal_error
 
@@ -122,19 +122,29 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
         async def owned_close():
             with bind_execution_cleanup(None):
                 await pair[0].__aexit__(None, None, None)
+        admission = OwnedTaskAdmission()
+        opening = None
         try:
             task = create_owned_task(
                 owned_close(), retirement_resource=pair[1], retain_originals=True,
+                admission=admission,
             )
         except BaseException as admission_error:
-            raise execution_terminal_error(
-                original, admission_error,
-                retain_originals=True, isolate_control_originals=True,
-            )
+            opening = admission_error
+            task = admission.task
+            if task is None:
+                raise execution_terminal_error(
+                    original, opening,
+                    retain_originals=True, isolate_control_originals=True,
+                )
         outcome = await await_owned_task(task)
-        if outcome.error is not None or outcome.cancellation is not None:
+        retirement = None
+        if outcome.error is not None:
+            retirement = RuntimeError("original Anthropic context retirement failed")
+            retirement._kestrel_native_retirement_debts = ((pair[1], task),)
+        if opening is not None or outcome.error is not None or outcome.cancellation is not None:
             raise execution_terminal_error(
-                original, outcome.error, outcome.cancellation,
+                original, opening, outcome.error, retirement, outcome.cancellation,
                 retain_originals=True, isolate_control_originals=True,
             )
 
