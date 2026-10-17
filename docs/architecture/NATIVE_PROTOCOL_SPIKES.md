@@ -48,11 +48,11 @@ retain indefinitely.
 | kestrel-channel-whatsapp | 0.2.2 | SDK >=0.23.0,<1 |
 | kestrel-channel-telegram | 0.1.8 | SDK >=0.36,<0.40 |
 | kestrel-feature-workflows | 0.7.2 | SDK >=0.36.0,<1 |
-| kestrel-feature-talon | 0.2.13 | SDK >=0.37.1,<0.40; FastAPI >=0.115,<1 |
+| kestrel-feature-talon | 0.2.13 | SDK >=0.37.1,<0.40; core >=0.53.20,<0.54.0; FastAPI >=0.115,<1 |
 | kestrel-claws | editable 0.4.3 | SDK >=0.37.1,<0.40; core >=0.53.9 |
 | kestrel-feature-eye | editable 0.4.4 | SDK >=0.37.1,<0.40; FastAPI >=0.115,<1; workflows >=0.5.0,<0.8 |
 | kestrel-feature-flight | editable 0.4.3 | SDK >=0.37.1,<0.40; FastAPI >=0.115,<1; workflows >=0.7.0,<0.8 |
-| kestrel-feature-features | 0.3.2 | SDK >=0.36.0,<0.40 |
+| kestrel-feature-features | 0.3.2 | SDK >=0.36.0,<0.40; core >=0.53.4,<0.54 |
 | kestrel-feature-mcp | 0.4.1 | MCP >=1.26.0,<2; SDK >=0.10,<1 |
 | kestrel-feature-observability[fleet] | 0.17.15 | SDK >=0.38.1,<1 |
 | arize-phoenix | 20.23.0 | FastAPI >=0.137.0; Pydantic AI >=2.53.0,<3; fastmcp-slim[client,server] >=4,<5 |
@@ -161,9 +161,24 @@ or consent grant should be added to this document. Console UX selection remains
 gated on this experiment; the user has been asked for test accounts and the
 public metadata destination.
 
+## Docker gateway premise failure
+
+Measured the native client against a real Docker container: nine tools were
+listed and `add(4, 5)` returned 9. The same client against Docker MCP Gateway
+v0.44.1 returned HTTP 400: unsupported protocol version, with supported revisions
+ending at `2025-11-25`. Version 0.44.1 was the newest published gateway release
+when checked (all upstream releases are marked prerelease). This is recorded
+with reproduction in [#3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683).
+The operator has been asked whether to retire that mode, leave it unavailable
+or expand scope to upgrade upstream. No older-protocol fallback was added.
+
 ## Open release gates
 
 - Complete the OAuth acceptance experiment above.
+- Resolve the Docker gateway scope decision in #3683.
+- Before the breaking A2A core/SDK release, update Talon/Features core ceilings
+  and the SDK ceilings of Telegram/Talon/Features/Claws/Eye/Flight. Test their
+  actual callers with the new interfaces before raising the host floor.
 - Resolve and test the whole host manifest after coordinated package changes.
 - Complete full-diff worktree review before each PR; record the final verdict.
 - Implement/run both protocol conformance suites and real interop acceptance.

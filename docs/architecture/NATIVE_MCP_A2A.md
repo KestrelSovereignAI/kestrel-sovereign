@@ -38,7 +38,7 @@ caps are subject to migration, not reasons to downgrade the protocol target.
 | `kestrel-sovereign-sdk` | Remove draft wire models; shared host/feature credential and typed-part contracts; update all consumers |
 | Host manifest packages | Survey published constraints and editable sources; release incompatible consumers before the host floor moves |
 
-Core's `a2a/types.py` and `a2a/agent_card.py` are re-exports. The actual
+Core's `kestrel_sovereign/a2a/types.py` and `kestrel_sovereign/a2a/agent_card.py` are re-exports. The actual
 handwritten models are in `kestrel_sdk/a2a/`. Removing only the core files
 would leave the private wire intact. Inventory both namespaces and their
 consumers before the coordinated SDK/core release. Keep the SDK lightweight:
@@ -70,7 +70,7 @@ manually serialize `_meta`, call `initialize`, retain `Mcp-Session-Id`, or
 silently negotiate the draft protocol. Test captured HTTP requests to establish
 that this is the protocol actually sent. Gateway/container releases must pass
 the same modern-protocol test before their upgrade ships. Capture and assert the
-SDK's required `Mcp-Method` and tool/resource-specific `Mcp-Name` headers.
+SDK's required `Mcp-Method` and tool/resource/prompt-specific `Mcp-Name` headers.
 Retire the removed `notifications/initialized`, `ping`, `logging/setLevel`,
 `notifications/roots/list_changed`, resource subscribe/unsubscribe, standalone
 HTTP GET stream and SSE resumption (`Last-Event-ID`/event IDs). New subscriptions
@@ -115,12 +115,32 @@ checks apply to error callbacks before trusting or displaying error details.
 
 ### Credential storage and connect UI
 
-Reuse `security/service_key_storage.py::ServiceKeyStorage`, whose storage is
-already agent-scoped and encrypted through `security/agent_encryption.py`.
-Do not use the host/user/sponsor master-key stores for per-agent tokens, and
-do not invent a plaintext token file. Extend this credential service with a
-typed bundle and atomic generation check for refresh-token rotation; the MCP
-feature sees a host-provided protocol rather than importing core.
+Reuse the host credential subsystem's agent-derived encryption and database
+ownership, surveyed in `kestrel_sovereign/security/service_key_storage.py` and
+`kestrel_sovereign/security/agent_encryption.py`. Its existing API-key
+`ServiceKeyStorage.store_key` is insert-only: replacing a live key belongs to
+`kestrel_sovereign/features/keys/feature.py::rotate_service_key` and requires
+constitutional approval (F196). OAuth refresh must not bypass that contract.
+
+Add a typed OAuth credential capability in this subsystem, with separate
+`agent_oauth_grants` and `agent_oauth_credentials` rows. Reuse the existing
+agent encryption implementation with an OAuth-specific purpose; extract common
+encrypted persistence mechanics if needed, without cloning crypto or changing
+API-key write policy. Do not use host/user/sponsor master-key stores or
+plaintext token files. The feature consumes a host-provided credential protocol
+and cannot call an unrestricted `store_key(replace=True)` endpoint.
+
+The authenticated connect flow creates a durable, scoped grant only after the
+operator authorizes that agent, client identity, issuer, resource and scopes.
+Token refresh is an operation authorized by that existing grant: atomically
+compare the stored generation, verify that the grant remains active, and rotate
+only that connection's encrypted token bundle. Refresh cannot widen scopes,
+change the bound identities/resource or replace an API key. Disconnect revokes
+the grant and removes its tokens atomically. The host checks the durable grant;
+a caller-supplied grant ID or causation claim confers no authority. Test forged,
+wrong-agent, revoked and racing-refresh grants alongside the existing F196
+API-key tests. This keeps unattended refresh possible without an approval prompt
+for every access-token expiry and keeps API-key replacement approval intact.
 
 Key the connection by agent DID, canonical resource, authorization issuer and
 client identity. Store access/refresh tokens, expiry and granted scopes in the
@@ -180,19 +200,28 @@ checks as the original call. Cancellation does not invent a completed result.
 MCP's Multi Round-Trip Requests (MRTR) are core protocol, independent of the
 Tasks extension. A normal tool/resource/prompt request can return
 `InputRequiredResult` with `resultType: "input_required"`, `inputRequests` and
-opaque `requestState`. Persist a pending continuation only when the turn has
-an interactive operator. Release the turn lock before receiving the response;
-a new owned continuation reissues the **original operation** with the SDK's
-`inputResponses` and unchanged opaque `requestState`. Preserve request binding,
-expiry and the SDK's round limit. Results without `resultType` are treated as
-`complete` by the SDK as required; do not reinterpret them as pending input.
+opaque `requestState`. Classify what input is actually needed. When there are
+no `inputRequests`, the SDK may immediately reissue the original operation with
+the unchanged state, under the same deadline/round limit; no operator or pending
+approval is needed. Likewise, machine-handled inputs do not become human waits.
+This host does not advertise the deprecated roots or sampling capabilities, so
+conformant servers must not request them; unsolicited unsupported requests fail
+with the SDK's capability error rather than fabricated operator input.
 
-Signal-driven turns and `NON_INTERACTIVE_SESSION_IDS` keep the shipped #3439
-behavior: `allow_blocking=False` and an auditable `no_approver` denial. They do
-not create an indefinite human wait or acquire interactive authority through a
-continuation. For interactive input, reject stale/wrong-agent/wrong-operation
-responses; never persist secrets as conversation content. Exercise both paths
-against the real turn scheduler, including #3439's lock-contention scenario.
+Only an input request that actually requires an operator uses a pending human
+continuation. On an interactive turn, release the turn lock before receiving
+the response. A new owned continuation reissues the **original operation** with
+the SDK's `inputResponses` and unchanged opaque `requestState`. Preserve request
+binding, expiry and the round limit. Results without `resultType` are treated
+as `complete` by the SDK as required; do not reinterpret them as pending input.
+
+For operator-required input, signal-driven turns and
+`NON_INTERACTIVE_SESSION_IDS` keep the shipped #3439 behavior:
+`allow_blocking=False` and an auditable `no_approver` denial. This does not deny
+state-only MRTR retries. Unattended turns do not acquire interactive authority
+through a continuation. Reject stale/wrong-agent/wrong-operation human responses
+and keep secrets out of conversations. Exercise state-only and operator-required
+paths against the real turn scheduler, including #3439's lock-contention case.
 
 ## A2A 1.0 cutover
 
@@ -206,7 +235,7 @@ signed card at the standard authority-root `/.well-known/agent-card.json`.
 Other per-agent public cards are reached by **direct configuration**, at
 `/api/agent-routes/{encoded_routing_name}/agent-card.json`; these nested URLs are
 not called well-known discovery. Encode the manager's registration key using
-`multi_agent/route_name.py::encode_agent_route_name`. `agent.agent_id` is a DID,
+`kestrel_sovereign/multi_agent/route_name.py::encode_agent_route_name`. `agent.agent_id` is a DID,
 and a mutable display name is also unsuitable for routing.
 
 Both bindings use the manager's stable routing key to select the agent. The
@@ -299,7 +328,7 @@ an explicitly provisioned principal and a compatible card policy.
 
 Carry question ID, reply expectation and answer reference in extension
 metadata. Use core task/context/message identifiers for transport identity.
-Retain `async_pending_a2a_question_store.py`, recipient binding and
+Retain `kestrel_sovereign/storage/async_pending_a2a_question_store.py`, recipient binding and
 `a2a_question_answered` wake behavior. Duplicate, unsolicited and wrong-peer
 answers cannot satisfy another agent's pending wait.
 
@@ -343,10 +372,17 @@ changes). Signing a card does not authorize arbitrary callback egress.
    feature 0.4.1's `mcp<2` cannot resolve with Phoenix 20's FastMCP dependency.
    Stage and test both changes together from worktrees, then release feature
    before host. Resolve the full host feature manifest before host release.
+   Docker gateway native support is currently blocked by [#3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683);
+   the latest published gateway rejects the target protocol. Its retirement or
+   upstream upgrade requires a scope decision, never a protocol downgrade.
 3. Add remote connections/OAuth/registry, then Apps and Tasks. Remote write
    scopes remain gated on [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
-4. Release the coordinated SDK/core A2A cutover with storage migration and
-   every consumer updated. Run both A2A bindings through the TCK and a
+4. Before the breaking A2A core/SDK release, publish/test consumers admitting
+   the new floors: Talon 0.2.13 and Features 0.3.2 currently cap core below
+   0.54. Telegram, Talon, Features and editable Claws/Eye/Flight also cap SDK
+   below 0.40. Update their constraints and actual callers; do not weaken the
+   new core/SDK floor. Then release the coordinated SDK/core A2A cutover with
+   storage migration and every consumer updated. Run both A2A bindings through the TCK and a
    different-framework bidirectional task/card-verification exercise.
 5. Implement the server direction under [#1990](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1990),
    reusing MCP 2.x, per-agent routing, protected-resource metadata, credential
