@@ -22,16 +22,47 @@ from tests.integration.test_execution_custody_review30_pg import lose_ack
 from tests.unit.test_execution_custody_review35_native import traceback_size
 
 
+async def registered_cleanup_component(manager, schema, tmp_path, monkeypatch):
+    """Actual constructor/storage component; never born/initialized/READY."""
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+    from tests.utils.postgres_schema import with_search_path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+    (tmp_path / "kestrel.toml").write_text('[llm]\nroute_priority = []\n[llm.vendors]\n', encoding="utf-8")
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    backend = PostgresBackend(dsn=with_search_path(os.environ["TEST_POSTGRES_URL"], schema),
+                              min_pool_size=0, max_pool_size=2, advisory_max_pool_size=1)
+    await backend.connect()
+    db = AsyncDatabase(backend)
+    service = LLMService(usage_db=db)
+    assert not service.providers
+    child = KestrelAgent(did="did:test:refund-component", storage_path=str(tmp_path / "unborn.db"), llm_service=service)
+    storage = AsyncStorage(backend=backend)
+    storage.db = db
+    child.storage = child._raw_storage = storage
+    assert not child._runtime_publication_ready.is_set()
+    manager._agents["child"] = child
+    manager._agent_names[child.did] = "child"
+    return child, db
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["join", "completed", "remove", "registered-component", "drain", "drain-live", "drain-waiter", "drain-quarantine", "fleet-waiter", "drain-quarantine-unseal-refusal", "remove-reconcile", "registered-component-reconcile"])
+@pytest.mark.parametrize("route", ["join", "completed", "remove", "registered-component", "drain", "drain-live", "drain-waiter", "drain-quarantine", "fleet-waiter", "drain-quarantine-unseal-refusal", "remove-reconcile", "registered-component-reconcile", "registered-component-completion-observer"])
 @pytest.mark.parametrize("source_cancel", [False, True])
 @pytest.mark.parametrize("caller_cancel", [False, True])
 async def test_original_native_refund_survives_join_callback_and_terminal_drain(
     native_pg, tmp_path, monkeypatch, route, source_cancel, caller_cancel,
 ):
     backend, observer, schema = native_pg
-    removal_route = route.removesuffix("-reconcile")
+    removal_route = "registered-component" if route.startswith("registered-component-") else route.removesuffix("-reconcile")
     reconcile_route = route.endswith("-reconcile")
+    earlier_observer_route = route.endswith("-observer")
     drain_route = ("drain-waiter" if route == "fleet-waiter" else
                    "drain-quarantine" if route == "drain-quarantine-unseal-refusal" else route)
     entered, release = asyncio.Event(), asyncio.Event()
@@ -71,6 +102,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
     drain_join = asyncio.Event()
     drain_waiter = asyncio.Event()
     reconcile_join = asyncio.Event()
+    completion_entered, completion_release = asyncio.Event(), asyncio.Event()
     reconcile_lock_owned = False
     competing_drains = []
     withdrawals = []
@@ -90,7 +122,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             return previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
 
         loop.set_task_factory(refuse_unseal)
-    if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"} or reconcile_route:
+    if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"} or reconcile_route or earlier_observer_route:
         from kestrel_sovereign.multi_agent import agent_manager as manager_module
         from kestrel_sovereign import _async_ownership as ownership_module
 
@@ -132,34 +164,31 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
         monkeypatch.setattr(manager, "_acquire_quarantined_shutdown_drain", observed_acquire)
     child = child_db = None
     if removal_route == "registered-component":
-        from kestrel_sovereign.kestrel_agent import KestrelAgent
-        from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
-        from kestrel_sovereign.storage.async_storage import AsyncStorage
-        from kestrel_sovereign.storage.db.postgres import PostgresBackend
-        from tests.utils.postgres_schema import with_search_path
+        child, child_db = await registered_cleanup_component(manager, schema, tmp_path, monkeypatch)
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("PROJECT_DIR", str(tmp_path))
-        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
-        (tmp_path / "kestrel.toml").write_text('[llm]\nroute_priority = []\n[llm.vendors]\n', encoding="utf-8")
-        # A declared empty installation inventory, not a substituted provider.
-        monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
-        child_backend = PostgresBackend(dsn=with_search_path(os.environ["TEST_POSTGRES_URL"], schema),
-                                        min_pool_size=0, max_pool_size=2, advisory_max_pool_size=1)
-        await child_backend.connect()
-        child_db = AsyncDatabase(child_backend)
-        service = LLMService(usage_db=child_db)
-        assert not service.providers
-        child = KestrelAgent(did="did:test:refund-component", storage_path=str(tmp_path / "unborn.db"), llm_service=service)
-        storage = AsyncStorage(backend=child_backend)
-        storage.db = child_db
-        child.storage = child._raw_storage = storage
-        # Inject only this cleanup component's map slot. It was NOT incepted,
-        # initialized, authenticated or marked READY by this fixture.
-        assert not child._runtime_publication_ready.is_set()
-        manager._agents["child"] = child
-        manager._agent_names[child.did] = "child"
+    task = None
+    if earlier_observer_route:
+        shutdown_tasks = []
+
+        def observe_shutdown(loop, coroutine, **kwargs):
+            code = getattr(coroutine, "cr_code", None)
+            child_task = previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
+            if code is not None and code.co_qualname == "KestrelAgent.shutdown":
+                shutdown_tasks.append(child_task)
+            return child_task
+
+        loop.set_task_factory(observe_shutdown)
+        actual_completion = child.wait_for_shutdown_completion
+
+        async def held_completion():
+            if asyncio.current_task() not in shutdown_tasks:
+                # Delay only the manager's separate completion observer, not
+                # the real shutdown's own internal native completion join.
+                completion_entered.set()
+                await completion_release.wait()
+            return await actual_completion()
+
+        monkeypatch.setattr(child, "wait_for_shutdown_completion", held_completion)
 
     async def consume():
         with bind_execution_custody(GenerationFence()):
@@ -181,11 +210,15 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
                 return await manager.drain_quarantined_shutdowns()
             return await manager._await_child_budget_release_cancellation_safe(record.task)
 
-    task = None
     try:
         with monkeypatch.context() as ack:
             lose_ack(ack, cancelled=False, entered=entered, release=release)
             task = create_owned_task(consume(), retain_originals=True)
+            if earlier_observer_route:
+                await asyncio.wait_for(completion_entered.wait(), 5)
+                if route == "registered-component-completion-observer" and caller_cancel:
+                    task.cancel("actual earlier removal observer withdrawal")
+                completion_release.set()
             await asyncio.wait_for(entered.wait(), 5)
             assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=184') == 1
             if removal_route in {"remove", "registered-component"}:
@@ -199,7 +232,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
                 reconcile_lock_owned = True
                 release.set()
                 await asyncio.wait_for(reconcile_join.wait(), 5)
-            if caller_cancel:
+            if caller_cancel and not earlier_observer_route:
                 task.cancel("actual refund caller withdrawal")
             release.set()
             if reconcile_lock_owned:
@@ -216,9 +249,10 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             import inspect
             assert refused and refusal in tuple(_explicit_control_chain(outcome.error))
             assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
-        if (drain_route in {"drain-live", "drain-waiter", "drain-quarantine"} or reconcile_route) and caller_cancel:
+        if (drain_route in {"drain-live", "drain-waiter", "drain-quarantine"} or reconcile_route or earlier_observer_route) and caller_cancel:
             chain = tuple(_explicit_control_chain(outcome.error))
-            assert any(isinstance(error, asyncio.CancelledError) and error.args == ("actual refund caller withdrawal",)
+            message = "actual earlier removal observer withdrawal" if earlier_observer_route else "actual refund caller withdrawal"
+            assert any(isinstance(error, asyncio.CancelledError) and error.args == (message,)
                        for error in chain), "live terminal refund drain lost its actual caller withdrawal"
             assert len(withdrawals) == 1 and withdrawals[0] in chain
             assert withdrawals[0] not in tuple(_explicit_control_chain(manager._quarantined_shutdown_control)), "finite drain withdrawal leaked into shared source latch"
@@ -260,6 +294,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=184') == 1
     finally:
         loop.set_task_factory(previous_factory)
+        completion_release.set()
         if reconcile_lock_owned:
             manager._lock.release()
         for pair in refused:
@@ -276,3 +311,194 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             await child.shutdown()
         if child_db is not None:
             await child_db.close()
+
+
+@pytest.mark.asyncio
+async def test_real_shutdown_observer_withdrawal_is_not_reconstructed(native_pg, tmp_path, monkeypatch):
+    _backend, observer, schema = native_pg
+    manager = AgentManager(base_data_dir=tmp_path)
+    child, db = await registered_cleanup_component(manager, schema, tmp_path, monkeypatch)
+    actual_wait_for = asyncio.wait_for
+    withdrawals = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    actual_close = db.close
+    owner = None
+
+    async def close():
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            await actual_close()
+
+    async def wait_for(awaitable, *args, **kwargs):
+        try:
+            return await actual_wait_for(awaitable, *args, **kwargs)
+        except asyncio.CancelledError as cancellation:
+            if asyncio.current_task() is owner:
+                withdrawals.append(cancellation)
+            raise
+
+    try:
+        monkeypatch.setattr(asyncio, "wait_for", wait_for)
+        monkeypatch.setattr(db, "close", close)
+        owner = create_owned_task(manager.remove_agent("child", offboard_runtime=False), retain_originals=True)
+        await asyncio.wait_for(entered.wait(), 5)
+        assert not owner.done() and db.backend.is_connected
+        owner.cancel("actual original shutdown wait_for observer withdrawal")
+        release.set()
+        outcome = await await_owned_task(owner)
+        assert len(withdrawals) == 1 and outcome.error is withdrawals[0], "removal replaced the actual shutdown observer withdrawal"
+        await manager.drain_quarantined_shutdowns()
+        assert not db.backend.is_connected and manager.get_agent("child") is None
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0
+    finally:
+        release.set()
+        if owner is not None:
+            await await_owned_task(owner)
+        await manager.drain_quarantined_shutdowns()
+        try:
+            # Rejoining an already-cancelled shutdown replays its retained
+            # control. Collect that terminal result without bypassing the
+            # independent fixture database retirement below.
+            await await_owned_task(create_owned_task(
+                child.shutdown(), retain_originals=True,
+            ))
+        finally:
+            await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller_cancel", [False, True])
+async def test_completion_join_keeps_prior_native_receipt_and_original_close_failure(
+    native_pg, tmp_path, monkeypatch, caller_cancel,
+):
+    from kestrel_sovereign import _async_ownership as ownership
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+    from kestrel_sovereign.kestrel_agent import await_agent_shutdown_completion
+
+    backend, observer, schema = native_pg
+    manager = AgentManager(base_data_dir=tmp_path)
+    child, database = await registered_cleanup_component(manager, schema, tmp_path, monkeypatch)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def effect():
+        with bind_execution_custody(GenerationFence()):
+            await backend.execute("INSERT INTO effects VALUES (195, 'prior completion receipt')")
+
+    with monkeypatch.context() as ack:
+        lose_ack(ack, cancelled=False, entered=entered, release=release)
+        source = create_owned_task(effect(), retain_originals=True)
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            release.set()
+            original = (await await_owned_task(source)).error
+        finally:
+            release.set()
+            await await_owned_task(source)
+    assert original is not None and execution_commit_outcome(original) == "unknown"
+    graph, debts = tuple(_explicit_control_chain(original)), tuple(execution_cleanup_debts(original))
+    actual_wait, actual_close = child.wait_for_shutdown_completion, database.backend.close
+    actual_join = ownership.await_owned_task
+    close_entered, close_release = asyncio.Event(), asyncio.Event()
+    close_ack = OSError("actual completed native close acknowledgement lost")
+    withdrawals, owner = [], None
+
+    async def close():
+        close_entered.set()
+        await close_release.wait()
+        await actual_close()
+        raise close_ack
+
+    async def completion():
+        # Transparent completion component: real agent waiter, then its real
+        # database closer. No Agent initialization/READY is manufactured.
+        await actual_wait()
+        await database.close()
+
+    async def join(task, *args, **kwargs):
+        outcome = await actual_join(task, *args, **kwargs)
+        if asyncio.current_task() is owner and outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+        return outcome
+
+    try:
+        monkeypatch.setattr(database.backend, "close", close)
+        monkeypatch.setattr(child, "wait_for_shutdown_completion", completion)
+        monkeypatch.setattr(ownership, "await_owned_task", join)
+        owner = create_owned_task(await_agent_shutdown_completion(child, prior_error=original), retain_originals=True)
+        await asyncio.wait_for(close_entered.wait(), 5)
+        if caller_cancel:
+            owner.cancel("actual completion observer withdrawal beside prior receipt")
+        close_release.set()
+        outcome = await actual_join(owner)
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert original in chain and close_ack in chain, "completion join dropped an independent original close failure"
+        assert execution_commit_outcome(outcome.error) == "unknown"
+        assert tuple(_explicit_control_chain(original)) == graph
+        assert tuple(execution_cleanup_debts(original)) == debts, "completion join mutated shared native receipt debt"
+        assert bool(withdrawals) is caller_cancel and all(error in chain for error in withdrawals)
+        assert not database.backend.is_connected
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=195') == 1
+    finally:
+        close_release.set()
+        if owner is not None:
+            await actual_join(owner)
+        monkeypatch.setattr(child, "wait_for_shutdown_completion", actual_wait)
+        monkeypatch.setattr(database.backend, "close", actual_close)
+        await await_owned_task(create_owned_task(child.shutdown(), retain_originals=True))
+        await actual_close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_native_offboarding_preserves_its_actual_observer(tmp_path, monkeypatch):
+    import threading
+    from kestrel_sovereign.features.isolated_runtime import RuntimeNamespaceCleanupOutcome
+    from kestrel_sovereign.multi_agent.agent_manager import InflightRuntimeOffboarding
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    artifact = tmp_path / "fixture-owned-offboarding"
+    artifact.write_text("fixture-owned cleanup", encoding="utf-8")
+    entered, release = threading.Event(), threading.Event()
+    actual_wait = asyncio.wait
+    withdrawals = []
+    observing = asyncio.Event()
+    owner = None
+
+    def remove():
+        entered.set()
+        assert release.wait(5)
+        artifact.unlink()
+        return RuntimeNamespaceCleanupOutcome.REMOVED
+
+    async def wait(*args, **kwargs):
+        if asyncio.current_task() is owner:
+            observing.set()
+        try:
+            return await actual_wait(*args, **kwargs)
+        except asyncio.CancelledError as cancellation:
+            if asyncio.current_task() is owner:
+                withdrawals.append(cancellation)
+            raise
+
+    worker = create_owned_task(asyncio.to_thread(remove), retain_originals=True)
+    record = InflightRuntimeOffboarding("fixture-child", "did:test:fixture-offboarding", artifact, worker)
+    try:
+        monkeypatch.setattr(asyncio, "wait", wait)
+        owner = create_owned_task(manager._finish_agent_runtime_offboarding(record, cancellation_already_observed=False), retain_originals=True)
+        async with asyncio.timeout(5):
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+        await asyncio.wait_for(observing.wait(), 5)
+        owner.cancel("actual bounded offboarding observer withdrawal")
+        outcome = await await_owned_task(owner)
+        assert outcome.error is None
+        cancelled, failure = outcome.result
+        assert cancelled and failure.cleanup_pending and not worker.done() and artifact.exists()
+        assert len(withdrawals) == 1 and withdrawals[0] in tuple(_explicit_control_chain(failure)), "offboarding metadata discarded actual observer withdrawal"
+    finally:
+        release.set()
+        if owner is not None:
+            await await_owned_task(owner)
+        await await_owned_task(worker)
+        await manager.drain_quarantined_shutdowns()

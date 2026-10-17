@@ -8970,11 +8970,15 @@ class AgentManager:
             done, _ = await asyncio.wait(
                 {record.task}, timeout=RUNTIME_OFFBOARD_TIMEOUT_S
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as withdrawal:
             self._retain_timed_out_runtime_offboarding(record)
-            return True, retained(
+            pending = retained(
                 RuntimeError("runtime offboarding continues after cancellation"),
                 cleanup_pending=True,
+            )
+            return True, execution_terminal_error(
+                pending, withdrawal,
+                retain_originals=True, isolate_control_originals=True,
             )
 
         if not done:
@@ -9713,6 +9717,7 @@ class AgentManager:
         # still refund the hold.  Treat it as a completed removal rather than
         # silently retaining money because there is no routing entry.
         ordinary_budget_release: Optional[InflightRemovalBudgetRelease] = None
+        removal_withdrawals: list[BaseException] = []
         handoff_offboarding_pending: Optional[
             RuntimeOffboardingRetainedError
         ] = None
@@ -9771,7 +9776,7 @@ class AgentManager:
             try:
                 release_cancelled = (
                     await self._await_child_budget_release_cancellation_safe(
-                        ordinary_budget_release.task
+                        ordinary_budget_release.task, withdrawals=removal_withdrawals,
                     )
                 )
             except BaseException as error:
@@ -9781,7 +9786,7 @@ class AgentManager:
                 release_cancelled = _contains_lifecycle_cancellation(error)
             reconciliation_cancelled = False
             reconciliation_failure = None
-            reconciliation_withdrawals: list[BaseException] = []
+            reconciliation_withdrawals = removal_withdrawals
             try:
                 reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking(
                     withdrawals=reconciliation_withdrawals,
@@ -9832,8 +9837,10 @@ class AgentManager:
                 await asyncio.wait_for(
                     asyncio.shield(shutdown_task), timeout=SHUTDOWN_TIMEOUT
                 )
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as withdrawal:
                 caller_cancelled = asyncio.current_task().cancelling() > 0
+                if caller_cancelled:
+                    removal_withdrawals.append(withdrawal)
                 if not shutdown_task.done():
                     shutdown_task.cancel()
                 shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
@@ -9934,25 +9941,40 @@ class AgentManager:
                     exc_info=True,
                 )
                 try:
-                    await await_agent_shutdown_completion(agent, prior_error=exc)
+                    await await_agent_shutdown_completion(
+                        agent, prior_error=exc, withdrawals=removal_withdrawals,
+                    )
                 except BaseException as terminal:
                     if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
                         raise
+                    if removal_withdrawals:
+                        raise execution_terminal_error(
+                            terminal, *removal_withdrawals, retain_originals=True,
+                            prefer_cancellation=True, isolate_control_originals=True,
+                        )
                 return False
 
             if not shutdown_handed_off:
                 (
                     join_cancelled,
                     shutdown_failure,
-                ) = await await_lifecycle_task_completion(shutdown_task)
+                ) = await await_lifecycle_task_completion(
+                    shutdown_task, withdrawals=removal_withdrawals,
+                )
                 caller_cancelled = caller_cancelled or join_cancelled
                 try:
                     caller_cancelled = await await_agent_shutdown_completion(
                         agent, prior_error=shutdown_failure,
+                        withdrawals=removal_withdrawals,
                     ) or caller_cancelled
                 except BaseException as terminal:
                     if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
                         raise
+                    if removal_withdrawals:
+                        raise execution_terminal_error(
+                            terminal, *removal_withdrawals, retain_originals=True,
+                            prefer_cancellation=True, isolate_control_originals=True,
+                        )
                     logger.warning(
                         "Agent '%s' shutdown task failed; retaining it until "
                         "cleanup can be confirmed: %s",
@@ -10052,7 +10074,7 @@ class AgentManager:
             try:
                 release_cancelled = (
                     await self._await_child_budget_release_cancellation_safe(
-                        ordinary_budget_release.task
+                        ordinary_budget_release.task, withdrawals=removal_withdrawals,
                     )
                 )
             except BaseException as exc:
@@ -10073,7 +10095,7 @@ class AgentManager:
         # pruning predicate treats its live reaper as authoritative ownership.
         reconciliation_cancelled = False
         reconciliation_failure = None
-        reconciliation_withdrawals = []
+        reconciliation_withdrawals = removal_withdrawals
         try:
             reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking(
                 withdrawals=reconciliation_withdrawals,
@@ -10984,17 +11006,22 @@ class AgentManager:
         return record
 
     async def _await_child_budget_release_cancellation_safe(
-        self, budget_release: "asyncio.Future[object]"
+        self, budget_release: "asyncio.Future[object]", *,
+        withdrawals: Optional[list[BaseException]] = None,
     ) -> bool:
         """Join one admitted budget release before reporting cancellation."""
 
         caller = asyncio.current_task()
         release_cancelled = bool(caller is not None and caller.cancelling())
         outcome = await await_owned_task(budget_release)
+        if withdrawals is not None and outcome.cancellation is not None:
+            if all(prior is not outcome.cancellation for prior in withdrawals):
+                withdrawals.append(outcome.cancellation)
         release_cancelled = release_cancelled or outcome.cancellation is not None
         terminal = execution_terminal_error(
             outcome.error, outcome.cancellation,
             self._quarantined_shutdown_control,
+            *(withdrawals or ()),
             retain_originals=True, prefer_cancellation=True,
             isolate_control_originals=True,
         )
@@ -11003,7 +11030,7 @@ class AgentManager:
         # Ordinary availability preserves the historical cancellation-wins
         # contract. Native control above retains both actual original carriers.
         if release_cancelled:
-            if outcome.cancellation is not None:
+            if outcome.cancellation is not None or withdrawals:
                 raise terminal
             raise asyncio.CancelledError() from terminal
         if terminal is not None:

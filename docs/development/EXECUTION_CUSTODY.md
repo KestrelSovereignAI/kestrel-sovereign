@@ -1642,6 +1642,15 @@ tracking reconciliation, not just through the preceding refund. Both unpublished
 holds and registered cleanup components retain the native refund receipt and
 the actual cancellation from that later join. The finite isolated carrier does
 not write the caller's withdrawal into the manager's shared unsafe-refund latch.
+The same caller-local collection spans the earlier shutdown/completion joins
+and the intervening refund observer, including an already-observed withdrawal.
+Bounded offboarding retains its actual observer in the pending cleanup carrier;
+its worker remains manager-owned and public metadata remains sanitized.
+The durable tail recognizes the canonical native database behind storage, not
+its SQLite-specific close reservation. PostgreSQL close and optional engine
+pre-close retain their original owner through observer withdrawal too. If the
+one tail deadline expires, existing retirement debt retains that exact resource
+and Task; Python coroutine-frame closure is not physical database retirement.
 
 Auxiliary inception SQLite connections use the canonical owned database closer
 with the active publication or inspection error. Refused admission retains the
@@ -1650,6 +1659,16 @@ composition leaves shared operational receipts unchanged. A failed publication
 readback cannot discard native execution control or cancellation; artifacts
 remain retained unless physical absence was established. These component tests
 do not certify successful genesis, provider acceptance or READY.
+Auxiliary transaction rollback also retains original body and observer evidence
+before the close phase begins; a later successful close cannot reconstruct a
+withdrawal that an earlier rollback discarded.
+
+Replacement-birth directory custody is not provider-dependent. Database
+initialization may fail before returning a handle, and local authority/archive
+connections can fail to retire beside a caller-owned PostgreSQL target. The
+same inception retirement owner retains those exact owned database resources
+and the original OS directory lock. Explicit reconciliation retires owned
+databases before releasing that lock; it never adopts the borrowed target.
 
 ### Delivery descendant shutdown
 

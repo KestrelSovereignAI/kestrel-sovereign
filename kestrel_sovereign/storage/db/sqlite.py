@@ -1960,7 +1960,10 @@ class SQLiteBackend(DatabaseBackend):
             await conn.rollback()
         except asyncio.CancelledError as cleanup_error:
             self._handoff_cancelled_write(conn)
-            terminal = execution_terminal_error(error, cleanup_error)
+            terminal = execution_terminal_error(
+                error, cleanup_error,
+                retain_originals=True, isolate_control_originals=True,
+            )
             if terminal is not cleanup_error:
                 # The selected error can itself be a legacy QueryError whose
                 # explicit cause carries authority/COMMIT evidence. Keep that
@@ -1968,7 +1971,10 @@ class SQLiteBackend(DatabaseBackend):
                 raise terminal
             raise
         except BaseException as cleanup_error:
-            terminal = execution_terminal_error(error, cleanup_error)
+            terminal = execution_terminal_error(
+                error, cleanup_error,
+                retain_originals=True, isolate_control_originals=True,
+            )
             if terminal is not cleanup_error:
                 raise terminal
             raise

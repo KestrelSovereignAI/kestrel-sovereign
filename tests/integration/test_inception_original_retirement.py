@@ -24,7 +24,7 @@ from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["refused", "close-ack", "withdrawal"])
+@pytest.mark.parametrize("mode", ["refused", "close-ack", "withdrawal", "rollback-withdrawal"])
 async def test_original_publication_control_survives_local_authority_retirement(
     native_pg, tmp_path, monkeypatch, mode,
 ):
@@ -40,6 +40,7 @@ async def test_original_publication_control_survives_local_authority_retirement(
     actual_sqlite, actual_transaction = AsyncDatabase.sqlite, backend.transaction
     actual_join = ownership_module.await_owned_task
     opened, originals, graphs, close_tasks, withdrawals, refused = [], [], [], [], [], []
+    rollback_withdrawals = []
     entered, release = asyncio.Event(), asyncio.Event()
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     allocation = RuntimeError("actual local authority closer admission refused")
@@ -61,6 +62,19 @@ async def test_original_publication_control_survives_local_authority_retirement(
         db = await actual_sqlite(*args, **kwargs)
         connection, close = db.backend._connection, db.close
         opened.append((db, connection, close))
+        actual_rollback = connection.rollback
+
+        async def observed_rollback():
+            if mode == "rollback-withdrawal" and not entered.is_set():
+                entered.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError as cancellation:
+                    rollback_withdrawals.append(cancellation)
+                    raise
+            return await actual_rollback()
+
+        monkeypatch.setattr(connection, "rollback", observed_rollback)
 
         async def observed_close():
             close_tasks.append(asyncio.current_task())
@@ -100,10 +114,10 @@ async def test_original_publication_control_survives_local_authority_retirement(
             monkeypatch.setattr(backend, "transaction", observed_transaction)
             monkeypatch.setattr(ownership_module, "await_owned_task", observed_join)
             loop.set_task_factory(factory)
-            if mode != "withdrawal":
+            if mode not in {"withdrawal", "rollback-withdrawal"}:
                 release.set()
             owner = create_owned_task(run(), retain_originals=True)
-            if mode == "withdrawal":
+            if mode in {"withdrawal", "rollback-withdrawal"}:
                 await asyncio.wait_for(entered.wait(), 5)
                 owner.cancel("actual local authority retirement observer withdrawal")
                 release.set()
@@ -126,6 +140,8 @@ async def test_original_publication_control_survives_local_authority_retirement(
             assert db.backend._connection is None and not getattr(connection, "_thread", connection).is_alive()
             if mode == "close-ack":
                 assert lost_close_ack in chain
+            elif mode == "rollback-withdrawal":
+                assert len(rollback_withdrawals) == 1 and rollback_withdrawals[0] in chain, "auxiliary rollback discarded its actual observer withdrawal"
             else:
                 assert len(withdrawals) == 1 and withdrawals[0] in chain
     finally:

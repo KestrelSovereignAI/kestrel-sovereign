@@ -536,6 +536,7 @@ async def await_lifecycle_task_completion(
 
 async def await_agent_shutdown_completion(
     agent: object, *, prior_error: BaseException | None = None,
+    withdrawals: list[BaseException] | None = None,
 ) -> bool:
     """Join an agent's deferred durable cleanup without dropping it on cancel.
 
@@ -552,17 +553,34 @@ async def await_agent_shutdown_completion(
     # not evidence that the caller was cancelled while joining its cleanup.
     cancelled = False
     failure = prior_error
+    observed_withdrawals = withdrawals if withdrawals is not None else []
     waiter = getattr(agent, "wait_for_shutdown_completion", None)
     if callable(waiter):
         try:
             completion = waiter()
             if inspect.isawaitable(completion):
-                task = asyncio.ensure_future(completion)
-                join_cancelled, join_failure = await await_lifecycle_task_completion(task)
+                from kestrel_sovereign._async_ownership import create_owned_task
+
+                task = (completion if isinstance(completion, asyncio.Future) else
+                        create_owned_task(completion, retain_originals=True))
+                join_cancelled, join_failure = await await_lifecycle_task_completion(
+                    task, withdrawals=observed_withdrawals,
+                )
                 cancelled = join_cancelled or cancelled
-                failure = execution_terminal_error(failure, join_failure)
+                failure = execution_terminal_error(
+                    failure, join_failure,
+                    retain_originals=True, isolate_control_originals=True,
+                )
         except BaseException as join_failure:
-            failure = execution_terminal_error(failure, join_failure)
+            failure = execution_terminal_error(
+                failure, join_failure,
+                retain_originals=True, isolate_control_originals=True,
+            )
+    if observed_withdrawals:
+        failure = execution_terminal_error(
+            failure, *observed_withdrawals,
+            retain_originals=True, isolate_control_originals=True,
+        )
     if failure is not None:
         if not isinstance(failure, asyncio.CancelledError) or is_execution_control_error(failure):
             raise failure
@@ -10453,6 +10471,16 @@ Expected Duration: {expected_duration}
         run_storage = hasattr(self.storage, "close")
         if storage_close_timeout is None:
             storage_close_timeout = _minimum_storage_close_timeout(self.storage)
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        # Native storage owns physical backend retirement even when its close
+        # reservation is zero (PostgreSQL). A cancelled observer must retain
+        # that original owner, never close the coroutine joining its backend.
+        native_storage_resource = (
+            self.storage
+            if isinstance(getattr(self.storage, "db", None), AsyncDatabase)
+            else None
+        )
         if storage_preclose_timeout is None:
             storage_preclose_timeout = max(
                 _minimum_storage_potential_preclose_timeout(self.storage),
@@ -10841,7 +10869,9 @@ Expected Duration: {expected_duration}
                     max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
                 ),
                 "storage-sqla-pre-close",
-                shielded=storage_preclose_timeout > 0.0,
+                shielded=(storage_preclose_timeout > 0.0 or
+                          native_storage_resource is not None),
+                retirement_resource=native_storage_resource,
                 # The primary SQLite backend owns an independent worker.  It
                 # must receive its reserved close chance before a pre-close
                 # timeout/error is reported as degraded.
@@ -10850,7 +10880,8 @@ Expected Duration: {expected_duration}
 
         # Close storage — SQLite gets its declared worker-exit reservation and
         # keeps running through an external cancellation until that bounded
-        # contract completes.  Other backends retain the existing behavior.
+        # contract completes. Native backends also retain their physical close
+        # owner through observer withdrawal; legacy custom stores are unchanged.
         if run_storage:
             storage = self.storage
 
@@ -10867,7 +10898,9 @@ Expected Duration: {expected_duration}
                 custody.release("storage", close_storage),
                 _step_guard(storage_close_timeout),
                 "storage-close",
-                shielded=storage_close_timeout > 0.0,
+                shielded=(storage_close_timeout > 0.0 or
+                          native_storage_resource is not None),
+                retirement_resource=native_storage_resource,
             )
 
         if storage_preclose_status in {"error", "abandoned"}:
