@@ -39,7 +39,7 @@ async def test_parallel_tool_admission_joins_original_children_and_closes_refusa
     actual_create = asyncio.create_task
 
     def create(operation, *args, **kwargs):
-        name = kwargs.get("name", "")
+        name = kwargs.get("name") or ""
         selected = (
             name.startswith("orchestrator-parallel-tool:")
             or name == "orchestrator-tool-batch"

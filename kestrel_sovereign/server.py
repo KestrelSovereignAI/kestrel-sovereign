@@ -2572,7 +2572,7 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
     try:
         await backend.connect()
     except BaseException as startup_failure:
-        cleanup_cancelled, cleanup_failure, _ = await _run_lifespan_shutdown_phase(
+        cleanup_cancelled, cleanup_failure, _, cleanup_withdrawal = await _run_lifespan_shutdown_phase(
             "shared_agent_postgres_startup_cleanup", backend.close,
             resources=(backend,),
         )
@@ -2583,7 +2583,7 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
                 "Shared PostgreSQL startup cleanup also failed: "
                 f"{type(cleanup_failure).__name__}"
             )
-        terminal = execution_terminal_error(startup_failure, cleanup_failure,
+        terminal = execution_terminal_error(startup_failure, cleanup_failure, cleanup_withdrawal,
                                            retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
@@ -2711,11 +2711,11 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
         # A transient bootstrap pool is invisible to ordinary server teardown,
         # so this helper remains its cancellation-safe lifecycle owner until it
         # is terminal.  Do not allow a repeated cancellation to strand it.
-        close_cancelled, close_failure, _ = await _run_lifespan_shutdown_phase(
+        close_cancelled, close_failure, _, close_withdrawal = await _run_lifespan_shutdown_phase(
             "host_scheduler_protocol_preflight_close", storage.close,
             resources=(storage,),
         )
-        terminal = execution_terminal_error(preflight_failure, close_failure,
+        terminal = execution_terminal_error(preflight_failure, close_failure, close_withdrawal,
                                            retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
@@ -2886,7 +2886,7 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
         if callable(configure_registration):
             configure_registration(_register_runtime_scheduler_tenant)
     except BaseException as startup_failure:
-        cleanup_cancelled, cleanup_failure, _ = await _run_lifespan_shutdown_phase(
+        cleanup_cancelled, cleanup_failure, _, cleanup_withdrawal = await _run_lifespan_shutdown_phase(
             "host_scheduler_startup_cleanup", lambda: _shutdown_host_scheduler(app),
             resources=tuple(owner for owner in (storage, runner) if owner is not None),
         )
@@ -2903,7 +2903,7 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
                     cleanup_failure.__traceback__,
                 ),
             )
-        terminal = execution_terminal_error(startup_failure, cleanup_failure,
+        terminal = execution_terminal_error(startup_failure, cleanup_failure, cleanup_withdrawal,
                                            retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
@@ -3012,7 +3012,9 @@ def _split_lifecycle_cancellation(
     return False, failure
 
 
-async def _rollback_startup_agent_manager(manager) -> bool:
+async def _rollback_startup_agent_manager(
+    manager, *, original_failure: BaseException | None = None,
+) -> bool:
     """Drain a partially-started multi-agent manager before dropping it.
 
     Host scheduler startup happens after agents have been loaded.  Its failure
@@ -3020,14 +3022,20 @@ async def _rollback_startup_agent_manager(manager) -> bool:
     own dispatchers or storage.  Keep the cleanup task alive through repeated
     cancellation and return whether the startup caller was cancelled.
     """
-    cancelled, failure, _ = await _run_lifespan_shutdown_phase(
+    cancelled, failure, _, withdrawal = await _run_lifespan_shutdown_phase(
         "server_startup:rollback_agents", manager.shutdown_all,
         resources=(manager,),
     )
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
-    if failure is not None and is_execution_control_error(failure):
-        raise execution_terminal_error(failure)
+    terminal = execution_terminal_error(
+        original_failure, failure, withdrawal, retain_originals=True,
+        prefer_cancellation=True, isolate_control_originals=True,
+    )
+    if terminal is not None and (is_execution_control_error(terminal) or (
+        original_failure is not None and withdrawal is not None
+    )):
+        raise terminal
     if failure is not None:
         logger.warning(
             "Multi-agent startup rollback did not fully shut down loaded agents: %s",
@@ -3047,7 +3055,7 @@ async def _run_lifespan_shutdown_phase(
     operation,
     *,
     resources=(),
-) -> tuple[bool, BaseException | None, object | None]:
+) -> tuple[bool, BaseException | None, object | None, BaseException | None]:
     """Own one teardown phase, including partial startup, through cancellation.
 
     Each phase receives a distinct task.  A cancellation of the lifespan task
@@ -3056,9 +3064,11 @@ async def _run_lifespan_shutdown_phase(
     admission boundary: a refused cleanup retains its actual original resource
     and closes the unstarted coroutine, never reporting successful retirement.
     """
-    from kestrel_sovereign._async_ownership import create_owned_task
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
     phase_task = None
+    withdrawal = None
+    task_had_failure = True
     try:
         phase_task = create_owned_task(
             operation(), name=f"server_shutdown:{name}", retain_originals=True,
@@ -3070,10 +3080,20 @@ async def _run_lifespan_shutdown_phase(
         # Return the failure so later independent phases still get their drain.
         cancelled, failure = False, _unstarted_lifespan_phase_error(error, resources)
     else:
-        cancelled, failure = await await_lifecycle_task_completion(phase_task)
-    task_had_failure = failure is not None
+        caller = asyncio.current_task()
+        cancelled = bool(caller is not None and caller.cancelling())
+        outcome = await await_owned_task(phase_task)
+        cancelled = cancelled or outcome.cancellation is not None
+        failure, withdrawal = outcome.error, outcome.cancellation
+        task_had_failure = failure is not None
+    original_phase_failure = failure
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
+    if failure_cancelled:
+        withdrawal = execution_terminal_error(
+            withdrawal, original_phase_failure, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
     if failure is not None:
         logger.warning(
             "Server shutdown phase %r failed: %s",
@@ -3084,7 +3104,9 @@ async def _run_lifespan_shutdown_phase(
     result = None
     if not task_had_failure and phase_task is not None:
         result = phase_task.result()
-    return cancelled, failure, result
+    # Preserve the actual original withdrawal separately from physical child
+    # success. A caller's native body receipt may only be known one level out.
+    return cancelled, failure, result, withdrawal
 
 
 def _unstarted_lifespan_phase_error(error: BaseException, resources) -> BaseException:
@@ -3147,7 +3169,9 @@ def _require_retired_server_resources(app: FastAPI) -> None:
         ) from previous
 
 
-async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException | None]:
+async def _shutdown_server_resources(
+    app: FastAPI, *, original_failure: BaseException | None = None,
+) -> tuple[bool, BaseException | None]:
     """Drain every server-owned teardown phase before reporting an outcome."""
     from kestrel_sovereign.execution_custody import execution_terminal_error
     logger.info("Server shutting down...")
@@ -3169,6 +3193,7 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         "phoenix": (),
     }
 
+    withdrawals = []
     for name, operation in (
         ("host-scheduler", lambda: _shutdown_host_scheduler(app)),
         # The scheduler is now drained, so no cold wake can remount host
@@ -3206,11 +3231,13 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
                 RuntimeError(f"Server shutdown phase {name!r} retains resources: "
                              f"unretired prerequisites {blocked_by!r}"), resources,
             )
-            phase_cancelled, result = False, None
+            phase_cancelled, result, withdrawal = False, None, None
         else:
-            phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
+            phase_cancelled, failure, result, withdrawal = await _run_lifespan_shutdown_phase(
                 name, operation, resources=resources,
             )
+        if withdrawal is not None:
+            withdrawals.append(withdrawal)
         cancelled = cancelled or phase_cancelled
         if result is True:
             # ``_shutdown_phoenix`` records cancellation that it observed while
@@ -3218,8 +3245,14 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
             cancelled = True
         if failure is not None:
             failed_phases.add(name)
-            first_failure = execution_terminal_error(first_failure, failure, retain_originals=True)
+            first_failure = execution_terminal_error(first_failure, failure, retain_originals=True,
+                                                     isolate_control_originals=True)
 
+    if any(is_execution_control_error(error) for error in (original_failure, first_failure)):
+        first_failure = execution_terminal_error(
+            first_failure, *withdrawals, retain_originals=True,
+            isolate_control_originals=True,
+        )
     app.state._lifespan_teardown_error = first_failure
     return cancelled, first_failure
 
@@ -3234,9 +3267,10 @@ async def _lifespan_teardown_owner(app: FastAPI):
         body_failure = exc
         raise
     finally:
-        cancelled, teardown_failure = await _shutdown_server_resources(app)
+        cancelled, teardown_failure = await _shutdown_server_resources(app, original_failure=body_failure)
         from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-        terminal = execution_terminal_error(body_failure, teardown_failure, retain_originals=True)
+        terminal = execution_terminal_error(body_failure, teardown_failure, retain_originals=True,
+                                           isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
         # Preserve the original failure from startup/request lifespan body.  On
@@ -3793,7 +3827,7 @@ async def _lifespan_startup(app: FastAPI):
             rollback_failure = None
             if manager is not None:
                 try:
-                    rollback_cancelled = await _rollback_startup_agent_manager(manager)
+                    rollback_cancelled = await _rollback_startup_agent_manager(manager, original_failure=e)
                 except BaseException as error:
                     rollback_failure = error
                 rollback_complete = not manager.list_agents()

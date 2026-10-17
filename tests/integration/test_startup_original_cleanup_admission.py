@@ -383,3 +383,224 @@ async def test_native_pool_close_joins_physical_retirement_after_repeated_withdr
         if task is not None:
             await await_owned_task(task)
         await owner.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["pool", "preflight", "scheduler"])
+@pytest.mark.parametrize("native_body,native_close,withdrawals", [
+    (body, close, count) for body, close in [(True, False), (False, True), (True, True)]
+    for count in (1, 2)
+] + [(True, False, 0)])
+async def test_outer_startup_phase_retains_actual_observer_withdrawal(
+    native_pg, tmp_path, monkeypatch, route, native_body, native_close, withdrawals,
+):
+    from kestrel_sovereign import server
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+
+    backend, observer, schema = native_pg
+
+    async def unknown_receipt(identifier):
+        original = None
+        backend._execution_custody = ExecutionCustody(GenerationFence())
+        try:
+            with monkeypatch.context() as ack:
+                receipts = lose_native_ack(ack, boundary="commit", original=OSError("actual phase COMMIT ACK lost"))
+                try:
+                    await backend.execute("INSERT INTO effects VALUES (?, 'original phase receipt')", (identifier,))
+                except BaseException as error:
+                    original = error
+            assert receipts == [True] and execution_commit_outcome(original) == "unknown"
+            return original
+        finally:
+            backend._execution_custody = None
+
+    body = await unknown_receipt(185) if native_body else ValueError("ordinary original startup failure")
+    closer = await unknown_receipt(186) if native_close else None
+    originals = [error for error in (body, closer) if error is not None]
+    graphs = [tuple(_explicit_control_chain(error)) for error in originals]
+    entered, release = asyncio.Event(), asyncio.Event()
+    owners = []
+    actual_connect, actual_initialize, actual_close = PostgresBackend.connect, AsyncStorage.initialize, PostgresBackend.close
+
+    async def connect_then_fail(owner):
+        result = await actual_connect(owner)
+        if route == "pool":
+            owners.append(owner)
+            raise body
+        return result
+
+    async def initialize_then_fail(owner):
+        await actual_initialize(owner)
+        owners.append(owner.db.backend)
+        raise body
+
+    async def actual_close_after_observation(owner):
+        if owner in owners:
+            entered.set()
+            await release.wait()
+        result = await actual_close(owner)
+        if owner in owners and withdrawals == 0:
+            asyncio.current_task().cancel("actual original native phase withdrawal")
+            await asyncio.sleep(0)
+        if owner in owners and closer is not None:
+            raise closer
+        return result
+
+    manager = AgentManager(base_data_dir=tmp_path / "empty-manager")
+
+    async def selected_discovery_only(_config):
+        return {"did:test:unloaded-input-only": ("unloaded-input-only", None)}
+
+    app, task = FastAPI(), None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setenv("KESTREL_DB_BACKEND", "postgres")
+            patch.setenv("KESTREL_DATABASE_URL", with_search_path(os.environ["TEST_POSTGRES_URL"], schema))
+            patch.setenv("KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE", "2")
+            patch.setenv("KESTREL_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE", "1")
+            patch.setattr(manager, "local_agent_configs_by_did", selected_discovery_only)
+            patch.setattr(PostgresBackend, "close", actual_close_after_observation)
+            if route == "pool":
+                patch.setattr(PostgresBackend, "connect", connect_then_fail)
+                operation = server._start_shared_agent_postgres_backend(app)
+            else:
+                patch.setattr(AsyncStorage, "initialize", initialize_then_fail)
+                operation = (server._prepare_shared_postgres_scheduler_protocol(app, manager, None)
+                             if route == "preflight" else server._start_host_scheduler(app, manager, None))
+            task = create_owned_task(operation, retain_originals=True)
+            await asyncio.wait_for(entered.wait(), 5)
+            for attempt in range(withdrawals):
+                task.cancel(f"actual outer phase observer withdrawal {attempt}")
+                await asyncio.sleep(0)
+            if withdrawals:
+                await asyncio.wait({task}, timeout=0.05)
+            assert not task.done() and all(owner.is_connected for owner in owners), "startup phase abandoned accepted physical cleanup on observer withdrawal"
+            release.set()
+            outcome = await await_owned_task(task)
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert is_execution_control_error(outcome.error) and execution_commit_outcome(outcome.error) == "unknown"
+        assert all(original in chain for original in originals)
+        prefix = "actual original native phase withdrawal" if withdrawals == 0 else "actual outer phase observer withdrawal"
+        assert any(isinstance(error, asyncio.CancelledError)
+                   and error.args and str(error.args[0]).startswith(prefix)
+                   for error in chain), "startup phase discarded its actual original observer cancellation"
+        assert all(tuple(_explicit_control_chain(original)) == graph for original, graph in zip(originals, graphs)), "startup phase mutated an original source receipt"
+        assert all(not owner.is_connected for owner in owners), "startup phase did not join its actual physical cleanup"
+        expected = int(native_body) + int(native_close)
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id IN (185,186)') == expected
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        for owner in owners:
+            await actual_close(owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["manager", "teardown"])
+@pytest.mark.parametrize("withdrawals", [0, 1, 2])
+async def test_original_phase_observer_reaches_outer_lifespan_composer(
+    native_pg, tmp_path, monkeypatch, route, withdrawals,
+):
+    from kestrel_sovereign import server
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign.host_features import build_host_context
+
+    backend, observer, schema = native_pg
+    body = None
+    backend._execution_custody = ExecutionCustody(GenerationFence())
+    with monkeypatch.context() as ack:
+        receipts = lose_native_ack(ack, boundary="commit", original=OSError("actual outer lifespan COMMIT ACK lost"))
+        try:
+            await backend.execute("INSERT INTO effects VALUES (187, 'original outer lifespan receipt')")
+        except BaseException as error:
+            body = error
+    backend._execution_custody = None
+    assert receipts == [True] and execution_commit_outcome(body) == "unknown"
+    graph = tuple(_explicit_control_chain(body))
+    config = tmp_path / "multi_agent.toml"
+    config.write_text('[host]\nbind = "127.0.0.1"\nport = 8888\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    for key, value in {
+        "KESTREL_HOME": str(tmp_path), "PROJECT_DIR": str(tmp_path),
+        "KESTREL_DB_PATH": str(tmp_path / "private-state"),
+        "KESTREL_HOST_DB_PATH": str(tmp_path / "host.db"),
+        "KESTREL_MULTI_AGENT_CONFIG": str(config), "KESTREL_MULTI_AGENT": "1",
+        "KESTREL_API_KEY": "inert-native-host-auth-not-provider-credential",
+        "KESTREL_DB_BACKEND": "sqlite", "KESTREL_HOLD_BACKEND": "sqlite",
+        "KESTREL_PHOENIX_ENABLED": "0", "KESTREL_TRACING_ENABLED": "0",
+    }.items():
+        monkeypatch.setenv(key, value)
+    entered, release = asyncio.Event(), asyncio.Event()
+    managers, workers = [], []
+    app, task = FastAPI(), None
+    actual_load, actual_shutdown = AgentManager.load_from_config, AgentManager.shutdown_all
+    actual_host_shutdown = server._shutdown_host_features
+
+    async def load_empty_then_fail(manager, *args, **kwargs):
+        result = await actual_load(manager, *args, **kwargs)
+        assert result == 0 and not manager.list_agents()
+        managers.append(manager)
+        raise body
+
+    async def retain_manager_observer(manager):
+        entered.set()
+        await release.wait()
+        result = await actual_shutdown(manager)
+        if withdrawals == 0:
+            asyncio.current_task().cancel("actual original outer phase withdrawal")
+            await asyncio.sleep(0)
+        return result
+
+    async def retain_context_observer(app):
+        entered.set()
+        await release.wait()
+        result = await actual_host_shutdown(app)
+        if withdrawals == 0:
+            asyncio.current_task().cancel("actual original outer phase withdrawal")
+            await asyncio.sleep(0)
+        return result
+
+    async def operation():
+        if route == "manager":
+            async with server._lifespan_startup(app):
+                pytest.fail("original startup control reached serving publication")
+        else:
+            async with server._lifespan_teardown_owner(app):
+                raise body
+
+    try:
+        with monkeypatch.context() as patch:
+            if route == "manager":
+                patch.setattr(AgentManager, "load_from_config", load_empty_then_fail)
+                patch.setattr(AgentManager, "shutdown_all", retain_manager_observer)
+            else:
+                context = await build_host_context(db_path=str(tmp_path / "actual-owned-context.db"))
+                app.state.host_context, app.state.host_features = context, []
+                connection = context.db.backend._connection
+                workers.append(getattr(connection, "_thread", connection))
+                patch.setattr(server, "_shutdown_host_features", retain_context_observer)
+            task = create_owned_task(operation(), retain_originals=True)
+            await asyncio.wait_for(entered.wait(), 5)
+            for attempt in range(withdrawals):
+                task.cancel(f"actual outer lifespan observer withdrawal {attempt}")
+                await asyncio.sleep(0)
+            assert not task.done() and all(worker.is_alive() for worker in workers)
+            release.set()
+            outcome = await await_owned_task(task)
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert body in chain and execution_commit_outcome(outcome.error) == "unknown"
+        prefix = "actual original outer phase withdrawal" if withdrawals == 0 else "actual outer lifespan observer withdrawal"
+        assert any(isinstance(error, asyncio.CancelledError) and error.args
+                   and str(error.args[0]).startswith(prefix)
+                   for error in chain), "outer lifespan discarded its actual original phase observer cancellation"
+        assert tuple(_explicit_control_chain(body)) == graph, "outer lifespan mutated its original native body receipt"
+        assert all(not worker.is_alive() for worker in workers)
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=187') == 1
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        await server._shutdown_server_resources(app)
+        for manager in managers:
+            await actual_shutdown(manager)

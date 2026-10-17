@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
     execution_cleanup_debts,
     is_execution_control_error,
 )
@@ -143,7 +144,8 @@ async def test_refused_prerequisite_keeps_actual_hold_dependencies_while_indepen
                 async with _lifespan_teardown_owner(app):
                     pass
             loop.set_task_factory(previous)
-            assert caught.value is refusal and is_execution_control_error(refusal)
+            assert refusal in tuple(_explicit_control_chain(caught.value)) and is_execution_control_error(caught.value)
+            assert tuple(_explicit_control_chain(refusal)) == (refusal,)
             assert app.state.agent is agent and db.backend._connection is not None
             if runner is not None:
                 assert app.state.host_scheduler_runner is runner and runner._running

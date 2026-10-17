@@ -9182,7 +9182,9 @@ class AgentManager:
         failed one is different: routing may already be withdrawn, so dropping
         the completed task would let a terminal drain falsely certify the
         manager. Keep metadata only until the host operator explicitly
-        acknowledges it; the finished task and its traceback remain unretained.
+        acknowledges it. Ordinary failures retain no finished Task/traceback;
+        native control remains in the existing terminal custody latch and is
+        not settled by acknowledgement of this public metadata.
         """
 
         return {
@@ -9724,24 +9726,35 @@ class AgentManager:
                 ordinary_budget_release = self._start_child_budget_release(name)
         if unpublished_hold:
             assert ordinary_budget_release is not None
+            release_failure = None
             try:
                 release_cancelled = (
                     await self._await_child_budget_release_cancellation_safe(
                         ordinary_budget_release.task
                     )
                 )
-            except asyncio.CancelledError:
-                # The admitted release has reached a terminal state before its
-                # cancellation-safe join propagates. Reconcile the now-settled
-                # ownership maps before reporting cancellation to DELETE.
-                release_cancelled = True
-            reconciliation_cancelled = (
-                await self._reconcile_fully_removed_child_tracking()
+            except BaseException as error:
+                if not _is_lifecycle_terminal_outcome(error):
+                    raise
+                release_failure = error
+                release_cancelled = _contains_lifecycle_cancellation(error)
+            reconciliation_cancelled = False
+            reconciliation_failure = None
+            try:
+                reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking()
+            except BaseException as error:
+                if not _is_lifecycle_terminal_outcome(error):
+                    raise
+                reconciliation_failure = error
+            terminal = execution_terminal_error(
+                release_failure, reconciliation_failure,
+                unpublished_offboarding_failure, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
             )
+            if terminal is not None:
+                raise terminal
             if release_cancelled or reconciliation_cancelled:
                 raise asyncio.CancelledError()
-            if unpublished_offboarding_failure is not None:
-                raise unpublished_offboarding_failure
             return True
 
         async with self._lock:
@@ -9988,7 +10001,8 @@ class AgentManager:
         # release task DELETE has always joined, now admitted early enough for
         # a terminal manager drain to join it too.
         release_cancelled = False
-        release_failure: Optional[Exception] = None
+        release_failure: Optional[BaseException] = None
+        release_withdrawal: Optional[asyncio.CancelledError] = None
         if ordinary_budget_release is not None:
             try:
                 release_cancelled = (
@@ -9996,29 +10010,40 @@ class AgentManager:
                         ordinary_budget_release.task
                     )
                 )
-            except asyncio.CancelledError:
-                # The release join is terminal even when it must propagate a
-                # caller cancellation. Finish child-name reconciliation first.
-                release_cancelled = True
-            except Exception as exc:
+            except BaseException as exc:
+                if not _is_lifecycle_terminal_outcome(exc):
+                    raise
                 # The task completion callback has already retained bounded
                 # unsafe-refund evidence. Continue reconciliation so a runtime
                 # offboarding failure cannot be hidden by this independent
                 # budget failure, then surface both below.
-                release_failure = exc
+                if isinstance(exc, asyncio.CancelledError) and not is_execution_control_error(exc):
+                    release_withdrawal = exc
+                else:
+                    release_failure = exc
+                release_cancelled = _contains_lifecycle_cancellation(exc)
         # Direct DELETE is also a supported child-removal path. Reconcile its
         # parent edge before releasing the same A2A lifecycle boundary used by
         # name admission. Quarantined cleanup remains reserved because the
         # pruning predicate treats its live reaper as authoritative ownership.
-        reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking()
+        reconciliation_cancelled = False
+        reconciliation_failure = None
+        try:
+            reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking()
+        except BaseException as error:
+            if not _is_lifecycle_terminal_outcome(error):
+                raise
+            reconciliation_failure = error
         removal_cancelled = (
             caller_cancelled or release_cancelled or reconciliation_cancelled
         )
         terminal_outcomes: list[BaseException] = []
         if removal_cancelled:
-            terminal_outcomes.append(asyncio.CancelledError())
+            terminal_outcomes.append(release_withdrawal or asyncio.CancelledError())
         if release_failure is not None:
             terminal_outcomes.append(release_failure)
+        if reconciliation_failure is not None:
+            terminal_outcomes.append(reconciliation_failure)
         if handoff_offboarding_pending is not None:
             terminal_outcomes.append(handoff_offboarding_pending)
         _raise_lifecycle_outcomes(
@@ -10790,6 +10815,13 @@ class AgentManager:
     ) -> None:
         """Retain bounded evidence for one terminal ordinary-release failure."""
 
+        if is_execution_control_error(failure):
+            # The existing terminal custody latch outlives public metadata
+            # acknowledgement/eviction. A display record cannot settle an
+            # original uncertain refund or retire its native evidence.
+            self._quarantined_shutdown_control = execution_terminal_error(
+                self._quarantined_shutdown_control, failure,
+            )
         unsafe = UnsafeRemovalBudgetReleaseFailure(
             release_id=record.release_id,
             child_name=_bounded_shutdown_metadata(record.child_name),
@@ -10879,12 +10911,7 @@ class AgentManager:
                 is record
             ):
                 self._inflight_removal_budget_releases_by_child.pop(child_name, None)
-            if task.cancelled():
-                self._record_unsafe_removal_budget_release_failure(
-                    record, asyncio.CancelledError()
-                )
-                return
-            failure = task.exception()
+            failure = owned_task_error(task)
             if failure is not None:
                 self._record_unsafe_removal_budget_release_failure(record, failure)
 
@@ -10903,25 +10930,33 @@ class AgentManager:
     ) -> bool:
         """Join one admitted budget release before reporting cancellation."""
 
-        release_cancelled, release_failure = await await_lifecycle_task_completion(
-            budget_release
+        caller = asyncio.current_task()
+        release_cancelled = bool(caller is not None and caller.cancelling())
+        outcome = await await_owned_task(budget_release)
+        release_cancelled = release_cancelled or outcome.cancellation is not None
+        terminal = execution_terminal_error(
+            outcome.error, outcome.cancellation,
+            self._quarantined_shutdown_control,
+            retain_originals=True, prefer_cancellation=True,
+            isolate_control_originals=True,
         )
-        # The task's done callback retains unsafe refund evidence before this
-        # join returns.  Once that owned task has settled, the caller's
-        # cancellation must still win over its provider error; DELETE otherwise
-        # reports an ordinary failure even though its cancellation contract was
-        # observed and cleanup fully completed.
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
+        # Ordinary availability preserves the historical cancellation-wins
+        # contract. Native control above retains both actual original carriers.
         if release_cancelled:
-            raise asyncio.CancelledError()
-        if release_failure is not None:
-            raise release_failure
+            if outcome.cancellation is not None:
+                raise terminal
+            raise asyncio.CancelledError() from terminal
+        if terminal is not None:
+            raise terminal
         # ``_release_child_budget_cancellation_safe`` predates the task
         # admission wrapper and promises a boolean: ``True`` means its own
         # cancellation-safe cleanup observed caller cancellation after the
         # refund completed. The wrapper's join cancellation is only one half
         # of that contract; preserve an override's completed ``True`` result
         # too. Legacy overrides returning ``None`` remain a normal success.
-        return release_cancelled or budget_release.result() is True
+        return outcome.result is True
 
     async def _release_child_budget_cancellation_safe(self, child_name: str) -> bool:
         """Release one removed child's hold before reporting caller cancellation."""

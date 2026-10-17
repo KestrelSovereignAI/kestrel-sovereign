@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
     execution_cleanup_debts,
     is_execution_control_error,
 )
@@ -65,6 +66,7 @@ async def test_original_same_app_startup_cannot_overwrite_retained_native_owners
         asyncio.get_running_loop().get_task_factory(),
         [],
     )
+    refusal = RuntimeError("original Agent phase refused")
 
     def factory(loop, coroutine, **kwargs):
         operation = _actual_operation(coroutine)
@@ -75,7 +77,7 @@ async def test_original_same_app_startup_cannot_overwrite_retained_native_owners
             and code.co_qualname == "_shutdown_server_agents"
         ):
             refused.append((coroutine, operation))
-            raise RuntimeError("original Agent phase refused")
+            raise refusal
         return (
             previous(loop, coroutine, **kwargs)
             if previous
@@ -99,9 +101,12 @@ async def test_original_same_app_startup_cannot_overwrite_retained_native_owners
     restart_task, observing = None, None
     try:
         loop.set_task_factory(factory)
-        with pytest.raises(RuntimeError, match="phase refused"):
+        with pytest.raises(BaseException) as caught:
             async with server._lifespan_teardown_owner(app):
                 pass
+        assert is_execution_control_error(caught.value)
+        assert refusal in tuple(_explicit_control_chain(caught.value))
+        assert tuple(_explicit_control_chain(refusal)) == (refusal,)
         loop.set_task_factory(previous)
         assert (
             app.state.agent is agent
