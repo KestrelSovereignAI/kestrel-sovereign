@@ -326,8 +326,11 @@ use the scheduler host's own storage pool, not the agents' advisory pool.
 
 #### SDK 0.39 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.39.0,<0.40`; the
-`observability` extra carries the same SDK line with `metrics`. 0.39.0 adds
+Core requires `kestrel-sovereign-sdk[httpx,tracing]>=0.39.1,<0.40`; the
+`observability` extra adds `metrics` under that same base constraint. 0.39.1
+owns the canonical outbound URL/IP policy and native pinned HTTP transport;
+avatar downloads and DID resolution use it. Core retains only its stdlib HTTPS
+I/O implementation for DID documents. 0.39.0 adds
 the decisions contract (LLM contract v7, epic #3424) that `LLMService.decide`
 is built on, on top of the runtime contracts of the 0.37–0.38 line: durable
 isolated execution, provider-neutral private inference leases (including
