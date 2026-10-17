@@ -84,6 +84,10 @@ Ordinary facade failures retain bounded retry after the original operation
 settles; successful retirement and a settled acknowledgement alone do not create
 permanent cleanup debt. Each finite observer keeps its own original withdrawal
 without adding that cancellation to another observer's shared source history.
+Uncertainty from an independent ingress operation still denies new work, but
+does not pretend that a child's as-yet-unattempted physical stop already failed.
+An earlier bounded cleanup that waited behind that ingress may finish its first
+stop once the exact ingress owner settles; it cannot retry a failed native stop.
 
 Wake preparation failures retain the existing secret-free tool error envelope;
 an ancillary telemetry failure after publication leaves the live child running

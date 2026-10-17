@@ -825,7 +825,7 @@ class _HostOwnedFacadeOperation:
         self._host_loop = asyncio.get_running_loop()
         self._source: asyncio.Future[Any] | None = None
         self._source_loop: asyncio.AbstractEventLoop | None = None
-        self._host_task: asyncio.Task[Any] | None = None
+        self._host_task: asyncio.Future[Any] | None = None
         self._admission = OwnedTaskAdmission()
         self._opening: BaseException | None = None
         self._settlement_poll: asyncio.TimerHandle | None = None
@@ -854,6 +854,10 @@ class _HostOwnedFacadeOperation:
             self._source = operation
             self._source_loop = operation.get_loop()
             self._foreign_loop = self._source_loop is not self._host_loop
+            if not self._foreign_loop:
+                # Preserve the task-like diagnostic/join surface as an alias
+                # of the ORIGINAL source, never another observer operation.
+                self._host_task = operation
             try:
                 self._install_source_settlement_observer()
             except BaseException as error:
@@ -2034,23 +2038,7 @@ class _ProxyLifecycleAttempt:
                     )
             except BaseException as error:
                 observed = error
-        if not self.harvested and (task is None or task.done()):
-            physical = execution_terminal_error(
-                self.opening, owned_task_error(task) if task is not None else None,
-                retain_originals=True, isolate_control_originals=True,
-            )
-            if physical is not None and self.resource is not None:
-                debt = RuntimeError("original proxy lifecycle owner did not retire")
-                debt._kestrel_native_retirement_debts = ((self.resource, task),)
-                physical = execution_terminal_error(
-                    physical, debt, retain_originals=True,
-                    isolate_control_originals=True,
-                )
-            self.failure = execution_terminal_error(
-                self.failure, physical, retain_originals=True,
-                isolate_control_originals=True,
-            )
-            self.harvested = True
+        self.harvest()
         terminal = execution_terminal_error(
             self.failure, self.opening, observed, retain_originals=True,
             isolate_control_originals=True,
@@ -2058,6 +2046,28 @@ class _ProxyLifecycleAttempt:
         if terminal is not None:
             raise retained_execution_error(terminal)
         return result
+
+    def harvest(self) -> None:
+        """Classify settled original admission without waiting or replacing it."""
+        task = self.admission.task
+        if self.harvested or (task is not None and not task.done()):
+            return
+        physical = execution_terminal_error(
+            self.opening, owned_task_error(task) if task is not None else None,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        if physical is not None and self.resource is not None:
+            debt = RuntimeError("original proxy lifecycle owner did not retire")
+            debt._kestrel_native_retirement_debts = ((self.resource, task),)
+            physical = execution_terminal_error(
+                physical, debt, retain_originals=True,
+                isolate_control_originals=True,
+            )
+        self.failure = execution_terminal_error(
+            self.failure, physical, retain_originals=True,
+            isolate_control_originals=True,
+        )
+        self.harvested = True
 
 
 @dataclass
@@ -9439,6 +9449,17 @@ class ProxyFeature(Feature):
     def _admit_terminal_cleanup(self, *, retry_retirement: bool) -> _ProxyLifecycleAttempt:
         """Publish the canonical receipt before callback publication can fail."""
         attempt = self._terminal_cleanup_owner
+        if attempt is not None and (
+            attempt.admission.task is None or attempt.admission.task.done()
+        ):
+            # Synchronous preparation may finish without a waiter classifying
+            # it. Harvest first: done is neither failed-native nor retired.
+            attempt.harvest()
+            self._classify_terminal_cleanup_attempt(attempt)
+            if attempt.disposition in {"retired", "ordinary-incomplete"}:
+                self._terminal_cleanup_owner = None
+                self._terminal_cleanup_task = None
+                attempt = None
         if attempt is not None:
             return attempt
         self._terminal_cleanup_uncertain = False if retry_retirement else self._terminal_cleanup_uncertain
@@ -9567,9 +9588,17 @@ class ProxyFeature(Feature):
         task = attempt.admission.task
         if task is not None and not task.done():
             return  # The fair-share deadline transferred this SAME owner.
-        control = execution_terminal_error(attempt.failure,
-            vars(self).get("_event_ingress_control"), retain_originals=True,
-            isolate_control_originals=True)
+        # Ingress uncertainty still denies work, but does not mean this
+        # cleanup's physical stop failed. A prior bounded attempt may have
+        # stopped BEFORE calling stop while the exact ingress owner was live.
+        # Its eventual native failure must not forbid the first physical stop.
+        # Only this attempt's opening/observation or actual failed stop does.
+        control = execution_terminal_error(
+            attempt.failure,
+            *(marker.failure for marker in self._terminal_stop_completed_client_markers
+              if marker.failure is not None),
+            retain_originals=True, isolate_control_originals=True,
+        )
         if is_execution_control_error(control):
             attempt.failure = control
             attempt.disposition = "native-unresolved"

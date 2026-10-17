@@ -133,6 +133,17 @@ async def test_batch_fatal_cleanup_includes_all_native_initializer_receipts(monk
 async def test_isolated_lifecycle_join_preserves_first_native_receipt(monkeypatch, tmp_path, kind, boundary):
     agent, db = await native_owner(tmp_path)
     failure = receipt(kind)
+    original = OriginalFailure.capture(failure)
+    withdrawals = []
+    native_wait = asyncio.wait_for
+    async def observed_wait(*args, **kwargs):
+        try:
+            return await native_wait(*args, **kwargs)
+        except asyncio.CancelledError as error:
+            withdrawals.append(error)
+            raise
+    if boundary == "facade_cancel":
+        monkeypatch.setattr(asyncio, "wait_for", observed_wait)
     entered, release = asyncio.Event(), asyncio.Event()
     child = outer = None
     async def native():
@@ -160,7 +171,10 @@ async def test_isolated_lifecycle_join_preserves_first_native_receipt(monkeypatc
             release.set()
         outcome = await await_owned_task(outer)
         assert child.done() and await db.fetchval("SELECT COUNT(*) FROM effects") == 1
-        assert outcome.error is failure, "lifecycle boundary erased canonical child control"
+        original.assert_retained(outcome.error)
+        if boundary == "facade_cancel":
+            from kestrel_sovereign.execution_custody import _explicit_control_chain
+            assert withdrawals and withdrawals[0] in tuple(_explicit_control_chain(outcome.error)), "lifecycle lost actual finite observer withdrawal"
         for _ in range(100):
             try:
                 await runtime._await_task_until_complete(child, preserve_cancellation=False)
