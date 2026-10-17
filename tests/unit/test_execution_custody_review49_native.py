@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from tests.utils.receipt_delivery import ReceiptDelivery
+from tests.utils.original_failure import OriginalFailure
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput
 from kestrel_sdk.llm import InferenceLeaseState
 from sqlalchemy import text
@@ -165,9 +166,11 @@ async def test_a2a_stores_all_close_after_original_receipt_and_later_cancel(tmp_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["feature", "a2a"])
 @pytest.mark.parametrize("kind", KINDS)
-async def test_cancelled_drain_joins_native_effect_and_retains_receipt(tmp_path, route, kind):
+async def test_cancelled_drain_joins_native_effect_and_retains_receipt(tmp_path, route, kind, monkeypatch):
     agent, db = await native_owner(tmp_path)
     original = terminal(kind)
+    source = OriginalFailure.capture(original)
+    withdrawals = []
     entered, unwinding, release = (asyncio.Event() for _ in range(3))
     class NativeFeature(Feature):
         async def initialize(self):
@@ -193,6 +196,15 @@ async def test_cancelled_drain_joins_native_effect_and_retains_receipt(tmp_path,
     # No durable A2A task was submitted: exercise the actual owned drain rather
     # than fabricating a stored task to match this internal native effect.
     manager._execution_authorities.pop(child, None)
+    if route == "feature":
+        from kestrel_sovereign import _async_ownership as ownership_module
+        actual_join = ownership_module.await_owned_task
+        async def observed_join(task, *args, **kwargs):
+            outcome = await actual_join(task, *args, **kwargs)
+            if task is child and outcome.cancellation is not None:
+                withdrawals.append(outcome.cancellation)
+            return outcome
+        monkeypatch.setattr(ownership_module, "await_owned_task", observed_join)
     parent = None
     try:
         await entered.wait()
@@ -203,7 +215,12 @@ async def test_cancelled_drain_joins_native_effect_and_retains_receipt(tmp_path,
         assert not parent.done()
         release.set()
         result = await join(parent)
-        assert result.error is original
+        if route == "feature":
+            source.assert_retained(result.error)
+            assert withdrawals and all(error in tuple(_explicit_control_chain(result.error))
+                                       for error in withdrawals)
+        else:
+            assert result.error is original
         assert child.done()
         assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
         if route == "feature":

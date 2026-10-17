@@ -7390,15 +7390,18 @@ class AgentManager:
                         raise
                     try:
                         await _stage_candidate(name)
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError as staging_failure:
                         # A lightweight/test initializer may not participate in
                         # the construction barrier itself. Once it returned a
                         # private agent, this wrapper owns that result even if
                         # cancellation lands while terminal staging unblocks.
-                        await self._discard_unpublished_initialized_agent(
-                            name,
-                            initialized,
-                        )
+                        try:
+                            await self._discard_unpublished_initialized_agents([(name, initialized)])
+                        except BaseException as cleanup_failure:
+                            raise execution_terminal_error(
+                                staging_failure, cleanup_failure, retain_originals=True,
+                                isolate_control_originals=True,
+                            )
                         raise
                     return initialized
                 finally:
@@ -7526,7 +7529,7 @@ class AgentManager:
                 except BaseException as cleanup_failure:
                     terminal = execution_terminal_error(fatal, *(
                         result for result in results if isinstance(result, BaseException)
-                    ), cleanup_failure)
+                    ), cleanup_failure, retain_originals=True, isolate_control_originals=True)
                     if terminal is not None and is_execution_control_error(terminal):
                         raise terminal
                     if isinstance(fatal, asyncio.CancelledError):
@@ -7534,7 +7537,7 @@ class AgentManager:
                     raise
                 terminal = execution_terminal_error(fatal, *(
                     result for result in results if isinstance(result, BaseException)
-                ))
+                ), retain_originals=True, isolate_control_originals=True)
                 if terminal is not None and is_execution_control_error(terminal):
                     raise terminal
                 if isinstance(fatal, asyncio.CancelledError) or cleanup_cancelled:

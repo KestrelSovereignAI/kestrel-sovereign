@@ -373,6 +373,29 @@ class OwnedTaskOutcome(Generic[_T]):
     cancellation: asyncio.CancelledError | None
 
 
+def owned_task_observation_control(outcome):
+    """Keep native source facts, not a finite observer's withdrawal wrapper.
+
+    This projects evidence only; it neither authenticates foreign errors nor
+    adopts, closes or retries the original resource. A cancellation which is
+    itself the sole native carrier cannot be silently discarded.
+    """
+    from kestrel_sovereign.execution_custody import (
+        _explicit_control_chain, execution_terminal_error, is_execution_control_error,
+    )
+    if outcome is None:
+        return None
+    controls = [outcome.error]
+    withdrawal = outcome.cancellation
+    if is_execution_control_error(withdrawal):
+        originals = [error for error in _explicit_control_chain(withdrawal)
+                     if error is not withdrawal and is_execution_control_error(error)]
+        controls.extend(originals or [withdrawal])
+    return execution_terminal_error(
+        *controls, retain_originals=True, isolate_control_originals=True,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PendingOwnedTask(Generic[_T]):
     """Abandoned observation, never a terminal native result or commit receipt."""

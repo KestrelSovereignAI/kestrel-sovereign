@@ -3,7 +3,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error, owned_task_observation_control
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody, _explicit_control_chain, bind_execution_cleanup, execution_terminal_error,
     is_execution_control_error,
@@ -18,17 +18,7 @@ def llm_close_observation_control(outcome):
     cancellation itself is the sole native receipt, its facts cannot be
     discarded or replaced with a fabricated successful-retirement projection.
     """
-    if outcome is None:
-        return None
-    controls = [outcome.error]
-    withdrawal = outcome.cancellation
-    if is_execution_control_error(withdrawal):
-        originals = [error for error in _explicit_control_chain(withdrawal)
-                     if error is not withdrawal and is_execution_control_error(error)]
-        controls.extend(originals or [withdrawal])
-    return execution_terminal_error(
-        *controls, retain_originals=True, isolate_control_originals=True,
-    )
+    return owned_task_observation_control(outcome)
 
 
 def start_llm_close_task(owner, key, operation, *, resource=None):

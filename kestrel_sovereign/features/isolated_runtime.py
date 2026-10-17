@@ -73,6 +73,7 @@ from kestrel_sovereign._async_ownership import (
     create_owned_task,
     gather_owned,
     owned_task_error,
+    owned_task_observation_control,
     raise_owned_outcome,
 )
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
@@ -82,6 +83,7 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_custody_snapshot,
     current_execution_custody,
     execution_commit_outcome,
+    execution_denial_scopes,
     execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
@@ -812,9 +814,8 @@ class _HostOwnedFacadeOperation:
     and late-retention decision to that original object.
 
     Coroutines and immediate values retain their compatibility path: the named
-    host task *is* their operation.  A same-loop Future/Task additionally gets
-    a named observer task for diagnostics, but the Future remains authoritative
-    for ownership.  Cross-loop Futures cannot safely be awaited here; they are
+    host task *is* their operation. A returned Future/Task is already owned:
+    it needs no competing observer Task. Cross-loop Futures cannot safely be awaited here; they are
     retained and cancelled/observed through their owning loop, while callers
     fail closed without starting a competing lifecycle operation.
     """
@@ -825,6 +826,9 @@ class _HostOwnedFacadeOperation:
         self._source: asyncio.Future[Any] | None = None
         self._source_loop: asyncio.AbstractEventLoop | None = None
         self._host_task: asyncio.Task[Any] | None = None
+        self._admission = OwnedTaskAdmission()
+        self._opening: BaseException | None = None
+        self._settlement_poll: asyncio.TimerHandle | None = None
         self._foreign_loop = False
         self._done_callbacks: list[Callable[["_HostOwnedFacadeOperation"], None]] = []
         # A foreign Future may only be consumed by its owning loop.  Until that
@@ -850,24 +854,48 @@ class _HostOwnedFacadeOperation:
             self._source = operation
             self._source_loop = operation.get_loop()
             self._foreign_loop = self._source_loop is not self._host_loop
-            if not self._foreign_loop:
-                self._host_task = asyncio.create_task(
-                    self._observe_source(operation), name=name
-                )
-                self._host_task.add_done_callback(_consume_late_lifecycle_task_outcome)
-            self._install_source_settlement_observer()
+            try:
+                self._install_source_settlement_observer()
+            except BaseException as error:
+                self._opening = error
+                self._poll_failed_publication()
             return
 
         async def await_operation() -> Any:
             return await _maybe_await(operation)
 
-        self._host_task = asyncio.create_task(await_operation(), name=name)
-        self._host_task.add_done_callback(self._notify_settled)
+        # Pass the actual coroutine to canonical admission: closing only an
+        # unstarted adapter wrapper would leak that original on refusal.
+        recipe = operation if inspect.isawaitable(operation) else await_operation()
+        try:
+            create_owned_task(recipe, name=name, retain_originals=True,
+                              admission=self._admission)
+        except BaseException as error:
+            self._opening = error
+        self._host_task = self._admission.task
+        if self._host_task is not None:
+            try:
+                self._host_task.add_done_callback(self._notify_settled)
+            except BaseException as error:
+                self._opening = execution_terminal_error(
+                    self._opening, error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+                self._poll_failed_publication()
 
-    async def _observe_source(self, source: asyncio.Future[Any]) -> Any:
-        return raise_owned_outcome(
-            await await_owned_task(source), operation="isolated facade source",
-        )
+    def _poll_failed_publication(self) -> None:
+        """Neutral completion backstop only when callback publication failed.
+
+        No replacement Task or facade operation is allocated. The existing
+        bounded lifecycle owner still cancels/retains the exact original.
+        """
+        self._settlement_poll = None
+        if self.done():
+            self._notify_settled()
+        elif not self._host_loop.is_closed():
+            self._settlement_poll = self._host_loop.call_later(
+                0.02, self._poll_failed_publication,
+            )
 
     @property
     def foreign_loop(self) -> bool:
@@ -887,7 +915,7 @@ class _HostOwnedFacadeOperation:
         if self._foreign_loop:
             return self._foreign_settlement_acknowledged
         target = self._source if self._source is not None else self._host_task
-        return target is not None and target.done()
+        return target.done() if target is not None else self._opening is not None
 
     def cancelled(self) -> bool:
         # Do not inspect a foreign Future's terminal outcome from the host
@@ -910,10 +938,15 @@ class _HostOwnedFacadeOperation:
             )
         target = self._source if self._source is not None else self._host_task
         if target is None:
+            if self._opening is not None:
+                raise retained_execution_error(self._opening)
             raise RuntimeError("host-owned facade operation lost its completion target")
         if not target.done():
             return target.result()
-        error = owned_task_error(target)
+        error = execution_terminal_error(
+            self._opening, owned_task_error(target), retain_originals=True,
+            isolate_control_originals=True,
+        )
         if error is not None:
             raise retained_execution_error(error)
         return target.result()
@@ -1143,6 +1176,9 @@ class _HostOwnedFacadeOperation:
     def _notify_settled(self, _: asyncio.Future[Any] | None = None) -> None:
         if self._settlement_notified:
             return
+        if self._settlement_poll is not None:
+            self._settlement_poll.cancel()
+            self._settlement_poll = None
         self._settlement_notified = True
         callbacks, self._done_callbacks = self._done_callbacks, []
         for callback in callbacks:
@@ -1219,7 +1255,10 @@ async def _await_task_until_complete(
 
     if settle_on_cancellation:
         outcome = await await_owned_task(task)
-        terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+        terminal = execution_terminal_error(
+            outcome.error, outcome.cancellation, retain_originals=True,
+            isolate_control_originals=True,
+        )
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
         if outcome.error is not None:
@@ -1259,6 +1298,7 @@ async def _await_owned_facade_lifecycle_operation(
     on_completed: Callable[[], None] | None = None,
     on_timeout: Callable[[], None] | None = None,
     on_late_task: Callable[[_HostOwnedFacadeOperation], None],
+    on_admitted: Callable[[_HostOwnedFacadeOperation], None] | None = None,
 ) -> Any:
     """Own a facade operation without allowing it to hold lifecycle forever.
 
@@ -1281,6 +1321,8 @@ async def _await_owned_facade_lifecycle_operation(
     """
 
     task = _create_host_owned_facade_task(operation, name=name)
+    if on_admitted is not None:
+        on_admitted(task)
     if task.foreign_loop:
         # The original Future is retained before this failure is visible. Its
         # owner records both the exact operation and the facade fence, so no
@@ -1321,6 +1363,7 @@ async def _await_owned_facade_lifecycle_operation(
     owner_cancellation_count = owner.cancelling() if owner is not None else 0
     settled = _facade_settlement_event(task)
     cancellation_args: tuple[Any, ...] | None = None
+    cancellation_original: asyncio.CancelledError | None = None
 
     def parent_cancellation_arrived() -> bool:
         current_owner = asyncio.current_task()
@@ -1331,7 +1374,7 @@ async def _await_owned_facade_lifecycle_operation(
         )
 
     def remember_cancellation(exc: asyncio.CancelledError) -> None:
-        nonlocal cancellation_args
+        nonlocal cancellation_args, cancellation_original
 
         if cancellation_args is None and parent_cancellation_arrived():
             # This exception came from waiting on a neutral settlement event,
@@ -1339,6 +1382,7 @@ async def _await_owned_facade_lifecycle_operation(
             # Python's first-delivered semantics, including an empty first
             # cancellation followed by a later reason.
             cancellation_args = tuple(exc.args)
+            cancellation_original = exc
 
     async def observe_delivered_parent_cancellation() -> None:
         """Receive a cancellation accepted as a child settled concurrently."""
@@ -1353,7 +1397,7 @@ async def _await_owned_facade_lifecycle_operation(
     def replay_remembered_cancellation() -> NoReturn:
         """Raise the caller cancellation without retaining facade state."""
 
-        nonlocal operation, task, on_completed, on_timeout, on_late_task, owner
+        nonlocal operation, task, on_completed, on_timeout, on_late_task, on_admitted, owner
 
         # A CancelledError keeps this helper's traceback.  Clear every local
         # which can lead back to a facade task, a bound facade callback, or an
@@ -1363,13 +1407,14 @@ async def _await_owned_facade_lifecycle_operation(
         on_completed = None
         on_timeout = None
         on_late_task = None
+        on_admitted = None
         owner = None
         raise asyncio.CancelledError(*cancellation_args)
 
     def raise_authoritative_timeout() -> NoReturn:
         """Raise the host timeout without retaining a completed facade task."""
 
-        nonlocal operation, task, on_completed, on_timeout, on_late_task, owner
+        nonlocal operation, task, on_completed, on_timeout, on_late_task, on_admitted, owner
 
         # Like the cancellation path above, this public exception keeps this
         # helper's traceback.  A cooperative task can raise a secret-bearing
@@ -1380,6 +1425,7 @@ async def _await_owned_facade_lifecycle_operation(
         on_completed = None
         on_timeout = None
         on_late_task = None
+        on_admitted = None
         owner = None
         raise _FacadeLifecycleOperationTimedOut(
             "isolated facade lifecycle operation exceeded its settlement budget"
@@ -1454,7 +1500,10 @@ async def _await_owned_facade_lifecycle_operation(
         control = _consume_late_lifecycle_task_outcome(task)
         await observe_delivered_parent_cancellation()
         if control is not None:
-            raise retained_execution_error(control)
+            raise retained_execution_error(execution_terminal_error(
+                control, cancellation_original, retain_originals=True,
+                isolate_control_originals=True,
+            ))
         if cancellation_args is not None:
             replay_remembered_cancellation()
         raise_authoritative_timeout()
@@ -1467,7 +1516,10 @@ async def _await_owned_facade_lifecycle_operation(
 
     control = _consume_late_lifecycle_task_outcome(task)
     if control is not None:
-        raise retained_execution_error(control)
+        raise retained_execution_error(execution_terminal_error(
+            control, cancellation_original, retain_originals=True,
+            isolate_control_originals=True,
+        ))
 
     if cancellation_args is not None:
         # A cancellation already observed by this owner is its public result.
@@ -1937,6 +1989,77 @@ class _TrackedFacadeLifecycleTask:
     client_ref: weakref.ReferenceType[Any] | None
 
 
+@dataclass(eq=False)
+class _ProxyLifecycleAttempt:
+    """Metadata for one existing Core owner, never another physical closer."""
+
+    generation: int
+    resource: Any = field(default=None, repr=False)
+    admission: OwnedTaskAdmission = field(default_factory=OwnedTaskAdmission)
+    opening: BaseException | None = field(default=None, repr=False)
+    failure: BaseException | None = field(default=None, repr=False)
+    disposition: str = "pending"
+    harvested: bool = False
+
+    def start(self, operation: Any, *, name: str) -> None:
+        try:
+            create_owned_task(operation, name=name, retain_originals=True,
+                              admission=self.admission)
+        except BaseException as error:
+            self.opening = error
+
+    async def join(self, *, settle_on_cancellation: bool = True) -> Any:
+        task = self.admission.task
+        observed = None
+        result = None
+        if task is not None:
+            try:
+                if settle_on_cancellation:
+                    outcome = await await_owned_task(task)
+                    result = outcome.result
+                    source = owned_task_observation_control(outcome)
+                    if is_execution_control_error(source) and execution_denial_scopes(source) != ():
+                        self.failure = execution_terminal_error(
+                            self.failure, source, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
+                    observed = execution_terminal_error(
+                        outcome.error, outcome.cancellation, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
+                else:
+                    result = await _await_task_until_complete(
+                        task, preserve_cancellation=False,
+                        settle_on_cancellation=False,
+                    )
+            except BaseException as error:
+                observed = error
+        if not self.harvested and (task is None or task.done()):
+            physical = execution_terminal_error(
+                self.opening, owned_task_error(task) if task is not None else None,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if physical is not None and self.resource is not None:
+                debt = RuntimeError("original proxy lifecycle owner did not retire")
+                debt._kestrel_native_retirement_debts = ((self.resource, task),)
+                physical = execution_terminal_error(
+                    physical, debt, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            self.failure = execution_terminal_error(
+                self.failure, physical, retain_originals=True,
+                isolate_control_originals=True,
+            )
+            self.harvested = True
+        terminal = execution_terminal_error(
+            self.failure, self.opening, observed, retain_originals=True,
+            isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise retained_execution_error(terminal)
+        return result
+
+
 @dataclass
 class _TerminalStopCompletionMarker:
     """An exact stop-completion marker with safe non-weakref fallback.
@@ -1954,6 +2077,8 @@ class _TerminalStopCompletionMarker:
     # forgetting a marker which the callback later recreates after retirement.
     completed: bool = False
     terminal_retirement_claimed: bool = False
+    operation: _HostOwnedFacadeOperation | None = field(default=None, repr=False)
+    failure: BaseException | None = field(default=None, repr=False)
 
     def client(self) -> Any:
         return self.weak_client() if self.weak_client is not None else self.strong_client
@@ -6744,6 +6869,9 @@ class ProxyFeature(Feature):
         # caller cancellation cannot strand a second cleanup behind
         # ``_reload_lock`` after the first caller has unwound.
         self._terminal_cleanup_task: Optional[asyncio.Task[None]] = None
+        self._terminal_cleanup_owner: _ProxyLifecycleAttempt | None = None
+        self._terminal_cleanup_owned_attempts: list[_ProxyLifecycleAttempt] = []
+        self._initialization_attempts: list[_ProxyLifecycleAttempt] = []
         # Terminal retirement has a narrower ownership domain than a reload:
         # an owner which already holds ``_reload_lock`` must be able to finish
         # its terminal fence without waiting for a shared cleanup that is
@@ -8218,18 +8346,24 @@ class ProxyFeature(Feature):
             enable_generation = self._latch_terminal_lifecycle()
             await self._complete_terminal_cleanup()
 
-        task = asyncio.create_task(
-            self._initialize_uninterrupted(enable_generation),
-            name=f"isolated-initialize:{self.name}",
-        )
+        attempt = _ProxyLifecycleAttempt(enable_generation)
+        self._initialization_attempts.append(attempt)
+        attempt.start(self._initialize_uninterrupted(enable_generation),
+                      name=f"isolated-initialize:{self.name}")
         try:
-            await _await_task_until_complete(task, preserve_cancellation=False)
-        except BaseException:
+            await attempt.join()
+        except BaseException as opening:
             # This also covers a cancellation observed after the inner task
             # successfully reset the gate.  A cancelled initialize is never a
             # successful publication from its caller's perspective.
-            await self._quarantine_unreconciled_client()
+            self._retain_execution_control(attempt.failure)
+            await self._quarantine_unreconciled_client(
+                prior_error=opening, retain_prior_control=False,
+            )
             raise
+        finally:
+            if not is_execution_control_error(attempt.failure):
+                self._initialization_attempts.remove(attempt)
 
     async def _initialize_uninterrupted(self, terminal_generation: int) -> None:
         """Build and publish a fresh child while holding lifecycle ownership."""
@@ -8243,8 +8377,12 @@ class ProxyFeature(Feature):
             # A completed shutdown/quarantine transaction belongs to the old
             # enable cycle.  A later explicit initialize gets a fresh terminal
             # transaction if this new cycle subsequently fails.
-            if self._terminal_cleanup_task is not None and self._terminal_cleanup_task.done():
+            if (self._terminal_cleanup_task is not None
+                and self._terminal_cleanup_task.done()
+                and self._terminal_cleanup_owner is not None
+                and self._terminal_cleanup_owner.disposition == "retired"):
                 self._terminal_cleanup_task = None
+                self._terminal_cleanup_owner = None
             # Reset lifecycle state to the fresh-start baseline BEFORE the client or
             # supervisor start. ``shutdown()`` latches ``_stopping=True`` to unwind
             # the health supervisor; runtime re-enable re-runs this SAME instance's
@@ -8312,13 +8450,10 @@ class ProxyFeature(Feature):
 
         require_execution_work(self.agent)
         started = asyncio.get_running_loop().time()
-        task = asyncio.create_task(
-            asyncio.to_thread(self.ensure_venv),
-            name=f"isolated-venv-prepare:{self.name}",
-        )
-        environment_mutated = await _await_task_until_complete(
-            task, preserve_cancellation=False
-        )
+        attempt = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation)
+        attempt.start(asyncio.to_thread(self.ensure_venv),
+                      name=f"isolated-venv-prepare:{self.name}")
+        environment_mutated = await attempt.join()
         require_execution_work(self.agent)
         self._last_provision_seconds = asyncio.get_running_loop().time() - started
         self._last_cache_hit = not environment_mutated
@@ -8386,11 +8521,15 @@ class ProxyFeature(Feature):
         # accepted foreign Task would silently adopt an operation we do not own.
         if not asyncio.iscoroutine(operation):
             raise TypeError("gate lifecycle operation must be a fresh coroutine")
-        task = create_owned_task(operation, name=f"isolated-traffic-{name}:{self.name}")
-        await _await_task_until_complete(
-            task,
-            preserve_cancellation=preserve_cancellation,
-        )
+        attempt = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation)
+        attempt.start(operation, name=f"isolated-traffic-{name}:{self.name}")
+        # Gate mutations must settle before their lifecycle owner releases its
+        # lock, including accepted-then-failed callback publication.
+        try:
+            await attempt.join()
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error) or not preserve_cancellation:
+                raise
 
     async def _close_traffic_gate(self) -> None:
         await self._run_traffic_gate_operation(
@@ -8804,6 +8943,11 @@ class ProxyFeature(Feature):
             if marked_client is not client:
                 retained_markers.append(marker)
                 continue
+            if marker.failure is not None:
+                # Native-unresolved originals cannot be revoked by restart or
+                # by a queued terminal owner arriving after physical failure.
+                retained_markers.append(marker)
+                continue
             if marker.completed:
                 found = True
                 continue
@@ -8966,7 +9110,8 @@ class ProxyFeature(Feature):
 
     def _retain_execution_control(self, error: BaseException | None) -> None:
         """One strongest receipt across all ordinary and facade work owners."""
-        if error is not None and is_execution_control_error(error):
+        if (error is not None and is_execution_control_error(error)
+            and execution_denial_scopes(error) != ()):
             self._event_ingress_control = execution_terminal_error(
                 vars(self).get("_event_ingress_control"), error,
             )
@@ -9083,6 +9228,13 @@ class ProxyFeature(Feature):
         """
 
         async with self._terminal_retirement_lock:
+            for marker in self._terminal_stop_completed_client_markers:
+                if marker.failure is not None and any(
+                    client is marker.client() for client in self._terminal_retirement_clients
+                ):
+                    self._retain_execution_control(marker.failure)
+                    self._terminal_cleanup_uncertain = True
+                    return False
             if retry_retirement:
                 # A concurrent owned quarantine may have failed while this
                 # explicit retry waited for the same client. Begin its fresh
@@ -9101,6 +9253,25 @@ class ProxyFeature(Feature):
                     # and require its completion before a fresh retry.
                     self._terminal_cleanup_uncertain = True
                     return False
+                marker = self._begin_terminal_stop_completion(client)
+
+                def admitted(operation: _HostOwnedFacadeOperation) -> None:
+                    if marker is not None:
+                        marker.operation = operation
+
+                def retain_native_failure(error: BaseException) -> None:
+                    # Physical source only: a finite waiter's cancellation
+                    # must not become another caller's withdrawal history.
+                    source = (_consume_late_lifecycle_task_outcome(marker.operation)
+                              if marker is not None and marker.operation is not None
+                              and marker.operation.done() else error)
+                    if is_execution_control_error(source) and execution_denial_scopes(source) != ():
+                        if marker is not None:
+                            marker.failure = source
+                        self._retain_execution_control(source)
+                    else:
+                        self._discard_terminal_stop_completion(marker)
+
                 try:
                     await _await_owned_facade_lifecycle_operation(
                         client.stop(),
@@ -9114,13 +9285,16 @@ class ProxyFeature(Feature):
                         on_late_task=lambda task, client=client: self._retain_terminal_lifecycle_task(
                             task, client
                         ),
+                        on_admitted=admitted,
                     )
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as error:
+                    retain_native_failure(error)
                     # The owned stop task has already reached its terminal
                     # process state.  Let the caller replay its original
                     # cancellation rather than rewriting it as a stop failure.
                     raise
                 except _FacadeLifecycleOperationTimedOut:
+                    self._discard_terminal_stop_completion(marker)
                     logger.error(
                         "Isolated feature %s terminal stop exceeded its bounded "
                         "facade lifecycle budget; the proxy remains sealed for retry",
@@ -9128,6 +9302,7 @@ class ProxyFeature(Feature):
                     )
                     return False
                 except BaseException as error:  # noqa: BLE001 - hostile stop can raise non-Exception
+                    retain_native_failure(error)
                     self._retain_execution_control(error)
                     self._terminal_cleanup_uncertain = True
                     logger.error(
@@ -9136,6 +9311,8 @@ class ProxyFeature(Feature):
                         self.name,
                     )
                     return False
+                else:
+                    self._discard_terminal_stop_completion(marker)
         return True
 
     async def reload(self) -> None:
@@ -9257,15 +9434,22 @@ class ProxyFeature(Feature):
         """
 
         self._latch_terminal_lifecycle()
-        self._terminal_cleanup_uncertain = False
-        task = self._terminal_cleanup_task
-        if task is None or task.done():
-            self._terminal_cleanup_task = asyncio.create_task(
-                self._terminal_cleanup_uninterrupted(
-                    lifecycle_lock_held=False, retry_retirement=True,
-                ),
-                name=f"isolated-terminal-cleanup:{self.name}",
-            )
+        self._admit_terminal_cleanup(retry_retirement=True)
+
+    def _admit_terminal_cleanup(self, *, retry_retirement: bool) -> _ProxyLifecycleAttempt:
+        """Publish the canonical receipt before callback publication can fail."""
+        attempt = self._terminal_cleanup_owner
+        if attempt is not None:
+            return attempt
+        self._terminal_cleanup_uncertain = False if retry_retirement else self._terminal_cleanup_uncertain
+        resource = self if self._client is not None or self._terminal_retirement_clients else None
+        attempt = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation, resource)
+        self._terminal_cleanup_owner = attempt
+        attempt.start(self._terminal_cleanup_uninterrupted(
+            lifecycle_lock_held=False, retry_retirement=retry_retirement,
+        ), name=f"isolated-terminal-cleanup:{self.name}")
+        self._terminal_cleanup_task = attempt.admission.task
+        return attempt
 
     async def shutdown_with_agent_deadline(self) -> None:
         """Shutdown under KestrelAgent's bounded fair-share lifecycle owner.
@@ -9280,7 +9464,7 @@ class ProxyFeature(Feature):
         # Direct callers retain the normal shutdown contract.  KestrelAgent
         # has already prepared the shared task synchronously before it applies
         # its fair-share timeout.
-        if self._terminal_cleanup_task is None:
+        if self._terminal_cleanup_owner is None:
             self.prepare_shutdown_with_agent_deadline()
         token = _AGENT_SHUTDOWN_DEADLINE_ACTIVE.set(True)
         try:
@@ -9306,11 +9490,19 @@ class ProxyFeature(Feature):
         cancelling an SDK stop coroutine that owns a process handle.
         """
 
-        # An explicit lifecycle caller is a new bounded retirement attempt. A
-        # best-effort supervisor/quarantine cleanup that just fenced a facade
-        # timeout must instead preserve uncertainty and return promptly.
-        if not best_effort:
-            self._terminal_cleanup_uncertain = False
+        unresolved = next((attempt for attempt in (
+            self._terminal_cleanup_owner, *self._terminal_cleanup_owned_attempts,
+        ) if attempt is not None and attempt.disposition == "native-unresolved"), None)
+        if unresolved is not None:
+            # A neutral Task returning None is not physical/native settlement.
+            # Re-observe that exact original; never allocate a replacement.
+            await unresolved.join()
+            terminal = execution_terminal_error(unresolved.failure,
+                vars(self).get("_event_ingress_control"), retain_originals=True,
+                isolate_control_originals=True)
+            if terminal is not None:
+                raise retained_execution_error(terminal)
+            return
 
         if lifecycle_lock_held:
             # A set-config/reload owner cannot await the shared terminal task:
@@ -9320,40 +9512,36 @@ class ProxyFeature(Feature):
             # separate shielded task instead.  It does not acquire the lock, so
             # neither the cleanup nor the original shutdown can be orphaned in
             # a lock cycle.
-            task = asyncio.create_task(
-                self._terminal_cleanup_uninterrupted(
-                    lifecycle_lock_held=True,
-                    retry_retirement=not best_effort,
-                ),
-                name=f"isolated-terminal-cleanup-owned:{self.name}",
-            )
+            attempt = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation,
+                self if self._client is not None or self._terminal_retirement_clients else None)
+            self._terminal_cleanup_owned_attempts.append(attempt)
+            attempt.start(self._terminal_cleanup_uninterrupted(
+                lifecycle_lock_held=True, retry_retirement=not best_effort,
+            ), name=f"isolated-terminal-cleanup-owned:{self.name}")
             # This owner-local task is not stored on the proxy.  It must drain
             # through cancellation; only the shared task in the branch below
             # can safely be handed back to KestrelAgent's deadline owner.
-            await _await_task_until_complete(task, preserve_cancellation=False)
-        else:
-            task = self._terminal_cleanup_task
-            if task is None or task.done():
-                task = asyncio.create_task(
-                    self._terminal_cleanup_uninterrupted(
-                        lifecycle_lock_held=False,
-                        retry_retirement=not best_effort,
-                    ),
-                    name=f"isolated-terminal-cleanup:{self.name}",
-                )
-                self._terminal_cleanup_task = task
             try:
-                await _await_task_until_complete(
-                    task,
-                    preserve_cancellation=False,
+                await attempt.join()
+            finally:
+                self._classify_terminal_cleanup_attempt(attempt)
+                if attempt.disposition != "native-unresolved":
+                    self._terminal_cleanup_owned_attempts.remove(attempt)
+        else:
+            attempt = self._admit_terminal_cleanup(retry_retirement=not best_effort)
+            try:
+                await attempt.join(
                     settle_on_cancellation=not _AGENT_SHUTDOWN_DEADLINE_ACTIVE.get(),
                 )
             finally:
                 # A settled shared task has no policy-bearing result and must
                 # not become a stale lifecycle handle.  A later explicit call
                 # creates a fresh neutral attempt if any exact client remains.
-                if self._terminal_cleanup_task is task and task.done():
+                self._classify_terminal_cleanup_attempt(attempt)
+                if (self._terminal_cleanup_owner is attempt
+                    and attempt.disposition in {"retired", "ordinary-incomplete"}):
                     self._terminal_cleanup_task = None
+                    self._terminal_cleanup_owner = None
 
         if not best_effort and (
             self._terminal_cleanup_uncertain
@@ -9374,6 +9562,24 @@ class ProxyFeature(Feature):
             )
         if not best_effort and vars(self).get("_event_ingress_control") is not None:
             raise retained_execution_error(self._event_ingress_control)
+
+    def _classify_terminal_cleanup_attempt(self, attempt: _ProxyLifecycleAttempt) -> None:
+        task = attempt.admission.task
+        if task is not None and not task.done():
+            return  # The fair-share deadline transferred this SAME owner.
+        control = execution_terminal_error(attempt.failure,
+            vars(self).get("_event_ingress_control"), retain_originals=True,
+            isolate_control_originals=True)
+        if is_execution_control_error(control):
+            attempt.failure = control
+            attempt.disposition = "native-unresolved"
+            self._terminal_cleanup_uncertain = True
+            self._retain_execution_control(control)
+        elif (attempt.failure is not None or self._terminal_cleanup_uncertain
+              or self._terminal_retirement_clients or self._has_running_terminal_health_probe_task()):
+            attempt.disposition = "ordinary-incomplete"
+        else:
+            attempt.disposition = "retired"
 
     async def _terminal_cleanup_uninterrupted(
         self,
@@ -10685,6 +10891,7 @@ class ProxyFeature(Feature):
         *,
         lifecycle_lock_held: bool = False,
         prior_error: BaseException | None = None,
+        retain_prior_control: bool = True,
     ) -> None:
         """Fail closed when a recovery child cannot be reconciled to storage.
 
@@ -10699,7 +10906,8 @@ class ProxyFeature(Feature):
         # a cancellation delivered after seal cannot skip unpublication,
         # adapter removal, supervision cancellation, or best-effort retirement
         # while the task is still waiting on another lifecycle owner.
-        self._retain_execution_control(prior_error)
+        if retain_prior_control:
+            self._retain_execution_control(prior_error)
         self._latch_terminal_lifecycle()
         cleanup_error = None
         try:
@@ -10711,6 +10919,7 @@ class ProxyFeature(Feature):
             cleanup_error = error
         terminal = execution_terminal_error(
             vars(self).get("_event_ingress_control"), prior_error, cleanup_error,
+            retain_originals=True, isolate_control_originals=True,
         )
         if prior_error is not None and terminal is not None and is_execution_control_error(terminal):
             raise terminal

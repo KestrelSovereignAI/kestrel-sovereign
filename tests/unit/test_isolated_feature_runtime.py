@@ -3987,12 +3987,14 @@ def test_hosted_lifecycle_policy_requires_and_binds_explicit_agent_scope(tmp_pat
         KestrelAgent(
             did="did:test:unscoped-idle",
             storage_path=str(tmp_path / "unscoped" / "agent.db"),
+            llm_service=Mock(providers=[]),  # This constructor-policy test owns no providers.
             isolated_runtime_idle_timeout_seconds=60,
         )
 
     agent = KestrelAgent(
         did="did:test:scoped-idle",
         storage_path=str(tmp_path / "scoped" / "agent.db"),
+        llm_service=Mock(providers=[]),
         isolated_runtime_root=tmp_path / "runtimes",
         isolated_runtime_namespace="tenant/agent",
         isolated_runtime_idle_timeout_seconds=60,

@@ -75,6 +75,16 @@ one new generation. Failed or cancellation-resistant stops seal the proxy and
 retain the exact client for terminal cleanup; they are never reported as idle
 success. A transient cold-start failure instead restores the idle/retryable
 state, and caller cancellation cannot interrupt a wake transaction midway.
+
+Initialization and terminal cleanup retain their original Task admission receipt,
+including allocation refusal or callback-publication failure. Completed is not
+the same as retired: an unresolved native outcome keeps its exact original
+operation fenced, even for a shutdown already queued on the retirement lock.
+Ordinary facade failures retain bounded retry after the original operation
+settles; successful retirement and a settled acknowledgement alone do not create
+permanent cleanup debt. Each finite observer keeps its own original withdrawal
+without adding that cancellation to another observer's shared source history.
+
 Wake preparation failures retain the existing secret-free tool error envelope;
 an ancillary telemetry failure after publication leaves the live child running
 and supervised rather than misclassifying it as idle.

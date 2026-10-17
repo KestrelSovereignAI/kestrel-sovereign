@@ -3,6 +3,7 @@
 import asyncio
 
 import httpx
+import httpx2
 import pytest
 from google import genai
 from google.auth.credentials import AnonymousCredentials
@@ -21,11 +22,12 @@ from tests.unit.test_execution_custody_review43_native import carries
 async def test_temporary_client_close_cannot_erase_original_control(
     monkeypatch, adapter, kind, close_failure,
 ):
+    native_http = httpx2 if adapter == "anthropic" else httpx
     original = receipt(kind)
     entered, release = asyncio.Event(), asyncio.Event()
     retired = []
 
-    class Transport(httpx.AsyncBaseTransport):
+    class Transport(native_http.AsyncBaseTransport):
         async def handle_async_request(self, request):
             raise original
 
@@ -36,9 +38,9 @@ async def test_temporary_client_close_cannot_erase_original_control(
             if close_failure:
                 raise RuntimeError("ordinary native transport close failure")
 
-    native_client = httpx.AsyncClient
+    native_client = native_http.AsyncClient
     client = native_client(transport=Transport())
-    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr(native_http, "AsyncClient", lambda *a, **k: client)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-transport-only")
     monkeypatch.setenv("OPENROUTER_API_KEY", "offline-transport-only")
     instance = AnthropicAdapter() if adapter == "anthropic" else OpenRouterAdapter()

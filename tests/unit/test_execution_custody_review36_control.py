@@ -3,6 +3,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.agent.privacy_state import PrivacyState, restore_privacy_state
@@ -65,6 +66,7 @@ async def test_constructed_manager_agent_keeps_initialization_control_after_clea
     agent, db = await native_owner(tmp_path)
     manager = module.AgentManager(base_data_dir=tmp_path)
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
     closed = []
     async def initialize():
         await db.execute("INSERT INTO effects VALUES (1)")
@@ -85,7 +87,8 @@ async def test_constructed_manager_agent_keeps_initialization_control_after_clea
         outcome = await await_owned_task(asyncio.create_task(manager._initialize_agent(
             "child", LocalAgentConfig(data_dir=str(tmp_path), port=18888))))
         assert closed == [True] and db.backend._connection is None
-        assert outcome.error is failure, "constructed Agent rollback replaced initialization control"
+        source.assert_retained(outcome.error, resource=agent,
+                               task=agent._unpublished_cleanup_owner.admission.task)
         assert agent._shutdown_control is failure
     finally:
         await db.close()
@@ -99,6 +102,7 @@ async def test_batch_fatal_cleanup_includes_all_native_initializer_receipts(monk
     agent, db = await native_owner(tmp_path)
     manager = AgentManager(base_data_dir=tmp_path)
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
     async def initialize(name, *_args, **_kwargs):
         if name == "Alpha":
             raise asyncio.CancelledError("ordinary first initializer cancellation")
@@ -116,7 +120,9 @@ async def test_batch_fatal_cleanup_includes_all_native_initializer_receipts(monk
     try:
         outcome = await await_owned_task(asyncio.create_task(manager.load_from_config(config)))
         assert db.backend._connection is None and not manager.list_agents()
-        assert outcome.error is failure, "cleanup branch omitted later initializer's native receipt"
+        source.assert_retained(outcome.error, resource=agent,
+                               task=agent._unpublished_cleanup_owner.admission.task)
+        assert manager._agent_operations["gamma"].child is agent
     finally:
         await db.close()
 
@@ -244,6 +250,7 @@ async def test_native_config_cas_uncertainty_survives_recovery(monkeypatch, tmp_
         def require_work(self):
             pass
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
     agent, db, feature, client, _event, _entered, release = await owner(monkeypatch, tmp_path, failure)
     scope = ExecutionCustody(LocalFence())
     native_cas = agent.storage.compare_and_swap_node
@@ -272,7 +279,7 @@ async def test_native_config_cas_uncertainty_survives_recovery(monkeypatch, tmp_
     try:
         outcome = await await_owned_task(asyncio.create_task(apply()))
         assert commits == ["swapped"], "uncertain native CAS was retried"
-        assert outcome.error is failure, "CAS recovery replaced original native receipt"
+        source.assert_retained(outcome.error)
         assert client.stopped and feature._client is None and feature._terminal_lifecycle_latched
     finally:
         release.set()
