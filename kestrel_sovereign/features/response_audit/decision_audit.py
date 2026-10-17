@@ -28,12 +28,20 @@ without any special casing: nothing from the response can leak through it.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
-from kestrel_sdk.llm.decisions import DecisionError, DecisionRequest, NoulQuestion
+from kestrel_sdk.llm.decisions import (
+    DecisionError,
+    DecisionRequest,
+    DecisionUnavailable,
+    NoulQuestion,
+)
 
 if TYPE_CHECKING:
     from kestrel_sovereign.llm.decisions.evaluation import Sample
+
+logger = logging.getLogger(__name__)
 
 #: Caller id keying ``[decisions.thresholds]`` and decision telemetry.
 AUDIT_CALLER = "response_audit"
@@ -225,8 +233,16 @@ async def decision_audit(
 
     ``request`` is the user text the reply answers and ``tool_results`` the
     turn's tool result envelopes (reduced by :func:`tool_outcomes_for_audit`).
-    Any decision failure returns ``audited=False`` with risk 3, exactly like
-    a chat-audit provider failure, so strict mode fails closed.
+    Both outcomes below are ``audited=False``, so strict mode fails closed on
+    either; they differ only in what warn mode shows, as on the chat backend:
+
+    * ``DecisionUnavailable``: no route could take the audit and nothing was
+      sent (a privacy mode with no local decision route, or none calibrated
+      for this caller under ``uncalibrated = "refuse"``). Risk 1 with a
+      ``reason``, like the chat audit's no-route skip: an audit that did not
+      run says nothing about the reply.
+    * Any other decision failure (timeout, transport, protocol): risk 3, like
+      a chat-audit provider failure.
     """
 
     outcomes, omitted = tool_outcomes_for_audit(tool_results)
@@ -242,6 +258,19 @@ async def decision_audit(
             threshold_keys=keys,
             default_thresholds=DEFAULT_THRESHOLDS,
         )
+    except DecisionUnavailable as exc:
+        # Route ids and reason codes only, so the reasoning stays content-free.
+        rejected = ", ".join(f"{r.route} {r.reason.value}" for r in exc.rejections)
+        reasoning = f"Decision audit skipped: {exc.reason.value}" + (
+            f" ({rejected})" if rejected else ""
+        )
+        logger.warning("Response audit did not run: %s", reasoning)
+        return {
+            "risk_level": 1,
+            "reasoning": reasoning,
+            "audited": False,
+            "reason": exc.reason.value,
+        }
     except DecisionError as exc:
         return {
             "risk_level": 3,

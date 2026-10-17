@@ -11,10 +11,14 @@ import pytest
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sdk.llm.decisions import (
+    DecisionProtocolError,
     DecisionResult,
     DecisionTimeout,
+    DecisionTransportError,
     DecisionUnavailable,
     NoulAnswer,
+    RejectionReason,
+    RouteRejection,
     UnavailableReason,
 )
 
@@ -142,11 +146,59 @@ async def test_decision_audit_uses_resolved_thresholds_and_content_free_reasonin
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", [DecisionTimeout("slow"),
-                                   DecisionUnavailable(UnavailableReason.NO_LOCAL_ROUTE, "x")])
+                                   DecisionTransportError("502"),
+                                   DecisionProtocolError("bad answer")])
 async def test_decision_failure_is_an_unrun_audit(error) -> None:
     result = await da.decision_audit(_service(0, 0, error=error), "text")
     assert result == {"risk_level": 3, "audited": False,
                       "reasoning": f"Decision audit failed: {type(error).__name__}"}
+
+
+_REFUSED_LOCAL = DecisionUnavailable(
+    UnavailableReason.NO_CANDIDATE, f"refused: {SECRET}",
+    rejections=(RouteRejection("ollama:local", RejectionReason.NOT_CALIBRATED,
+                               model="tev1:0.8b", detail=SECRET),),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, expected", [
+    (_REFUSED_LOCAL, "Decision audit skipped: no_candidate (ollama:local not_calibrated)"),
+    (DecisionUnavailable(UnavailableReason.NO_LOCAL_ROUTE, "x"),
+     "Decision audit skipped: no_local_route"),
+])
+async def test_no_route_is_a_skipped_audit_not_a_risky_reply(error, expected) -> None:
+    """Nothing was sent, so the reply was not judged: risk 1 like the chat
+    audit's no-route skip, still ``audited=False``, and content-free."""
+    result = await da.decision_audit(_service(0, 0, error=error), "text")
+    assert result == {"risk_level": 1, "audited": False, "reasoning": expected,
+                      "reason": error.reason.value}
+
+
+@pytest.mark.asyncio
+async def test_warn_hook_passes_a_reply_no_route_could_audit_untouched() -> None:
+    """The privacy-mode case with ``uncalibrated = "refuse"``: warn mode must
+    not stamp a risk-3 warning on every reply (the chat twin is
+    ``test_warn_hook_does_not_send_or_block_when_no_local_route_can_audit``)."""
+    agent = _agent(_service(0, 0, error=_REFUSED_LOCAL))
+    hook = ResponseAuditHook(
+        agent=agent, mode="warn",
+        auditor=lambda text, redact, **turn: da.decision_audit(agent.llm_service, text, **turn))
+    out = await hook.execute(_hook_input("A perfectly ordinary answer in a privacy mode."))
+    assert out.permission_decision == PermissionDecision.ALLOW
+    assert out.updated_input is None
+
+
+@pytest.mark.asyncio
+async def test_strict_hook_still_denies_a_reply_no_route_could_audit() -> None:
+    agent = _agent(_service(0, 0, error=_REFUSED_LOCAL))
+    hook = ResponseAuditHook(
+        agent=agent, mode="strict",
+        auditor=lambda text, redact, **turn: da.decision_audit(agent.llm_service, text, **turn))
+    out = await hook.execute(_hook_input("A perfectly ordinary answer in a privacy mode."))
+    assert out.permission_decision == PermissionDecision.DENY
+    assert "unavailable" in out.permission_reason
+    assert SECRET not in out.permission_reason
 
 
 def _hook_input(text: str) -> HookInput:
