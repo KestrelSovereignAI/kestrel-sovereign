@@ -30,10 +30,9 @@ _POST_SUITE_MARGIN_MINUTES = 1.0
 
 # (tier named in `budget-basis(<tier>)`, ci.yml job id, suite path)
 _TIERS = [
-    pytest.param("unit", "unit-tests", "tests/unit/", id="unit"),
-    pytest.param(
-        "integration", "integration-tests", "tests/integration/", id="integration"
-    ),
+    ("unit", "unit-tests", "tests/unit/"),
+    ("integration", "integration-tests", "tests/integration/"),
+    ("mcp", "mcp-permission-seam", "tests/integration/test_mcp_permission_boundary.py"),
 ]
 
 
@@ -93,7 +92,7 @@ def test_each_tier_has_its_own_marker():
         "an untiered `budget-basis:` marker is ambiguous; "
         "write `budget-basis(<tier>):`"
     )
-    for tier in ("unit", "integration"):
+    for tier, _, _ in _TIERS:
         assert len(budget_basis_pattern(tier).findall(text)) == 1, (
             f"expected exactly one budget-basis({tier}) marker"
         )
