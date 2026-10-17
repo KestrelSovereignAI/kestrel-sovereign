@@ -651,6 +651,7 @@ class OwnedAsyncIterator(Generic[_T]):
                             self._cleanup_error = error
                             self._terminal_error = execution_terminal_error(
                                 self._terminal_error, error,
+                                retain_originals=True, isolate_control_originals=True,
                             )
                             raise self._terminal_error
             finally:
@@ -704,7 +705,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 debt for debt in error._kestrel_native_retirement_debts
                 if not (debt[0] is self and debt[1] is self._owner)
             )
-        raise_owned_outcome(outcome, operation=self._operation)
+        raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
 
 
 def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:

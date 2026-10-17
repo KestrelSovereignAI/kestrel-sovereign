@@ -1377,7 +1377,7 @@ class _ExecutionForwarder:
             try:
                 await self.aclose()
             except BaseException as cleanup_error:
-                raise execution_terminal_error(error, cleanup_error, retain_originals=True)
+                raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
             if not is_execution_control_error(error):
                 with _bind_captured_custody(self._scopes):
                     require_execution_work(self._runtime_owner)
@@ -1423,7 +1423,7 @@ class _ExecutionForwarder:
                     except BaseException as cleanup_error:
                         self._source_exhausted = False
                         self._cleanup_state.requested = True
-                        raise execution_terminal_error(error, cleanup_error)
+                        raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
 
     async def aclose(self):
         # Normal EOF completes this source, not a queued child's independent
@@ -1447,8 +1447,8 @@ async def close_execution_stream(
     close = getattr(stream, "aclose", None)
     if callable(close):
         with bind_execution_cleanup(owner, captured):
-            outcome = await await_owned_task(create_owned_task(close(), retirement_resource=stream))
-            error = execution_terminal_error(outcome.error, outcome.cancellation)
+            outcome = await await_owned_task(create_owned_task(close(), retirement_resource=stream, retain_originals=True))
+            error = execution_terminal_error(outcome.error, outcome.cancellation, retain_originals=True, isolate_control_originals=True)
             if error is not None:
                 raise error
 
@@ -1467,7 +1467,7 @@ async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
         try:
             await iterator.aclose()
         except BaseException as cleanup_error:
-            raise execution_terminal_error(error, cleanup_error)
+            raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
 
 
 def execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody: tuple[ExecutionCustody, ...] = (), lifecycle: ExecutionStreamLifecycle | None = None) -> AsyncIterator[Any]:

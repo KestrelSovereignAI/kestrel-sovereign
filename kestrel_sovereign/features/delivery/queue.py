@@ -30,7 +30,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
+    owned_task_join_ancestors,
+    pending_owned_retirement_error,
+)
 from kestrel_sovereign.features.delivery.models import (
     DeliveryResult,
     DeliveryStatus,
@@ -228,6 +234,19 @@ class DeliveryQueue:
 
     async def start(self):
         """Create DB tables and launch the background worker."""
+        if self._task is not None:
+            terminal = execution_terminal_error(
+                getattr(self, "_worker_control", None),
+                owned_task_error(self._task) if self._task.done() else None,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if terminal is not None and is_execution_control_error(terminal):
+                raise terminal
+            if not self._task.done():
+                raise pending_owned_retirement_error(
+                    self, (self._task,),
+                    message="original delivery worker must settle before restart",
+                )
         await self._ensure_tables()
         await self._reclaim_in_flight()
         self._stop_requested.clear()
@@ -250,6 +269,18 @@ class DeliveryQueue:
         self._stop_requested.set()
         terminal = getattr(self, "_worker_control", None)
         if self._task:
+            if self._task is asyncio.current_task() or self._task in owned_task_join_ancestors():
+                # A delivery callback cannot join the worker waiting on its
+                # own result. Request cooperative stop, retain the SAME owner,
+                # and report pending retirement rather than a successful ACK.
+                raise execution_terminal_error(
+                    terminal,
+                    pending_owned_retirement_error(
+                        self, (self._task,),
+                        message="delivery descendant cannot retire its waiting worker",
+                    ),
+                    retain_originals=True, isolate_control_originals=True,
+                )
             if not self._loop_entered and not self._task.done():
                 # The production factory may still be awaiting agent READY.
                 # No loop query/effect has been admitted, and that barrier

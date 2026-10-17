@@ -64,6 +64,19 @@ class _DeferredToolBatchCancellation:
 
     outcome: OwnedTaskOutcome[Any]
 
+    @contextmanager
+    def handoff(self):
+        """Keep finite evidence until the consumer resumes this handoff.
+
+        Owned stream forwarding resumes a source only after consumer advance.
+        Aborted delivery or generator close must project the original receipt,
+        not discard it as a yielded value that nobody received.
+        """
+        try:
+            yield self
+        except BaseException as consumer_error:
+            self.raise_outcome(consumer_error)
+
     def raise_outcome(self, consumer_error: BaseException | None = None):
         """Project this SAME finite batch evidence on every consumer exit."""
         if consumer_error is not None:

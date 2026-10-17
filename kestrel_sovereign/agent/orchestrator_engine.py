@@ -3856,7 +3856,8 @@ class OrchestratorEngineMixin:
                 # captured cancellation to StreamingMixin without emitting any
                 # more client-visible bytes; it re-raises only after durable
                 # conversation history contains the completed result.
-                yield batch_result
+                with batch_result.handoff():
+                    yield batch_result
                 return
             _parts_by_event_index: dict = {}
             for _evt_idx, _evt_parts in part_emit_buffer:

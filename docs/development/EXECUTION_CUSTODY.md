@@ -1611,3 +1611,26 @@ tests execute all three actual streaming persistence checkpoints after a real
 PostgreSQL COMMIT with lost acknowledgement; an ordinary SQL failure or refused
 checkpoint Task cannot replace that original UNKNOWN receipt. Declared model
 and context inputs are component inputs, not paid-provider or full Agent proof.
+
+The existing deferred carrier retains the same receipt through its producer's
+handoff context. Normal continuation confirms delivery through the existing
+owned-stream handshake; aborted handoff or generator close projects the original
+batch evidence. Finite source/forwarder/close aggregates use isolated original
+composition as well: a later admission denial cannot replace the earlier native
+receipt, and shared source errors do not acquire unrelated observer history.
+
+### Delivery descendant shutdown
+
+Delivery shutdown requests cooperative stop before observing retirement. A
+callback (or nested descendant) cannot synchronously join its waiting worker;
+the canonical physical join-ancestry graph detects that cycle. The queue reports
+pending retirement of the same queue/worker, not successful Stop or delivery ACK.
+Restart cannot replace a pending worker or automatically reclaim a delivery whose
+original worker failed with native control. No new owner registry is introduced.
+
+If a local provider handles the pending-retirement signal and the original
+worker completes its real status ACK successfully, an external close can confirm
+retirement and healthy restart remains valid. That settles only the actual
+pending worker, never independent UNKNOWN effects. Native tests exercise queue
+rows, source/descendant Tasks and PostgreSQL effects; declared local callbacks
+are not remote-provider message acceptance or complete Agent shutdown proof.

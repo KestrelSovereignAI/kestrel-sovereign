@@ -9,6 +9,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     _explicit_control_chain,
     bind_execution_custody,
+    is_execution_control_error,
     require_execution_work,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
@@ -817,9 +818,21 @@ async def test_public_stream_does_not_fallback_after_original_admission_loss():
 
 
 @pytest.mark.asyncio
-async def test_aborted_hosted_stream_cannot_issue_usage_or_billing_writes():
+async def test_aborted_hosted_stream_cannot_issue_usage_or_billing_writes(monkeypatch):
     from tests.unit.test_streaming_usage_metering import _FakeService
     from kestrel_sovereign.llm.adapter import LLMResponse
+    from kestrel_sovereign.llm import streaming as streaming_module
+    original_denials = []
+    actual_admission = streaming_module.require_execution_work
+
+    def admission(*args, **kwargs):
+        try:
+            return actual_admission(*args, **kwargs)
+        except ExecutionAuthorityError as error:
+            original_denials.append(error)
+            raise
+
+    monkeypatch.setattr(streaming_module, "require_execution_work", admission)
     service = _FakeService()
     service._execution_custody = ExecutionCustody(Authority())
     class Adapter:
@@ -833,8 +846,14 @@ async def test_aborted_hosted_stream_cannot_issue_usage_or_billing_writes():
     # Closing a hosted stream forbids accounting writes; the accounting
     # admission denial is still terminal evidence, not a successful close.
     # Retain the original GeneratorExit as well as the cleanup-only denial.
-    with pytest.raises(ExecutionAuthorityError, match="cleanup-only") as caught:
+    with pytest.raises(BaseException) as caught:
         await stream.aclose()
+    assert is_execution_control_error(caught.value)
+    assert original_denials and all(
+        error in tuple(_explicit_control_chain(caught.value))
+        and "cleanup-only" in str(error)
+        for error in original_denials
+    )
     assert any(
         isinstance(error, GeneratorExit)
         for error in _explicit_control_chain(caught.value)
