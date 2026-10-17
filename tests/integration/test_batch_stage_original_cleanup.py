@@ -61,4 +61,3 @@ async def test_staging_withdrawal_retains_original_private_cleanup_and_name(
             caller.cancel()
         await await_owned_task(caller)
         await database.close()
-

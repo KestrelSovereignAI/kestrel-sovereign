@@ -79,4 +79,3 @@ async def test_proxy_native_observation_keeps_finite_actual_withdrawal(
         await await_owned_task(caller)
         for task in accepted:
             await await_owned_task(task)
-

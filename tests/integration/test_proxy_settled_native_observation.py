@@ -76,4 +76,3 @@ async def test_proxy_settled_native_ack_observation_is_not_permanent_retirement_
     finally:
         loop.set_task_factory(previous)
         await feature.shutdown()
-
