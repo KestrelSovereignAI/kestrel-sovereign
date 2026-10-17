@@ -31,7 +31,7 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("door", ["drain", "route-http", "model-http", "mandate"])
+@pytest.mark.parametrize("door", ["drain", "route-http", "model-http", "mandate", "close-completion"])
 @pytest.mark.parametrize(
     "kind", ["native-control", "native-cancel", "ordinary", "healthy"]
 )
@@ -140,7 +140,9 @@ async def test_actual_preference_drain_keeps_withdrawal_without_polluting_latch(
         if door == "model-http":
             return await models.set_route_embedding_model(request)
         service.set_embedding_route(None)
-        if door == "mandate":
+        if door == "close-completion":
+            await service.wait_for_close_completion()
+        elif door == "mandate":
             async with service.mandate_change():
                 entered.append(True)
         else:
@@ -152,6 +154,8 @@ async def test_actual_preference_drain_keeps_withdrawal_without_polluting_latch(
             operation(), name="actual-preference-observer", retain_originals=True
         )
         outcome = await _async_ownership.await_owned_task(owner)
+        if door == "close-completion" and not kind.startswith("native"):
+            n.retirement_withdrawals.extend(withdrawals)
         assert (
             fired and writers and withdrawals and all(task.done() for task in writers)
         )

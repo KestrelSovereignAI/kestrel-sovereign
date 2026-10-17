@@ -44,6 +44,7 @@ class NativeMemoryOwners:
     catalog_requests: object
     lease: object
     did: object
+    retirement_withdrawals: list
 
 
 @pytest.fixture
@@ -65,6 +66,7 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
     service = LLMService(usage_db=storage.db, agent_data_dir=tmp_path / "llm")
     server = client = local_db = None
     handlers = set()
+    retirement_withdrawals = []
     try:
         requests, catalog_requests, handler_failures, handlers = [], [], [], set()
 
@@ -277,6 +279,7 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
             catalog_requests,
             lease,
             did,
+            retirement_withdrawals,
         )
     finally:
         backend._execution_custody = service._execution_custody = None
@@ -286,7 +289,15 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
             try:
                 await operation()
             except BaseException as error:
-                if not (retained_control and is_execution_control_error(error)):
+                # A lifecycle observer's actual cancellation can remain on a
+                # completed service's receipt. Tests explicitly register ONLY
+                # the SAME observed object; do not clear it or accept arbitrary
+                # cancellations/failed physical retirement as cleanup success.
+                expected_withdrawal = (
+                    retained_control and isinstance(error, asyncio.CancelledError)
+                    and any(error is original for original in retirement_withdrawals)
+                )
+                if not (expected_withdrawal or retained_control and is_execution_control_error(error)):
                     unexpected.append(error)
 
         await retire(service.close, retained_control=True)

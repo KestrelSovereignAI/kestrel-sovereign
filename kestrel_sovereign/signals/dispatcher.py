@@ -90,7 +90,7 @@ import secrets
 import time
 import weakref
 from collections import OrderedDict, deque
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
@@ -6158,7 +6158,9 @@ class SignalDispatcher:
                         value = await value
                     if isinstance(value, str):
                         constitution_text = value
-                except Exception:
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.exception(
                         "_get_governing_constitution raised for signal %s; "
                         "the dispatch will refuse to proceed without the "
@@ -6216,7 +6218,9 @@ class SignalDispatcher:
                         refreshed = await refreshed
                     if isinstance(refreshed, str) and refreshed:
                         audit.constitution_hash = refreshed
-                except Exception:
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.exception(
                         "Post-anchor constitution_hash refresh raised for "
                         "signal %s; canary derivation may use stale value",
@@ -6282,7 +6286,7 @@ class SignalDispatcher:
                             SystemPromptNamespaceError,
                         )
 
-                        if isinstance(exc, SystemPromptNamespaceError):
+                        if is_execution_control_error(exc) or isinstance(exc, SystemPromptNamespaceError):
                             raise
                         logger.exception(
                             "Inline-format doctrine resolution failed for "
@@ -6447,12 +6451,14 @@ class SignalDispatcher:
                         value = await value
                     if value:
                         anchored_doctrine = value
-                except Exception as exc:
+                except BaseException as exc:
                     from kestrel_sovereign.agent.system_prompt_assembler import (
                         SystemPromptNamespaceError,
                     )
 
-                    if isinstance(exc, SystemPromptNamespaceError):
+                    if (not isinstance(exc, Exception)
+                        or is_execution_control_error(exc)
+                        or isinstance(exc, SystemPromptNamespaceError)):
                         # Receipt registration and causation binding happen
                         # before doctrine resolution. This validation error is
                         # intentionally loud, but it must not leave either
@@ -6700,7 +6706,9 @@ class SignalDispatcher:
             value = ensure()
             if asyncio.iscoroutine(value):
                 await value
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.exception(
                 "agent.ensure_doctrine_bundle_anchored raised; "
                 "drift detection may be skipped for this dispatch"
@@ -6738,7 +6746,9 @@ class SignalDispatcher:
                 if asyncio.iscoroutine(value):
                     value = await value
                 audit.constitution_hash = value
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception(
                     "agent.get_constitution_hash raised for signal %s; "
                     "leaving constitution_hash NULL",
@@ -6757,7 +6767,9 @@ class SignalDispatcher:
                 if asyncio.iscoroutine(value):
                     value = await value
                 anchored_hash = value
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception(
                     "agent.get_anchored_doctrine_bundle_hash raised for "
                     "signal %s",
@@ -6771,7 +6783,9 @@ class SignalDispatcher:
                 if asyncio.iscoroutine(value):
                     value = await value
                 live_hash = value
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception(
                     "agent.compute_live_doctrine_bundle_hash raised for "
                     "signal %s",

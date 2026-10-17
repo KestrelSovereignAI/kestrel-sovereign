@@ -6297,6 +6297,7 @@ No other text or formatting.
         attempt or permission for fresh work. It never repeats a native effect.
         """
         terminal = vars(self).get("_llm_close_control")
+        observations = []
         while True:
             owners = set(vars(self).get("_preference_persistence_tasks", ()))
             owners.update(vars(self).get("_modality_record_tasks", ()))
@@ -6314,6 +6315,7 @@ No other text or formatting.
                 error = outcome.error
                 if task not in resource_closers and error is not None and not is_execution_control_error(error):
                     error = None
+                observations.extend((error, outcome.cancellation))
                 failure = execution_terminal_error(error, outcome.cancellation)
                 if failure is not None:
                     terminal = execution_terminal_error(terminal, failure)
@@ -6325,14 +6327,25 @@ No other text or formatting.
             try:
                 await asyncio.sleep(0)
             except asyncio.CancelledError as withdrawal:
+                observations.append(withdrawal)
                 terminal = execution_terminal_error(
                     terminal, withdrawal, retain_originals=True,
                 )
             if terminal is not None and all(task.done() for task in owners):
                 break
-        terminal = execution_terminal_error(terminal, vars(self).get("_llm_close_control"),
-                                            vars(self).get("_preference_persistence_control"),
-                                            vars(self).get("_modality_record_control"))
+        evidence = []
+        for error in (terminal, *observations, vars(self).get("_llm_close_control"),
+                      vars(self).get("_preference_persistence_control"),
+                      vars(self).get("_modality_record_control")):
+            if error is not None and all(error is not prior for prior in evidence):
+                evidence.append(error)
+        # This finite owner joins distinct drain observers. Keep each original
+        # withdrawal without attaching it to their shared strongest-writer latch.
+        terminal = execution_terminal_error(
+            BaseExceptionGroup("original LLM close observation evidence", evidence)
+            if len(evidence) > 1 else (evidence[0] if evidence else None),
+            retain_originals=True,
+        )
         if terminal is not None:
             self._llm_close_control = terminal
             raise terminal

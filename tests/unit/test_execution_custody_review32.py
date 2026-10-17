@@ -9,7 +9,7 @@ from tests.utils.receipt_delivery import ReceiptDelivery
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCommitOutcomeError, ExecutionCustody,
-    bind_execution_runtime, require_execution_work,
+    bind_execution_runtime, require_execution_work, _explicit_control_chain, execution_commit_outcome,
 )
 from tests.unit.test_execution_custody import Authority
 from tests.unit.test_execution_custody_review29 import native_owner, retire
@@ -53,6 +53,16 @@ async def test_actual_agent_retains_storage_until_native_preference_writer_settl
     error = receipt(kind)
     writes, closes = [], []
     writer = shutdown = waiter = None
+    withdrawals = []
+    actual_wait = service_module.await_owned_task
+
+    async def observed_wait(task, *args, **kwargs):
+        outcome = await actual_wait(task, *args, **kwargs)
+        if task is writer and outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+        return outcome
+
+    monkeypatch.setattr(service_module, "await_owned_task", observed_wait)
 
     async def native_then_late_receipt(*args, **kwargs):
         result = await original_execute(*args, **kwargs)
@@ -101,8 +111,18 @@ async def test_actual_agent_retains_storage_until_native_preference_writer_settl
         else:
             with pytest.raises(BaseException) as caught:
                 await asyncio.wait_for(waiter, 5)
-            assert caught.value is error
-            assert agent._shutdown_control is error
+            chain = tuple(_explicit_control_chain(caught.value))
+            retained = tuple(_explicit_control_chain(agent._shutdown_control))
+            assert error in chain and error in retained
+            assert execution_commit_outcome(caught.value) == "unknown"
+            assert execution_commit_outcome(agent._shutdown_control) == "unknown"
+            assert all(item in chain and item in retained for item in withdrawals)
+            assert service._preference_persistence_control is error
+            assert all(item not in tuple(_explicit_control_chain(error)) for item in withdrawals)
+            for _ in range(3):
+                with pytest.raises(BaseException) as later:
+                    await service.drain_preference_persistence()
+                assert later.value is error
         assert storage_closed.is_set()
         assert len(writes) == 1 and closes == [True]
         assert not service.has_pending_close_owners()

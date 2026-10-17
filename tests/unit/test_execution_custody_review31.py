@@ -7,7 +7,7 @@ import threading
 
 import pytest
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, _explicit_control_chain, execution_commit_outcome
 from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.features.base import Feature
 from tests.unit.test_execution_custody_proxy_ingress import owner
@@ -174,6 +174,16 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
     entered, release, settled = (asyncio.Event() for _ in range(3))
     failure, calls = carrier(kind), []
     first_close = retry_close = writer = None
+    withdrawals = []
+    actual_wait = service_module.await_owned_task
+
+    async def observed_wait(task, *args, **kwargs):
+        outcome = await actual_wait(task, *args, **kwargs)
+        if task is writer and outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+        return outcome
+
+    monkeypatch.setattr(service_module, "await_owned_task", observed_wait)
 
     async def stubborn():
         calls.append(stage)
@@ -243,11 +253,17 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
             await await_owned_task(task)
         with pytest.raises(BaseException) as caught:
             await retry_close
-        assert caught.value is failure
+        chain = tuple(_explicit_control_chain(caught.value))
+        assert failure in chain and execution_commit_outcome(caught.value) == "unknown"
+        assert all(error in chain for error in withdrawals)
         with pytest.raises(BaseException) as caught:
             await service.close()
-        assert caught.value is failure
+        chain = tuple(_explicit_control_chain(caught.value))
+        assert failure in chain and execution_commit_outcome(caught.value) == "unknown"
+        assert all(error in chain for error in withdrawals)
         if stage == "preference":
+            assert service._preference_persistence_control is failure
+            assert all(error not in tuple(_explicit_control_chain(failure)) for error in withdrawals)
             # A writer receipt is independent of physical writer settlement.
             assert not any(task is not None for task in service._llm_close_tasks.values())
         else:

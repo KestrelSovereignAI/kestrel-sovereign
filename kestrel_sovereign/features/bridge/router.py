@@ -547,7 +547,9 @@ def get_router() -> APIRouter:
                         agent_stream is not None
                         and agent_stream.cleanup_error is not None
                     )
-                    raise execution_terminal_error(active_error, cleanup_error)
+                    raise execution_terminal_error(
+                        active_error, cleanup_error, retain_originals=True,
+                    )
                 else:
                     agent_stream_cleanup_failed = (
                         agent_stream is not None

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
-from kestrel_sovereign.execution_custody import bind_execution_custody, execution_commit_outcome
+from kestrel_sovereign.execution_custody import _explicit_control_chain, bind_execution_custody, execution_commit_outcome
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
@@ -38,6 +38,16 @@ async def test_native_commit_writer_must_settle_before_agent_storage_close(
     original_close = storage.close
     writer = shutdown = waiter = None
     closes = []
+    withdrawals = []
+    actual_wait = service_module.await_owned_task
+
+    async def observed_wait(task, *args, **kwargs):
+        outcome = await actual_wait(task, *args, **kwargs)
+        if task is writer and outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+        return outcome
+
+    monkeypatch.setattr(service_module, "await_owned_task", observed_wait)
     hold_native_ack(monkeypatch, committed, cancelled, release, cancel_receipt=cancel_receipt)
     monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.02)
 
@@ -81,8 +91,20 @@ async def test_native_commit_writer_must_settle_before_agent_storage_close(
         assert execution_commit_outcome(original) == "unknown"
         with pytest.raises(BaseException) as caught:
             await asyncio.wait_for(waiter, 5)
-        assert caught.value is original
-        assert agent._shutdown_control is original
+        chain = tuple(_explicit_control_chain(caught.value))
+        retained = tuple(_explicit_control_chain(agent._shutdown_control))
+        assert original in chain and original in retained
+        assert execution_commit_outcome(caught.value) == "unknown"
+        assert execution_commit_outcome(agent._shutdown_control) == "unknown"
+        assert all(error in chain and error in retained for error in withdrawals)
+        # The finite shutdown receipt retains its own cancellations; the
+        # shared strongest-writer latch must not become caller history.
+        assert service._preference_persistence_control is original
+        assert all(error not in tuple(_explicit_control_chain(original)) for error in withdrawals)
+        for _ in range(3):
+            with pytest.raises(BaseException) as later:
+                await service.drain_preference_persistence()
+            assert later.value is original
         assert closed.is_set() and closes == [True]
         assert not service.has_pending_close_owners()
         await assert_native_preference_rows(

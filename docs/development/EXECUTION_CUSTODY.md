@@ -92,6 +92,12 @@ PG metadata writes/COMMIT/release, actual Agent callbacks, actual endpoint and
 mandate bodies exercise preference draining; sibling SQLite writers exercise
 the related modality consumer with declared compatibility receipts.
 
+The outer service close-completion join also retains its finite observations:
+two distinct drain observers can carry different actual withdrawals while
+joining the same native writer. Selecting one strongest native receipt must
+not discard those originals. This composition uses a fresh carrier; the
+bounded writer latch and physical native close owners stay unchanged.
+
 Bridge session, logging, initialization, status/history, tool enumeration and
 HTTP availability consumers likewise propagate canonical control before
 best-effort fallback or success. Native lease denials are delivered after real
@@ -99,6 +105,25 @@ PG/SQLite statements at explicit component callbacks; these tests do not claim
 native lost-COMMIT or authenticated gateway acceptance. The healthy hour count
 uses a bound UTC ISO cutoff matching persisted timestamps on both backends,
 not SQLite-only SQL or a differently formatted text comparison.
+
+Bridge stream teardown preserves both the interrupted serializer's original
+carrier and its separate source owner's cleanup failure. The source owner's
+own cancellation is not a substitute for the transport observer's withdrawal.
+Request completion still waits for the actual source retirement and marks
+uncertain cleanup abandoned; original retention never becomes a successful ACK.
+
+Constitution/doctrine audit, anchor, governing-text and pre-turn consumers
+propagate native execution control before ordinary compatibility fallbacks.
+A pre-turn refusal after ephemeral receipt registration and causation binding
+clears both capabilities before propagation, including cancellation. The
+native tests run actual dispatcher/SQL/lease boundaries with declared governance
+hooks; they do not establish full Agent genesis, amendment approval or READY.
+
+Standalone spawn shutdown likewise distinguishes cooperative restore-task
+withdrawal from a cancellation carrier with native control provenance. It joins
+the same accepted restore owner before propagating its original native denial;
+ordinary restoration failures remain failures. The native regression declares
+the accepted restore handle as component input, not complete Manager recovery.
 
 Database recovery tests inspect the exact original operation/publication and
 cleanup errors in the full explicit carrier chain and retain the same database

@@ -1732,8 +1732,9 @@ class SpawnFeature(Feature):
                 restore_task.cancel()
             cancelled, failure = await await_lifecycle_task_completion(restore_task)
             caller_cancelled = caller_cancelled or cancelled
-            if failure is not None and not isinstance(
-                failure, asyncio.CancelledError
+            if failure is not None and (
+                not isinstance(failure, asyncio.CancelledError)
+                or is_execution_control_error(failure)
             ):
                 outcomes.append(failure)
             if self._standalone_restore_task is restore_task:
