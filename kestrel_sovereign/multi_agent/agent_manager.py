@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
@@ -9242,7 +9242,9 @@ class AgentManager:
             release_ids.add(active.release_id)
         return release_ids
 
-    async def _set_quarantined_shutdown_handoffs_sealed(self, sealed: bool) -> bool:
+    async def _set_quarantined_shutdown_handoffs_sealed(
+        self, sealed: bool, *, withdrawals: Optional[list[BaseException]] = None,
+    ) -> bool:
         """Set the temporary reaper-handoff seal at a drain boundary.
 
         Quarantined handoffs and ordinary budget-release tasks are both
@@ -9254,11 +9256,12 @@ class AgentManager:
         in the small gap before it owns the state transition.
         """
 
-        acquire = asyncio.create_task(
+        acquire = create_owned_task(
             self._lock.acquire(),
             name="agent_manager:set_quarantined_shutdown_handoff_seal",
+            retain_originals=True,
         )
-        cancelled, failure = await await_lifecycle_task_completion(acquire)
+        cancelled, failure = await await_lifecycle_task_completion(acquire, withdrawals=withdrawals)
         if failure is not None:
             raise RuntimeError(
                 "Unable to update quarantined shutdown handoff seal"
@@ -9273,14 +9276,17 @@ class AgentManager:
             self._lock.release()
         return cancelled
 
-    async def _acquire_quarantined_shutdown_drain(self) -> bool:
+    async def _acquire_quarantined_shutdown_drain(
+        self, *, withdrawals: Optional[list[BaseException]] = None,
+    ) -> bool:
         """Serialize terminal drains despite caller cancellation."""
 
-        acquire = asyncio.create_task(
+        acquire = create_owned_task(
             self._quarantined_shutdown_drain_lock.acquire(),
             name="agent_manager:drain_quarantined_shutdowns",
+            retain_originals=True,
         )
-        cancelled, failure = await await_lifecycle_task_completion(acquire)
+        cancelled, failure = await await_lifecycle_task_completion(acquire, withdrawals=withdrawals)
         if failure is not None:
             raise RuntimeError(
                 "Unable to acquire quarantined shutdown drain"
@@ -9313,31 +9319,45 @@ class AgentManager:
         # this drain has already declared empty.  The seal is released after
         # every attempt: a failure that leaves an agent or a delegated hold
         # retained must remain retryable by a later startup/server shutdown.
-        cancelled = await self._acquire_quarantined_shutdown_drain()
+        withdrawals: list[BaseException] = []
+        acquired = False
         try:
+            cancelled = await self._acquire_quarantined_shutdown_drain(withdrawals=withdrawals)
+            acquired = True
             self._seal_agent_registration_for_shutdown_all()
             spawn_cancelled, spawn_failures = (
-                await self._join_admitted_spawn_operations()
+                await self._join_admitted_spawn_operations(withdrawals=withdrawals)
             )
             cancelled = cancelled or spawn_cancelled
             result = await self._drain_quarantined_shutdowns_while_locked(
                 cancelled=cancelled,
                 reported_budget_release_failures=reported_budget_release_failures,
+                withdrawals=withdrawals,
             )
             _raise_lifecycle_outcomes(
                 "One or more admitted spawns had terminal failures",
                 spawn_failures,
             )
             return result
+        except BaseException as error:
+            control = vars(self).get("_quarantined_shutdown_control")
+            if control is not None or is_execution_control_error(error):
+                raise execution_terminal_error(
+                    control, error, *withdrawals, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            raise
         finally:
-            self._reopen_agent_registration_after_shutdown_all()
-            self._quarantined_shutdown_drain_lock.release()
+            if acquired:
+                self._reopen_agent_registration_after_shutdown_all()
+                self._quarantined_shutdown_drain_lock.release()
 
     async def _drain_quarantined_shutdowns_while_locked(
         self,
         *,
         cancelled: bool,
         reported_budget_release_failures: Optional[set[str]],
+        withdrawals: Optional[list[BaseException]] = None,
     ) -> bool:
         """Drain terminal cleanup while the caller owns the drain lock."""
 
@@ -9346,7 +9366,7 @@ class AgentManager:
         observed_runtime_offboardings: set[int] = set()
         observed_cleanup_tasks: set[int] = set()
         observed_budget_releases: set[str] = set()
-        refund_withdrawals: list[BaseException] = []
+        refund_withdrawals = [] if withdrawals is None else withdrawals
         # ``shutdown_all`` may have already joined and reported a release
         # before this terminal drain gets to its retained unsafe metadata.
         # That evidence must remain for a later drain, but one fleet-shutdown
@@ -9403,7 +9423,7 @@ class AgentManager:
         sealed = False
         try:
             cancelled = (
-                await self._set_quarantined_shutdown_handoffs_sealed(True)
+                await self._set_quarantined_shutdown_handoffs_sealed(True, withdrawals=refund_withdrawals)
             ) or cancelled
             sealed = True
 
@@ -9423,7 +9443,7 @@ class AgentManager:
                     observed_reapers.add(record.reaper_id)
                     observed_cleanup_tasks.add(id(record.task))
                     join_cancelled, failure = await await_lifecycle_task_completion(
-                        record.task
+                        record.task, withdrawals=refund_withdrawals,
                     )
                     cancelled = cancelled or join_cancelled
                     classified_outcome = False
@@ -9453,7 +9473,7 @@ class AgentManager:
                     (
                         join_cancelled,
                         offboarding_failure,
-                    ) = await await_lifecycle_task_completion(runtime_offboarding.task)
+                    ) = await await_lifecycle_task_completion(runtime_offboarding.task, withdrawals=refund_withdrawals)
                     cancelled = cancelled or join_cancelled
                     classified_outcome = False
                     if offboarding_failure is None:
@@ -9489,13 +9509,10 @@ class AgentManager:
                     if budget_release.release_id in observed_budget_releases:
                         continue
                     observed_budget_releases.add(budget_release.release_id)
-                    release_outcome = await await_owned_task(budget_release.task)
-                    release_failure = release_outcome.error
-                    if release_outcome.cancellation is not None:
-                        cancelled = True
-                        # This actual caller belongs to this finite drain, not
-                        # the shared bounded source-control latch.
-                        refund_withdrawals.append(release_outcome.cancellation)
+                    join_cancelled, release_failure = await await_lifecycle_task_completion(
+                        budget_release.task, withdrawals=refund_withdrawals,
+                    )
+                    cancelled = cancelled or join_cancelled
                     if (
                         release_failure is not None
                         and budget_release.release_id
@@ -9514,7 +9531,7 @@ class AgentManager:
                 # observing a reaper and its callback retiring the live task.
                 callback_yield = asyncio.create_task(asyncio.sleep(0))
                 yield_cancelled, yield_failure = await await_lifecycle_task_completion(
-                    callback_yield
+                    callback_yield, withdrawals=refund_withdrawals,
                 )
                 cancelled = cancelled or yield_cancelled
                 if yield_failure is not None:
@@ -9561,7 +9578,7 @@ class AgentManager:
                 name="agent_manager:reconcile_completed_child_terminations",
             )
             reconciliation_cancelled, reconciliation_failure = (
-                await await_lifecycle_task_completion(reconciliation)
+                await await_lifecycle_task_completion(reconciliation, withdrawals=refund_withdrawals)
             )
             cancelled = cancelled or reconciliation_cancelled
             if reconciliation_failure is not None:
@@ -9595,7 +9612,7 @@ class AgentManager:
         finally:
             if sealed:
                 cancelled = (
-                    await self._set_quarantined_shutdown_handoffs_sealed(False)
+                    await self._set_quarantined_shutdown_handoffs_sealed(False, withdrawals=refund_withdrawals)
                 ) or cancelled
 
         # Preserve both cancellation and every sanitized cleanup failure after
@@ -13108,6 +13125,7 @@ class AgentManager:
 
     async def _join_admitted_spawn_operations(
         self,
+        *, withdrawals: Optional[list[BaseException]] = None,
     ) -> tuple[bool, list[BaseException]]:
         """Join every spawn admitted before the shutdown registration fence.
 
@@ -13145,7 +13163,7 @@ class AgentManager:
                 task = operation.spawn_task
                 assert task is not None
                 join_cancelled, failure = await await_lifecycle_task_completion(
-                    task
+                    task, withdrawals=withdrawals,
                 )
                 cancelled = cancelled or join_cancelled
                 # A spawn owns its rollback until this join.  Ordinary spawn
@@ -14551,15 +14569,29 @@ class AgentManager:
         # making a live agent look like a false ``remove_agent(False)`` failure.
         # This also serializes concurrent fleet shutdowns, so the second owner
         # takes a fresh snapshot after the first has finished every live agent.
-        cancelled = await self._acquire_quarantined_shutdown_drain()
+        withdrawals: list[BaseException] = []
+        acquired = False
         try:
+            cancelled = await self._acquire_quarantined_shutdown_drain(withdrawals=withdrawals)
+            acquired = True
             self._seal_agent_registration_for_shutdown_all()
-            await self._shutdown_all_while_drain_locked(cancelled=cancelled)
+            await self._shutdown_all_while_drain_locked(cancelled=cancelled, withdrawals=withdrawals)
+        except BaseException as error:
+            control = vars(self).get("_quarantined_shutdown_control")
+            if control is not None or is_execution_control_error(error):
+                raise execution_terminal_error(
+                    control, error, *withdrawals, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            raise
         finally:
-            self._reopen_agent_registration_after_shutdown_all()
-            self._quarantined_shutdown_drain_lock.release()
+            if acquired:
+                self._reopen_agent_registration_after_shutdown_all()
+                self._quarantined_shutdown_drain_lock.release()
 
-    async def _shutdown_all_while_drain_locked(self, *, cancelled: bool) -> None:
+    async def _shutdown_all_while_drain_locked(
+        self, *, cancelled: bool, withdrawals: Optional[list[BaseException]] = None,
+    ) -> None:
         """Perform one fleet sweep while owning the terminal drain boundary."""
 
         # Stop + release budgeted children leaf-first (#2113): reverse insertion
@@ -14574,7 +14606,7 @@ class AgentManager:
         # bounded by its own initializer; waiting for arbitrary provider or
         # inception I/O here would turn a normal fleet shutdown into a hang.
         spawn_join_cancelled, spawn_failures = (
-            await self._join_admitted_spawn_operations()
+            await self._join_admitted_spawn_operations(withdrawals=withdrawals)
         )
         cancelled = spawn_join_cancelled or cancelled
         failures: list[BaseException] = list(spawn_failures)
@@ -14665,6 +14697,8 @@ class AgentManager:
                 # propagating cancellation.  Continue sweeping later agents;
                 # only prune this name when the authoritative maps confirm it.
                 cancelled = True
+                if withdrawals is not None:
+                    withdrawals.append(exc)
                 removed = fully_removed(name)
                 if is_execution_control_error(exc):
                     record_failure(name, exc)
@@ -14851,7 +14885,8 @@ class AgentManager:
             cancelled = (
                 await self._drain_quarantined_shutdowns_while_locked(
                     cancelled=False,
-                    reported_budget_release_failures=reported_budget_release_failures
+                    reported_budget_release_failures=reported_budget_release_failures,
+                    withdrawals=withdrawals,
                 )
             ) or cancelled
         except BaseExceptionGroup as exc:

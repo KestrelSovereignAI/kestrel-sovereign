@@ -920,7 +920,10 @@ class PostgresBackend(DatabaseBackend):
         factory, inventing a completed closer or leaking its live transaction.
         Keep the exact resource and absence of an owner as retirement debt.
         """
-        terminal = execution_terminal_error(body_failure, refusal, retain_originals=True)
+        terminal = execution_terminal_error(
+            body_failure, refusal, retain_originals=True,
+            isolate_control_originals=True,
+        )
         PostgresBackend._abort_native_connection(connection, terminal)
         terminal._kestrel_native_retirement_debts = (
             *getattr(terminal, "_kestrel_native_retirement_debts", ()),
@@ -1616,6 +1619,47 @@ class PostgresBackend(DatabaseBackend):
                 self._txn_conn_var.reset(token)
         after_commit.run()
 
+    async def _close_failed_advisory_session(
+        self, connection: Any, original: BaseException,
+    ) -> BaseException:
+        """Join the original server session before reporting failed release.
+
+        Local ``terminate()`` does not wait for PostgreSQL to process the
+        disconnect and release its locks. Native graceful close cancels and
+        joins an active query, sends Terminate, and waits for the server EOF.
+        A refused or failed closer is explicit retirement debt, never proof
+        that the original server-side exclusion has disappeared.
+        """
+        native = (connection._con if isinstance(connection, asyncpg.pool.PoolConnectionProxy)
+                  else connection)
+        if native is None:
+            # A detached proxy cannot close a successor checkout.
+            return original
+        scopes = current_execution_custody(self)
+        resource = _NativePostgresRetirement(connection, connection, native)
+        try:
+            closer = create_owned_task(
+                connection.close(), name="postgres-original-advisory-retirement",
+                retirement_resource=resource, retain_originals=True,
+            )
+        except BaseException as refusal:
+            return self._refused_native_owner(
+                connection, connection, refusal, scopes, original, native,
+            )
+        outcome = await await_owned_task(closer)
+        terminal = execution_terminal_error(
+            original, outcome.error, outcome.cancellation, retain_originals=True,
+            isolate_control_originals=True,
+        )
+        if outcome.error is not None:
+            terminal._kestrel_native_retirement_debts = (
+                *getattr(terminal, "_kestrel_native_retirement_debts", ()),
+                (resource, closer),
+            )
+            for scope in scopes:
+                scope.revoke("original advisory session retirement failed")
+        return terminal
+
     @asynccontextmanager
     async def advisory_locks(
         self,
@@ -1694,7 +1738,7 @@ class PostgresBackend(DatabaseBackend):
                 capability._admit()
                 yield capability
                 capability.require_live()
-            except BaseException:
+            except BaseException as original:
                 # A cancellation can race PostgreSQL granting a blocking lock
                 # after asyncpg has sent the cancellation request. Terminating
                 # this dedicated connection is the only unconditional release
@@ -1704,7 +1748,7 @@ class PostgresBackend(DatabaseBackend):
                 session_attached = capability._remove_listener()
                 listener_attached = False
                 if session_attached:
-                    conn.terminate()
+                    raise await self._close_failed_advisory_session(conn, original)
                 raise
             else:
                 capability._retire()
@@ -1718,15 +1762,11 @@ class PostgresBackend(DatabaseBackend):
                         await conn.execute(
                             f"SELECT {unlock_function}($1, $2)", namespace, key
                         )
-                except BaseException:
+                except BaseException as original:
                     # asyncpg may already have detached the pooled proxy
                     # after loss. Never replace the original loss/cancellation
                     # with that secondary cleanup error.
-                    try:
-                        conn.terminate()
-                    except asyncpg.InterfaceError:
-                        pass
-                    raise
+                    raise await self._close_failed_advisory_session(conn, original)
             finally:
                 capability._retire()
                 if listener_attached:
@@ -1764,9 +1804,8 @@ class PostgresBackend(DatabaseBackend):
                     if not acquired:
                         await asyncio.sleep(_ADVISORY_LOCK_POLL_INTERVAL_S)
                 yield
-            except BaseException:
-                conn.terminate()
-                raise
+            except BaseException as original:
+                raise await self._close_failed_advisory_session(conn, original)
             else:
                 try:
                     unlocked = await conn.fetchval(
@@ -1778,9 +1817,8 @@ class PostgresBackend(DatabaseBackend):
                         raise RuntimeError(
                             "PostgreSQL polled advisory lock disappeared"
                         )
-                except BaseException:
-                    conn.terminate()
-                    raise
+                except BaseException as original:
+                    raise await self._close_failed_advisory_session(conn, original)
     
     async def table_exists(self, table_name: str) -> bool:
         """Check whether an unqualified relation resolves on this connection.

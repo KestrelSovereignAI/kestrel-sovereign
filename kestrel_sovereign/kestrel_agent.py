@@ -494,6 +494,8 @@ def _dispatcher_release_outcome(result: object) -> ReleaseOutcome:
 
 async def await_lifecycle_task_completion(
     task: "asyncio.Future[object]",
+    *,
+    withdrawals: list[BaseException] | None = None,
 ) -> tuple[bool, BaseException | None]:
     """Drive one lifecycle task to a terminal state despite caller cancellation.
 
@@ -503,6 +505,10 @@ async def await_lifecycle_task_completion(
     cancellation of the joiner, while the second item reports the task's
     terminal outcome without confusing a task-cancellation with a fresh
     cancellation of the lifecycle owner.
+
+    Finite lifecycle boundaries may supply a caller-local withdrawal list.
+    It receives the SAME original observation, not a reconstructed exception;
+    it must never be installed on a shared writer/manager history latch.
     """
     from kestrel_sovereign._async_ownership import await_owned_task
 
@@ -511,6 +517,9 @@ async def await_lifecycle_task_completion(
     joiner = asyncio.current_task()
     cancelled = bool(joiner is not None and joiner.cancelling())
     outcome = await await_owned_task(task)
+    if withdrawals is not None and outcome.cancellation is not None:
+        if all(prior is not outcome.cancellation for prior in withdrawals):
+            withdrawals.append(outcome.cancellation)
     cancelled = cancelled or outcome.cancellation is not None
     failure = outcome.error
     if any(error is not None and is_execution_control_error(error)

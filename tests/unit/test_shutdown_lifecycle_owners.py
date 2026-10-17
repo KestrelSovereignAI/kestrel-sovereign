@@ -1626,8 +1626,8 @@ async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
     allow_drain_scan = asyncio.Event()
     real_set_seal = manager._set_quarantined_shutdown_handoffs_sealed
 
-    async def expose_empty_seal(sealed: bool) -> bool:
-        cancelled = await real_set_seal(sealed)
+    async def expose_empty_seal(sealed: bool, *, withdrawals=None) -> bool:
+        cancelled = await real_set_seal(sealed, withdrawals=withdrawals)
         if sealed:
             seal_visible.set()
             await allow_drain_scan.wait()
@@ -1874,10 +1874,10 @@ async def test_terminal_drain_sanitizes_cancelled_worker_with_prior_failure(
     real_join = manager_module.await_lifecycle_task_completion
     cleanup_join_started = asyncio.Event()
 
-    async def observe_join(task):
+    async def observe_join(task, *, withdrawals=None):
         if task is cleanup_task:
             cleanup_join_started.set()
-        return await real_join(task)
+        return await real_join(task, withdrawals=withdrawals)
 
     monkeypatch.setattr(
         manager_module,

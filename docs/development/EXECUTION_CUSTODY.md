@@ -453,6 +453,22 @@ cannot inherit its replacement. Consumers must join all owned work before
 normal advisory retirement. Cleanup does not grant new cognition/tool/storage
 authority; terminal identity/token CAS needs its own explicit native custody.
 
+Failed advisory retirement also owns the original native session through its
+physical exit. A synchronous asyncpg `terminate()` only aborts the local
+transport; it does not prove that PostgreSQL has released the exclusion. Both
+advisory APIs use the same owned native closer on failure: cancel/join pending
+protocol work, send Terminate and await server EOF. A refused or failed closer
+retains the exact original connection and Task (or no admitted Task) as cleanup
+debt. A detached proxy never authorizes closing a successor checkout.
+
+Finite public/fleet manager drains collect original observer withdrawals
+through the canonical lifecycle observer, including entry serialization,
+handoff seals, quarantine/refund joins, reconciliation and unsealing. The
+collection is caller-local and used only for isolated terminal composition;
+shared bounded source latches and later observers inherit no caller history.
+Legacy boolean lifecycle observation remains compatible when no collection is
+requested. This changes neither native commit classification nor retry rights.
+
 The native provider service retains the owning agent's runtime custody and
 checks each adapter attempt and streamed chunk, including decision discovery,
 pin canaries, decisions, embeddings and each internal retry after backoff.

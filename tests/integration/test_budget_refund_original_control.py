@@ -23,13 +23,15 @@ from tests.unit.test_execution_custody_review35_native import traceback_size
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["join", "completed", "remove", "registered-component", "drain", "drain-live"])
+@pytest.mark.parametrize("route", ["join", "completed", "remove", "registered-component", "drain", "drain-live", "drain-waiter", "drain-quarantine", "fleet-waiter", "drain-quarantine-unseal-refusal"])
 @pytest.mark.parametrize("source_cancel", [False, True])
 @pytest.mark.parametrize("caller_cancel", [False, True])
 async def test_original_native_refund_survives_join_callback_and_terminal_drain(
     native_pg, tmp_path, monkeypatch, route, source_cancel, caller_cancel,
 ):
     backend, observer, schema = native_pg
+    drain_route = ("drain-waiter" if route == "fleet-waiter" else
+                   "drain-quarantine" if route == "drain-quarantine-unseal-refusal" else route)
     entered, release = asyncio.Event(), asyncio.Event()
     originals, graphs, deposit_owners = [], [], []
 
@@ -65,31 +67,62 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
     manager._child_budgets["child"] = entry
     records = []
     drain_join = asyncio.Event()
+    drain_waiter = asyncio.Event()
+    competing_drains = []
     withdrawals = []
-    if route == "drain-live":
+    loop, previous_factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refused = []
+    refusal = RuntimeError("actual final handoff-unseal Task admission refused")
+    if route == "drain-quarantine-unseal-refusal":
+        from tests.unit.test_host_context_native_cleanup import _actual_operation
+
+        def refuse_unseal(loop, coroutine, **kwargs):
+            actual = _actual_operation(coroutine)
+            code, frame = getattr(actual, "cr_code", None), getattr(actual, "cr_frame", None)
+            if (not refused and manager._quarantined_shutdown_handoffs_sealed and code is not None
+                    and code.co_qualname == "Lock.acquire" and frame.f_locals.get("self") is manager._lock):
+                refused.append((coroutine, actual))
+                raise refusal
+            return previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+        loop.set_task_factory(refuse_unseal)
+    if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"}:
         from kestrel_sovereign.multi_agent import agent_manager as manager_module
+        from kestrel_sovereign import _async_ownership as ownership_module
 
         actual_owned_join = manager_module.await_owned_task
         actual_legacy_join = manager_module.await_lifecycle_task_completion
+        actual_acquire = manager._acquire_quarantined_shutdown_drain
+        acquisitions = []
+
+        async def observed_acquire(*args, **kwargs):
+            acquisitions.append(asyncio.current_task())
+            if drain_route == "drain-waiter" and len(acquisitions) == 2:
+                assert manager._quarantined_shutdown_drain_lock.locked()
+                drain_waiter.set()
+            return await actual_acquire(*args, **kwargs)
 
         async def observed_owned_join(child):
             selected = bool(records) and child is records[0].task
             if selected:
-                assert not child.done()
-                drain_join.set()
+                if drain_route != "drain-waiter" or asyncio.current_task() in competing_drains:
+                    assert not child.done()
+                    drain_join.set()
             outcome = await actual_owned_join(child)
-            if selected and outcome.cancellation is not None:
+            if outcome.cancellation is not None:
                 withdrawals.append(outcome.cancellation)
             return outcome
 
-        async def observed_legacy_join(child):
+        async def observed_legacy_join(child, *args, **kwargs):
             if records and child is records[0].task:
                 assert not child.done()
                 drain_join.set()
-            return await actual_legacy_join(child)
+            return await actual_legacy_join(child, *args, **kwargs)
 
         monkeypatch.setattr(manager_module, "await_owned_task", observed_owned_join)
+        monkeypatch.setattr(ownership_module, "await_owned_task", observed_owned_join)
         monkeypatch.setattr(manager_module, "await_lifecycle_task_completion", observed_legacy_join)
+        monkeypatch.setattr(manager, "_acquire_quarantined_shutdown_drain", observed_acquire)
     child = child_db = None
     if route == "registered-component":
         from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -127,10 +160,17 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
                 return await manager.remove_agent("child", offboard_runtime=False)
             record = manager._start_child_budget_release("child")
             records.append(record)
+            if drain_route == "drain-quarantine":
+                manager._retain_quarantined_cleanup(name="child", agent_id="did:test:unpublished-child", task=record.task)
+            if drain_route == "drain-waiter":
+                competing_drains.append(create_owned_task(manager.drain_quarantined_shutdowns(), retain_originals=True))
+                await drain_join.wait()
             if route in {"completed", "drain"}:
                 await await_owned_task(record.task)
                 await asyncio.sleep(0)  # Actual completion callback retires metadata.
-            if route in {"drain", "drain-live"}:
+            if route == "fleet-waiter":
+                return await manager.shutdown_all()
+            if route == "drain" or drain_route in {"drain-live", "drain-waiter", "drain-quarantine"}:
                 return await manager.drain_quarantined_shutdowns()
             return await manager._await_child_budget_release_cancellation_safe(record.task)
 
@@ -143,8 +183,8 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=184') == 1
             if route in {"remove", "registered-component"}:
                 records.append(manager._inflight_removal_budget_releases_by_child["child"])
-            if route == "drain-live":
-                await asyncio.wait_for(drain_join.wait(), 5)
+            if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"}:
+                await asyncio.wait_for((drain_waiter if drain_route == "drain-waiter" else drain_join).wait(), 5)
             if source_cancel:
                 deposit_owners[0].cancel("actual original refund COMMIT observer withdrawal")
             if caller_cancel:
@@ -157,7 +197,11 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
         assert outcome.error is not None and is_execution_control_error(outcome.error), "refund completion lost original native execution control"
         assert execution_commit_outcome(outcome.error) == "unknown", "refund completion erased original COMMIT uncertainty"
         assert originals[0] in tuple(_explicit_control_chain(outcome.error)), "refund completion discarded its original native carrier"
-        if route == "drain-live" and caller_cancel:
+        if route == "drain-quarantine-unseal-refusal":
+            import inspect
+            assert refused and refusal in tuple(_explicit_control_chain(outcome.error))
+            assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
+        if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"} and caller_cancel:
             chain = tuple(_explicit_control_chain(outcome.error))
             assert any(isinstance(error, asyncio.CancelledError) and error.args == ("actual refund caller withdrawal",)
                        for error in chain), "live terminal refund drain lost its actual caller withdrawal"
@@ -200,9 +244,15 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
         assert len(deposit_owners) == 1
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=184') == 1
     finally:
+        loop.set_task_factory(previous_factory)
+        for pair in refused:
+            for coroutine in pair:
+                coroutine.close()
         release.set()
         if task is not None:
             await await_owned_task(task)
+        for drainer in competing_drains:
+            await await_owned_task(drainer)
         for record in records:
             await await_owned_task(record.task)
         if child is not None:
