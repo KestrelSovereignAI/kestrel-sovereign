@@ -8,6 +8,7 @@ it does not claim the empty actual manager owns a born agent.
 import asyncio
 import inspect
 import os
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -45,6 +46,7 @@ async def test_startup_refused_original_cleanup_keeps_native_owner_and_body(
                 original = error
             assert receipts == [True] and execution_commit_outcome(original) == "unknown"
         backend._execution_custody = None
+
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 1
     original_graph = tuple(_explicit_control_chain(original))
     manager = AgentManager(base_data_dir=tmp_path / "actual-empty-manager")
@@ -158,3 +160,226 @@ async def test_startup_refused_original_cleanup_keeps_native_owner_and_body(
             else:
                 await owner.close()
         backend._execution_custody = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["backend", "preflight", "scheduler"])
+@pytest.mark.parametrize("pool_kind", ["primary", "advisory"])
+async def test_accepted_startup_phase_retains_refused_native_pool_closer(
+    native_pg, monkeypatch, route, pool_kind,
+):
+    from kestrel_sovereign import server
+
+    _, _, schema = native_pg
+    dsn = with_search_path(os.environ["TEST_POSTGRES_URL"], schema)
+    app = FastAPI()
+    owners, pools, refused, body_errors = [], [], [], []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    allocation = RuntimeError("actual native pool closer admission refused")
+    actual_initialize = AsyncStorage.initialize
+
+    async def prepare(owner):
+        native = owner.db.backend if isinstance(owner, AsyncStorage) else owner
+        await native._ensure_advisory_pool()
+        owners.append(owner)
+        pools.extend([native._pool, native._advisory_pool])
+
+    async def initialize_then_fail(owner):
+        await actual_initialize(owner)
+        await prepare(owner)
+        original = ValueError("ordinary original preflight failure")
+        body_errors.append(original)
+        raise original
+
+    async def selected_discovery_only(_config):
+        return {"did:test:unloaded-input-only": ("unloaded-input-only", None)}
+
+    manager = SimpleNamespace(local_agent_configs_by_did=selected_discovery_only,
+                              cold_scheduler_identity_failures=[])
+
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        frame = getattr(operation, "cr_frame", None)
+        owner = frame.f_locals.get("self") if frame is not None else None
+        target = pools[0 if pool_kind == "primary" else 1] if pools else None
+        code = getattr(operation, "cr_code", None)
+        if not refused and owner is target and target is not None and code.co_qualname == "Pool.close":
+            refused.append((coroutine, operation))
+            raise allocation
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    caught = None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setenv("KESTREL_DB_BACKEND", "postgres")
+            patch.setenv("KESTREL_DATABASE_URL", dsn)
+            if route == "backend":
+                owner = PostgresBackend(dsn=dsn, min_pool_size=0, max_pool_size=2, advisory_max_pool_size=1)
+                await owner.connect()
+                await prepare(owner)
+            else:
+                patch.setattr(AsyncStorage, "initialize", initialize_then_fail)
+            loop.set_task_factory(factory)
+            try:
+                if route == "backend":
+                    await owners[0].close()
+                elif route == "preflight":
+                    await server._prepare_shared_postgres_scheduler_protocol(app, manager, None)
+                else:
+                    await server._start_host_scheduler(app, manager, None)
+            except BaseException as error:
+                caught = error
+            finally:
+                loop.set_task_factory(previous)
+        assert refused and caught is not None
+        assert is_execution_control_error(caught), "accepted phase normalized native closer refusal as ordinary startup failure"
+        target = pools[0 if pool_kind == "primary" else 1]
+        independent = pools[1 if pool_kind == "primary" else 0]
+        assert any(resource is target and task is None for resource, task in execution_cleanup_debts(caught)), "native pool closer lost its exact original resource and absent owner"
+        native = owners[0].db.backend if isinstance(owners[0], AsyncStorage) else owners[0]
+        assert getattr(native, "_pool" if pool_kind == "primary" else "_advisory_pool") is target, "native pool refusal cleared the retained original handle"
+        assert not target._closed and independent._closed, "native pool refusal skipped independent physical retirement"
+        assert allocation in tuple(_explicit_control_chain(caught)), "startup lost original native admission failure"
+        assert all(error in tuple(_explicit_control_chain(caught)) for error in body_errors)
+        assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+                   for pair in refused for coro in pair), "unstarted native pool closer leaked its coroutine"
+    finally:
+        loop.set_task_factory(previous)
+        for pair in refused:
+            for coroutine in pair:
+                coroutine.close()
+        for owner in owners:
+            await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_outer_multi_agent_startup_preserves_original_body_and_rollback_refusal(
+    native_pg, tmp_path, monkeypatch,
+):
+    from kestrel_sovereign import server
+
+    backend, observer, schema = native_pg
+    original = None
+    backend._execution_custody = ExecutionCustody(GenerationFence())
+    with monkeypatch.context() as ack:
+        receipts = lose_native_ack(ack, boundary="commit", original=OSError("actual outer startup COMMIT ACK lost"))
+        try:
+            await backend.execute("INSERT INTO effects VALUES (183, 'original startup receipt')")
+        except BaseException as error:
+            original = error
+    backend._execution_custody = None
+    assert receipts == [True] and execution_commit_outcome(original) == "unknown"
+    graph = tuple(_explicit_control_chain(original))
+    config = tmp_path / "multi_agent.toml"
+    config.write_text('[host]\nbind = "127.0.0.1"\nport = 8888\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    for key, value in {
+        "KESTREL_HOME": str(tmp_path), "PROJECT_DIR": str(tmp_path),
+        "KESTREL_DB_PATH": str(tmp_path / "private-state"),
+        "KESTREL_HOST_DB_PATH": str(tmp_path / "host.db"),
+        "KESTREL_MULTI_AGENT_CONFIG": str(config), "KESTREL_MULTI_AGENT": "1",
+        "KESTREL_API_KEY": "inert-native-host-auth-not-provider-credential",
+        "KESTREL_DB_BACKEND": "sqlite", "KESTREL_HOLD_BACKEND": "sqlite",
+        "KESTREL_PHOENIX_ENABLED": "0", "KESTREL_TRACING_ENABLED": "0",
+    }.items():
+        monkeypatch.setenv(key, value)
+    managers, refused = [], []
+    actual_load = AgentManager.load_from_config
+
+    async def load_empty_then_fail(manager, *args, **kwargs):
+        result = await actual_load(manager, *args, **kwargs)
+        assert result == 0 and not manager.list_agents()
+        managers.append(manager)
+        raise original
+
+    monkeypatch.setattr(AgentManager, "load_from_config", load_empty_then_fail)
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    allocation = RuntimeError("actual original manager rollback admission refused")
+
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        code = getattr(operation, "cr_code", None)
+        if not refused and code is not None and code.co_qualname == "AgentManager.shutdown_all":
+            refused.append((coroutine, operation))
+            raise allocation
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    app, caught = FastAPI(), None
+    try:
+        loop.set_task_factory(factory)
+        try:
+            async with server._lifespan_startup(app):
+                pytest.fail("original startup control reached serving publication")
+        except BaseException as error:
+            caught = error
+        finally:
+            loop.set_task_factory(previous)
+        assert refused and len(managers) == 1 and caught is not None
+        chain = tuple(_explicit_control_chain(caught))
+        assert original in chain and execution_commit_outcome(caught) == "unknown"
+        assert allocation in chain, "outer startup rollback discarded original Task admission failure"
+        assert tuple(_explicit_control_chain(original)) == graph, "outer startup rollback mutated its original body receipt"
+        assert any(resource is managers[0] and task is None for resource, task in execution_cleanup_debts(caught))
+        assert app.state.agent_manager is None
+        assert app.state.startup_cleanup_agent_manager is managers[0]
+        assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=183') == 1
+    finally:
+        loop.set_task_factory(previous)
+        await server._shutdown_server_resources(app)
+        for manager in managers:
+            await manager.shutdown_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pool_kind", ["primary", "advisory"])
+async def test_native_pool_close_joins_physical_retirement_after_repeated_withdrawal(
+    native_pg, monkeypatch, pool_kind,
+):
+    import asyncpg
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+
+    _, _, schema = native_pg
+    owner = PostgresBackend(dsn=with_search_path(os.environ["TEST_POSTGRES_URL"], schema),
+                            min_pool_size=0, max_pool_size=2, advisory_max_pool_size=1)
+    await owner.connect()
+    await owner._ensure_advisory_pool()
+    primary, advisory = owner._pool, owner._advisory_pool
+    target = primary if pool_kind == "primary" else advisory
+    connection = await target.acquire()
+    native_connection = connection._con
+    entered = asyncio.Event()
+    actual_close = asyncpg.Pool.close
+
+    async def observe_actual_close(pool):
+        if pool is target:
+            entered.set()
+        return await actual_close(pool)
+
+    task = None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncpg.Pool, "close", observe_actual_close)
+            task = create_owned_task(owner.close(), retain_originals=True)
+            await asyncio.wait_for(entered.wait(), 5)
+            for attempt in range(2):
+                task.cancel(f"actual pool closer caller withdrawal {attempt}")
+                await asyncio.sleep(0)
+            await asyncio.wait({task}, timeout=0.05)
+            assert not task.done() and not native_connection.is_closed(), "caller withdrawal abandoned accepted native pool close"
+            releasing = connection
+            connection = None
+            await target.release(releasing)
+            outcome = await await_owned_task(task)
+        assert isinstance(outcome.error, asyncio.CancelledError), "physical pool close discarded original caller withdrawal"
+        assert primary._closed and advisory._closed, "caller withdrawal skipped independent physical pool close"
+        assert owner._pool is None and owner._advisory_pool is None
+        assert not execution_cleanup_debts(outcome.error)
+    finally:
+        if connection is not None and not native_connection.is_closed():
+            await target.release(connection)
+        if task is not None:
+            await await_owned_task(task)
+        await owner.close()

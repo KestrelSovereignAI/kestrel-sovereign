@@ -540,6 +540,10 @@ class ModelDiscoveryMixin:
                 self._amend_catalog_failures(
                     shared_cache, snapshot, reconcile_outcomes
                 )
+                # Reconciliation yields to the original shared refresh. A
+                # healthy earlier snapshot cannot outlive its newly known
+                # control, even when there are no availability amendments.
+                shared_cache.snapshot()
                 return self._filter_models(
                     cached_models,
                     featured_only=featured_only,

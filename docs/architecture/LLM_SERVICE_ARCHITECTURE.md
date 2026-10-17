@@ -306,6 +306,10 @@ entering discovery. It controls data reuse, not control provenance. Every catalo
 publication, disk restore and outcome amendment rechecks the same receipt under
 the cache lock, so an independent live caller cannot overwrite unresolved source
 uncertainty that appeared while its own discovery was running.
+Cache-hit completion observes that same receipt again after awaited embedding
+and decision reconciliation, even when there are no availability amendments.
+This check preserves the selected snapshot; it does not substitute a newer
+catalog or infer permission from the independent reader's live scope.
 
 The deadline can only cancel a step that awaits. A listing that blocks the
 event loop cannot be cut off and holds every other route's step and deadline

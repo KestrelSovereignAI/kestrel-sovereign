@@ -1,18 +1,23 @@
 """Native startup effect and physical rollback retain the strongest receipt."""
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 
 from kestrel_sovereign import server
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain, bind_execution_custody,
+    execution_commit_outcome, is_execution_control_error,
+)
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_storage import AsyncStorage
-from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
+from tests.integration.test_execution_custody_review30_pg import lose_ack
 from tests.unit.test_execution_custody_review29 import native_owner
-from tests.unit.test_execution_custody_review32 import receipt
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -26,14 +31,43 @@ async def test_native_startup_rollback_cannot_demote_cleanup_control(
     db = AsyncDatabase(backend)
     storage = AsyncStorage(backend=backend)
     storage.db = db
-    failure = receipt(kind)
+    # Produce the receipt through actual PostgreSQL COMMIT and an actual
+    # observer Task withdrawal, rather than constructing its classification.
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def committed_cleanup_evidence():
+        with bind_execution_custody(GenerationFence()):
+            await backend.execute("INSERT INTO effects VALUES (350, 'cleanup COMMIT')")
+    with monkeypatch.context() as ack:
+        lose_ack(ack, cancelled=False, entered=entered, release=release)
+        source = create_owned_task(committed_cleanup_evidence(), retain_originals=True)
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            if kind == "cancel_unknown":
+                source.cancel("original native cleanup observer withdrawal")
+            release.set()
+            failure = (await await_owned_task(source)).error
+        finally:
+            release.set()
+            await await_owned_task(source)
+    assert failure is not None and execution_commit_outcome(failure) == "unknown"
+    if kind == "group":
+        connection = sqlite3.connect(tmp_path / "closed-cleanup.db")
+        connection.close()
+        try:
+            connection.execute("SELECT 1")
+        except sqlite3.ProgrammingError as independent:
+            failure = BaseExceptionGroup("independent original cleanup errors", [failure, independent])
+    original_graph = tuple(_explicit_control_chain(failure))
+    startup_errors = []
     closed = asyncio.Event()
     original_close = backend.close
     app = FastAPI()
 
     async def native_startup_failure(*_args):
         await db.execute("INSERT INTO effects VALUES (35, 'startup effect')")
-        raise ValueError("ordinary startup failure")
+        original = ValueError("ordinary startup failure")
+        startup_errors.append(original)
+        raise original
 
     async def native_close_receipt():
         await original_close()
@@ -85,7 +119,13 @@ async def test_native_startup_rollback_cannot_demote_cleanup_control(
         outcome = await await_owned_task(task)
         assert closed.is_set(), "startup owner skipped physical PostgreSQL retirement"
         assert await observer.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects WHERE id=35') == 1
-        assert outcome.error is failure, "startup rollback demoted original native cleanup receipt"
+        assert await observer.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects WHERE id=350') == 1
+        assert is_execution_control_error(outcome.error), "startup rollback demoted original native cleanup control"
+        assert execution_commit_outcome(outcome.error) == "unknown", "startup rollback erased original COMMIT uncertainty"
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert failure in chain, "startup rollback discarded its original native cleanup carrier"
+        assert all(original in chain for original in startup_errors), "startup rollback discarded its original body failure"
+        assert tuple(_explicit_control_chain(failure)) == original_graph, "startup rollback mutated its original native cleanup receipt"
     finally:
         await await_owned_task(task)
         monkeypatch.setattr(backend, "close", original_close)

@@ -172,6 +172,86 @@ async def test_background_catalog_original_commit_control_survives_callback_and_
                 await await_owned_task(source)
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("carrier", ["error", "cancel"])
+@pytest.mark.parametrize("consumer", ["discovery", "tool"])
+async def test_cached_catalog_rechecks_original_refresh_after_reconciliation(
+    native_pg, monkeypatch, carrier, consumer,
+):
+    backend, observer, schema = native_pg
+    committed, ack_release, reconciling, reader_release = (asyncio.Event() for _ in range(4))
+    cache = SharedModelCache()
+    cache.set_stale([])
+    service = service_owner()
+    service.config = {}
+    monkeypatch.setattr("kestrel_sovereign.llm.model_discovery.get_shared_model_cache", lambda: cache)
+    originals, graphs = [], []
+    armed = False
+    actual_reconcile = service.reconcile_embedding_capabilities
+
+    async def reconcile_then_wait(*, use_cache=True):
+        await actual_reconcile(use_cache=use_cache)
+        if armed:
+            reconciling.set()
+            await reader_release.wait()
+
+    monkeypatch.setattr(service, "reconcile_embedding_capabilities", reconcile_then_wait)
+
+    async def refresh():
+        with bind_execution_custody(GenerationFence()):
+            try:
+                await backend.execute("INSERT INTO effects VALUES (183, 'pending original refresh')")
+            except BaseException as error:
+                originals.append(error)
+                graphs.append(tuple(_explicit_control_chain(error)))
+                raise
+
+    async def consume():
+        with bind_execution_custody(GenerationFence()):
+            if consumer == "tool":
+                from kestrel_sovereign.features.model.feature import ModelAgent
+                feature = ModelAgent(agent=None)
+                feature.llm_service = service
+                return await feature.list_models(use_cache=True)
+            return await service.discover_all_models(use_cache=True)
+
+    source = reader = None
+    try:
+        with monkeypatch.context() as ack:
+            lose_ack(ack, cancelled=False, entered=committed, release=ack_release)
+            assert cache.refresh_in_background(refresh)
+            source = cache._refresh_task
+            await asyncio.wait_for(committed.wait(), 5)
+            # Actual independent forced discovery publishes its empty configured
+            # inventory while the SAME original refresh remains pending.
+            with bind_execution_custody(GenerationFence()):
+                assert await service.discover_all_models(use_cache=False) == []
+            assert cache.fresh_snapshot() is not None and not source.done()
+            armed = True
+            reader = create_owned_task(consume(), context=contextvars.Context(), retain_originals=True)
+            await asyncio.wait_for(reconciling.wait(), 5)
+            if carrier == "cancel":
+                source.cancel("actual original catalog COMMIT observer withdrawal")
+            ack_release.set()
+            await await_owned_task(source)
+            assert len(originals) == 1 and execution_commit_outcome(originals[0]) == "unknown"
+            reader_release.set()
+            outcome = await await_owned_task(reader)
+        assert outcome.error is not None, "cache-hit completion disclosed healthy catalog after original shared control"
+        assert is_execution_control_error(outcome.error)
+        assert execution_commit_outcome(outcome.error) == "unknown"
+        assert originals[0] in tuple(_explicit_control_chain(outcome.error))
+        assert tuple(_explicit_control_chain(originals[0])) == graphs[0]
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=183') == 1
+    finally:
+        ack_release.set()
+        reader_release.set()
+        if reader is not None:
+            await await_owned_task(reader)
+        if source is not None:
+            await await_owned_task(source)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_debt", [False, True])
 async def test_stopped_refresh_is_local_only_without_native_retirement_debt(
     tmp_path, monkeypatch, cleanup_debt,

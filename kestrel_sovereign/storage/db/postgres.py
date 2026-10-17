@@ -748,67 +748,39 @@ class PostgresBackend(DatabaseBackend):
             raise ConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
     
     async def close(self) -> None:
-        """Close every owned pool before surfacing a close failure or cancel.
+        """Join independent original pool closers, retaining refused owners.
 
-        The advisory pool is a separate owned resource even when the primary
-        pool was supplied by ``from_pool``.  Keep each handle until its own
-        close task reaches a successful terminal state, so a failure or an
-        owned-task cancellation remains retryable instead of stranding a
-        dedicated advisory session behind a cleared reference.
+        Never clear a handle until its own accepted closer physically succeeds.
+        Task-factory refusal is native retirement debt for that exact pool, not
+        an ordinary close failure or permission to skip the independent pool.
+        Borrowed primary pools are only detached; their caller retains custody.
         """
-
-        pending_cancellation: asyncio.CancelledError | None = None
-        failures: list[BaseException] = []
-
-        advisory_pool = self._advisory_pool
-        if advisory_pool is not None:
-            outcome = await await_owned_task(
-                asyncio.create_task(advisory_pool.close()),
-                pending_cancellation,
-            )
-            pending_cancellation = outcome.cancellation
-            if outcome.error is None:
-                if self._advisory_pool is advisory_pool:
-                    self._advisory_pool = None
-            else:
-                failures.append(outcome.error)
-
-        primary_pool = self._pool
-        if primary_pool is not None:
-            if self._owns_pool:
-                outcome = await await_owned_task(
-                    asyncio.create_task(primary_pool.close()),
-                    pending_cancellation,
-                )
-                pending_cancellation = outcome.cancellation
-                if outcome.error is None:
-                    if self._pool is primary_pool:
-                        self._pool = None
-                    logger.debug("Closed PostgreSQL connection pool")
-                else:
-                    failures.append(outcome.error)
-            else:
-                # We don't own the pool (from from_pool), just release our
-                # reference even when advisory cleanup failed or was cancelled.
-                logger.debug("Released PostgreSQL pool reference (not owned)")
-                if self._pool is primary_pool:
+        errors: list[BaseException] = []
+        for attribute in ("_advisory_pool", "_pool"):
+            pool = getattr(self, attribute)
+            if pool is None:
+                continue
+            if attribute == "_pool" and not self._owns_pool:
+                if self._pool is pool:
                     self._pool = None
-
-        if pending_cancellation is not None:
-            if failures:
-                pending_cancellation.add_note(
-                    "PostgreSQL pool cleanup also failed: "
-                    + "; ".join(str(error) for error in failures)
+                continue
+            try:
+                task = create_owned_task(
+                    pool.close(), retirement_resource=pool, retain_originals=True,
                 )
-                raise pending_cancellation from failures[0]
-            raise pending_cancellation
-        if failures:
-            if len(failures) > 1:
-                failures[0].add_note(
-                    "Additional PostgreSQL pool cleanup failures: "
-                    + "; ".join(str(error) for error in failures[1:])
-                )
-            raise failures[0]
+            except BaseException as error:
+                errors.append(error)
+                continue
+            outcome = await await_owned_task(task)
+            errors.extend((outcome.error, outcome.cancellation))
+            if outcome.error is None and getattr(self, attribute) is pool:
+                setattr(self, attribute, None)
+        terminal = execution_terminal_error(
+            *errors, retain_originals=True, prefer_cancellation=True,
+            isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
     
     def _ensure_connected(self) -> asyncpg.Pool:
         """Ensure we have an active pool."""

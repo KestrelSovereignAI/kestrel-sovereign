@@ -3797,17 +3797,18 @@ async def _lifespan_startup(app: FastAPI):
                 except BaseException as error:
                     rollback_failure = error
                 rollback_complete = not manager.list_agents()
-                terminal = execution_terminal_error(e, rollback_failure)
-                if not rollback_complete or (
-                    terminal is not None and is_execution_control_error(terminal)
-                ):
-                    # Preserve the manager for the outer lifespan teardown to
-                    # retry, but never leave it on the public routing surface:
-                    # a startup error dominates readiness and these agents may
-                    # still be draining their own cleanup.
-                    app.state.startup_cleanup_agent_manager = manager
-                    app.state.agent_manager = None
-            terminal = execution_terminal_error(e, rollback_failure)
+            terminal = execution_terminal_error(
+                e, rollback_failure, retain_originals=True,
+                isolate_control_originals=True,
+            )
+            if manager is not None and (not rollback_complete or (
+                terminal is not None and is_execution_control_error(terminal)
+            )):
+                # Keep the actual manager for outer teardown, never public
+                # routing. Compose once without mutating the original startup
+                # receipt or dropping the original rollback-admission failure.
+                app.state.startup_cleanup_agent_manager = manager
+                app.state.agent_manager = None
             if terminal is not None and is_execution_control_error(terminal):
                 raise terminal
             if not isinstance(e, Exception):
