@@ -13,7 +13,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Union, AsyncIterator, Type
 
-import httpx
+import httpx2
 from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
@@ -152,11 +152,11 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
         await close_acquired((stream_cm, stream))
 
 
-class _ProgressReportingBody(httpx.AsyncByteStream):
+class _ProgressReportingBody(httpx2.AsyncByteStream):
     """An Anthropic response body that reports each chunk it reads as call
     progress (#3357)."""
 
-    def __init__(self, body: httpx.AsyncByteStream) -> None:
+    def __init__(self, body: httpx2.AsyncByteStream) -> None:
         self._body = body
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -185,7 +185,7 @@ def _report_body_progress(stream: Any) -> None:
     """
     response = getattr(stream, "response", None)
     body = getattr(response, "stream", None)
-    if isinstance(body, httpx.AsyncByteStream) and not isinstance(
+    if isinstance(body, httpx2.AsyncByteStream) and not isinstance(
         body, _ProgressReportingBody
     ):
         response.stream = _ProgressReportingBody(body)
@@ -559,6 +559,26 @@ def _system_content_blocks(content: Any) -> List[Dict[str, Any]]:
     return [{"type": "text", "text": _message_content_to_text(content)}]
 
 
+def _validate_sampling_parameters(kwargs: Dict[str, Any], options: Any = None) -> None:
+    """Reject settings removed from the Anthropic 1.x Messages API."""
+    supplied = set(kwargs)
+    if options is None:
+        options = kwargs.get("request_options")
+    raw = getattr(options, "raw", None)
+    if isinstance(raw, dict):
+        supplied.update(raw)
+    unsupported = [
+        name for name in ("temperature", "top_p", "top_k")
+        if name in supplied
+    ]
+    if unsupported:
+        raise ValueError(
+            "Anthropic 1.x does not support sampling parameters: "
+            + ", ".join(unsupported)
+            + "; remove these settings from this provider request"
+        )
+
+
 class AnthropicAdapter(LLMAdapter):
     """
     Adapter for Anthropic Claude API.
@@ -789,6 +809,7 @@ class AnthropicAdapter(LLMAdapter):
         only thing honored is an explicit ``raw`` dict escape hatch, merged into
         the outbound request.
         """
+        _validate_sampling_parameters(request_kwargs, options)
         out = request_kwargs
         raw = getattr(options, "raw", None)
         if isinstance(raw, dict):
@@ -812,7 +833,7 @@ class AnthropicAdapter(LLMAdapter):
         Routes a dotted ``operation`` (e.g. "messages.count_tokens") through the
         pre-initialized SDK client, so auth headers (x-api-key / version),
         base_url and retries are all reused. Path-based passthrough is NOT
-        supported — hitting the raw httpx transport directly would bypass the
+        supported — hitting the raw httpx2 transport directly would bypass the
         SDK's auth headers and reach Anthropic unauthenticated.
         """
         if not operation:
@@ -1384,6 +1405,7 @@ class AnthropicAdapter(LLMAdapter):
         Returns:
             LLMResponse with content and/or tool calls
         """
+        _validate_sampling_parameters(kwargs)
         cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
         try:
             raise_if_cancelled(cancel_token)
@@ -1401,9 +1423,6 @@ class AnthropicAdapter(LLMAdapter):
 
             if combined_system:
                 api_params["system"] = combined_system
-
-            if "temperature" in kwargs:
-                api_params["temperature"] = kwargs["temperature"]
 
             if response_format is not None and issubclass(response_format, BaseModel):
                 api_params["output_config"] = _native_structured_output_config(
@@ -1551,6 +1570,7 @@ class AnthropicAdapter(LLMAdapter):
             Structured output with response_format is not well-supported in streaming mode
             for Anthropic. Use non-streaming get_response for structured output.
         """
+        _validate_sampling_parameters(kwargs)
         cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
         try:
             raise_if_cancelled(cancel_token)
@@ -1690,6 +1710,7 @@ class AnthropicAdapter(LLMAdapter):
         # still flush partial usage (#1684). Popped before building api_params
         # so it is never forwarded to the Anthropic SDK.
         usage_sink = kwargs.pop("usage_sink", None)
+        _validate_sampling_parameters(kwargs)
         cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
         try:
             raise_if_cancelled(cancel_token)
@@ -1707,9 +1728,6 @@ class AnthropicAdapter(LLMAdapter):
 
             if combined_system:
                 api_params["system"] = combined_system
-
-            if "temperature" in kwargs:
-                api_params["temperature"] = kwargs["temperature"]
 
             # Native structured output streams the JSON as ordinary text deltas.
             structured = (
@@ -2048,7 +2066,7 @@ class AnthropicAdapter(LLMAdapter):
         :meth:`get_response` (the SDK 0.5.0 contract requires the
         framework-initialized client be passed to discovery so routes
         with custom ``base_url`` reach the right endpoint). This
-        implementation uses an ``httpx.AsyncClient`` directly because
+        implementation uses an ``httpx2.AsyncClient`` directly because
         the Anthropic ``/v1/models`` endpoint does not require the
         Anthropic SDK client; the parameter is ignored here.
 
@@ -2064,7 +2082,7 @@ class AnthropicAdapter(LLMAdapter):
                 logger.warning("ANTHROPIC_API_KEY not set, returning empty model list")
                 return []
 
-            async with owned_native_http_client(httpx.AsyncClient()) as client:
+            async with owned_native_http_client(httpx2.AsyncClient()) as client:
                 retain_native_execution_http_client_close(client)
                 response = await client.get(
                     "https://api.anthropic.com/v1/models",
@@ -2087,12 +2105,12 @@ class AnthropicAdapter(LLMAdapter):
             logger.info(f"Anthropic returned {len(models)} models")
             return models
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             logger.error(f"Anthropic API HTTP error: {e.response.status_code} - {e.response.text}")
             if is_execution_control_error(e):
                 raise
             return []
-        except httpx.RequestError as e:
+        except httpx2.RequestError as e:
             logger.error(f"Anthropic API connection error: {e}")
             if is_execution_control_error(e):
                 raise

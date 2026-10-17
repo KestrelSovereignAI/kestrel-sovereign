@@ -1146,7 +1146,7 @@ class PhoenixSupervisor:
         expected to strip the prefix before forwarding. Forwarding the prefix
         verbatim makes every asset/API path miss and fall back to the SPA
         index (200 ``text/html`` for ``.js`` → the browser's strict-MIME
-        module errors). Verified live on 17.7.0: ``/assets/x.js`` → JS,
+        module errors). Verified live on 17.7.0 and 20.23.0: ``/assets/x.js`` → JS,
         ``/phoenix/assets/x.js`` → index fallback.
         """
         rel = path.lstrip("/")

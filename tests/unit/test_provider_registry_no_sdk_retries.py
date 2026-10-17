@@ -87,19 +87,19 @@ class TestConnectionErrorFailsFast:
     2.x's default ``max_retries=2`` backoff can complete in 1-1.5s
     on a fast host, so any threshold high enough for CI stability is
     high enough to silently pass a retries-back-on regression). Count
-    attempts directly via an ``httpx.AsyncHTTPTransport`` spy — that's
+    attempts directly via an ``httpx2.AsyncHTTPTransport`` spy — that's
     both flake-free and precisely measures the thing we actually care
     about: number of HTTP attempts == 1.
     """
 
     @pytest.mark.asyncio
     async def test_connection_refused_makes_exactly_one_attempt(self):
-        """The SDK must NOT retry. One ``httpx.send`` call per request."""
-        import httpx
+        """The SDK must NOT retry. One ``httpx2.send`` call per request."""
+        import httpx2
 
         attempt_count = 0
         original_handle_async_request = (
-            httpx.AsyncHTTPTransport.handle_async_request
+            httpx2.AsyncHTTPTransport.handle_async_request
         )
 
         async def counting_handle(self, request):
@@ -119,7 +119,7 @@ class TestConnectionErrorFailsFast:
         )
         try:
             with patch.object(
-                httpx.AsyncHTTPTransport,
+                httpx2.AsyncHTTPTransport,
                 "handle_async_request",
                 counting_handle,
             ):
