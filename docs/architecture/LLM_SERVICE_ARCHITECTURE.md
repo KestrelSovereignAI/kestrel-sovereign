@@ -107,6 +107,15 @@ owned-Task boundary with the original executor as the retirement resource.
 Physical Task settlement also retires its active-set membership immediately;
 deferred completion bookkeeping must not make that finite drain repeat a join.
 
+Temporary image paths enter the owned cleanup inventory immediately after file
+construction, before context entry or writing. One unlink collector serves both
+partial materialization and turn finalization, attempts every owned path without
+following leaf symlinks, and retains cleanup errors rather than masking the
+opening failure. Within a turn, a failed unlink retains its actual path and the
+original accepted turn Task as native retirement debt, so provider fallback cannot
+consume it as ordinary availability. Image cleanup errors cannot bypass callback
+admission closure, accepted-handler/checkpoint retirement or sink/mutex release.
+
 A registered callback's pure own-scope denial can remain local to that turn only
 when it carries neither canonical commit outcome nor cleanup debt. An acknowledged
 commit followed by an own-scope denial is still durable execution evidence: the

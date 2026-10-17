@@ -481,6 +481,16 @@ initial-reservation capabilities cannot recreate work. Re-registration cannot
 change an inactive consumer back to active; a new workflow wait needs a new
 consumer ID.
 
+#### Cognition terminalizer admission
+
+Failure to admit an exact-token cleanup Task is not an ACK or permission to
+replay cognition. Canonical admission closes the unstarted coroutine and keeps
+the actual immutable delivery snapshot as explicit retirement debt. The existing
+cleanup registry retains one bounded source-control receipt across repeated
+unadmitted attempts; each caller separately receives its actual allocation error
+with the original native receipt. A later admitted cleanup must settle the same
+delivery/token through its real CAS, without reviving ordinary runtime work.
+
 #### Resuming on a wait handle instead of holding a turn
 
 A held wait (`wait("<kind>:<handle>")`, or any `run_wait_loop` caller) is

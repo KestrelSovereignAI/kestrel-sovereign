@@ -5252,10 +5252,12 @@ class SignalDispatcher:
         self, delivery: DurableDelivery, error: BaseException,
     ) -> None:
         """Keep irreversible control evidence non-retryable and non-ACKable."""
-        from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
-        from kestrel_sovereign.execution_custody import execution_terminal_error
+        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
+        from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_terminal_error
 
-        self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
+        prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
+        retained_error = execution_terminal_error(None if prior is None else prior[1], error)
+        self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained_error)
         self._rearm_cleanup_runtime_owner_heartbeat()
         key = (self._agent.did, delivery.consumer_id, delivery.delivery_id,
             self._durable_delivery_owner, delivery.lease_token or "")
@@ -5272,10 +5274,28 @@ class SignalDispatcher:
             # later callback; the cleared CAS cannot manufacture new debt.
             # A failed metadata attempt keeps the existing bounded exact-token
             # reconciliation policy, never a replacement owner or work grant.
-            task = asyncio.create_task(
-                self._apply_cognition_control_terminal(delivery, error),
-                name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
-            )
+            try:
+                task = create_owned_task(
+                    self._apply_cognition_control_terminal(delivery, error),
+                    name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
+                    retirement_resource=delivery, retain_originals=True,
+                )
+            except BaseException as admission_error:
+                terminal = execution_terminal_error(
+                    error, admission_error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+                # One bounded source latch owns the exact delivery. A later
+                # allocation refusal is a new caller's finite observation,
+                # not another permanent link in that shared source history.
+                already_unadmitted = any(
+                    resource is delivery and owner is None
+                    for resource, owner in execution_cleanup_debts(retained_error)
+                )
+                retained = (execution_terminal_error(retained_error, admission_error)
+                            if already_unadmitted else terminal)
+                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
+                raise terminal
             owners[key] = task
         outcome = await await_owned_task(task)
         # Caller cancellation is not a failed receipt. The owned child has

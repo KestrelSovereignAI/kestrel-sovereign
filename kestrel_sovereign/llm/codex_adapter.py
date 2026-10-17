@@ -465,8 +465,30 @@ _DATA_IMAGE_SUFFIXES = {
 }
 
 
+def _cleanup_app_server_data_images(
+    paths: List[Path], *, retirement_owner: Optional[asyncio.Task[Any]] = None,
+) -> List[OSError]:
+    """Attempt every owned unlink without bypassing later retirement."""
+    failures: List[OSError] = []
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            if retirement_owner is not None:
+                # This synchronous unlink ran in the already accepted turn
+                # owner. Retain that actual failed attempt, not a fabricated
+                # cleanup Task or an ordinary provider-availability failure.
+                error._kestrel_native_retirement_debts = (
+                    *getattr(error, "_kestrel_native_retirement_debts", ()),
+                    (path, retirement_owner),
+                )
+            failures.append(error)
+    return failures
+
+
 def _materialize_app_server_data_images(
     request_input: List[Dict[str, Any]],
+    *, retirement_owner: Optional[asyncio.Task[Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Path]]:
     """Turn inline image data URLs into temporary ``localImage`` inputs.
 
@@ -510,14 +532,17 @@ def _materialize_app_server_data_images(
                 )
                 continue
 
-            with tempfile.NamedTemporaryFile(
+            image_file = tempfile.NamedTemporaryFile(
                 prefix="kestrel-codex-image-",
                 suffix=suffix,
                 delete=False,
-            ) as image_file:
-                image_file.write(payload)
-                path = Path(image_file.name)
+            )
+            path = Path(image_file.name)
+            # Constructor acceptance owns this native artifact, even if its
+            # context entry, write, flush or close fails before publication.
             temp_paths.append(path)
+            with image_file:
+                image_file.write(payload)
             local_item: Dict[str, Any] = {
                 "type": "localImage",
                 "path": str(path),
@@ -525,9 +550,15 @@ def _materialize_app_server_data_images(
             if item.get("detail"):
                 local_item["detail"] = item["detail"]
             materialized.append(local_item)
-    except Exception:
-        for path in temp_paths:
-            path.unlink(missing_ok=True)
+    except BaseException as error:
+        cleanup_errors = _cleanup_app_server_data_images(
+            temp_paths, retirement_owner=retirement_owner,
+        )
+        if cleanup_errors:
+            raise execution_terminal_error(
+                error, *cleanup_errors, retain_originals=True,
+                isolate_control_originals=True,
+            )
         raise
     return materialized, temp_paths
 
@@ -2905,6 +2936,7 @@ class CodexAdapter(LLMAdapter):
 
         sink = app.open_turn_sink(thread_id)
         temp_image_paths: List[Path] = []
+        image_retirement_owner = asyncio.current_task()
         # Whether the app-server ended the turn (``turn/completed``). Until it
         # does, a caller that abandons the turn leaves it running on the
         # thread (see below).
@@ -2920,7 +2952,8 @@ class CodexAdapter(LLMAdapter):
             # priority order so per-turn overrides stay consistent
             # with the workspace boundary the sandbox is enforcing.
             request_input, temp_image_paths = _materialize_app_server_data_images(
-                _turn_input_to_request_input(turn_input)
+                _turn_input_to_request_input(turn_input),
+                retirement_owner=image_retirement_owner,
             )
             turn_params: Dict[str, Any] = {
                 "threadId": thread_id,
@@ -3327,8 +3360,10 @@ class CodexAdapter(LLMAdapter):
                 self.reset_thread(session_id)
             raise
         finally:
-            for path in temp_image_paths:
-                path.unlink(missing_ok=True)
+            unwind_error = sys.exception()
+            inline_terminal_errors.extend(_cleanup_app_server_data_images(
+                temp_image_paths, retirement_owner=image_retirement_owner,
+            ))
             # Close admission before joining. A handler selected by the reader
             # before this point registers itself in ``active_inline_tool_handlers``
             # synchronously, before its first await, so it cannot slip between
@@ -3338,7 +3373,6 @@ class CodexAdapter(LLMAdapter):
                     _unreg()
                 except Exception:  # noqa: BLE001 - cleanup is best-effort
                     pass
-            unwind_error = sys.exception()
             pending_cleanup_cancellation = (
                 unwind_error
                 if isinstance(unwind_error, asyncio.CancelledError)

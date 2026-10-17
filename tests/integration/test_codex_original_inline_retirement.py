@@ -6,8 +6,10 @@ checkpoints are real local PG writes, not returned success stand-ins.
 """
 
 import asyncio
+import base64
 import contextvars
 import inspect
+from pathlib import Path
 import sys
 
 import pytest
@@ -50,10 +52,10 @@ for line in sys.stdin:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", ["collector", "collector-native", "checkpoint", "checkpoint-observer", "native-tool", "tool-observer", "deferred-completion"]
+    "mode", ["collector", "collector-native", "checkpoint", "checkpoint-observer", "native-tool", "tool-observer", "deferred-completion", "image", "image-native"]
 )
 async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
-    native_pg, monkeypatch, mode
+    native_pg, monkeypatch, tmp_path, mode
 ):
     backend, observer, schema = native_pg
     await observer.execute(f'CREATE TABLE "{schema}".inline_checkpoints (id INTEGER PRIMARY KEY)')
@@ -75,6 +77,40 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
     caller_receipts = []
     retirement_observers = []
     handler_sets, join_counts = [], {}
+    image_paths, image_errors, image_owners, image_tasks = [], [], [], []
+    content = "local fixture"
+    if mode in {"image", "image-native"}:
+        payload = b"\x89PNG\r\n\x1a\nlocal-declared-image-input"
+        content = [{"type": "text", "text": "local fixture"}, {
+            "type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(payload).decode("ascii"),
+            },
+        }]
+        materialize = adapter_module._materialize_app_server_data_images
+        native_unlink = Path.unlink
+
+        def materialize_then_replace(turn_input, **kwargs):
+            materialized, paths = materialize(turn_input, **kwargs)
+            image_owners.append(kwargs.get("retirement_owner"))
+            image_tasks.append(asyncio.current_task())
+            for path in paths:
+                assert path.read_bytes() == payload
+                native_unlink(path)
+                path.mkdir()
+                image_paths.append(path)
+            return materialized, paths
+
+        def observe_native_unlink(path, *args, **kwargs):
+            try:
+                return native_unlink(path, *args, **kwargs)
+            except OSError as error:
+                if path in image_paths:
+                    image_errors.append(error)
+                raise
+
+        monkeypatch.setattr(adapter_module.tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setattr(adapter_module, "_materialize_app_server_data_images", materialize_then_replace)
+        monkeypatch.setattr(Path, "unlink", observe_native_unlink)
     refusal = RuntimeError("original inline retirement Task allocation refused")
     loop, factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     actual_register, actual_events = app.register_server_request_handler, app.iter_turn_events
@@ -139,7 +175,7 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
             await backend.execute("INSERT INTO effects VALUES (179, 'original inline effect')")
             started.set()
             await release_tool.wait()
-        if mode in {"collector-native", "native-tool", "tool-observer"}:
+        if mode in {"collector-native", "native-tool", "tool-observer", "image-native"}:
             try:
                 lease.require_live()
             except BaseException as error:
@@ -178,7 +214,7 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
     owner = create_owned_task(
         adapter.get_response(
             client="declared-local-protocol", model="auto",
-            messages=[{"role": "user", "content": "local fixture"}],
+            messages=[{"role": "user", "content": content}],
             tools=[{"type": "function", "function": {"name": "write_local_effect", "parameters": {"type": "object"}}}],
             session_id="local-inline-session", tool_executor=execute,
         ), retain_originals=True,
@@ -186,10 +222,16 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
     try:
         await asyncio.wait_for(started.wait(), 5)
         assert len(tools) == 1 and not tools[0].done()
+        if mode in {"image", "image-native"}:
+            assert len(image_paths) == 1 and image_paths[0].is_dir()
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0
         loop.set_task_factory(refuse)
         owner.cancel("actual inline turn observer withdrawal")
-        await asyncio.wait_for(admission_closed.wait(), 5)
+        try:
+            await asyncio.wait_for(admission_closed.wait(), 5)
+        except TimeoutError:
+            assert not image_errors, "image cleanup error bypassed original handler admission closure"
+            raise
         await asyncio.sleep(0)
         lock = adapter._thread_locks["local-inline-thread"]
         assert lock.locked() and "local-inline-thread" in app._turn_sinks, (
@@ -211,7 +253,7 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
         release_tool.set()
         if mode == "checkpoint":
             await asyncio.wait_for(allocation_attempted.wait(), 5)
-        elif mode not in {"collector-native", "native-tool", "tool-observer"}:
+        elif mode not in {"collector-native", "native-tool", "tool-observer", "image-native"}:
             try:
                 await asyncio.wait_for(checkpoint_started.wait(), 5)
             except TimeoutError:
@@ -237,12 +279,21 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
             "inline retirement replaced actual caller withdrawal or native tool receipt"
         )
         assert all(tuple(_explicit_control_chain(error)) == before for error, before in original_chains)
+        if mode in {"image", "image-native"}:
+            assert image_errors and all(error in chain for error in image_errors)
+            assert all(error.filename == str(image_paths[0]) for error in image_errors)
+            assert is_execution_control_error(outcome.error), "failed image retirement became ordinary provider availability"
+            assert len(image_owners) == 1 and image_owners[0] is image_tasks[0] and image_owners[0].done()
+            assert any(
+                resource is image_paths[0] and attempt is image_owners[0]
+                for resource, attempt in execution_cleanup_debts(outcome.error)
+            ), "failed image unlink lost its actual artifact/original turn owner"
         if mode == "checkpoint":
             assert refusal in chain and all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused)
             assert (execute, None) in execution_cleanup_debts(outcome.error)
             assert is_execution_control_error(outcome.error)
             assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".inline_checkpoints') == 0
-        elif mode in {"collector-native", "native-tool", "tool-observer"}:
+        elif mode in {"collector-native", "native-tool", "tool-observer", "image-native"}:
             assert source_errors and is_execution_control_error(outcome.error)
             assert not refused and not checkpoints
         else:
@@ -261,3 +312,5 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
             coroutine.close()
         await await_owned_task(create_owned_task(app.aclose(), retain_originals=True))
         assert process.returncode is not None
+        for path in image_paths:
+            path.rmdir()
