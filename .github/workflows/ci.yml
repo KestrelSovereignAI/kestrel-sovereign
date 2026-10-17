@@ -464,7 +464,8 @@ jobs:
         # exceed. 35 + 5, plus teardown, is why the runner backstop is 45.
         #
         # This does not mask a hang. Per-test `--timeout=60` catches those in
-        # a minute; the wall clock only decides how much passing work is
+        # a minute, and tests/shared/hang_backstop.py ends one it cannot
+        # (#3669); the wall clock only decides how much passing work is
         # thrown away. Runner sizing — the real fix — stays in #2795.
         #
         # budget-basis(unit): slowest-pass=13.8 worst-runner-ratio=2.3 samples=51 longest-test=300

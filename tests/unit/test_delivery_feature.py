@@ -1178,7 +1178,7 @@ class TestQueueIdempotency:
             )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("key", ["", "x" * 4097])
+    @pytest.mark.parametrize("key", ["", "x" * 4097], ids=["empty", "over-4096"])
     async def test_invalid_idempotency_key_is_rejected(self, real_queue, key):
         queue, _ = real_queue
 

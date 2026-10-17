@@ -36,6 +36,16 @@ from tests.shared.pytest_cleanup_plugin import (
     cost_tracking,  # noqa: F401 - exposed as a pytest fixture
 )
 from tests.shared.resource_registry import registry
+from tests.shared.hang_backstop import (
+    configure as _hang_backstop_configure,
+    pytest_enter_pdb,  # noqa: F401 - exposed as a pytest hook
+    pytest_exception_interact,  # noqa: F401 - exposed as a pytest hook
+    pytest_runtest_protocol,  # noqa: F401 - exposed as a pytest hook
+)
+from tests.shared.node_id_length import (
+    pytest_xdist_node_collection_finished,  # noqa: F401 - exposed as a pytest hook
+    refuse_overlong_node_ids,
+)
 from kestrel_sovereign import paths
 from tests.shared.host_runtime_isolation import (
     ISOLATION_DIRNAME,
@@ -126,8 +136,9 @@ def pytest_addoption(parser):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip cloud_resource tests unless --run-cloud is provided."""
+    """Skip cloud_resource tests unless --run-cloud is provided; refuse overlong IDs."""
     _cleanup_collection_modifyitems(config, items)
+    refuse_overlong_node_ids(items)
 
 
 def _require_pytest_asyncio(config) -> None:
@@ -163,6 +174,7 @@ def _require_pytest_asyncio(config) -> None:
 def pytest_configure(config):
     """Configure pytest with all plugins and load .env for skipif conditions."""
     _require_pytest_asyncio(config)
+    _hang_backstop_configure(config)
     REFUSAL_RECORDER.install()
     # The allow-list's third root: an explicit --basetemp may lie outside the
     # system temporary directory, and every tmp_path lives below it.
