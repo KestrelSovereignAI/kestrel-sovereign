@@ -12879,8 +12879,9 @@ class TestLoadFromConfig:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("router_prefix", ["", "/prefixed"])
     @pytest.mark.parametrize("valid_peer_router", [True, False])
+    @pytest.mark.parametrize("route_count", [1, 2, 5])
     async def test_readiness_rollback_removes_only_its_own_host_routes(
-        self, tmp_path, router_prefix, valid_peer_router,
+        self, tmp_path, router_prefix, valid_peer_router, route_count,
     ):
         """A late ready failure cannot erase a later committed registration."""
 
@@ -12889,9 +12890,12 @@ class TestLoadFromConfig:
         def candidate(agent_id: str, route_path: str):
             router = APIRouter(prefix=router_prefix)
 
-            @router.get(route_path)
             async def route():
                 return {"agent": agent_id}
+
+            for index in range(route_count):
+                path = route_path if index == 0 else f"{route_path}-{index}"
+                router.add_api_route(path, route, methods=["GET"])
 
             feature = SimpleNamespace(
                 name="SharedReadyFeature",
@@ -12971,16 +12975,21 @@ class TestLoadFromConfig:
 
         assert manager.get_agent("FirstReady") is None
         assert manager.get_agent("SecondReady") is agents["SecondReady"]
-        second_feature = agents["SecondReady"].features["SharedReadyFeature"]
-        second_router = second_feature.get_router()
         assert server._resolve_live_route_agent(
             app, {"state": {}}, agents["FirstReady"],
         ) is None
-        expected_path = f"{router_prefix}/shared-ready-route"
-        assert sum(
-            route.path == expected_path
-            for route in iter_route_contexts(app.routes)
-        ) == int(valid_peer_router)
+        expected_paths = [
+            f"{router_prefix}/shared-ready-route" + (f"-{index}" if index else "")
+            for index in range(route_count)
+        ]
+        # A surviving shared registration must remain callable, and retaining
+        # its key must not block remount or create duplicate physical leaves.
+        server._mount_feature_routers(app, agents=(agents["SecondReady"],))
+        for expected_path in expected_paths:
+            assert sum(
+                context.path == expected_path
+                for context in iter_route_contexts(app.routes)
+            ) == int(valid_peer_router)
         assert {
             field: vars(agents["FirstReady"])[field]
             for field in restored_fields if field in vars(agents["FirstReady"])
@@ -12992,12 +13001,14 @@ class TestLoadFromConfig:
             await app(scope, receive, send)
 
         with TestClient(app) as client:
-            assert client.get(expected_path).status_code == 404
+            for expected_path in expected_paths:
+                assert client.get(expected_path).status_code == 404
         with TestClient(selected_peer) as client:
-            response = client.get(expected_path)
-        assert response.status_code == (200 if valid_peer_router else 404)
-        if valid_peer_router:
-            assert response.json() == {"agent": "did:test:second-ready"}
+            for expected_path in expected_paths:
+                response = client.get(expected_path)
+                assert response.status_code == (200 if valid_peer_router else 404)
+                if valid_peer_router:
+                    assert response.json() == {"agent": "did:test:second-ready"}
 
 
     def test_preflight_reserves_spawn_cap_before_projection(self):

@@ -896,6 +896,11 @@ class _LiveFeatureRouter(APIRouter):
             "strict_content_type": parent.strict_content_type,
         }
 
+    @property
+    def registration_key(self) -> tuple:
+        """The exact shared mount this lifecycle owns, including feature name."""
+        return (self._feature_name, *self._signature[1:])
+
     def _current_router(self, scope):
         agent = _resolve_live_route_agent(
             self._host_app, scope, self._mount_agent,
@@ -932,7 +937,7 @@ class _LiveFeatureRoute(RouteContext):
     """A fixed native API context whose match and dispatch share a live gate.
 
     Include the source through FastAPI first, retaining its complete native
-    metadata and lifespan. Publish only the resulting API leaf contexts to the
+    metadata. Publish only the resulting API leaf contexts to the
     host; later source-router mutations cannot publish ungated frontend groups.
     """
 
@@ -1706,15 +1711,11 @@ async def _onboard_host_registered_agent(
         if id(route) in owned_feature_route_ids
     ]
     for key in owned_router_keys:
-        _feature_name, _prefix, route_shapes = key
-        expected_shapes = set(route_shapes)
         owned_router_route_ids[key] = {
             id(route)
             for route in owned_feature_routes
-            if {
-                _feature_route_shape(context)
-                for context in iter_route_contexts([route])
-            } == expected_shapes
+            if isinstance(route, _LiveFeatureRoute)
+            and route.lifecycle.registration_key == key
         }
     owned_ui_mount_ids.update(
         id(route)

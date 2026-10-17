@@ -1708,27 +1708,41 @@ def test_owner_withdrawal_requires_an_agent_url_without_probing_broken_peers(mon
         restore()
 
 
-def test_native_context_projection_preserves_feature_router_lifespan():
+def test_native_context_projection_keeps_host_metadata_when_mounted_during_startup():
+    from fastapi import Header
     from kestrel_sovereign import server
 
     events = []
 
-    @asynccontextmanager
-    async def feature_lifespan(_app):
-        events.append("start")
-        yield
-        events.append("stop")
+    async def host_dependency(scope: str = Header(alias="X-Host-Scope")):
+        events.append(scope)
 
-    router = APIRouter(lifespan=feature_lifespan)
+    router = APIRouter()
 
-    @router.get("/feature-lifespan")
+    @router.get("/startup-feature", tags=["feature-tag"])
     async def endpoint():
         return {"events": list(events)}
 
-    app = FastAPI()
-    app.state.agent = _make_agent({"LifespanFeature": SimpleNamespace(enabled=True, get_router=lambda: router)})
+    @asynccontextmanager
+    async def host_lifespan(app):
+        # Match production: feature routers are discovered inside the already
+        # entered host startup, not before the host lifespan is opened.
+        server._mount_feature_routers(app)
+        yield
+
+    app = FastAPI(lifespan=host_lifespan, dependencies=[Depends(host_dependency)])
+    app.router.tags = ["host-tag"]
+    app.state.agent = _make_agent({"StartupFeature": SimpleNamespace(enabled=True, get_router=lambda: router)})
     app.state.agent_manager = None
-    server._mount_feature_routers(app)
     with TestClient(app) as client:
-        assert client.get("/feature-lifespan").json() == {"events": ["start"]}
-    assert events == ["start", "stop"]
+        operation = app.openapi()["paths"]["/startup-feature"]["get"]
+        assert set(operation["tags"]) == {"host-tag", "feature-tag"}
+        assert any(
+            parameter["name"] == "X-Host-Scope" and parameter["required"]
+            for parameter in operation["parameters"]
+        )
+        assert client.get("/startup-feature").status_code == 422
+        assert client.get("/startup-feature", headers={"X-Host-Scope": "authorized"}).json() == {
+            "events": ["authorized"],
+        }
+    assert events == ["authorized"]
