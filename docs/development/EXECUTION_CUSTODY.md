@@ -1568,4 +1568,22 @@ cleanup. Actual cancellation is not a missing-receipt result. Tests exercise the
 real Agent registry methods and verifier with native PG component effects, not
 constitutional amendment approval or a provider-generated answer.
 
+Successful bounded-to-native provider upgrade may resolve an obsolete pending
+status error, but preserves actual cancellation carried by the earlier close
+Task's error as well as the current observer's cancellation. Both observations
+still refer to the same physically joined original SDK owner.
+
+Parallel tool batches submit lazy coroutines through the existing owned fan-out
+helper. Refusal of a later Task joins every accepted sibling and closes the
+unstarted refused operation before returning the original terminal evidence.
+Indexed Task names remain available without a second ownership implementation.
+The outer batch uses canonical admission with its original delegated lock context.
+Finite fan-out and outer join projections preserve each actual observer
+withdrawal without adding that history to a shared child source receipt.
+Deferred batch cancellation uses that same projection at all streaming and
+non-streaming consumers after the existing persistence checkpoint; the carrier
+owns the projection contract rather than each consumer reimplementing it.
+Native component tests use actual eager Tasks, PG effects and allocator refusal;
+they do not establish a complete Agent turn or external tool acceptance.
+
 These are candidate contracts, not whole-branch review or release approval.

@@ -40,6 +40,8 @@ from kestrel_sdk.llm import ToolCallStarted
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
+    create_owned_task,
+    gather_owned,
     raise_owned_outcome,
 )
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
@@ -3011,41 +3013,19 @@ class OrchestratorEngineMixin:
                             effective_model=em,
                         )
 
-                children = [
-                    asyncio.create_task(
+                await gather_owned(
+                    (
                         _run_one(
                             tc,
                             per_tool_messages[i],
                             per_tool_results[i] if per_tool_results is not None else None,
-                        ), name=f"orchestrator-parallel-tool:{i}",
-                    )
-                    for i, tc in enumerate(batch_tcs)
-                ]
-                primary_error = None
-                try:
-                    await asyncio.gather(*children)
-                except BaseException as error:
-                    primary_error = error
-                    raise
-                finally:
-                    # gather propagates its first child error without joining
-                    # siblings. A batch cannot retire while those siblings
-                    # still carry its admissions or publish effects/results.
-                    for child in children:
-                        if not child.done():
-                            child.cancel()
-                    terminal_error = primary_error
-                    for child in children:
-                        outcome = await await_owned_task(child)
-                        terminal_error = execution_terminal_error(
-                            terminal_error, outcome.error, outcome.cancellation,
                         )
-                    if terminal_error is not None:
-                        # Join every child, then apply the canonical control
-                        # precedence to the original error AND late outcomes.
-                        # Authority denial is control too, not only commit
-                        # uncertainty; it must never become an acknowledged Stop.
-                        raise terminal_error
+                        for i, tc in enumerate(batch_tcs)
+                    ),
+                    retain_originals=True,
+                    isolate_control_originals=True,
+                    name_prefix="orchestrator-parallel-tool",
+                )
 
                 # Append results in original request order
                 for i in range(len(batch_tcs)):
@@ -3106,10 +3086,11 @@ class OrchestratorEngineMixin:
         )
         if callable(delegate_lock_ownership):
             delegate_lock_ownership(batch_context)
-        owner = asyncio.create_task(
+        owner = create_owned_task(
             run_owned_batch(),
             name="orchestrator-tool-batch",
             context=batch_context,
+            retain_originals=True,
         )
         tool_results = kwargs.get("tool_results")
         result_count = len(tool_results) if isinstance(tool_results, list) else None
@@ -3124,6 +3105,7 @@ class OrchestratorEngineMixin:
         return raise_owned_outcome(
             outcome,
             operation="side-effecting orchestrator tool batch",
+            retain_originals=True,
         )
 
     # ------------------------------------------------------------------
@@ -3382,10 +3364,7 @@ class OrchestratorEngineMixin:
                 defer_cancellation_to_persistence=True,
             )
             if isinstance(batch_result, _DeferredToolBatchCancellation):
-                raise_owned_outcome(
-                    batch_result.outcome,
-                    operation="side-effecting orchestrator tool batch",
-                )
+                batch_result.raise_outcome()
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()

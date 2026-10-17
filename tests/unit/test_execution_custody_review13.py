@@ -1,4 +1,4 @@
-"""Actual parallel dispatch must retain every joined terminal-control carrier."""
+"""Real dispatch/Task contracts with declared receipts; native I/O is separate."""
 
 import asyncio
 
@@ -8,7 +8,8 @@ from kestrel_sovereign.agent.invocation import bind_async_invocation, bind_async
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError, ExecutionCommitOutcomeError, execution_commit_outcome,
+    ExecutionAuthorityError, ExecutionCommitOutcomeError, _explicit_control_chain,
+    execution_commit_outcome, is_execution_control_error,
 )
 from tests.unit.test_tool_concurrency import FakeTool, FakeToolCall
 
@@ -32,6 +33,9 @@ async def test_parallel_late_control_survives_actual_invocation(first, control, 
             if carrier == "cancel" else RuntimeError("late wrapped carrier")
         )
         expected.__cause__ = evidence
+    first_error = (asyncio.CancelledError("ordinary first cancellation")
+                   if first == "cancel" else ValueError("ordinary first failure"))
+    original_chain = tuple(_explicit_control_chain(expected))
 
     class Agent(OrchestratorEngineMixin):
         _direct_tools = {"first": FakeTool(safe=True), "late": FakeTool(safe=True)}
@@ -53,9 +57,7 @@ async def test_parallel_late_control_survives_actual_invocation(first, control, 
         async def _dispatch_tool_call(self, call, *args, **kwargs):
             if call.name == "first":
                 await started.wait()
-                if first == "cancel":
-                    raise asyncio.CancelledError("ordinary first cancellation")
-                raise ValueError("ordinary first failure")
+                raise first_error
             started.set()
             try:
                 await asyncio.Event().wait()
@@ -70,9 +72,12 @@ async def test_parallel_late_control_survives_actual_invocation(first, control, 
                 {}, set(), [], 0, "provider-free probe",
             )
 
-    with pytest.raises(type(expected)) as caught:
+    with pytest.raises(BaseException) as caught:
         await Agent().turn(request_id="parallel-control")
-    assert caught.value is expected
+    assert expected in tuple(_explicit_control_chain(caught.value))
+    assert first_error in tuple(_explicit_control_chain(caught.value))
+    assert is_execution_control_error(caught.value)
+    assert tuple(_explicit_control_chain(expected)) == original_chain
     assert joined.is_set(), "parallel sibling was not joined"
     assert execution_commit_outcome(caught.value) == (None if control == "denied" else control)
     assert dispositions == [RequestCompletionDisposition.ABANDONED]

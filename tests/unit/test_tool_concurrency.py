@@ -9,7 +9,7 @@ nothing bypasses hooks, observability, or context_stats.
 import asyncio
 import pytest
 from dataclasses import dataclass
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock
 
 from kestrel_sovereign.agent.orchestrator_engine import (
     OrchestratorEngineMixin,
@@ -157,6 +157,11 @@ async def test_parallel_failure_joins_cancellation_resistant_sibling_before_retu
     cancelled = asyncio.Event()
     drained = asyncio.Event()
     finished = []
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError, _explicit_control_chain, execution_commit_outcome,
+    )
+    first_error = ValueError("first child failed")
+    original_unknown = ExecutionCommitOutcomeError("unknown")
 
     class Agent(OrchestratorEngineMixin):
         _direct_tools = {"fail": FakeTool(safe=True), "slow": FakeTool(safe=True)}
@@ -166,7 +171,7 @@ async def test_parallel_failure_joins_cancellation_resistant_sibling_before_retu
         async def _dispatch_tool_call(self, call, *args, **kwargs):
             if call.name == "fail":
                 await entered.wait()
-                raise ValueError("first child failed")
+                raise first_error
             entered.set()
             try:
                 await asyncio.Event().wait()
@@ -175,8 +180,7 @@ async def test_parallel_failure_joins_cancellation_resistant_sibling_before_retu
                 await drained.wait()
             finished.append("slow child joined")
             if uncertain:
-                from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
-                raise ExecutionCommitOutcomeError("unknown")
+                raise original_unknown
 
     agent = Agent()
     task = asyncio.create_task(agent._execute_tool_batch(
@@ -187,9 +191,13 @@ async def test_parallel_failure_joins_cancellation_resistant_sibling_before_retu
         await asyncio.wait_for(cancelled.wait(), timeout=2)
         assert not task.done()
         drained.set()
-        from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
-        with pytest.raises(ExecutionCommitOutcomeError if uncertain else ValueError):
+        with pytest.raises(BaseException if uncertain else ValueError) as caught:
             await task
+        assert first_error in tuple(_explicit_control_chain(caught.value))
+        if uncertain:
+            assert original_unknown in tuple(_explicit_control_chain(caught.value))
+            assert execution_commit_outcome(caught.value) == "unknown"
+            assert tuple(_explicit_control_chain(original_unknown)) == (original_unknown,)
         assert finished == ["slow child joined"]
     finally:
         drained.set()

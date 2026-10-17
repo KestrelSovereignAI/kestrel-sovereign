@@ -141,8 +141,14 @@ class UnpublishedLLMOwner:
                     terminal, error, retain_originals=True,
                     isolate_control_originals=True,
                 )
-            if outcome.cancellation is not None:
-                raise outcome.cancellation
+            withdrawal = execution_terminal_error(
+                *(error for error in _explicit_control_chain(terminal)
+                  if isinstance(error, asyncio.CancelledError)),
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
+            if withdrawal is not None:
+                raise withdrawal
             return
         if self.control is not None:
             raise self.control

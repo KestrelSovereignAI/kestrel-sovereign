@@ -183,12 +183,16 @@ async def wait_owned_tasks_until(tasks, *, deadline: float):
 
 
 async def gather_owned(operations, *, cancel_siblings_on_error=True,
-                       retirement_resource=None, retain_originals=False):
+                       retirement_resource=None, retain_originals=False,
+                       name_prefix: str | None = None,
+                       isolate_control_originals=False):
     """Join accepted children even if later admission or observation fails.
 
     Independent native retirement can disable sibling cancellation: all
     operations are attempted, refused admission retains the original resource,
     and accepted children physically join before terminal control is selected.
+    Finite callers can isolate original control carriers from shared source
+    receipts. Indexed names are diagnostic only, never a second owner.
     """
     from kestrel_sovereign.execution_custody import (
         execution_terminal_error,
@@ -198,17 +202,19 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     pending = set()
     primary = None
     try:
-        for operation in operations:
+        for index, operation in enumerate(operations):
             try:
                 children.append(create_owned_task(
                     operation, retirement_resource=retirement_resource,
                     retain_originals=retain_originals,
+                    name=f"{name_prefix}:{index}" if name_prefix is not None else None,
                 ))
             except BaseException as error:
                 if cancel_siblings_on_error:
                     raise
                 primary = execution_terminal_error(
                     primary, error, retain_originals=retain_originals,
+                    isolate_control_originals=isolate_control_originals,
                 )
         pending = set(children)
         while pending:
@@ -220,6 +226,7 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     except BaseException as error:
         primary = execution_terminal_error(
             primary, error, retain_originals=retain_originals,
+            isolate_control_originals=isolate_control_originals,
         )
     if primary is not None and cancel_siblings_on_error:
         for child in children:
@@ -233,7 +240,10 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
         if outcome.error is not None and (not isinstance(outcome.error, asyncio.CancelledError) or is_execution_control_error(outcome.error)):
             errors.append(outcome.error)
         errors.append(outcome.cancellation)
-    terminal = execution_terminal_error(*errors, retain_originals=retain_originals)
+    terminal = execution_terminal_error(
+        *errors, retain_originals=retain_originals,
+        isolate_control_originals=isolate_control_originals,
+    )
     if terminal is not None:
         raise terminal
     return results
@@ -826,8 +836,13 @@ def raise_owned_outcome(
     outcome: OwnedTaskOutcome[_T],
     *,
     operation: str,
+    retain_originals: bool = False,
 ) -> _T:
-    """Preserve control evidence before ordinary caller-cancellation precedence."""
+    """Preserve control before ordinary cancellation precedence.
+
+    Finite joins may retain original native source and caller evidence without
+    modifying the shared source receipt; the default priority is unchanged.
+    """
 
     from kestrel_sovereign.execution_custody import (
         execution_terminal_error,
@@ -837,7 +852,10 @@ def raise_owned_outcome(
         error is not None and is_execution_control_error(error)
         for error in (outcome.error, outcome.cancellation)
     ):
-        raise execution_terminal_error(outcome.error, outcome.cancellation)
+        raise execution_terminal_error(
+            outcome.error, outcome.cancellation, retain_originals=retain_originals,
+            isolate_control_originals=retain_originals,
+        )
 
     if outcome.cancellation is not None:
         if outcome.error is not None:

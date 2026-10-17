@@ -231,3 +231,53 @@ async def test_unpublished_physical_join_keeps_actual_plain_withdrawal(native_pg
         release.set()
         await await_owned_task(operation)
         await await_owned_task(physical)
+
+
+@pytest.mark.asyncio
+async def test_successful_native_upgrade_retains_bounded_original_cancellation(
+    native_memory_owners, monkeypatch
+):
+    """Real bounded service close C is not an obsolete pending-status error."""
+    n = native_memory_owners
+    service = n.service
+    client = service.providers[0]["client"]
+    actual_close = client.close
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def close():
+        calls.append(asyncio.current_task())
+        entered.set()
+        await release.wait()
+        await actual_close()
+
+    monkeypatch.setattr(client, "close", close)
+    monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 1.0)
+    owner = lifecycle.UnpublishedLLMOwner(service, ())
+    bounded = create_owned_task(owner.retire(), retain_originals=True)
+    upgraded = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        original_owner = owner.task
+        original_owner.cancel("actual bounded close caller withdrawal")
+        first = await asyncio.wait_for(await_owned_task(bounded), 5)
+        assert isinstance(first.error, asyncio.CancelledError)
+        assert first.cancellation is None and owner.control is None
+        assert owner.task is original_owner and not client.is_closed()
+        assert service.has_pending_close_owners()
+        original = first.error
+        release.set()
+        upgraded = create_owned_task(
+            owner.retire(join_native=True), retain_originals=True
+        )
+        result = await asyncio.wait_for(await_owned_task(upgraded), 5)
+        assert result.error is not None and original in tuple(
+            _explicit_control_chain(result.error)
+        ), "successful native upgrade erased original bounded-close cancellation"
+        assert client.is_closed() and len(calls) == 1 and calls[0].done()
+        assert not service.has_pending_close_owners() and not n.requests
+    finally:
+        release.set()
+        await await_owned_task(bounded)
+        if upgraded is not None:
+            await await_owned_task(upgraded)

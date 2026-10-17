@@ -64,6 +64,13 @@ class _DeferredToolBatchCancellation:
 
     outcome: OwnedTaskOutcome[Any]
 
+    def raise_outcome(self):
+        """Project this SAME finite batch evidence after its checkpoint."""
+        return raise_owned_outcome(
+            self.outcome, operation="side-effecting orchestrator tool batch",
+            retain_originals=True,
+        )
+
 
 def resolve_turn_invocation_context(
     llm_service,
@@ -2020,10 +2027,7 @@ class StreamingMixin:
             if _stopped_generation(self, request_id) is not None:
                 await persist_cancelled_tool_turn()
                 if deferred_tool_batch_cancellation is not None:
-                    raise_owned_outcome(
-                        deferred_tool_batch_cancellation.outcome,
-                        operation="side-effecting orchestrator tool batch",
-                    )
+                    deferred_tool_batch_cancellation.raise_outcome()
                 return
             # Persist only the post-tool synthesis in ``content``. Any
             # pre-tool prose was already retracted from the SSE client by
@@ -2122,10 +2126,7 @@ class StreamingMixin:
                 # ACKed as an ordinary success. The gates on either side of
                 # this one both re-raise; this one has to as well.
                 if deferred_tool_batch_cancellation is not None:
-                    raise_owned_outcome(
-                        deferred_tool_batch_cancellation.outcome,
-                        operation="side-effecting orchestrator tool batch",
-                    )
+                    deferred_tool_batch_cancellation.raise_outcome()
                 return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             audit_denied = getattr(tool_final_text, "denied", False)
@@ -2210,10 +2211,7 @@ class StreamingMixin:
                 require_success=tool_batch_completed(),
             )
             if deferred_tool_batch_cancellation is not None:
-                raise_owned_outcome(
-                    deferred_tool_batch_cancellation.outcome,
-                    operation="side-effecting orchestrator tool batch",
-                )
+                deferred_tool_batch_cancellation.raise_outcome()
             # #2674: strict-audit release. Nothing visible was streamed live this
             # turn; now that the POST_RESPONSE verdict exists, release ONLY the
             # reviewed text (block message on DENY, reviewed prose on

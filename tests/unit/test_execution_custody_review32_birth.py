@@ -7,6 +7,7 @@ import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
     current_execution_custody,
     execution_cleanup_debts,
     is_execution_control_error,
@@ -100,7 +101,7 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
         if kind in {"unknown", "cancel_unknown", "group", "ordinary"} and not late_receipt:
             with pytest.raises(BaseException) as caught:
                 await initialize()
-            assert caught.value is failure
+            assert failure in tuple(_explicit_control_chain(caught.value))
             if kind == "ordinary":
                 # This error came from an ORIGINAL physical adapter close,
                 # not an ordinary writer. Its failed ACK now truthfully owns
@@ -123,7 +124,7 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
             assert len(owners) == 1
             with pytest.raises(OSError) as closed:
                 await drain_unpublished_llm_owners(owners)
-            assert closed.value is failure
+            assert failure in tuple(_explicit_control_chain(closed.value))
             assert service.has_pending_close_owners()
             assert calls == [True]
         else:
@@ -148,11 +149,11 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
                 if late_receipt:
                     with pytest.raises(BaseException) as caught:
                         await drain
-                    assert caught.value is failure
+                    assert failure in tuple(_explicit_control_chain(caught.value))
                     assert len(owners) == 1 and calls == [True]
                     with pytest.raises(BaseException) as caught:
                         await drain_unpublished_llm_owners(owners)
-                    assert caught.value is failure
+                    assert failure in tuple(_explicit_control_chain(caught.value))
                     assert calls == [True]
                 else:
                     await drain
@@ -160,7 +161,7 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
             else:
                 with pytest.raises(BaseException) as caught:
                     await drain_unpublished_llm_owners(owners)
-                assert caught.value is failure
+                assert failure in tuple(_explicit_control_chain(caught.value))
                 assert len(owners) == 1 and calls == [True]
     finally:
         release.set()
