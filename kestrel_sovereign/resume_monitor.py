@@ -121,6 +121,7 @@ class ResumeMonitor:
         wall_clock: Callable[[], float] = time.time,
         mono_clock: Callable[[], float] = time.monotonic,
         name: str = "resume-monitor",
+        task_factory=None,
     ) -> None:
         self._on_resume = on_resume
         self._tick_seconds = max(1.0, float(tick_seconds))
@@ -128,6 +129,7 @@ class ResumeMonitor:
         self._wall_clock = wall_clock
         self._mono_clock = mono_clock
         self._name = name
+        self._task_factory = task_factory or asyncio.create_task
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._prev_wall: Optional[float] = None
@@ -165,7 +167,11 @@ class ResumeMonitor:
             )
             try:
                 await self._on_resume(gap)
-            except Exception:
+            except Exception as error:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+
+                if is_execution_control_error(error):
+                    raise
                 # The monitor must never die because a consumer raised —
                 # the next suspend still needs to be caught.
                 logger.exception("ResumeMonitor on_resume callback failed")
@@ -188,7 +194,7 @@ class ResumeMonitor:
             logger.warning("ResumeMonitor already running")
             return
         self._running = True
-        self._task = asyncio.create_task(self._loop(), name=self._name)
+        self._task = self._task_factory(self._loop(), name=self._name)
         logger.info(
             "ResumeMonitor started (tick=%.0fs, threshold=%.0fs)",
             self._tick_seconds,

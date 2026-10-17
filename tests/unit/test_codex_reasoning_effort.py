@@ -650,9 +650,11 @@ class TestFullTurnSettingsFreeze:
         real_await_or_cancelled = codex_adapter_module.await_or_cancelled
         lock_acquires = 0
 
-        async def acquire_then_invalidate(awaitable, cancel_token):
+        async def acquire_then_invalidate(awaitable, cancel_token, *, abandoned_result_cleanup=None):
             nonlocal lock_acquires
-            result = await real_await_or_cancelled(awaitable, cancel_token)
+            result = await real_await_or_cancelled(
+                awaitable, cancel_token, abandoned_result_cleanup=abandoned_result_cleanup,
+            )
             lock_acquires += 1
             if lock_acquires == 1:
                 # Force the same-session poisoned-thread re-resolution path

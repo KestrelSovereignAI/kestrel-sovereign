@@ -43,3 +43,46 @@ async def test_stream_tap_delivery_queues_are_isolated_for_the_same_retry():
     await tap.finish(retry_delivery)
     assert [chunk async for chunk in tap.subscribe(retry_delivery)] == ["retry"]
     assert not tap.has_stream(retry_delivery)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [False, True])
+async def test_original_stopped_tap_body_physically_retires_without_abandonment(tmp_path, started):
+    import asyncio
+    from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
+    from kestrel_sovereign.execution_custody import (
+        execution_cleanup_debts, execution_stream, is_execution_control_error,
+    )
+    from tests.unit.test_execution_custody_review29 import native_owner, retire
+
+    agent, db = await native_owner(tmp_path)
+    tap = AgentStreamTap()
+    request_id, delivery = "original-native-stop", "original-native-delivery"
+    generation = agent.register_active_request(request_id)
+    tap.register(delivery, owner=agent, request_id=request_id)
+    await tap.finish(delivery, completed=True)
+    agent._cleanup_cancelled_request(request_id, generation=generation)
+    producer = tap.producer_custody(delivery, agent)
+    async def audio():
+        yield await db.fetchval("SELECT CAST('audio' AS BLOB)")
+        await asyncio.Event().wait()
+    stream = tap.own_response(delivery, agent,
+        execution_stream(agent, audio(), captured_custody=producer))
+    try:
+        if started:
+            assert await anext(stream) == b"audio"
+        assert agent.cancel_current_request(request_id, generation=generation)
+        with pytest.raises(BaseException) as stopped:
+            await anext(stream)
+        assert is_execution_control_error(stopped.value)
+        assert not execution_cleanup_debts(stopped.value)
+        tap.unregister(delivery)
+        assert await asyncio.wait_for(agent.wait_for_request_completion(request_id), 2) is RequestCompletionDisposition.COMPLETED
+    finally:
+        tap.unregister(delivery)
+        try:
+            await stream.aclose()
+        except BaseException as error:
+            assert is_execution_control_error(error)
+        await retire(agent)
+        await db.close()

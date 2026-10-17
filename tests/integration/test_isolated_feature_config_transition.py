@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import sys
+from types import MethodType
 from unittest.mock import Mock
 
 import pytest
@@ -22,6 +23,7 @@ from kestrel_sovereign.features.isolated_runtime import (
     ProxyFeature,
     configure_hosted_isolated_runtime_lifecycle,
 )
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
 _TEST_AGENT_DID = "did:test:isolated-integration"
@@ -77,6 +79,24 @@ class _Storage:
             return "predicate_failed"
         self.nodes[node_id] = new_node
         return "swapped"
+
+
+def _hosted_lifecycle_agent(tmp_path):
+    """Declared host fields with actual Agent Task admission/retirement.
+
+    Mock attributes are not publication ACKs. The real child lifecycle below
+    must publish actual owned Tasks, even though this is not full Agent READY.
+    """
+    agent = Mock(
+        did=_TEST_AGENT_DID,
+        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+        features={},
+    )
+    agent.storage = _Storage()
+    agent._background_tasks = set()
+    for name in ("_track_background_task", "_remember_shutdown_control", "_raise_shutdown_control"):
+        setattr(agent, name, MethodType(getattr(KestrelAgent, name), agent))
+    return agent
 
 
 class _SDKWireClient:
@@ -226,12 +246,7 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
         service="idle-lifecycle-service",
     )
     snapshots = []
-    agent = Mock(
-        did=_TEST_AGENT_DID,
-        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
-        features={},
-    )
-    agent.storage = _Storage()
+    agent = _hosted_lifecycle_agent(tmp_path)
     agent.isolated_runtime_root = tmp_path / "runtimes"
     agent.isolated_runtime_namespace = "tenant/agent"
     configure_hosted_isolated_runtime_lifecycle(
@@ -292,8 +307,12 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
             "IdleLifecycleFeature"
         }
     finally:
-        await feature.shutdown()
+        try:
+            await feature.shutdown()
+        finally:
+            await KestrelAgent._shutdown_background_tasks(agent)
 
+    assert not agent._background_tasks
     assert second_process is not None
     assert second_process.returncode is not None
 
@@ -358,12 +377,7 @@ def main():
         project=str(project),
     )
     snapshots = []
-    agent = Mock(
-        did=_TEST_AGENT_DID,
-        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
-        features={},
-    )
-    agent.storage = _Storage()
+    agent = _hosted_lifecycle_agent(tmp_path)
     agent.isolated_runtime_root = tmp_path / "runtimes"
     agent.isolated_runtime_namespace = "tenant/agent"
     configure_hosted_isolated_runtime_lifecycle(
@@ -403,8 +417,12 @@ def main():
         assert managed_venv.is_dir()
         assert feature._last_cache_hit is False
     finally:
-        await feature.shutdown()
+        try:
+            await feature.shutdown()
+        finally:
+            await KestrelAgent._shutdown_background_tasks(agent)
 
+    assert not agent._background_tasks
     assert second_process is not None
     assert second_process.returncode is not None
 

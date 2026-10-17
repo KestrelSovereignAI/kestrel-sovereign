@@ -12,6 +12,15 @@ from __future__ import annotations
 import logging
 from typing import Callable, List
 
+from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
+    current_execution_custody,
+    execution_commit_outcome,
+    execution_denial_scopes,
+    execution_cleanup_debts,
+    is_execution_control_error,
+)
+
 logger = logging.getLogger(__name__)
 
 AfterCommitCallback = Callable[[], None]
@@ -20,12 +29,33 @@ AfterCommitCallback = Callable[[], None]
 def run_after_commit(callback: AfterCommitCallback) -> None:
     """Run one callback whose writes have committed.
 
-    The writes are durable, so a callback that fails must not reach the
-    writer as a failed write: it is logged with its traceback instead.
+    Ordinary reporting failures are logged without presenting durable writes
+    as rolled back. Execution control still propagates, with the committed
+    outcome retained (or a stronger outcome already carried by the error).
     """
     try:
         callback()
-    except Exception:  # noqa: BLE001 - the write committed; reporting it as failed would lie
+    except BaseException as error:  # explicit cancellation/group carriers can contain control
+        if is_execution_control_error(error):
+            if (execution_commit_outcome(error) == "committed"
+                and execution_denial_scopes(error) is not None
+                and not execution_cleanup_debts(error)):
+                # Preserve an already settled native fact/local denial. A
+                # reporting callback must not turn it into uncertainty on
+                # healthy runtime scopes. Unscoped/UNKNOWN/debt stays fatal.
+                raise
+            # The original write has committed. Custody/native-close failure
+            # is still control, not a logged-and-forgotten reporting error.
+            # A callback's stronger unknown outcome must remain unchanged.
+            outcome = execution_commit_outcome(error) or "committed"
+            scopes = (*current_execution_custody(), *(execution_denial_scopes(error) or ()))
+            for scope in scopes:
+                scope.preserve_commit_uncertainty(outcome)
+            if execution_commit_outcome(error) is not None:
+                raise
+            raise ExecutionCommitOutcomeError("committed") from error
+        if not isinstance(error, Exception):
+            raise
         logger.exception("After-commit callback %r failed", callback)
 
 

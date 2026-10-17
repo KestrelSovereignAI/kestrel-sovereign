@@ -11,6 +11,15 @@ Adapter for local Ollama instance with support for:
 import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
+from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    owned_native_http_client, native_sdk_operation,
+    owned_execution_stream, close_native_execution_stream, retain_native_execution_http_client_close,
+    is_execution_control_error,
+    current_execution_custody, bind_execution_cleanup, require_execution_work,
+    execution_terminal_error, retained_execution_error,
+)
 from collections.abc import Mapping
 from typing import (
     Any, AsyncIterator, Awaitable, Dict, List, Optional, Tuple, Type, TypeVar,
@@ -29,6 +38,7 @@ from .adapter import (
     ToolCall,
     split_thinking_from_content,
 )
+from .lifecycle import harvest_llm_close_task, llm_close_observation_control, start_llm_close_task
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     RawResponse,
@@ -244,6 +254,113 @@ class OllamaAdapter(LLMAdapter):
         self._embedding_configured = (
             embedding_model is not None or embedding_dim is not None
         )
+        self._discovery_clients = {}
+        self._discovery_borrowers = {}
+        self._discovery_closed = False
+        self._discovery_control = None
+
+    def _retain_discovery_control(self, error):
+        if is_execution_control_error(error):
+            # Once fenced, no new discovery borrower can enter. This finite
+            # aggregate is bounded by already admitted original owners, not
+            # an append-only catalog history. Never retain observer withdrawal.
+            self._discovery_control = execution_terminal_error(
+                self._discovery_control, error, retain_originals=True,
+                isolate_control_originals=True,
+            )
+
+    async def _retire_discovery_client(self, client, scopes):
+        if client not in self._discovery_clients:
+            # A concurrent borrower/retirement waiter already joined the SAME
+            # successful close. Failed closes are never removed from this map.
+            if self._discovery_control is not None:
+                raise retained_execution_error(self._discovery_control)
+            return
+        # The native client owns its canonical close registry. The adapter's
+        # existing map retains that SAME Task, not another wrapper/registry
+        # capable of spending a second physical close. Successful private
+        # clients can leave both the adapter inventory and its object graph.
+        key = "ollama-discovery-pool"
+        try:
+            with bind_execution_cleanup(self, scopes):
+                task = start_llm_close_task(client, key, client.aclose, resource=client)
+        except BaseException as error:
+            self._retain_discovery_control(vars(client).get("_llm_close_control"))
+            self._retain_discovery_control(error)
+            raise
+        self._discovery_clients[client] = task
+        outcome = await await_owned_task(task) if task is not None else None
+        failure = harvest_llm_close_task(client, key, task, observation_error=llm_close_observation_control(outcome)) if task is not None else None
+        publication = vars(client).get("_llm_close_control")
+        self._retain_discovery_control(failure)
+        self._retain_discovery_control(publication)
+        if failure is None:
+            self._discovery_clients.pop(client, None)
+        terminal = execution_terminal_error(
+            self._discovery_control, failure, publication,
+            outcome.error if outcome is not None else None,
+            outcome.cancellation if outcome is not None else None,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
+
+    @asynccontextmanager
+    async def _discovery_client(self, client=None):
+        if self._discovery_control is not None:
+            raise retained_execution_error(self._discovery_control)
+        require_execution_work(self)
+        if self._discovery_closed:
+            raise RuntimeError("Ollama discovery owner is retired")
+        if client is not None:
+            yield client
+            return  # Borrowed route clients belong to the service, not this call.
+        scopes = current_execution_custody(self)
+        client = ollama.AsyncClient()
+        native = client._client
+        self._discovery_clients[native] = None
+        borrower = asyncio.get_running_loop().create_future()
+        self._discovery_borrowers[native] = borrower
+        original = None
+        try:
+            retain_native_execution_http_client_close(native)
+            yield client
+        except BaseException as error:
+            original = error
+        finally:
+            # The borrower has exited native discovery before a concurrent
+            # shutdown may retire its transport. This is not a close receipt.
+            borrower.set_result(None)
+            self._discovery_borrowers.pop(native, None)
+        try:
+            await self._retire_discovery_client(native, scopes)
+        except BaseException as error:
+            original = execution_terminal_error(
+                original, error, retain_originals=True, isolate_control_originals=True,
+            )
+        if original is not None:
+            raise original
+
+    async def aclose(self):
+        """Join exact discovery pool owners; a failed close is never repeated."""
+        self._discovery_closed = True
+        terminal = self._discovery_control
+        for client in tuple(self._discovery_clients):
+            try:
+                borrower = self._discovery_borrowers.get(client)
+                if borrower is not None:
+                    joined = await await_owned_task(borrower)
+                    terminal = execution_terminal_error(
+                        terminal, joined.error, joined.cancellation,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                await self._retire_discovery_client(client, current_execution_custody(self))
+            except BaseException as error:
+                terminal = execution_terminal_error(
+                    terminal, error, retain_originals=True, isolate_control_originals=True,
+                )
+        if terminal is not None:
+            raise terminal
 
     def provider_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -379,6 +496,7 @@ class OllamaAdapter(LLMAdapter):
             output_tokens=output_tokens,
         )
 
+    @native_sdk_operation
     async def raw_request(
         self,
         client: Any,
@@ -393,6 +511,7 @@ class OllamaAdapter(LLMAdapter):
         (e.g. ``pull``, ``show``, ``ps``). Routes a named ``operation`` through
         the initialized Ollama client so host/transport are reused. Path-based
         passthrough is unsupported (the typed client owns the endpoint mapping)."""
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not operation:
             raise ValueError(
                 "raw_request requires a named Ollama client operation "
@@ -427,10 +546,13 @@ class OllamaAdapter(LLMAdapter):
 
         url = f"{str(host).rstrip('/')}/api/tags"
         try:
-            async with httpx.AsyncClient(timeout=timeout) as http:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=timeout)) as http:
+                retain_native_execution_http_client_close(http)
                 response = await http.get(url)
             return response.status_code < 500
-        except httpx.HTTPError:
+        except httpx.HTTPError as error:
+            if is_execution_control_error(error):
+                raise
             return False
 
     def embedding_space_id(self) -> Optional[str]:
@@ -481,6 +603,7 @@ class OllamaAdapter(LLMAdapter):
             served = getattr(response, "model", None)
         usage_sink.add(input_tokens=tokens, model=served)
 
+    @native_sdk_operation
     async def aembed(
         self,
         client: "ollama.AsyncClient",
@@ -491,6 +614,7 @@ class OllamaAdapter(LLMAdapter):
         usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             response = await client.embed(
                 model=model or self._embedding_model,
@@ -498,12 +622,15 @@ class OllamaAdapter(LLMAdapter):
                 **self._embed_kwargs(dimensions),
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Ollama embedding failed: %s", exc)
             return None
         self._report_embedding_usage(usage_sink, response)
         embeddings = response.get("embeddings", []) if isinstance(response, dict) else getattr(response, "embeddings", [])
         return list(embeddings[0]) if embeddings else None
 
+    @native_sdk_operation
     async def aembed_batch(
         self,
         client: "ollama.AsyncClient",
@@ -514,6 +641,7 @@ class OllamaAdapter(LLMAdapter):
         usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not texts:
             return []
         try:
@@ -523,6 +651,8 @@ class OllamaAdapter(LLMAdapter):
                 **self._embed_kwargs(dimensions),
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Ollama batch embedding failed: %s", exc)
             return [None] * len(texts)
         self._report_embedding_usage(usage_sink, response)
@@ -561,6 +691,7 @@ class OllamaAdapter(LLMAdapter):
 
         return messages
 
+    @native_sdk_operation
     async def get_response(
         self,
         client: "ollama.AsyncClient",
@@ -591,6 +722,7 @@ class OllamaAdapter(LLMAdapter):
                 arrived (#3572). The pending request was cancelled, which
                 closed its HTTP response, so the daemon stops generating.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not OLLAMA_AVAILABLE:
             raise RuntimeError("Ollama is not available in this environment")
 
@@ -667,6 +799,8 @@ class OllamaAdapter(LLMAdapter):
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(f"Ollama structured output validation failed: {e}")
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.error(f"Unexpected error during Ollama structured output validation: {e}", exc_info=True)
                     # Return raw content if validation fails
 
@@ -749,6 +883,7 @@ class OllamaAdapter(LLMAdapter):
         prompt (#3572): the pending read is cancelled, which closes the HTTP
         response, so the daemon stops generating.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not OLLAMA_AVAILABLE:
             raise RuntimeError("Ollama is not available in this environment")
 
@@ -767,15 +902,20 @@ class OllamaAdapter(LLMAdapter):
             # a server that ignores ``num_predict`` must not stream without end.
             extra_kwargs, budget = self._chat_kwargs(extra_kwargs, kwargs, model)
 
+            # Ollama returns an async generator rather than an SDK stream
+            # exposing .response. Own its native HTTP response BEFORE the
+            # generator can reach HTTPX's implicit EOF close.
             stream = await await_or_cancelled(
                 with_retry(
                     client.chat,
                     model=model,
                     messages=messages,
                     stream=True,
+                    acquired_result_cleanup=close_native_execution_stream,
                     **extra_kwargs
                 ),
                 cancel_token,
+                abandoned_result_cleanup=close_native_execution_stream,
             )
 
             chunk_count = 0
@@ -837,9 +977,7 @@ class OllamaAdapter(LLMAdapter):
             finally:
                 # Closing the response is what stops the server generating
                 # when this stream is abandoned or fails part-way.
-                aclose = getattr(stream, "aclose", None)
-                if aclose is not None:
-                    await aclose()
+                await close_native_execution_stream(stream, self)
 
             if done_reason == _LENGTH_DONE_REASON:
                 raise self._output_cap_reached(
@@ -862,6 +1000,8 @@ class OllamaAdapter(LLMAdapter):
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(f"Ollama streaming structured output validation failed: {e}")
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.error(f"Unexpected error during Ollama streaming structured output validation: {e}", exc_info=True)
 
             total_tokens = None
@@ -881,6 +1021,8 @@ class OllamaAdapter(LLMAdapter):
             logger.error(f"Ollama streaming API error: {e}")
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Ollama streaming failed: {e}", exc_info=True)
             raise
 
@@ -906,16 +1048,17 @@ class OllamaAdapter(LLMAdapter):
         Yields:
             Text chunks as they arrive. For structured output, yields JSON chunks.
         """
-        async for item in self._stream_with_usage(
+        async with owned_execution_stream(self, self._stream_with_usage(
             client=client,
             model=model,
             messages=messages,
             tools=tools,
             response_format=response_format,
             **kwargs
-        ):
-            if not isinstance(item, LLMResponse):
-                yield item
+        )) as owned_stream:
+            async for item in owned_stream:
+                if not isinstance(item, LLMResponse):
+                    yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -1001,14 +1144,15 @@ class OllamaAdapter(LLMAdapter):
 
             # No tools - stream text and forward the terminal usage response so
             # the service layer meters text-only streamed turns (#1684).
-            async for item in self._stream_with_usage(
+            async with owned_execution_stream(self, self._stream_with_usage(
                 client=client,
                 model=model,
                 messages=messages,
                 response_format=response_format,
                 **kwargs
-            ):
-                yield item
+            )) as owned_stream:
+                async for item in owned_stream:
+                    yield item
 
         except OutputCapReachedError:
             raise
@@ -1016,6 +1160,8 @@ class OllamaAdapter(LLMAdapter):
             logger.error(f"Ollama streaming with tools API error: {e}")
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Ollama streaming with tools failed: {e}", exc_info=True)
             raise
 
@@ -1091,6 +1237,7 @@ class OllamaAdapter(LLMAdapter):
         capabilities = _show_field(info, "capabilities") or []
         return "decision" in capabilities and "completion" not in capabilities
 
+    @native_sdk_operation
     async def _check_tool_support(self, client: "ollama.AsyncClient", model_name: str) -> bool:
         """Check if a model supports tool calling via /api/show metadata.
 
@@ -1103,6 +1250,7 @@ class OllamaAdapter(LLMAdapter):
         Returns:
             True if the model advertises tool calling support.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             info = await client.show(model_name)
         except Exception as e:
@@ -1152,15 +1300,16 @@ class OllamaAdapter(LLMAdapter):
         if not OLLAMA_AVAILABLE:
             logger.warning("Ollama library not available, returning empty model list")
             return []
-        return await self._bounded_listing(
-            self._list_chat_models(client), "model listing"
-        )
+        async with self._discovery_client(client) as local:
+            return await self._bounded_listing(
+                self._list_chat_models(local), "model listing"
+            )
 
+    @native_sdk_operation
     async def _list_chat_models(self, client: Any) -> List[ModelInfo]:
         """:meth:`list_models` without its timeout."""
         try:
-            if client is None:
-                client = ollama.AsyncClient()
+            retain_native_execution_http_client_close(getattr(client, "_client", None))
             response = await client.list()
 
             # Handle both dict response (older ollama) and Pydantic model (newer ollama)
@@ -1218,6 +1367,8 @@ class OllamaAdapter(LLMAdapter):
                 try:
                     show_info = await client.show(model_name)
                 except Exception as e:  # noqa: BLE001 - per-model metadata is best-effort
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Could not read metadata for {model_name}: {e}")
                     show_info = None
                 if show_info is not None and self._is_decision_only(show_info):
@@ -1247,8 +1398,12 @@ class OllamaAdapter(LLMAdapter):
 
         except ollama.ResponseError as e:
             logger.error(f"Ollama API error while listing models: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to list Ollama models: {e}", exc_info=True)
             return []
 
@@ -1284,12 +1439,14 @@ class OllamaAdapter(LLMAdapter):
         with ``decision_context_limit``. Failures propagate so discovery can
         mark the route stale.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not OLLAMA_AVAILABLE or client is None:
             return []
         return await self._bounded_listing(
             self._list_decision_models(client), "decision model listing"
         )
 
+    @native_sdk_operation
     async def _list_decision_models(self, client: Any) -> List[DecisionModelInfo]:
         """:meth:`list_decision_models` without its timeout."""
         response = await client.list()
@@ -1319,6 +1476,7 @@ class OllamaAdapter(LLMAdapter):
         logger.info(f"Ollama: discovered {len(results)} decision models")
         return results
 
+    @native_sdk_operation
     async def _check_embedding_support(
         self, client: "ollama.AsyncClient", model_name: str
     ) -> bool:
@@ -1330,6 +1488,7 @@ class OllamaAdapter(LLMAdapter):
         replaces the name-substring heuristic in :meth:`list_models`, so a
         differently-named embedding model is still discovered.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             info = await client.show(model_name)
             if isinstance(info, dict):
@@ -1338,11 +1497,25 @@ class OllamaAdapter(LLMAdapter):
                 capabilities = getattr(info, "capabilities", None) or []
             return "embedding" in capabilities
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Could not check embedding support for {model_name}: {e}")
             return False
 
     async def list_embedding_models(
         self, client: Any = None, chat_models: Any = None
+    ) -> List["EmbeddingModelInfo"]:
+        """Borrow a route client or own the whole temporary discovery pool."""
+        if not OLLAMA_AVAILABLE:
+            return []
+        async with self._discovery_client(client) as local:
+            return await self._bounded_listing(
+                self._list_embedding_models(local), "embedding model listing"
+            )
+
+    @native_sdk_operation
+    async def _list_embedding_models(
+        self, client: Any
     ) -> List["EmbeddingModelInfo"]:
         """Discover locally-available embedding models (#2338).
 
@@ -1362,24 +1535,10 @@ class OllamaAdapter(LLMAdapter):
         raises ``TimeoutError`` (#3646): unlike an error answer, it is not an
         empty catalog, and discovery records it as the route's failure.
         """
-        if not OLLAMA_AVAILABLE:
-            logger.warning(
-                "Ollama library not available, returning empty embedding model list"
-            )
-            return []
-        return await self._bounded_listing(
-            self._list_embedding_models(client), "embedding model listing"
-        )
-
-    async def _list_embedding_models(
-        self, client: Any
-    ) -> List["EmbeddingModelInfo"]:
-        """:meth:`list_embedding_models` without its timeout."""
         from .embedding_discovery import EmbeddingModelInfo
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
 
         try:
-            if client is None:
-                client = ollama.AsyncClient()
             response = await client.list()
 
             if hasattr(response, "models"):
@@ -1413,6 +1572,8 @@ class OllamaAdapter(LLMAdapter):
             return results
         except Exception as e:
             logger.error(f"Failed to list Ollama embedding models: {e}", exc_info=True)
+            if is_execution_control_error(e):
+                raise
             return []
 
     # ---- Provider metadata (SDK 0.6.0) -------------------------------------

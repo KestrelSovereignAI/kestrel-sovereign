@@ -662,7 +662,15 @@ async def test_postgres_scheduled_mutator_does_not_deadlock_rollout_admission(
         ) == (False, None)
         assert await db.fetchone(
             "SELECT status FROM task_execution_log WHERE task_id = ?", (task_id,)
-        ) == ("cancelled",)
+        ) == ("executing",)
+        unresolved = await db.fetchone(
+            "SELECT terminal_status, claim_execution_id, claim_scheduled_for FROM scheduled_tasks WHERE id = ?", (task_id,)
+        )
+        assert unresolved[0] == "unresolved_effect"
+        assert unresolved[1] and unresolved[2]
+        resume = await mutation_feature.schedule_resume(task_id)
+        assert resume.status.value == "error"
+        assert resume.data["disabled_reason"] == "unresolved_effect"
     finally:
         if tick is not None and not tick.done():
             tick.cancel()
@@ -1336,7 +1344,9 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
     row_lock_held = asyncio.Event()
     blocked_renewal_started = asyncio.Event()
     blocked_renewal_finished = asyncio.Event()
+    blocked_renewal_cancelled = asyncio.Event()
     blocked_renewal_results: list[bool] = []
+    blocked_renewal_denials: list[BaseException] = []
 
     async def executor(_task_name, _args):
         executor_started.set()
@@ -1354,6 +1364,14 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
                 renewed = await super()._renew_lease_once(task)
                 blocked_renewal_results.append(renewed)
                 return renewed
+            except asyncio.CancelledError:
+                blocked_renewal_cancelled.set()
+                raise
+            except Exception as error:
+                from kestrel_sovereign.execution_custody import execution_denial_scopes
+                assert execution_denial_scopes(error), "renewal failed without original authority-denial provenance"
+                blocked_renewal_denials.append(error)
+                raise
             finally:
                 blocked_renewal_finished.set()
 
@@ -1424,7 +1442,14 @@ async def test_postgres_renewal_does_not_resurrect_expired_token_after_row_lock_
 
         row_lock_held.clear()
         await asyncio.wait_for(blocked_renewal_finished.wait(), timeout=2)
-        assert blocked_renewal_results == [False]
+        # The independently confirmed deadline denies the original renewal
+        # when its row lock resumes, or revokes it before native admission.
+        # Every original receipt must be joined; none may extend the lease.
+        assert blocked_renewal_results == [False] or (
+            blocked_renewal_results == [] and blocked_renewal_cancelled.is_set()
+        ) or (
+            blocked_renewal_results == [] and len(blocked_renewal_denials) == 1
+        )
         assert locked_expiry is not None
         row = await db.fetchone(
             "SELECT lease_expires_at, claim_token FROM scheduled_tasks WHERE id = ?",

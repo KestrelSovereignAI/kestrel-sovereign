@@ -45,6 +45,7 @@ from kestrel_sovereign.signals import (
     SourceRegistry,
 )
 from kestrel_sovereign.waits import WaitRegistry
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 
 
 class FeatureContributionRuntimeError(RuntimeError):
@@ -1112,15 +1113,20 @@ class FeatureContributionRuntime:
             self.context_clause_registry.unregister_batch(exact_context)
 
         failed = False
+        controls = []
 
         def attempt(operation) -> None:
             nonlocal failed
             try:
                 operation()
-            except Exception:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
                 # The public error below is deliberately fixed text. Registry
                 # exceptions can include third-party names or representations.
                 failed = True
+                if is_execution_control_error(error) or isinstance(error, asyncio.CancelledError):
+                    controls.append(error)
+                elif not isinstance(error, Exception):
+                    raise
 
         def quarantine_operator_set(registration_set: OperatorRegistrationSet) -> None:
             nonlocal failed
@@ -1131,10 +1137,14 @@ class FeatureContributionRuntime:
                 withdrawn = self.operator_registry.quarantine_registration_set(
                     registration_set
                 )
-            except Exception:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
                 # Keep the retained capability unmarked so a later repair can
                 # retry its authenticated withdrawal.
                 failed = True
+                if is_execution_control_error(error) or isinstance(error, asyncio.CancelledError):
+                    controls.append(error)
+                elif not isinstance(error, Exception):
+                    raise
                 return
             if withdrawn is not True:
                 failed = True
@@ -1186,8 +1196,9 @@ class FeatureContributionRuntime:
         )
         attempt(lambda: self.source_registry.quarantine_claims(feature, sources))
         if failed:
-            raise FeatureContributionRuntimeError(
-                "feature contributions could not be quarantined"
+            raise execution_terminal_error(
+                FeatureContributionRuntimeError("feature contributions could not be quarantined"),
+                *controls, retain_originals=True, isolate_control_originals=True,
             ) from None
 
         del self._active[id(feature)]
@@ -1342,7 +1353,9 @@ class FeatureContributionRuntime:
                 return
             await prepare()
             return
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                raise
             task = asyncio.current_task()
             if task is not None and task.cancelling():
                 externally_cancelled = True
@@ -1351,10 +1364,12 @@ class FeatureContributionRuntime:
                     prepared.feature,
                     "prepare_context_clause_refresh",
                 )
-        except Exception:
+        except Exception as error:
             # Preparation is arbitrary out-of-tree code and may carry private
             # feature state in its error or cancellation text. As with context
             # renderers, discard the untrusted exception object completely.
+            if is_execution_control_error(error):
+                raise
             sanitized_error = FeatureContributionCollectionError(
                 prepared.feature,
                 "prepare_context_clause_refresh",
@@ -1388,11 +1403,13 @@ class FeatureContributionRuntime:
                     )
                 )
             return tuple(resolved)
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
             # Renderer exceptions are arbitrary out-of-tree objects and may
             # carry user-authored text or credentials in their message.  Do
             # not retain them as a cause: API/startup error boundaries format
             # complete exception chains into production logs.
+            if is_execution_control_error(error):
+                raise
             sanitized_error = FeatureContributionCollectionError(
                 prepared.feature, "render_context_clauses"
             )
@@ -1530,6 +1547,8 @@ class FeatureContributionRuntime:
             value = method()
             return tuple(value) if materialize else value
         except (Exception, asyncio.CancelledError) as exc:
+            if is_execution_control_error(exc):
+                raise
             if discard_cause:
                 # Context clauses are user-authored prompt material and their
                 # getters commonly read secret-bearing feature configuration.

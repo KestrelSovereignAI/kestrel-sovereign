@@ -81,6 +81,7 @@ from typing import Any, Generic, TypeVar, assert_never
 from kestrel_sovereign._async_ownership import (
     OwnedTaskOutcome,
     await_owned_task,
+    owned_task_error,
     raise_owned_outcome,
 )
 from kestrel_sovereign.kestrel_config.timeouts import (
@@ -493,20 +494,34 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             # cancellation, never because close() cancelled the opening.
             await asyncio.wait({opening})
         except asyncio.CancelledError as cancellation:
-            opening.cancel()
+            if not opening.done() and not opening.cancelling():
+                opening.cancel()
             outcome = await await_owned_task(opening, cancellation)
-            record = outcome.result
+            # A completion observer can fail independently of the physical
+            # acquisition. It must not hide a successfully registered session
+            # which this cancelled caller still owns the responsibility to
+            # release, nor replace the observer's original native evidence.
+            observations = [outcome.error]
+            record = opening.result() if owned_task_error(opening) is None else None
             if record is not None:
                 release = self._ensure_release(record, ReleaseIntent.CANCEL)
                 released = await await_owned_task(release, outcome.cancellation)
-                if released.error is not None or released.result is not True:
+                observations.append(released.error)
+                if owned_task_error(release) is not None or release.result() is not True:
                     logger.error(
                         "%s job %s registered after its caller was cancelled "
                         "and could not be released; custody retained",
                         self._hooks.display_name,
                         job_id,
                     )
-            raise cancellation
+            from kestrel_sovereign.execution_custody import execution_terminal_error
+            raise_owned_outcome(
+                OwnedTaskOutcome(None, execution_terminal_error(
+                    *observations, retain_originals=True,
+                    isolate_control_originals=True,
+                ), outcome.cancellation or cancellation),
+                operation="cancelled training acquisition", retain_originals=True,
+            )
         if opening.cancelled():
             raise TrainingSubmissionError(
                 f"{self._hooks.display_name} training adapter closed while "

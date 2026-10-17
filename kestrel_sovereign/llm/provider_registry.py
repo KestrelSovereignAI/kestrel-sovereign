@@ -41,6 +41,7 @@ import os
 from typing import List, Dict, Any, Optional, Tuple
 
 import openai
+from kestrel_sovereign.execution_custody import execution_work_operation
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url, get_openrouter_api_base
 
@@ -308,6 +309,9 @@ class ProviderRegistry:
                         info.name,
                     )
             except Exception as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Failed to finalize OpenRouter route '%s': %s", name, e
                 )
@@ -458,7 +462,7 @@ class ProviderRegistry:
             )
             if oauth_manager is not None:
                 client = anthropic.AsyncAnthropic(
-                    auth_token=oauth_manager.initial_access_token
+                    auth_token=oauth_manager.initial_access_token, max_retries=0,
                 )
                 # The Anthropic SDK back-fills ``api_key`` from
                 # ``ANTHROPIC_API_KEY`` in the environment whenever the
@@ -472,7 +476,7 @@ class ProviderRegistry:
                 client.api_key = None
                 logger.info("%s:%s using OAuth token", vendor, route)
             elif api_key:
-                client = anthropic.AsyncAnthropic(api_key=api_key)
+                client = anthropic.AsyncAnthropic(api_key=api_key, max_retries=0)
             else:
                 raise ValueError(
                     f"{vendor}:{route} requires api_key_env, auth_token_env, or "
@@ -907,6 +911,7 @@ def _bootstrap_host_provider_id(management_key: str) -> str:
     return f"openrouter_bootstrap_{digest}"
 
 
+@execution_work_operation
 async def _mint_bootstrap_openrouter_key(
     management_key: str,
     limit_usd: float = _BOOTSTRAP_OPENROUTER_LIMIT_USD,
@@ -957,6 +962,9 @@ async def _mint_bootstrap_openrouter_key(
                     )
                     return persisted
             except Exception as e:  # noqa: BLE001 — never block startup on this
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Could not read persisted bootstrap OpenRouter key "
                     "(%s); will mint a fresh one", e,
@@ -965,18 +973,13 @@ async def _mint_bootstrap_openrouter_key(
         # Late import: keep the provisioning surface (httpx) out of module
         # import so the registry loads on deployments that never touch it.
         from kestrel_sovereign.features.llm_keys.openrouter_provisioning import (
-            OpenRouterProvisioningService,
+            mint_managed_openrouter_key,
         )
 
-        service = OpenRouterProvisioningService(management_key=management_key)
-        try:
-            key_info = await service.create_agent_key(
-                agent_name="bootstrap-registry-default",
-                limit_usd=limit_usd,
-                limit_reset="monthly",
-            )
-        finally:
-            await service.close()
+        key_info = await mint_managed_openrouter_key(
+            management_key, "bootstrap-registry-default",
+            limit_usd=limit_usd, reset="monthly",
+        )
 
         # Persist so the next process (cold start) reuses this key instead of
         # minting another. Best-effort — a store failure just degrades to the
@@ -990,6 +993,9 @@ async def _mint_bootstrap_openrouter_key(
                 await HostKeyStorage(host_db).store_key(provider_id, key_info.key)
                 persisted = True
             except Exception as e:  # noqa: BLE001
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Could not persist bootstrap OpenRouter key (%s); it will "
                     "be re-minted on the next cold start", e,

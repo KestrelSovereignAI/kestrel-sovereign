@@ -284,16 +284,14 @@ async def _close_context_after_startup_failure(
 ) -> None:
     """Join context cleanup before propagating a failed startup phase."""
 
-    from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
+    from kestrel_sovereign.execution_custody import execution_terminal_error
 
-    close_task = asyncio.create_task(
-        close_bound_host_context(context),
-        name=f"hold_context:{phase}:close",
-    )
-    cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
-        close_task
-    )
-    if cleanup_failure is not None:
+    # The shared context drain already registers and physically joins every
+    # original native closer through withdrawal. An extra collector Task here
+    # would add a new refusal boundary before that actual resource inventory.
+    try:
+        await close_bound_host_context(context)
+    except BaseException as cleanup_failure:
         logger.warning(
             "Hold context cleanup failed after %s: %s",
             phase,
@@ -304,8 +302,10 @@ async def _close_context_after_startup_failure(
                 cleanup_failure.__traceback__,
             ),
         )
-    if cleanup_cancelled and not isinstance(startup_failure, asyncio.CancelledError):
-        raise asyncio.CancelledError() from startup_failure
+        raise execution_terminal_error(
+            startup_failure, cleanup_failure,
+            retain_originals=True, prefer_cancellation=True,
+        )
 
 
 async def initialize_with_bound_hold_context(

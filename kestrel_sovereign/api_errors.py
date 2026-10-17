@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
 
 if TYPE_CHECKING:
     from kestrel_sovereign.llm.retry import AdvisedWaitExceedsRetryBudget
@@ -221,8 +222,14 @@ async def api_unhandled_exception_handler(
         )
         return api_error_response(
             status_code=500,
-            code="internal_error",
-            message="An internal error occurred.",
+            code="execution_control" if is_execution_control_error(exc) else "internal_error",
+            details=([{ "commit_outcome": execution_commit_outcome(exc) }]
+                if is_execution_control_error(exc) else None),
+            message=(
+                "Execution stopped. Reconcile the operation before continuing."
+                if is_execution_control_error(exc)
+                else "An internal error occurred."
+            ),
             correlation_id=correlation_id,
         )
     finally:

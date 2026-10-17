@@ -994,21 +994,15 @@ def test_llm_service_embedding_provider_honors_disabled_policy():
     assert service.get_embedding_service() is None
 
 
-def test_default_provider_embedding_service_resolves_each_call(monkeypatch):
-    class FakeLLMService:
-        calls = 0
-
-        def get_embedding_service(self):
-            type(self).calls += 1
-            return SimpleNamespace(model=f"embed-{type(self).calls}")
-
-    monkeypatch.setattr(llm_service_module, "LLMService", FakeLLMService)
-
-    first = get_provider_embedding_service()
-    second = get_provider_embedding_service()
-
-    assert first.model == "embed-1"
-    assert second.model == "embed-2"
+def test_provider_embedding_lookup_never_constructs_unowned_service(monkeypatch):
+    def unowned_service(*args, **kwargs):
+        pytest.fail("embedding lookup allocated an unowned LLM service")
+    monkeypatch.setattr(llm_service_module, "LLMService", unowned_service)
+    assert get_provider_embedding_service() is None
+    assert get_provider_embedding_service(None) is None
+    route = SimpleNamespace(model="explicit-owner")
+    owner = SimpleNamespace(get_embedding_service=lambda: route)
+    assert get_provider_embedding_service(owner) is route
 
 
 async def test_provider_embedding_service_uses_common_batch_contract():

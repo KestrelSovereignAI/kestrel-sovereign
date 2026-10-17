@@ -120,6 +120,7 @@ def test_kestrel_agent_wires_trusted_shared_advisory_backend():
         primary_pool,
         advisory_dsn=None,
         advisory_backend=host_backend,
+        execution_custody=None,
     )
 
 

@@ -3727,7 +3727,9 @@ async def test_final_admission_read_failure_preserves_claim_without_dispatch(
     )
 
     async def renew_until_cancelled(_task):
-        await asyncio.Event().wait()
+        # The native monitor now stops its interval cooperatively; this
+        # final-admission fault fixture must expose that same stop boundary.
+        await asyncio.current_task()._kestrel_renewal_state.stop_requested.wait()
 
     runner._renew_lease = renew_until_cancelled
     try:

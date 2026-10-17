@@ -4,7 +4,9 @@
 the stable execution identity for that occurrence.  A runner claims before it
 dispatches, renews the claim while dispatch is in flight, and finalizes with a
 compare-and-set.  This makes concurrent runners safe against one another; a
-process death leaves a lease which another runner may recover after expiry.
+process death before dispatch leaves a claim recoverable after expiry. Once
+PostgreSQL dispatch begins, an unfinished occurrence requires reconciliation
+instead of automatic replay of a potentially completed external effect.
 """
 
 import asyncio
@@ -17,24 +19,51 @@ import json
 import logging
 import os
 import secrets
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Collection
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Protocol, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Union,
+)
 
-from kestrel_sovereign._async_ownership import await_owned_task, run_blocking_operation
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
+    raise_owned_outcome,
+    run_blocking_operation,
+)
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
+from kestrel_sovereign.execution_custody import (
+    AdvisoryExecutionFence,
+    ConfirmedLeaseDeadline,
+    ExecutionAuthorityError,
+    bind_execution_custody,
+    bind_execution_custody_snapshot,
+    bind_execution_runtime,
+    current_execution_custody,
+    execution_cleanup_debts,
+    execution_commit_outcome,
+    execution_denial_scopes,
+    execution_terminal_error,
+    is_execution_control_error,
+    require_execution_work,
+    retained_execution_error,
+)
 from kestrel_sovereign.features.scheduler.constants import (
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
-)
-from kestrel_sovereign.turn_scope import turn_scoped
-from kestrel_sovereign.storage.database_clock import (
-    database_backend_type as scheduler_database_backend_type,
-    database_clock as scheduler_database_clock,
-    database_now_sql as scheduler_database_now_sql,
 )
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
 from kestrel_sovereign.features.scheduler.failure_streak import (
@@ -53,6 +82,16 @@ from kestrel_sovereign.features.scheduler.status import (
     mark_runtime_owner_stopped,
     scheduler_tick_in_progress_limit_seconds,
 )
+from kestrel_sovereign.storage.database_clock import (
+    database_backend_type as scheduler_database_backend_type,
+)
+from kestrel_sovereign.storage.database_clock import (
+    database_clock as scheduler_database_clock,
+)
+from kestrel_sovereign.storage.database_clock import (
+    database_now_sql as scheduler_database_now_sql,
+)
+from kestrel_sovereign.turn_scope import turn_scoped
 
 logger = logging.getLogger(__name__)
 
@@ -328,8 +367,10 @@ class SchedulerFeatureUnavailable(RuntimeError):
 
     This is not an execution failure: a feature may be intentionally excluded
     from a cold tenant or be soft-disabled while its persisted schedules are
-    retained.  The runner therefore leaves the durable claim recoverable
-    instead of consuming the occurrence as a failed task.
+    retained. Before dispatch the runner leaves the durable claim recoverable
+    instead of consuming it as a failed task. A PostgreSQL occurrence already
+    marked executing requires reconciliation, even if the dispatcher reports
+    this exception: an exception alone cannot prove absence of external effects.
     """
 
     def __init__(self, agent_id: str) -> None:
@@ -345,8 +386,9 @@ class SchedulerDispatchNotReady(RuntimeError):
     Until every feature finished cross-feature wiring, a task's owning tool
     may simply not be registered yet (#2474). Nothing was executed, so the
     runner neither records a result nor advances the occurrence: the claim
-    stays live and is recovered after its lease expires, which bounds retries
-    to one per lease interval.
+    stays live. Before dispatch, lease expiry bounds recovery to one retry per
+    lease interval. After the PostgreSQL effect-start marker, reconciliation is
+    required rather than assuming this exception proves no effect occurred.
     """
 
     def __init__(self, agent_id: str, task_name: str) -> None:
@@ -459,15 +501,21 @@ class _SchedulerExecutionScope:
 
     execution: SchedulerExecution
     active: bool = True
+    occurrence_task: Optional[asyncio.Task] = None
 
     def revoke(self) -> None:
         """Make this occurrence unavailable from every copied context."""
 
         self.active = False
+        self.occurrence_task = None
+
+
+class _SchedulerEffectFence(AdvisoryExecutionFence):
+    """Typed occurrence lease, distinct from a resident runtime advisory lease."""
 
 
 @dataclass
-class _LeaseRenewalState:
+class _LeaseRenewalState(ConfirmedLeaseDeadline):
     """Shared fail-closed state for an owned claim-renewal task.
 
     A renewal worker returning is never a benign completion: it either lost
@@ -476,13 +524,35 @@ class _LeaseRenewalState:
     letting a completed executor attempt a stale terminal compare-and-set.
     """
 
-    lost: asyncio.Event = field(default_factory=asyncio.Event)
-    error: Optional[BaseException] = None
+    stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    stop_owner: Optional[Callable[[], Awaitable[None]]] = None
+    custody: tuple = ()
+    occurrence_owner: object | None = None
+    occurrence_scopes: tuple = ()
+    backend_type: str = field(default="postgres", init=False)
 
-    def mark_lost(self, error: Optional[BaseException] = None) -> None:
-        if self.error is None and error is not None:
-            self.error = error
-        self.lost.set()
+    def retain_scope(self, scope) -> None:
+        """Record creation, not permission: entry validation can still deny."""
+        if scope not in self.occurrence_scopes:
+            self.occurrence_scopes = (*self.occurrence_scopes, scope)
+
+    async def lock_and_validate(self, connection: Any) -> None:
+        # The original confirmed deadline, not a fresh claim or checkout.
+        # Exact token/owner validation remains in native claim CAS.
+        self.require_work()
+
+
+@dataclass(frozen=True)
+class _OriginalOccurrenceReceipt:
+    """Immutable provenance carried by its original error, not diagnostic history."""
+
+    owner: object
+    scopes: tuple
+
+
+_rollout_renewal_state: contextvars.ContextVar[_LeaseRenewalState | None] = contextvars.ContextVar(
+    "scheduler_rollout_renewal_state", default=None,
+)
 
 
 @dataclass
@@ -532,6 +602,7 @@ def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
         return None
     if not scope.active:
         raise SchedulerAuthorityRevoked(scope.execution.id)
+    require_execution_work()
     return scope.execution
 
 
@@ -546,6 +617,24 @@ def capture_scheduler_execution_scope() -> Optional[_SchedulerExecutionScope]:
     """
 
     return _current_execution.get()
+
+
+def get_current_scheduler_occurrence_task(
+    *, agent_id: str, task_name: str,
+) -> Optional[asyncio.Task]:
+    """Exact original live task for an inspecting scheduled consumer.
+
+    The existing revocable execution scope crosses awaited dispatch tasks.
+    This identity is only for bookkeeping, never a new execution admission.
+    In particular a restart inspector can ignore its own parent occurrence
+    without hiding another schedule, same-named task or another agent.
+    """
+    execution = get_current_scheduler_execution()
+    if execution is None or execution.agent_id != agent_id or execution.task_name != task_name:
+        return None
+    scope = _current_execution.get()
+    task = scope.occurrence_task
+    return task if task is not None and not task.done() else None
 
 
 @contextlib.contextmanager
@@ -734,7 +823,8 @@ class HostedSchedulerExecutor:
         async def dispatch() -> Any:
             return await self._dispatch_resolved_agent(agent, execution)
 
-        yield dispatch
+        with bind_execution_runtime(agent):
+            yield dispatch
 
     async def execute_scheduled(self, execution: SchedulerExecution) -> Any:
         # Retain the public one-shot hosted-executor contract for callers that
@@ -921,7 +1011,8 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
                     async def dispatch() -> Any:
                         return await self._dispatch_resolved_agent(agent, execution)
 
-                    yield dispatch
+                    with bind_execution_runtime(agent):
+                        yield dispatch
                 return
 
             await lifecycle_lock.acquire()
@@ -973,7 +1064,8 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
             async def dispatch() -> Any:
                 return await self._dispatch_resolved_agent(agent, execution)
 
-            yield dispatch
+            with bind_execution_runtime(agent):
+                yield dispatch
 
     def _loaded_agent_for(self, agent_id: str) -> Optional[Any]:
         """Return an already-published agent for ``agent_id``, if present."""
@@ -1071,6 +1163,8 @@ class SchedulerRunner:
             ]
         ] = None,
         authorized_agent_ids_page_size: int = 500,
+        runtime_task_factory=None,
+        occurrence_task_factory=None,
         failure_alert_threshold: int = DEFAULT_FAILURE_ALERT_THRESHOLD,
     ):
         try:
@@ -1141,6 +1235,8 @@ class SchedulerRunner:
         # The one bounded page currently admitted to selection and telemetry.
         self._authorized_agent_ids_page: tuple[str, ...] = ()
         self._executor = executor
+        self._runtime_task_factory = runtime_task_factory or asyncio.create_task
+        self._occurrence_task_factory = occurrence_task_factory or asyncio.create_task
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
         self._max_concurrent_tasks = max(1, int(max_concurrent_tasks))
@@ -1161,6 +1257,8 @@ class SchedulerRunner:
         self._is_agent_authorized = is_agent_authorized
         self._on_protocol_failure = on_protocol_failure
         self._readiness_failure: Optional[BaseException] = None
+        self._execution_control_error: Optional[BaseException] = None
+        self._occurrence_control_receipts: list[BaseException] = []
         self._schema_provenance: Optional[str] = None
         # ``_task`` owns the supervisor; ``_worker_task`` is the replaceable
         # polling loop it watches.  A dead worker must never become an
@@ -1290,9 +1388,56 @@ class SchedulerRunner:
             return "executing"
         return "running"
 
-    def _latch_protocol_failure(self, error: BaseException) -> None:
-        """Persist the first safety failure in process state and notify host."""
+    def _latch_protocol_failure(
+        self, error: BaseException, *, occurrence_state: _LeaseRenewalState | None = None,
+    ) -> None:
+        """Retain local denials; latch host-wide safety failures."""
 
+        denied = execution_denial_scopes(error)
+        state = occurrence_state if occurrence_state is not None else _rollout_renewal_state.get()
+        owned_scopes = (
+            state.occurrence_scopes
+            if state is not None and state.occurrence_owner is self else ()
+        )
+        previous = getattr(error, "_kestrel_original_scheduler_receipt", None)
+        if (
+            denied
+            and execution_commit_outcome(error) is None
+            and not execution_cleanup_debts(error)
+            and all(
+                type(scope.fence) in (_LeaseRenewalState, _SchedulerEffectFence)
+                for scope in denied
+            )
+            and (
+                all(scope in owned_scopes for scope in denied)
+                or (
+                    state is None
+                    and isinstance(previous, _OriginalOccurrenceReceipt)
+                    and previous.owner is self
+                    and all(scope in previous.scopes for scope in denied)
+                )
+            )
+        ):
+            # Only THIS original occurrence ended: a fence's type or a scope
+            # inherited from a different admission is not provenance. A later
+            # context-free observer can retain already-proven scopes. A new
+            # active occurrence or added foreign scope is different evidence.
+            # Keep its exact denial
+            # without turning one expired claim into an all-tenant outage.
+            # Commit carriers, unscoped/runtime denial and physical close
+            # debt are deliberately excluded from this local classification.
+            receipts = vars(self).setdefault("_occurrence_control_receipts", [])
+            retained = retained_execution_error(error)
+            proof = _OriginalOccurrenceReceipt(self, tuple(denied))
+            error._kestrel_original_scheduler_receipt = proof
+            retained._kestrel_original_scheduler_receipt = proof
+            if len(receipts) < 32 and not any(error is receipt for receipt in receipts):
+                receipts.append(retained)
+            return
+        if is_execution_control_error(error):
+            self._execution_control_error = execution_terminal_error(
+                getattr(self, "_execution_control_error", None), error
+            )
         if self._readiness_failure is None:
             self._readiness_failure = error
         if self._on_protocol_failure is not None:
@@ -1429,10 +1574,10 @@ class SchedulerRunner:
         self._arm_requested_at = arm_requested_at.isoformat()
         self._running = True
         self._runtime_worker_state = "starting"
-        self._task = asyncio.create_task(
+        self._task = self._runtime_task_factory(
             self._supervise_loop(), name="scheduler-supervisor"
         )
-        self._telemetry_task = asyncio.create_task(
+        self._telemetry_task = self._runtime_task_factory(
             self._telemetry_loop(), name="scheduler-runtime-telemetry"
         )
         # Polling ownership exists before the best-effort telemetry task. A
@@ -1471,6 +1616,8 @@ class SchedulerRunner:
             outcome = await await_owned_task(task, pending_cancellation)
             if outcome.cancellation is not None:
                 pending_cancellation = outcome.cancellation
+            if outcome.error is not None and is_execution_control_error(outcome.error):
+                self._latch_protocol_failure(outcome.error)
             if outcome.error is not None and not isinstance(
                 outcome.error, asyncio.CancelledError
             ):
@@ -1499,9 +1646,13 @@ class SchedulerRunner:
                 ),
             )
         except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
             if pending_cancellation is None:
                 pending_cancellation = error
         except Exception as error:
+            if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
             logger.warning(
                 "SchedulerRunner %s runtime-status cleanup failed during stop",
                 self._owner_id,
@@ -1512,8 +1663,12 @@ class SchedulerRunner:
                 ),
             )
         logger.info("SchedulerRunner %s stopped", self._owner_id)
-        if pending_cancellation is not None:
-            raise pending_cancellation
+        terminal = execution_terminal_error(
+            getattr(self, "_execution_control_error", None), pending_cancellation,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
 
     async def _publish_runtime_status(self, worker_state: str) -> None:
         agent_ids = await self._current_authorized_agent_ids()
@@ -1552,6 +1707,20 @@ class SchedulerRunner:
                 last_error_type=self._last_worker_error_type,
             )
 
+    def _harvest_runtime_status_publication(self, task, *, observation_error=None):
+        """Keep a cancelled native receipt before releasing its task graph."""
+        error = owned_task_error(task)
+        if observation_error is not error and is_execution_control_error(observation_error):
+            self._latch_protocol_failure(observation_error)
+        if not getattr(task, "_kestrel_status_control_harvested", False):
+            task._kestrel_status_control_harvested = True
+            if error is not None and is_execution_control_error(error):
+                self._latch_protocol_failure(error)
+        return execution_terminal_error(
+            error, observation_error, retain_originals=True,
+            isolate_control_originals=True,
+        )
+
     async def _publish_runtime_status_best_effort(
         self,
         worker_state: Optional[str] = None,
@@ -1583,6 +1752,7 @@ class SchedulerRunner:
                                 wait_seconds,
                             )
                             return
+                    self._harvest_runtime_status_publication(pending)
                     self._runtime_status_publish_task = None
 
                 remaining = deadline - loop.time()
@@ -1596,9 +1766,7 @@ class SchedulerRunner:
                 self._runtime_status_publish_task = publish_task
 
                 def _publish_done(task: asyncio.Task) -> None:
-                    if task.cancelled():
-                        return
-                    error = task.exception()
+                    error = self._harvest_runtime_status_publication(task)
                     if error is not None:
                         logger.warning(
                             "SchedulerRunner %s could not publish %s state",
@@ -1614,6 +1782,7 @@ class SchedulerRunner:
                     timeout=wait_seconds,
                 )
                 if done:
+                    self._harvest_runtime_status_publication(publish_task)
                     self._runtime_status_publish_task = None
                 else:
                     logger.warning(
@@ -1652,14 +1821,21 @@ class SchedulerRunner:
                     deadline=deadline,
                 )
                 await self._join_runtime_status_publish_task(deadline=deadline)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             publish_task = self._runtime_status_publish_task
+            outcome = None
             if publish_task is not None and not publish_task.done():
                 publish_task.cancel()
-                await await_owned_task(publish_task)
+                outcome = await await_owned_task(publish_task)
+            error = self._harvest_runtime_status_publication(
+                publish_task, observation_error=outcome.error if outcome is not None else None,
+            ) if publish_task is not None else None
             if self._runtime_status_publish_task is publish_task:
                 self._runtime_status_publish_task = None
-            raise
+            raise execution_terminal_error(
+                error, cancellation, outcome.cancellation if outcome is not None else None,
+                retain_originals=True, isolate_control_originals=True,
+            )
 
     async def _join_runtime_status_publish_task(self, *, deadline: float) -> bool:
         """Join one publish for a bounded interval, then cancel as a last resort."""
@@ -1685,6 +1861,7 @@ class SchedulerRunner:
                 )
                 publish_task.cancel()
                 outcome = await await_owned_task(publish_task)
+                self._harvest_runtime_status_publication(publish_task, observation_error=outcome.error)
                 if self._runtime_status_publish_task is publish_task:
                     self._runtime_status_publish_task = None
                 if outcome.cancellation is not None:
@@ -1692,6 +1869,7 @@ class SchedulerRunner:
                 return False
 
         outcome = await await_owned_task(publish_task)
+        self._harvest_runtime_status_publication(publish_task, observation_error=outcome.error)
         if self._runtime_status_publish_task is publish_task:
             self._runtime_status_publish_task = None
         if outcome.cancellation is not None:
@@ -1880,7 +2058,7 @@ class SchedulerRunner:
     def _admit_occurrence(self, task: ScheduledTask) -> None:
         """Start one due row on its own task and record it as in flight."""
 
-        occurrence = asyncio.create_task(
+        occurrence = self._occurrence_task_factory(
             self._run_occurrence(task), name=f"scheduler-occurrence:{task.id}"
         )
         self._occurrences[task.id] = _AdmittedOccurrence(
@@ -1916,7 +2094,10 @@ class SchedulerRunner:
                     self._end_claim_phase(task.id)
                 if claimed is not None:
                     await self._execute_claim(claimed)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            asyncio.current_task()._kestrel_owned_terminal_error = retained_execution_error(error)
+            if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
             logger.warning(
                 "Scheduled occurrence for task %s (%s) was cancelled",
                 task.id,
@@ -1950,6 +2131,11 @@ class SchedulerRunner:
     def _occurrence_finished(
         self, schedule_id: str, finished: asyncio.Task[None]
     ) -> None:
+        error = owned_task_error(finished)
+        if finished.done() and not finished.cancelled():
+            finished.exception()
+        if error is not None and is_execution_control_error(error):
+            self._latch_protocol_failure(error)
         occurrence = self._occurrences.get(schedule_id)
         if occurrence is not None and occurrence.task is finished:
             del self._occurrences[schedule_id]
@@ -2375,8 +2561,31 @@ class SchedulerRunner:
             )
             for agent_id in sorted(set(agent_ids))
         )
-        async with advisory_locks(keys, shared=shared):
-            yield
+        renewal_state = _rollout_renewal_state.get()
+
+        def on_loss(_lease):
+            if renewal_state is not None:
+                renewal_state.mark_lost(ExecutionAuthorityError("scheduler advisory session lost"))
+
+        async with advisory_locks(keys, shared=shared, on_loss=on_loss if keys else None) as lease:
+            if shared and lease is not None:
+                with bind_execution_custody(_SchedulerEffectFence(
+                    lease, owner_live=(
+                        renewal_state.is_live
+                        if renewal_state is not None else None
+                    ),
+                ), on_scope_created=(
+                    renewal_state.retain_scope
+                    if renewal_state is not None and renewal_state.occurrence_owner is self else None
+                )):
+                    if renewal_state is not None:
+                        renewal_state.custody = current_execution_custody()
+                    try:
+                        yield
+                    finally:
+                        await self._join_renewal_before_exclusion_retirement()
+            else:
+                yield
 
     @asynccontextmanager
     async def _postgres_rollout_effect_gate(self, agent_id: str):
@@ -2516,14 +2725,27 @@ class SchedulerRunner:
             # executor. The advisory gate has the same protocol linearization
             # role while allowing lease renewal and ordinary tool writes.
             async with self._sqlite_rollout_gate(task.agent_id, shared=True):
-                async with self._transaction():
-                    admitted = await self._lock_active_rollout_control(task.agent_id)
+                admitted = await self._settled_dispatch_admission(task.agent_id)
                 yield admitted
             return
         async with self._postgres_rollout_effect_gate(task.agent_id):
-            async with self._transaction():
-                admitted = await self._lock_active_rollout_control(task.agent_id)
+            admitted = await self._settled_dispatch_admission(task.agent_id)
             yield admitted
+
+    async def _settled_dispatch_admission(self, agent_id: str) -> bool:
+        """Join the original admission mutation before Stop can leave its gate.
+
+        The caller still owns the effect advisory lease. Its cancellation must
+        not interrupt the short transaction's native COMMIT acknowledgement,
+        nor allow an effect after that acknowledgement. Genuine native commit
+        failures retain their original outcome through the owned-task helper.
+        """
+        async def record_admission():
+            async with self._transaction():
+                return await self._lock_active_rollout_control(agent_id)
+
+        outcome = await await_owned_task(create_owned_task(record_admission()))
+        return raise_owned_outcome(outcome, operation="scheduler dispatch admission")
 
     async def _lock_claim_execution_log(
         self, execution_id: str, task: ScheduledTask
@@ -2756,18 +2978,23 @@ class SchedulerRunner:
                 token,
                 execution_id,
             )
+        identity_update = (
+            "claim_execution_id = claim_execution_id, claim_scheduled_for = claim_scheduled_for,"
+            if status == "executing"
+            else "claim_execution_id = NULL, claim_scheduled_for = NULL,"
+        )
         updated = await self._db.execute(
             f"""
             UPDATE scheduled_tasks
             SET enabled = 0, scheduler_claim_fenced = 0,
                 lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
-                claim_execution_id = NULL, claim_scheduled_for = NULL,
-                terminal_status = 'execution_log_inconsistent',
+                {identity_update}
+                terminal_status = ?,
                 terminal_at = {terminal_at}
             WHERE id = ? AND agent_id = ? AND lease_owner = ?
               AND claim_token = ? AND claim_execution_id = ?
             """,
-            params,
+            (("unresolved_effect" if status == "executing" else "execution_log_inconsistent"), *params),
         )
         if not self._updated(updated):
             raise RuntimeError(
@@ -3197,6 +3424,7 @@ class SchedulerRunner:
         )
 
     async def _execute_claim(self, task: ScheduledTask) -> None:
+        occurrence_task = asyncio.current_task()
         if not await self._agent_is_currently_authorized(task.agent_id):
             logger.warning(
                 "Refusing to execute scheduler claim %s for unauthorized agent %s",
@@ -3231,191 +3459,249 @@ class SchedulerRunner:
             attempt=task.attempt_count,
             owner=self._owner_id,
         )
-        renewal_state = _LeaseRenewalState()
+        renewal_state = _LeaseRenewalState(
+            confirmed_deadline=self._live_claim_deadlines.get(task.claim_execution_id),
+            occurrence_owner=self,
+        )
+        rollout_token = _rollout_renewal_state.set(renewal_state)
+        deadline_watch = None
         try:
+            deadline_watch = asyncio.create_task(
+                self._monitor_confirmed_lease_deadline(renewal_state),
+                name=f"scheduler-lease-deadline:{execution.id}",
+            )
             renewal = asyncio.create_task(
                 self._monitor_lease_renewal(task, renewal_state),
                 name=f"scheduler-lease:{execution.id}",
             )
+            renewal_state.stop_owner = lambda: self._stop_renewal(renewal, task, execution)
         except BaseException:
+            if deadline_watch is not None:
+                deadline_watch.cancel()
+                await await_owned_task(deadline_watch)
             self._forget_live_claim(task)
+            _rollout_renewal_state.reset(rollout_token)
             raise
         started = time.monotonic()
         in_preparation = True
         try:
+            # Cold preparation can itself commit bootstrap effects before
+            # yielding a runtime. Persist the exact occurrence's evidence
+            # BEFORE entering it, in a short transaction which holds no locks
+            # across bootstrap DDL. No replacement admission is needed on loss.
+            if self._prepared_executor_method() is not None:
+                await self._mark_effect_started(task, execution)
             # A prepared executor resolves/cold-starts before the PostgreSQL
             # control-row transaction. AgentManager retains a shared DID
             # execution lease through the eventual effect, so DELETE cannot
             # revoke the target between preparation and dispatch. Renewal is
             # already active while this may take time.
-            async with self._prepared_execution(execution) as dispatch:
-                in_preparation = False
-                if renewal_state.lost.is_set():
-                    self._log_lease_loss(execution, phase="preparation")
-                    return
-                async with self._active_dispatch_admission(task) as admitted:
-                    if not admitted:
-                        logger.warning(
-                            "Refusing scheduler effect for %s: rollout is no longer active",
-                            execution.id,
-                        )
+            async def prepare_and_dispatch():
+                nonlocal in_preparation
+                async with self._prepared_execution(execution) as dispatch:
+                    # Renewal was started before cold preparation. Capture the
+                    # host's original generation now, never reconstruct it from a
+                    # later database read or assume task creation inherited it.
+                    renewal_state.custody = current_execution_custody()
+                    in_preparation = False
+                    if not renewal_state.is_live():
+                        self._log_lease_loss(execution, phase="preparation")
                         return
-                    if renewal_state.lost.is_set():
-                        self._log_lease_loss(execution, phase="admission")
-                        return
-                    now = (
-                        await self._database_clock()
-                        if self._uses_database_clock()
-                        else datetime.now(timezone.utc)
-                    )
-                    late = self._seconds_late(task.next_run_at, now)
-                    grace = (
-                        self._misfire_grace_seconds
-                        if task.misfire_grace_seconds is None
-                        else max(0, int(task.misfire_grace_seconds))
-                    )
-                    policy = (
-                        task.misfire_policy
-                        if task.misfire_policy in MISFIRE_POLICIES
-                        else MISFIRE_SKIP
-                    )
-                    if policy == MISFIRE_SKIP and grace and late > grace:
-                        if renewal_state.lost.is_set():
-                            self._log_lease_loss(execution, phase="misfire finalization")
+                    async with self._active_dispatch_admission(task) as admitted:
+                        if not admitted:
+                            logger.warning(
+                                "Refusing scheduler effect for %s: rollout is no longer active",
+                                execution.id,
+                            )
                             return
+                        if not renewal_state.is_live():
+                            self._log_lease_loss(execution, phase="admission")
+                            return
+                        now = (
+                            await self._database_clock()
+                            if self._uses_database_clock()
+                            else datetime.now(timezone.utc)
+                        )
+                        late = self._seconds_late(task.next_run_at, now)
+                        grace = (
+                            self._misfire_grace_seconds
+                            if task.misfire_grace_seconds is None
+                            else max(0, int(task.misfire_grace_seconds))
+                        )
+                        policy = (
+                            task.misfire_policy
+                            if task.misfire_policy in MISFIRE_POLICIES
+                            else MISFIRE_SKIP
+                        )
+                        if policy == MISFIRE_SKIP and grace and late > grace:
+                            if not renewal_state.is_live():
+                                self._log_lease_loss(execution, phase="misfire finalization")
+                                return
+                            await self._finalize(
+                                task,
+                                execution,
+                                status="skipped_misfire",
+                                result_text=(
+                                    f"skipped: {late:.0f}s late (> {grace}s misfire grace); "
+                                    "policy=skip"
+                                ),
+                                duration_ms=0,
+                                outcome_signal=None,
+                                ran=False,
+                            )
+                            return
+
+                        status = "success"
+                        result_text: Optional[str] = None
+                        outcome_signal: Optional[float] = None
+                        pause_schedule = False
+                        ran = True
+                        scope = _SchedulerExecutionScope(execution, occurrence_task=occurrence_task)
+                        token = _current_execution.set(scope)
+                        try:
+                            # This is the final effect boundary. Preparation is
+                            # complete (and, for AgentManager, the target is
+                            # already cold-loaded under its lifecycle lock), so
+                            # the non-locking exact-token read and live-authority
+                            # check occur as late as possible without making an
+                            # ``ACCESS SHARE`` lock block feature bootstrap DDL.
+                            #
+                            # These are admission reads, not target work: a
+                            # provider/database error must escape to the outer
+                            # scheduler-infrastructure path without consuming the
+                            # claimed occurrence. Only errors after admission are
+                            # normalized as target failures below.
+                            if (
+                                not renewal_state.is_live()
+                                or not await self._agent_is_currently_authorized(
+                                    task.agent_id
+                                )
+                                or not await self._claim_token_is_live(task)
+                                or not renewal_state.is_live()
+                            ):
+                                logger.warning(
+                                    "Refusing scheduler effect for %s: agent was revoked, "
+                                    "claim was fenced or expired, or renewal was lost",
+                                    execution.id,
+                                )
+                                return
+                            await self._mark_effect_started(task, execution)
+                            try:
+                                completed, raw = await self._run_dispatch_while_lease_live(
+                                    dispatch,
+                                    execution,
+                                    renewal_state,
+                                )
+                                if not completed:
+                                    self._log_lease_loss(execution, phase="effect")
+                                    return
+                                (
+                                    status,
+                                    result_text,
+                                    outcome_signal,
+                                    pause_schedule,
+                                ) = self._normalise_result(raw, task)
+                            except asyncio.CancelledError:
+                                raise
+                            except SchedulerFeatureUnavailable as error:
+                                if is_execution_control_error(error):
+                                    raise
+                                # A runtime disable can race preparation/admission.
+                                # It is not a task failure and must not advance this
+                                # occurrence. Leaving the exact claim live prevents a
+                                # hot retry. PostgreSQL already persisted the effect-
+                                # start marker, so expiry requires reconciliation;
+                                # it cannot safely prove this dispatcher did no work.
+                                logger.info(
+                                    "Deferring scheduler claim %s because %s has no enabled "
+                                    "SchedulerFeature",
+                                    execution.id,
+                                    task.agent_id,
+                                )
+                                return
+                            except SchedulerDispatchNotReady as e:
+                                if is_execution_control_error(e):
+                                    raise
+                                # Same deferral contract as above (#2474): nothing
+                                # ran, so no success row, no last_run_at, no cron
+                                # advance. PostgreSQL's effect-start marker still
+                                # requires reconciliation rather than automatic retry.
+                                logger.info(
+                                    "Deferring scheduler claim %s: %s", execution.id, e
+                                )
+                                return
+                            except ScheduledTaskOwnerUnavailable as e:
+                                if is_execution_control_error(e):
+                                    raise
+                                status = "failed"
+                                result_text = str(e)
+                                ran = False
+                                logger.error(
+                                    "Scheduled task %s (%s) failed: %s",
+                                    task.id,
+                                    task.task_name,
+                                    e,
+                                )
+                            except Exception as e:
+                                if is_execution_control_error(e) or self._readiness_failure is not None:
+                                    # Keep the pre-dispatch executing marker and
+                                    # occurrence identity for reconciliation. A lost
+                                    # acknowledgement is not a terminal task failure.
+                                    raise
+                                status = "failed"
+                                result_text = f"{type(e).__name__}: {e}"
+                                logger.error(
+                                    "Scheduled task %s (%s) failed: %s",
+                                    task.id,
+                                    task.task_name,
+                                    e,
+                                )
+                        finally:
+                            # Invalidate before the parent context is reset.
+                            # Child tasks created by a target inherit this same
+                            # scope, so they can no longer present a completed
+                            # occurrence as trusted scheduler work after the
+                            # runner cancels or completes its owned effect.
+                            scope.revoke()
+                            _current_execution.reset(token)
+                        if not renewal_state.is_live():
+                            self._log_lease_loss(execution, phase="finalization")
+                            return
+                        # Keep renewal alive until the terminal compare-and-set
+                        # commits. Cancelling it before this await creates a
+                        # lease-expiry window in which a recovery worker can win
+                        # while this worker still writes.
                         await self._finalize(
                             task,
                             execution,
-                            status="skipped_misfire",
-                            result_text=(
-                                f"skipped: {late:.0f}s late (> {grace}s misfire grace); "
-                                "policy=skip"
-                            ),
-                            duration_ms=0,
-                            outcome_signal=None,
-                            ran=False,
+                            status=status,
+                            result_text=result_text,
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                            outcome_signal=outcome_signal,
+                            ran=ran,
+                            pause_schedule=pause_schedule,
                         )
-                        return
 
-                    status = "success"
-                    result_text: Optional[str] = None
-                    outcome_signal: Optional[float] = None
-                    pause_schedule = False
-                    ran = True
-                    scope = _SchedulerExecutionScope(execution)
-                    token = _current_execution.set(scope)
-                    try:
-                        # This is the final effect boundary. Preparation is
-                        # complete (and, for AgentManager, the target is
-                        # already cold-loaded under its lifecycle lock), so
-                        # the non-locking exact-token read and live-authority
-                        # check occur as late as possible without making an
-                        # ``ACCESS SHARE`` lock block feature bootstrap DDL.
-                        #
-                        # These are admission reads, not target work: a
-                        # provider/database error must escape to the outer
-                        # scheduler-infrastructure path without consuming the
-                        # claimed occurrence. Only errors after admission are
-                        # normalized as target failures below.
-                        if (
-                            renewal_state.lost.is_set()
-                            or not await self._agent_is_currently_authorized(
-                                task.agent_id
-                            )
-                            or not await self._claim_token_is_live(task)
-                            or renewal_state.lost.is_set()
-                        ):
-                            logger.warning(
-                                "Refusing scheduler effect for %s: agent was revoked, "
-                                "claim was fenced or expired, or renewal was lost",
-                                execution.id,
-                            )
-                            return
-                        try:
-                            completed, raw = await self._run_dispatch_while_lease_live(
-                                dispatch,
-                                execution,
-                                renewal_state,
-                            )
-                            if not completed:
-                                self._log_lease_loss(execution, phase="effect")
-                                return
-                            (
-                                status,
-                                result_text,
-                                outcome_signal,
-                                pause_schedule,
-                            ) = self._normalise_result(raw, task)
-                        except asyncio.CancelledError:
-                            raise
-                        except SchedulerFeatureUnavailable:
-                            # A runtime disable can race preparation/admission.
-                            # It is not a task failure and must not advance this
-                            # occurrence. Leaving the exact claim live prevents a
-                            # hot retry; once it expires, a later re-enable can
-                            # recover the same durable execution identity.
-                            logger.info(
-                                "Deferring scheduler claim %s because %s has no enabled "
-                                "SchedulerFeature",
-                                execution.id,
-                                task.agent_id,
-                            )
-                            return
-                        except SchedulerDispatchNotReady as e:
-                            # Same deferral contract as above (#2474): nothing
-                            # ran, so no success row, no last_run_at, no cron
-                            # advance. Lease expiry bounds the retry.
-                            logger.info(
-                                "Deferring scheduler claim %s: %s", execution.id, e
-                            )
-                            return
-                        except ScheduledTaskOwnerUnavailable as e:
-                            status = "failed"
-                            result_text = str(e)
-                            ran = False
-                            logger.error(
-                                "Scheduled task %s (%s) failed: %s",
-                                task.id,
-                                task.task_name,
-                                e,
-                            )
-                        except Exception as e:
-                            status = "failed"
-                            result_text = f"{type(e).__name__}: {e}"
-                            logger.error(
-                                "Scheduled task %s (%s) failed: %s",
-                                task.id,
-                                task.task_name,
-                                e,
-                            )
-                    finally:
-                        # Invalidate before the parent context is reset.
-                        # Child tasks created by a target inherit this same
-                        # scope, so they can no longer present a completed
-                        # occurrence as trusted scheduler work after the
-                        # runner cancels or completes its owned effect.
-                        scope.revoke()
-                        _current_execution.reset(token)
-                    if renewal_state.lost.is_set():
-                        self._log_lease_loss(execution, phase="finalization")
-                        return
-                    # Keep renewal alive until the terminal compare-and-set
-                    # commits. Cancelling it before this await creates a
-                    # lease-expiry window in which a recovery worker can win
-                    # while this worker still writes.
-                    await self._finalize(
-                        task,
-                        execution,
-                        status=status,
-                        result_text=result_text,
-                        duration_ms=int((time.monotonic() - started) * 1000),
-                        outcome_signal=outcome_signal,
-                        ran=ran,
-                        pause_schedule=pause_schedule,
-                    )
+            # Cold preparation and dispatch share one owned task. Expiry
+            # cancels AND joins its bootstrap tail; cancellation-resistant
+            # descendants retain the same irrevocable deadline fence.
+            with (
+                bind_execution_custody(renewal_state, on_scope_created=renewal_state.retain_scope)
+                if self._database_backend_type() == "postgres"
+                else nullcontext()
+            ):
+                completed, _ = await self._run_dispatch_while_lease_live(
+                    prepare_and_dispatch, execution, renewal_state
+                )
+                if not completed:
+                    self._log_lease_loss(execution, phase="preparation/dispatch")
         except asyncio.CancelledError:
             raise
-        except SchedulerFeatureUnavailable:
+        except SchedulerFeatureUnavailable as error:
+            if is_execution_control_error(error):
+                self._latch_protocol_failure(error)
+                logger.error("Scheduler preparation %s requires authority/commit reconciliation: %s", execution.id, error)
+                return
             # Cold preparation can discover that a globally disabled or
             # otherwise unavailable feature was not visible in the host's
             # pre-claim configuration. Preserve the claimed occurrence (and
@@ -3427,8 +3713,17 @@ class SchedulerRunner:
                 execution.id,
                 task.agent_id,
             )
+            # An explicit unavailable-feature verdict is known non-dispatch,
+            # not a lost acknowledgement. Restore the pre-effect claim only
+            # under its original live exact-owner CAS; expiry/loss cannot do so.
+            if self._prepared_executor_method() is not None and renewal_state.is_live():
+                await self._mark_effect_started(task, execution, preparation_deferred=True)
             return
         except Exception as error:
+            if is_execution_control_error(error) or self._readiness_failure is not None:
+                self._latch_protocol_failure(error)
+                logger.error("Scheduler execution %s requires authority/commit reconciliation: %s", execution.id, error)
+                return
             if not in_preparation:
                 # Database/admission failures remain scheduler infrastructure
                 # failures. Do not disguise one as an ordinary cold-load task
@@ -3445,11 +3740,11 @@ class SchedulerRunner:
                 task.task_name,
                 error,
             )
-            if renewal_state.lost.is_set():
+            if not renewal_state.is_live():
                 self._log_lease_loss(execution, phase="preparation failure")
                 return
             async with self._active_dispatch_admission(task) as admitted:
-                if not admitted or renewal_state.lost.is_set():
+                if not admitted or not renewal_state.is_live():
                     logger.warning(
                         "Refusing scheduler preparation failure finalization for %s",
                         execution.id,
@@ -3465,7 +3760,29 @@ class SchedulerRunner:
                     ran=False,
                 )
         finally:
-            await self._stop_renewal(renewal, task, execution)
+            retirement_errors = [sys.exception()]
+            try:
+                await self._stop_renewal(renewal, task, execution)
+            except BaseException as error:
+                retirement_errors.append(error)
+            finally:
+                try:
+                    if deadline_watch is not None:
+                        deadline_watch.cancel()
+                        outcome = await await_owned_task(deadline_watch)
+                        retirement_errors.append(outcome.cancellation)
+                        if outcome.error is not None and (
+                            not isinstance(outcome.error, asyncio.CancelledError)
+                            or is_execution_control_error(outcome.error)
+                        ):
+                            retirement_errors.append(outcome.error)
+                finally:
+                    _rollout_renewal_state.reset(rollout_token)
+            terminal = execution_terminal_error(*retirement_errors)
+            if terminal is not None:
+                if is_execution_control_error(terminal):
+                    self._latch_protocol_failure(terminal, occurrence_state=renewal_state)
+                raise terminal
 
     def _prepared_executor_method(self) -> Optional[Callable[[SchedulerExecution], Any]]:
         """Return a structurally supplied preparation method, if any.
@@ -3493,7 +3810,10 @@ class SchedulerRunner:
             async def dispatch() -> Any:
                 return await self._run_executor(execution)
 
-            yield dispatch
+            try:
+                yield dispatch
+            finally:
+                await self._join_renewal_before_exclusion_retirement()
             return
 
         context = prepare(execution)
@@ -3511,13 +3831,31 @@ class SchedulerRunner:
                 raise TypeError(
                     "prepare_scheduled must yield an async dispatch callable"
                 )
-            yield dispatch
+            try:
+                yield dispatch
+            finally:
+                await self._join_renewal_before_exclusion_retirement()
+
+    async def _join_renewal_before_exclusion_retirement(self) -> None:
+        """Original native renewal must settle before any enclosing lease exits."""
+        state = _rollout_renewal_state.get()
+        if state is not None and state.stop_owner is not None:
+            primary = sys.exception()
+            try:
+                await state.stop_owner()
+            except BaseException as cleanup:
+                raise execution_terminal_error(primary, cleanup)
+            finally:
+                # The original task is physically settled before this helper
+                # returns/raises. Detached denied children need its receipt,
+                # not a closure retaining the whole scheduler/parent graph.
+                state.stop_owner = None
 
     async def _monitor_lease_renewal(
         self, task: ScheduledTask, state: _LeaseRenewalState
     ) -> None:
         """Run a renewal worker and make any terminal outcome fail closed."""
-
+        asyncio.current_task()._kestrel_renewal_state = state
         try:
             await self._renew_lease(task)
         except asyncio.CancelledError:
@@ -3528,14 +3866,28 @@ class SchedulerRunner:
         else:
             # The renewal loop has no successful terminal state. A normal
             # return means the exact claim or live authority was lost.
-            state.mark_lost()
+            if not state.stop_requested.is_set():
+                state.mark_lost()
         finally:
             self._forget_live_claim(task)
+
+    async def _monitor_confirmed_lease_deadline(self, state: _LeaseRenewalState) -> None:
+        """Expire custody independently of a blocked renewal checkout/row lock."""
+        await state.monitor()
 
     async def _renew_live_claim_once(self, task: ScheduledTask) -> bool:
         """Renew a claim and expose only its bounded live-lease interval."""
 
-        renewed = await self._renew_lease_once(task)
+        state = _rollout_renewal_state.get()
+        if state is not None and not state.is_live():
+            self._forget_live_claim(task)
+            return False
+        renewal_started = time.monotonic()
+        with bind_execution_custody_snapshot(state.custody if state is not None else ()):
+            renewed = await self._renew_lease_once(task)
+        if state is not None and not state.is_live():
+            self._forget_live_claim(task)
+            return False
         execution_id = task.claim_execution_id
         if not execution_id:
             return renewed
@@ -3543,8 +3895,15 @@ class SchedulerRunner:
             self._forget_live_claim(task)
             return False
         now = time.monotonic()
+        # The DB expiry cannot precede statement execution, but a delayed
+        # acknowledgement consumes the lease. Starting BEFORE the checkout is
+        # conservative and cannot extend authority beyond the durable interval.
+        deadline = renewal_started + self._lease_seconds
+        if deadline <= now or (state is not None and not state.confirm(deadline)):
+            self._forget_live_claim(task)
+            return False
         was_live = self._live_claim_deadlines.get(execution_id, 0.0) > now
-        self._live_claim_deadlines[execution_id] = now + self._lease_seconds
+        self._live_claim_deadlines[execution_id] = deadline
         self._refresh_live_claim_deadline_snapshot()
         if not was_live:
             self._runtime_status_wake.set()
@@ -3575,6 +3934,48 @@ class SchedulerRunner:
             phase,
         )
 
+    async def _mark_effect_started(
+        self, task: ScheduledTask, execution: SchedulerExecution, *,
+        preparation_deferred: bool = False,
+    ) -> None:
+        """Persist indeterminate evidence BEFORE PostgreSQL preparation/dispatch.
+
+        An expired claim alone is not proof that an external effect did not
+        happen. Recovery preserves this occurrence's canonical log instead of
+        making it executable again. Only exact-owner live finalization may
+        resolve ``executing`` into a known outcome. An explicit unavailable
+        feature can restore ``claimed`` under this same original live CAS.
+        This is a short ordinary
+        guarded transaction, not a post-loss work grant or a new receipt table.
+        """
+        if self._database_backend_type() != "postgres":
+            return
+        async with self._transaction():
+            if not await self._lock_claim_token_for_renewal(task):
+                raise ExecutionAuthorityError("scheduler claim lost before effect evidence")
+            # Evaluate clock_timestamp only AFTER owning the unchanged row,
+            # not in the statement that may wait for that row's lock.
+            claimed = await self._db.execute(
+                f"""UPDATE scheduled_tasks SET attempt_count = attempt_count
+                WHERE id = ? AND agent_id = ? AND lease_owner = ?
+                  AND claim_token = ? AND claim_execution_id = ?
+                  AND scheduler_protocol_version = ? AND scheduler_rollout_fenced = 0
+                  AND enabled = 0 AND scheduler_claim_fenced = 1
+                  AND {self._database_lease_live_sql()}""",
+                (task.id, task.agent_id, self._owner_id, task.claim_token,
+                 execution.id, SCHEDULER_PROTOCOL_VERSION),
+            )
+            if not self._updated(claimed):
+                raise ExecutionAuthorityError("scheduler claim lost before effect evidence")
+            marked = await self._db.execute(
+                """UPDATE task_execution_log SET status = ?
+                WHERE id = ? AND task_id = ? AND agent_id = ?
+                  AND status IN ('claimed', 'executing')""",
+                ("claimed" if preparation_deferred else "executing", execution.id, task.id, task.agent_id),
+            )
+            if not self._updated(marked):
+                raise ExecutionAuthorityError("scheduler effect evidence already resolved or missing")
+
     async def _run_dispatch_while_lease_live(
         self,
         dispatch: PreparedScheduledDispatch,
@@ -3592,22 +3993,41 @@ class SchedulerRunner:
         """
 
         async def invoke_dispatch() -> Any:
-            return await dispatch()
+            try:
+                require_execution_work()
+                result = await dispatch()
+                require_execution_work()
+                return result
+            except BaseException as error:
+                asyncio.current_task()._kestrel_owned_terminal_error = retained_execution_error(error)
+                raise
 
-        effect = asyncio.create_task(
-            invoke_dispatch(), name=f"scheduler-effect:{execution.id}"
+        effect = create_owned_task(
+            invoke_dispatch(), name=f"scheduler-effect:{execution.id}", retain_originals=True,
         )
-        lease_lost = asyncio.create_task(
-            renewal_state.lost.wait(), name=f"scheduler-lease-watch:{execution.id}"
-        )
+        lease_lost = None
+        watcher_admission_failure = None
         try:
+            # Admission of the watcher can fail after this ORIGINAL effect
+            # entered native I/O. Its admission belongs inside the physical
+            # join boundary; canonical admission also closes refused coros.
+            try:
+                lease_lost = create_owned_task(
+                    renewal_state.lost.wait(), name=f"scheduler-lease-watch:{execution.id}",
+                    retain_originals=True,
+                )
+            except BaseException as error:
+                watcher_admission_failure = error
+                raise
             await asyncio.wait(
                 {effect, lease_lost}, return_when=asyncio.FIRST_COMPLETED
             )
-            if renewal_state.lost.is_set():
+            if not renewal_state.is_live():
                 if not effect.done():
                     effect.cancel()
                 outcome = await await_owned_task(effect)
+                if outcome.error is not None and is_execution_control_error(outcome.error):
+                    raise outcome.error
                 if outcome.cancellation is not None:
                     raise outcome.cancellation
                 if outcome.error is not None and not isinstance(
@@ -3621,22 +4041,45 @@ class SchedulerRunner:
                 return False, None
 
             outcome = await await_owned_task(effect)
-            if outcome.cancellation is not None:
-                raise outcome.cancellation
-            if outcome.error is not None:
-                raise outcome.error
+            terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+            if terminal is not None:
+                raise terminal
             # Give a renewal completion that raced the effect task precedence:
             # even a completed effect must not terminalize under a lost lease.
-            if renewal_state.lost.is_set():
+            if not renewal_state.is_live():
                 return False, None
             return True, outcome.result
         finally:
+            original = sys.exception()
             if not effect.done():
                 effect.cancel()
-                await await_owned_task(effect)
-            if not lease_lost.done():
-                lease_lost.cancel()
-                await await_owned_task(lease_lost)
+            effect_outcome = await await_owned_task(effect)
+            if not effect.cancelled():
+                effect.exception()
+            lease_error = lease_cancellation = None
+            if lease_lost is not None:
+                if not lease_lost.done():
+                    lease_lost.cancel()
+                lease_outcome = await await_owned_task(lease_lost)
+                lease_error = lease_outcome.error
+                lease_cancellation = lease_outcome.cancellation
+            terminal = execution_terminal_error(
+                original, effect_outcome.error, effect_outcome.cancellation,
+                lease_error, lease_cancellation, retain_originals=True,
+            )
+            if terminal is not None and is_execution_control_error(terminal):
+                self._latch_protocol_failure(terminal)
+                raise terminal
+            if isinstance(watcher_admission_failure, Exception) and terminal is not None:
+                # An infrastructure observer could not start. Even if the
+                # original effect retired without a typed native receipt, that
+                # does not prove it never committed an external effect. Keep
+                # the executing marker, not a normalized target-failure row.
+                self._latch_protocol_failure(terminal)
+                raise terminal
+            cancellation = effect_outcome.cancellation or lease_cancellation
+            if cancellation is not None:
+                raise cancellation
 
     async def _run_executor(self, execution: SchedulerExecution) -> Any:
         # ``AsyncMock`` and similar dynamic proxies fabricate any attribute on
@@ -3664,10 +4107,22 @@ class SchedulerRunner:
         task: ScheduledTask,
         execution: SchedulerExecution,
     ) -> None:
-        """Cancel and join the owned renewal task despite caller cancellation."""
+        """Stop its interval; join the original native renewal acknowledgement."""
 
-        renewal.cancel()
+        state = getattr(renewal, "_kestrel_renewal_state", None)
+        if state is None:
+            # A not-yet-started monitor still owns the state copied at birth.
+            state = _rollout_renewal_state.get()
+        if state is not None:
+            state.stop_requested.set()
+        else:
+            # Legacy external/test renewers have no native owned monitor.
+            renewal.cancel()
         outcome = await await_owned_task(renewal)
+        terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+        if terminal is not None and is_execution_control_error(terminal):
+            self._latch_protocol_failure(terminal)
+            raise terminal
         if outcome.cancellation is not None:
             raise outcome.cancellation
         if outcome.error is not None and not isinstance(
@@ -3693,8 +4148,16 @@ class SchedulerRunner:
         # fractional configuration in a future release.
         interval = min(self._lease_seconds / 3, self._lease_seconds - 0.001)
         interval = max(0.001, interval)
+        state = getattr(asyncio.current_task(), "_kestrel_renewal_state", None)
         while True:
-            await asyncio.sleep(interval)
+            if state is None:
+                await asyncio.sleep(interval)
+            else:
+                try:
+                    await asyncio.wait_for(state.stop_requested.wait(), timeout=interval)
+                    return
+                except asyncio.TimeoutError:
+                    pass
             if not await self._renew_live_claim_once(task):
                 logger.warning("Lost scheduler lease for task %s execution %s", task.id, task.claim_execution_id)
                 return
@@ -3848,6 +4311,15 @@ class SchedulerRunner:
                 if not await self._lock_live_claim_for_finalization(task, execution):
                     await self._mark_cancelled_if_no_longer_runnable(execution)
                     return
+                renewal_state = _rollout_renewal_state.get()
+                if renewal_state is not None:
+                    # This exact finalizer now owns the original live-token
+                    # row lock. Stop future intervals before it clears that
+                    # token: a renewal observing our own committed clearance
+                    # is not external lease loss. Already-entered native
+                    # renewal acknowledgements still join at scope retirement;
+                    # the original confirmed deadline is never extended here.
+                    renewal_state.stop_requested.set()
                 schedule_now = await self._database_clock()
             else:
                 schedule_now = datetime.now(timezone.utc)
@@ -3936,7 +4408,7 @@ class SchedulerRunner:
                     SET status = ?, result_text = ?, duration_ms = ?,
                         executed_at = {now_sql}, outcome_signal = ?,
                         attempt_count = ?, completed_at = {now_sql}
-                    WHERE id = ? AND task_id = ? AND agent_id = ? AND status = 'claimed'
+                    WHERE id = ? AND task_id = ? AND agent_id = ? AND status IN ('claimed', 'executing')
                     """,
                     (
                         status, result_text, duration_ms, outcome_signal,
@@ -3986,7 +4458,7 @@ class SchedulerRunner:
                     UPDATE task_execution_log
                     SET status = ?, result_text = ?, duration_ms = ?, executed_at = ?,
                         outcome_signal = ?, attempt_count = ?, completed_at = ?
-                    WHERE id = ? AND task_id = ? AND agent_id = ? AND status = 'claimed'
+                    WHERE id = ? AND task_id = ? AND agent_id = ? AND status IN ('claimed', 'executing')
                     """,
                     (
                         status, result_text, duration_ms, now_iso, outcome_signal,

@@ -71,9 +71,9 @@ def merged_prs(repo: str, since: datetime) -> list[dict]:
             args += ["-f", f"cursor={cursor}"]
         page = gh_json(*args)["data"]["repository"]["pullRequests"]
         prs += page["nodes"]
-        # Ordered by creation, so a PR created before the window can still
-        # have merged inside it; stop one page past the boundary.
-        if not page["pageInfo"]["hasNextPage"] or parse_time(page["nodes"][-1]["createdAt"]) < since - timedelta(days=7):
+        # Creation order supplies no cutoff for a merge-time window: even a
+        # years-old PR on a later page may have merged inside that window.
+        if not page["pageInfo"]["hasNextPage"]:
             break
         cursor = page["pageInfo"]["endCursor"]
     return [pr for pr in prs if parse_time(pr["mergedAt"]) >= since]
@@ -137,6 +137,9 @@ def report_prs(prs: list[dict], since: datetime) -> None:
     print(f"  PRs with a merge-from-base commit: {merges_from_base} ({100 * merges_from_base / max(len(prs), 1):.0f}%)")
 
     events = sorted([(start, 1) for start, _ in spans] + [(end, -1) for _, end in spans])
+    if not events or events[0][0] == events[-1][0]:
+        print("  Work in flight (claim or first commit..merge): (no data)")
+        return
     samples, in_flight, index = [], 0, 0
     moment, last = events[0][0], events[-1][0]
     while moment < last:

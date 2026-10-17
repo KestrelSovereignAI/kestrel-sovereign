@@ -32,6 +32,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -66,7 +67,26 @@ from kestrel_sdk.isolated_feature import (
 )
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission,
+    await_owned_task,
+    create_owned_task,
+    gather_owned,
+    owned_task_error,
+    raise_owned_outcome,
+)
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
+    bind_execution_custody_snapshot,
+    current_execution_custody,
+    execution_commit_outcome,
+    execution_terminal_error,
+    is_execution_control_error,
+    require_execution_work,
+    retained_execution_error,
+)
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
 from kestrel_sovereign.features.channels.route_ownership import (
@@ -817,6 +837,7 @@ class _HostOwnedFacadeOperation:
         # resulting neutral classification, never the facade value, exception,
         # or traceback, so host lifecycle ownership can distinguish success.
         self._foreign_settlement_disposition: str | None = None
+        self._foreign_control_receipt: BaseException | None = None
         self._settlement_notified = False
         # ``done()`` for a foreign source means its owner loop has safely
         # consumed the private result.  It does *not* mean the host lifecycle
@@ -844,7 +865,9 @@ class _HostOwnedFacadeOperation:
         self._host_task.add_done_callback(self._notify_settled)
 
     async def _observe_source(self, source: asyncio.Future[Any]) -> Any:
-        return await asyncio.shield(source)
+        return raise_owned_outcome(
+            await await_owned_task(source), operation="isolated facade source",
+        )
 
     @property
     def foreign_loop(self) -> bool:
@@ -888,7 +911,17 @@ class _HostOwnedFacadeOperation:
         target = self._source if self._source is not None else self._host_task
         if target is None:
             raise RuntimeError("host-owned facade operation lost its completion target")
+        if not target.done():
+            return target.result()
+        error = owned_task_error(target)
+        if error is not None:
+            raise retained_execution_error(error)
         return target.result()
+
+    @property
+    def foreign_control_receipt(self) -> BaseException | None:
+        """Owner-loop classified control without foreign value/traceback custody."""
+        return self._foreign_control_receipt
 
     async def wait(self) -> Any:
         return await self.shield()
@@ -1037,10 +1070,12 @@ class _HostOwnedFacadeOperation:
             return
         try:
             source.result()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             disposition = "cancelled"
-        except BaseException:  # noqa: BLE001 - foreign outcomes stay private
+            self._classify_foreign_control(error)
+        except BaseException as error:  # noqa: BLE001 - foreign outcomes stay private
             disposition = "failed"
+            self._classify_foreign_control(error)
         else:
             disposition = "succeeded"
         self._foreign_settlement_disposition = disposition
@@ -1062,6 +1097,18 @@ class _HostOwnedFacadeOperation:
             # Host shutdown cannot turn owner-loop acknowledgement into a
             # retry, but it must not undo this terminal acknowledgement.
             pass
+
+    def _classify_foreign_control(self, error: BaseException) -> None:
+        # Only fixed canonical categories cross loops. Never retain the
+        # source exception, its args/cause/context, value or traceback.
+        if not is_execution_control_error(error):
+            return
+        outcome = execution_commit_outcome(error)
+        self._foreign_control_receipt = (
+            ExecutionCommitOutcomeError(outcome)
+            if outcome is not None
+            else ExecutionAuthorityError("foreign facade execution authority denied")
+        )
 
     def _install_source_settlement_observer(self) -> None:
         source = self._source
@@ -1107,8 +1154,8 @@ class _HostOwnedFacadeOperation:
 
 def _consume_late_lifecycle_task_outcome(
     operation: asyncio.Future[Any] | _HostOwnedFacadeOperation,
-) -> None:
-    """Consume a fenced operation's eventual result without retaining failure."""
+) -> BaseException | None:
+    """Consume once; export only canonical control to the owning host."""
 
     # Cross-loop results are normally retrieved by ``observed`` in their
     # source loop.  The only exception is an already-terminal source at
@@ -1116,11 +1163,15 @@ def _consume_late_lifecycle_task_outcome(
     # stopped owner loop cannot strand it.  Do not retrieve a later foreign
     # result here: that would retain secret-bearing errors on host traceback.
     if isinstance(operation, _HostOwnedFacadeOperation) and operation.foreign_loop:
-        return
+        return operation.foreign_control_receipt
+    if isinstance(operation, asyncio.Future):
+        error = owned_task_error(operation)
+        return error if error is not None and is_execution_control_error(error) else None
     try:
         operation.result()
-    except BaseException:  # noqa: BLE001 - terminal facade outcomes stay private
-        pass
+    except BaseException as error:  # noqa: BLE001 - ordinary facade outcomes stay private
+        return error if is_execution_control_error(error) else None
+    return None
 
 
 def _facade_settlement_event(operation: _HostOwnedFacadeOperation) -> asyncio.Event:
@@ -1166,39 +1217,39 @@ async def _await_task_until_complete(
     owns a subprocess or an active traffic boundary.
     """
 
-    cancellation_args: tuple[Any, ...] | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            # A cancellation request is not a reason to abandon the child
-            # before it records its own SDK fence or cleanup outcome.
-            if task.done() and task.cancelled():
-                break
-            if not settle_on_cancellation:
-                # The shared task remains attached to its owner (for example
-                # ``_terminal_cleanup_task``).  A caller with a smaller
-                # whole-agent budget can therefore move on without cancelling
-                # an SDK stop coroutine that may own the sole process handle.
-                raise
-            # Preserve the first cancellation only.  A caller can receive
-            # further cancellation requests while this shielded cleanup
-            # drains; letting a later request replace the original loses the
-            # cancellation which actually interrupted the lifecycle owner and
-            # retains an exception traceback longer than necessary.
-            if cancellation_args is None:
-                cancellation_args = tuple(exc.args)
-            continue
-    # A child cancellation is a result of the child operation, not an empty
-    # successful result.  In particular, lifecycle callers must not mistake a
-    # cancelled terminal cleanup for a completed one and release ownership
-    # while its child or gate state remains uncertain.
-    if task.cancelled():
-        raise asyncio.CancelledError()
-    result = task.result()
-    if cancellation_args is not None and not preserve_cancellation:
-        raise asyncio.CancelledError(*cancellation_args)
-    return result
+    if settle_on_cancellation:
+        outcome = await await_owned_task(task)
+        terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
+        if outcome.error is not None:
+            raise retained_execution_error(outcome.error)
+        if outcome.cancellation is not None and not preserve_cancellation:
+            raise outcome.cancellation
+        return outcome.result
+
+    # Deadline owners may hand off a still-running child, but must never await
+    # a shield carrying its exception: asyncio consumes a cancelled child's
+    # original cause at that first retrieval. Settlement is neutral data.
+    settled = asyncio.Event()
+    # One source-error observer survives deadline handoff. Individual waiters
+    # remove their neutral completion callbacks even when interrupted, so
+    # repeated deadlines cannot retain an unbounded list of abandoned Events.
+    if not getattr(task, "_kestrel_owned_terminal_observer", False):
+        task.add_done_callback(owned_task_error)
+        task._kestrel_owned_terminal_observer = True
+    def completed(done: asyncio.Task[Any]) -> None:
+        settled.set()
+    task.add_done_callback(completed)
+    try:
+        if not task.done():
+            await settled.wait()
+    finally:
+        task.remove_done_callback(completed)
+    error = owned_task_error(task)
+    if error is not None:
+        raise retained_execution_error(error)
+    return task.result()
 
 
 async def _await_owned_facade_lifecycle_operation(
@@ -1400,8 +1451,10 @@ async def _await_owned_facade_lifecycle_operation(
         # Consume the post-fence terminal result even when a facade swallowed
         # cancellation and returned success.  The timeout itself remains the
         # authoritative lifecycle outcome.
-        _consume_late_lifecycle_task_outcome(task)
+        control = _consume_late_lifecycle_task_outcome(task)
         await observe_delivered_parent_cancellation()
+        if control is not None:
+            raise retained_execution_error(control)
         if cancellation_args is not None:
             replay_remembered_cancellation()
         raise_authoritative_timeout()
@@ -1411,6 +1464,10 @@ async def _await_owned_facade_lifecycle_operation(
     # classifying the child terminal state.  Historical cancellation counts do
     # not pass this admission fence.
     await observe_delivered_parent_cancellation()
+
+    control = _consume_late_lifecycle_task_outcome(task)
+    if control is not None:
+        raise retained_execution_error(control)
 
     if cancellation_args is not None:
         # A cancellation already observed by this owner is its public result.
@@ -1541,7 +1598,9 @@ async def _await_owned_health_probe(
                 # but its cumulative count remains on the parent task.
                 remember_parent_cancellation(exc)
         if task.done():
-            _consume_late_lifecycle_task_outcome(task)
+            control = _consume_late_lifecycle_task_outcome(task)
+            if control is not None:
+                raise control
             return
         on_late_task(task)
 
@@ -1579,6 +1638,9 @@ async def _await_owned_health_probe(
             await fence_parent_cancellation()
             replay_parent_cancellation(cancellation_args)
         if task.cancelled():
+            control = _consume_late_lifecycle_task_outcome(task)
+            if control is not None:
+                raise control
             operation = None
             task = None
             on_started = None
@@ -1608,7 +1670,9 @@ async def _await_owned_health_probe(
     if cancellation_args is not None:
         await fence_parent_cancellation()
         replay_parent_cancellation(cancellation_args)
-    _consume_late_lifecycle_task_outcome(task)
+    control = _consume_late_lifecycle_task_outcome(task)
+    if control is not None:
+        raise control
     raise_authoritative_timeout()
 
 
@@ -1757,8 +1821,28 @@ class _TrafficGate:
         try:
             yield
         finally:
-            release = asyncio.create_task(self._release_admission())
-            await _await_task_until_complete(release, preserve_cancellation=False)
+            original = sys.exc_info()[1]
+            cancellations = []
+            while True:
+                try:
+                    # The original caller owns this in-memory decrement. The
+                    # only suspension is acquiring our asyncio.Condition;
+                    # cancellation removes that waiter before acquisition.
+                    # Once acquired, decrement/notify cannot suspend. Retrying
+                    # acquisition therefore cannot repeat native work or
+                    # release the same admission twice, and needs no new Task.
+                    await self._release_admission()
+                    break
+                except asyncio.CancelledError as cancellation:
+                    cancellations.append(cancellation)
+                except BaseException as cleanup:
+                    raise execution_terminal_error(
+                        original, *cancellations, cleanup, retain_originals=True
+                    )
+            if cancellations:
+                raise execution_terminal_error(
+                    original, *cancellations, retain_originals=True
+                )
 
 
 _HOST_INGRESS_SUCCESS = "success"
@@ -1767,6 +1851,7 @@ _HOST_INGRESS_UNSUPPORTED = "unsupported"
 _HOST_INGRESS_UNKNOWN_NAME = "unknown-name"
 _HOST_INGRESS_TERMINAL = "terminal"
 _HOST_INGRESS_CANCELLED = "cancelled"
+_HOST_INGRESS_CONTROL = "execution-control"
 
 # A valid JSON tree whose encoded form fits the SDK's 64 KiB wire limit can
 # contain at most this many nodes: a flat list of one-character JSON scalars
@@ -1798,6 +1883,17 @@ class _HostIngressOutcome:
 
     status: str
     payload: HostIngressPayload = field(default=None, repr=False)
+    commit_outcome: str | None = None
+
+
+def _redacted_host_ingress_error(error: BaseException) -> _HostIngressOutcome:
+    # Only canonical non-sensitive classifications cross the private boundary;
+    # no native exception, traceback, request payload or provider prose escapes.
+    if is_execution_control_error(error):
+        return _HostIngressOutcome(_HOST_INGRESS_CONTROL,
+            commit_outcome=execution_commit_outcome(error))
+    return _HostIngressOutcome(_HOST_INGRESS_CANCELLED if isinstance(error, asyncio.CancelledError)
+        else _HOST_INGRESS_GENERIC_FAILURE)
 
 
 @dataclass
@@ -2148,7 +2244,7 @@ async def _wait_for_host_ingress_operation(
         # slot held by its public caller.
         outcome_slot.take()
         outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
-    if caller_cancel_args is not None:
+    if caller_cancel_args is not None and outcome.status != _HOST_INGRESS_CONTROL:
         # A completed worker can carry a successful response even though a
         # caller cancellation won while its shield was being drained.  Never
         # return that response through the public cancellation path: exception
@@ -2164,6 +2260,10 @@ def _deliver_host_ingress_outcome(
 ) -> HostIngressPayload:
     """Raise public errors from a frame that has no request/client locals."""
 
+    if outcome.status == _HOST_INGRESS_CONTROL:
+        if outcome.commit_outcome is not None:
+            raise ExecutionCommitOutcomeError(outcome.commit_outcome)
+        raise ExecutionAuthorityError("host ingress execution authority retired")
     if caller_cancel_args is not None:
         raise asyncio.CancelledError(*caller_cancel_args)
     if outcome.status == _HOST_INGRESS_SUCCESS:
@@ -2953,6 +3053,7 @@ _WINDOWS_RESERVED_COMPONENTS = frozenset(
     }
 )
 _RUNTIME_OWNER_MARKER = ".kestrel-runtime-owner"
+_IMMUTABLE_LAUNCH_CUSTODY_MARKER = ".kestrel-immutable-launch-custody"
 _RUNTIME_OWNER_TEMP_PREFIX = ".kestrel-runtime-owner.tmp-"
 _VENV_RELOCATION_REPAIR_MARKER = ".kestrel-venv-relocation-pending"
 _VENV_RELOCATION_REPAIR_TEMP_PREFIX = ".kestrel-venv-relocation-pending.tmp-"
@@ -4855,6 +4956,18 @@ def _open_cleanup_parent_at(
         raise
 
 
+def _assert_no_immutable_launch_custody_at(directory_fd: int) -> None:
+    """Restrictive disk evidence survives cold cleanup and is never followed."""
+    try:
+        os.stat(_IMMUTABLE_LAUNCH_CUSTODY_MARKER, dir_fd=directory_fd,
+                follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise IsolatedRuntimePreparationError(
+        "Runtime cleanup would remove a retained immutable host launch artifact."
+    )
+
+
 def _cleanup_child_directories_at(
     directory_fd: int,
     *,
@@ -4862,6 +4975,7 @@ def _cleanup_child_directories_at(
 ) -> list[tuple[str, tuple[int, int]]]:
     """Snapshot child-directory identities after checking namespace custody."""
 
+    _assert_no_immutable_launch_custody_at(directory_fd)
     children: list[tuple[str, tuple[int, int]]] = []
     with os.scandir(directory_fd) as entries:
         for entry in entries:
@@ -5149,6 +5263,9 @@ def _remove_isolated_feature_runtime(
                 return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
             descriptors.append(current_fd)
         _read_existing_runtime_owner(current_fd, owner)
+        # Feature-level reclamation also crosses the namespace's durable
+        # launch-custody boundary. A cold proxy has no historical path list.
+        _assert_no_immutable_launch_custody_at(current_fd)
         try:
             feature_parent_fd = os.open(
                 "feature_venvs", _directory_open_flags(), dir_fd=current_fd
@@ -5572,6 +5689,45 @@ def remove_released_legacy_runtime_root(
             os.close(parent_fd)
 
 
+def retain_host_launch_artifact_custody(scope, owner, legacy_root, paths) -> None:
+    """Persist cleanup denial on OWNED mutable roots, never on launch artifacts.
+
+    Historical operator selections remain protected after the agent, proxy,
+    manager and process settings disappear. Presence is restrictive evidence,
+    never permission to launch or delete. No cleanup path may erase it.
+    """
+    if scope is None:
+        return
+    for root in (scope.path,) + ((legacy_root,) if legacy_root is not None else ()):
+        if not any(path == root or root in path.parents for path in paths):
+            continue
+        if root == scope.path:
+            prepare_isolated_runtime_namespace(scope, owner)
+        directory_fd = os.open(root, _directory_open_flags())
+        try:
+            if not _same_file_identity(os.stat(root, follow_symlinks=False), os.fstat(directory_fd)):
+                raise IsolatedRuntimeNamespaceError("Immutable launch custody root changed during validation.")
+            if root == scope.path:
+                _read_existing_runtime_owner(directory_fd, owner)
+            else:
+                _validate_released_legacy_root_custody(os.fstat(directory_fd))
+            try:
+                marker_fd = os.open(_IMMUTABLE_LAUNCH_CUSTODY_MARKER,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    _PRIVATE_FILE_MODE, dir_fd=directory_fd)
+            except FileExistsError:
+                # Even malformed/replaced restrictive evidence denies cleanup.
+                continue
+            try:
+                _write_all(marker_fd, _runtime_owner_bytes(owner))
+                os.fsync(marker_fd)
+            finally:
+                os.close(marker_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
 def remove_runtime_namespace(
     scope: Optional[IsolatedRuntimeNamespace],
     owner: Optional[str],
@@ -5607,6 +5763,27 @@ def remove_agent_runtime_namespace(agent: Any) -> RuntimeNamespaceCleanupOutcome
         if runtime_scope is not None
         else None
     )
+    if runtime_scope is not None:
+        # Retain constructed proxies even when discovery quarantines them or
+        # removes them from the public feature map. Offboarding is not a grant
+        # to delete a host-selected immutable artifact.
+        owners = list(getattr(agent, "__dict__", {}).get("_isolated_runtime_cleanup_owners", ()))
+        features = getattr(agent, "features", None)
+        if isinstance(features, dict):
+            owners.extend(feature for feature in features.values() if isinstance(feature, ProxyFeature))
+        roots = (runtime_scope.path,) + ((legacy_root,) if legacy_root is not None else ())
+        for feature in owners:
+            if any(getattr(feature, attr, True) for attr in (
+                "_hosted_immutable_venv_custody_unproven",
+                "_hosted_immutable_bin_custody_unproven",
+            )):
+                raise IsolatedRuntimePreparationError("Agent runtime cleanup has unproven immutable artifact custody.")
+            paths = (
+                *feature._validated_hosted_immutable_venv_custody_paths,
+                *feature._validated_hosted_immutable_bin_custody_paths,
+            )
+            if any(path == root or root in path.parents for root in roots for path in paths):
+                raise IsolatedRuntimePreparationError("Agent runtime cleanup would remove an immutable host launch artifact.")
     return remove_runtime_namespace(runtime_scope, owner, legacy_root)
 
 
@@ -5865,6 +6042,7 @@ class _ValidatedHostedPrebuiltVenv:
 
     root_path: Path
     bin_path: Path
+    custody_paths: tuple[Path, ...]
 
 
 def _validate_hosted_prebuilt_venv(
@@ -5922,6 +6100,12 @@ def _validate_hosted_prebuilt_venv(
     return _ValidatedHostedPrebuiltVenv(
         root_path=venv_path,
         bin_path=bin_path,
+        custody_paths=tuple(sorted(set(
+            _immutable_prebuilt_custody_paths(value, venv_path, setting=setting)
+            + _immutable_prebuilt_custody_paths(str(venv_path / "pyvenv.cfg"), config_path, setting=setting)
+            + _immutable_prebuilt_custody_paths(str(_venv_bin_dir(venv_path)), bin_path, setting=setting)
+            + _immutable_prebuilt_custody_paths(str(_venv_python(venv_path)), python_path, setting=setting)
+        ))),
     )
 
 
@@ -5991,6 +6175,37 @@ class _ValidatedHostedPrebuiltOverrides:
     venv_bin_path: Optional[Path]
     venv_setting: Optional[str]
     bin_path: Optional[Path]
+    venv_custody_paths: tuple[Path, ...] = ()
+    bin_custody_paths: tuple[Path, ...] = ()
+
+
+def _immutable_prebuilt_custody_paths(value: str, canonical: Path, *, setting: str) -> tuple[Path, ...]:
+    """Retain the configured entry and every required native symlink hop.
+
+    Cleanup does not follow symlinks: preserving only their final targets
+    permits deletion of a launch-critical operator entry inside a workspace.
+    A bounded walk records intermediate links, including links reached from
+    an originally external setting. No path here grants provisioning rights.
+    """
+    current = Path(os.path.abspath(Path(value).expanduser()))
+    required = {current, canonical}
+    for _ in range(64):
+        prefix = Path(current.anchor)
+        for index, component in enumerate(current.parts[1:], 1):
+            prefix /= component
+            if prefix.is_symlink():
+                required.add(prefix)
+                target = prefix.readlink()
+                if not target.is_absolute():
+                    target = prefix.parent / target
+                current = Path(os.path.abspath(target.joinpath(*current.parts[index + 1:])))
+                required.add(current)
+                break
+        else:
+            if current != canonical:
+                raise _hosted_prebuilt_override_error(setting)
+            return tuple(sorted(required))
+    raise _hosted_prebuilt_override_error(setting)
 
 
 def _validate_hosted_process_prebuilt_overrides(
@@ -6041,18 +6256,23 @@ def _validate_hosted_process_prebuilt_overrides(
 
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
+    venv_custody_paths = selected_venv.custody_paths if selected_venv is not None else ()
     if bin_value:
+        bin_path = _validate_hosted_prebuilt_bin(bin_value, setting=bin_key)
         return _ValidatedHostedPrebuiltOverrides(
             venv_path=selected_venv_path,
             venv_bin_path=selected_venv_bin_path,
             venv_setting=selected_venv_setting,
-            bin_path=_validate_hosted_prebuilt_bin(bin_value, setting=bin_key),
+            bin_path=bin_path,
+            venv_custody_paths=venv_custody_paths,
+            bin_custody_paths=_immutable_prebuilt_custody_paths(bin_value, bin_path, setting=bin_key),
         )
     return _ValidatedHostedPrebuiltOverrides(
         venv_path=selected_venv_path,
         venv_bin_path=selected_venv_bin_path,
         venv_setting=selected_venv_setting,
         bin_path=None,
+        venv_custody_paths=venv_custody_paths,
     )
 
 
@@ -6473,6 +6693,7 @@ class ProxyFeature(Feature):
         agent_attributes = getattr(agent, "__dict__", None)
         if isinstance(agent_attributes, dict):
             agent_attributes["_isolated_runtime_features_constructed"] = True
+            agent_attributes.setdefault("_isolated_runtime_cleanup_owners", []).append(self)
         self.runtime = runtime
         self.name = runtime.class_name
         # Resolve hosted containment before classifying optional feature
@@ -6611,12 +6832,13 @@ class ProxyFeature(Feature):
         # Resolve at construction, before feature startup/discovery can turn a
         # missing hosted scope into an optional-feature warning and continue.
         self._agent_runtime_dir = agent_runtime_dir(agent)
+        constructor_overrides = None
         if (
             self._isolated_runtime_scope is not None
             or getattr(agent, "isolated_runtime_hosted", False) is True
         ):
             _assert_hosted_feature_env_is_scoped(self.name, self.runtime.distribution)
-            _validate_hosted_process_prebuilt_overrides(
+            constructor_overrides = _validate_hosted_process_prebuilt_overrides(
                 self.name,
                 runtime_venv=self.runtime.venv,
             )
@@ -6744,9 +6966,30 @@ class ProxyFeature(Feature):
         self._bin_path: Optional[Path] = None
         # BIN deliberately makes _venv_path name the unused Core default.
         # Retain the separately validated immutable VENV for custody checks.
-        self._validated_hosted_immutable_venv_path: Optional[Path] = None
-        self._validated_hosted_immutable_venv_setting: Optional[str] = None
+        self._validated_hosted_immutable_venv_path: Optional[Path] = (
+            constructor_overrides.venv_path if constructor_overrides else None
+        )
+        self._validated_hosted_immutable_venv_setting: Optional[str] = (
+            constructor_overrides.venv_setting if constructor_overrides else None
+        )
         self._hosted_immutable_venv_custody_unproven = False
+        self._validated_hosted_immutable_bin_path: Optional[Path] = (
+            constructor_overrides.bin_path if constructor_overrides else None
+        )
+        self._validated_hosted_immutable_venv_custody_paths: tuple[Path, ...] = (
+            constructor_overrides.venv_custody_paths if constructor_overrides else ()
+        )
+        self._validated_hosted_immutable_bin_custody_paths: tuple[Path, ...] = (
+            constructor_overrides.bin_custody_paths if constructor_overrides else ()
+        )
+        self._hosted_immutable_bin_custody_unproven = False
+        retain_host_launch_artifact_custody(
+            self._isolated_runtime_scope,
+            _agent_runtime_owner(agent) if self._isolated_runtime_scope is not None else None,
+            self._released_legacy_runtime_root,
+            (*self._validated_hosted_immutable_venv_custody_paths,
+             *self._validated_hosted_immutable_bin_custody_paths),
+        )
         # Hosted immutable console wrappers may themselves be operator-facing
         # symlinks. Preparation resolves and validates one exact regular target;
         # child construction must execute that target rather than re-following
@@ -6861,6 +7104,8 @@ class ProxyFeature(Feature):
                 and not self._stopping
                 and not self._immutable_venv_custody_is_unproven()
                 and not self._immutable_venv_override_is_inside_workspace()
+                and not self._hosted_immutable_bin_custody_unproven
+                and not self._immutable_bin_override_is_inside_workspace()
             ),
             "disk_telemetry_status": self._disk_telemetry_status,
         }
@@ -7431,16 +7676,36 @@ class ProxyFeature(Feature):
         coro = deliver()
         name = f"isolated-runtime-telemetry:{self.name}"
         tracker = getattr(self.agent, "_track_background_task", None)
-        task = None
-        if callable(tracker):
-            try:
-                tracked = tracker(coro, name=name)
-                if isinstance(tracked, asyncio.Task):
-                    task = tracked
-            except Exception:  # noqa: BLE001 - test doubles may reject tracking
-                task = None
-        if task is None:
-            task = asyncio.create_task(coro, name=name)
+        try:
+            if callable(tracker):
+                task = tracker(coro, name=name)
+                if not isinstance(task, asyncio.Task):
+                    raise TypeError("telemetry publisher must return its actual Task")
+            else:
+                from kestrel_sovereign._async_ownership import create_owned_task
+                task = create_owned_task(coro, name=name)
+        except BaseException as error:
+            # Canonical refusal already closes the fresh operation; an
+            # unregistered owner must do the same. Never retry this coroutine.
+            coro.close()
+            self._telemetry_emit_pending = True
+            self._telemetry_emit_force_pending |= force
+            self._telemetry_disk_refresh_pending |= refresh_disk
+            self._telemetry_environment_refresh_pending |= refresh_environment
+            if (
+                is_execution_control_error(error)
+                or not isinstance(error, Exception)
+                or isinstance(error, TypeError)
+            ):
+                raise
+            # Ordinary advisory publication may be retried by a later explicit
+            # event, with a fresh operation. Refusal itself starts no retry loop.
+            logger.warning(
+                "Hosted isolated runtime telemetry publication failed for %s",
+                self.name,
+                exc_info=True,
+            )
+            return
         self._telemetry_emit_tasks.add(task)
 
         def consume(completed: asyncio.Task[None]) -> None:
@@ -7970,6 +8235,7 @@ class ProxyFeature(Feature):
         """Build and publish a fresh child while holding lifecycle ownership."""
 
         async with self._reload_lock:
+            require_execution_work(self.agent)
             if terminal_generation != self._terminal_lifecycle_generation:
                 raise _TerminalLifecyclePermitRevoked(
                     "isolated feature terminal lifecycle changed during initialize"
@@ -8044,6 +8310,7 @@ class ProxyFeature(Feature):
         venv mutation cannot continue after lifecycle ownership is released.
         """
 
+        require_execution_work(self.agent)
         started = asyncio.get_running_loop().time()
         task = asyncio.create_task(
             asyncio.to_thread(self.ensure_venv),
@@ -8052,6 +8319,7 @@ class ProxyFeature(Feature):
         environment_mutated = await _await_task_until_complete(
             task, preserve_cancellation=False
         )
+        require_execution_work(self.agent)
         self._last_provision_seconds = asyncio.get_running_loop().time() - started
         self._last_cache_hit = not environment_mutated
 
@@ -8114,7 +8382,11 @@ class ProxyFeature(Feature):
         remains after ``_reload_lock`` with authority to mutate admission.
         """
 
-        task = asyncio.create_task(operation, name=f"isolated-traffic-{name}:{self.name}")
+        # Preserve create_task's coroutine-only contract: wrapping an already
+        # accepted foreign Task would silently adopt an operation we do not own.
+        if not asyncio.iscoroutine(operation):
+            raise TypeError("gate lifecycle operation must be a fresh coroutine")
+        task = create_owned_task(operation, name=f"isolated-traffic-{name}:{self.name}")
         await _await_task_until_complete(
             task,
             preserve_cancellation=preserve_cancellation,
@@ -8158,7 +8430,7 @@ class ProxyFeature(Feature):
             self._terminal_traffic_drain_task = task
 
             def release(completed_task: asyncio.Task[None]) -> None:
-                _consume_late_lifecycle_task_outcome(completed_task)
+                self._retain_event_ingress_task_control(completed_task)
                 if self._terminal_traffic_drain_task is completed_task:
                     self._terminal_traffic_drain_task = None
 
@@ -8200,9 +8472,14 @@ class ProxyFeature(Feature):
         # A terminal cleanup can latch while a detached start awaits.  Do not
         # publish that child behind a sealed gate; retire it before reporting
         # the terminal lifecycle boundary to the caller.
-        if self._terminal_lifecycle_latched:
-            await self._retire_detached_client(client)
+        try:
             self._assert_child_start_allowed()
+        except BaseException as error:
+            try:
+                await self._retire_detached_client(client)
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(error, cleanup_error)
+            raise
         self._publish_client(
             client,
             tools,
@@ -8302,12 +8579,20 @@ class ProxyFeature(Feature):
             ) from exc
         try:
             started = asyncio.get_running_loop().time()
+            self._assert_child_start_allowed()
             await _maybe_await(client.start())
+            self._assert_child_start_allowed()
             self._capture_process_identity(client)
             advertised_tools = await _maybe_await(client.list_tools())
+            self._assert_child_start_allowed()
             self._last_cold_start_seconds = asyncio.get_running_loop().time() - started
         except BaseException as exc:
-            await self._retire_detached_client(client)
+            try:
+                await self._retire_detached_client(client)
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(exc, cleanup_error)
+            if is_execution_control_error(exc):
+                raise
             if isinstance(
                 exc,
                 (
@@ -8346,6 +8631,7 @@ class ProxyFeature(Feature):
         already the single live proxy state.
         """
 
+        self._assert_child_start_allowed()
         self._client = client
         self._tools = tools
         self._idle_ui_contributions = self._ui_contributions_from_capabilities(
@@ -8558,7 +8844,7 @@ class ProxyFeature(Feature):
         self._terminal_lifecycle_tasks.append(ownership)
 
         def release(completed_task: _HostOwnedFacadeOperation) -> None:
-            _consume_late_lifecycle_task_outcome(completed_task)
+            self._retain_event_ingress_task_control(completed_task)
             self._terminal_lifecycle_tasks = [
                 candidate
                 for candidate in self._terminal_lifecycle_tasks
@@ -8577,7 +8863,7 @@ class ProxyFeature(Feature):
         """
 
         if task.done():
-            _consume_late_lifecycle_task_outcome(task)
+            self._retain_event_ingress_task_control(task)
             return
         if self._terminal_health_probe_task is task:
             return
@@ -8586,7 +8872,7 @@ class ProxyFeature(Feature):
         self._terminal_health_probe_task = task
 
         def release(completed_task: _HostOwnedFacadeOperation) -> None:
-            _consume_late_lifecycle_task_outcome(completed_task)
+            self._retain_event_ingress_task_control(completed_task)
             if self._terminal_health_probe_task is completed_task:
                 self._terminal_health_probe_task = None
 
@@ -8607,7 +8893,7 @@ class ProxyFeature(Feature):
             return False
         if not task.done():
             return True
-        _consume_late_lifecycle_task_outcome(task)
+        self._retain_event_ingress_task_control(task)
         if self._terminal_health_probe_task is task:
             self._terminal_health_probe_task = None
         return False
@@ -8657,11 +8943,40 @@ class ProxyFeature(Feature):
                 # facade may then publish an ordinary terminal failure instead
                 # of CancelledError.  It is not cancellation of this cleanup
                 # owner; consume it and continue with client retirement.
-                _consume_late_lifecycle_task_outcome(task)
+                self._retain_event_ingress_task_control(task)
                 break
 
         self._has_running_terminal_health_probe_task()
         return True
+
+    def _retain_event_ingress_task_control(
+        self, task: asyncio.Future[Any] | _HostOwnedFacadeOperation,
+    ) -> None:
+        """Harvest every ingress owner before removal, retaining one receipt.
+
+        Routing, deferred routing, legacy queues and ACK/NACK completion are
+        four producers of the same ownership contract. Cancellation retrieval
+        must use the shared first-receipt cache; a second Task.result() can
+        otherwise erase the original cause. Ordinary provider failures stay
+        best effort and no completed task/client collection is retained here.
+        """
+        if not task.done():
+            return
+        self._retain_execution_control(_consume_late_lifecycle_task_outcome(task))
+
+    def _retain_execution_control(self, error: BaseException | None) -> None:
+        """One strongest receipt across all ordinary and facade work owners."""
+        if error is not None and is_execution_control_error(error):
+            self._event_ingress_control = execution_terminal_error(
+                vars(self).get("_event_ingress_control"), error,
+            )
+
+    def _require_event_ingress_work(self) -> None:
+        """A retained unknown/denied effect cannot authorize later ingress."""
+        error = vars(self).get("_event_ingress_control")
+        if error is not None:
+            raise retained_execution_error(error)
+        require_execution_work(self.agent)
 
     async def _cancel_terminal_event_ingress_tasks(self) -> bool:
         """Fence inbound, ACK, and deferred-ingress workers before retirement.
@@ -8674,15 +8989,18 @@ class ProxyFeature(Feature):
         """
 
         current = asyncio.current_task()
-        tasks = tuple(
+        owned_tasks = tuple(
             task
             for task in (
                 *self._event_ack_tasks,
                 *self._event_ingress_tasks,
                 *self._deferred_acknowledged_event_tasks,
             )
-            if task is not current and not task.done()
+            if task is not current
         )
+        for task in owned_tasks:
+            self._retain_event_ingress_task_control(task)
+        tasks = tuple(task for task in owned_tasks if not task.done())
         for task in tasks:
             task.cancel()
         if not tasks:
@@ -8695,6 +9013,11 @@ class ProxyFeature(Feature):
         except asyncio.TimeoutError:
             self._terminal_cleanup_uncertain = True
             return False
+        finally:
+            # A join can settle before its queued completion callback runs.
+            # Public retirement must not depend on that scheduling order.
+            for task in owned_tasks:
+                self._retain_event_ingress_task_control(task)
         return True
 
     def _has_running_terminal_lifecycle_task(self, client: Any) -> bool:
@@ -8726,7 +9049,7 @@ class ProxyFeature(Feature):
                         running = True
                     retained_tasks.append(ownership)
                     continue
-                _consume_late_lifecycle_task_outcome(task)
+                self._retain_event_ingress_task_control(task)
                 continue
             marked_client = (
                 ownership.client_ref() if ownership.client_ref is not None else None
@@ -8748,7 +9071,7 @@ class ProxyFeature(Feature):
         self._terminal_lifecycle_tasks = retained_tasks
         return running
 
-    async def _retire_terminal_clients(self) -> bool:
+    async def _retire_terminal_clients(self, *, retry_retirement: bool = False) -> bool:
         """Attempt exact retained-client retirement without public policy.
 
         This is the only shared terminal ``stop()`` path.  It catches every
@@ -8760,6 +9083,11 @@ class ProxyFeature(Feature):
         """
 
         async with self._terminal_retirement_lock:
+            if retry_retirement:
+                # A concurrent owned quarantine may have failed while this
+                # explicit retry waited for the same client. Begin its fresh
+                # attempt only after acquiring physical retirement ownership.
+                self._terminal_cleanup_uncertain = False
             # A detached startup can retain another client while an existing
             # stop is awaited.  Keep selecting from the live identity list so
             # a successful pass cannot report retirement while that late exact
@@ -8799,7 +9127,8 @@ class ProxyFeature(Feature):
                         self.name,
                     )
                     return False
-                except BaseException:  # noqa: BLE001 - hostile stop can raise non-Exception
+                except BaseException as error:  # noqa: BLE001 - hostile stop can raise non-Exception
+                    self._retain_execution_control(error)
                     self._terminal_cleanup_uncertain = True
                     logger.error(
                         "Isolated feature %s could not stop its terminal client; "
@@ -8932,7 +9261,9 @@ class ProxyFeature(Feature):
         task = self._terminal_cleanup_task
         if task is None or task.done():
             self._terminal_cleanup_task = asyncio.create_task(
-                self._terminal_cleanup_uninterrupted(lifecycle_lock_held=False),
+                self._terminal_cleanup_uninterrupted(
+                    lifecycle_lock_held=False, retry_retirement=True,
+                ),
                 name=f"isolated-terminal-cleanup:{self.name}",
             )
 
@@ -8992,6 +9323,7 @@ class ProxyFeature(Feature):
             task = asyncio.create_task(
                 self._terminal_cleanup_uninterrupted(
                     lifecycle_lock_held=True,
+                    retry_retirement=not best_effort,
                 ),
                 name=f"isolated-terminal-cleanup-owned:{self.name}",
             )
@@ -9005,6 +9337,7 @@ class ProxyFeature(Feature):
                 task = asyncio.create_task(
                     self._terminal_cleanup_uninterrupted(
                         lifecycle_lock_held=False,
+                        retry_retirement=not best_effort,
                     ),
                     name=f"isolated-terminal-cleanup:{self.name}",
                 )
@@ -9035,12 +9368,18 @@ class ProxyFeature(Feature):
             # Do not expose a hostile facade's message/type/traceback.  This
             # fresh public lifecycle error says only that the sealed proxy has
             # not reached a state in which success would be honest.
-            raise RuntimeError("isolated feature terminal retirement is incomplete")
+            raise execution_terminal_error(
+                vars(self).get("_event_ingress_control"),
+                RuntimeError("isolated feature terminal retirement is incomplete"),
+            )
+        if not best_effort and vars(self).get("_event_ingress_control") is not None:
+            raise retained_execution_error(self._event_ingress_control)
 
     async def _terminal_cleanup_uninterrupted(
         self,
         *,
         lifecycle_lock_held: bool,
+        retry_retirement: bool = False,
     ) -> None:
         """Run one shared cleanup attempt without exporting external failures.
 
@@ -9054,8 +9393,10 @@ class ProxyFeature(Feature):
         try:
             await self._terminal_cleanup_attempt(
                 lifecycle_lock_held=lifecycle_lock_held,
+                retry_retirement=retry_retirement,
             )
-        except BaseException:  # noqa: BLE001 - shared task must not retain facade failures
+        except BaseException as error:  # noqa: BLE001 - ordinary facade failures stay private
+            self._retain_execution_control(error)
             # If unpublication itself failed, the sealed public slot is still
             # the only exact retry handle.  Retaining by identity is harmless
             # when a prior phase already unpublished it.
@@ -9071,6 +9412,7 @@ class ProxyFeature(Feature):
         self,
         *,
         lifecycle_lock_held: bool,
+        retry_retirement: bool = False,
     ) -> None:
         """Seal, unpublish, stop, and drain without caller interruption.
 
@@ -9108,7 +9450,7 @@ class ProxyFeature(Feature):
             health_probe_running = not await self._cancel_terminal_health_probe()
         ingress_tasks_settled = await self._cancel_terminal_event_ingress_tasks()
         if (
-            self._terminal_cleanup_uncertain
+            (self._terminal_cleanup_uncertain and not retry_retirement)
             or health_probe_running
             or not ingress_tasks_settled
         ):
@@ -9120,7 +9462,7 @@ class ProxyFeature(Feature):
             # retry; this terminal path reports no false success or reopen.
             self._terminal_cleanup_uncertain = True
             return
-        if not await self._retire_terminal_clients():
+        if not await self._retire_terminal_clients(retry_retirement=retry_retirement):
             # Do not drain beneath a stop failure: a hostile facade can raise
             # while its admitted RPC is still wedged.  The retained exact
             # handle makes a later terminal attempt bounded and recoverable.
@@ -9559,6 +9901,7 @@ class ProxyFeature(Feature):
         durable active configuration.
         """
         cfg = dict(config) if isinstance(config, dict) else {}
+        self._require_event_ingress_work()
         # Idle retirement removes only the process, not the feature's lifecycle
         # contract. Recreate that child before staging so a negotiated
         # transition validator cannot be bypassed by ``_client is None``.
@@ -9788,6 +10131,10 @@ class ProxyFeature(Feature):
                 ) from authority_error
             except asyncio.CancelledError as cancellation_error:
                 body_error = cancellation_error
+                if is_execution_control_error(cancellation_error):
+                    await self._quarantine_unreconciled_client(
+                        lifecycle_lock_held=True, prior_error=cancellation_error,
+                    )
                 if transition is not None:
                     # Every await after staging enters this path. The cleanup
                     # task is shielded so a second cancellation cannot strand
@@ -9818,6 +10165,10 @@ class ProxyFeature(Feature):
                 raise
             except BaseException as transition_error:
                 body_error = transition_error
+                if is_execution_control_error(transition_error):
+                    await self._quarantine_unreconciled_client(
+                        lifecycle_lock_held=True, prior_error=transition_error,
+                    )
                 if transition is not None and not transition_settled:
                     if transition_attempted and not transition_succeeded:
                         if (
@@ -9883,8 +10234,14 @@ class ProxyFeature(Feature):
                     finalizer_error = exc
                 finally:
                     self._end_reload()
-                if finalizer_error is not None and body_error is None:
-                    raise finalizer_error
+                if finalizer_error is not None:
+                    terminal = execution_terminal_error(
+                        vars(self).get("_event_ingress_control"), body_error, finalizer_error,
+                    )
+                    if terminal is not None and is_execution_control_error(terminal):
+                        raise terminal
+                    if body_error is None:
+                        raise finalizer_error
             assert transition is not None
             return self._config_commit_receipt(transition)
 
@@ -9958,13 +10315,20 @@ class ProxyFeature(Feature):
             if promotion.error is not None:
                 self._raise_promotion_failure(promotion)
             return self._config_commit_receipt(transition)
-        except BaseException:
-            if transition is not None and not transition_settled:
-                await self._run_owned_transition_cleanup(
-                    transition,
-                    force=False,
-                    preserve_cancellation=False,
+        except BaseException as terminal_error:
+            if is_execution_control_error(terminal_error):
+                await self._quarantine_unreconciled_client(
+                    lifecycle_lock_held=True, prior_error=terminal_error,
                 )
+            if transition is not None and not transition_settled:
+                try:
+                    await self._run_owned_transition_cleanup(
+                        transition,
+                        force=False,
+                        preserve_cancellation=False,
+                    )
+                except BaseException as cleanup_error:
+                    raise execution_terminal_error(terminal_error, cleanup_error)
             raise
 
     async def set_config_with_secret_preservation(
@@ -10030,9 +10394,11 @@ class ProxyFeature(Feature):
                     transition,
                     force=force,
                 )
-            except BaseException:  # noqa: BLE001 - cancellation cleanup fences the proxy
+            except BaseException as error:  # noqa: BLE001 - cancellation cleanup fences the proxy
                 self._host_config_loaded = False
-                await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+                await self._quarantine_unreconciled_client(
+                    lifecycle_lock_held=True, prior_error=error,
+                )
 
         task = asyncio.create_task(cleanup())
         # Shielding alone is insufficient: a *second* cancellation used to let
@@ -10087,8 +10453,12 @@ class ProxyFeature(Feature):
             # explicit initialize, then retire the potentially divergent child.
             self._host_config = dict(state.config)
             self._host_config_loaded = True
-        except BaseException:
+        except BaseException as authority_error:
             self._host_config_loaded = False
+            await self._quarantine_unreconciled_client(
+                lifecycle_lock_held=True, prior_error=authority_error,
+            )
+            return
         await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
 
     async def _assert_staged_transition_authority(
@@ -10137,10 +10507,20 @@ class ProxyFeature(Feature):
         )
         try:
             await _await_task_until_complete(task, preserve_cancellation=preserve_cancellation)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as recovery_error:
+            if is_execution_control_error(recovery_error):
+                await self._quarantine_unreconciled_client(
+                    lifecycle_lock_held=True,
+                    prior_error=execution_terminal_error(_original_error, recovery_error),
+                )
             raise
         except BaseException as recovery_error:
             self._fenced_recovery_failed = True
+            if is_execution_control_error(recovery_error):
+                await self._quarantine_unreconciled_client(
+                    lifecycle_lock_held=True,
+                    prior_error=execution_terminal_error(_original_error, recovery_error),
+                )
             # The uninterrupted body has already tried generation-scoped
             # cleanup.  Repeat through the standard fenced cleanup path so a
             # generic failure (including old-client stop failure) cannot leave
@@ -10227,7 +10607,7 @@ class ProxyFeature(Feature):
                 target_config = state.config
 
             await self._connect_client(target_config)
-        except BaseException:
+        except BaseException as recovery_error:
             # A partially restored old client must be visible only to the
             # cleanup/quarantine path, never to traffic (the gate is closed).
             if (
@@ -10239,8 +10619,20 @@ class ProxyFeature(Feature):
             # In particular, a failed old-client stop must not prevent the
             # generation's durable cleanup.  This happens before quarantine so
             # a later replica does not inherit a needless pending wedge.
-            await self._clear_owned_pending_before_quarantine(transition)
-            await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+            cleanup_error = None
+            # A native control receipt forbids fresh CAS/readback recovery;
+            # physically quarantine first, retaining that original receipt.
+            if not is_execution_control_error(recovery_error):
+                try:
+                    await self._clear_owned_pending_before_quarantine(transition)
+                except BaseException as error:
+                    cleanup_error = error
+            await self._quarantine_unreconciled_client(
+                lifecycle_lock_held=True,
+                prior_error=execution_terminal_error(recovery_error, cleanup_error),
+            )
+            if cleanup_error is not None:
+                raise execution_terminal_error(recovery_error, cleanup_error)
             raise
 
         self._host_config = dict(target_config)
@@ -10282,13 +10674,17 @@ class ProxyFeature(Feature):
             if cleanup.cleared:
                 self._host_config = dict(cleanup.state.config)
                 self._host_config_loaded = True
-        except BaseException:  # noqa: BLE001 - quarantine remains the fallback
+        except BaseException as error:  # noqa: BLE001 - quarantine remains the fallback
             self._host_config_loaded = False
+            self._retain_execution_control(error)
+            if is_execution_control_error(error):
+                raise retained_execution_error(error)
 
     async def _quarantine_unreconciled_client(
         self,
         *,
         lifecycle_lock_held: bool = False,
+        prior_error: BaseException | None = None,
     ) -> None:
         """Fail closed when a recovery child cannot be reconciled to storage.
 
@@ -10303,11 +10699,23 @@ class ProxyFeature(Feature):
         # a cancellation delivered after seal cannot skip unpublication,
         # adapter removal, supervision cancellation, or best-effort retirement
         # while the task is still waiting on another lifecycle owner.
+        self._retain_execution_control(prior_error)
         self._latch_terminal_lifecycle()
-        await self._complete_terminal_cleanup(
-            best_effort=True,
-            lifecycle_lock_held=lifecycle_lock_held,
+        cleanup_error = None
+        try:
+            await self._complete_terminal_cleanup(
+                best_effort=True,
+                lifecycle_lock_held=lifecycle_lock_held,
+            )
+        except BaseException as error:
+            cleanup_error = error
+        terminal = execution_terminal_error(
+            vars(self).get("_event_ingress_control"), prior_error, cleanup_error,
         )
+        if prior_error is not None and terminal is not None and is_execution_control_error(terminal):
+            raise terminal
+        if cleanup_error is not None:
+            raise retained_execution_error(cleanup_error)
 
     async def _stage_pending_config(
         self,
@@ -10804,9 +11212,11 @@ class ProxyFeature(Feature):
                     )
             await self._reconcile_client_to_authoritative_config(state.config, force=force)
             return state
-        except BaseException:
+        except BaseException as error:
             self._host_config_loaded = False
-            await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+            await self._quarantine_unreconciled_client(
+                lifecycle_lock_held=True, prior_error=error,
+            )
             raise
 
     async def _promote_config(
@@ -10962,6 +11372,9 @@ class ProxyFeature(Feature):
             # so it quarantines before any hook or traffic can continue.
             raise
         except BaseException as exc:
+            if is_execution_control_error(exc):
+                self._retain_execution_control(exc)
+                raise retained_execution_error(exc)
             # A write boundary may raise after commit. Its caller performs the
             # authoritative read needed to classify the result.
             return _ConfigWriteResult(committed=False, error=exc)
@@ -11025,6 +11438,9 @@ class ProxyFeature(Feature):
         except _ConfigAuthorityChanged:
             raise
         except Exception as exc:  # noqa: BLE001 - durable read is a hard boundary
+            if is_execution_control_error(exc):
+                self._retain_execution_control(exc)
+                raise retained_execution_error(exc)
             raise RuntimeError(
                 f"Cannot apply config for isolated feature {self.name}: "
                 "failed to load config transition state"
@@ -11111,7 +11527,10 @@ class ProxyFeature(Feature):
         except BaseException as read_error:
             # We cannot prove which config won, so no live child may remain.
             self._host_config_loaded = False
-            await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+            await self._quarantine_unreconciled_client(
+                lifecycle_lock_held=True,
+                prior_error=execution_terminal_error(write_error, read_error),
+            )
             if isinstance(write_error, asyncio.CancelledError):
                 raise write_error
             raise RuntimeError(
@@ -11246,6 +11665,7 @@ class ProxyFeature(Feature):
     def _assert_child_start_allowed(self) -> None:
         """Refuse normal child-lifecycle work after terminal cleanup starts."""
 
+        require_execution_work(self.agent)
         if self._terminal_lifecycle_latched or self._stopping:
             raise _TerminalLifecyclePermitRevoked(
                 f"Cannot continue isolated feature {self.name}: terminal lifecycle "
@@ -11312,46 +11732,73 @@ class ProxyFeature(Feature):
             return await self._prepare_config_transition(transition.next_config)
 
         stop_heartbeat = asyncio.Event()
-        heartbeat = asyncio.create_task(
-            self._run_transition_lease_heartbeat(transition, stop_heartbeat),
-            name=f"isolated-config-lease:{self.name}",
-        )
-        hook = asyncio.create_task(
-            self._prepare_config_transition(transition.next_config),
-            name=f"isolated-config-hook:{self.name}",
-        )
+        heartbeat_admission, hook_admission = OwnedTaskAdmission(), OwnedTaskAdmission()
+        hook_admitted = False
+        failures = []
+        result = None
         try:
+            heartbeat = create_owned_task(
+                self._run_transition_lease_heartbeat(transition, stop_heartbeat),
+                name=f"isolated-config-lease:{self.name}",
+                retain_originals=True, admission=heartbeat_admission,
+            )
+            hook = create_owned_task(
+                self._prepare_config_transition(transition.next_config),
+                name=f"isolated-config-hook:{self.name}",
+                retain_originals=True, admission=hook_admission,
+            )
+            hook_admitted = True
             done, _ = await asyncio.wait(
                 {hook, heartbeat}, return_when=asyncio.FIRST_COMPLETED
             )
             if heartbeat in done:
                 # A healthy heartbeat only finishes when asked to stop below;
                 # before that, its completion is a lost lease or storage error.
-                heartbeat.result()
+                failure = owned_task_error(heartbeat)
+                if failure is not None:
+                    raise failure
                 raise _ConfigTransitionLeaseLost(
                     "isolated config transition lease heartbeat stopped unexpectedly"
                 )
-            return hook.result()
+            failure = owned_task_error(hook)
+            if failure is not None:
+                raise failure
+            result = hook.result()
+        except BaseException as error:
+            failures.append(error)
+
+        # Admission itself is inside the owning lifetime. An accepted Task is
+        # inventoried even if its callback publication refused the handoff.
+        # Keep renewing until the original hook physically settles; a failed
+        # hook join must never bypass the independent heartbeat stop/join.
+        hook, heartbeat = hook_admission.task, heartbeat_admission.task
+        try:
+            if hook is not None:
+                if not hook.done() and hook_admitted:
+                    hook.cancel()
+                outcome = await await_owned_task(hook)
+                if outcome.error is not None and (
+                    not isinstance(outcome.error, asyncio.CancelledError)
+                    or is_execution_control_error(outcome.error)
+                ):
+                    failures.append(outcome.error)
+                failures.append(outcome.cancellation)
+        except BaseException as error:
+            failures.append(error)
         finally:
-            # If the lease cannot be renewed, cancellation may reach the SDK
-            # child; wait for its cancellation to settle before recovery makes
-            # a replacement decision.  No lifecycle task may outlive the
-            # reload lock.
-            if not hook.done():
-                hook.cancel()
-                try:
-                    await self._await_task_completion(
-                        hook, preserve_cancellation=True
-                    )
-                except asyncio.CancelledError:
-                    pass
             stop_heartbeat.set()
-            try:
-                await self._await_task_completion(
-                    heartbeat, preserve_cancellation=True
-                )
-            except asyncio.CancelledError:
-                pass
+            if heartbeat is not None:
+                try:
+                    outcome = await await_owned_task(heartbeat)
+                    failures.extend((outcome.error, outcome.cancellation))
+                except BaseException as error:
+                    failures.append(error)
+        terminal = execution_terminal_error(
+            *failures, retain_originals=True, isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
+        return result
 
     def _supports_config_transition(self) -> bool:
         """Whether the initialized SDK client explicitly opted into transitions."""
@@ -11638,16 +12085,13 @@ class ProxyFeature(Feature):
 
         try:
             try:
+                require_execution_work(self.agent)
                 result = await _maybe_await(call(request.name, request.payload))
-            except asyncio.CancelledError:
-                outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-                return
-            except BaseException:  # noqa: BLE001 - external RPC boundary redaction
+                require_execution_work(self.agent)
+            except BaseException as error:  # noqa: BLE001 - external RPC boundary redaction
                 # The SDK/custom-client boundary is untrusted. Do not retain its
                 # exception object or its potentially secret-bearing message.
-                outcome_slot.outcome = _HostIngressOutcome(
-                    _HOST_INGRESS_GENERIC_FAILURE
-                )
+                outcome_slot.outcome = _redacted_host_ingress_error(error)
                 return
             try:
                 # A custom facade must not be able to return a mutable or subclass
@@ -11657,12 +12101,8 @@ class ProxyFeature(Feature):
                     _HOST_INGRESS_SUCCESS,
                     _snapshot_host_ingress_payload(result),
                 )
-            except asyncio.CancelledError:
-                outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-            except BaseException:  # noqa: BLE001 - external response boundary redaction
-                outcome_slot.outcome = _HostIngressOutcome(
-                    _HOST_INGRESS_GENERIC_FAILURE
-                )
+            except BaseException as error:  # noqa: BLE001 - external response boundary redaction
+                outcome_slot.outcome = _redacted_host_ingress_error(error)
         finally:
             # This worker may survive a caller cancellation. Drop every
             # request/client-adjacent reference as soon as the RPC settles;
@@ -11681,9 +12121,11 @@ class ProxyFeature(Feature):
 
         try:
             while True:
+                require_execution_work(self.agent)
                 wake_idle = False
                 completed_call = False
                 async with self._traffic_gate.admit():
+                    require_execution_work(self.agent)
                     client = self._client
                     if client is None and self._idle_retired:
                         wake_idle = True
@@ -11695,15 +12137,8 @@ class ProxyFeature(Feature):
                     else:
                         try:
                             capabilities = self._host_ingress_capabilities()
-                        except asyncio.CancelledError:
-                            outcome_slot.outcome = _HostIngressOutcome(
-                                _HOST_INGRESS_CANCELLED
-                            )
-                            return
-                        except BaseException:  # noqa: BLE001 - untrusted capability facade
-                            outcome_slot.outcome = _HostIngressOutcome(
-                                _HOST_INGRESS_GENERIC_FAILURE
-                            )
+                        except BaseException as error:  # noqa: BLE001 - untrusted capability facade
+                            outcome_slot.outcome = _redacted_host_ingress_error(error)
                             return
                         if capabilities is None:
                             outcome_slot.outcome = _HostIngressOutcome(
@@ -11718,15 +12153,8 @@ class ProxyFeature(Feature):
 
                         try:
                             call = getattr(client, "call_host_ingress", None)
-                        except asyncio.CancelledError:
-                            outcome_slot.outcome = _HostIngressOutcome(
-                                _HOST_INGRESS_CANCELLED
-                            )
-                            return
-                        except BaseException:  # noqa: BLE001 - untrusted descriptor boundary
-                            outcome_slot.outcome = _HostIngressOutcome(
-                                _HOST_INGRESS_GENERIC_FAILURE
-                            )
+                        except BaseException as error:  # noqa: BLE001 - untrusted descriptor boundary
+                            outcome_slot.outcome = _redacted_host_ingress_error(error)
                             return
                         if not callable(call):
                             outcome_slot.outcome = _HostIngressOutcome(
@@ -11742,19 +12170,20 @@ class ProxyFeature(Feature):
                             self._record_runtime_activity()
                         completed_call = True
                 if completed_call:
+                    require_execution_work(self.agent)
                     self._schedule_runtime_telemetry()
                     return
                 if wake_idle:
                     await self._wake_idle_runtime()
         except (_TrafficGateTerminalError, _TerminalLifecyclePermitRevoked):
             outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_TERMINAL)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             # The public caller shields this worker, so a cancellation here is
             # child/runtime-originated and must remain distinguishable from the
             # caller cancellation handled by ``_wait_for_host_ingress_operation``.
-            outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-        except BaseException:  # noqa: BLE001 - no internal traceback may escape
-            outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
+            outcome_slot.outcome = _redacted_host_ingress_error(error)
+        except BaseException as error:  # noqa: BLE001 - no internal traceback may escape
+            outcome_slot.outcome = _redacted_host_ingress_error(error)
         finally:
             call = None
             capabilities = None
@@ -11889,6 +12318,11 @@ class ProxyFeature(Feature):
         )
 
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        from kestrel_sovereign.execution_custody import bind_execution_runtime
+        with bind_execution_runtime(self.agent):
+            return await self._call_isolated_tool_owned(name, args)
+
+    async def _call_isolated_tool_owned(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         context = _scheduled_tool_execution_context()
         requested_at = asyncio.get_running_loop().time()
         experienced_wake = False
@@ -11948,7 +12382,10 @@ class ProxyFeature(Feature):
                 "tool": name,
                 "success": False,
             }
-        except IsolatedRuntimePreparationError:
+        except IsolatedRuntimePreparationError as error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                raise
             if context is not None:
                 raise
             return {
@@ -12032,6 +12469,8 @@ class ProxyFeature(Feature):
         )
 
         try:
+            from kestrel_sovereign.execution_custody import require_execution_work
+            require_execution_work(self.agent)
             if context is not None:
                 # The context was translated before admission, which can wait
                 # on a config transition or an idle wake.  Re-read authority
@@ -12050,6 +12489,7 @@ class ProxyFeature(Feature):
                 result = await _maybe_await(
                     self._client.call_tool(name, args, context=context)
                 )
+            require_execution_work(self.agent)
             from kestrel_sovereign.features.base import is_flat_toolresult_envelope
             if is_flat_toolresult_envelope(result):
                 # Service returned the flat ToolResult envelope. Pass it through
@@ -12075,6 +12515,9 @@ class ProxyFeature(Feature):
         except (SchedulerExecutionContextUnavailable, SchedulerAuthorityRevoked):
             raise
         except Exception as exc:  # noqa: BLE001
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(exc):
+                raise
             if context is not None:
                 # No scheduler effect may proceed if the negotiated context was
                 # rejected or the context-aware RPC could not be delivered.
@@ -12116,6 +12559,7 @@ class ProxyFeature(Feature):
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
         hosted = self._runtime_is_hosted()
+        selected_bin = os.environ.get(_env_key(self.name, "BIN")) if hosted else None
         selected_setting = (
             self._hosted_immutable_venv_setting() if hosted else None
         )
@@ -12173,6 +12617,10 @@ class ProxyFeature(Feature):
                     resolved_venv = self._default_venv_path()
                 resolved_bin = None
         except Exception:
+            if selected_bin:
+                # An unsuccessful revalidation cannot grant deletion authority
+                # over either the old immutable runnable or its replacement.
+                self._hosted_immutable_bin_custody_unproven = True
             if selected_setting is not None:
                 # A failed cold re-resolution proves nothing about custody.
                 # Retain the last validated artifact but fail closed even when
@@ -12196,6 +12644,13 @@ class ProxyFeature(Feature):
         # Publish only after every validation and computation succeeds. There
         # is no await between these stores, and production callers hold the
         # reload lock, so reclaim cannot observe a mixed launch/custody state.
+        if validated_hosted_overrides is not None:
+            retain_host_launch_artifact_custody(
+                self._isolated_runtime_scope, _agent_runtime_owner(self.agent),
+                self._released_legacy_runtime_root,
+                (*validated_hosted_overrides.venv_custody_paths,
+                 *validated_hosted_overrides.bin_custody_paths),
+            )
         (
             self._service_target,
             self._venv_path,
@@ -12203,14 +12658,24 @@ class ProxyFeature(Feature):
             self._validated_hosted_immutable_venv_path,
             self._validated_hosted_immutable_venv_setting,
             self._hosted_immutable_venv_custody_unproven,
+            self._validated_hosted_immutable_bin_path,
+            self._validated_hosted_immutable_venv_custody_paths,
+            self._validated_hosted_immutable_bin_custody_paths,
+            self._hosted_immutable_bin_custody_unproven,
             self._validated_hosted_console_path,
         ) = (
             service_target,
             resolved_venv,
             resolved_bin,
-            validated_venv_path,
-            validated_venv_setting,
-            False,
+            validated_venv_path or self._validated_hosted_immutable_venv_path,
+            validated_venv_setting or self._validated_hosted_immutable_venv_setting,
+            self._hosted_immutable_venv_custody_unproven,
+            (resolved_bin or self._validated_hosted_immutable_bin_path) if hosted else None,
+            tuple(dict.fromkeys((*self._validated_hosted_immutable_venv_custody_paths,
+                *(validated_hosted_overrides.venv_custody_paths if validated_hosted_overrides else ())))),
+            tuple(dict.fromkeys((*self._validated_hosted_immutable_bin_custody_paths,
+                *(validated_hosted_overrides.bin_custody_paths if validated_hosted_overrides else ())))),
+            self._hosted_immutable_bin_custody_unproven,
             None,
         )
         return resolved_venv, resolved_bin
@@ -12284,13 +12749,69 @@ class ProxyFeature(Feature):
         if selected_override is None:
             return False
         runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
-        selected_venv = Path(os.path.abspath(selected_override))
-        return selected_venv == runtime_dir or runtime_dir in selected_venv.parents
+        return any(
+            selected == runtime_dir or runtime_dir in selected.parents
+            for selected in (selected_override, *self._validated_hosted_immutable_venv_custody_paths)
+        )
 
     def _immutable_venv_custody_is_unproven(self) -> bool:
         """Whether failed hosted resolution makes workspace custody unknown."""
 
         return self._hosted_immutable_venv_custody_unproven
+
+    def _require_mutable_provisioning_custody(self) -> None:
+        """A removed setting never transfers retained operator artifacts to uv.
+
+        The restrictive namespace marker is intentionally coarser than one
+        selected venv. After a process restart it cannot prove which subtree
+        contains the immutable launch chain, so it denies default provisioning
+        in that namespace rather than guessing that custody has disappeared.
+        """
+        if not self._runtime_is_hosted():
+            return
+        assert self._venv_path is not None
+        if self._immutable_venv_custody_is_unproven() or self._hosted_immutable_bin_custody_unproven:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature immutable launch custody is unproven; provisioning is refused."
+            )
+        selected = {Path(os.path.abspath(self._venv_path)), self._venv_path.resolve()}
+        retained = (
+            *self._validated_hosted_immutable_venv_custody_paths,
+            *self._validated_hosted_immutable_bin_custody_paths,
+        )
+        if any(
+            path == target or path in target.parents or target in path.parents
+            for path in retained for target in selected
+        ):
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature provisioning would mutate a retained immutable launch artifact."
+            )
+        scope = self._isolated_runtime_scope
+        if scope is None:
+            return
+        owner = _agent_runtime_owner(self.agent)
+        prepare_isolated_runtime_namespace(scope, owner)
+        descriptor = os.open(scope.path, _directory_open_flags())
+        try:
+            if not _same_file_identity(
+                os.stat(scope.path, follow_symlinks=False), os.fstat(descriptor),
+            ):
+                raise IsolatedRuntimeNamespaceError("Provisioning custody root changed during validation.")
+            _read_existing_runtime_owner(descriptor, owner)
+            _assert_no_immutable_launch_custody_at(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _immutable_bin_override_is_inside_workspace(self) -> bool:
+        """A validated operator runnable never acquires Core removal custody."""
+        selected = self._validated_hosted_immutable_bin_path
+        if selected is None:
+            return False
+        runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
+        return any(
+            path == runtime_dir or runtime_dir in path.parents
+            for path in (selected, *self._validated_hosted_immutable_bin_custody_paths)
+        )
 
     def _process_venv_is_overridden(self) -> bool:
         """Whether this host selected a process-wide immutable venv artifact."""
@@ -12324,6 +12845,7 @@ class ProxyFeature(Feature):
         operator-provided prebuilt environment remains immutable while service
         state, temp files, and user-home/XDG writes stay agent scoped.
         """
+        require_execution_work(self.agent)
         runtime_dir = self._feature_runtime_dir()
         self._venv_relocated_this_startup = False
         if self._isolated_runtime_scope is not None:
@@ -12338,6 +12860,7 @@ class ProxyFeature(Feature):
                 else ()
             )
             migration_results: set[tuple[tuple[str, ...], str, str]] = set()
+            require_execution_work(self.agent)
             prepare_isolated_runtime_namespace(
                 self._isolated_runtime_scope,
                 _agent_runtime_owner(self.agent),
@@ -12347,6 +12870,7 @@ class ProxyFeature(Feature):
             )
             self._venv_relocated_this_startup = bool(migration_results)
             if self._released_legacy_runtime_root is not None:
+                require_execution_work(self.agent)
                 self._venv_relocated_this_startup = (
                     migrate_released_hosted_feature_runtime(
                         self._released_legacy_runtime_root,
@@ -12357,6 +12881,7 @@ class ProxyFeature(Feature):
                     )
                     or self._venv_relocated_this_startup
                 )
+            require_execution_work(self.agent)
             prepare_isolated_runtime_namespace(
                 self._isolated_runtime_scope,
                 _agent_runtime_owner(self.agent),
@@ -12402,6 +12927,7 @@ class ProxyFeature(Feature):
             runtime_dir / "cache",
             self._agent_runtime_dir / "channel_link_artifacts",
         ):
+            require_execution_work(self.agent)
             if directory.is_symlink():
                 raise IsolatedRuntimeNamespaceError(
                     "Standalone isolated feature runtime workspace must not "
@@ -12513,6 +13039,7 @@ class ProxyFeature(Feature):
     def _clear_venv_relocation_repair_marker(self) -> None:
         """Clear migration intent only after launch verification and stamping."""
 
+        require_execution_work(self.agent)
         if self._isolated_runtime_scope is None:
             return
         runtime_dir = self._feature_runtime_dir()
@@ -12615,6 +13142,7 @@ class ProxyFeature(Feature):
     def _write_provision_manifest_payload(self, manifest: Dict[str, Any]) -> None:
         """Atomically publish one private Core provisioning manifest."""
 
+        require_execution_work(self.agent)
         path = self._provision_manifest_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(manifest, indent=2).encode("utf-8")
@@ -12632,6 +13160,7 @@ class ProxyFeature(Feature):
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = None
+            require_execution_work(self.agent)
             os.replace(temporary, path)
             path.chmod(_PRIVATE_FILE_MODE)
             if os.name == "posix":
@@ -13077,6 +13606,7 @@ class ProxyFeature(Feature):
     def ensure_venv(self) -> bool:
         """Ensure the runtime environment within one hosted mutation budget."""
 
+        require_execution_work(self.agent)
         if not self._runtime_is_hosted():
             return self._ensure_venv_with_active_budget()
         timeout = _hosted_provisioning_timeout_seconds()
@@ -13089,6 +13619,7 @@ class ProxyFeature(Feature):
     def _ensure_venv_with_active_budget(self) -> bool:
         """Perform preparation under the caller's hosted deadline, if any."""
 
+        require_execution_work(self.agent)
         assert self._venv_path is not None
         python_path = _venv_python(self._venv_path)
 
@@ -13140,6 +13671,24 @@ class ProxyFeature(Feature):
                         target.console_executable,
                         setting=hosted_immutable_setting,
                     )
+                    self._validated_hosted_immutable_venv_custody_paths = tuple(sorted(set(
+                        self._validated_hosted_immutable_venv_custody_paths
+                        + validated_overrides.venv_custody_paths
+                        + _immutable_prebuilt_custody_paths(
+                            str(_console_script_path(self._venv_path, target.console_executable)),
+                            validated_console_path, setting=hosted_immutable_setting,
+                        )
+                    )))
+                    # Acceptance can discover an intermediate console symlink
+                    # in an owned mutable namespace after constructor custody.
+                    # Persist its restrictive marker before publishing launch.
+                    retain_host_launch_artifact_custody(
+                        self._isolated_runtime_scope,
+                        _agent_runtime_owner(self.agent) if self._isolated_runtime_scope is not None else None,
+                        self._released_legacy_runtime_root,
+                        (*self._validated_hosted_immutable_venv_custody_paths,
+                         *self._validated_hosted_immutable_bin_custody_paths),
+                    )
                     self._verify_launch_artifact(
                         validated_console_path=validated_console_path,
                     )
@@ -13157,6 +13706,7 @@ class ProxyFeature(Feature):
             self._validated_hosted_console_path = validated_console_path
             return False
 
+        self._require_mutable_provisioning_custody()
         exists = python_path.exists()
 
         # A PREBUILT operator-supplied (override) venv is NOT ours to mutate:
@@ -13279,20 +13829,27 @@ class ProxyFeature(Feature):
     def _run_provisioning_command(self, cmd: List[str]) -> None:
         """Map expected host provisioning failures to optional quarantine."""
 
+        require_execution_work(self.agent)
         try:
             self._run(cmd)
+            require_execution_work(self.agent)
         except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise IsolatedRuntimePreparationError(
                 "Isolated feature venv provisioning could not be completed."
             ) from exc
 
     def _run(self, cmd: List[str]) -> None:
+        require_execution_work(self.agent)
         if not cmd:
             raise ValueError("Provisioning command must not be empty")
         if not self._runtime_is_hosted():
             if shutil.which(cmd[0]) is None:
                 raise RuntimeError(f"Required executable not found: {cmd[0]}")
+            require_execution_work(self.agent)
             subprocess.run(cmd, check=True)
+            require_execution_work(self.agent)
             return
 
         assert self._venv_path is not None
@@ -13314,6 +13871,7 @@ class ProxyFeature(Feature):
         )
         if timeout <= 0:
             raise subprocess.TimeoutExpired([executable, *cmd[1:]], timeout)
+        require_execution_work(self.agent)
         completed = asyncio.run(
             run_bounded_subprocess(
                 [executable, *cmd[1:]],
@@ -13321,12 +13879,14 @@ class ProxyFeature(Feature):
                 timeout=timeout,
             )
         )
+        require_execution_work(self.agent)
         if completed.timed_out:
             raise subprocess.TimeoutExpired(completed.argv, timeout)
         if completed.returncode != 0:
             raise subprocess.CalledProcessError(completed.returncode, completed.argv)
 
     def _build_client(self, config: Optional[Dict[str, Any]] = None) -> Any:
+        self._assert_child_start_allowed()
         factory = self._client_factory
         if factory is None:
             from kestrel_sdk.isolated_feature import SubprocessIsolatedFeatureClient
@@ -13500,9 +14060,31 @@ class ProxyFeature(Feature):
         """
 
         target = self._client if client is None else client
+        resident_context = None
+        if callable(getattr(type(self.agent), "_runtime_owner_context", None)):
+            # Registration follows exact-client publication while every boot
+            # admission is still live. A notification is a NEW inbound source
+            # operation, not a foreign continuation of the turn that booted
+            # the SDK reader. Retain only the same immutable runtime root.
+            resident_context = self.agent._runtime_owner_context()
 
         async def handle_source_event(event: Any, *, source_client: Any = target) -> None:
-            await self._handle_event(event, source_client=source_client)
+            if resident_context is None:
+                await self._handle_event(event, source_client=source_client)
+                return
+
+            async def receive():
+                require_execution_work(self.agent)
+                await self._handle_event(event, source_client=source_client)
+                require_execution_work(self.agent)
+
+            task = asyncio.create_task(
+                receive(), name=f"isolated-source-notification:{self.name}",
+                context=resident_context.copy(),
+            )
+            # The SDK serial reader cannot leave a handler detached on close.
+            # Inbound cognition itself is separately bounded/owned below.
+            await _await_task_until_complete(task, preserve_cancellation=False)
 
         register = (
             getattr(target, "set_event_handler", None)
@@ -13535,11 +14117,18 @@ class ProxyFeature(Feature):
         doubles whose ``_track_background_task`` doesn't return a real Task)."""
         name = f"isolated-feature:{self.name}"
         coro = self._supervise()
-        tracker = getattr(self.agent, "_track_background_task", None)
+        tracker = getattr(self.agent, "_track_runtime_task", None)
+        if not callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            tracker = getattr(self.agent, "_track_background_task", None)
         if callable(tracker):
             try:
                 task = tracker(coro, name=name)
-            except Exception:  # noqa: BLE001
+            except Exception as error:  # noqa: BLE001
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(error):
+                    raise
                 task = None
             if isinstance(task, asyncio.Task):
                 return task
@@ -13578,12 +14167,19 @@ class ProxyFeature(Feature):
             self._idle_monitor_task = None
         coro = self._monitor_idle_runtime()
         name = f"isolated-feature-idle:{self.name}"
-        tracker = getattr(self.agent, "_track_background_task", None)
+        tracker = getattr(self.agent, "_track_runtime_task", None)
+        if not callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            tracker = getattr(self.agent, "_track_background_task", None)
         tracked = None
         if callable(tracker):
             try:
                 tracked = tracker(coro, name=name)
-            except Exception:  # noqa: BLE001 - test doubles may reject tracking
+            except Exception as error:  # noqa: BLE001 - test doubles may reject tracking
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(error):
+                    raise
                 tracked = None
         if isinstance(tracked, asyncio.Task):
             self._idle_monitor_task = tracked
@@ -13851,6 +14447,16 @@ class ProxyFeature(Feature):
                         "Hosted isolated feature workspace contains the immutable "
                         f"venv selected by {setting} and cannot be reclaimed."
                     )
+                if self._hosted_immutable_bin_custody_unproven:
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature immutable BIN custody could not "
+                        "be proven; the workspace cannot be reclaimed."
+                    )
+                if self._immutable_bin_override_is_inside_workspace():
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature workspace contains the immutable "
+                        "BIN override and cannot be reclaimed."
+                    )
                 # Stop advertising assets and completed byte counts before the
                 # no-follow deletion begins. The event loop remains available
                 # while the worker removes a potentially large venv, so
@@ -13890,6 +14496,7 @@ class ProxyFeature(Feature):
         refresh_environment_after_wake = False
         async with self._reload_lock:
             if self._client is not None:
+                self._assert_child_start_allowed()
                 return
             if not self._idle_retired:
                 self._assert_child_start_allowed()
@@ -13899,6 +14506,7 @@ class ProxyFeature(Feature):
             reopened = False
             try:
                 await self._close_traffic_gate()
+                self._assert_child_start_allowed()
                 if self._client is None:
                     self._prepare_runtime_workspace()
                     self._venv_path, self._bin_path = self.resolve_runtime_paths()
@@ -13914,6 +14522,7 @@ class ProxyFeature(Feature):
                     if self._is_telegram_runtime():
                         await self._resolve_hosted_telegram_startup_attestation()
                     await self._connect_client()
+                    self._assert_child_start_allowed()
                     self._reload_gen += 1
                     self._idle_wake_count += 1
                     self._last_used_monotonic = asyncio.get_running_loop().time()
@@ -13972,6 +14581,7 @@ class ProxyFeature(Feature):
             backoff = 1.0
             while not self._stopping:
                 await asyncio.sleep(backoff)
+                require_execution_work(self.agent)
                 # A ``set_config`` reload intentionally stops/starts the client;
                 # don't probe (and "restart") a service that is mid-reload.
                 if self._reloading:
@@ -13999,18 +14609,23 @@ class ProxyFeature(Feature):
                         on_started=self._own_health_probe_task,
                         on_late_task=self._retain_terminal_health_probe_task,
                     )
+                    require_execution_work(self.agent)
                     healthy = self._is_healthy_response(health)
                     if healthy:
                         backoff = 1.0
                         continue
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.warning(
                         "Isolated feature %s health probe exceeded %ss — treating as "
                         "wedged and restarting",
                         self.name,
                         _HEALTH_PROBE_TIMEOUT,
                     )
-                except Exception:  # noqa: BLE001 - facade details stay private
+                except Exception as error:  # noqa: BLE001 - facade details stay private
+                    if is_execution_control_error(error):
+                        raise
                     logger.warning(
                         "Isolated feature %s health check failed", self.name
                     )
@@ -14086,7 +14701,8 @@ class ProxyFeature(Feature):
                                         task, client
                                     ),
                                 )
-                        except asyncio.CancelledError:
+                        except asyncio.CancelledError as stop_error:
+                            self._retain_execution_control(stop_error)
                             # A real caller cancellation can arrive while a
                             # facade stop itself fails/cancels.  Keep only a
                             # callback-proven completion for terminal cleanup;
@@ -14101,7 +14717,8 @@ class ProxyFeature(Feature):
                                     stop_completion
                                 )
                             raise
-                        except BaseException:  # noqa: BLE001 - fence hostile stop failures
+                        except BaseException as stop_error:  # noqa: BLE001 - fence hostile stop failures
+                            self._retain_execution_control(stop_error)
                             self._discard_terminal_stop_completion(stop_completion)
                             # Never reopen traffic to a client whose stop
                             # outcome is unknown.  The terminal transaction
@@ -14118,10 +14735,15 @@ class ProxyFeature(Feature):
                                 # would cancel and later join its own owner
                                 # while that owner awaits the cleanup task.
                                 self._supervision_task = None
-                            await self._complete_terminal_cleanup(
-                                best_effort=True,
-                                lifecycle_lock_held=True,
-                            )
+                            try:
+                                await self._complete_terminal_cleanup(
+                                    best_effort=True,
+                                    lifecycle_lock_held=True,
+                                )
+                            except BaseException as cleanup_error:
+                                raise execution_terminal_error(stop_error, cleanup_error)
+                            if is_execution_control_error(stop_error):
+                                raise stop_error
                             break
                         try:
                             await self._drain_traffic_gate()
@@ -14158,6 +14780,7 @@ class ProxyFeature(Feature):
                                     task, client
                                 ),
                             )
+                            require_execution_work(self.agent)
                             self._capture_process_identity(client)
                             self._last_cold_start_seconds = (
                                 asyncio.get_running_loop().time() - started
@@ -14189,7 +14812,11 @@ class ProxyFeature(Feature):
                                 lifecycle_lock_held=True,
                             )
                             break
-                        except Exception:  # noqa: BLE001 - facade details stay private
+                        except Exception as error:  # noqa: BLE001 - facade details stay private
+                            if is_execution_control_error(error):
+                                terminal_unwind = True
+                                self._latch_terminal_lifecycle()
+                                raise
                             logger.warning(
                                 "Isolated feature %s restart failed", self.name
                             )
@@ -14250,6 +14877,9 @@ class ProxyFeature(Feature):
         therefore required before the supervisor may touch a facade.
         """
 
+        require_execution_work(self.agent)
+        if vars(self).get("_event_ingress_control") is not None:
+            raise self._event_ingress_control
         return (
             not self._stopping
             and not self._terminal_lifecycle_latched
@@ -14446,15 +15076,23 @@ class ProxyFeature(Feature):
                 try:
                     async with self._traffic_gate.admit(wait_for_open=False):
                         for predecessor in completion_predecessors:
+                            from kestrel_sovereign._async_ownership import (
+                                owned_task_error,
+                            )
                             try:
                                 await asyncio.shield(predecessor)
-                            except asyncio.CancelledError:
+                            except asyncio.CancelledError as interruption:
+                                prior_error = owned_task_error(predecessor) if predecessor.done() else interruption
+                                if prior_error is not None and is_execution_control_error(prior_error):
+                                    raise prior_error
                                 if (
                                     asyncio.current_task() is not None
                                     and asyncio.current_task().cancelling()
                                 ):
                                     raise
-                            except BaseException:  # noqa: BLE001 - predecessor audited
+                            except BaseException as error:  # noqa: BLE001 - predecessor audited
+                                if is_execution_control_error(error):
+                                    raise
                                 logger.warning(
                                     "Prior inbound completion from isolated feature %s "
                                     "failed; rechecking the queued callback against "
@@ -14498,7 +15136,9 @@ class ProxyFeature(Feature):
                     self._schedule_event_ingress_retry(source_client, retry)
             except asyncio.CancelledError:
                 raise
-            except BaseException:  # noqa: BLE001 - producer retains its cursor
+            except BaseException as error:  # noqa: BLE001 - producer retains its cursor
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Detached inbound ingress from isolated feature %s failed",
                     self.name,
@@ -14510,25 +15150,23 @@ class ProxyFeature(Feature):
                 if retry is not None:
                     self._schedule_event_ingress_retry(source_client, retry)
 
-        task = asyncio.create_task(
+        tracker = getattr(self.agent, "_track_runtime_task", None)
+        if not callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            tracker = asyncio.create_task
+        task = tracker(
             route(), name=f"isolated-event-ingress-route:{self.name}"
         )
         self._event_ingress_tasks.add(task)
         self._event_ingress_clients.append((source_client, task))
 
         def consume_route(completed: asyncio.Task[None]) -> None:
+            self._retain_event_ingress_task_control(completed)
             self._event_ingress_tasks.discard(completed)
             self._event_ingress_clients = [
                 (client, owned_task)
                 for client, owned_task in self._event_ingress_clients
                 if owned_task is not completed
             ]
-            if completed.cancelled():
-                return
-            try:
-                completed.result()
-            except BaseException:  # noqa: BLE001 - already logged by route
-                return
 
         task.add_done_callback(consume_route)
 
@@ -14563,7 +15201,10 @@ class ProxyFeature(Feature):
                             maxsize=_MAX_PENDING_NON_CURSOR_INGRESS_EVENTS
                         ),
                     )
-                    task = asyncio.create_task(
+                    tracker = getattr(self.agent, "_track_runtime_task", None)
+                    if not callable(getattr(type(self.agent), "_track_runtime_task", None)):
+                        tracker = asyncio.create_task
+                    task = tracker(
                         self._route_non_cursor_inbound_events(queue_entry),
                         name=f"isolated-non-cursor-ingress-route:{self.name}",
                     )
@@ -14576,6 +15217,7 @@ class ProxyFeature(Feature):
                         *,
                         entry: _NonCursorIngressQueue = queue_entry,
                     ) -> None:
+                        self._retain_event_ingress_task_control(completed)
                         self._event_ingress_tasks.discard(completed)
                         self._non_cursor_event_ingress_queues = [
                             candidate
@@ -14583,12 +15225,6 @@ class ProxyFeature(Feature):
                             if candidate.worker is not completed
                         ]
                         entry.retired.set()
-                        if completed.cancelled():
-                            return
-                        try:
-                            completed.result()
-                        except BaseException:  # noqa: BLE001 - worker logs its route errors
-                            return
 
                     task.add_done_callback(consume)
 
@@ -14601,16 +15237,14 @@ class ProxyFeature(Feature):
                     # can drain it; no third item allocates host memory.
                     pass
 
-            join = asyncio.create_task(queue_entry.events.join())
-            retired = asyncio.create_task(queue_entry.retired.wait())
-            done, pending = await asyncio.wait(
-                (join, retired), return_when=asyncio.FIRST_COMPLETED
+            await gather_owned(
+                (operation() for operation in
+                 (queue_entry.events.join, queue_entry.retired.wait)),
+                return_when=asyncio.FIRST_COMPLETED,
+                retain_originals=True,
+                isolate_control_originals=True,
+                name_prefix="isolated-non-cursor-ingress-observer",
             )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                task.result()
 
     async def _route_non_cursor_inbound_events(
         self, queue_entry: _NonCursorIngressQueue
@@ -14651,7 +15285,9 @@ class ProxyFeature(Feature):
                 retire_worker = True
             except asyncio.CancelledError:
                 raise
-            except BaseException:  # noqa: BLE001 - legacy provider has no retry path
+            except BaseException as error:  # noqa: BLE001 - legacy provider has no retry path
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Detached legacy inbound ingress from isolated feature %s failed",
                     self.name,
@@ -15048,7 +15684,9 @@ class ProxyFeature(Feature):
                 return
             except asyncio.CancelledError:
                 raise
-            except BaseException:  # noqa: BLE001 - producer retains its cursor
+            except BaseException as error:  # noqa: BLE001 - producer retains its cursor
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Deferred acknowledged ingress from isolated feature %s failed",
                     self.name,
@@ -15069,13 +15707,8 @@ class ProxyFeature(Feature):
         self._deferred_acknowledged_event_tasks.add(task)
 
         def consume_deferred_event(completed: asyncio.Task[None]) -> None:
+            self._retain_event_ingress_task_control(completed)
             self._deferred_acknowledged_event_tasks.discard(completed)
-            if completed.cancelled():
-                return
-            try:
-                completed.result()
-            except BaseException:  # noqa: BLE001 - failure already logged
-                return
 
         task.add_done_callback(consume_deferred_event)
 
@@ -15134,6 +15767,7 @@ class ProxyFeature(Feature):
             for client, task in self._event_ack_clients
             if client is source_client and not task.done()
         )
+        captured_custody = current_execution_custody(self.agent)
 
         try:
             capabilities = getattr(source_client, "host_ingress_capabilities", None)
@@ -15145,7 +15779,9 @@ class ProxyFeature(Feature):
                 )
                 return
             call = getattr(source_client, "call_host_ingress", None)
-        except BaseException:  # noqa: BLE001 - untrusted facade stays unacknowledged
+        except BaseException as error:  # noqa: BLE001 - untrusted facade stays unacknowledged
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "Inbound event from isolated feature %s could not start completion",
                 self.name,
@@ -15165,7 +15801,11 @@ class ProxyFeature(Feature):
                     # queued completion cannot create a second completion RPC
                     # for the same provider callback.
                     await asyncio.shield(predecessor)
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as error:
+                    if predecessor.done():
+                        error = execution_terminal_error(error, owned_task_error(predecessor))
+                    if is_execution_control_error(error):
+                        raise error
                     if (
                         asyncio.current_task() is not None
                         and asyncio.current_task().cancelling()
@@ -15175,7 +15815,9 @@ class ProxyFeature(Feature):
                     # lifecycle transition. Recheck the current source below;
                     # if it remains current, this exact callback still needs
                     # its own completion attempt.
-                except BaseException:  # noqa: BLE001 - predecessor already audited
+                except BaseException as error:  # noqa: BLE001 - predecessor already audited
+                    if is_execution_control_error(error):
+                        raise
                     logger.warning(
                         "Prior inbound completion from isolated feature %s failed; "
                         "continuing the queued provider callback",
@@ -15184,6 +15826,7 @@ class ProxyFeature(Feature):
             for attempt in range(_EVENT_INGRESS_ACK_ATTEMPTS):
                 if self._terminal_lifecycle_latched or source_client is not self._client:
                     return
+                self._require_event_ingress_work()
                 settled, result = await self._await_event_ingress_ack_attempt(
                     call, request, source_client
                 )
@@ -15207,26 +15850,27 @@ class ProxyFeature(Feature):
             # fresh process instead of silently losing the update.
             self._fence_event_ingress_ack_source(source_client)
 
+        async def scoped_complete() -> None:
+            # Capture at publication, not each retry: replacing the agent's
+            # runtime slot cannot grant this old callback new authority.
+            with bind_execution_custody_snapshot(captured_custody):
+                await complete()
+
         task = asyncio.create_task(
-            complete(),
+            scoped_complete(),
             name=f"isolated-event-ingress-{kind}:{self.name}",
         )
         self._event_ack_tasks.add(task)
         self._event_ack_clients.append((source_client, task))
 
         def consume_acknowledgement(completed: asyncio.Task[None]) -> None:
+            self._retain_event_ingress_task_control(completed)
             self._event_ack_tasks.discard(completed)
             self._event_ack_clients = [
                 (client, owned_task)
                 for client, owned_task in self._event_ack_clients
                 if owned_task is not completed
             ]
-            if completed.cancelled():
-                return
-            try:
-                completed.result()
-            except BaseException:  # noqa: BLE001 - completion already logged
-                return
 
         task.add_done_callback(consume_acknowledgement)
 
@@ -15238,16 +15882,32 @@ class ProxyFeature(Feature):
     ) -> tuple[bool, Any]:
         """Run one ACK with a bounded owned timeout."""
 
+        self._require_event_ingress_work()
         operation = _create_host_owned_facade_task(
             _maybe_await(call(request.name, request.payload)),
             name=f"isolated-event-ingress-ack-rpc:{self.name}",
         )
+
+        def original_terminal_error(error):
+            # asyncio.shield reconstructs CancelledError for a cancelled
+            # child. Harvest its actual outcome before losing cause-carried
+            # authority evidence to that synthetic cancellation.
+            if operation.done() and not operation.foreign_loop:
+                try:
+                    operation.result()
+                except BaseException as source_error:
+                    return execution_terminal_error(error, source_error)
+            return error
+
         try:
             result = await asyncio.wait_for(
                 operation.shield(), timeout=_EVENT_INGRESS_ACK_TIMEOUT
             )
+            self._require_event_ingress_work()
             return True, result
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as error:
+            if is_execution_control_error(error):
+                raise
             operation.cancel()
             try:
                 await asyncio.wait_for(
@@ -15256,18 +15916,24 @@ class ProxyFeature(Feature):
             except asyncio.TimeoutError:
                 self._retain_terminal_lifecycle_task(operation, source_client)
                 return False, None
-            except BaseException:  # noqa: BLE001 - failed ACK remains retryable
-                _consume_late_lifecycle_task_outcome(operation)
+            except BaseException as error:  # noqa: BLE001 - failed ACK remains retryable
+                error = original_terminal_error(error)
+                self._retain_event_ingress_task_control(operation)
+                if is_execution_control_error(error):
+                    raise error
                 return True, None
-            _consume_late_lifecycle_task_outcome(operation)
+            self._retain_event_ingress_task_control(operation)
             return True, None
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            error = original_terminal_error(error)
             operation.cancel()
             if not operation.done():
                 self._retain_terminal_lifecycle_task(operation, source_client)
-            raise
-        except BaseException:  # noqa: BLE001 - producer retries unchanged cursor
-            _consume_late_lifecycle_task_outcome(operation)
+            raise error
+        except BaseException as error:  # noqa: BLE001 - producer retries unchanged cursor
+            self._retain_event_ingress_task_control(operation)
+            if is_execution_control_error(error):
+                raise
             return True, None
 
     def _fence_event_ingress_ack_source(self, source_client: Any) -> None:
@@ -15476,6 +16142,7 @@ class ProxyFeature(Feature):
         payload: dict[str, Any],
         *,
         terminal_disposition: str | None = None,
+        acknowledgement_only: bool = False,
     ) -> Any:
         """Durably admit one host-authenticated Telegram webhook result.
 
@@ -15500,6 +16167,15 @@ class ProxyFeature(Feature):
             and terminal_disposition not in _TELEGRAM_TERMINAL_DISPOSITIONS
         ):
             raise ProtocolError("invalid hosted Telegram terminal disposition")
+        if type(acknowledgement_only) is not bool or (
+            acknowledgement_only and terminal_disposition is not None
+        ):
+            raise ProtocolError("invalid hosted acknowledgement admission")
+        # This classification is supplied only by the authenticated host API.
+        # It is intentionally not a child-advertised terminal descriptor: a
+        # transport may not downgrade arbitrary messages to care receipts.
+        if acknowledgement_only:
+            terminal_disposition = "care_acknowledgement"
         return await self._route_validated_inbound(
             payload,
             cursor_owned_protocol=True,
@@ -15507,6 +16183,7 @@ class ProxyFeature(Feature):
         )
 
     async def _route_inbound(self, payload: Any) -> Any:
+        self._require_event_ingress_work()
         channel = self._channel_feature()
         terminal_disposition = _telegram_terminal_inbound_disposition.get()
         expected_method = (

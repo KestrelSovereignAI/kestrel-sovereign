@@ -11,7 +11,8 @@ from kestrel_sovereign.endpoints.closing_streaming_response import (
 
 
 @pytest.mark.asyncio
-async def test_send_failure_after_first_chunk_closes_body() -> None:
+@pytest.mark.parametrize("close_in_stream_task", [False, True])
+async def test_send_failure_after_first_chunk_closes_body(close_in_stream_task) -> None:
     finalized = asyncio.Event()
 
     async def body():
@@ -21,7 +22,7 @@ async def test_send_failure_after_first_chunk_closes_body() -> None:
         finally:
             finalized.set()
 
-    response = ClosingStreamingResponse(body())
+    response = ClosingStreamingResponse(body(), close_in_stream_task=close_in_stream_task)
 
     async def receive():
         return {"type": "http.disconnect"}

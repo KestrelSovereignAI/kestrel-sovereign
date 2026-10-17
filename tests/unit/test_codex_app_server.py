@@ -135,6 +135,12 @@ class TestDispatchLogic:
 
     def _client(self):
         c = CodexAppServerClient.__new__(CodexAppServerClient)
+        # This transport-only fixture has never started or retired a process.
+        # Keep the production failed-startup cache fence in its initial state.
+        c._close_task = None
+        c._startup_retryable = False
+        c._explicitly_closed = False
+        c._proc = None
         c._pending = {}
         c._turn_sinks = {}
         c._server_request_handlers = {}

@@ -408,4 +408,3 @@ async def test_baseline_scores_only_the_questions_it_answers() -> None:
         timeout_seconds=5, concurrency=1, target_accuracy=0.9)
     assert report.expected_keys == ["block", "concern"]
     assert {m.key for m in report.metrics} == {"block", "concern"}
-

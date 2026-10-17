@@ -573,6 +573,9 @@ def test_the_session_pre_pin_leaves_nothing_for_a_dotenv_load_to_fill(
             "KESTREL_OPERATOR_API_KEY": "kept",
         },
     )
+    # The outer credential-free gate disables dotenv globally. This test owns
+    # an exact synthetic file and must exercise its explicit load, not a no-op.
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
     load_dotenv(env_file, override=False)
 
     assert {name: os.environ[name] for name in paths.RUNTIME_PATH_ENV_NAMES} == pinned

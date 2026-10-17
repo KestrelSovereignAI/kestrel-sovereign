@@ -13,28 +13,30 @@ This is the primary API for working with A2A tasks.
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, AsyncGenerator, Callable, Coroutine, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Callable,
+    Coroutine,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
+from uuid import uuid4
 
-from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
-
-from kestrel_sovereign.a2a.types import (
-    Task,
-    TaskState,
-    TaskStatus,
-    TaskSendParams,
-    Message,
-    TextPart,
-    Artifact,
-    TaskStatusUpdateEvent,
-    TaskArtifactUpdateEvent,
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    raise_owned_outcome,
 )
 from kestrel_sovereign.a2a.agent_card import AgentCard
 from kestrel_sovereign.a2a.stores import (
-    TaskStore,
-    SessionService,
+    FeedbackStore,
     MemoryService,
     ObservabilityStore,
-    FeedbackStore,
+    SessionService,
+    TaskStore,
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskCancellationSnapshot,
@@ -42,13 +44,22 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskMutationAuthorizationError,
     without_reserved_cancellation_receipt,
 )
-from typing import Protocol, runtime_checkable, TYPE_CHECKING
-from uuid import uuid4
-
-from kestrel_sovereign._async_ownership import (
-    await_owned_task,
-    raise_owned_outcome,
+from kestrel_sovereign.a2a.types import (
+    Artifact,
+    Message,
+    Task,
+    TaskArtifactUpdateEvent,
+    TaskSendParams,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+    TextPart,
 )
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
+from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks import HooksManager
@@ -171,6 +182,9 @@ class TaskManager:
         self._execution_authorities: dict[
             asyncio.Task[None], tuple[str, str]
         ] = {}
+        # Completed children must not disappear with an unresolved receipt.
+        # Retirement joins physical owners but does not reconcile that receipt.
+        self._execution_control: BaseException | None = None
 
     async def initialize(self) -> None:
         """Initialize all stores."""
@@ -198,7 +212,13 @@ class TaskManager:
             asyncio.CancelledError: The caller was cancelled. The stores not
                 yet closed stay open for a later call.
         """
-        await self.drain_execution_tasks(cancel=True)
+        failures: list[tuple[str, BaseException]] = []
+        try:
+            await self.drain_execution_tasks(cancel=True)
+        except BaseException as error:
+            if not is_execution_control_error(error):
+                raise
+            failures.append(("execution_tasks", error))
 
         # Close all stores in reverse order of initialization
         stores = (
@@ -208,21 +228,27 @@ class TaskManager:
             ("session_service", self.session_service),
             ("task_store", self.task_store),
         )
-        failures: list[tuple[str, Exception]] = []
         for name, store in stores:
             if store is None:
                 continue
             try:
-                await store.close()
-            except Exception as e:
+                outcome = await await_owned_task(create_owned_task(store.close()))
+                error = execution_terminal_error(outcome.error, outcome.cancellation)
+                if error is not None:
+                    raise error
+            except BaseException as e:
+                if not isinstance(e, (Exception, asyncio.CancelledError)) and not is_execution_control_error(e):
+                    raise
                 logger.warning("Error closing %s: %s", name, e, exc_info=True)
                 failures.append((name, e))
 
         if failures:
-            first_name, first = failures[0]
+            first = execution_terminal_error(*(error for _, error in failures))
+            first_name = next(name for name, error in failures if error is first)
             first.add_note(f"TaskManager could not close {first_name}")
-            for name, error in failures[1:]:
-                first.add_note(f"TaskManager could not close {name} either: {error}")
+            for name, error in failures:
+                if error is not first:
+                    first.add_note(f"TaskManager could not close {name} either: {error}")
             raise first
 
         logger.info("TaskManager closed all stores")
@@ -442,6 +468,8 @@ class TaskManager:
                             expected_state=expected_state,
                         )
                 except Exception as save_err:
+                    if is_execution_control_error(save_err):
+                        raise
                     logger.error(
                         f"Failed to save task outcome {task.id}: {save_err}. "
                         "Retrying outside transaction..."
@@ -453,6 +481,8 @@ class TaskManager:
                             expected_state=expected_state,
                         )
                     except Exception as retry_err:
+                        if is_execution_control_error(retry_err):
+                            raise
                         logger.critical(
                             f"Task outcome {task.id} failed to save permanently: {retry_err}. "
                             f"Result lost for skill={skill_id}, agent={agent_id}"
@@ -491,25 +521,30 @@ class TaskManager:
         authority_agent_id: str,
     ) -> asyncio.Task[None]:
         """Own background task execution so close() can cancel and await it."""
-        task = asyncio.create_task(coro, name=f"a2a-task-{task_id}")
+        task = create_owned_task(coro, name=f"a2a-task-{task_id}")
         self._execution_tasks.add(task)
         self._execution_authorities[task] = (task_id, authority_agent_id)
 
         def _discard(done: asyncio.Task[None]) -> None:
+            from kestrel_sovereign._async_ownership import owned_task_error
+            error = owned_task_error(done)
+            if error is not None and is_execution_control_error(error):
+                self._remember_execution_control(error)
             self._execution_tasks.discard(done)
             self._execution_authorities.pop(done, None)
 
         task.add_done_callback(_discard)
         return task
 
+    def _remember_execution_control(self, error: BaseException) -> None:
+        if is_execution_control_error(error):
+            self._execution_control = execution_terminal_error(self._execution_control, error)
+
     async def drain_execution_tasks(self, *, cancel: bool = False) -> None:
         """Wait for tracked background executions, optionally cancelling them."""
         tasks = set(self._execution_tasks)
-        if not tasks:
-            return
-
+        terminal_errors: list[BaseException] = []
         if cancel:
-            caller_cancelled = False
             for task in tasks:
                 binding = self._execution_authorities.get(task)
                 if binding is not None:
@@ -520,11 +555,15 @@ class TaskManager:
                             reason="Task canceled during shutdown",
                             agent_name=authority_agent_id,
                         )
-                    except ValueError:
-                        pass
-                    except asyncio.CancelledError:
-                        caller_cancelled = True
-                    except Exception:
+                    except ValueError as error:
+                        self._remember_execution_control(error)
+                    except asyncio.CancelledError as cancellation:
+                        self._remember_execution_control(cancellation)
+                        terminal_errors.append(cancellation)
+                    except BaseException as error:
+                        self._remember_execution_control(error)
+                        if not isinstance(error, Exception) and not is_execution_control_error(error):
+                            terminal_errors.append(error)
                         # Shutdown must still stop the in-memory worker when its
                         # durable receipt cannot be persisted. The backend error
                         # is observable in logs, but cannot strand the worker or
@@ -538,10 +577,18 @@ class TaskManager:
                 else:
                     task.cancel()
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            result = await await_owned_task(task)
+            if result.error is not None:
+                self._remember_execution_control(result.error)
+            if result.cancellation is not None:
+                terminal_errors.append(result.cancellation)
         self._execution_tasks.difference_update(tasks)
-        if cancel and caller_cancelled:
-            raise asyncio.CancelledError()
+        terminal = execution_terminal_error(
+            self._execution_control, *terminal_errors,
+        )
+        if terminal is not None:
+            raise terminal
 
     @staticmethod
     def _cancellation_reason(task: Task) -> str:
@@ -568,7 +615,9 @@ class TaskManager:
                 agent_name=authority_agent_id,
                 task_payload=task,
             )
-        except ValueError:
+        except ValueError as cancellation_error:
+            if is_execution_control_error(cancellation_error):
+                raise
             current = await self.task_store.get_for_recipient(
                 task.id,
                 authority_agent_id,
@@ -602,19 +651,25 @@ class TaskManager:
                     final=task.status.state
                     in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED},
                 )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            if is_execution_control_error(cancellation):
+                raise
             try:
                 await self.cancel_task(
                     task.id,
                     reason="Task canceled during shutdown",
                     agent_name=authority_agent_id,
                 )
-            except ValueError:
+            except ValueError as cancellation_error:
+                if is_execution_control_error(cancellation_error):
+                    raise
                 # An independently authorized cancellation or other terminal
                 # result won the race. Never narrate over that durable state.
                 pass
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Async task execution failed: {e}")
             task.status = TaskStatus(
                 state=TaskState.FAILED,
@@ -663,6 +718,13 @@ class TaskManager:
                 terminal_operation_id=terminal_operation_id,
             )
         except Exception as save_error:
+            if is_execution_control_error(save_error):
+                raise
+            # Authority/uncertain-COMMIT control is not an ordinary transport
+            # failure. A matching terminal token cannot authorize a retired
+            # execution to claim a completion wake or start new readback work.
+            if is_execution_control_error(save_error):
+                raise
             # PostgreSQL can commit and then lose the COMMIT acknowledgement.
             # Reconcile the recipient-scoped canonical row before treating the
             # exception as a failed write: the private per-attempt token proves
@@ -683,7 +745,9 @@ class TaskManager:
             except asyncio.CancelledError:
                 raise
             except Exception as reconciliation_error:
-                raise save_error from reconciliation_error
+                if is_execution_control_error(reconciliation_error):
+                    raise
+                raise execution_terminal_error(save_error, reconciliation_error)
             if committed_operation_id != terminal_operation_id:
                 raise
 
@@ -699,7 +763,9 @@ class TaskManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as reconciliation_error:
+                if is_execution_control_error(reconciliation_error):
+                    raise
                 logger.warning(
                     "Task %s terminal commit was proven by operation token but "
                     "its canonical payload could not be reread; emitting the "
@@ -910,6 +976,8 @@ class TaskManager:
             return {"success": True, "result": "Task completed"}
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Command execution failed: {e}")
             return {"success": False, "error": str(e)}
 
@@ -977,6 +1045,8 @@ class TaskManager:
             try:
                 chain = self._causation_chain_provider()
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "causation_chain_provider raised; proceeding "
                     "without chain metadata: %s", e,
@@ -1023,6 +1093,8 @@ class TaskManager:
             try:
                 self._on_task_submitted(task)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "on_task_submitted callback failed for %s: %s",
                     task.id, e, exc_info=True,
@@ -1049,7 +1121,9 @@ class TaskManager:
                     "parts": [p.model_dump() for p in params.message.parts],
                 },
             )
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             logger.warning(
                 "Task %s was created but its session projection failed",
                 task.id,
@@ -1063,7 +1137,9 @@ class TaskManager:
                 session_id=params.sessionId,
                 metadata={"task_id": task.id},
             )
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             logger.warning(
                 "Task %s was created but observability logging failed",
                 task.id,
@@ -1090,7 +1166,9 @@ class TaskManager:
                 operation="A2A task creation canonical readback",
             )
             canonical_read_succeeded = canonical is not None
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as readback_error:
+            if is_execution_control_error(readback_error):
+                raise
             canonical = None
             logger.warning(
                 "Task %s was accepted but its canonical readback failed",
@@ -1460,7 +1538,7 @@ class TaskManager:
             except BaseException as reconciliation_failure:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
-                raise error from reconciliation_failure
+                raise execution_terminal_error(error, reconciliation_failure)
             if not committed_here:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
@@ -1505,26 +1583,34 @@ class TaskManager:
                 f"Agent {agent_name!r} is not authorized to cancel task {task_id!r}"
             )
 
-        receipt = (task.metadata or {}).get("cancellation_receipt") or {}
-        previous_state = receipt.get("status_before")
-        if self._on_task_cancelled is not None:
-            try:
-                self._on_task_cancelled(task)
-            except Exception as exc:
-                logger.warning(
-                    "on_task_cancelled callback failed for %s: %s",
-                    task.id,
-                    exc,
-                    exc_info=True,
-                )
-        await self._finish_status_projection(
-            task,
-            old_state=str(previous_state or TaskState.UNKNOWN.value),
-            new_state=TaskState.CANCELED,
-            agent_name=agent_name,
-            is_final=True,
-            reason=reason,
-        )
+        try:
+            receipt = (task.metadata or {}).get("cancellation_receipt") or {}
+            previous_state = receipt.get("status_before")
+            if self._on_task_cancelled is not None:
+                try:
+                    self._on_task_cancelled(task)
+                except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
+                    logger.warning(
+                        "on_task_cancelled callback failed for %s: %s",
+                        task.id,
+                        exc,
+                        exc_info=True,
+                    )
+            await self._finish_status_projection(
+                task,
+                old_state=str(previous_state or TaskState.UNKNOWN.value),
+                new_state=TaskState.CANCELED,
+                agent_name=agent_name,
+                is_final=True,
+                reason=reason,
+            )
+        except BaseException as projection_failure:
+            # Exact actor/operation readback proves which CAS committed, not
+            # that its UNKNOWN transport outcome may be discarded. Retain the
+            # FIRST native receipt through every later callback/projection.
+            raise execution_terminal_error(store_failure, projection_failure, retain_originals=True)
 
         logger.info(
             "Task %s canceled by %s: %s -> %s",
@@ -1549,7 +1635,7 @@ class TaskManager:
     ) -> None:
         """Join post-commit projections before propagating caller cancellation."""
 
-        projection = asyncio.create_task(
+        projection = create_owned_task(
             self._project_status_transition(
                 task,
                 old_state=old_state,
@@ -1610,7 +1696,9 @@ class TaskManager:
                     session_id=task.sessionId,
                     metadata={"task_id": task_id},
                 )
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 logger.warning(
                     "Task %s failed durably but failure observability logging failed",
                     task_id,
@@ -1697,7 +1785,9 @@ class TaskManager:
                     event_type="status_update",
                     data=event_data,
                 )
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 logger.warning(
                     "Task %s transitioned durably but its session projection failed",
                     task.id,
@@ -1718,7 +1808,9 @@ class TaskManager:
                     session_id=task.sessionId,
                     metadata=metadata,
                 )
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 logger.warning(
                     "Task %s transitioned durably but observability logging failed",
                     task.id,
@@ -1727,7 +1819,9 @@ class TaskManager:
 
         try:
             await self._notify_status_update(task, final=is_final)
-        except Exception:
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
             logger.warning(
                 "Task %s transitioned durably but subscriber notification failed",
                 task.id,
@@ -1736,7 +1830,9 @@ class TaskManager:
         if is_final and self.memory_service and task.sessionId:
             try:
                 await self._save_to_memory(task)
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
                 logger.warning(
                     "Task %s transitioned durably but memory recording failed",
                     task.id,
@@ -1862,6 +1958,8 @@ class TaskManager:
             try:
                 self._on_task_complete(task)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Task completion callback error: {e}")
 
         # Notify SSE subscribers
@@ -1964,11 +2062,11 @@ async def create_task_manager(
         Initialized TaskManager
     """
     from kestrel_sovereign.a2a.stores import (
-        SQLiteTaskStore,
-        SQLiteSessionService,
-        SQLiteObservabilityStore,
-        SQLiteMemoryService,
         SQLiteFeedbackStore,
+        SQLiteMemoryService,
+        SQLiteObservabilityStore,
+        SQLiteSessionService,
+        SQLiteTaskStore,
     )
 
     task_store = SQLiteTaskStore(db_path)

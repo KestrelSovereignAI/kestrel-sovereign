@@ -21,20 +21,36 @@ import time
 from contextlib import aclosing, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import (
-    Any, AsyncIterator, Awaitable, Callable, Dict, Iterator, List, Mapping,
-    Optional, Tuple, TypeVar, Union,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
 )
+
+from kestrel_sdk.hooks.base import HookEvent, HookInput
+from kestrel_sdk.llm import ToolCallStarted
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
+    create_owned_task,
+    gather_owned,
     raise_owned_outcome,
 )
-from kestrel_sdk.hooks.base import HookEvent, HookInput
-from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
     ToolDispatchEntry,
     infer_tool_result_status,
     tool_result_size_bytes,
+)
+from kestrel_sovereign.agent.direct_tool_arguments import (
+    normalize_direct_tool_arguments,
 )
 from kestrel_sovereign.llm.adapter import (
     LLMResponse,
@@ -57,7 +73,12 @@ from kestrel_sovereign.turn_completion import (
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
-from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sovereign.agent.invocation import (
+    current_invocation_effect_checkpoint,
+    current_invocation_id,
+    mark_current_invocation_effect_completed,
+)
+
 # Re-use streaming.py's in-band sentinel builders for follow-up
 # ToolCallStarted events so the chat UI's revise-on-tool semantic
 # applies uniformly to first-level AND multi-iteration tool calls
@@ -69,27 +90,22 @@ from kestrel_sovereign.agent.parts import (
     drain_parts,
     sanitize_part,
 )
-from kestrel_sovereign.agent.invocation import (
-    current_invocation_effect_checkpoint,
-    current_invocation_id,
-    mark_current_invocation_effect_completed,
-)
-from kestrel_sovereign.storage.privacy_wrapper import (
-    held_transition_reentry_token,
-)
-from kestrel_sovereign.turn_scope import capture_turn_scope
 from kestrel_sovereign.agent.streaming import (
-    _DeferredToolBatchCancellation,
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
-    _build_revise_sentinel,
-    _build_tool_sentinel,
-    _stopped_generation,
     INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT,
     STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+    _build_revise_sentinel,
+    _build_tool_sentinel,
+    _DeferredToolBatchCancellation,
+    _stopped_generation,
 )
-from kestrel_sovereign.agent.direct_tool_arguments import (
-    normalize_direct_tool_arguments,
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    execution_terminal_error,
+    is_execution_control_error,
+    require_execution_work,
 )
+from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.agent.tool_allowlist import (
     ToolCallContext,
     allowlist_evidence,
@@ -103,6 +119,9 @@ from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_VALIDATION,
     record_tool_rejection,
 )
+from kestrel_sovereign.storage.privacy_wrapper import (
+    held_transition_reentry_token,
+)
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -113,6 +132,7 @@ from kestrel_sovereign.telemetry import (
     # signal-dispatch spans that stamp the same value (#2940).
     real_session_id,
 )
+from kestrel_sovereign.turn_scope import capture_turn_scope
 
 # These constants are also defined in kestrel_agent.py — import from there at
 # runtime so that env-var overrides are respected.  The mixin accesses them via
@@ -329,6 +349,13 @@ class LLMCallWatchdog:
         """Await the non-streaming call ``pending``, bounding its silence."""
         return await self._bounded(pending)
 
+    def _owns_current_source(self) -> bool:
+        from kestrel_sovereign._async_ownership import owned_iterator_parent_tasks
+        return (
+            asyncio.current_task() is self._owner
+            or self._owner in owned_iterator_parent_tasks()
+        )
+
     async def _bounded(self, pending: Awaitable[_T]) -> _T:
         self._owner = asyncio.current_task()
         deadline = asyncio.timeout(None)
@@ -368,7 +395,7 @@ class LLMCallWatchdog:
     ) -> AsyncIterator[Any]:
         """``stream``, a streamed attempt at candidate ``route``, its time to
         its first item and each wait between items bounded by the route."""
-        if asyncio.current_task() is not self._owner:
+        if not self._owns_current_source():
             # Not this call's attempt: an inline tool's own model call, on
             # the task its transport runs the tool on.
             return stream
@@ -385,7 +412,7 @@ class LLMCallWatchdog:
     ) -> _T:
         """Await ``pending``, a non-streaming attempt at candidate ``route``,
         bounding its silence by the route."""
-        if asyncio.current_task() is not self._owner:
+        if not self._owns_current_source():
             return await pending
         return await self._bounded_attempt(
             pending, self.attempt_timeout(route),
@@ -1069,7 +1096,10 @@ class OrchestratorEngineMixin:
         # executions — a telemetry-layer ``agent.tool_execution`` span would
         # double-instrument the call and root as the ``unknown`` agent.
         exec_start = time.time()
+        require_execution_work(self)
         result = await execute_fn(args)
+        mark_current_invocation_effect_completed(session_id)
+        require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
 
         # #2641: envelope-carried parts → this turn's collector, BEFORE the
@@ -1093,7 +1123,7 @@ class OrchestratorEngineMixin:
             HookEvent.POST_TOOL_USE,
             post_hook_input,
         )
-
+        require_execution_work(self)
         return result
 
     async def _generate_with_messages_bounded(
@@ -1176,15 +1206,18 @@ class OrchestratorEngineMixin:
         if state is not None and state.completed and not state.checkpointed:
             request_id = current_invocation_id()
             stopped = _stopped_generation(self, request_id) is not None
-            await OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint(
-                self,
-                session_id=session_id or state.session_id,
-                request_id=request_id,
-                checkpoint=(
-                    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT if stopped
-                    else INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT
-                ),
-            )
+            try:
+                await OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint(
+                    self,
+                    session_id=session_id or state.session_id,
+                    request_id=request_id,
+                    checkpoint=(
+                        STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT if stopped
+                        else INCOMPLETE_GENERATION_TOOL_BATCH_CHECKPOINT
+                    ),
+                )
+            except BaseException as checkpoint_error:
+                raise execution_terminal_error(error, checkpoint_error)
         return failure
 
     def _make_inline_tool_executor(
@@ -1237,6 +1270,7 @@ class OrchestratorEngineMixin:
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
                 )
+                require_execution_work(self)
             # The Codex reader owns this callback on an old task context.  Pass
             # the turn's captured mutable state explicitly: a ContextVar lookup
             # here would see the reader's stale pre-turn snapshot.
@@ -1691,7 +1725,10 @@ class OrchestratorEngineMixin:
         # OpenInference TOOL span is the one source of truth for tool
         # executions.
         exec_start = time.time()
+        require_execution_work(self)
         result = await found_tool.execute(**effective_args)
+        mark_current_invocation_effect_completed(session_id)
+        require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
         # #2641: envelope-carried parts → the owning turn's collector. The
         # codex inline executor wraps this call in ``bind_part_collector``, so
@@ -1714,7 +1751,7 @@ class OrchestratorEngineMixin:
         await self.hooks_manager.execute_hooks_parallel(
             HookEvent.POST_TOOL_USE, post_input,
         )
-
+        require_execution_work(self)
         return result
 
     def _resolve_named_tool(self, tool_name: str) -> tuple[Any, Any]:
@@ -1923,6 +1960,7 @@ class OrchestratorEngineMixin:
         # that kills the whole stream. POST_SUBAGENT_CALL still fires
         # on the failure path so observability/audit hooks see every
         # dispatch outcome.
+        require_execution_work(self)
         try:
             with optional_span("agent.feature_dispatch", {
                 OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
@@ -1944,7 +1982,13 @@ class OrchestratorEngineMixin:
                 result = await feature.execute_as_subagent(
                     task=task, context=context, denied_tools=denied_tools,
                 )
+                mark_current_invocation_effect_completed(session_id)
+                require_execution_work(self)
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:  # noqa: BLE001 — boundary catch is the contract
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s",
                 source, feature_name, e, exc_info=True,
@@ -1992,7 +2036,7 @@ class OrchestratorEngineMixin:
             feature_name=feature_name, effective_args=effective_args,
             result=result, exec_duration_ms=exec_duration_ms,
         )
-
+        require_execution_work(self)
         return result
 
     async def _fire_post_subagent_hook(
@@ -2042,6 +2086,8 @@ class OrchestratorEngineMixin:
                 "tools": tools,
             })
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Never let event emission break the tool execution path
             logging.warning(
                 "Failed to emit tools_updated event for session %s: %s",
@@ -2451,6 +2497,8 @@ class OrchestratorEngineMixin:
                 )
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             print(f"a2a_tool_dispatches dispatch wrapper failed: {exc}", file=sys.stderr)
 
     async def _dispatch_feature_tool(
@@ -2576,18 +2624,25 @@ class OrchestratorEngineMixin:
             await self.hooks_manager.execute_hooks_parallel(
                 HookEvent.POST_SUBAGENT_CALL, post_hook_input
             )
+            require_execution_work(self)
 
             if streaming and tool_events is not None:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
 
+        except ExecutionAuthorityError:
+            raise
         except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
+            if is_execution_control_error(e):
+                raise
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
                 session_id=session_id, dispatch_meta=dispatch_meta,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
@@ -2636,7 +2691,10 @@ class OrchestratorEngineMixin:
             if not store or not callable(getattr(store, "get_permission", None)):
                 return set()
 
-            from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+            from kestrel_sovereign.features.security.permissions import (
+                PermissionLevel,
+                PermissionStore,
+            )
             if not isinstance(store, PermissionStore):
                 return set()
 
@@ -2657,7 +2715,11 @@ class OrchestratorEngineMixin:
                     denied.add(tool_obj.name)
 
             return denied
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.debug(f"[SECURITY] Could not check denied tools: {e}")
             return set()
 
@@ -2794,6 +2856,8 @@ class OrchestratorEngineMixin:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
             return await _failed(
                 str(e),
@@ -2949,15 +3013,18 @@ class OrchestratorEngineMixin:
                             effective_model=em,
                         )
 
-                await asyncio.gather(
-                    *[
+                await gather_owned(
+                    (
                         _run_one(
                             tc,
                             per_tool_messages[i],
                             per_tool_results[i] if per_tool_results is not None else None,
                         )
                         for i, tc in enumerate(batch_tcs)
-                    ]
+                    ),
+                    retain_originals=True,
+                    isolate_control_originals=True,
+                    name_prefix="orchestrator-parallel-tool",
                 )
 
                 # Append results in original request order
@@ -3019,10 +3086,11 @@ class OrchestratorEngineMixin:
         )
         if callable(delegate_lock_ownership):
             delegate_lock_ownership(batch_context)
-        owner = asyncio.create_task(
+        owner = create_owned_task(
             run_owned_batch(),
             name="orchestrator-tool-batch",
             context=batch_context,
+            retain_originals=True,
         )
         tool_results = kwargs.get("tool_results")
         result_count = len(tool_results) if isinstance(tool_results, list) else None
@@ -3037,6 +3105,7 @@ class OrchestratorEngineMixin:
         return raise_owned_outcome(
             outcome,
             operation="side-effecting orchestrator tool batch",
+            retain_originals=True,
         )
 
     # ------------------------------------------------------------------
@@ -3169,10 +3238,13 @@ class OrchestratorEngineMixin:
                 or (state is not None and state.checkpointed)
             )
             if (had_inline_effect or captured_results) and not already_checkpointed:
-                await self._persist_completed_tool_stop_checkpoint(
-                    session_id=session_id,
-                    request_id=current_invocation_id(),
-                )
+                try:
+                    await self._persist_completed_tool_stop_checkpoint(
+                        session_id=session_id,
+                        request_id=current_invocation_id(),
+                    )
+                except BaseException as checkpoint_error:
+                    raise execution_terminal_error(error, checkpoint_error)
                 if state is not None:
                     state.checkpointed = True
                 setattr(error, "_kestrel_completed_effect_checkpointed", True)
@@ -3292,10 +3364,7 @@ class OrchestratorEngineMixin:
                 defer_cancellation_to_persistence=True,
             )
             if isinstance(batch_result, _DeferredToolBatchCancellation):
-                raise_owned_outcome(
-                    batch_result.outcome,
-                    operation="side-effecting orchestrator tool batch",
-                )
+                batch_result.raise_outcome()
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
@@ -3409,6 +3478,8 @@ class OrchestratorEngineMixin:
             try:
                 qualified = (selection() or {}).get("model")
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logging.debug(
                     "[ORCHESTRATOR] get_active_model_selection failed (%s); "
                     "falling back to get_active_model_id.", exc,
@@ -3421,6 +3492,8 @@ class OrchestratorEngineMixin:
             try:
                 resolved = active()
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 logging.warning(
                     "[ORCHESTRATOR] Could not resolve the active model for "
                     "continuation pruning (%s).", exc,
@@ -3476,6 +3549,8 @@ class OrchestratorEngineMixin:
                 if limit:
                     return int(limit)
             except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
                 # Never silently substitute a window we can't justify — say
                 # which model failed to resolve and that the default is a guess.
                 logging.warning(
@@ -3781,7 +3856,8 @@ class OrchestratorEngineMixin:
                 # captured cancellation to StreamingMixin without emitting any
                 # more client-visible bytes; it re-raises only after durable
                 # conversation history contains the completed result.
-                yield batch_result
+                with batch_result.handoff():
+                    yield batch_result
                 return
             _parts_by_event_index: dict = {}
             for _evt_idx, _evt_parts in part_emit_buffer:

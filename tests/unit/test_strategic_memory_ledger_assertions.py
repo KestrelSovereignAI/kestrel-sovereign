@@ -602,6 +602,33 @@ async def test_a_ledger_larger_than_one_read_page_projects_in_one_pass(
 
 
 @pytest.mark.asyncio
+async def test_dependency_plan_does_not_reparse_unrelated_direct_facts(
+    governed, ledger, monkeypatch
+):
+    """Canonical direct rows ground IDs; only inferred mappings need planning."""
+    storage, raw, _ = governed
+    for index in range(8):
+        ledger.add_pattern(f"unrelated direct pattern {index}", source="bounded-test")
+    ledger.normalize()
+    await project(storage, ledger)
+    facts = await active(storage)
+    assert len(facts) == 8
+    parsed = []
+    original = Assertion.from_mapping
+
+    def from_mapping(cls, mapping):
+        parsed.append(mapping["revision_id"])
+        return original(mapping)
+
+    monkeypatch.setattr(Assertion, "from_mapping", classmethod(from_mapping))
+    result = await raw._assertion_store()._plan_dependent_current_revisions(
+        [facts[0].revision_id]
+    )
+    assert result == ([], ())
+    assert parsed == [], "dependency planning reparsed unrelated canonical direct facts"
+
+
+@pytest.mark.asyncio
 async def test_paging_survives_tombstones_filling_whole_pages(governed, ledger):
     """Retired rows keep occupying cursor positions, so the read must page past them.
 

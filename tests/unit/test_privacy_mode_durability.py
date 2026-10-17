@@ -77,6 +77,7 @@ async def _booted_agent(tmp_path, *, before_initialize=None):
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
     identity_dir = tmp_path / "identity"
     did_file = tmp_path / "did.txt"
@@ -101,11 +102,19 @@ async def _booted_agent(tmp_path, *, before_initialize=None):
         did=did,
         storage_path=os.path.join(str(identity_dir), "kestrel_prime.db"),
         llm_service=llm_service,
+        # Persistence/privacy boot is the subject, not the optional feature
+        # catalog. Keep every mandatory sovereignty feature but do not load
+        # unrelated workers into the five-second shutdown fair-share budget.
+        allowed_features=set(),
+        sync_enabled=False,
     )
     try:
         if before_initialize is not None:
             await before_initialize(agent)
         await agent.initialize()
+        assert {
+            type(feature).__name__ for feature in agent.features.values()
+        } == MANDATORY_FEATURES
         yield agent
     finally:
         await agent.shutdown()

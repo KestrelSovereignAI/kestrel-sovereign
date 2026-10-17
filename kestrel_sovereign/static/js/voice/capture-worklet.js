@@ -12,7 +12,8 @@
  * Messaging contract:
  *   main → worklet:  { type: 'configure', targetSampleRate }
  *   main → worklet:  { type: 'pause' }  |  { type: 'resume' }
- *   worklet → main:  { type: 'chunk', pcm: ArrayBuffer, level: Number }
+ *   main → worklet:  { type: 'reset', generation } // explicit input boundary
+ *   worklet → main:  { type: 'chunk', generation, pcm: ArrayBuffer, level: Number }
  *
  * `level` is the peak sample magnitude in this frame, normalized to 0..1.
  */
@@ -26,6 +27,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this._targetRate = 24000;
     this._ratio = this._inputRate / this._targetRate;
     this._paused = false;
+    this._generation = 0;
 
     // Accumulator for fractional-sample resampling: keeps the fractional
     // offset across frames so we don't drift over time.
@@ -48,6 +50,11 @@ class CaptureProcessor extends AudioWorkletProcessor {
         this._paused = true;
       } else if (msg.type === 'resume') {
         this._paused = false;
+      } else if (msg.type === 'reset') {
+        if (!Number.isSafeInteger(msg.generation) || msg.generation <= this._generation) return;
+        this._generation = msg.generation;
+        this._resampleFrac = 0;
+        this._outWrite = 0;
       }
     };
   }
@@ -83,7 +90,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
         // Ship a complete frame.
         const out = new Int16Array(this._outBuffer); // copy
         this.port.postMessage(
-          { type: 'chunk', pcm: out.buffer, level: peak },
+          { type: 'chunk', generation: this._generation, pcm: out.buffer, level: peak },
           [out.buffer],
         );
         this._outWrite = 0;

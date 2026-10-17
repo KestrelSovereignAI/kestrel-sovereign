@@ -645,10 +645,11 @@ class TestAllToolsReachCodexHandler:
 
         def _spy_make_handler(executor, thread_id, allowed_tools,
                               executed_log=None, tool_aliases=None,
-                              active_handlers=None):
+                              active_handlers=None, terminal_errors=None):
             captured["allowed_tools"] = set(allowed_tools)
             return orig_register(executor, thread_id, allowed_tools,
-                                 executed_log, tool_aliases, active_handlers)
+                                 executed_log, tool_aliases, active_handlers,
+                                 terminal_errors)
 
         adapter._make_tool_call_handler = _spy_make_handler
 

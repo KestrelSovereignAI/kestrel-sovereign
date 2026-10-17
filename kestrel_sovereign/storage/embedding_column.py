@@ -32,6 +32,8 @@ import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 if TYPE_CHECKING:
     from .async_database import AsyncDatabase
 
@@ -127,6 +129,8 @@ async def ensure_embedding_vec_column(
                     f"ALTER TABLE {table} ADD COLUMN {CANONICAL_COLUMN} BLOB", ()
                 )
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         # Another connection may have added it first (SQLite has no
         # ``ADD COLUMN IF NOT EXISTS``).
         if await db.column_exists(table, CANONICAL_COLUMN):
@@ -154,6 +158,8 @@ async def ensure_embedding_vec_column(
                     (),
                 )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Could not create the HNSW index on %s.%s: %s. kNN search "
                 "still works, without the index.",

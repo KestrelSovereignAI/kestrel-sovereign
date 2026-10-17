@@ -31,6 +31,13 @@ POSTGRES_URL = "postgresql://unused/usage"
 @pytest.fixture(autouse=True)
 def _clear_usage_env(monkeypatch):
     """Usage-DB selection reads these; a developer's environment must not decide."""
+    from kestrel_sovereign.storage.db import sqlite
+
+    # These tests assert connection sharing/ownership, not the one-second
+    # physical-retirement deadline. A busy xdist worker can delay an otherwise
+    # successful real close beyond that incidental default. Keep a finite local
+    # test budget; native close/debt deadline tests and production are unchanged.
+    monkeypatch.setattr(sqlite, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", 10.0)
     for var in ("KESTREL_DB_PATH", "KESTREL_DATABASE_URL", "DATABASE_URL"):
         monkeypatch.delenv(var, raising=False)
 

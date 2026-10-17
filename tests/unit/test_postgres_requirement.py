@@ -10,6 +10,9 @@ guard turns a skipped PostgreSQL case into a failure.
 from __future__ import annotations
 
 from types import SimpleNamespace
+import os
+import subprocess
+import sys
 
 import pytest
 import yaml
@@ -111,6 +114,52 @@ def test_an_unparametrized_skip_is_left_alone(required):
     assert report.outcome == "skipped"
 
 
+def test_native_fixture_dependency_is_a_required_postgres_case(required):
+    # fixturenames is pytest's resolved graph, including indirect dependencies.
+    item = SimpleNamespace(fixturenames=["request", "native_pg", "consumer"])
+    report = _skipped("native PostgreSQL unavailable")
+    guard.fail_skipped_postgres_case(item, report)
+    assert report.outcome == "failed", "native fixture skip escaped required PostgreSQL gate"
+
+
+@pytest.mark.parametrize(("selection", "count", "status"), [
+    ("native_postgres", 8, 0), ("not native_postgres", 0, 5),
+])
+def test_actual_native_consumers_are_marked_before_deselection(tmp_path, selection, count, status):
+    root = CI_WORKFLOW.parents[2]
+    # A real collection observer consumes the same resolved items before normal
+    # marker deselection. Marking cannot rely on today's incidental ordering of
+    # equal-priority plugins; other first-priority consumers must also see it.
+    (tmp_path / "native_collection_observer.py").write_text(
+        "import pytest\n"
+        "@pytest.hookimpl(tryfirst=True)\n"
+        "def pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n"
+        "        if 'native_pg' in item.fixturenames:\n"
+        "            assert item.get_closest_marker('native_postgres'), "
+        "'native marker was not available to first-priority collection consumers'\n"
+        "def pytest_collection_finish(session):\n"
+        "    print('NATIVE_SELECTED_COUNT=' + str(len(session.items)))\n"
+    )
+    env = {key: os.environ[key] for key in ("HOME", "PATH", "SYSTEMROOT") if key in os.environ}
+    env.update(PYTHONPATH=os.pathsep.join((str(root), str(tmp_path))), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+               PYTHON_DOTENV_DISABLED="1", KESTREL_SKIP_DOTENV="1",
+               KESTREL_PHOENIX_ENABLED="0", KESTREL_TRACING_ENABLED="0")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "pytest_asyncio.plugin",
+         "-p", "native_collection_observer", "-o", "addopts=",
+         "tests/integration/test_cognition_terminal_original_admission.py",
+         "--collect-only", "-q", "-m", selection],
+        cwd=root, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == status, result.stdout + result.stderr
+    # Human warnings can begin with tests/integration/path.py:line too. Read
+    # the actual post-deselection session count, never those display lines.
+    selected = [line.removeprefix("NATIVE_SELECTED_COUNT=") for line in result.stdout.splitlines()
+                if line.startswith("NATIVE_SELECTED_COUNT=")]
+    assert selected == [str(count)], "native fixture consumers were not marked before selection"
+
+
 def test_a_postgres_case_may_still_skip_when_not_required(monkeypatch):
     monkeypatch.delenv(guard.REQUIRE_ENV, raising=False)
     report = _skipped()
@@ -186,6 +235,32 @@ def test_the_unit_step_does_not_move_code_onto_postgres():
     for name in ("DATABASE_URL", "KESTREL_DATABASE_URL"):
         assert name not in env
         assert name not in (_unit_job().get("env") or {})
+
+
+def test_native_ci_requires_the_test_url_and_selects_exactly_one_lane():
+    jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
+    job = jobs["native-postgres-tests"]
+    step, = [step for step in job["steps"] if "pytest tests/integration/" in step.get("run", "")]
+    assert str(step["env"][guard.REQUIRE_ENV]) == "1", "native CI must refuse PostgreSQL skips"
+    service = job["services"]["postgres"]
+    port = str(service["ports"][0]).split(":")[0]
+    assert f"@localhost:{port}/" in step["env"][guard.URL_ENV]
+    assert "pg_isready" in service["options"]
+    assert '-m "native_postgres and ' in step["run"], "dedicated native CI selection lost"
+    ordinary, = [step for step in jobs["integration-tests"]["steps"]
+                 if "pytest tests/integration/" in step.get("run", "")]
+    assert "not native_postgres" in ordinary["run"], "native cases run in both integration lanes"
+    assert job["permissions"] == {"contents": "read"}
+    assert job["needs"] == "lint-and-imports"
+    assert job["if"] == jobs["integration-tests"]["if"]
+    checkout, = [step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@")]
+    assert checkout["with"]["ref"] == "${{ inputs.ref }}"
+    # Same integration per-case ceiling; pytest prints its epilogue before the
+    # step's hard backstop, rather than the runner killing a healthy owner.
+    assert "--session-timeout=2700" in step["run"]
+    assert "--timeout=120" in step["run"]
+    assert step["timeout-minutes"] >= 49
+    assert job["timeout-minutes"] > step["timeout-minutes"]
 
 
 # ---------------------------------------------------------------------------
