@@ -888,7 +888,7 @@ class _LiveFeatureRouter(APIRouter):
         if next(router._iter_low_priority_routes(), None) is not None:
             raise TypeError("Feature frontend() routes must use get_ui_contributions()")
         self.include_router(router)
-        self._binding: tuple[APIRouter, APIRouter] | None = None
+        self._bindings: dict[int, tuple[APIRouter, APIRouter]] = {}
         self._host_app = app
         self._feature_name = feature_name
         self._mount_agent = mount_agent
@@ -912,7 +912,8 @@ class _LiveFeatureRouter(APIRouter):
             self._host_app, scope, self._mount_agent,
             self._feature_name, self._signature,
         )
-        return _live_feature_router(agent, self._feature_name, self._signature)
+        router = _live_feature_router(agent, self._feature_name, self._signature)
+        return (agent, router) if router is not None else None
 
     def matches(self, scope):
         matched = super().matches(scope)
@@ -930,14 +931,22 @@ class _LiveFeatureRouter(APIRouter):
         if current is None:
             await _feature_route_gone_response(scope, receive, send)
             return
-        # Cache only the exact source router. A matching shape alone cannot
-        # justify reusing a closure from a different tenant or a fresh factory.
-        # One slot bounds retained feature instances across tenant/reload churn.
-        if self._binding is None or self._binding[0] is not current:
+        agent, source = current
+        # Keep one native binding per live agent. Alternating tenants reuse
+        # their own handlers; fresh factories still replace their own binding.
+        # Prune withdrawn agents so churn cannot retain an unbounded fleet.
+        agent_key = id(agent)
+        live_keys = {id(current_agent) for current_agent in _iter_current_agents(self._host_app)}
+        live_keys.add(agent_key)
+        for retired in self._bindings.keys() - live_keys:
+            del self._bindings[retired]
+        binding = self._bindings.get(agent_key)
+        if binding is None or binding[0] is not source:
             bound = APIRouter(**self._host_options)
-            bound.include_router(current)
-            self._binding = (current, bound)
-        await self._binding[1].handle(scope, receive, send)
+            bound.include_router(source)
+            binding = (source, bound)
+            self._bindings[agent_key] = binding
+        await binding[1].handle(scope, receive, send)
 
 
 def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
@@ -1496,7 +1505,9 @@ async def _onboard_host_registered_agent(
                     router = feature.get_router()
                 except Exception:
                     continue
-                if router is not None:
+                # An invalid contribution was refused at mount time and
+                # cannot own a shared physical mount during rollback.
+                if isinstance(router, APIRouter):
                     key = _feature_router_signature(feature_name, router)
                     if key in owned_router_keys:
                         shared_router_keys.add(key)

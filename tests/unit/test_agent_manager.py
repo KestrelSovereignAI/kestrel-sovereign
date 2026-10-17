@@ -12878,8 +12878,9 @@ class TestLoadFromConfig:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("router_prefix", ["", "/prefixed"])
+    @pytest.mark.parametrize("valid_peer_router", [True, False])
     async def test_readiness_rollback_removes_only_its_own_host_routes(
-        self, tmp_path, router_prefix,
+        self, tmp_path, router_prefix, valid_peer_router,
     ):
         """A late ready failure cannot erase a later committed registration."""
 
@@ -12912,6 +12913,18 @@ class TestLoadFromConfig:
             "SecondReady": candidate(
                 "did:test:second-ready", "/shared-ready-route"
             ),
+        }
+        if not valid_peer_router:
+            agents["SecondReady"].features["SharedReadyFeature"].get_router = (
+                lambda: SimpleNamespace(routes=[], prefix="")
+            )
+        restored_fields = (
+            "_scoped_policy_required", "_a2a_host_manager", "a2a_did_resolver",
+            "a2a_inbound_sender_authorizer",
+        )
+        prior_agent_fields = {
+            field: vars(agents["FirstReady"])[field]
+            for field in restored_fields if field in vars(agents["FirstReady"])
         }
         manager = AgentManager(base_data_dir=tmp_path)
 
@@ -12960,22 +12973,29 @@ class TestLoadFromConfig:
         assert manager.get_agent("SecondReady") is agents["SecondReady"]
         second_feature = agents["SecondReady"].features["SharedReadyFeature"]
         second_router = second_feature.get_router()
-        assert server._resolve_live_route_agent(
-            app,
-            {"state": {}},
-            agents["FirstReady"],
-            "SharedReadyFeature",
-            server._feature_router_signature("", second_router),
-        ) is agents["SecondReady"]
+        if valid_peer_router:
+            assert server._resolve_live_route_agent(
+                app,
+                {"state": {}},
+                agents["FirstReady"],
+                "SharedReadyFeature",
+                server._feature_router_signature("", second_router),
+            ) is agents["SecondReady"]
         expected_path = f"{router_prefix}/shared-ready-route"
         assert sum(
             route.path == expected_path
             for route in iter_route_contexts(app.routes)
-        ) == 1
+        ) == int(valid_peer_router)
+        assert {
+            field: vars(agents["FirstReady"])[field]
+            for field in restored_fields if field in vars(agents["FirstReady"])
+        } == prior_agent_fields
+        assert app.state.demo_mode is False
         with TestClient(app) as client:
             response = client.get(expected_path)
-        assert response.status_code == 200
-        assert response.json() == {"agent": "did:test:second-ready"}
+        assert response.status_code == (200 if valid_peer_router else 404)
+        if valid_peer_router:
+            assert response.json() == {"agent": "did:test:second-ready"}
 
 
     def test_preflight_reserves_spawn_cap_before_projection(self):

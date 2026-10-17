@@ -1528,29 +1528,44 @@ def test_ungated_frontend_routes_are_rejected_atomically(tmp_path, caplog, neste
     assert "get_ui_contributions" in caplog.text
 
 
-def test_stable_native_router_does_not_rebuild_handlers_per_request(monkeypatch):
-    from kestrel_sovereign import server
+@pytest.mark.parametrize("tenant_count", [1, 2, 3])
+def test_stable_native_router_does_not_rebuild_handlers_per_request(monkeypatch, tenant_count):
     from fastapi.routing import APIRoute
 
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+
     events = []
-    feature = _DependencyBoundRouterFeature("stable", events)
-    app = FastAPI()
-    app.state.agent = _make_agent({"StableFeature": feature})
-    app.state.agent_manager = None
-    server._mount_feature_routers(app)
-    with TestClient(app) as client:
-        assert client.get("/test-feature-lifecycle/dependency-bound").status_code == 200
-        builds = []
-        original = APIRoute.get_route_handler
+    agents = {
+        f"tenant{i}": _make_agent({
+            "StableFeature": _DependencyBoundRouterFeature(f"tenant{i}", events)
+        })
+        for i in range(tenant_count)
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            for tenant in agents:
+                assert client.get(
+                    f"/api/agents/{tenant}/test-feature-lifecycle/dependency-bound",
+                    headers={"X-API-Key": API_KEY},
+                ).json() == {"owner": tenant}
+            builds = []
+            original = APIRoute.get_route_handler
 
-        def tracked(route):
-            builds.append(route.path)
-            return original(route)
+            def tracked(route):
+                builds.append(route.path)
+                return original(route)
 
-        monkeypatch.setattr(APIRoute, "get_route_handler", tracked)
-        for _ in range(3):
-            assert client.get("/test-feature-lifecycle/dependency-bound").json() == {"owner": "stable"}
-        assert builds == []
+            monkeypatch.setattr(APIRoute, "get_route_handler", tracked)
+            for _ in range(3):
+                for tenant in agents:
+                    assert client.get(
+                        f"/api/agents/{tenant}/test-feature-lifecycle/dependency-bound",
+                        headers={"X-API-Key": API_KEY},
+                    ).json() == {"owner": tenant}
+            assert builds == []
+    finally:
+        restore()
 
 
 def test_same_feature_factory_can_change_its_closure_without_changing_shape():
@@ -1593,3 +1608,41 @@ def test_invalid_live_router_contract_fails_clearly():
     # A broken plugin must report its error instead of being silently omitted.
     with pytest.raises(RuntimeError, match="router construction failed"):
         server._current_feature_router(SimpleNamespace(get_router=broken), ())
+
+
+def test_native_binding_cache_is_bounded_by_current_agents(monkeypatch):
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    mounted = []
+    original = server._LiveFeatureRouter
+
+    class TrackedRouter(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            mounted.append(self)
+
+    monkeypatch.setattr(server, "_LiveFeatureRouter", TrackedRouter)
+    events = []
+    agents = {
+        name: _make_agent({"StableFeature": _DependencyBoundRouterFeature(name, events)})
+        for name in ("stable", "withdrawn")
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        assert len(mounted) == 1
+        with TestClient(app) as client:
+            for name in ("stable", "withdrawn"):
+                assert client.get(
+                    f"/api/agents/{name}/test-feature-lifecycle/dependency-bound",
+                    headers={"X-API-Key": API_KEY},
+                ).json() == {"owner": name}
+            assert len(mounted[0]._bindings) == 2
+            del agents["withdrawn"]
+            assert client.get(
+                "/api/agents/stable/test-feature-lifecycle/dependency-bound",
+                headers={"X-API-Key": API_KEY},
+            ).json() == {"owner": "stable"}
+            assert set(mounted[0]._bindings) == {id(agents["stable"])}
+    finally:
+        restore()
