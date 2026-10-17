@@ -110,6 +110,7 @@ class NativeExecutionObserver:
         """
         self.close_admission()
         cancellation = None
+        observations = []
         while True:
             phases = tuple(phase for record in tuple(self._resources) for phase in tuple(record.phases))
             if not phases:
@@ -117,13 +118,28 @@ class NativeExecutionObserver:
             for phase in phases:
                 if phase.owner is not None:
                     outcome = await await_owned_task(phase.owner)
+                    observations.append(outcome.error)
+                    if is_execution_control_error(outcome.error):
+                        self._error = execution_terminal_error(
+                            self._error, outcome.error, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
                     cancellation = execution_terminal_error(cancellation, outcome.cancellation)
                 # Classification must finish before the inventory is sampled
                 # again. The resource remains rooted across subsequent phases;
                 # this notification itself proves no physical retirement.
                 classified = await await_owned_task(phase.classified)
+                observations.append(classified.error)
+                if is_execution_control_error(classified.error):
+                    self._error = execution_terminal_error(
+                        self._error, classified.error, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                 cancellation = execution_terminal_error(cancellation, classified.cancellation)
-        error = self._error
+        error = execution_terminal_error(
+            self._error, *observations, retain_originals=True,
+            isolate_control_originals=True,
+        )
         unresolved = tuple(self._resources)
         if unresolved:
             debt = ExecutionAuthorityError("original native resource still held by a cancellable body")

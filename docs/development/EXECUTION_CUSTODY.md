@@ -1939,3 +1939,38 @@ Semantic maintenance keeps a handled worker error after successful diagnostics
 as well as during diagnostic failure. Successful lease retirement preserves the
 ordinary status return; failed retirement/admission or actual observer withdrawal
 composes the worker and cleanup without rewriting either original source graph.
+
+Completion observation is separate from physical retirement. A failed completion
+callback registration or removal can carry native control even when the original
+Task physically succeeds. The canonical borrowed join retains removal evidence
+before returning caller withdrawal without adopting or cancelling its producer.
+Native inventories, resident Feature/Health/Scheduler consumers, private SDK close
+owners and SQLite drain joins retain that independent observation. Successful
+physical close still releases its actual resource; observation control does not
+invent a second closer or phantom physical debt. Iterator terminal readers join
+both the original producer and its original cancellation observer before composing
+their finite outcomes. Repeated withdrawal cannot interrupt the same unwind twice.
+
+Shared service/private-client latches retain native observation control, not a
+previous caller's cancellation. Each finite caller receives its own actual
+withdrawal together with the original source evidence. Later uncancelled readers
+see the retained source control without inheriting an expanding observer history.
+Tests use actual local SDK pools and original native PG/SQLite operations, not
+authenticated providers or inference.
+
+Provisional onboarding, scheduler rollback, unpublished agent cleanup, name release
+and cap-slot retirement use a retained lifecycle-operation record and the canonical
+Task admission receipt. Accepted original cleanup is inventoried before later
+admission can fail; refused coroutines close without replacement attempts. The
+existing admitted name roots failed private cleanup and cannot be reused merely
+because its Task is terminal. A cap-slot retirement must settle before name release.
+The cap-slot fixture is declared component input, not signed spawn/budget acceptance.
+
+Feature disable/remove rollback and config recovery cannot reactivate an original
+generation across retained native control. The common safe-mode transition marks
+integrity uncertain before awaiting independent cleanup and preserves original
+native failures through context-rendering boundaries. Subsequent activation and
+READY seams refuse while that uncertainty remains. These are component recovery
+proofs, not whole-Agent READY or deployed recovery acceptance. Private host-ingress
+retention, isolated-runtime terminal admission and the wider recovery/consumer
+inventory remain subject to the cumulative independent review ledger.

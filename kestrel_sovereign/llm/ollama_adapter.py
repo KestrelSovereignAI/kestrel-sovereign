@@ -290,7 +290,7 @@ class OllamaAdapter(LLMAdapter):
             raise
         self._discovery_clients[client] = task
         outcome = await await_owned_task(task) if task is not None else None
-        failure = harvest_llm_close_task(client, key, task) if task is not None else None
+        failure = harvest_llm_close_task(client, key, task, observation_error=outcome.error) if task is not None else None
         publication = vars(client).get("_llm_close_control")
         self._retain_discovery_control(failure)
         self._retain_discovery_control(publication)
@@ -298,6 +298,7 @@ class OllamaAdapter(LLMAdapter):
             self._discovery_clients.pop(client, None)
         terminal = execution_terminal_error(
             self._discovery_control, failure, publication,
+            outcome.error if outcome is not None else None,
             outcome.cancellation if outcome is not None else None,
             retain_originals=True, isolate_control_originals=True,
         )

@@ -962,6 +962,7 @@ class Feature(_SdkFeature):
         from kestrel_sovereign.execution_custody import execution_terminal_error
         self._owned_background_control = execution_terminal_error(
             vars(self).get("_owned_background_control"), error,
+            retain_originals=True, isolate_control_originals=True,
         )
 
     def _track_owned_runtime_task(self, coro, *, name: str) -> asyncio.Task:
@@ -997,7 +998,6 @@ class Feature(_SdkFeature):
             task.cancel()
         from kestrel_sovereign._async_ownership import (
             await_owned_task,
-            owned_task_error,
         )
         from kestrel_sovereign.execution_custody import execution_terminal_error
         cancellations = []
@@ -1006,11 +1006,10 @@ class Feature(_SdkFeature):
             if task is current or task in owned_task_join_ancestors(current):
                 continue
             outcome = await await_owned_task(task)
+            self._remember_background_control(outcome.error)
             joined.append(task)
             if outcome.cancellation is not None:
                 cancellations.append(outcome.cancellation)
-        for task in joined:
-            self._remember_background_control(owned_task_error(task))
         # Reentrant shutdown can originate in one of these actual Tasks. It
         # cannot cancel/join itself or its actual waiting callers. Keep their
         # ORIGINAL list/root so existing

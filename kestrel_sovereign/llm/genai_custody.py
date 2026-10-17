@@ -178,8 +178,8 @@ async def close_genai_client(client):
         return
     outcome = await await_owned_task(task)
     terminal = execution_terminal_error(
-        original, harvest_llm_close_task(client, "genai-native-client", task),
-        vars(client).get("_llm_close_control"), outcome.cancellation,
+        original, harvest_llm_close_task(client, "genai-native-client", task, observation_error=outcome.error),
+        vars(client).get("_llm_close_control"), outcome.error, outcome.cancellation,
         retain_originals=True, isolate_control_originals=True,
     )
     if terminal is not None:

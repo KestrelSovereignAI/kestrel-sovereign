@@ -102,6 +102,55 @@ async def test_owned_join_publication_failure_still_joins_original_native_effect
 
 
 @pytest.mark.asyncio
+async def test_borrowed_signal_withdrawal_keeps_removal_control_without_adopting_producer(native_pg, monkeypatch):
+    from kestrel_sovereign.signals.dispatcher import SignalDispatchHandle
+
+    backend, observer, schema = native_pg
+    original = await _original_control(backend, monkeypatch)
+    source = OriginalFailure.capture(original)
+    entered, release, observed = asyncio.Event(), asyncio.Event(), []
+    class RemovalTask(asyncio.Task):
+        def remove_done_callback(self, callback):
+            result = super().remove_done_callback(callback)
+            if getattr(callback, "__name__", "") == "mark_complete":
+                raise original
+            return result
+    async def produce():
+        await backend.execute("INSERT INTO effects VALUES (244, 'original borrowed signal producer')")
+        entered.set()
+        await release.wait()
+    native = RemovalTask(produce(), loop=asyncio.get_running_loop())
+    receipt = asyncio.get_running_loop().create_future()
+    # Actual SDK handle, not a replacement dispatcher/task implementation.
+    handle = SignalDispatchHandle(signal_id="borrowed-original", task=native, durable_admission=receipt)
+    async def borrow():
+        try:
+            await handle.wait()
+        except BaseException as error:
+            observed.append(error)
+            raise
+    borrower = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        borrower = create_owned_task(borrow(), retain_originals=True)
+        await asyncio.sleep(0)
+        borrower.cancel("actual borrowed signal observer withdrew")
+        done, _ = await asyncio.wait({borrower}, timeout=0.1)
+        assert done, "borrowed signal cancellation adopted the producer lifetime"
+        outcome = await await_owned_task(borrower)
+        source.assert_retained(outcome.error)
+        assert observed and any(isinstance(error, asyncio.CancelledError) and error.args == ("actual borrowed signal observer withdrew",)
+                                for error in _explicit_control_chain(observed[0])), "borrowed completion lost actual caller withdrawal"
+        assert not native.done() and not native.cancelling()
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=244') == 1
+    finally:
+        release.set()
+        if borrower is not None:
+            await await_owned_task(borrower)
+        await await_owned_task(native)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("after", [False, True])
 async def test_borrowed_completion_publication_failure_does_not_adopt_native_owner(native_pg, monkeypatch, after):
     backend, observer, schema = native_pg

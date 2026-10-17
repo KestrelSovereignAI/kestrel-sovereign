@@ -492,6 +492,69 @@ def _dispatcher_release_outcome(result: object) -> ReleaseOutcome:
     return reported_outcome(result)
 
 
+def require_feature_lifecycle_integrity(agent: object) -> None:
+    """A failed original generation cannot grant a new activation or READY."""
+    if getattr(agent, "_feature_lifecycle_integrity_uncertain", False) is True:
+        control = vars(agent).get("_feature_lifecycle_control")
+        if control is not None:
+            from kestrel_sovereign.execution_custody import retained_execution_error
+            raise retained_execution_error(control)
+        raise RuntimeError("feature lifecycle integrity requires verified repair")
+
+
+async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors, features=()) -> None:
+    """One fail-closed transition for activation, restoration and config repair.
+
+    Native control belongs to the original generation, not a later attempt to
+    reconstruct it. Ordinary foreign feature/config exceptions are not copied
+    into a public cause. Persistence failure cannot clear the in-memory latch.
+    """
+    cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+    agent._feature_lifecycle_integrity_uncertain = True
+    agent._feature_lifecycle_repair_verified = False
+    controls = [error for error in errors if is_execution_control_error(error)]
+    withdrawals = [error for error in errors if isinstance(error, asyncio.CancelledError)
+                   and not is_execution_control_error(error)]
+    quarantine = getattr(agent, "_quarantine_feature_contributions", None)
+    for feature in features:
+        feature.enabled = False
+        if callable(quarantine):
+            try:
+                quarantine(feature)
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
+                if is_execution_control_error(error):
+                    controls.append(error)
+                elif isinstance(error, BaseExceptionGroup):
+                    _raise_unexpected_lifecycle_exception_group(error)
+    try:
+        enter = getattr(agent, "enter_safe_mode", None)
+        if callable(enter):
+            result = enter(reason, cause=cause)
+            if inspect.isawaitable(result):
+                await result
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
+        if is_execution_control_error(error):
+            controls.append(error)
+        elif isinstance(error, asyncio.CancelledError):
+            withdrawals.append(error)
+        elif isinstance(error, BaseExceptionGroup):
+            _raise_unexpected_lifecycle_exception_group(error)
+    finally:
+        agent._safe_mode = True
+        agent._safe_mode_reason = reason
+        agent._safe_mode_cause = cause
+        agent._feature_lifecycle_control = execution_terminal_error(
+            vars(agent).get("_feature_lifecycle_control"), *controls,
+            retain_originals=True, isolate_control_originals=True,
+        )
+    terminal = execution_terminal_error(
+        agent._feature_lifecycle_control, *withdrawals, retain_originals=True,
+        isolate_control_originals=True,
+    )
+    if terminal is not None:
+        raise terminal
+
+
 async def await_lifecycle_task_completion(
     task: "asyncio.Future[object]",
     *,
@@ -6801,6 +6864,7 @@ class KestrelAgent(
 
         feature_class_name = type(feature).__name__
         mandatory = feature_class_name in MANDATORY_FEATURES
+        require_feature_lifecycle_integrity(self)
         if prepared_contributions is None:
             prepared_contributions = self._prepare_feature_contribution_transition(
                 (feature,)
@@ -7037,6 +7101,7 @@ class KestrelAgent(
         :meth:`_register_feature` (which additionally handles first-load
         discovery and the mandatory-feature readiness contract).
         """
+        require_feature_lifecycle_integrity(self)
         if prepared_contributions is None:
             prepared_contributions = self._prepare_feature_contribution_transition(
                 (feature,)
@@ -7082,7 +7147,7 @@ class KestrelAgent(
             feature.enabled = True
             bump_registry_generation(self)
             self._cached_features_prompt = self._build_features_prompt_section()
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as activation_error:
             # Atomic activation: undo whatever partially registered so a failed
             # enable can't strand hooks / sources / tools. Soft teardown keeps
             # the instance loaded (re-enable-able). If exact-inverse drift makes
@@ -7090,9 +7155,12 @@ class KestrelAgent(
             # ORIGINAL activation error is allowed to surface; otherwise a
             # disabled feature can keep contributing prompt bytes.
             quarantine_error = None
+            controls = [activation_error] if is_execution_control_error(activation_error) else []
             try:
                 await self._unregister_feature_runtime(feature, unload=False)
-            except (Exception, asyncio.CancelledError) as cleanup_exc:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as cleanup_exc:
+                if is_execution_control_error(cleanup_exc):
+                    controls.append(cleanup_exc)
                 logging.warning(
                     "Cleanup after failed activation of feature '%s' reported %s; "
                     "quarantining surviving contributions",
@@ -7101,31 +7169,18 @@ class KestrelAgent(
                 )
                 try:
                     self._quarantine_feature_contributions(feature)
-                except (Exception, asyncio.CancelledError):
+                except (Exception, asyncio.CancelledError, BaseExceptionGroup) as quarantine_exc:
+                    if is_execution_control_error(quarantine_exc):
+                        controls.append(quarantine_exc)
                     quarantine_error = RuntimeError(
                         "failed activation contributions could not be quarantined"
                     )
-            if quarantine_error is not None:
+            if quarantine_error is not None or controls:
                 safe_mode_reason = (
                     "Feature activation contribution quarantine failed; "
                     "cognition is blocked until lifecycle integrity is restored"
                 )
-                self._feature_lifecycle_integrity_uncertain = True
-                self._feature_lifecycle_repair_verified = False
-                try:
-                    await self.enter_safe_mode(
-                        safe_mode_reason,
-                        cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
-                    )
-                except (Exception, asyncio.CancelledError):
-                    # Safe Mode persistence is best-effort here, but the
-                    # in-memory cognition latch is not. A second failure must
-                    # not reopen prompts over an untrusted feature generation.
-                    self._safe_mode = True
-                    self._safe_mode_reason = safe_mode_reason
-                    self._safe_mode_cause = (
-                        SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
-                    )
+                await enter_feature_lifecycle_safe_mode(self, safe_mode_reason, *controls)
                 # Do not retain a third-party cleanup/quarantine exception as a
                 # printable cause; either may contain feature configuration.
                 raise quarantine_error from None
@@ -7143,6 +7198,7 @@ class KestrelAgent(
         feature generation.
         """
 
+        require_feature_lifecycle_integrity(self)
         ready_hook = getattr(feature, "on_agent_ready", None)
         if ready_hook is not None:
             try:
@@ -7153,7 +7209,12 @@ class KestrelAgent(
                 # closed instead of observing a half-published generation.
                 with self.committed_feature_transition_cognition():
                     await ready_hook(self)
-            except (Exception, asyncio.CancelledError) as exc:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+                if is_execution_control_error(exc):
+                    await enter_feature_lifecycle_safe_mode(
+                        self, "Feature READY hook reported unresolved native control", exc,
+                        features=(feature,),
+                    )
                 # A hook may await a child task that was cancelled on its own;
                 # ready hooks remain best-effort in that case.  Cancellation of
                 # this transition task itself is different: swallowing it would

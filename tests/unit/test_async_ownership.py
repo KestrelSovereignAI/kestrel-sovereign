@@ -635,7 +635,13 @@ async def test_initiated_close_still_records_source_unwind_failure_as_cleanup():
 
     with pytest.raises(RuntimeError, match="close unwind cleanup failed"):
         await owned.aclose()
-    consumer.cancel()
+    # Physical close also joins the original cancellation observer; delivery
+    # of its terminal notification to this reader is a separate scheduling
+    # step. Prove the reader is terminal before testing post-terminal cancel,
+    # rather than racing a genuine caller withdrawal into that native join.
+    done, _ = await asyncio.wait({consumer}, timeout=1)
+    assert done, "original cleanup failure did not reach its terminal reader"
+    assert consumer.cancel() is False
     with pytest.raises(RuntimeError, match="close unwind cleanup failed"):
         await consumer
 

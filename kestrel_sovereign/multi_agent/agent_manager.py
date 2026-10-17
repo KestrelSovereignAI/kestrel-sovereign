@@ -643,8 +643,8 @@ class TerminalDescendantSpawnFence:
 
 
 @dataclass(slots=True)
-class _HostOnboardingRollback:
-    """One provisional host mutation and its original rollback attempt.
+class _OwnedLifecycleOperation:
+    """One retained lifecycle operation and its original physical attempt.
 
     This record replaces the callback in the existing agent custody slot.
     Failed admission/retirement stays here, never a second native attempt or
@@ -653,42 +653,53 @@ class _HostOnboardingRollback:
     """
 
     operation: Callable[[], Awaitable[None]]
+    phase: str = "host_onboarding_rollback"
+    resource: object | None = None
     admission: OwnedTaskAdmission = field(default_factory=OwnedTaskAdmission)
     attempted: bool = False
     opening: BaseException | None = None
     failure: BaseException | None = None
     harvested: bool = False
 
-    async def join(self, name: str) -> tuple[bool, BaseException | None]:
+    def start(self, name: str) -> None:
+        """Inventory acceptance synchronously, including publication refusal."""
         if not self.attempted:
             self.attempted = True
             try:
                 create_owned_task(
-                    self.operation(), name=f"host_onboarding_rollback:{name}",
+                    self.operation(), name=f"{self.phase}:{name}",
                     retain_originals=True, admission=self.admission,
                 )
             except BaseException as error:
                 self.opening = error
+
+    async def join(self, name: str) -> tuple[bool, BaseException | None]:
+        self.start(name)
         task = self.admission.task
         outcome = await await_owned_task(task) if task is not None else None
         if not self.harvested:
             physical = execution_terminal_error(
-                self.opening, outcome.error if outcome is not None else None,
+                self.opening, owned_task_error(task) if task is not None else None,
                 retain_originals=True, isolate_control_originals=True,
             )
             if physical is not None:
-                debt = RuntimeError("original host onboarding rollback did not retire")
-                debt._kestrel_native_retirement_debts = ((self, task),)
+                debt = RuntimeError("original lifecycle operation did not retire")
+                debt._kestrel_native_retirement_debts = ((self.resource if self.resource is not None else self, task),)
                 self.failure = execution_terminal_error(
                     physical, debt, retain_originals=True,
                     isolate_control_originals=True,
                 )
             self.harvested = True
+        if outcome is not None and is_execution_control_error(outcome.error):
+            self.failure = execution_terminal_error(
+                self.failure, outcome.error, retain_originals=True,
+                isolate_control_originals=True,
+            )
         withdrawal = outcome.cancellation if outcome is not None else None
         joiner = asyncio.current_task()
         cancelled = withdrawal is not None or bool(joiner and joiner.cancelling())
         return cancelled, execution_terminal_error(
-            self.failure, withdrawal, retain_originals=True,
+            self.failure, outcome.error if outcome is not None else None, withdrawal, retain_originals=True,
             isolate_control_originals=True,
         )
 
@@ -715,6 +726,9 @@ class _DynamicSchedulerTenantRegistration:
             rollback_protocol, "scheduler_registration_nonce", None
         )
         self._finished = False
+        self._rollback_owner = _OwnedLifecycleOperation(
+            self.rollback, phase="scheduler_tenant_rollback", resource=self,
+        )
 
     def commit(self) -> None:
         """Publish the registration by opening scheduler execution scope."""
@@ -2509,7 +2523,7 @@ class AgentManager:
             if rollback is not None and not callable(rollback):
                 raise TypeError("agent registration hook rollback must be callable")
             if rollback is not None:
-                agent._host_onboarding_rollback = _HostOnboardingRollback(rollback)
+                agent._host_onboarding_rollback = _OwnedLifecycleOperation(rollback)
 
     async def _complete_registered_agent_readiness(
         self,
@@ -3080,13 +3094,7 @@ class AgentManager:
                 retire_process_runtime_custody(execution_custody)
                 cleanup_failure = None
                 if scheduler_registration is not None:
-                    rollback_task = asyncio.create_task(
-                        scheduler_registration.rollback(),
-                        name=f"scheduler_tenant_rollback:{name}",
-                    )
-                    _, rollback_failure = await await_lifecycle_task_completion(
-                        rollback_task
-                    )
+                    _, rollback_failure = await scheduler_registration._rollback_owner.join(name)
                     if rollback_failure is not None:
                         cleanup_failure = rollback_failure
                         logger.error(
@@ -3142,7 +3150,7 @@ class AgentManager:
         """Retire rollback custody after routing publication commits."""
 
         rollback = vars(agent).get("_host_onboarding_rollback")
-        if isinstance(rollback, _HostOnboardingRollback) and rollback.attempted:
+        if isinstance(rollback, _OwnedLifecycleOperation) and rollback.attempted:
             pending = RuntimeError("cannot commit host onboarding after rollback began")
             pending._kestrel_native_retirement_debts = ((rollback, rollback.admission.task),)
             raise execution_terminal_error(
@@ -3164,8 +3172,8 @@ class AgentManager:
         )
         if onboarding_rollback is None:
             return False, None
-        if not isinstance(onboarding_rollback, _HostOnboardingRollback):
-            onboarding_rollback = _HostOnboardingRollback(onboarding_rollback)
+        if not isinstance(onboarding_rollback, _OwnedLifecycleOperation):
+            onboarding_rollback = _OwnedLifecycleOperation(onboarding_rollback)
             agent._host_onboarding_rollback = onboarding_rollback
         result = await onboarding_rollback.join(name)
         if onboarding_rollback.failure is None:
@@ -3196,15 +3204,12 @@ class AgentManager:
             # Stop future selection before feature shutdown can yield. The
             # owned rollback task keeps the global protocol cleanup joinable
             # across repeated caller cancellation.
-            rollback_task = asyncio.create_task(
-                registration.rollback(),
-                name=f"scheduler_tenant_rollback:{name}",
-            )
             rollback_cancelled, rollback_failure = (
-                await await_lifecycle_task_completion(rollback_task)
+                await registration._rollback_owner.join(name)
             )
             cancelled = cancelled or rollback_cancelled
-            delattr(agent, "_dynamic_scheduler_tenant_registration")
+            if registration._rollback_owner.failure is None:
+                delattr(agent, "_dynamic_scheduler_tenant_registration")
         shutdown_failure: Optional[BaseException] = None
         try:
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
@@ -3397,26 +3402,38 @@ class AgentManager:
             if already_withdrawn
             else self._discard_unpublished_initialized_agent
         )
-        cleanup_tasks = [
-            asyncio.create_task(
-                cleanup(name, agent),
-                name=f"agent_unpublished_cleanup:{name}",
-            )
-            for name, agent in agents
-        ]
+        cleanup_owners = []
+        for name, agent in agents:
+            owner = vars(agent).get("_unpublished_cleanup_owner")
+            if owner is None:
+                owner = _OwnedLifecycleOperation(
+                    lambda name=name, agent=agent: cleanup(name, agent),
+                    phase="agent_unpublished_cleanup", resource=agent,
+                )
+                agent._unpublished_cleanup_owner = owner
+            admission = self._agent_operations.get(self._canonical_agent_name(name))
+            if admission is not None:
+                # The admitted name remains the private root after routing
+                # withdrawal, including a refused/failed original cleanup.
+                admission.child = agent
+            cleanup_owners.append((name, owner))
+            owner.start(name)
         cancelled = False
         failures: list[Exception] = []
         fatal: Optional[BaseException] = None
         control = None
-        for cleanup_task in cleanup_tasks:
+        for name, owner in cleanup_owners:
             try:
                 cleanup_cancelled, cleanup_failure = (
-                    await await_lifecycle_task_completion(cleanup_task)
+                    await owner.join(name)
                 )
             except BaseException as error:
                 cleanup_cancelled, cleanup_failure = False, error
             cancelled = cancelled or cleanup_cancelled
-            control = execution_terminal_error(control, cleanup_failure)
+            control = execution_terminal_error(
+                control, cleanup_failure, retain_originals=True,
+                isolate_control_originals=True,
+            )
             if cleanup_failure is None:
                 continue
             if isinstance(cleanup_failure, asyncio.CancelledError):
@@ -6125,6 +6142,15 @@ class AgentManager:
             # publication is queued).  Taking it again would turn that normal
             # ownership handoff into a re-entrancy deadlock.
             async with self._lock:
+                child = admission.child
+                cleanup = vars(child).get("_unpublished_cleanup_owner") if child is not None else None
+                if cleanup is not None and cleanup.failure is not None:
+                    # Settlement of a failed Task is not physical retirement
+                    # of its resource, nor permission to reuse its name.
+                    raise cleanup.failure
+                slot = vars(admission).get("_spawn_slot_retirement_owner")
+                if slot is not None and slot.failure is not None:
+                    raise slot.failure
                 if (
                     self._agent_operations.get(admission.canonical_name)
                     is admission
@@ -6135,10 +6161,13 @@ class AgentManager:
                 if admission.candidate_staged_event is not None:
                     admission.candidate_staged_event.set()
 
-        release_task = asyncio.create_task(
-            release(), name=f"agent_operation_release:{admission.canonical_name}"
-        )
-        cancelled, failure = await await_lifecycle_task_completion(release_task)
+        owner = vars(admission).get("_release_owner")
+        if owner is None:
+            owner = _OwnedLifecycleOperation(
+                release, phase="agent_operation_release", resource=admission,
+            )
+            admission._release_owner = owner
+        cancelled, failure = await owner.join(admission.canonical_name)
         if failure is not None:
             raise failure
         if cancelled:
@@ -6189,17 +6218,21 @@ class AgentManager:
     ) -> bool:
         """Retire every admission before returning any observed cancellation."""
 
-        releases = [
-            asyncio.create_task(
-                self._release_agent_operation(admission),
-                name=f"agent_operation_final_release:{admission.canonical_name}",
-            )
-            for admission in admissions
-        ]
-        return await self._settle_owned_lifecycle_tasks(
-            releases,
-            description="One or more agent operation admissions failed to release",
+        # Each operation already has one retained release owner. Admitting a
+        # second fanout wrapper adds a failure boundary but owns no resource.
+        failures, withdrawals = [], []
+        for admission in admissions:
+            try:
+                await self._release_agent_operation(admission)
+            except BaseException as error:
+                (withdrawals if isinstance(error, asyncio.CancelledError) else failures).append(error)
+        terminal = execution_terminal_error(
+            *failures, *withdrawals, retain_originals=True,
+            isolate_control_originals=True,
         )
+        if terminal is not None and (failures or is_execution_control_error(terminal)):
+            raise terminal
+        return bool(withdrawals)
 
     async def _retire_spawn_slot_and_admission(
         self,
@@ -6218,23 +6251,33 @@ class AgentManager:
                     admission.spawn_slot_active = False
                     self._resolve_spawn_slot_terminal(admission)
 
-        tasks: list["asyncio.Future[object]"] = [
-            asyncio.create_task(
-                self._release_agent_operation(admission),
-                name=f"agent_operation_final_release:{admission.canonical_name}",
-            )
-        ]
+        cancelled, failures = False, []
         if spawn_slot_admitted:
-            tasks.append(
-                asyncio.create_task(
-                    retire_spawn_slot(),
-                    name=f"spawn_slot_retirement:{admission.canonical_name}",
+            owner = vars(admission).get("_spawn_slot_retirement_owner")
+            if owner is None:
+                owner = _OwnedLifecycleOperation(
+                    retire_spawn_slot, phase="spawn_slot_retirement", resource=admission,
                 )
-            )
-        return await self._settle_owned_lifecycle_tasks(
-            tasks,
-            description="One or more spawn lifecycle owners failed to retire",
+                admission._spawn_slot_retirement_owner = owner
+            cancelled, failure = await owner.join(admission.canonical_name)
+            failures.append(failure)
+        # Release the name only AFTER its exact cap slot retired. A failed
+        # slot remains on the admission; this same canonical release refuses
+        # reuse instead of letting a new outer fanout spend another attempt.
+        try:
+            await self._release_agent_operation(admission)
+        except asyncio.CancelledError as error:
+            cancelled = True
+            failures.append(error)
+        except BaseException as error:
+            failures.append(error)
+        terminal = execution_terminal_error(
+            *failures, retain_originals=True, isolate_control_originals=True,
         )
+        if terminal is not None and (is_execution_control_error(terminal)
+                or not isinstance(terminal, asyncio.CancelledError)):
+            raise terminal
+        return cancelled
 
     def _resolve_spawn_slot_terminal(
         self,
@@ -7344,12 +7387,26 @@ class AgentManager:
             failed_admission_task = None
 
             async def collect_initializer_results():
-                gathered = await asyncio.gather(*init_tasks, return_exceptions=True)
-                return [
-                    (owned_task_error(task) or result)
-                    if isinstance(result, BaseException) else result
-                    for task, result in zip(init_tasks, gathered)
-                ]
+                # No cancellable gathering future may forward a second
+                # interrupt while an accepted initializer is unwinding.
+                def interrupt_batch(_current):
+                    all_candidates_staged.set()
+                    for initializer in init_tasks:
+                        if not initializer.done() and not initializer.cancelling():
+                            initializer.cancel()
+                results = []
+                for initializer in init_tasks:
+                    outcome = await await_owned_task(
+                        initializer, cancel_on_caller_cancellation=interrupt_batch,
+                    )
+                    physical = owned_task_error(initializer)
+                    if outcome.cancellation is not None or outcome.error is not physical:
+                        raise execution_terminal_error(
+                            outcome.error, outcome.cancellation, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
+                    results.append(physical if physical is not None else outcome.result)
+                return results
 
             try:
                 for name, agent_cfg, admission in admitted:
@@ -7372,7 +7429,7 @@ class AgentManager:
                             init_tasks.append(receipt.task)
                 results = await collect_initializer_results()
             except BaseException as initial_failure:
-                # A later admission can fail before gather exists. Release the
+                # A later admission can fail before joining begins. Release the
                 # construction barrier first: a cancelled native initializer
                 # can itself need that barrier to finish its original unwind.
                 all_candidates_staged.set()
@@ -7380,8 +7437,7 @@ class AgentManager:
                     if (initializer is not failed_admission_task
                         and not initializer.done() and not initializer.cancelling()):
                         initializer.cancel()
-                # ``gather`` cancellation cancels pending initializers. Results
-                # that already initialized are invisible to shutdown_all(), so
+                # Results that already initialized are invisible to shutdown_all(), so
                 # this batch still owns their cleanup.  Cancellation wins only
                 # after all of those ownership transfers have settled.
                 # These original initializer Tasks are already owned. Recovery
@@ -7392,9 +7448,10 @@ class AgentManager:
                 for initializer in init_tasks:
                     outcome = await await_owned_task(initializer)
                     initial_failure = execution_terminal_error(
-                        initial_failure, outcome.cancellation, retain_originals=True,
+                        initial_failure, outcome.error, outcome.cancellation, retain_originals=True,
                         isolate_control_originals=True)
-                    settled.append(outcome.error if outcome.error is not None else outcome.result)
+                    physical = owned_task_error(initializer)
+                    settled.append(physical if physical is not None else initializer.result())
                 initialized = [
                     (name, result)
                     for (name, _, _), result in zip(admitted, settled)

@@ -542,10 +542,8 @@ class OwnedAsyncIterator(Generic[_T]):
             raise StopAsyncIteration
         if marker is _ITERATOR_TERMINAL:
             self._closed = True
-            outcome = await await_owned_task(self._owner)
-            if self._terminal_error is not None:
-                outcome = OwnedTaskOutcome(None, self._terminal_error, outcome.cancellation)
-            raise_owned_outcome(outcome, operation=self._operation)
+            outcome = await self._join_source_owners()
+            raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
             raise StopAsyncIteration
 
         self._item_outstanding = True
@@ -555,14 +553,13 @@ class OwnedAsyncIterator(Generic[_T]):
         """Translate lifecycle cancellation without racing a delivered item."""
 
         self._cancellation_watch_started = True
-        completion = asyncio.Event()
-
-        def mark_complete(_task: asyncio.Task[None]) -> None:
-            completion.set()
-
-        self._owner.add_done_callback(mark_complete)
         try:
-            await completion.wait()
+            outcome = await await_owned_task(self._owner, defer_cancellation=False)
+            if outcome.error is not owned_task_error(self._owner):
+                # A borrowed join's publication/removal failure is distinct
+                # from the producer's physical result. Its original watcher
+                # remains owned by this iterator and is harvested below.
+                raise outcome.error
         except asyncio.CancelledError:
             if self._owner.done():
                 return
@@ -579,10 +576,34 @@ class OwnedAsyncIterator(Generic[_T]):
                     self._cancel_owner_if_running
                 )
             else:
+                self._cancel_owner_if_running()
+            raise
+        except BaseException:
+            # Losing the cancellation observer cannot leave an operational
+            # producer running without its lifecycle handoff. Interrupt once;
+            # the reader/closer still physically joins that SAME producer.
+            self._stop.set()
+            self._continue.set()
+            if not self._owner.done() and not self._owner.cancelling():
                 self._owner.cancel()
             raise
-        finally:
-            self._owner.remove_done_callback(mark_complete)
+
+    async def _join_source_owners(self):
+        """Retain the source AND its original cancellation observer outcomes."""
+        from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+        outcome = await await_owned_task(self._owner)
+        watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
+        watcher_error = watcher.error if watcher is not None else None
+        if isinstance(watcher_error, asyncio.CancelledError) and not is_execution_control_error(watcher_error):
+            watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
+        return OwnedTaskOutcome(
+            outcome.result,
+            execution_terminal_error(self._terminal_error, outcome.error, watcher_error,
+                retain_originals=True, isolate_control_originals=True),
+            execution_terminal_error(outcome.cancellation,
+                watcher.cancellation if watcher is not None else None,
+                retain_originals=True, isolate_control_originals=True),
+        )
 
     def _interrupt_if_watch_never_started(
         self,
@@ -603,10 +624,10 @@ class OwnedAsyncIterator(Generic[_T]):
             and not self._cancellation_watch_started
             and not self._owner.done()
         ):
-            self._owner.cancel()
+            self._cancel_owner_if_running()
 
     def _cancel_owner_if_running(self) -> None:
-        if not self._owner.done():
+        if not self._owner.done() and not self._owner.cancelling():
             self._owner.cancel()
 
     async def _run(self) -> None:
@@ -704,11 +725,9 @@ class OwnedAsyncIterator(Generic[_T]):
         self._stop.set()
         self._continue.set()
         owner_cancelled_by_close = False
-        if not self._owner.done() and not self._interrupted_by_cleanup:
+        if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
             owner_cancelled_by_close = self._owner.cancel()
-        outcome = await await_owned_task(self._owner)
-        if self._terminal_error is not None:
-            outcome = OwnedTaskOutcome(None, self._terminal_error, outcome.cancellation)
+        outcome = await self._join_source_owners()
         from kestrel_sovereign.execution_custody import is_execution_control_error
         if (
             (owner_cancelled_by_close or self._construction_error is not None)
@@ -721,15 +740,6 @@ class OwnedAsyncIterator(Generic[_T]):
             # the iterator, it is a successful close, while cancellation of
             # the caller itself still takes precedence below.
             outcome = OwnedTaskOutcome(None, None, outcome.cancellation)
-        if self._cancellation_owner is not None:
-            watcher = await await_owned_task(self._cancellation_owner)
-            from kestrel_sovereign.execution_custody import execution_terminal_error
-            watcher_error = watcher.error
-            if isinstance(watcher_error, asyncio.CancelledError) and not is_execution_control_error(watcher_error):
-                watcher_error = None
-            outcome = OwnedTaskOutcome(outcome.result,
-                execution_terminal_error(outcome.error, watcher_error, retain_originals=True),
-                execution_terminal_error(outcome.cancellation, watcher.cancellation, retain_originals=True))
         if self._construction_error is not None and outcome.error is None:
             # Reconcile ONLY the original constructor task reservation, after
             # its actual frame/lock cleanup AND watcher have physically joined.
@@ -825,13 +835,20 @@ async def await_owned_task(
             try:
                 if publication_errors:
                     await asyncio.sleep(_OWNED_COMPLETION_RECHECK_SECONDS)
+                elif not defer_cancellation:
+                    # This Future belongs only to the borrowed observer. Its
+                    # cancellation cannot reach the producer, and an extra
+                    # shield would delay terminal readers behind close return.
+                    await completion
                 else:
                     await asyncio.shield(completion)
             except asyncio.CancelledError as error:
-                if not defer_cancellation:
-                    raise
                 if pending_cancellation is None:
                     pending_cancellation = error
+                if not defer_cancellation:
+                    # Leave promptly, but only AFTER callback removal has
+                    # contributed its independent control to this observer.
+                    break
                 if (callable(cancel_on_caller_cancellation) or cancel_on_caller_cancellation) and not cancellation_forwarded:
                     # Interrupt the operation once, then own its entire unwind.
                     # Repeated caller cancellation must not interrupt cleanup.
@@ -849,6 +866,12 @@ async def await_owned_task(
         except BaseException as error:
             publication_errors.append(error)
 
+    if not defer_cancellation and pending_cancellation is not None:
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        raise execution_terminal_error(
+            pending_cancellation, *publication_errors, retain_originals=True,
+            isolate_control_originals=True,
+        )
     if not task.done():
         # Only an explicitly borrowed observer may leave before settlement.
         assert not defer_cancellation and publication_errors

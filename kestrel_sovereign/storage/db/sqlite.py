@@ -1351,6 +1351,10 @@ class SQLiteBackend(DatabaseBackend):
                     # a stubborn drain once; repeated cancellation cannot
                     # abandon this owner or replace native control evidence.
                     outcome = await await_owned_task(drain, cancel_on_caller_cancellation=True)
+                    failure = execution_terminal_error(
+                        failure, outcome.error, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                     pending_cancellation = pending_cancellation or outcome.cancellation
                 # Harvest the original terminal error only after completion;
                 # ordinary drain cancellation is not caller cancellation.
@@ -1400,7 +1404,10 @@ class SQLiteBackend(DatabaseBackend):
             self._closing = False
             self._connection_generation = None
 
-        terminal = execution_terminal_error(failure, pending_cancellation)
+        terminal = execution_terminal_error(
+            failure, pending_cancellation, retain_originals=True,
+            isolate_control_originals=True,
+        )
         if terminal is not None:
             raise terminal
     

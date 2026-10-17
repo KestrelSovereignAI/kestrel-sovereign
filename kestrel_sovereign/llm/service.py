@@ -6308,6 +6308,11 @@ No other text or formatting.
                 error = outcome.error
                 if task not in resource_closers and error is not None and not is_execution_control_error(error):
                     error = None
+                if is_execution_control_error(error):
+                    self._llm_close_control = execution_terminal_error(
+                        vars(self).get("_llm_close_control"), error,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
                 observations.extend((error, outcome.cancellation))
                 failure = execution_terminal_error(
                     error, outcome.cancellation, retain_originals=True,
@@ -6342,7 +6347,6 @@ No other text or formatting.
             retain_originals=True, isolate_control_originals=True,
         )
         if terminal is not None:
-            self._llm_close_control = terminal
             raise terminal
 
     async def close(self):

@@ -66,7 +66,7 @@ def start_llm_close_task(owner, key, operation, *, resource=None):
     return task
 
 
-def harvest_llm_close_task(owner, key, task):
+def harvest_llm_close_task(owner, key, task, *, observation_error=None):
     """Reconcile one ORIGINAL terminal owner before releasing its registry key.
 
     Eager completion does not run queued callbacks before a direct join returns.
@@ -74,6 +74,15 @@ def harvest_llm_close_task(owner, key, task):
     """
     if not task.done():
         raise RuntimeError("cannot harvest an unfinished original LLM closer")
+    # A join's callback failure is not the physical closer's result. Retain
+    # its nonlocal control at the existing owner even if a queued completion
+    # callback already released the successful physical resource below.
+    # Caller withdrawal is deliberately NOT an input to this shared latch.
+    if is_execution_control_error(observation_error):
+        owner._llm_close_control = execution_terminal_error(
+            vars(owner).get("_llm_close_control"), observation_error,
+            retain_originals=True, isolate_control_originals=True,
+        )
     error = owned_task_error(task)
     tasks = vars(owner).setdefault("_llm_close_tasks", {})
     if tasks.get(key) is not task:
@@ -156,9 +165,9 @@ class UnpublishedLLMOwner:
             outcome.error, outcome.cancellation, retain_originals=True,
             isolate_control_originals=True,
         )
-        if self.control is not None or terminal is not None and is_execution_control_error(terminal):
+        if self.control is not None or is_execution_control_error(outcome.error):
             self.control = execution_terminal_error(
-                self.control, terminal, retain_originals=True,
+                self.control, outcome.error, retain_originals=True,
                 isolate_control_originals=True,
             )
         if join_native and not joins_native:
@@ -186,7 +195,10 @@ class UnpublishedLLMOwner:
                 raise withdrawal
             return
         if self.control is not None:
-            raise self.control
+            raise execution_terminal_error(
+                self.control, terminal, retain_originals=True,
+                isolate_control_originals=True,
+            )
         if terminal is not None:
             raise terminal
 

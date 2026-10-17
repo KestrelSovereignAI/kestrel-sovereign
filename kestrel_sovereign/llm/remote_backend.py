@@ -81,7 +81,7 @@ class RemoteBackendMixin:
         owner = start_llm_close_task(self, key, client.close, resource=client)
         outcome = await await_owned_task(owner) if owner is not None else None
         if owner is not None:
-            harvest_llm_close_task(self, key, owner)
+            harvest_llm_close_task(self, key, owner, observation_error=outcome.error)
         terminal = execution_terminal_error(
             vars(self).get("_llm_close_control"),
             outcome.error if outcome is not None else None,

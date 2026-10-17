@@ -149,7 +149,7 @@ class HealthFeature(Feature):
         ]
         for task in pending_persists:
             outcome = await await_owned_task(task)
-            self._harvest_health_persistence(task)
+            self._harvest_health_persistence(task, observation_error=outcome.error)
             errors.append(outcome.cancellation)
         self._health_persist_tasks = set()
         try:
@@ -162,10 +162,15 @@ class HealthFeature(Feature):
         if terminal is not None:
             raise terminal
 
-    def _harvest_health_persistence(self, task: asyncio.Task) -> None:
+    def _harvest_health_persistence(self, task: asyncio.Task, *, observation_error=None) -> None:
         error = owned_task_error(task)
         if not task.cancelled():
             task.exception()
+        if is_execution_control_error(observation_error):
+            self._health_persist_control = execution_terminal_error(
+                getattr(self, "_health_persist_control", None), observation_error,
+                retain_originals=True, isolate_control_originals=True,
+            )
         if error is not None and is_execution_control_error(error):
             self._health_persist_control = execution_terminal_error(
                 getattr(self, "_health_persist_control", None), error
@@ -182,9 +187,10 @@ class HealthFeature(Feature):
             if not task.done():
                 task.cancel()
             outcome = await await_owned_task(task)
-            self._harvest_health_persistence(task)
+            self._harvest_health_persistence(task, observation_error=outcome.error)
             terminal = execution_terminal_error(
                 getattr(self, "_health_persist_control", None),
+                outcome.error if is_execution_control_error(outcome.error) else None,
                 outcome.cancellation,
             )
             self._background_task = None

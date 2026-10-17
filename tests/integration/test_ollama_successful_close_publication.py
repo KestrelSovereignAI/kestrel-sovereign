@@ -20,8 +20,9 @@ from tests.utils.original_failure import OriginalFailure
 @pytest.mark.parametrize("embedding", [False, True])
 @pytest.mark.parametrize("source_cancel", [False, True])
 @pytest.mark.parametrize("withdraw", [False, True])
+@pytest.mark.parametrize("callback_stage", ["generic", "join-add", "join-remove"])
 async def test_successful_pool_retirement_replays_publication_not_local_withdrawal(
-    native_pg, catalog_peer, monkeypatch, tmp_path, after, embedding, source_cancel, withdraw,
+    native_pg, catalog_peer, monkeypatch, tmp_path, after, embedding, source_cancel, withdraw, callback_stage,
 ):
     clients, requests, _control, actual_close = catalog_peer
     original = await _original_control(native_pg[0], monkeypatch, source_cancel)
@@ -50,12 +51,20 @@ async def test_successful_pool_retirement_replays_publication_not_local_withdraw
     class PublicationTask(asyncio.Task):
         refused = False
         def add_done_callback(self, callback, *args, **kwargs):
-            if not self.refused and getattr(callback, "__name__", "") == "completed":
+            selected = "completed" if callback_stage == "generic" else "mark_complete"
+            if callback_stage != "join-remove" and not self.refused and getattr(callback, "__name__", "") == selected:
                 self.refused = True
                 if after:
                     super().add_done_callback(callback, *args, **kwargs)
                 raise original
             return super().add_done_callback(callback, *args, **kwargs)
+        def remove_done_callback(self, callback):
+            if callback_stage == "join-remove" and not self.refused and getattr(callback, "__name__", "") == "mark_complete":
+                self.refused = True
+                if after:
+                    super().remove_done_callback(callback)
+                raise original
+            return super().remove_done_callback(callback)
     def factory(loop, coroutine, **kwargs):
         if getattr(_actual_operation(coroutine), "cr_code", None) is close.__code__:
             return PublicationTask(coroutine, loop=loop, **kwargs)

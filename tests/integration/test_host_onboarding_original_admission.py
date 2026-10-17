@@ -117,6 +117,56 @@ async def test_host_rollback_refusal_keeps_original_registration_and_closes_coro
 
 
 @pytest.mark.asyncio
+async def test_normal_batch_wait_interrupts_each_original_initializer_only_once(native_pg, onboarding_owner, monkeypatch):
+    manager, _agent, database = onboarding_owner
+    source = await _original_control(native_pg[0], monkeypatch)
+    graph, debts = tuple(_explicit_control_chain(source)), tuple(execution_cleanup_debts(source))
+    entered, unwinding, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    originals, withdrawals = {}, []
+    async def initialize(name, *_args, **_kwargs):
+        from kestrel_sovereign.multi_agent.agent_manager import _BATCH_STAGE_CALLBACK
+        originals[name] = asyncio.current_task()
+        if len(originals) == 2:
+            entered.set()
+        try:
+            await asyncio.get_running_loop().create_future()
+        except asyncio.CancelledError as cancellation:
+            withdrawals.append(cancellation)
+            if len(withdrawals) == 2:
+                unwinding.set()
+            try:
+                await release.wait()
+                await database.execute("INSERT INTO host_rollback_effects VALUES (?)", (21 if name == "Alpha" else 22,))
+                raise source
+            finally:
+                await _BATCH_STAGE_CALLBACK.get()(name)
+    monkeypatch.setattr(manager, "_initialize_agent", initialize)
+    config = MultiAgentConfig(agents={
+        "Alpha": LocalAgentConfig(data_dir="alpha", port=8801),
+        "Beta": LocalAgentConfig(data_dir="beta", port=8802),
+    })
+    owner = create_owned_task(manager.load_from_config(config), retain_originals=True)
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        owner.cancel("actual first batch observer withdrawal")
+        await asyncio.wait_for(unwinding.wait(), 5)
+        owner.cancel("actual repeated batch observer withdrawal")
+        await asyncio.sleep(0)
+        release.set()
+        outcome = await await_owned_task(owner)
+        assert all(task.done() and task.cancelling() == 1 for task in originals.values()), "normal batch aggregate repeatedly interrupted accepted native initializer unwind"
+        assert source in tuple(_explicit_control_chain(outcome.error)), "repeated batch withdrawal erased the original native control"
+        assert tuple(_explicit_control_chain(source)) == graph and tuple(execution_cleanup_debts(source)) == debts
+        assert await database.fetchval("SELECT count(*) FROM host_rollback_effects WHERE id IN (21,22)") == 2
+        assert not manager._agent_operations
+    finally:
+        release.set()
+        await await_owned_task(owner)
+        for task in originals.values():
+            await await_owned_task(task)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source_cancel", [False, True])
 @pytest.mark.parametrize("withdraw", [False, True])
 async def test_host_rollback_joins_original_native_attempt_and_retains_all_control(
