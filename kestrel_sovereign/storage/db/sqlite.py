@@ -1681,7 +1681,7 @@ class SQLiteBackend(DatabaseBackend):
         self._raise_cancelled_write_drain_error()
 
     def _handoff_cancelled_write(
-        self, conn: aiosqlite.Connection
+        self, conn: aiosqlite.Connection, *, error: BaseException | None = None,
     ) -> None:
         """Transfer rollback to the backend and return without awaiting it.
 
@@ -1713,10 +1713,23 @@ class SQLiteBackend(DatabaseBackend):
         started_at = time.monotonic()
         self._cancelled_write_drain_error = None
         self._cancelled_write_drain_started_at = started_at
-        self._cancelled_write_drain = asyncio.create_task(
-            self._drain_cancelled_write(conn, started_at=started_at),
-            name=f"sqlite-cancelled-write-drain:{self.db_path}",
-        )
+        from kestrel_sovereign._async_ownership import create_owned_task
+
+        try:
+            self._cancelled_write_drain = create_owned_task(
+                self._drain_cancelled_write(conn, started_at=started_at),
+                name=f"sqlite-cancelled-write-drain:{self.db_path}",
+                retirement_resource=conn, retain_originals=True,
+            )
+        except BaseException as admission_error:
+            terminal = execution_terminal_error(
+                error, admission_error, retain_originals=True,
+                isolate_control_originals=True,
+            )
+            # No drain was admitted. Retain the original connection debt and
+            # fence subsequent writes instead of clearing the safety latch.
+            self._cancelled_write_drain_error = terminal
+            raise terminal
 
     async def _drain_cancelled_write(
         self, conn: aiosqlite.Connection, *, started_at: float
@@ -1954,16 +1967,16 @@ class SQLiteBackend(DatabaseBackend):
             # cancellation. Its native queue may still be blocked. Preserve
             # the existing deadline-safe rollback owner rather than awaiting
             # another operation behind COMMIT before returning that receipt.
-            self._handoff_cancelled_write(conn)
+            self._handoff_cancelled_write(conn, error=error)
             return
         try:
             await conn.rollback()
         except asyncio.CancelledError as cleanup_error:
-            self._handoff_cancelled_write(conn)
             terminal = execution_terminal_error(
                 error, cleanup_error,
                 retain_originals=True, isolate_control_originals=True,
             )
+            self._handoff_cancelled_write(conn, error=terminal)
             if terminal is not cleanup_error:
                 # The selected error can itself be a legacy QueryError whose
                 # explicit cause carries authority/COMMIT evidence. Keep that
@@ -2027,9 +2040,9 @@ class SQLiteBackend(DatabaseBackend):
                     if not self._in_transaction:
                         await self._commit_write(conn)
                     return cursor.rowcount
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as error:
                     if not self._in_transaction:
-                        self._handoff_cancelled_write(conn)
+                        self._handoff_cancelled_write(conn, error=error)
                     raise
                 except Exception as e:
                     if not self._in_transaction:
@@ -2058,9 +2071,9 @@ class SQLiteBackend(DatabaseBackend):
                     if not self._in_transaction:
                         await self._commit_write(conn)
                     return cursor.rowcount
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as error:
                     if not self._in_transaction:
-                        self._handoff_cancelled_write(conn)
+                        self._handoff_cancelled_write(conn, error=error)
                     raise
                 except Exception as e:
                     if not self._in_transaction:
@@ -2154,7 +2167,7 @@ class SQLiteBackend(DatabaseBackend):
                 if cursor is not None:
                     self._abandoned_read_cursors.add(cursor)
                 if not self._in_transaction:
-                    self._handoff_cancelled_write(conn)
+                    self._handoff_cancelled_write(conn, error=error)
             else:
                 # A snapshot is private to this read, so it needs no shared
                 # transaction fence. Interrupt its current SQLite operation so
@@ -2282,9 +2295,9 @@ class SQLiteBackend(DatabaseBackend):
                         await conn.executescript(script)
                     if not self._in_transaction:
                         await self._commit_write(conn)
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as error:
                     if not self._in_transaction:
-                        self._handoff_cancelled_write(conn)
+                        self._handoff_cancelled_write(conn, error=error)
                     raise
                 except Exception as e:
                     if not self._in_transaction:
@@ -2332,7 +2345,10 @@ class SQLiteBackend(DatabaseBackend):
                         await conn.execute(f"RELEASE SAVEPOINT {name}")
                     except BaseException as cleanup_error:
                         self._transaction_poisoned = True
-                        raise execution_terminal_error(error, cleanup_error)
+                        raise execution_terminal_error(
+                            error, cleanup_error, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
                 raise
             self._after_commit.release_savepoint()
             return
@@ -2353,8 +2369,8 @@ class SQLiteBackend(DatabaseBackend):
                     self._require_native_transaction()
                     await self._commit_write(conn)
                     committed = self._after_commit
-                except asyncio.CancelledError:
-                    self._handoff_cancelled_write(conn)
+                except asyncio.CancelledError as error:
+                    self._handoff_cancelled_write(conn, error=error)
                     raise
                 except Exception as e:
                     await self._rollback_after_failure(conn, error=e)

@@ -10954,15 +10954,24 @@ class AgentManager:
             release_awaitable = self._release_child_budget_cancellation_safe(
                 child_name
             )
-            # ``ensure_future`` preserves the existing override seam: legacy
-            # managers may return an already-created Future instead of a bare
-            # coroutine from ``_release_child_budget_cancellation_safe``.
-            budget_release = asyncio.ensure_future(release_awaitable)
+            # Preserve the legacy already-created Future seam; fresh
+            # awaitables use canonical admission and original-error capture.
+            if isinstance(release_awaitable, asyncio.Future):
+                budget_release = release_awaitable
+            elif inspect.isawaitable(release_awaitable):
+                budget_release = create_owned_task(
+                    release_awaitable, retain_originals=True,
+                )
+            else:
+                raise TypeError("An asyncio.Future, a coroutine or an awaitable is required")
         except BaseException as failure:
             # A failed Future gives the caller the same await/cancellation
             # contract as an asynchronously failed release, while ensuring the
             # just-reserved record can retain its evidence synchronously.
             budget_release = asyncio.get_running_loop().create_future()
+            # Keep the SAME admission carrier before projecting the legacy
+            # cancelled-Future state. A fresh Future cancellation has no cause.
+            budget_release._kestrel_owned_terminal_error = failure
             if isinstance(failure, asyncio.CancelledError):
                 budget_release.cancel()
             else:

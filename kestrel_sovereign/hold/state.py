@@ -951,29 +951,35 @@ async def _read_postgres_hold_custody_snapshot(
 
 async def _close_postgres_preflight_backends(
     *backends: Any,
+    prior_error: BaseException | None = None,
 ) -> tuple[BaseException, ...]:
     """Finish every raw-pool close even under repeated caller cancellation."""
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign.execution_custody import execution_terminal_error
 
-    async def close_all() -> tuple[Any, ...]:
-        return tuple(
-            await asyncio.gather(
-                *(backend.close() for backend in backends),
-                return_exceptions=True,
-            )
-        )
-
-    cleanup = asyncio.create_task(close_all())
-    cancelled = False
-    while not cleanup.done():
+    # Admit each independent native closer before joining any one of them.
+    # A refused admission retains that exact resource and must not skip peers.
+    owners, failures, withdrawals = [], [], []
+    for backend in backends:
         try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            cancelled = True
-            continue
-    results = cleanup.result()
-    if cancelled:
-        raise asyncio.CancelledError()
-    return tuple(result for result in results if isinstance(result, BaseException))
+            owners.append(create_owned_task(
+                backend.close(), retirement_resource=backend,
+                retain_originals=True, name="hold:preflight-native-close",
+            ))
+        except BaseException as failure:
+            failures.append(failure)
+    for owner in owners:
+        outcome = await await_owned_task(owner)
+        if outcome.error is not None:
+            failures.append(outcome.error)
+        if outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+    if prior_error is not None or withdrawals:
+        raise execution_terminal_error(
+            prior_error, *failures, *withdrawals, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
+    return tuple(failures)
 
 
 async def preflight_postgres_hold_custody(
@@ -999,9 +1005,13 @@ async def preflight_postgres_hold_custody(
         evidence_backend,
     )
     if close_errors:
-        raise HoldStateError(
-            "could not close PostgreSQL Hold custody preflight connections"
-        ) from close_errors[0]
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+
+        raise execution_terminal_error(
+            HoldStateError("could not close PostgreSQL Hold custody preflight connections"),
+            *close_errors, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
 
 
 async def _connect_postgres_hold_custody_backends(
@@ -1067,20 +1077,10 @@ async def _connect_postgres_hold_custody_backends(
                 )
             pair_id = validate_postgres_hold_custody(primary, evidence)
     except BaseException as failure:
-        close_errors: tuple[BaseException, ...] = ()
-        try:
-            close_errors = await _close_postgres_preflight_backends(
-                primary_backend,
-                evidence_backend,
-            )
-        except asyncio.CancelledError as cancellation:
-            failure = cancellation
-        for close_error in close_errors:
-            failure.add_note(
-                "Additional PostgreSQL Hold custody preflight close failure: "
-                f"{close_error!r}"
-            )
-        raise failure.with_traceback(failure.__traceback__)
+        await _close_postgres_preflight_backends(
+            primary_backend, evidence_backend, prior_error=failure,
+        )
+        raise
     return (
         primary_backend,
         evidence_backend,
@@ -1179,29 +1179,19 @@ async def initialize_postgres_hold_databases(
         )
         return primary_db, evidence_db, pair_id
     except BaseException as failure:
-        close_errors: tuple[BaseException, ...] = ()
-        try:
-            remaining_owners = []
-            if primary_db is not None:
-                remaining_owners.append(primary_db)
-            elif not primary_backend_consumed:
-                remaining_owners.append(primary_backend)
-            if evidence_db is not None:
-                remaining_owners.append(evidence_db)
-            elif not evidence_backend_consumed:
-                remaining_owners.append(evidence_backend)
-            if remaining_owners:
-                close_errors = await _close_postgres_preflight_backends(
-                    *remaining_owners
-                )
-        except asyncio.CancelledError as cancellation:
-            failure = cancellation
-        for close_error in close_errors:
-            failure.add_note(
-                "Additional PostgreSQL Hold database initialization close failure: "
-                f"{close_error!r}"
-            )
-        raise failure.with_traceback(failure.__traceback__)
+        remaining_owners = []
+        if primary_db is not None:
+            remaining_owners.append(primary_db)
+        elif not primary_backend_consumed:
+            remaining_owners.append(primary_backend)
+        if evidence_db is not None:
+            remaining_owners.append(evidence_db)
+        elif not evidence_backend_consumed:
+            remaining_owners.append(evidence_backend)
+        await _close_postgres_preflight_backends(
+            *remaining_owners, prior_error=failure,
+        )
+        raise
 
 
 def _domain_error_from_chain(error: BaseException) -> Optional[HoldStateError]:

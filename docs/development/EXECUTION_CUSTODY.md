@@ -1447,6 +1447,15 @@ server teardown consumers with SQLite resources and PostgreSQL COMMIT-ACK
 faults, not full server startup or READY. Scheduler startup/preflight allocation
 sites remain separate findings, not covered by this shutdown repair.
 
+Paired PostgreSQL Hold preflight retires each independent backend through the
+canonical owned admission and physical join. Refusing one closer retains that
+exact backend as unstarted debt and does not skip its peer. The failed opening,
+native close evidence and actual observer withdrawal remain original explicit
+carriers through both connection validation and database initialization cleanup;
+string notes and reconstructed cancellation are not settlement evidence. Native
+failed-preflight tests deliberately reject a same-cluster pair: they establish
+error/retirement custody, not successful independent-cluster Hold deployment.
+
 Independent teardown is dependency-aware. Refused or failed Scheduler/Agent
 phases leave their consumers' Hold context, Stop evidence and shared pools
 owned and live, with explicit unstarted retirement debt. They do not prevent
@@ -1644,6 +1653,9 @@ the actual cancellation from that later join. The finite isolated carrier does
 not write the caller's withdrawal into the manager's shared unsafe-refund latch.
 The same caller-local collection spans the earlier shutdown/completion joins
 and the intervening refund observer, including an already-observed withdrawal.
+Refund admission also retains its actual synchronous or Task-allocation failure
+before projecting legacy cancelled-Future state. Existing Futures keep their
+identity; fresh awaitables use canonical owned admission and coroutine cleanup.
 Bounded offboarding retains its actual observer in the pending cleanup carrier;
 its worker remains manager-owned and public metadata remains sanitized.
 The durable tail recognizes the canonical native database behind storage, not
@@ -1662,6 +1674,10 @@ do not certify successful genesis, provider acceptance or READY.
 Auxiliary transaction rollback also retains original body and observer evidence
 before the close phase begins; a later successful close cannot reconstruct a
 withdrawal that an earlier rollback discarded.
+Rollback handoff itself uses canonical admission with the exact original SQLite
+connection. A refused drain retains unstarted connection debt and fences later
+writes; the finite body/rollback originals are composed before that admission,
+including savepoint cleanup and the early uncertain-COMMIT handoff.
 
 Replacement-birth directory custody is not provider-dependent. Database
 initialization may fail before returning a handle, and local authority/archive

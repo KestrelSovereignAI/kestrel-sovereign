@@ -14,7 +14,7 @@ import pytest
 from kestrel_sovereign import inception_service
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
-    ExecutionCustody, _explicit_control_chain, execution_commit_outcome,
+    ExecutionCustody, _explicit_control_chain, execution_cleanup_debts, execution_commit_outcome,
     is_execution_control_error,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -24,7 +24,7 @@ from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["refused", "close-ack", "withdrawal", "rollback-withdrawal"])
+@pytest.mark.parametrize("mode", ["refused", "close-ack", "withdrawal", "rollback-withdrawal", "rollback-handoff-refused"])
 async def test_original_publication_control_survives_local_authority_retirement(
     native_pg, tmp_path, monkeypatch, mode,
 ):
@@ -65,7 +65,7 @@ async def test_original_publication_control_survives_local_authority_retirement(
         actual_rollback = connection.rollback
 
         async def observed_rollback():
-            if mode == "rollback-withdrawal" and not entered.is_set():
+            if mode.startswith("rollback-") and not entered.is_set():
                 entered.set()
                 try:
                     await release.wait()
@@ -96,6 +96,9 @@ async def test_original_publication_control_survives_local_authority_retirement(
     def factory(loop, coroutine, **kwargs):
         actual = _actual_operation(coroutine)
         code = getattr(actual, "cr_code", None)
+        if mode == "rollback-handoff-refused" and code is not None and code.co_qualname == "SQLiteBackend._drain_cancelled_write":
+            refused.append((coroutine, actual))
+            raise allocation
         if mode == "refused" and code is not None and code.co_qualname.endswith("observed_close"):
             refused.append((coroutine, actual))
             raise allocation
@@ -114,10 +117,10 @@ async def test_original_publication_control_survives_local_authority_retirement(
             monkeypatch.setattr(backend, "transaction", observed_transaction)
             monkeypatch.setattr(ownership_module, "await_owned_task", observed_join)
             loop.set_task_factory(factory)
-            if mode not in {"withdrawal", "rollback-withdrawal"}:
+            if mode not in {"withdrawal", "rollback-withdrawal", "rollback-handoff-refused"}:
                 release.set()
             owner = create_owned_task(run(), retain_originals=True)
-            if mode in {"withdrawal", "rollback-withdrawal"}:
+            if mode in {"withdrawal", "rollback-withdrawal", "rollback-handoff-refused"}:
                 await asyncio.wait_for(entered.wait(), 5)
                 owner.cancel("actual local authority retirement observer withdrawal")
                 release.set()
@@ -140,8 +143,12 @@ async def test_original_publication_control_survives_local_authority_retirement(
             assert db.backend._connection is None and not getattr(connection, "_thread", connection).is_alive()
             if mode == "close-ack":
                 assert lost_close_ack in chain
-            elif mode == "rollback-withdrawal":
+            elif mode in {"rollback-withdrawal", "rollback-handoff-refused"}:
                 assert len(rollback_withdrawals) == 1 and rollback_withdrawals[0] in chain, "auxiliary rollback discarded its actual observer withdrawal"
+                if mode == "rollback-handoff-refused":
+                    assert allocation in chain and refused
+                    assert any(resource is connection and task is None for resource, task in execution_cleanup_debts(outcome.error))
+                    assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
             else:
                 assert len(withdrawals) == 1 and withdrawals[0] in chain
     finally:

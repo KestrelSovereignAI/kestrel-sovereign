@@ -1,7 +1,6 @@
 """Original receipts survive actual native effects and consumer retirement."""
 
 import asyncio
-from contextlib import asynccontextmanager
 from contextvars import Context
 from types import SimpleNamespace
 
@@ -19,7 +18,8 @@ from kestrel_sovereign._async_ownership import (
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError,
+    ExecutionAuthorityError, _explicit_control_chain, execution_cleanup_debts,
+    execution_commit_outcome,
     bind_execution_custody,
     is_execution_control_error,
 )
@@ -225,11 +225,15 @@ async def test_sqlite_native_rollback_retains_original_cancellation_group(tmp_pa
     db = await AsyncDatabase.sqlite(str(tmp_path / "rollback.db"))
     await db.execute("CREATE TABLE effects(id INTEGER PRIMARY KEY)")
     original = terminal("group")
+    graph, debts = tuple(_explicit_control_chain(original)), tuple(execution_cleanup_debts(original))
+    rollback_errors = []
     conn = db.backend._connection
     rollback = conn.rollback
     async def rollback_then_cancel():
         await rollback()
-        raise asyncio.CancelledError("later native rollback cancellation")
+        cancellation = asyncio.CancelledError("later native rollback cancellation")
+        rollback_errors.append(cancellation)
+        raise cancellation
     monkeypatch.setattr(conn, "rollback", rollback_then_cancel)
     execute = conn.execute
     many = conn.executemany
@@ -239,7 +243,9 @@ async def test_sqlite_native_rollback_retains_original_cancellation_group(tmp_pa
         if sql.startswith("INSERT"):
             raise original
         if sql.startswith("ROLLBACK TO"):
-            raise asyncio.CancelledError("later native savepoint rollback")
+            cancellation = asyncio.CancelledError("later native savepoint rollback")
+            rollback_errors.append(cancellation)
+            raise cancellation
         return cursor
     async def many_then_receipt(*args, **kwargs):
         await many(*args, **kwargs)
@@ -270,7 +276,11 @@ async def test_sqlite_native_rollback_retains_original_cancellation_group(tmp_pa
                     raise original
     try:
         result = await join(create_owned_task(operation()))
-        assert result.error is original
+        chain = tuple(_explicit_control_chain(result.error))
+        assert original in chain and execution_commit_outcome(result.error) == "unknown"
+        assert rollback_errors and rollback_errors[0] in chain, "rollback lost its independent original cancellation"
+        assert tuple(_explicit_control_chain(original)) == graph
+        assert tuple(execution_cleanup_debts(original)) == debts
     finally:
         monkeypatch.undo()
         await db.close()

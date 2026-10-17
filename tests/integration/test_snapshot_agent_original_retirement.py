@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from kestrel_sovereign._async_ownership import create_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     execution_cleanup_debts,
@@ -17,6 +17,23 @@ from tests.unit.test_cleanup_task_admission import (
     _operation_name,
     _partial_native_agent,
 )
+
+
+# This is a pending-native-close ownership test, not a cold HTTP setup latency
+# benchmark. Keep a finite observer budget that permits real archive/client
+# setup on both interpreters before the deliberately held physical close.
+SNAPSHOT_TAIL_OBSERVER_BUDGET_S = 1.0
+
+
+async def _retire_partial_agent_fixture(agent, usage_db):
+    # The finite tail may now retain native storage as well as snapshot owners.
+    # Join those SAME owners before independently closing the fixture database;
+    # a concurrent second physical close is not fixture isolation.
+    await await_owned_task(create_owned_task(
+        agent.wait_for_shutdown_completion(), retain_originals=True,
+    ))
+    await agent.llm_service.close()
+    await usage_db.close()
 
 
 @pytest.mark.asyncio
@@ -48,7 +65,7 @@ async def test_agent_bounded_tail_retains_actual_pending_snapshot_closer(
         )
         state["close_error"].__cause__ = OSError("actual native close ACK failed")
     tail = create_owned_task(
-        agent._run_durable_shutdown_tail(0.2), retain_originals=True
+        agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
     tasks.append(tail)
     try:
@@ -76,13 +93,18 @@ async def test_agent_bounded_tail_retains_actual_pending_snapshot_closer(
             from kestrel_sovereign import _async_ownership
 
             actual_join = _async_ownership.await_owned_task
+            snapshot_owners = {
+                owner for resource, owner in debts
+                if resource is service and owner is not None
+            }
 
             async def observe_original_join(owner, *args, **kwargs):
                 # Assert the original dispatch before it could re-join a done
                 # owner forever. No fake completion/ACK is supplied.
-                assert not owner.done(), (
-                    "completed debt owner was re-admitted to the join loop"
-                )
+                if owner in snapshot_owners:
+                    assert not owner.done(), (
+                        "completed debt owner was re-admitted to the join loop"
+                    )
                 return await actual_join(owner, *args, **kwargs)
 
             monkeypatch.setattr(
@@ -134,8 +156,7 @@ async def test_agent_bounded_tail_retains_actual_pending_snapshot_closer(
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
         await asyncio.gather(tail, return_exceptions=True)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 @pytest.mark.asyncio
@@ -167,7 +188,7 @@ async def test_agent_retains_periodic_stop_and_explicit_snapshot_owners(
     tasks.append(worker)
     await asyncio.wait_for(entered.wait(), 3)
     tail = create_owned_task(
-        agent._run_durable_shutdown_tail(0.3), retain_originals=True
+        agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
     tasks.append(tail)
     try:
@@ -207,8 +228,7 @@ async def test_agent_retains_periodic_stop_and_explicit_snapshot_owners(
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
         await asyncio.gather(tail, worker, return_exceptions=True)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 @pytest.mark.asyncio
@@ -235,7 +255,7 @@ async def test_tail_captures_original_cause_bearing_native_callback_cancellation
     agent._sync_service = service
     agent._resource_custody().acquire("sync_service")
     tail = create_owned_task(
-        agent._run_durable_shutdown_tail(0.2), retain_originals=True
+        agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
     tasks.append(tail)
     try:
@@ -269,8 +289,7 @@ async def test_tail_captures_original_cause_bearing_native_callback_cancellation
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
         await asyncio.gather(tail, return_exceptions=True)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 @pytest.mark.asyncio
@@ -330,8 +349,7 @@ async def test_refused_snapshot_owner_preserves_unstarted_service_debt(
         )
     finally:
         loop.set_task_factory(factory)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 @pytest.mark.asyncio
@@ -378,7 +396,7 @@ async def test_completion_from_original_native_join_graph_keeps_owner_fenced(
 
         monkeypatch.setattr(service, "force_snapshot", original_snapshot)
     tail = create_owned_task(
-        agent._run_durable_shutdown_tail(0.2), retain_originals=True
+        agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
     tasks.append(tail)
     try:
@@ -419,8 +437,7 @@ async def test_completion_from_original_native_join_graph_keeps_owner_fenced(
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
         await asyncio.gather(tail, return_exceptions=True)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 # Timely native close failures at the real partial Agent boundary.
@@ -478,8 +495,7 @@ async def test_timely_agent_snapshot_and_stop_retain_both_native_failures(
     finally:
         release_close.set()
         await asyncio.gather(worker, return_exceptions=True)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 # Original actual tail observer cancellations survive native retirement.
@@ -528,7 +544,7 @@ async def test_agent_retains_exact_original_tail_observer_cancellation(
 
     monkeypatch.setattr(asyncio, "wait", observe_original_withdrawal)
     tail = create_owned_task(
-        agent._run_durable_shutdown_tail(0.3), retain_originals=True
+        agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
     tasks.append(tail)
     try:
@@ -565,8 +581,7 @@ async def test_agent_retains_exact_original_tail_observer_cancellation(
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
         await asyncio.gather(tail, return_exceptions=True)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 # An actual earlier completion observer cannot erase native cancellation evidence.
@@ -640,8 +655,7 @@ async def test_timely_native_cancel_receipt_survives_an_earlier_completion_reade
         )
     finally:
         loop.set_task_factory(factory)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 @pytest.mark.asyncio
@@ -681,8 +695,7 @@ async def test_timely_original_callback_cancellation_is_raised_after_successful_
             "successful close replaced original cancellation with its cause"
         )
     finally:
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 @pytest.mark.asyncio
@@ -814,8 +827,7 @@ async def test_actual_snapshot_failure_and_stop_refusal_keep_both_originals(
         )
     finally:
         loop.set_task_factory(factory)
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
 
 
 @pytest.mark.asyncio
@@ -899,5 +911,4 @@ async def test_native_retirement_control_cannot_be_demoted_to_observer_withdrawa
         )
         assert execution_cleanup_debts(failure) and not forbidden
     finally:
-        await agent.llm_service.close()
-        await usage_db.close()
+        await _retire_partial_agent_fixture(agent, usage_db)
