@@ -333,6 +333,34 @@ jobs:
         run: uv run python run_tests.py --kestrel --skip-check --validate-only
         timeout-minutes: 5
 
+  # Keep the optional tracing stack compatible with the native MCP SDK.
+  native-mcp-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Install the locked host and Phoenix dependency set
+        run: uv sync --python ${{ matrix.python-version }} --locked --extra phoenix
+      - name: Import the native SDK and tracing integrations together
+        run: uv run --no-sync python -c "from mcp import Client; import phoenix, pydantic_ai, openai"
+      - name: Check tracing, web authentication and OpenAI behavior
+        run: >-
+          uv run --no-sync python -m pytest
+          tests/unit/test_phoenix_supervisor.py tests/unit/test_phoenix_assets_redirect.py
+          tests/unit/test_server_auth.py tests/unit/test_openai_cache_usage.py
+          tests/unit/test_openai_thinking_channel.py tests/unit/test_openai_plan_autocompact.py -q
+
   # Unit tests (no services needed)
   unit-tests:
     runs-on: ubuntu-latest
