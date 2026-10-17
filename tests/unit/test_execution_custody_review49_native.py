@@ -581,7 +581,7 @@ async def test_stopped_settlement_callback_abandons_unknown_native_outcome(tmp_p
     original = terminal("cancel_unknown")
     guards = []
     async def settle():
-        guard = dispatcher._hold_durable_cognition_stop_completion("original-request")
+        guard = await dispatcher._hold_durable_cognition_stop_completion("original-request")
         guards.append(guard)
         guard.operation.cancel()
         await join(guard.operation)

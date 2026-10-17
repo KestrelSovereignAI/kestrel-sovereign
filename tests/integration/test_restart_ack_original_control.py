@@ -28,7 +28,7 @@ from tests.integration.test_execution_custody_review56_pg import lose_native_ack
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["enqueue", "ack", "terminal", "observer", "admission-observer"])
+@pytest.mark.parametrize("route", ["enqueue", "ack", "terminal", "observer", "admission-observer", "late-ack"])
 @pytest.mark.parametrize("source_cancel", [False, True])
 async def test_restart_ack_keeps_original_control_and_borrowed_dispatch_owner(
     native_pg, tmp_path, monkeypatch, route, source_cancel,
@@ -107,7 +107,7 @@ async def test_restart_ack_keeps_original_control_and_borrowed_dispatch_owner(
                 mode=SignalMode.COGNITION, target_agent=child.did, payload={},
             ))
             await asyncio.wait_for(entered.wait(), 5)
-            if route in {"ack", "observer"}:
+            if route in {"ack", "observer", "late-ack"}:
                 feature._inflight_restart_acks.add(row.id)
                 ack = feature._spawn_ack_supervisor(row, handle)
                 # Queue a completion marker behind the observer's initial run;
@@ -123,15 +123,26 @@ async def test_restart_ack_keeps_original_control_and_borrowed_dispatch_owner(
                 started = asyncio.get_running_loop().create_future()
                 asyncio.get_running_loop().call_soon(started.set_result, None)
                 await started
-            if route in {"observer", "admission-observer"}:
+            if route in {"observer", "admission-observer", "late-ack"}:
                 watcher.cancel("actual borrowed ACK observer withdrew")
                 outcome = await await_owned_task(watcher)
                 assert isinstance(outcome.error, asyncio.CancelledError)
                 assert not handle.task.done() and not handle.task.cancelling(), "ACK observer cancelled borrowed dispatcher owner"
                 assert not handle.durable_admission.cancelled()
+                withdrawn = outcome.error
+                if route == "late-ack":
+                    assert row.id in feature._inflight_restart_acks, "withdrawn ACK released retry guard while original dispatch still owns work"
+                    await feature.shutdown()
+                    assert row.id in feature._inflight_restart_acks, "feature disable released borrowed dispatch retry guard"
                 release.set()
                 completed = await await_owned_task(handle.task)
-                assert completed.error is None
+                if route == "late-ack":
+                    assert originals and originals[0] in tuple(_explicit_control_chain(completed.error))
+                    assert originals[0] in tuple(_explicit_control_chain(vars(feature).get("_owned_background_control"))), "original producer completion did not reach Feature retry fence"
+                    assert withdrawn not in tuple(_explicit_control_chain(vars(feature).get("_owned_background_control")))
+                    outcome = completed
+                else:
+                    assert completed.error is None
             else:
                 release.set()
                 outcome = await await_owned_task(watcher)
@@ -145,11 +156,18 @@ async def test_restart_ack_keeps_original_control_and_borrowed_dispatch_owner(
                     with pytest.raises(BaseException) as completed:
                         await handle.wait()
                     assert originals[0] in tuple(_explicit_control_chain(completed.value))
-            if route in {"enqueue", "ack"}:
+            if route in {"enqueue", "ack", "late-ack"}:
                 for _ in range(3):
                     with pytest.raises(BaseException) as blocked:
                         await feature._deliver_restart_completed(row, child.did, dispatcher, True)
                     assert originals[0] in tuple(_explicit_control_chain(blocked.value)), "restart sweep retried original uncertain wake"
+                if route == "late-ack":
+                    replacement = RestartCoordinatorFeature(child)
+                    replacement._db = db
+                    replacement._inflight_restart_acks = set()
+                    with pytest.raises(BaseException) as later_instance:
+                        await replacement._deliver_restart_completed(row, child.did, dispatcher, True)
+                    assert originals[0] in tuple(_explicit_control_chain(later_instance.value)), "new feature instance ignored Agent-owned original dispatch control"
             assert tuple(_explicit_control_chain(originals[0])) == graphs[0]
             assert tuple(execution_cleanup_debts(originals[0])) == debts[0]
         assert len(calls) == 1

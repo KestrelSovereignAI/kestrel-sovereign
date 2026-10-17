@@ -14,7 +14,7 @@ import logging
 from contextlib import asynccontextmanager
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
-    owned_native_http_client,
+    owned_native_http_client, native_sdk_operation,
     owned_execution_stream, close_native_execution_stream, retain_native_execution_http_client_close,
     is_execution_control_error,
     current_execution_custody, bind_execution_cleanup, require_execution_work,
@@ -456,6 +456,7 @@ class OllamaAdapter(LLMAdapter):
             output_tokens=output_tokens,
         )
 
+    @native_sdk_operation
     async def raw_request(
         self,
         client: Any,
@@ -562,6 +563,7 @@ class OllamaAdapter(LLMAdapter):
             served = getattr(response, "model", None)
         usage_sink.add(input_tokens=tokens, model=served)
 
+    @native_sdk_operation
     async def aembed(
         self,
         client: "ollama.AsyncClient",
@@ -588,6 +590,7 @@ class OllamaAdapter(LLMAdapter):
         embeddings = response.get("embeddings", []) if isinstance(response, dict) else getattr(response, "embeddings", [])
         return list(embeddings[0]) if embeddings else None
 
+    @native_sdk_operation
     async def aembed_batch(
         self,
         client: "ollama.AsyncClient",
@@ -648,6 +651,7 @@ class OllamaAdapter(LLMAdapter):
 
         return messages
 
+    @native_sdk_operation
     async def get_response(
         self,
         client: "ollama.AsyncClient",
@@ -1193,6 +1197,7 @@ class OllamaAdapter(LLMAdapter):
         capabilities = _show_field(info, "capabilities") or []
         return "decision" in capabilities and "completion" not in capabilities
 
+    @native_sdk_operation
     async def _check_tool_support(self, client: "ollama.AsyncClient", model_name: str) -> bool:
         """Check if a model supports tool calling via /api/show metadata.
 
@@ -1260,6 +1265,7 @@ class OllamaAdapter(LLMAdapter):
                 self._list_chat_models(local), "model listing"
             )
 
+    @native_sdk_operation
     async def _list_chat_models(self, client: Any) -> List[ModelInfo]:
         """:meth:`list_models` without its timeout."""
         try:
@@ -1400,6 +1406,7 @@ class OllamaAdapter(LLMAdapter):
             self._list_decision_models(client), "decision model listing"
         )
 
+    @native_sdk_operation
     async def _list_decision_models(self, client: Any) -> List[DecisionModelInfo]:
         """:meth:`list_decision_models` without its timeout."""
         response = await client.list()
@@ -1429,6 +1436,7 @@ class OllamaAdapter(LLMAdapter):
         logger.info(f"Ollama: discovered {len(results)} decision models")
         return results
 
+    @native_sdk_operation
     async def _check_embedding_support(
         self, client: "ollama.AsyncClient", model_name: str
     ) -> bool:
@@ -1465,6 +1473,7 @@ class OllamaAdapter(LLMAdapter):
                 self._list_embedding_models(local), "embedding model listing"
             )
 
+    @native_sdk_operation
     async def _list_embedding_models(
         self, client: Any
     ) -> List["EmbeddingModelInfo"]:

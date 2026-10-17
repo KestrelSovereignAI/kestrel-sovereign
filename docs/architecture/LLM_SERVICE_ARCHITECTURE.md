@@ -99,6 +99,15 @@ resource/Task debt if admission or physical retirement fails. A denied publicati
 must retain the original denial together with actual close errors and observer
 cancellation, without changing their original control graphs.
 
+The physical-close boundary retains and isolates those finite originals by
+default. Plain iterator `GeneratorExit` remains close protocol, while a
+control-bearing one is preserved as evidence. Non-stream OpenAI, Anthropic and
+Ollama producers share the canonical response owner across SDK normalization
+and retries, including late per-model catalog metadata requests. Availability
+probes cannot suppress that owner's original native control, and fresh caller
+scopes may still reuse a healthy shared client. Temporary client lifetime
+retirement remains distinct from per-operation response ownership.
+
 Codex turn shutdown first closes callback admission, directly joins the original
 accepted reader Tasks, and holds the original thread mutex and event sink through
 any accepted completed-effect checkpoint. It must not allocate an intermediate

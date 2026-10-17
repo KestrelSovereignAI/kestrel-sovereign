@@ -279,7 +279,7 @@ class SignalDispatchHandle(SignalHandle):
     Terminal and admission waits observe their original dispatcher owners;
     withdrawing a reader never cancels those borrowed operations. ACK-bearing
     ingress uses the earlier receipt rather than mistaking Task creation for
-    a durable commit. Explicit ``cancel()`` retains the SDK Stop contract.
+    a durable commit. Explicit ``cancel()`` retains the SDK cancellation contract.
     """
 
     durable_admission: asyncio.Future[DurableAdmissionResult]
@@ -1326,7 +1326,7 @@ class SignalDispatcher:
             durable_admission=durable_admission,
         )
 
-    def _hold_durable_cognition_stop_completion(
+    async def _hold_durable_cognition_stop_completion(
         self,
         request_id: str,
     ) -> _DurableCognitionSettlementGuard | None:
@@ -1382,78 +1382,100 @@ class SignalDispatcher:
         async def await_settlement_release() -> None:
             await settlement_release.wait()
 
-        operation = asyncio.create_task(
-            await_settlement_release(),
-            name=f"durable_cognition_settlement:{request_id}",
-        )
+        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+        operation = None
+        completion_callback = None
         try:
+            operation = create_owned_task(
+                await_settlement_release(),
+                name=f"durable_cognition_settlement:{request_id}",
+                retain_originals=True,
+            )
             bind_operation(self._agent, request_id, operation)
-        except BaseException:
-            operation.cancel()
-            cleanup(
-                self._agent,
-                request_id,
-                disposition=RequestCompletionDisposition.ABANDONED,
+            guard = _DurableCognitionSettlementGuard(
+                request_id=request_id,
                 generation=generation,
+                operation=operation,
             )
-            raise
-        guard = _DurableCognitionSettlementGuard(
-            request_id=request_id,
-            generation=generation,
-            operation=operation,
-        )
 
-        def release_settlement_owner(completed_owner: asyncio.Task) -> None:
-            stop_reached_settlement = (
-                guard.operation.cancelling() > 0 or guard.operation.cancelled()
-            )
-            owner_abandoned_settlement = completed_owner.cancelled()
-            from kestrel_sovereign._async_ownership import owned_task_error
-            owner_error = owned_task_error(completed_owner)
-            unresolved_control = (
-                owner_error is not None and is_execution_control_error(owner_error)
-            )
-            # Race matrix for the single release invariant:
-            #
-            #   cognition/settlement                  Stop completion
-            #   stopped + terminal NACK committed  -> COMPLETED (STOPPED)
-            #   stopped + NACK unavailable         -> ABANDONED (UNREACHABLE)
-            #   completed + late Stop during ACK   -> ABANDONED (UNREACHABLE)
-            #   any owner cancellation pre-settle  -> ABANDONED (UNREACHABLE)
-            #   no Stop, any ordinary terminal path-> COMPLETED
-            #
-            # The barrier is the shared linearization guard: cancellation must
-            # reach it, and only durable Stop terminalization can turn that
-            # cancellation into successful completion evidence.
-            disposition = (
-                RequestCompletionDisposition.ABANDONED
-                if (
-                    unresolved_control or (
-                        (stop_reached_settlement or owner_abandoned_settlement)
-                        and not guard.stop_terminalized
-                    )
+            def release_settlement_owner(completed_owner: asyncio.Task) -> None:
+                stop_reached_settlement = (
+                    guard.operation.cancelling() > 0 or guard.operation.cancelled()
                 )
-                else RequestCompletionDisposition.COMPLETED
-            )
+                owner_abandoned_settlement = completed_owner.cancelled()
+                from kestrel_sovereign._async_ownership import owned_task_error
+                owner_error = owned_task_error(completed_owner)
+                unresolved_control = (
+                    owner_error is not None and is_execution_control_error(owner_error)
+                )
+                # Race matrix for the single release invariant:
+                #
+                #   cognition/settlement                  Stop completion
+                #   stopped + terminal NACK committed  -> COMPLETED (STOPPED)
+                #   stopped + NACK unavailable         -> ABANDONED (UNREACHABLE)
+                #   completed + late Stop during ACK   -> ABANDONED (UNREACHABLE)
+                #   any owner cancellation pre-settle  -> ABANDONED (UNREACHABLE)
+                #   no Stop, any ordinary terminal path-> COMPLETED
+                #
+                # The barrier is the shared linearization guard: cancellation must
+                # reach it, and only durable Stop terminalization can turn that
+                # cancellation into successful completion evidence.
+                disposition = (
+                    RequestCompletionDisposition.ABANDONED
+                    if (
+                        unresolved_control or (
+                            (stop_reached_settlement or owner_abandoned_settlement)
+                            and not guard.stop_terminalized
+                        )
+                    )
+                    else RequestCompletionDisposition.COMPLETED
+                )
+                try:
+                    cleanup(
+                        self._agent,
+                        guard.request_id,
+                        disposition=disposition,
+                        generation=guard.generation,
+                    )
+                except Exception:
+                    # A failed release must remain visible as unfinished Stop debt;
+                    # never wake a waiter with invented completion evidence.
+                    logger.exception(
+                        "Could not release durable cognition settlement owner: signal=%s",
+                        guard.request_id,
+                    )
+                finally:
+                    settlement_release.set()
+
+            completion_callback = release_settlement_owner
+            owner.add_done_callback(completion_callback)
+            return guard
+        except BaseException as opening:
+            if completion_callback is not None:
+                owner.remove_done_callback(completion_callback)
+            if operation is not None:
+                operation.cancel()
+                outcome = await await_owned_task(operation)
+                opening = execution_terminal_error(
+                    opening,
+                    outcome.error if is_execution_control_error(outcome.error) else None,
+                    outcome.cancellation, retain_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
+                )
             try:
                 cleanup(
-                    self._agent,
-                    guard.request_id,
-                    disposition=disposition,
-                    generation=guard.generation,
+                    self._agent, request_id,
+                    disposition=RequestCompletionDisposition.ABANDONED,
+                    generation=generation,
                 )
-            except Exception:
-                # A failed release must remain visible as unfinished Stop debt;
-                # never wake a waiter with invented completion evidence.
-                logger.exception(
-                    "Could not release durable cognition settlement owner: signal=%s",
-                    guard.request_id,
+            except BaseException as cleanup_error:
+                debt = RuntimeError("original Stop settlement registration did not retire")
+                debt._kestrel_native_retirement_debts = (((self._agent, request_id, generation), None),)
+                raise execution_terminal_error(
+                    opening, cleanup_error, debt, retain_originals=True,
+                    isolate_control_originals=True,
                 )
-            finally:
-                settlement_release.set()
-
-        owner.add_done_callback(release_settlement_owner)
-        return guard
+            raise opening
 
     async def enqueue_durable_terminal(
         self,
@@ -4833,7 +4855,7 @@ class SignalDispatcher:
             self._schedule_outcome_log(routing_signal, registration, result)
             return result
 
-        settlement_guard = self._hold_durable_cognition_stop_completion(
+        settlement_guard = await self._hold_durable_cognition_stop_completion(
             routing_signal.id
         )
         routing_task: asyncio.Task[SignalResult] | None = None

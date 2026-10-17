@@ -499,7 +499,8 @@ class RestartCoordinatorFeature(Feature):
         # supervised by a background ack task in THIS process. Guards the
         # cron-tick retry from re-enqueuing a duplicate wake while a long
         # cognition turn is still in flight (#1796).
-        self._inflight_restart_acks: set = set()
+        if not hasattr(self, "_inflight_restart_acks"):
+            self._inflight_restart_acks: set = set()
         # request_id -> monotonic time THIS process crossed it into
         # ``executing``. Used to tell a dispatch still in flight from one that
         # silently failed, without a schema column: a row stamped with this
@@ -597,14 +598,12 @@ class RestartCoordinatorFeature(Feature):
 
         The agent owns the dispatcher task and the shared database; this
         feature owns only the acknowledgement task that observes delivery and
-        writes ``wake_delivered``.  Releasing the in-flight guard after the
-        owned tasks have been cancelled keeps a later enable/retry from seeing
-        a stale in-process acknowledgement.
+        writes ``wake_delivered``. A withdrawn observer leaves the original
+        dispatch's guard in place until its completion callback retains any
+        late native control. Disabling this feature never cancels that borrowed
+        producer or turns its still-pending work into retryable absence.
         """
         await super().shutdown()
-        inflight = getattr(self, "_inflight_restart_acks", None)
-        if inflight is not None:
-            inflight.clear()
 
     def get_router(self):
         """Expose the restart status-event API for chat-history reload.
@@ -3814,6 +3813,11 @@ class RestartCoordinatorFeature(Feature):
         # An uncertain original wake is not retryable absence. Reuse the
         # feature's existing bounded background-control owner, including the
         # synchronous enqueue edge before an ACK supervisor can exist.
+        # A replacement feature instance must also respect the Agent's SAME
+        # retained original producer, not just this instance's ACK lifetime.
+        runtime_control = getattr(type(self.agent), "_raise_shutdown_control", None)
+        if callable(runtime_control):
+            runtime_control(self.agent, control_only=True)
         retained = vars(self).get("_owned_background_control")
         if retained is not None:
             raise retained
@@ -3903,33 +3907,50 @@ class RestartCoordinatorFeature(Feature):
         re-dispatch lands ``OK``.
         """
 
+        borrowed = getattr(handle, "task", None)
+        if not isinstance(borrowed, asyncio.Future):
+            borrowed = None
+        acknowledgement = None
+
+        def dispatch_finished(source) -> None:
+            from kestrel_sovereign._async_ownership import owned_task_error
+            self._remember_background_control(owned_task_error(source))
+            if acknowledgement is None or acknowledgement.done():
+                self._inflight_restart_acks.discard(row.id)
+
+        if borrowed is not None:
+            # The Task remains Agent-owned. This callback retains its terminal
+            # evidence and guards retries even if our private ACK is withdrawn.
+            borrowed.add_done_callback(dispatch_finished)
+
         async def _await_and_ack() -> None:
             from kestrel_sdk.signals import Status
 
             try:
-                result = await handle.wait()
-            except BaseException as e:
-                from kestrel_sovereign.execution_custody import is_execution_control_error
-                self._remember_background_control(e)
-                if not isinstance(e, Exception) or is_execution_control_error(e):
-                    raise
-                logger.warning(
-                    "restart sweep: restart.completed wake for %s raised "
-                    "(%s); wake stays undelivered for retry", row.id, e,
-                )
-                return
+                try:
+                    result = await handle.wait()
+                except BaseException as e:
+                    from kestrel_sovereign.execution_custody import is_execution_control_error
+                    self._remember_background_control(e)
+                    if not isinstance(e, Exception) or is_execution_control_error(e):
+                        raise
+                    logger.warning(
+                        "restart sweep: restart.completed wake for %s raised "
+                        "(%s); wake stays undelivered for retry", row.id, e,
+                    )
+                    return
+                status = getattr(result, "status", None)
+                if status is not Status.OK:
+                    logger.warning(
+                        "restart sweep: restart.completed wake for %s did not "
+                        "land (status=%s); wake stays undelivered for retry",
+                        row.id, getattr(status, "value", status),
+                    )
+                    return
+                await self._mark_wake_delivered(row)
             finally:
-                self._inflight_restart_acks.discard(row.id)
-
-            status = getattr(result, "status", None)
-            if status is not Status.OK:
-                logger.warning(
-                    "restart sweep: restart.completed wake for %s did not "
-                    "land (status=%s); wake stays undelivered for retry",
-                    row.id, getattr(status, "value", status),
-                )
-                return
-            await self._mark_wake_delivered(row)
+                if borrowed is None or borrowed.done():
+                    self._inflight_restart_acks.discard(row.id)
 
         # FEATURE-owned so ``Feature.shutdown()`` (runtime disable / boot
         # rollback / soft disable) cancels this in-flight ack. The agent-global
@@ -3937,9 +3958,17 @@ class RestartCoordinatorFeature(Feature):
         # would outlive a disabled feature and later flag ``wake_delivered``
         # against torn-down state (kestrel-sovereign#2522 P2). Still
         # agent-tracked underneath, so full shutdown reaps it too.
-        return self._track_owned_background_task(
-            _await_and_ack(), name=f"restart_completed_ack:{row.id}",
-        )
+        try:
+            acknowledgement = self._track_owned_background_task(
+                _await_and_ack(), name=f"restart_completed_ack:{row.id}",
+            )
+        except BaseException:
+            if borrowed is None:
+                self._inflight_restart_acks.discard(row.id)
+            elif borrowed.done():
+                dispatch_finished(borrowed)
+            raise
+        return acknowledgement
 
     async def _terminalize_completed(self, row, now: str) -> bool:
         """Mark a swept restart row ``completed`` and mirror the COGNITION

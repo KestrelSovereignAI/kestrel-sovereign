@@ -15,7 +15,7 @@ from kestrel_sovereign import _async_ownership as ownership
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
     NativeExecutionStreamOwner, _explicit_control_chain, bind_execution_custody,
-    execution_cleanup_debts, execution_commit_outcome,
+    close_native_execution_stream, execution_cleanup_debts, execution_commit_outcome,
     retain_native_execution_http_client_close,
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
@@ -25,7 +25,7 @@ from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["openai", "anthropic"])
-@pytest.mark.parametrize("route", ["implicit", "inventory"])
+@pytest.mark.parametrize("route", ["implicit", "inventory", "helper"])
 @pytest.mark.parametrize("mode", ["admission", "observer", "native-failure"])
 @pytest.mark.parametrize("source_cancel", [False, True])
 async def test_sdk_native_response_close_preserves_original_admission_and_observers(
@@ -118,6 +118,8 @@ async def test_sdk_native_response_close_preserves_original_admission_and_observ
         except BaseException:
             if route == "implicit":
                 await response.aclose()
+            elif route == "helper":
+                await close_native_execution_stream(response)
             else:
                 inventory = NativeExecutionStreamOwner()
                 inventory.retain(response)

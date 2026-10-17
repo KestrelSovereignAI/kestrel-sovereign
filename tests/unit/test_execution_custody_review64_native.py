@@ -4,7 +4,7 @@ import asyncio
 import httpx
 import pytest
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.execution_custody import execution_cleanup_debts
+from kestrel_sovereign.execution_custody import execution_cleanup_debts, _explicit_control_chain
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.openrouter_adapter import OpenRouterAdapter
 
@@ -37,8 +37,10 @@ async def test_discovery_failure_retains_original_temporary_native_client_for_sh
         attempts.append(client)
         raise original
     monkeypatch.setattr(httpx.AsyncClient, "aclose", failed_close)
+    source_graph = tuple(_explicit_control_chain(original))
+    source_debts = tuple(execution_cleanup_debts(original))
     try:
-        with pytest.raises(OSError) as caught:
+        with pytest.raises(BaseException) as caught:
             if lane == "local-record":
                 await service._record_discovery("offline-local", service._discover_local_openai_compatible(
                     "offline-local", {"base_url": base, "context_limit": 4096}))
@@ -46,22 +48,27 @@ async def test_discovery_failure_retains_original_temporary_native_client_for_sh
                 adapter = OpenRouterAdapter()
                 adapter.api_key, adapter.base_url = "loopback-not-a-secret", base
                 await service._safe_list_models("offline-openrouter", adapter, None)
-        assert caught.value is original and len(requests) == len(attempts) == 1
+        assert original in tuple(_explicit_control_chain(caught.value))
+        assert tuple(_explicit_control_chain(original)) == source_graph
+        assert tuple(execution_cleanup_debts(original)) == source_debts
+        assert len(requests) == len(attempts) == 1
         resource, closer = execution_cleanup_debts(caught.value)[0]
         assert resource is attempts[0] and closer.done() and closer.exception() is original
         assert service.has_pending_close_owners()
         for _ in range(2):
-            with pytest.raises(OSError) as shutdown:
+            with pytest.raises(BaseException) as shutdown:
                 await service.close()
-            assert shutdown.value is original
+            assert original in tuple(_explicit_control_chain(shutdown.value))
+            assert tuple(_explicit_control_chain(original)) == source_graph
+            assert tuple(execution_cleanup_debts(original)) == source_debts
         assert attempts == [resource], "shutdown retried a failed original temporary transport close"
         assert resource in service._llm_native_retirement_resources.values()
     finally:
         monkeypatch.undo()
         try:
             await service.close()
-        except OSError as retained:
-            assert retained is original
+        except BaseException as retained:
+            assert original in tuple(_explicit_control_chain(retained))
         server.close()
         await server.wait_closed()
         for peer_task in tuple(peers):

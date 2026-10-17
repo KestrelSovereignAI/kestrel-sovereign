@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
+from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
 
 
 @pytest.mark.asyncio
@@ -228,14 +229,18 @@ async def test_temporary_ollama_pool_has_physical_retirement_owner(monkeypatch, 
     adapter = OllamaAdapter()
     try:
         if close_failure:
-            with pytest.raises(OSError) as caught:
+            with pytest.raises(BaseException) as caught:
                 await getattr(adapter, discovery)()
-            assert caught.value is original
+            assert original in tuple(_explicit_control_chain(caught.value))
+            assert not execution_cleanup_debts(original)
             first = adapter._discovery_clients[sdk._client]
             assert first.done() and not peer_done.is_set()
-            with pytest.raises(OSError) as caught:
+            with pytest.raises(BaseException) as caught:
                 await adapter.aclose()
-            assert caught.value is original
+            assert original in tuple(_explicit_control_chain(caught.value))
+            assert not execution_cleanup_debts(original)
+            assert execution_cleanup_debts(caught.value)
+            assert all(resource is sdk._client and task.done() for resource, task in execution_cleanup_debts(caught.value))
             assert adapter._discovery_clients[sdk._client] is first
             assert calls == [True]
         else:

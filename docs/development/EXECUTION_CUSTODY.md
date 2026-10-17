@@ -1773,7 +1773,7 @@ pending cancellation request.
 
 ### SDK retry and normalization boundaries
 
-Non-stream OpenAI/Anthropic SDK operations share the existing native-response
+Non-stream OpenAI/Anthropic/Ollama SDK operations share the existing native-response
 owner across their SDK attempts. The HTTPX `send` boundary records actual
 transport, eager-body and async-observer control before SDK normalization; a
 retry checks that same operation's original control before dispatch. This is
@@ -1781,6 +1781,14 @@ per-operation evidence, never client-wide poisoning or new work authority.
 Fresh caller scopes can reuse the same healthy shared client. Streaming keeps
 its existing explicit acquisition/transfer boundaries; private/temporary SDK
 client-lifetime inventory is a separate acceptance requirement.
+
+Ollama's actual embedding, chat, raw-request and catalog/capability producers
+enter that same operation owner before SDK error normalization. Catalog owners
+span both the initial listing and later per-model metadata requests. A SDK
+wrapper that suppresses an exception cause, or a capability probe that would
+otherwise return ordinary unavailability, cannot consume the owner's original
+native control. The measured localhost cases cover installed Ollama 0.6.1;
+they are not authenticated generation or production model acceptance.
 
 The [official Python SDK retry contract](https://developers.openai.com/api/reference/python#retries)
 documents configurable automatic retries. Installed OpenAI2.46.0 and Anthropic
@@ -1799,6 +1807,14 @@ Private close debt does not mutate a shared source exception. Loopback SDK
 cases cover both the underlying response close and the actual SDK retry path
 with refused inner cleanup; they are not public-provider acceptance.
 
+Finite original retention and isolation are the canonical physical-close
+defaults, including outer HTTP-body and adapter stream finalizers. Plain
+`GeneratorExit` is iterator-close protocol, not an independent failure to
+promote over actual observer cancellation. A control-bearing `GeneratorExit`
+still remains original evidence. Failed native retirement keeps its exact
+resource and accepted closer on a private debt carrier, never on a shared
+source exception; later shutdown observes that same attempt without retrying it.
+
 Core signal terminal/admission handles explicitly borrow their dispatcher-owned
 operations. Withdrawing an ACK observer does not cancel a dispatch; explicit
 handle cancellation remains available for that purpose. Restart wake consumers
@@ -1807,6 +1823,23 @@ failure owner and fence later wake retries rather than treating UNKNOWN as
 retryable absence. These tests use actual Core handles, Agent constructor/task
 components and native SQL fault fixtures, not cognition, Agent READY or a host
 restart. This does not change or certify standalone SDK consumers outside Core.
+
+An ACK observer's withdrawal does not end its borrowed producer's lifetime.
+The existing in-flight row guard survives until the original producer finishes;
+its completion callback retains late native control in the existing Feature
+owner. Feature disable/re-enable does not erase that pending guard. A replacement
+Feature also checks the Agent's existing original control before retrying, so
+instance replacement cannot turn retained uncertainty into undelivered absence.
+
+Durable cognition settlement registration is an awaited admission boundary.
+Task allocation, request binding and callback publication refusal retire the
+exact original request generation before returning; an accepted idle barrier
+is cancelled and physically joined first. A partially published callback is
+removed from the original dispatcher owner. If registration retirement itself
+fails, finite isolated composition keeps the opening and cleanup failures plus
+the exact Agent/request/generation debt instead of claiming Stop completion.
+Constructor/SQLite registration tests establish this finite component boundary,
+not distributed Stop, Agent initialization or durable ACK/NACK acceptance.
 
 Failed Hold admission keeps both the actual read failure and exact-token native
 rollback outcome. Local pending-admission bookkeeping can unwind after release,

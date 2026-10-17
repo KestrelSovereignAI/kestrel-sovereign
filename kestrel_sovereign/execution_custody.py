@@ -1067,14 +1067,15 @@ def retain_native_execution_http_client_close(client: Any) -> None:
 
 
 async def close_native_execution_stream(
-    stream: Any, owner: Any = None, *, retain_originals: bool = False,
+    stream: Any, owner: Any = None, *, retain_originals: bool = True,
     close_operation: Callable[[Any], Awaitable[None]] | None = None,
-    isolate_control_originals: bool = False,
+    isolate_control_originals: bool = True,
 ) -> None:
     """Physically join an acquired SDK/native close under cleanup-only custody.
 
-    Lifecycle epilogues may retain the opening cancellation and failed native
-    closer together. Legacy stream consumers keep their existing selection.
+    A physical epilogue is a finite observation: by default its opening,
+    native closer and actual observer withdrawal all remain explicit, without
+    appending private retirement history to a shared source receipt.
     An acquired SDK context/result can supply its exact physical exit instead
     of a method on that value; admission and failed-owner debt stay canonical.
     """
@@ -1115,8 +1116,13 @@ async def close_native_execution_stream(
                 (stream, close_task),
             )
     if outcome.error is not None or outcome.cancellation is not None:
-        if (not retain_originals and outcome.error is None and outcome.cancellation is not None
+        if (outcome.error is None and outcome.cancellation is not None
+            and (original is None or isinstance(original, GeneratorExit))
             and not is_execution_control_error(original)):
+            # Plain GeneratorExit is the iterator's close protocol, not an
+            # independent failure. Attaching it beneath actual withdrawal
+            # lets later ordinary selectors incorrectly promote it over C.
+            # A control-bearing GeneratorExit is still original evidence.
             raise outcome.cancellation
         raise execution_terminal_error(
             original, outcome.error, retirement, outcome.cancellation,
