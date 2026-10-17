@@ -191,10 +191,21 @@ advertised; track this in [#3684](https://github.com/KestrelSovereignAI/kestrel-
 Upgrade beyond the experimental candidate when needed; do not build an adapter
 or label the old core type a native extension result.
 
+The A2A candidate also has an independent signed-card gate. In `a2a-sdk==1.2.2`,
+`AgentCard.documentation_url = ""` has protobuf presence and survives
+`MessageToDict`, but the signing helper removes it; required empty description
+and capabilities disappear too. Both signing and verification use that cleanup.
+`AgentInterface.tenant` has no scalar presence in the generated descriptor.
+The normative presence rules must win: upgrade/fix the official SDK under
+[#3685](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3685),
+with canonical-byte vectors and independent verification before signed cards
+or the coordinated A2A cutover ship. No Kestrel canonicalization fork.
+
 ## Open release gates
 
 - Complete the OAuth acceptance experiment above, proving the SDK did not silently use DCR.
 - Resolve the native Tasks SDK support gate in #3684 before advertising it.
+- Resolve the signed-card SDK canonicalization gate in #3685 before the A2A cutover.
 - Gate extensions on negotiated capabilities; track upstream modern gateway support in #3683.
 - Before the breaking A2A core/SDK release, update Talon/Features core ceilings
   and the SDK ceilings of Telegram/Talon/Features/Claws/Eye/Flight. Test their

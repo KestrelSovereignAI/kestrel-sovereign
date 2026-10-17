@@ -320,19 +320,27 @@ request. Validate that tenant against the route-selected recipient for send,
 get/list/cancel/subscribe and push configuration before authorization or side
 effects; do not silently route based on a caller-supplied tenant. A mismatch
 fails with the binding's standard error. The sender copies the selected
-interface tenant exactly, including its field-presence semantics.
+interface tenant exactly; omit it when the selected interface advertises none.
+`AgentInterface.tenant` is a no-presence protobuf scalar: its empty value cannot
+be distinguished from unset and is omitted from canonical card JSON.
 
-The bindings carry tenant differently: JSON-RPC reads it from the SDK request
-body; HTTP+JSON uses the SDK's `/{tenant}` route alias. Serve that REST alias
-only for the exact non-empty tenant advertised by the route-selected agent;
-use base REST routes for the advertised default/empty tenant. Choose path-safe
-opaque tenant identifiers and let the SDK encode/decode them. A tenant segment
-never re-selects the host agent. Both aliases and the bare deployment route
-retain the host's selected recipient, then compare the binding's decoded tenant
-to its advertised value before authorization or storage access. Wrong-tenant
-paths/bodies fail even with a valid peer transport credential. Derive transport
-admission from the same binding registration, including REST tenant-qualified
-paths; do not maintain a second incomplete pattern list.
+JSON-RPC carries tenant in the SDK request body. HTTP+JSON uses the SDK's
+`/{tenant}` route alias and can also carry tenant in the JSON body (the SDK
+REST client sends both on send/stream/cancel/push writes). The dispatcher does
+not reconcile them: its call-context tenant comes from the path while the
+parsed request keeps the body value. Validate both before handing the request
+to authorization, task storage or a side-effecting handler. Every present REST
+body tenant must exactly equal the decoded path tenant AND the value advertised
+for the already-selected recipient/interface. On a bare REST route the path
+represents the advertised default/empty tenant, so any non-empty body tenant
+fails. This applies to standard-only peers as well as DID-extension peers.
+The route-selected agent remains the sole recipient; neither tenant carrier
+can select or override it. Reject a mismatch with the binding's standard error,
+even with a valid peer transport credential. Serve tenant-qualified aliases
+only for the exact non-empty advertised tenant and base routes for its default.
+Choose path-safe opaque values and let the SDK encode/decode them. Derive
+transport admission from the same binding registration, including both aliases
+and REST tenant-qualified paths; do not maintain a separate pattern list.
 
 The public card endpoints need narrowly matched, prefix-aware exemptions in
 host authentication middleware, which runs before agent prefix stripping.
@@ -392,11 +400,24 @@ retry/idempotency behavior. Reads/cancels also bind method, target and audience.
 The Agent Card has a separate standard JWS signature over the SDK card's JCS
 representation. Before JCS, apply A2A 1.0 section 5.7/8.4.1 presence rules:
 omit optional-and-unset fields and implicit defaults, retain required fields
-and explicitly set optional defaults, and exclude `signatures`. This includes
-the special presence requirements for each interface's `tenant`. Use the SDK's
-signing/serialization helpers and published vectors; plain `model_dump()` plus
-JCS is insufficient. Use the agent's
-Ed25519 verification method and a DID-bound `kid`; the existing hybrid message
+and explicitly set optional defaults, and exclude `signatures`. The normative
+[section 8.4.1](https://a2a-protocol.org/v1.0.0/specification/#841-canonicalization-requirements)
+is the canonical-byte oracle, not a same-helper signing round trip.
+
+**Signed-card release gate:** `a2a-sdk==1.2.2` does not implement that oracle:
+its signing helper recursively removes empty strings/objects/arrays, including
+explicit optional `documentationUrl: ""` and required empty `description` or
+`capabilities`. Both its signer and verifier share this defect. Resolve
+[#3685](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3685) by
+upgrading to a corrected official SDK release or contributing the repair to
+that SDK and consuming a tested release. Do not ship a Kestrel canonicalizer,
+relax verification, or remove valid empty fields just to evade the defect.
+Check in normative canonical-byte/signature vectors for required empties,
+absent versus explicitly empty optional values, explicit false capabilities,
+and the implicit empty interface tenant. Require both official SDK helpers
+and an independent verifier to pass before releasing signed cards and the
+coordinated A2A cutover. Plain `model_dump()` plus JCS is insufficient.
+Use the agent's Ed25519 verification method and a DID-bound `kid`; the existing hybrid message
 proof is not substituted for an interoperable Agent Card signature. Verify the
 card against a trusted DID resolution result before trusting advertised URLs
 or capabilities. A card containing its own untrusted key is not a trust root.
@@ -500,4 +521,6 @@ manual MRTR ownership/state expiry, model/app visibility isolation, MRTR
 operation rebinding, unknown outcomes after stream loss, private cache
 isolation, tenant mismatch, peer transport admission for both bindings/aliases,
 public discovery without an operator key, no-common-revision failure and
-protobuf-presence signature vectors. Final acceptance also searches for every retired wire surface.
+REST path/body tenant disagreement for signed and standard-only principals,
+protobuf-presence signature vectors against the normative oracle and an SDK
+release that passes #3685. Final acceptance also searches for every retired wire surface.
