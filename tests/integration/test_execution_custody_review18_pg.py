@@ -63,6 +63,7 @@ async def join_owned(agent, dispatcher):
 @pytest.mark.parametrize("receipt", ["nack", "fallback", "committed-nack"])
 @pytest.mark.parametrize("control", ["denied", "unknown", "committed"])
 @pytest.mark.parametrize("carrier", ["direct", "wrapped", "cancel"])
+@pytest.mark.timeout(10)
 async def test_native_failure_receipt_control_settles_or_retains_exact_delivery(native_pg, receipt, control, carrier):
     backend, controller, _schema = native_pg
     agent, dispatcher, delivery, signal = await setup_delivery(native_pg)
@@ -88,8 +89,7 @@ async def test_native_failure_receipt_control_settles_or_retains_exact_delivery(
         dispatcher.nack_durable_delivery = fail_receipt
     try:
         with pytest.raises(BaseException) as caught:
-            async with asyncio.timeout(0.5):
-                await route(dispatcher, delivery, signal)
+            await route(dispatcher, delivery, signal)
         assert caught.value is error
         state = await controller.fetchval("SELECT status FROM durable_signal_deliveries WHERE delivery_id='delivery1'")
         # The exact original retry capability now survives a committed NACK,
@@ -109,6 +109,7 @@ async def test_native_failure_receipt_control_settles_or_retains_exact_delivery(
 @pytest.mark.parametrize("control", ["denied", "unknown", "committed"])
 @pytest.mark.parametrize("carrier", ["direct", "wrapped", "cancel"])
 @pytest.mark.parametrize("late_commit", [False, True])
+@pytest.mark.timeout(10)
 async def test_native_renewal_control_survives_cooperative_or_retained_cognition(native_pg, monkeypatch, stubborn, control, carrier, late_commit):
     backend, controller, _schema = native_pg
     agent, dispatcher, delivery, signal = await setup_delivery(native_pg)
@@ -150,8 +151,9 @@ async def test_native_renewal_control_survives_cooperative_or_retained_cognition
     dispatcher.renew_durable_delivery_lease = renew
     try:
         with pytest.raises(BaseException) as caught:
-            async with asyncio.timeout(0.5):
-                await route(dispatcher, delivery, signal)
+            # The external test watchdog bounds the whole case without
+            # injecting a new cancellation into the owner under observation.
+            await route(dispatcher, delivery, signal)
         assert caught.value is error
         assert cancelled.is_set() is (not late_commit)
         if stubborn and not late_commit:
@@ -170,3 +172,34 @@ async def test_native_renewal_control_survives_cooperative_or_retained_cognition
         await asyncio.gather(*tuple(dispatcher._retained_durable_cognition_tasks), return_exceptions=True)
         await asyncio.sleep(0)
         await join_owned(agent, dispatcher)
+
+
+@pytest.mark.timeout(10)
+async def test_renewal_control_identity_is_not_changed_by_test_observer_deadline(native_pg, monkeypatch):
+    """A finite slow return after a real COMMIT is not caller withdrawal."""
+    backend, _observer, _schema = native_pg
+    actual_execute = backend.execute
+    release = asyncio.Event()
+    handles = []
+
+    async def execute(query, *args, **kwargs):
+        result = await actual_execute(query, *args, **kwargs)
+        if "committed before renewal join" in query:
+            # Delay only the acknowledged native return, with no CPU load or
+            # provider request. The old in-band 0.5s test timeout interrupts
+            # the observer and can convert the ORIGINAL control cancellation
+            # into TimeoutError, invalidating its own identity assertion.
+            handles.append(asyncio.get_running_loop().call_later(0.65, release.set))
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(backend, "execute", execute)
+    try:
+        await test_native_renewal_control_survives_cooperative_or_retained_cognition(
+            native_pg, monkeypatch, stubborn=True, control="unknown",
+            carrier="cancel", late_commit=True,
+        )
+    finally:
+        release.set()
+        for handle in handles:
+            handle.cancel()

@@ -837,8 +837,9 @@ class SignalDispatcher:
         # cancelled-before-start reservation reconciled) before storage closes.
         self._outcome_log_tasks: set[asyncio.Task] = set()
         self._outcome_log_tasks_by_signal: dict[str, set[asyncio.Task]] = {}
-        # One bounded, strongest receipt survives completion callbacks and
-        # fences this dispatcher until its storage outcome is reconciled.
+        # One bounded, strongest receipt survives completion callbacks for
+        # durable transition/repair AND outcome writers. The historical name
+        # is retained; these writers share one storage outcome/admission fence.
         self._outcome_log_control_error: BaseException | None = None
         # Cursor-owned cognition must not write a route-level outcome before
         # its exact durable ACK/NACK decision.  The task-local collector lets
@@ -1003,6 +1004,8 @@ class SignalDispatcher:
         no new operation can reach durable storage; work admitted before that
         point remains valid and shutdown waits for it to finish.
         """
+        if self._outcome_log_control_error is not None:
+            raise execution_terminal_error(self._outcome_log_control_error)
         current_task = asyncio.current_task()
         if current_task is None:  # pragma: no cover - async APIs run in Tasks
             raise RuntimeError("Durable signal delivery requires an asyncio task")
@@ -1162,8 +1165,6 @@ class SignalDispatcher:
         admission_error = None
         try:
             async with self._admit_durable_operation():
-                if self._outcome_log_control_error is not None:
-                    raise execution_terminal_error(self._outcome_log_control_error)
                 result = await self._run(
                     signal,
                     start,
@@ -2846,35 +2847,42 @@ class SignalDispatcher:
         for reservation in reservations:
             self._discard_transient_durable_handoff(reservation.delivery_id)
 
-        for reservation in reservations:
-            while True:
-                try:
-                    abandoned = await self._durable_store.abandon_initial_reservation(
-                        agent_id=self._agent.did,
-                        consumer_id=reservation.consumer_id,
-                        delivery_id=reservation.delivery_id,
-                        owner_id=self._durable_delivery_owner,
-                        reservation_token=reservation.reservation_token,
-                    )
-                except asyncio.CancelledError:
-                    # The repair task is normally protected by its parent's
-                    # shield, but a direct cancellation (for example during
-                    # event-loop teardown) can still arrive at this await.
-                    # Retrying the owner/token-conditional release is safe and
-                    # ensures the cancellation cannot leave an INITIAL_RESERVED
-                    # row behind.
-                    continue
-                if not abandoned:
-                    # A transaction that definitely rolled back reaches this
-                    # path too: the dispatcher deliberately keeps its opaque
-                    # capability until conditional repair proves there is no
-                    # matching committed row.  This is an expected no-op, not
-                    # an ownership violation.
-                    logger.debug(
-                        "Committed-reservation repair found no matching row for %s",
-                        reservation.delivery_id,
-                    )
-                break
+        withdrawal = None
+        try:
+            for reservation in reservations:
+                while True:
+                    try:
+                        abandoned = await self._durable_store.abandon_initial_reservation(
+                            agent_id=self._agent.did,
+                            consumer_id=reservation.consumer_id,
+                            delivery_id=reservation.delivery_id,
+                            owner_id=self._durable_delivery_owner,
+                            reservation_token=reservation.reservation_token,
+                        )
+                    except asyncio.CancelledError as error:
+                        # Ordinary observer withdrawal can defer reporting
+                        # until mandatory CAS repair settles. Native UNKNOWN
+                        # is different: a later no-match cannot reconcile an
+                        # acknowledgement already lost on this original CAS.
+                        if is_execution_control_error(error):
+                            raise
+                        withdrawal = withdrawal or error
+                        continue
+                    if not abandoned:
+                        logger.debug(
+                            "Committed-reservation repair found no matching row for %s",
+                            reservation.delivery_id,
+                        )
+                    break
+        except BaseException as error:
+            terminal = execution_terminal_error(
+                error, withdrawal, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
+            )
+            self._retain_durable_writer_control(terminal)
+            raise terminal
+        if withdrawal is not None:
+            raise withdrawal
 
     async def _repair_post_commit_reservations(self, persisted) -> None:
         """Finish committed-reservation repair despite repeated cancellation.
@@ -2889,15 +2897,43 @@ class SignalDispatcher:
         for reservation in persisted.initial_reservations:
             self._discard_transient_durable_handoff(reservation.delivery_id)
 
-        repair_task = asyncio.create_task(
-            self._requeue_committed_initial_reservations(persisted),
-            name=f"durable_signal_post_commit_repair:{self._agent.did}",
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task, create_owned_task, owned_task_error,
         )
-        self._post_commit_reservation_repairs.add(repair_task)
-        repair_task.add_done_callback(self._post_commit_reservation_repairs.discard)
-        from kestrel_sovereign._async_ownership import await_owned_task
+
+        def completed(task):
+            self._post_commit_reservation_repairs.discard(task)
+            self._retain_durable_writer_control(owned_task_error(task))
+
+        try:
+            repair_task = create_owned_task(
+                self._requeue_committed_initial_reservations(persisted),
+                name=f"durable_signal_post_commit_repair:{self._agent.did}",
+                retain_originals=True, retirement_resource=self,
+            )
+        except BaseException as error:
+            self._retain_durable_writer_control(error)
+            raise
+        try:
+            self._post_commit_reservation_repairs.add(repair_task)
+            repair_task.add_done_callback(completed)
+        except BaseException as error:
+            # Accepted work cannot escape a later publication refusal. This
+            # async owner can physically join it before propagating failure.
+            outcome = await await_owned_task(repair_task)
+            self._post_commit_reservation_repairs.discard(repair_task)
+            terminal = execution_terminal_error(
+                error, outcome.error, outcome.cancellation,
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
+            self._retain_durable_writer_control(terminal)
+            raise terminal
         outcome = await await_owned_task(repair_task)
-        error = execution_terminal_error(outcome.error, outcome.cancellation)
+        error = execution_terminal_error(
+            outcome.error, outcome.cancellation, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
         if error is not None:
             raise error
 
@@ -2915,9 +2951,22 @@ class SignalDispatcher:
             error = None
             for repair in repairs:
                 outcome = await await_owned_task(repair)
-                error = execution_terminal_error(error, outcome.error, outcome.cancellation)
+                error = execution_terminal_error(
+                    error, outcome.error, outcome.cancellation,
+                    retain_originals=True, prefer_cancellation=True,
+                    isolate_control_originals=True,
+                )
             if error is not None:
                 raise error
+        if self._outcome_log_control_error is not None:
+            raise execution_terminal_error(self._outcome_log_control_error)
+
+    def _retain_durable_writer_control(self, error: BaseException | None) -> None:
+        """One existing bounded safety latch for this runtime's native writers."""
+        if error is not None and is_execution_control_error(error):
+            self._outcome_log_control_error = execution_terminal_error(
+                self._outcome_log_control_error, error,
+            )
 
     def _runtime_owner_cleanup_required(self) -> bool:
         """Keep exact owner protection until retained cognition has joined."""
@@ -4088,7 +4137,10 @@ class SignalDispatcher:
                                         "failure: %s",
                                         cleanup_exc,
                                     )
-                                    raise execution_terminal_error(exc, cleanup_exc)
+                                    raise execution_terminal_error(
+                                        exc, cleanup_exc, retain_originals=True,
+                                        isolate_control_originals=True,
+                                    )
                             raise
                         if persisted.created:
                             try:
@@ -4113,7 +4165,10 @@ class SignalDispatcher:
                                         "failure: %s",
                                         cleanup_exc,
                                     )
-                                    raise execution_terminal_error(exc, cleanup_exc)
+                                    raise execution_terminal_error(
+                                        exc, cleanup_exc, retain_originals=True,
+                                        isolate_control_originals=True,
+                                    )
                                 if is_execution_control_error(exc):
                                     raise
                                 if isinstance(exc, Exception):
@@ -7069,9 +7124,7 @@ class SignalDispatcher:
             from kestrel_sovereign._async_ownership import owned_task_error
             error = owned_task_error(task)
             if error is not None and is_execution_control_error(error):
-                self._outcome_log_control_error = execution_terminal_error(
-                    self._outcome_log_control_error, error,
-                )
+                self._retain_durable_writer_control(error)
             elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # _log_safe reports storage/UI errors itself.  This is a
                 # defensive harvest for an unexpected task-body failure.
@@ -7118,7 +7171,7 @@ class SignalDispatcher:
             logger.error("Failed to write signal_log entry for %s", signal.id,
                          exc_info=(type(exc), exc, exc.__traceback__))
             if is_execution_control_error(exc):
-                self._outcome_log_control_error = execution_terminal_error(self._outcome_log_control_error, exc)
+                self._retain_durable_writer_control(exc)
                 raise execution_terminal_error(exc, outcome.cancellation)
             if not isinstance(exc, Exception):
                 raise execution_terminal_error(exc, outcome.cancellation)

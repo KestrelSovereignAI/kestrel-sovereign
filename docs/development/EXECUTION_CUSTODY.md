@@ -1732,3 +1732,29 @@ acceptance instead closes the unstarted operation and releases only that unused
 lease. Native tests persist synthetic evidence through actual storage/PG before
 rollback and separately confirm the healthy rollback and refusal paths. They do
 not certify production patient data or whole-Agent readiness.
+
+### Reservation repair and quarantine transfer
+
+Post-commit reservation repair uses the original runtime owner/token CAS. An
+UNKNOWN acknowledgement, even carried by the repair Task's cancellation, is
+terminal evidence: a second CAS miss cannot turn it into a successful repair.
+Ordinary withdrawal is deferred through mandatory repair, then reported using
+the actual original cancellation. Canonical admission closes refused unstarted
+operations; accepted repairs are joined even if later publication fails. The
+existing durable-writer safety latch fences subsequent admission and owner
+release after uncertain repair, without another ownership registry. Finite
+outer composition retains opening and repair failures; ordinary opening-error
+priority remains compatible with existing callers.
+
+Quarantine fences delegated spending synchronously but retains the exact hold
+until the refund acknowledges success. The same ordinary release owner admits
+the refund before quarantine publication. Only accepted publication transfers
+that exact Task to the reaper; refusal leaves its existing owner available for
+terminal joining. Inner ordinary admission uses the same canonical primitive.
+Local PostgreSQL ledger peers establish effects and lost acknowledgements, not
+real funds, production wallet acceptance or Agent READY.
+
+Paired Hold probes are lazy owned operations at every consumer. Partial Task
+admission joins accepted peers before backend retirement; later peer control
+and actual withdrawals survive finite terminal selection. Failed same-cluster
+preflight tests do not establish successful independent-cluster Hold boot.

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Iterable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 from uuid import UUID, uuid4
 
 try:  # pragma: no cover - exercised on Kestrel's POSIX deployment targets
@@ -34,7 +34,7 @@ try:  # pragma: no cover - imported only on Windows
 except ImportError:  # pragma: no cover - POSIX has no Windows byte-range locks
     msvcrt = None  # type: ignore[assignment]
 
-from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+from kestrel_sovereign._async_ownership import await_owned_task, gather_owned, raise_owned_outcome
 from kestrel_sovereign.private_storage import (
     PrivateStorageError,
     absolute_without_following_leaf,
@@ -727,28 +727,18 @@ def postgres_hold_custody_snapshot_from_rows(
 
 
 async def _gather_database_probes(
-    *probes: Awaitable[Any],
+    *probes: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, ...]:
-    """Cancel and await every sibling before a failed probe leaves its scope."""
+    """Admit lazily and join every accepted probe before backend retirement.
 
-    tasks = tuple(asyncio.ensure_future(probe) for probe in probes)
-    try:
-        return tuple(await asyncio.gather(*tasks))
-    except BaseException as failure:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        cleanup = asyncio.gather(*tasks, return_exceptions=True)
-        while not cleanup.done():
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                # Repeated cancellation must not let a database probe escape
-                # into host-context pool cleanup. Re-raise the original failure
-                # only after every owned child has reached a terminal state.
-                continue
-        await cleanup
-        raise
+    Later admission refusal must not strand earlier peers or leave unstarted
+    coroutines behind. Finite original selection also preserves peer native
+    uncertainty and actual observer withdrawal without mutating source errors.
+    """
+    return tuple(await gather_owned(
+        (probe() for probe in probes), retain_originals=True,
+        isolate_control_originals=True,
+    ))
 
 
 @asynccontextmanager
@@ -1034,15 +1024,15 @@ async def _connect_postgres_hold_custody_backends(
     )
     try:
         await _gather_database_probes(
-            primary_backend.connect(),
-            evidence_backend.connect(),
+            primary_backend.connect,
+            evidence_backend.connect,
         )
         primary_cluster, evidence_cluster = await _gather_database_probes(
-            _read_raw_postgres_cluster_identity(
+            lambda: _read_raw_postgres_cluster_identity(
                 primary_backend,
                 label="primary",
             ),
-            _read_raw_postgres_cluster_identity(
+            lambda: _read_raw_postgres_cluster_identity(
                 evidence_backend,
                 label="evidence",
             ),
@@ -1058,11 +1048,11 @@ async def _connect_postgres_hold_custody_backends(
             # two unlocked per-database reads can otherwise construct a state
             # that never existed as one custody snapshot.
             primary, evidence = await _gather_database_probes(
-                _read_postgres_hold_custody_snapshot(
+                lambda: _read_postgres_hold_custody_snapshot(
                     primary_backend,
                     label="primary",
                 ),
-                _read_postgres_hold_custody_snapshot(
+                lambda: _read_postgres_hold_custody_snapshot(
                     evidence_backend,
                     label="evidence",
                 ),
@@ -2829,8 +2819,8 @@ class HoldStore:
                 "PostgreSQL Hold requires an independent evidence database"
             )
         primary, evidence = await _gather_database_probes(
-            self._postgres_cluster_identity(self._db, label="primary"),
-            self._postgres_cluster_identity(evidence_db, label="evidence"),
+            lambda: self._postgres_cluster_identity(self._db, label="primary"),
+            lambda: self._postgres_cluster_identity(evidence_db, label="evidence"),
         )
         if primary == evidence:
             raise HoldStateError(
@@ -2872,22 +2862,22 @@ class HoldStore:
 
         return tuple(
             await _gather_database_probes(
-                self._read_postgres_binding(
+                lambda: self._read_postgres_binding(
                     self._db,
                     _POSTGRES_PRIMARY_BINDING_KEY,
                     label="primary",
                 ),
-                self._read_postgres_binding(
+                lambda: self._read_postgres_binding(
                     evidence_db,
                     _POSTGRES_EVIDENCE_BINDING_KEY,
                     label="evidence",
                 ),
-                self._read_postgres_binding(
+                lambda: self._read_postgres_binding(
                     self._db,
                     _POSTGRES_EVIDENCE_BINDING_KEY,
                     label="primary",
                 ),
-                self._read_postgres_binding(
+                lambda: self._read_postgres_binding(
                     evidence_db,
                     _POSTGRES_PRIMARY_BINDING_KEY,
                     label="evidence",
@@ -2927,8 +2917,8 @@ class HoldStore:
         if evidence_db is None:
             return
         primary, evidence = await _gather_database_probes(
-            self._postgres_domain_identity(self._db, label="primary"),
-            self._postgres_domain_identity(evidence_db, label="evidence"),
+            lambda: self._postgres_domain_identity(self._db, label="primary"),
+            lambda: self._postgres_domain_identity(evidence_db, label="evidence"),
         )
         if primary == evidence:
             raise HoldStateError(

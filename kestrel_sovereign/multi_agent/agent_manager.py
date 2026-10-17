@@ -10849,39 +10849,39 @@ class AgentManager:
         if self._quarantined_shutdown_handoffs_sealed:
             return False
 
-        entry = self._child_budgets.pop(child_name, None)
+        entry = self._child_budgets.get(child_name)
         if entry is None:
             return False
         delegated, parent_wallet = entry
         delegated.fence_spending()
 
         async def release() -> None:
-            try:
-                returned = await release_delegated_wallet(delegated, parent_wallet)
-            except BaseException:
-                # Quarantine fenced the wallet before withdrawing routing, but
-                # its refund is still an ordinary ownership obligation.  Keep
-                # the *exact* allocation entry retryable after a provider
-                # failure/cancellation, just as the non-quarantined path does.
-                # A new same-name create is refused while this entry remains,
-                # so restoration cannot attach old money to a new identity.
-                if child_name not in self._child_budgets:
-                    self._child_budgets[child_name] = entry
-                raise
-            logger.info(
-                "Released quarantined delegated budget for '%s': returned %s to parent (#2113).",
-                child_name,
-                returned,
-            )
+            # The same release implementation keeps the exact hold until its
+            # provider confirms success. Fencing does not withdraw ownership.
+            await self._release_child_budget(child_name)
 
-        task = asyncio.create_task(
-            release(), name=f"agent_budget_release_quarantine:{child_name}"
+        record = self._start_child_budget_release(
+            child_name, release_operation=release,
         )
+        task = record.task
+        if task.done():
+            failure = owned_task_error(task)
+            if failure is not None:
+                raise failure
+            return True
+        # The existing ordinary-release record owns this exact Task BEFORE
+        # reaper publication. A refused publication leaves that owner intact;
+        # terminal drains can still join it and retain late native failure.
         self._retain_quarantined_cleanup(
             name=child_name,
             agent_id=agent_id,
             task=task,
         )
+        # Transfer the existing owner only after accepted publication. The
+        # ordinary completion observer recognizes that its record transferred.
+        self._inflight_removal_budget_releases.pop(record.release_id, None)
+        if self._inflight_removal_budget_releases_by_child.get(child_name) is record:
+            self._inflight_removal_budget_releases_by_child.pop(child_name, None)
         logger.warning(
             "Handed delegated budget for %r to quarantined cleanup after immediate spend fence.",
             child_name,
@@ -10930,7 +10930,8 @@ class AgentManager:
         )
 
     def _start_child_budget_release(
-        self, child_name: str
+        self, child_name: str, *,
+        release_operation: Optional[Callable[[], Awaitable[object]]] = None,
     ) -> InflightRemovalBudgetRelease:
         """Admit or join one ordinary child-budget release under ``_lock``."""
 
@@ -10951,8 +10952,9 @@ class AgentManager:
         release_id = f"ordinary-budget-release:{self._next_removal_budget_release_id}"
         started_monotonic = time.monotonic()
         try:
-            release_awaitable = self._release_child_budget_cancellation_safe(
-                child_name
+            release_awaitable = (
+                release_operation() if release_operation is not None else
+                self._release_child_budget_cancellation_safe(child_name)
             )
             # Preserve the legacy already-created Future seam; fresh
             # awaitables use canonical admission and original-error capture.
@@ -10961,6 +10963,7 @@ class AgentManager:
             elif inspect.isawaitable(release_awaitable):
                 budget_release = create_owned_task(
                     release_awaitable, retain_originals=True,
+                    retirement_resource=self._child_budgets.get(child_name),
                 )
             else:
                 raise TypeError("An asyncio.Future, a coroutine or an awaitable is required")
@@ -10990,6 +10993,10 @@ class AgentManager:
         def observe_budget_release_completion(
             task: "asyncio.Future[object]",
         ) -> None:
+            if self._inflight_removal_budget_releases.get(record.release_id) is not record:
+                # The SAME Task was transferred to an accepted quarantine
+                # reaper. That owner's callback retains its terminal evidence.
+                return
             # A completed task retains its traceback-bearing frame. Remove it
             # immediately, but never discard an unsafe terminal outcome: this
             # callback can run while a terminal drain is still waiting to
@@ -11055,9 +11062,11 @@ class AgentManager:
     async def _release_child_budget_cancellation_safe(self, child_name: str) -> bool:
         """Release one removed child's hold before reporting caller cancellation."""
 
-        budget_release = asyncio.create_task(
+        budget_release = create_owned_task(
             self._release_child_budget(child_name),
             name=f"agent_budget_release:{child_name}",
+            retain_originals=True,
+            retirement_resource=self._child_budgets.get(child_name),
         )
         return await self._await_child_budget_release_cancellation_safe(budget_release)
 

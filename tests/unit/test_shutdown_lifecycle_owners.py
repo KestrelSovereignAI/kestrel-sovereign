@@ -1352,34 +1352,39 @@ async def test_quarantined_removal_fences_blocked_wallet_transfer_then_refunds_o
         child_wallet,
         BudgetAllocation(child_did=agent.agent_id, parent_did="did:parent", amount=Decimal("10")),
     )
-    manager._child_budgets["hostile"] = (delegated, parent_wallet)
+    entry = (delegated, parent_wallet)
+    manager._child_budgets["hostile"] = entry
 
     spending = asyncio.create_task(delegated.spend(Decimal("3"), "blocked debit", "FIL"))
     await asyncio.wait_for(child_wallet.transfer_entered.wait(), timeout=30.0)
     removal = asyncio.create_task(manager.remove_agent("hostile"))
     await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
 
-    assert await asyncio.wait_for(removal, timeout=0.2) is True
-    assert manager.get_agent("hostile") is None
-    assert "hostile" not in manager._child_budgets
-    assert delegated.can_spend(Decimal("1")) is False
-    assert parent_wallet.deposits == []
+    try:
+        assert await asyncio.wait_for(removal, timeout=0.2) is True
+        assert manager.get_agent("hostile") is None
+        # Spend fencing and ownership are distinct: the exact hold remains
+        # until the accepted refund physically acknowledges its one credit.
+        assert manager._child_budgets["hostile"] is entry
+        assert delegated.can_spend(Decimal("1")) is False
+        assert parent_wallet.deposits == []
 
-    child_wallet.allow_transfer.set()
-    assert await asyncio.wait_for(spending, timeout=30.0) is True
-    for _ in range(100):
-        if parent_wallet.deposits:
-            break
-        await asyncio.sleep(0)
-    assert parent_wallet.deposits == [Decimal("7")]
-    with pytest.raises(BudgetExceededError):
-        await delegated.spend(Decimal("1"), "post-refund", "FIL")
-
-    agent.allow_shutdown_finish.set()
-    for _ in range(100):
-        if all(not item["pending"] for item in manager.quarantined_shutdowns().values()):
-            break
-        await asyncio.sleep(0)
+        child_wallet.allow_transfer.set()
+        assert await asyncio.wait_for(spending, timeout=30.0) is True
+        for _ in range(100):
+            if parent_wallet.deposits:
+                break
+            await asyncio.sleep(0)
+        assert parent_wallet.deposits == [Decimal("7")]
+        assert "hostile" not in manager._child_budgets
+        with pytest.raises(BudgetExceededError):
+            await delegated.spend(Decimal("1"), "post-refund", "FIL")
+    finally:
+        child_wallet.allow_transfer.set()
+        agent.allow_shutdown_finish.set()
+        await asyncio.gather(spending, removal, return_exceptions=True)
+        for record in tuple(manager._quarantined_shutdown_reapers.values()):
+            await asyncio.gather(record.task, return_exceptions=True)
     assert all(not item["pending"] for item in manager.quarantined_shutdowns().values())
 
 
@@ -3534,18 +3539,23 @@ async def test_quarantined_refund_failure_restores_exact_hold_for_retry(monkeypa
     assert manager._handoff_child_budget_release_to_quarantined_reaper(
         "quarantined", agent_id="did:test:quarantined-refund"
     )
-    # The reaper owns this withdrawn name while the hold is temporarily out of
-    # the normal map.  A new identity cannot slip into that restoration gap.
-    await asyncio.wait_for(release_started.wait(), timeout=30.0)
-    with pytest.raises(RuntimeError, match="unresolved quarantined cleanup"):
-        await manager.load_agent(
-            "quarantined", LocalAgentConfig(data_dir="new", port=8801)
-        )
-    reaper = next(iter(manager._quarantined_shutdown_reapers.values())).task
-    allow_first_failure.set()
-    with pytest.raises(RuntimeError, match="provider refund failed"):
-        await reaper
-    await asyncio.sleep(0)
+    # The reaper owns this withdrawn name while the exact fenced hold stays
+    # tracked until refund acknowledgement. A new identity cannot replace it.
+    try:
+        await asyncio.wait_for(release_started.wait(), timeout=30.0)
+        with pytest.raises(RuntimeError, match="unresolved delegated budget cleanup"):
+            await manager.load_agent(
+                "quarantined", LocalAgentConfig(data_dir="new", port=8801)
+            )
+        reaper = next(iter(manager._quarantined_shutdown_reapers.values())).task
+        allow_first_failure.set()
+        with pytest.raises(RuntimeError, match="provider refund failed"):
+            await reaper
+        await asyncio.sleep(0)
+    finally:
+        allow_first_failure.set()
+        for record in tuple(manager._quarantined_shutdown_reapers.values()):
+            await asyncio.gather(record.task, return_exceptions=True)
 
     assert delegated.fence_calls == 1
     assert manager._child_budgets["quarantined"] is entry
