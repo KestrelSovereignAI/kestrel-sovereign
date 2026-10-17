@@ -58,14 +58,29 @@ DOORS = (
     "cli-config-pin",
     "cli-config-reconcile",
     "cli-config-route",
-    "cli-target-import",
-    "cli-target-construct",
     "cli-target-route",
     "cli-target-service",
     "cli-target-profile",
     "cli-agent-import",
     "cli-agent-construct",
 )
+
+
+def test_sync_target_lookup_cannot_import_or_construct_an_unowned_service(monkeypatch):
+    """The old target import/constructor doors no longer exist; allocation
+    remains covered on the canonical cli-agent-import/construct doors above.
+    """
+    actual_import = builtins.__import__
+    def imported(name, *args, **kwargs):
+        if name == "kestrel_sovereign.llm.service":
+            pytest.fail("synchronous target lookup imported an unowned service factory")
+        return actual_import(name, *args, **kwargs)
+    def construct():
+        pytest.fail("synchronous target lookup allocated an unowned service")
+    monkeypatch.setattr(service_module, "LLMService", construct)
+    monkeypatch.setattr(builtins, "__import__", imported)
+    error, service, profile = cli_embeddings._resolve_target()
+    assert error and "explicitly owned" in error and service is None and profile is None
 
 
 @pytest.mark.asyncio
@@ -314,22 +329,18 @@ async def test_actual_embedding_resolution_keeps_original_denial(
         if door in bindings:
             obj, name, caller, asynchronous = bindings[door]
             wrap(obj, name, caller=caller, asynchronous=asynchronous)
-        elif door in {"cli-target-import", "cli-agent-import"}:
+        elif door == "cli-agent-import":
             actual_import = builtins.__import__
 
             def imported(name, globals=None, locals=None, fromlist=(), level=0):
                 frame = inspect.currentframe().f_back
                 result = actual_import(name, globals, locals, fromlist, level)
-                if name == "kestrel_sovereign.llm.service" and frame.f_code.co_name == (
-                    "resolve_agent_embedding"
-                    if door == "cli-agent-import"
-                    else "_resolve_target"
-                ):
+                if name == "kestrel_sovereign.llm.service" and frame.f_code.co_name == "resolve_agent_embedding":
                     fault()
                 return result
 
             monkeypatch.setattr(builtins, "__import__", imported)
-        elif door in {"cli-target-construct", "cli-agent-construct"}:
+        elif door == "cli-agent-construct":
             actual_factory = service_module.LLMService
 
             def factory():
@@ -396,9 +407,7 @@ async def test_actual_embedding_resolution_keeps_original_denial(
             elif door.startswith("cli-agent-"):
                 result = await cli_embeddings.resolve_agent_embedding(db, n.did)
             else:
-                result = cli_embeddings._resolve_target(
-                    None if door == "cli-target-construct" else service
-                )
+                result = cli_embeddings._resolve_target(service)
         except BaseException as error:
             caught = error
         assert reached, f"declared boundary not reached: {door} {caught!r} {result!r}"

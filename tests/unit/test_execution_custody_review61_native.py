@@ -267,8 +267,11 @@ async def test_reanchor_embedding_joins_original_native_close_and_preserves_comm
     from kestrel_sovereign.setup.constitution_reanchor import _agent_embedding
     from kestrel_sovereign.execution_custody import execution_commit_outcome
     from tests.unit.test_execution_custody_review34 import native_close_owner
+    from kestrel_sovereign.llm.lifecycle import UnpublishedLLMOwner
     service, client, entered, release = await native_close_owner(monkeypatch)
-    resolution = cli_embeddings.AgentEmbeddingResolution(service, None, None)
+    resolution = cli_embeddings.AgentEmbeddingResolution(
+        service, None, None, _private_owner=UnpublishedLLMOwner(service, ()),
+    )
     async def resolve(_db, _did):
         return resolution
     monkeypatch.setattr(cli_embeddings, "resolve_agent_embedding", resolve)
@@ -287,9 +290,19 @@ async def test_reanchor_embedding_joins_original_native_close_and_preserves_comm
         release.set()
         result = await await_owned_task(task)
         assert committed == [True] and client.is_closed and original_closer.done()
-        assert execution_commit_outcome(result.error) == "committed"
-        debts = execution_cleanup_debts(result.error)
-        assert debts and debts[-1][0] is service and debts[-1][1].done()
+        if cancel:
+            assert execution_commit_outcome(result.error) == "committed"
+            assert any(isinstance(error, asyncio.CancelledError) for error in _explicit_control_chain(result.error))
+        else:
+            assert result.error is None
+        # The initial bounded close was incomplete, but the same canonical
+        # owner has now physically joined it. Do not fabricate failed native
+        # retirement debt after successful settlement or retain observer C on
+        # the shared service's original close receipt.
+        assert not execution_cleanup_debts(result.error)
+        assert resolution._private_owner.retired
+        assert resolution._private_owner.control is None
+        await resolution.aclose()
         assert service._llm_close_tasks[("adapter", id(client))] is None
     finally:
         release.set()

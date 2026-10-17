@@ -174,6 +174,81 @@ async def test_actual_genai_pool_close_is_one_original_owner_across_withdrawal(n
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_control", [False, True])
+async def test_genai_before_task_refusal_preserves_actual_catalog_withdrawal(native_pg, monkeypatch, source_control):
+    from kestrel_sovereign.llm.genai_custody import _close_genai_layers
+    from tests.integration.test_maintenance_original_retirement import _original_control
+    native = await _original_control(native_pg[0], monkeypatch) if source_control else None
+    entered = asyncio.Event()
+    peers, clients, originals, refused = set(), [], [], []
+    async def peer(reader, writer):
+        peers.add(asyncio.current_task())
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            entered.set()
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            peers.discard(asyncio.current_task())
+    server = await asyncio.start_server(peer, "127.0.0.1", 0)
+    actual = genai.Client
+    class LocalGenai(actual):
+        def __init__(self, *args, **kwargs):
+            kwargs["http_options"] = types.HttpOptions(
+                base_url=f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}", api_version="v1beta",
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+            super().__init__(*args, **kwargs)
+            clients.append(self)
+            request = self._api_client._async_request
+            async def observed(*args, **kwargs):
+                try:
+                    return await request(*args, **kwargs)
+                except asyncio.CancelledError as error:
+                    if native is not None:
+                        error.__cause__ = native
+                    originals.append((error, tuple(_explicit_control_chain(error)), tuple(execution_cleanup_debts(error))))
+                    raise
+            self._api_client._async_request = observed
+    monkeypatch.setattr(genai, "Client", LocalGenai)
+    monkeypatch.setenv("GOOGLE_API_KEY", "inert-localhost-only")
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refusal = RuntimeError("original private GenAI closer allocation refused")
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        if getattr(operation, "cr_code", None) is _close_genai_layers.__code__:
+            refused.append((coroutine, operation))
+            raise refusal
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+    owner = create_owned_task(GoogleAdapter().list_models(), retain_originals=True)
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        loop.set_task_factory(factory)
+        owner.cancel("actual catalog socket acquisition withdrew")
+        result = await await_owned_task(owner)
+        assert len(originals) == 1 and len(refused) == 1
+        opening, graph, debts = originals[0]
+        chain = tuple(_explicit_control_chain(result.error))
+        assert opening in chain, "GenAI close admission erased actual opening catalog cancellation"
+        assert refusal in chain
+        assert any(resource is clients[0] and task is None for resource, task in execution_cleanup_debts(result.error))
+        assert tuple(_explicit_control_chain(opening)) == graph
+        assert tuple(execution_cleanup_debts(opening)) == debts
+        if source_control:
+            assert native in chain and execution_commit_outcome(result.error) == "unknown"
+    finally:
+        loop.set_task_factory(previous)
+        await await_owned_task(owner)
+        for client in clients:
+            await _close_genai_layers(client)
+        server.close()
+        await server.wait_closed()
+        for task in tuple(peers):
+            await await_owned_task(task)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("after", [False, True])
 async def test_genai_close_publication_failure_still_joins_original_pool(monkeypatch, after):
     from kestrel_sovereign.llm.genai_custody import _close_genai_layers

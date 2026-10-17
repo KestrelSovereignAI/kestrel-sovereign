@@ -159,9 +159,16 @@ async def close_genai_client(client):
     from .lifecycle import harvest_llm_close_task, start_llm_close_task
 
     original = sys.exc_info()[1]
-    task = start_llm_close_task(
-        client, "genai-native-client", lambda: _close_genai_layers(client), resource=client,
-    )
+    try:
+        task = start_llm_close_task(
+            client, "genai-native-client", lambda: _close_genai_layers(client), resource=client,
+        )
+    except BaseException as error:
+        # Allocation refusal precedes the normal join/composer. Its actual
+        # client debt must not erase a body cancellation into implicit context.
+        raise execution_terminal_error(
+            original, error, retain_originals=True, isolate_control_originals=True,
+        )
     if task is None:
         if vars(client).get("_llm_close_control") is not None:
             raise execution_terminal_error(

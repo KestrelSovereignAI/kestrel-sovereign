@@ -1598,61 +1598,10 @@ async def _agent_embedding(
     from kestrel_sovereign.cli_embeddings import resolve_agent_embedding
 
     resolution = await resolve_agent_embedding(db, agent_did)
-    body_error = None
-    try:
+    # Resolution owns a private service before its first awaited config read;
+    # the SAME owner spans this committed repair and its physical retirement.
+    async with resolution.lifetime(committed_on_success=True):
         yield resolution
-    except BaseException as error:
-        body_error = error
-        raise
-    finally:
-        if resolution.llm_service is not None:
-            from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
-            from kestrel_sovereign.execution_custody import (
-                ExecutionCommitOutcomeError, execution_terminal_error,
-            )
-
-            service = resolution.llm_service
-            async def retire():
-                close_error = None
-                try:
-                    await service.close()
-                except BaseException as error:
-                    close_error = error
-                # A bounded close is not physical retirement. Join the SAME
-                # retained native owners before borrowed transaction storage
-                # is closed, without retrying any provider or reanchor effect.
-                pending = getattr(service, "has_pending_close_owners", None)
-                if callable(pending) and pending():
-                    try:
-                        await service.wait_for_close_completion()
-                    except BaseException as error:
-                        close_error = execution_terminal_error(close_error, error)
-                if close_error is not None:
-                    raise close_error
-
-            closer = None
-            try:
-                closer = create_owned_task(retire(), retirement_resource=service)
-                outcome = await await_owned_task(closer)
-                cleanup = execution_terminal_error(outcome.error, outcome.cancellation)
-            except BaseException as error:
-                # A missing Task is not a retired service. Preserve both the
-                # original body disposition and the raw physical resource;
-                # canonical admission closes the refused fresh coroutine.
-                cleanup = error
-            if cleanup is not None:
-                # The embedding span surrounds the caller's transaction. A
-                # successful body is a committed repair, NOT retry permission.
-                if body_error is None:
-                    terminal = ExecutionCommitOutcomeError("committed")
-                    terminal.__cause__ = cleanup
-                else:
-                    terminal = execution_terminal_error(body_error, cleanup)
-                terminal._kestrel_native_retirement_debts = (
-                    *getattr(terminal, "_kestrel_native_retirement_debts", ()),
-                    (service, closer),
-                )
-                raise terminal
 
 
 async def _reindex_constitution_rag(

@@ -115,6 +115,23 @@ when callback publication fails. Refused or unstarted retirement retains the
 actual resource and original Task rather than reporting physical success.
 Private close debt is carried separately from shared source control errors.
 
+Offline embedding resolution establishes the same unpublished-service owner
+immediately after constructing a private `LLMService`, before awaiting persisted
+configuration or discovery. A resolution that cannot return retires that owner
+itself. `AgentEmbeddingResolution` then hands off the lifetime explicitly: use
+`async with resolution` or `await resolution.aclose()`. Reindex owns it across
+dry-run, refusal, write and failure exits; reanchor uses that same lifetime with
+its known committed-body distinction. Injected services remain borrowed.
+Synchronous target lookup never constructs a hidden service. Before-Task closer
+refusal retains both the original body/cancellation and actual resource debt.
+
+Semantic maintenance classifies original execution control before business
+status projection. Native uncertainty is not an ordinary failed-run diagnostic
+or stale-lease result. Failed diagnostics retain their original worker error,
+and exact holder/token lease release uses the canonical physical-close owner
+under cleanup-only custody. Its body, native close and actual observer withdrawal
+are isolated finite evidence, never mutations to a shared source receipt.
+
 Codex turn shutdown first closes callback admission, directly joins the original
 accepted reader Tasks, and holds the original thread mutex and event sink through
 any accepted completed-effect checkpoint. It must not allocate an intermediate

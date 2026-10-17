@@ -1079,7 +1079,7 @@ async def close_native_execution_stream(
     An acquired SDK context/result can supply its exact physical exit instead
     of a method on that value; admission and failed-owner debt stay canonical.
     """
-    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
 
     close = None
     if close_operation is None:
@@ -1093,15 +1093,22 @@ async def close_native_execution_stream(
             result = close() if close_operation is None else close_operation(stream)
             if inspect.isawaitable(result):
                 await result
+    admission = OwnedTaskAdmission()
     try:
         close_task = create_owned_task(
             owned_close(), retirement_resource=stream, retain_originals=retain_originals,
+            admission=admission,
         )
     except BaseException as error:
-        raise execution_terminal_error(
-            original, error, retain_originals=True,
-            isolate_control_originals=isolate_control_originals,
-        )
+        close_task = admission.task
+        if close_task is None:
+            raise execution_terminal_error(
+                original, error, retain_originals=True,
+                isolate_control_originals=isolate_control_originals,
+            )
+        # Canonical receipt publication failed after accepting a start-gated
+        # Task. Join THAT failed original; its native resource is still debt,
+        # never a successful or detached cleanup effect.
     outcome = await await_owned_task(close_task)
     retirement = None
     if outcome.error is not None:

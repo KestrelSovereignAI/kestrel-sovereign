@@ -117,31 +117,41 @@ class UnpublishedLLMOwner:
     task_joins_native: bool = False
     control: BaseException | None = None
     admission_failure: BaseException | None = None
+    retired: bool = False
 
     async def retire(self, *, join_native: bool = False) -> None:
         if self.admission_failure is not None:
             # The original provider is still owned, not a successful bounded
             # attempt that can be upgraded by submitting a different closer.
             raise self.admission_failure
+        if self.retired:
+            if self.control is not None:
+                raise self.control
+            return
         if self.task is None:
             self.task_joins_native = join_native
+            admission = OwnedTaskAdmission()
             with bind_execution_cleanup(self.provider, self.scopes):
                 try:
                     self.task = create_owned_task(
                         self._close(join_native=join_native), name="unpublished-provider:close",
                         retain_originals=True, retirement_resource=self.provider,
+                        admission=admission,
                     )
                 except BaseException as error:
+                    self.task = admission.task
                     self.control = execution_terminal_error(
                         self.control, error, retain_originals=True,
                         isolate_control_originals=True,
                     )
-                    self.admission_failure = self.control
-                    raise self.admission_failure
+                    if self.task is None:
+                        self.admission_failure = self.control
+                        raise self.admission_failure
         task, joins_native = self.task, self.task_joins_native
         outcome = await await_owned_task(task)
         if self.task is task and outcome.error is None and self.control is None:
             self.task = None
+            self.retired = join_native and joins_native
         terminal = execution_terminal_error(
             outcome.error, outcome.cancellation, retain_originals=True,
             isolate_control_originals=True,
@@ -208,6 +218,7 @@ class UnpublishedLLMOwner:
                         *(error for error in _explicit_control_chain(failure)
                           if isinstance(error, asyncio.CancelledError)),
                         retain_originals=True, prefer_cancellation=True,
+                        isolate_control_originals=True,
                     )
                 )
                 try:

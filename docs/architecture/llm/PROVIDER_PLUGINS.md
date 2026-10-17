@@ -126,6 +126,14 @@ inject and close an `LLMService`. Agent-owned storage already injects that same
 service. This prevents ambient provider credentials from creating unowned SDK
 pools or usage databases during a synchronous metadata lookup.
 
+Offline CLI resolution differs from that borrowed lookup: it explicitly owns a
+new service before awaiting configuration. Its returned `AgentEmbeddingResolution`
+is an async context manager (also exposes `aclose`); reindex and reanchor consume
+that same lifetime. A failed resolver retires before returning control. Close
+allocation refusal preserves an opening cancellation alongside actual unstarted
+resource debt. Retirement uses the existing unpublished-service owner, not a
+second reanchor-only close registry or a source-mutating error projection.
+
 Cancellation and explicit irreversible control receipts remain original errors,
 including their causes/groups. Model discovery must not translate them into an
 empty catalog. These built-in integrations are verified with actual SDKs and

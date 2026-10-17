@@ -17,6 +17,7 @@ from kestrel_sovereign.execution_custody import (
     execution_commit_outcome,
 )
 from kestrel_sovereign.llm import service as service_module
+from kestrel_sovereign.llm.lifecycle import UnpublishedLLMOwner
 from kestrel_sovereign.setup.constitution_reanchor import _agent_embedding
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from tests.integration.test_execution_authority_postgres import GenerationFence
@@ -37,7 +38,9 @@ async def test_reanchor_closer_admission_refusal_keeps_actual_commit_and_service
     )
     client = httpx.AsyncClient()
     service.providers = [{"adapter": client}]
-    resolution = cli_embeddings.AgentEmbeddingResolution(service, None, None)
+    resolution = cli_embeddings.AgentEmbeddingResolution(
+        service, None, None, _private_owner=UnpublishedLLMOwner(service, ()),
+    )
 
     async def resolve(_db, _did):
         return resolution
@@ -55,7 +58,7 @@ async def test_reanchor_closer_admission_refusal_keeps_actual_commit_and_service
         inner = frame.f_locals.get("operation") if frame is not None else None
         candidate = inner if inspect.iscoroutine(inner) else coroutine
         code = getattr(candidate, "cr_code", None)
-        if code is not None and code.co_qualname == "_agent_embedding.<locals>.retire":
+        if code is not None and code.co_qualname == "UnpublishedLLMOwner._close":
             refused.append((coroutine, candidate))
             raise RuntimeError("reanchor physical closer Task allocation refused")
         return (

@@ -74,7 +74,8 @@ import json
 import logging
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 from kestrel_sovereign.execution_custody import is_execution_control_error
@@ -739,19 +740,11 @@ def _resolve_target(
     Original execution control is never an availability refusal: import,
     construction, route and profile consumers propagate its explicit carrier.
     """
-    try:
-        from kestrel_sovereign.llm.service import LLMService
-    except Exception as exc:  # pragma: no cover - defensive
-        if is_execution_control_error(exc):
-            raise
-        return (f"could not import LLMService: {exc}", None, None)
-
-    try:
-        service_owner = llm_service if llm_service is not None else LLMService()
-    except Exception as exc:
-        if is_execution_control_error(exc):
-            raise
-        return (f"could not initialize LLM service: {exc}", None, None)
+    # This synchronous metadata lookup cannot own an implicit service's SDK
+    # pools. Offline callers allocate through resolve_agent_embedding instead.
+    if llm_service is None:
+        return ("an explicitly owned LLM service is required to resolve embeddings", None, None)
+    service_owner = llm_service
 
     # Explicit "none" means the operator has disabled embeddings — never
     # silently re-embed anyway.
@@ -831,6 +824,52 @@ class AgentEmbeddingResolution:
     embedding_service: Optional[Any]
     profile_id: Optional[str]
     error: Optional[str] = None
+    _private_owner: Optional[Any] = field(default=None, repr=False, compare=False)
+
+    async def aclose(self) -> None:
+        """Retire a private service; an injected service remains borrowed."""
+        await self._retire()
+
+    async def _retire(self, body_error=None, *, committed_on_success=False):
+        from kestrel_sovereign.execution_custody import (
+            ExecutionCommitOutcomeError, execution_terminal_error,
+        )
+        owner = self._private_owner
+        if owner is None:
+            return
+        try:
+            await owner.retire(join_native=True)
+        except BaseException as cleanup:
+            debt = None
+            if not owner.retired:
+                debt = RuntimeError("original private embedding service retirement failed")
+                debt._kestrel_native_retirement_debts = ((owner.provider, owner.task),)
+            committed = (
+                ExecutionCommitOutcomeError("committed")
+                if body_error is None and committed_on_success else None
+            )
+            raise execution_terminal_error(
+                body_error, committed, cleanup, debt, retain_originals=True,
+                isolate_control_originals=True,
+            )
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, error, traceback):
+        await self._retire(error)
+
+    @asynccontextmanager
+    async def lifetime(self, *, committed_on_success=False):
+        """Own resolution consumption, retaining actual body/close evidence."""
+        body_error = None
+        try:
+            yield self
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            await self._retire(body_error, committed_on_success=committed_on_success)
 
 
 async def resolve_agent_embedding(
@@ -855,7 +894,13 @@ async def resolve_agent_embedding(
     so the target is the profile the live agent resolves, not the
     config/default route (#2263/#2337/#2338/#2361). An injected service is
     presumed already configured and is resolved as-is.
+
+    The returned resolution owns a newly constructed service: use it as an
+    async context manager (or call ``aclose``). Ownership is established before
+    awaited configuration, so a resolution that cannot return retires it here.
+    Injected services remain borrowed on every exit.
     """
+    owner = None
     if llm_service is None:
         try:
             from kestrel_sovereign.llm.service import LLMService
@@ -870,20 +915,29 @@ async def resolve_agent_embedding(
                 profile_id=None,
                 error=f"could not initialize LLM service: {exc}",
             )
-        err = await _apply_persisted_embedding_config(llm_service, db, agent_id)
-        if err is not None:
-            return AgentEmbeddingResolution(
-                llm_service=llm_service,
-                embedding_service=None,
-                profile_id=None,
-                error=err,
-            )
-    err, embedding_service, profile_id = _resolve_target(llm_service)
+        from kestrel_sovereign.execution_custody import current_execution_custody
+        from kestrel_sovereign.llm.lifecycle import UnpublishedLLMOwner
+        owner = UnpublishedLLMOwner(llm_service, current_execution_custody(llm_service))
+    try:
+        err = (
+            await _apply_persisted_embedding_config(llm_service, db, agent_id)
+            if owner is not None else None
+        )
+        if err is None:
+            err, embedding_service, profile_id = _resolve_target(llm_service)
+        else:
+            embedding_service, profile_id = None, None
+    except BaseException as error:
+        await AgentEmbeddingResolution(
+            llm_service, None, None, _private_owner=owner,
+        )._retire(error)
+        raise
     return AgentEmbeddingResolution(
         llm_service=llm_service,
         embedding_service=embedding_service,
         profile_id=profile_id,
         error=err,
+        _private_owner=owner,
     )
 
 
@@ -1029,11 +1083,18 @@ async def _reindex(
         resolution = await resolve_agent_embedding(
             db, agent_id, llm_service=llm_service
         )
-        if resolution.error is not None:
-            print(f"ERROR: {resolution.error}", file=sys.stderr)
-            return 2
-        embedding_service = resolution.embedding_service
-        target_profile_id = resolution.profile_id
+        async with resolution:
+            if resolution.error is not None:
+                print(f"ERROR: {resolution.error}", file=sys.stderr)
+                return 2
+            # One resolved pass through this same implementation; the outer
+            # resolution owns a private service across every early return.
+            return await _reindex(
+                db, table=table, agent_id=agent_id, batch=batch, rate_limit=rate_limit,
+                dry_run=dry_run, apply=apply, llm_service=resolution.llm_service,
+                embedding_service=resolution.embedding_service,
+                target_profile_id=resolution.profile_id, target_dim=target_dim,
+            )
 
     if target_dim is None:
         target_dim = getattr(embedding_service, "embedding_dim", None)
