@@ -449,14 +449,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "evidence/native-protocols/dependencies.in",
-        "evidence/native-protocols/published-caps.json"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/NATIVE_PROTOCOL_SPIKES.md",
       "privacy": "public",
       "render": "public",
