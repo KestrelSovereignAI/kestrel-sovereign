@@ -11,12 +11,13 @@ import secrets
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.routing import APIRoute, APIWebSocketRoute, iter_route_contexts
+from fastapi.routing import APIRoute, APIWebSocketRoute, RouteContext, iter_route_contexts
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -777,22 +778,17 @@ def _resolve_live_route_agent(
     app: FastAPI,
     scope,
     mount_agent,
-    feature_name: str,
-    signature: tuple,
 ):
-    """Resolve a live owner for one physically shared feature route.
+    """Resolve the explicit or original owner of a shared feature route.
 
     Request-scoped routing is authoritative.  For unprefixed routes, retain
     the original mount owner while it is managed — the same object, or the
     same agent reloaded under a new object (readiness rollback then retry,
     DELETE then re-create, a scheduler cold wake): the manager keeps one
     routing name per DID, so the DID is the owner's stable identity and the
-    object is not.  If that owner is gone, the route may rebind only when
-    exactly one managed agent still serves it: an unprefixed address names
-    no agent, so with two or more candidates the executor would be chosen
-    by ``list_agents()`` order, invisible to the caller (#3240, the shape of
-    #3216). Refuse instead; the agent-prefixed form stays the unambiguous
-    address.
+    object is not. If the owner is gone, the unprefixed address is unbound.
+    Only an explicit agent URL may select a different agent. Never inspect an
+    unrelated plugin to silently reassign an address whose owner disappeared.
     """
 
     state = scope.get("state") or {}
@@ -825,13 +821,6 @@ def _resolve_live_route_agent(
         ]
         if len(reloaded) == 1:
             return reloaded[0]
-    survivors = [
-        candidate
-        for candidate in managed_agents
-        if _live_feature_router(candidate, feature_name, signature) is not None
-    ]
-    if len(survivors) == 1:
-        return survivors[0]
     return None
 
 
@@ -910,20 +899,9 @@ class _LiveFeatureRouter(APIRouter):
     def _current_router(self, scope):
         agent = _resolve_live_route_agent(
             self._host_app, scope, self._mount_agent,
-            self._feature_name, self._signature,
         )
         router = _live_feature_router(agent, self._feature_name, self._signature)
         return (agent, router) if router is not None else None
-
-    def matches(self, scope):
-        matched = super().matches(scope)
-        # Avoid constructing any live feature router for unrelated paths.
-        # Check PARTIAL as well: a disabled wrong-method route must be 404.
-        if matched[0] is Match.NONE:
-            return matched
-        if self._current_router(scope) is None:
-            return Match.NONE, {}
-        return matched
 
     async def handle(self, scope, receive, send):
         # A feature can disappear after matching, before dispatch.
@@ -947,6 +925,40 @@ class _LiveFeatureRouter(APIRouter):
             binding = (source, bound)
             self._bindings[agent_key] = binding
         await binding[1].handle(scope, receive, send)
+
+
+@dataclass(frozen=True)
+class _LiveFeatureRoute(RouteContext):
+    """A fixed native API context whose match and dispatch share a live gate.
+
+    Include the source through FastAPI first, retaining its complete native
+    metadata and lifespan. Publish only the resulting API leaf contexts to the
+    host; later source-router mutations cannot publish ungated frontend groups.
+    """
+
+    native: RouteContext = field(kw_only=True, repr=False, compare=False)
+    lifecycle: _LiveFeatureRouter = field(kw_only=True, repr=False, compare=False)
+
+    @classmethod
+    def bind(cls, native: RouteContext, lifecycle: _LiveFeatureRouter):
+        # Forward the public dataclass as a whole, including FastAPI's opaque
+        # effective context. Never reconstruct route/dependency metadata here.
+        values = {
+            item.name: getattr(native, item.name)
+            for item in fields(RouteContext) if item.init
+        }
+        return cls(**values, native=native, lifecycle=lifecycle)
+
+    def matches(self, scope):
+        matched = self.native.matches(scope)
+        if matched[0] is Match.NONE:
+            return matched
+        if self.lifecycle._current_router(scope) is None:
+            return Match.NONE, {}
+        return matched
+
+    async def handle(self, scope, receive, send):
+        await self.lifecycle.handle(scope, receive, send)
 
 
 def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
@@ -991,7 +1003,12 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 if router_key in mounted_keys:
                     continue
                 routes_before_include = len(app.routes)
-                app.include_router(_LiveFeatureRouter(app, router, name, agent))
+                lifecycle = _LiveFeatureRouter(app, router, name, agent)
+                app.include_router(lifecycle)
+                contexts = list(iter_route_contexts(app.routes[routes_before_include:]))
+                app.routes[routes_before_include:] = [
+                    _LiveFeatureRoute.bind(context, lifecycle) for context in contexts
+                ]
                 mounted_keys.add(router_key)
                 mounted.append(name)
             except Exception as exc:

@@ -12973,14 +12973,9 @@ class TestLoadFromConfig:
         assert manager.get_agent("SecondReady") is agents["SecondReady"]
         second_feature = agents["SecondReady"].features["SharedReadyFeature"]
         second_router = second_feature.get_router()
-        if valid_peer_router:
-            assert server._resolve_live_route_agent(
-                app,
-                {"state": {}},
-                agents["FirstReady"],
-                "SharedReadyFeature",
-                server._feature_router_signature("", second_router),
-            ) is agents["SecondReady"]
+        assert server._resolve_live_route_agent(
+            app, {"state": {}}, agents["FirstReady"],
+        ) is None
         expected_path = f"{router_prefix}/shared-ready-route"
         assert sum(
             route.path == expected_path
@@ -12991,7 +12986,14 @@ class TestLoadFromConfig:
             for field in restored_fields if field in vars(agents["FirstReady"])
         } == prior_agent_fields
         assert app.state.demo_mode is False
+        async def selected_peer(scope, receive, send):
+            if scope["type"] == "http":
+                scope.setdefault("state", {})["agent"] = agents["SecondReady"]
+            await app(scope, receive, send)
+
         with TestClient(app) as client:
+            assert client.get(expected_path).status_code == 404
+        with TestClient(selected_peer) as client:
             response = client.get(expected_path)
         assert response.status_code == (200 if valid_peer_router else 404)
         if valid_peer_router:

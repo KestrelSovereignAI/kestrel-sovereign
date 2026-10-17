@@ -1166,8 +1166,8 @@ def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_
         restore()
 
 
-def test_unprefixed_feature_route_rebinds_to_the_only_survivor():
-    """One remaining agent that serves the shape is not an ambiguous choice."""
+def test_unprefixed_feature_route_requires_an_agent_url_after_owner_withdrawal():
+    """An address never silently switches agents after its owner disappears."""
 
     os.environ["KESTREL_API_KEY"] = API_KEY
     alice = _InstanceBoundRouterFeature("alice-v1")
@@ -1183,17 +1183,16 @@ def test_unprefixed_feature_route_rebinds_to_the_only_survivor():
         with TestClient(app) as client:
             assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
             agents.pop("alice")
-            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert client.get(path, headers=headers).status_code == 404
+            assert bob.served == 0
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {"owner": "bob-v1"}
             assert alice.served == 1 and bob.served == 1
     finally:
         restore()
 
 
-def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
-    """A candidate that no longer serves the shape (feature disabled, or the
-    feature removed) does not count: with it gone the other one is the only
-    survivor and serves; with both live the unprefixed form is refused."""
-
+def test_unprefixed_route_stays_unbound_while_other_agents_change():
+    """Peer lifecycle changes cannot claim an unprefixed address."""
     os.environ["KESTREL_API_KEY"] = API_KEY
     alice = _InstanceBoundRouterFeature("alice-v1")
     bob = _InstanceBoundRouterFeature("bob-v1")
@@ -1209,28 +1208,17 @@ def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
     try:
         with TestClient(app) as client:
             agents.pop("alice")
-            assert client.get(path, headers=headers).status_code == 404
-            # Refused at the match gate: wrong method is 404, never 405 (#3258).
-            assert client.post(path, headers=headers).status_code == 404
-
-            bob.enabled = False
-            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
-            assert bob.served == 0
-
-            bob.enabled = True
-            assert client.get(path, headers=headers).status_code == 404
-            assert client.post(path, headers=headers).status_code == 404
-
-            agents["bob"].features.pop("ProxyFeature")
-            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
-            assert bob.served == 0 and carol.served == 2
-
-            # Enabled and same-named, but the shape is gone from its router:
-            # not a survivor of THIS route, so carol is still the only one.
-            drifted = _DriftedRouterFeature()
-            agents["bob"].features["ProxyFeature"] = drifted
-            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
-            assert drifted.served == 0 and carol.served == 3
+            for state in ("active", "disabled", "removed", "drifted"):
+                if state == "disabled":
+                    bob.enabled = False
+                elif state == "removed":
+                    agents["bob"].features.clear()
+                elif state == "drifted":
+                    agents["bob"].features["ProxyFeature"] = _DriftedRouterFeature()
+                assert client.get(path, headers=headers).status_code == 404
+                assert client.post(path, headers=headers).status_code == 404
+                assert client.get(f"/api/agents/carol{path}", headers=headers).json() == {"owner": "carol-v1"}
+                assert bob.served == 0
     finally:
         restore()
 
@@ -1375,7 +1363,7 @@ def test_dispatch_refuses_a_feature_disabled_after_the_match():
 
 
 def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
-    """Review r2: the owner clause precedes the survivor rule. A mount owner
+    """A mount owner
     re-created under its DID with the feature disabled (readiness rollback,
     then retry) is still the owner: the unprefixed form refuses rather than
     quietly rebinding to the one peer that serves, which is exactly the
@@ -1397,9 +1385,10 @@ def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
         with TestClient(app) as client:
             assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
 
-            # Withdrawn: bob is the sole survivor and serves.
+            # Withdrawn: the unprefixed address cannot select bob implicitly.
             agents.pop("alice")
-            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert client.get(path, headers=headers).status_code == 404
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {"owner": "bob-v1"}
             assert bob.served == 1
 
             # Back under the same DID, but not serving: the owner is retained
@@ -1646,3 +1635,98 @@ def test_native_binding_cache_is_bounded_by_current_agents(monkeypatch):
             assert set(mounted[0]._bindings) == {id(agents["stable"])}
     finally:
         restore()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("lifecycle", ["active", "disabled", "removed"])
+def test_frontend_added_after_mount_cannot_escape_the_feature_boundary(tmp_path, nested, warm, lifecycle):
+    from kestrel_sovereign import server
+
+    (tmp_path / "index.html").write_text("<html>private tenant frontend</html>")
+    source = APIRouter()
+
+    @source.get("/post-mount-api")
+    async def endpoint():
+        return {"owner": "tenant"}
+
+    router = source
+    if nested:
+        router = APIRouter()
+        router.include_router(source, prefix="/nested")
+    feature = SimpleNamespace(enabled=True, get_router=lambda: router)
+    agent = _make_agent({"MutableFeature": feature})
+    app = FastAPI()
+    app.state.agent = agent
+    app.state.agent_manager = None
+    server._mount_feature_routers(app)
+    prefix = "/nested" if nested else ""
+    with TestClient(app) as client:
+        if warm:
+            assert client.get(f"{prefix}/post-mount-api").json() == {"owner": "tenant"}
+        source.frontend("/late-spa", directory=tmp_path)
+        if lifecycle == "disabled":
+            feature.enabled = False
+        elif lifecycle == "removed":
+            agent.features.clear()
+        assert client.get(f"{prefix}/late-spa/").status_code == 404
+        assert client.get(f"{prefix}/post-mount-api").status_code == (
+            200 if lifecycle == "active" else 404
+        )
+
+
+@pytest.mark.parametrize("failure", ["invalid", "raises"])
+def test_owner_withdrawal_requires_an_agent_url_without_probing_broken_peers(monkeypatch, failure):
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    calls = []
+
+    def broken_router():
+        calls.append(failure)
+        if failure == "raises":
+            raise RuntimeError("unrelated peer router failed")
+        return SimpleNamespace(routes=[], prefix="")
+
+    agents = {
+        "owner": _make_agent({"ProxyFeature": _InstanceBoundRouterFeature("owner")}),
+        "healthy": _make_agent({"ProxyFeature": _InstanceBoundRouterFeature("healthy")}),
+        "broken": _make_agent({"ProxyFeature": SimpleNamespace(enabled=True, get_router=broken_router)}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "owner"}
+            validated_calls = len(calls)
+            del agents["owner"]
+            assert client.get(path, headers=headers).status_code == 404
+            assert client.get(f"/api/agents/healthy{path}", headers=headers).json() == {"owner": "healthy"}
+            assert len(calls) == validated_calls
+    finally:
+        restore()
+
+
+def test_native_context_projection_preserves_feature_router_lifespan():
+    from kestrel_sovereign import server
+
+    events = []
+
+    @asynccontextmanager
+    async def feature_lifespan(_app):
+        events.append("start")
+        yield
+        events.append("stop")
+
+    router = APIRouter(lifespan=feature_lifespan)
+
+    @router.get("/feature-lifespan")
+    async def endpoint():
+        return {"events": list(events)}
+
+    app = FastAPI()
+    app.state.agent = _make_agent({"LifespanFeature": SimpleNamespace(enabled=True, get_router=lambda: router)})
+    app.state.agent_manager = None
+    server._mount_feature_routers(app)
+    with TestClient(app) as client:
+        assert client.get("/feature-lifespan").json() == {"events": ["start"]}
+    assert events == ["start", "stop"]
