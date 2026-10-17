@@ -180,9 +180,21 @@ The earlier gateway-retirement question is superseded. The gateway's modern
 capability gap remains [#3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683);
 older-revision interoperability does not establish modern conformance.
 
+## SDK feature support boundary
+
+The dependency spike establishes a usable native core SDK, not every extension.
+`mcp==2.3.0` has no 2026 Tasks implementation. Client result claims accept only
+`tools/call`; task-shaped resource/prompt results fail required-content parsing.
+The SDK's exported `CreateTaskResult` documents the 2025 core format. A6 needs
+an actual capable official extension/SDK revision before any task capability is
+advertised; track this in [#3684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3684).
+Upgrade beyond the experimental candidate when needed; do not build an adapter
+or label the old core type a native extension result.
+
 ## Open release gates
 
-- Complete the OAuth acceptance experiment above.
+- Complete the OAuth acceptance experiment above, proving the SDK did not silently use DCR.
+- Resolve the native Tasks SDK support gate in #3684 before advertising it.
 - Gate extensions on negotiated capabilities; track upstream modern gateway support in #3683.
 - Before the breaking A2A core/SDK release, update Talon/Features core ceilings
   and the SDK ceilings of Telegram/Talon/Features/Claws/Eye/Flight. Test their

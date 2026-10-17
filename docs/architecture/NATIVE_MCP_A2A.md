@@ -103,7 +103,7 @@ link any retry dispatch to the original rather than inventing a success.
 | Refresh | Agent-scoped encrypted token bundle; serialize refresh/rotation for the same connection across requests; commit rotated credentials atomically |
 | Discovery | Official Registry alongside Docker/local catalogs; explicit source and namespaced identity, opaque pagination, no arbitrary executable installation from search results |
 | Apps | Preserve tool metadata, structured content and `ui://` resource association through a typed part; isolated renderer and governed app calls |
-| Tasks | Versioned extension via SDK and a durable wait provider |
+| Tasks | Capable official extension/SDK release (support gap #3684), all eligible result paths, durable wait provider |
 | Operator input | Core MRTR (`InputRequiredResult`), governed input surface, no lock held across an interactive response |
 
 ### Authorization response issuer checks
@@ -173,6 +173,18 @@ If a vendor needs a pre-registered client, show that requirement explicitly.
 Do not silently switch to deprecated dynamic registration or borrow another
 product's client identity to make the spike pass.
 
+Enforce this before using `OAuthClientProvider`: discover and validate resource/
+issuer metadata through the SDK, and reject CIMD mode unless that issuer
+advertises CIMD. Pre-seed its issuer/connection-scoped `TokenStorage` client-info
+record using the SDK's `create_client_info_from_metadata_url`, with the selected
+CIMD URL as `client_id` and exact redirect URIs. `get_client_info` must return
+that typed record; the SDK then has no need to enter its default DCR branch.
+Operator-registered identities use their own explicit record instead. Do not
+construct an unseeded provider and rely on a debug log to detect registration.
+Acceptance must prove no registration POST for absent CIMD support, changed
+metadata or invalid-client responses. If a selected SDK cannot enforce this,
+upgrade/expose the SDK policy before release; do not patch a private auth flow.
+
 ### Registry and Apps
 
 Registry discovery uses the official registry's currently published API schema
@@ -205,7 +217,13 @@ each bridge message to the iframe source, session nonce, agent, connection and
 origin; allow only the Apps methods the host implements. A requested tool must
 be mounted and allowed for that app. Its invocation re-enters the same host
 dispatch used by model calls, including approvals and the resulting
-`a2a_tool_dispatches` row. Unmount/disconnect invalidates outstanding bridges.
+`a2a_tool_dispatches` row. Keep one governed registry of connection tools with
+separate model/app projections. Honor `_meta.ui.visibility`: model-only tools
+are excluded from app calls, app-only tools stay out of model schemas but remain
+registered for governed calls from that server's own app. Omission defaults to
+both surfaces; vendor visibility never grants authority beyond host policy.
+See [tool visibility](https://apps.extensions.modelcontextprotocol.io/api/interfaces/app.McpUiToolMeta.html).
+Unmount/disconnect invalidates outstanding bridges.
 
 ### Tasks and operator input
 
@@ -215,10 +233,22 @@ wait-provider contract. Advertise only supported extension versions. Poll,
 cancel and result retrieval use the same authorized connection and policy
 checks as the original call. Cancellation does not invent a completed result.
 Declaring `io.modelcontextprotocol/tasks` allows a server to return
-`CreateTaskResult` instead of a final result on any supported `tools/call`,
+a `resultType: "task"` result instead of a final result on any supported `tools/call`,
 `resources/read` or `prompts/get`; there is no per-call task opt-in. Do not
 advertise it until the durable wait provider and every eligible result path
 handle both shapes. Register the task before releasing the originating dispatch.
+
+The Phase 0 candidate `mcp==2.3.0` does **not** ship the 2026 Tasks extension.
+Its client result claims attach only to `tools/call`; resource/prompt result
+parsers cannot accept task shapes. Its exported `CreateTaskResult` is the old
+2025 core type and must not be used for this extension. A6 is gated on
+[#3684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3684): select
+an actual official extension/SDK package and revision supporting all eligible
+methods, or contribute that support to the official SDK, then raise dependency
+bounds as needed. The candidate is not a ceiling to retain. No partial
+advertisement, private wire types or generic-result adapter fills this gap.
+Until that gate passes, do not advertise Tasks; surface a server's required-
+capability error clearly instead of accepting work whose result cannot be read.
 
 When `tasks/get` reports `input_required`, classify its `inputRequests` using
 the same machine/operator rules and policy below. Respond through
@@ -229,23 +259,37 @@ outstanding key. Operator waits release the turn lock, survive restart and
 respect unattended-turn denial. Test both input paths against the published
 [Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks).
 
-MCP's Multi Round-Trip Requests (MRTR) are core protocol, independent of the
-Tasks extension. A normal tool/resource/prompt request can return
-`InputRequiredResult` with `resultType: "input_required"`, `inputRequests` and
-opaque `requestState`. Classify what input is actually needed. When there are
-no `inputRequests`, the SDK may immediately reissue the original operation with
-the unchanged state, under the same deadline/round limit; no operator or pending
-approval is needed. Likewise, machine-handled inputs do not become human waits.
-This host does not advertise the deprecated roots or sampling capabilities, so
-conformant servers must not request them; unsolicited unsupported requests fail
-with the SDK's capability error rather than fabricated operator input.
+MCP's Multi Round-Trip Requests (MRTR) are core protocol, independent of Tasks.
+A normal tool/resource/prompt request can return `InputRequiredResult` with
+`resultType: "input_required"`, `inputRequests` and opaque `requestState`.
+A1's basic client has no operator-input callbacks and can use the SDK's automatic
+state-only driver. Before A6 advertises governed input, switch its governed
+operations to the documented manual SDK session APIs, for example
+`client.session.call_tool(..., allow_input_required=True)`, and the corresponding
+resource/prompt APIs. Do not call the high-level auto-driver on those operations:
+the host must receive each typed intermediate result to persist a continuation.
+The host owns deadline, round limit and bounded backoff for manual reissues.
+Empty `inputRequests` retries unchanged state without creating a human wait;
+machine-handled requests likewise do not become operator prompts.
 
-Only an input request that actually requires an operator uses a pending human
-continuation. On an interactive turn, release the turn lock before receiving
-the response. A new owned continuation reissues the **original operation** with
-the SDK's `inputResponses` and unchanged opaque `requestState`. Preserve request
-binding, expiry and the round limit. Results without `resultType` are treated
-as `complete` by the SDK as required; do not reinterpret them as pending input.
+Elicitation is the supported operator request family; roots and sampling stay
+off. Configure the SDK elicitation callback only once governed handling exists.
+In SDK 2.3 that callback advertises both form and URL modes, so handle both:
+forms enter the host's governed input surface; URL-mode requests initially get
+an explicit audited standard decline, with no browser navigation. Enabling URL
+flows later requires explicit host origin/egress policy and operator action.
+For earlier negotiated protocols the callback declines operator-required input;
+it does not pretend an old inline request has restartable MRTR state.
+Unsolicited roots/sampling requests fail with the SDK's capability error.
+
+On modern interactive turns, persist the request binding, release the turn lock
+and return control. A new owned continuation reissues the **original operation**
+with SDK `inputResponses`, byte-unchanged `requestState`, and a fresh request ID.
+Durable storage survives host restart; remote state may not survive server
+restart, key rotation or expiry. Rejected/expired state makes the continuation
+explicitly non-resumable; retain an unknown dispatch outcome if execution cannot
+be established. Never drop state and submit a fresh side effect automatically.
+Results without `resultType` remain `complete` as the SDK specifies.
 
 For operator-required input, signal-driven turns and
 `NON_INTERACTIVE_SESSION_IDS` keep the shipped #3439 behavior:
@@ -277,6 +321,18 @@ get/list/cancel/subscribe and push configuration before authorization or side
 effects; do not silently route based on a caller-supplied tenant. A mismatch
 fails with the binding's standard error. The sender copies the selected
 interface tenant exactly, including its field-presence semantics.
+
+The bindings carry tenant differently: JSON-RPC reads it from the SDK request
+body; HTTP+JSON uses the SDK's `/{tenant}` route alias. Serve that REST alias
+only for the exact non-empty tenant advertised by the route-selected agent;
+use base REST routes for the advertised default/empty tenant. Choose path-safe
+opaque tenant identifiers and let the SDK encode/decode them. A tenant segment
+never re-selects the host agent. Both aliases and the bare deployment route
+retain the host's selected recipient, then compare the binding's decoded tenant
+to its advertised value before authorization or storage access. Wrong-tenant
+paths/bodies fail even with a valid peer transport credential. Derive transport
+admission from the same binding registration, including REST tenant-qualified
+paths; do not maintain a second incomplete pattern list.
 
 The public card endpoints need narrowly matched, prefix-aware exemptions in
 host authentication middleware, which runs before agent prefix stripping.
@@ -387,7 +443,9 @@ Ship inbound and outbound together. Delete `POST /api/agent/tasks/send`, old
 task read/cancel/subscribe routes, all draft wire models and all callers.
 Replace the retired entries in `kestrel_sovereign/a2a/transport_auth.py` with
 narrow method/path allowlists for the SDK's JSON-RPC and HTTP+JSON binding
-endpoints, before host authentication runs. Cover bare routes plus both
+endpoints in the peer lane of host authentication, before operator-key handling
+and agent-prefix stripping. Include the REST tenant-qualified paths above.
+Cover bare routes plus both
 `/api/agents/{routing_name}` and `/api/agent-routes/{encoded_routing_name}`
 forms; test every binding and alias using the peer transport credential.
 Adjacent operator endpoints must remain denied. Do not repurpose the operator
@@ -433,10 +491,13 @@ versions/commits and record which protocol scenarios they actually support.
 Do not label a skipped 2026 scenario or a mocked interop peer a conformance pass.
 Acceptance includes governed dispatch database evidence, Apps bridge denial
 tests (including vendor CSP/permission escalation), task result handling on all
-eligible operations, `tasks/get` → `tasks/update` input/restart, OAuth restart/rotation, cross-agent token isolation, signature tampering,
+eligible operations with a real capable SDK, `tasks/get` → `tasks/update`
+input/restart, form elicitation and explicit URL denial, no implicit DCR,
+OAuth restart/rotation, cross-agent token isolation, signature tampering,
 replay, recipient denial, question forgery, cancellation races and lock-free
 operator input, exact issuer comparison (including present unadvertised `iss`),
-MRTR operation rebinding, unknown outcomes after stream loss, private cache
+manual MRTR ownership/state expiry, model/app visibility isolation, MRTR
+operation rebinding, unknown outcomes after stream loss, private cache
 isolation, tenant mismatch, peer transport admission for both bindings/aliases,
 public discovery without an operator key, no-common-revision failure and
 protobuf-presence signature vectors. Final acceptance also searches for every retired wire surface.
