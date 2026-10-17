@@ -1161,7 +1161,7 @@ async def set_avatar(request: Request, file: Optional[UploadFile] = File(None)):
             source_url = url
             # SSRF guard (#1727): reject URLs whose host resolves to a private /
             # loopback / link-local / metadata address before fetching.
-            from kestrel_sovereign.security.ssrf import (
+            from kestrel_sdk.security.outbound import (
                 SSRFError,
                 assert_safe_url,
                 pinned_httpx_async_transport,

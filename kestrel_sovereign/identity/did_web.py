@@ -354,11 +354,8 @@ def _default_fetcher(url: str) -> bytes:
     # SSRF guard (#1727): the host comes from an attacker-controllable sender DID
     # (e.g. did:web:169.254.169.254 → cloud metadata). Reject non-public targets
     # before the request fires. HTTPS-only is enforced above.
-    from kestrel_sovereign.security.ssrf import (
-        SSRFError,
-        pinned_urllib_https_opener,
-        validate_outbound_url,
-    )
+    from kestrel_sdk.security.outbound import SSRFError, validate_outbound_url
+    from kestrel_sovereign.security.pinned_urllib import pinned_urllib_https_opener
     try:
         validated_url = validate_outbound_url(url, allowed_schemes=("https",))
     except SSRFError as e:
