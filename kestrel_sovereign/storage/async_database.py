@@ -92,6 +92,7 @@ async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseExcept
         # database and operation receipt on the public recovery contract.
         cause = execution_terminal_error(
             operation_error, error, retain_originals=True,
+            isolate_control_originals=True,
         )
         raise DatabaseRetirementError(db, operation_error, error) from cause
     outcome = await await_owned_task(cleanup)
@@ -103,18 +104,20 @@ async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseExcept
         # selecting a stronger close/body receipt must not discard it.
         cause = execution_terminal_error(
             operation_error, close_exc, outcome.cancellation,
-            retain_originals=True,
+            retain_originals=True, isolate_control_originals=True,
         )
         raise DatabaseRetirementError(db, operation_error, close_exc) from cause
     if db.connection_retirement_pending:
         failure = DatabaseRetirementError(db, operation_error)
         raise failure from execution_terminal_error(
             operation_error, outcome.cancellation, retain_originals=True,
+            isolate_control_originals=True,
         )
     if outcome.cancellation is not None:
         terminal = execution_terminal_error(
             operation_error, outcome.cancellation,
             retain_originals=True, prefer_cancellation=True,
+            isolate_control_originals=True,
         )
         terminal.add_note("Caller cancellation occurred during joined database retirement")
         raise terminal

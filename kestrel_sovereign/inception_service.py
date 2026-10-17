@@ -591,7 +591,11 @@ async def _inception_publication_custody(db, output_dir: Path, identity: str | N
                         pass
 
                     local = await AsyncDatabase.sqlite(str(path), schema_initializer=retain_schema)
-                    custody.push_async_callback(local.close)
+
+                    async def retire_local(_kind, error, _traceback):
+                        await _close_owned_database(local, error)
+
+                    custody.push_async_exit(retire_local)
                     await custody.enter_async_context(local.transaction(immediate=True))
                     await _assert_fresh_inception_lifetime(local, identity)
         async with db.transaction(immediate=True):
@@ -1047,7 +1051,7 @@ async def create_kestrel_identity_async(
                             await _assert_fresh_inception_lifetime(original, deterministic_did)
                             _refuse_previous_identity_namespace(Path(output_dir), slug)
                     finally:
-                        await original.close()
+                        await _close_owned_database(original, sys.exception())
                 latest = os.lstat(db_path)
                 if (retained.st_dev, retained.st_ino) != (latest.st_dev, latest.st_ino):
                     raise ValueError("Inception database changed before archival; use authorized recovery")
@@ -1433,6 +1437,7 @@ async def create_kestrel_identity_async(
             # not erase the keys of an identity that actually reached the graph.
             # An unreadable outcome is uncertainty, never permission to delete.
             cleanup_safe = False
+            publication_failure = inception_error
             if not publication_body_completed:
                 try:
                     # Native physical absence after body failure/rollback is not
@@ -1441,11 +1446,18 @@ async def create_kestrel_identity_async(
                     cleanup_safe = await db.fetchone(
                         "SELECT node_id FROM graph_nodes WHERE node_id = ?", (agent_node.node_id,),
                     ) is None
-                except Exception:
+                except BaseException as readback_error:
+                    if is_execution_control_error(readback_error) or isinstance(readback_error, asyncio.CancelledError):
+                        publication_failure = execution_terminal_error(
+                            inception_error, readback_error,
+                            retain_originals=True, isolate_control_originals=True,
+                        )
+                    elif not isinstance(readback_error, Exception):
+                        raise
                     logging.exception("Inception publication outcome unreadable; retaining identity artifacts")
             try:
                 if not using_external_db:
-                    await retire_owned_database(inception_error)
+                    await retire_owned_database(publication_failure)
                 if cleanup_safe:
                     cleanup_artifacts(identity_paths)
                     if not using_external_db:
@@ -1454,6 +1466,8 @@ async def create_kestrel_identity_async(
                 # Staged files never became active and are safe to discard even
                 # when a competing existing root caused the final refusal.
                 _discard_identity_staging(identity_stage_dir, staged_identity_paths)
+            if publication_failure is not inception_error:
+                raise publication_failure
             raise
 
         _discard_identity_staging(identity_stage_dir, staged_identity_paths)

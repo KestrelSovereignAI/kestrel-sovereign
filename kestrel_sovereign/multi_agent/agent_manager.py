@@ -8435,9 +8435,18 @@ class AgentManager:
                                 "Revoked cold scheduler authority for agent %r",
                                 name,
                             )
+                            withdrawals: list[BaseException] = []
                             reconciliation_cancelled = (
-                                await self._reconcile_fully_removed_child_tracking()
+                                await self._reconcile_fully_removed_child_tracking(
+                                    withdrawals=withdrawals,
+                                )
                             )
+                            terminal = execution_terminal_error(
+                                *withdrawals, retain_originals=True,
+                                isolate_control_originals=True,
+                            )
+                            if terminal is not None:
+                                raise terminal
                             if reconciliation_cancelled:
                                 raise asyncio.CancelledError()
                             return True
@@ -8583,9 +8592,17 @@ class AgentManager:
             if admission_cancelled:
                 raise asyncio.CancelledError()
             return False
+        withdrawals = []
         reconciliation_cancelled = (
-            await self._reconcile_fully_removed_child_tracking()
+            await self._reconcile_fully_removed_child_tracking(
+                withdrawals=withdrawals,
+            )
         )
+        terminal = execution_terminal_error(
+            *withdrawals, retain_originals=True, isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
         logger.info(
             "Offboarded registered cold agent %r by durable identity",
             cold_name,
@@ -9764,15 +9781,19 @@ class AgentManager:
                 release_cancelled = _contains_lifecycle_cancellation(error)
             reconciliation_cancelled = False
             reconciliation_failure = None
+            reconciliation_withdrawals: list[BaseException] = []
             try:
-                reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking()
+                reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking(
+                    withdrawals=reconciliation_withdrawals,
+                )
             except BaseException as error:
                 if not _is_lifecycle_terminal_outcome(error):
                     raise
                 reconciliation_failure = error
             terminal = execution_terminal_error(
                 release_failure, reconciliation_failure,
-                unpublished_offboarding_failure, retain_originals=True,
+                unpublished_offboarding_failure, *reconciliation_withdrawals,
+                retain_originals=True,
                 prefer_cancellation=True, isolate_control_originals=True,
             )
             if terminal is not None:
@@ -10052,8 +10073,11 @@ class AgentManager:
         # pruning predicate treats its live reaper as authoritative ownership.
         reconciliation_cancelled = False
         reconciliation_failure = None
+        reconciliation_withdrawals = []
         try:
-            reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking()
+            reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking(
+                withdrawals=reconciliation_withdrawals,
+            )
         except BaseException as error:
             if not _is_lifecycle_terminal_outcome(error):
                 raise
@@ -10062,14 +10086,24 @@ class AgentManager:
             caller_cancelled or release_cancelled or reconciliation_cancelled
         )
         terminal_outcomes: list[BaseException] = []
-        if removal_cancelled:
+        if removal_cancelled and not reconciliation_withdrawals:
             terminal_outcomes.append(release_withdrawal or asyncio.CancelledError())
+        elif release_withdrawal is not None:
+            terminal_outcomes.append(release_withdrawal)
+        terminal_outcomes.extend(reconciliation_withdrawals)
         if release_failure is not None:
             terminal_outcomes.append(release_failure)
         if reconciliation_failure is not None:
             terminal_outcomes.append(reconciliation_failure)
         if handoff_offboarding_pending is not None:
             terminal_outcomes.append(handoff_offboarding_pending)
+        if reconciliation_withdrawals:
+            terminal = execution_terminal_error(
+                *terminal_outcomes, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
+            )
+            if terminal is not None:
+                raise terminal
         _raise_lifecycle_outcomes(
             f"Agent {name!r} removal had terminal budget outcomes",
             terminal_outcomes,
@@ -13111,15 +13145,25 @@ class AgentManager:
                             parent_did, child_name
                         )
 
-    async def _reconcile_fully_removed_child_tracking(self) -> bool:
+    async def _reconcile_fully_removed_child_tracking(
+        self, *, withdrawals: Optional[list[BaseException]] = None,
+    ) -> bool:
         """Own child-tracking reconciliation through repeated cancellation."""
 
-        reconciliation = asyncio.create_task(
+        reconciliation = create_owned_task(
             self._prune_all_fully_removed_child_tracking(),
             name="agent_manager:reconcile_removed_child_tracking",
+            retain_originals=True,
         )
-        cancelled, failure = await await_lifecycle_task_completion(reconciliation)
+        cancelled, failure = await await_lifecycle_task_completion(
+            reconciliation, withdrawals=withdrawals,
+        )
         if failure is not None:
+            if withdrawals:
+                raise execution_terminal_error(
+                    failure, *withdrawals, retain_originals=True,
+                    isolate_control_originals=True,
+                )
             raise failure
         return cancelled
 

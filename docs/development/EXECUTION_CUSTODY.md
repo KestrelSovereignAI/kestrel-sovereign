@@ -1635,6 +1635,22 @@ batch evidence. Finite source/forwarder/close aggregates use isolated original
 composition as well: a later admission denial cannot replace the earlier native
 receipt, and shared source errors do not acquire unrelated observer history.
 
+### Removal reconciliation and inception retirement
+
+Direct removal carries original observer withdrawals through its final child
+tracking reconciliation, not just through the preceding refund. Both unpublished
+holds and registered cleanup components retain the native refund receipt and
+the actual cancellation from that later join. The finite isolated carrier does
+not write the caller's withdrawal into the manager's shared unsafe-refund latch.
+
+Auxiliary inception SQLite connections use the canonical owned database closer
+with the active publication or inspection error. Refused admission retains the
+same database; accepted close is joined through withdrawal. Finite retirement
+composition leaves shared operational receipts unchanged. A failed publication
+readback cannot discard native execution control or cancellation; artifacts
+remain retained unless physical absence was established. These component tests
+do not certify successful genesis, provider acceptance or READY.
+
 ### Delivery descendant shutdown
 
 Delivery shutdown requests cooperative stop before observing retirement. A

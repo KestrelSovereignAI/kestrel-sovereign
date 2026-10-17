@@ -23,13 +23,15 @@ from tests.unit.test_execution_custody_review35_native import traceback_size
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["join", "completed", "remove", "registered-component", "drain", "drain-live", "drain-waiter", "drain-quarantine", "fleet-waiter", "drain-quarantine-unseal-refusal"])
+@pytest.mark.parametrize("route", ["join", "completed", "remove", "registered-component", "drain", "drain-live", "drain-waiter", "drain-quarantine", "fleet-waiter", "drain-quarantine-unseal-refusal", "remove-reconcile", "registered-component-reconcile"])
 @pytest.mark.parametrize("source_cancel", [False, True])
 @pytest.mark.parametrize("caller_cancel", [False, True])
 async def test_original_native_refund_survives_join_callback_and_terminal_drain(
     native_pg, tmp_path, monkeypatch, route, source_cancel, caller_cancel,
 ):
     backend, observer, schema = native_pg
+    removal_route = route.removesuffix("-reconcile")
+    reconcile_route = route.endswith("-reconcile")
     drain_route = ("drain-waiter" if route == "fleet-waiter" else
                    "drain-quarantine" if route == "drain-quarantine-unseal-refusal" else route)
     entered, release = asyncio.Event(), asyncio.Event()
@@ -68,6 +70,8 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
     records = []
     drain_join = asyncio.Event()
     drain_waiter = asyncio.Event()
+    reconcile_join = asyncio.Event()
+    reconcile_lock_owned = False
     competing_drains = []
     withdrawals = []
     loop, previous_factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
@@ -86,7 +90,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             return previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
 
         loop.set_task_factory(refuse_unseal)
-    if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"}:
+    if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"} or reconcile_route:
         from kestrel_sovereign.multi_agent import agent_manager as manager_module
         from kestrel_sovereign import _async_ownership as ownership_module
 
@@ -102,18 +106,21 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
                 drain_waiter.set()
             return await actual_acquire(*args, **kwargs)
 
-        async def observed_owned_join(child):
+        async def observed_owned_join(child, *args, **kwargs):
             selected = bool(records) and child is records[0].task
             if selected:
                 if drain_route != "drain-waiter" or asyncio.current_task() in competing_drains:
                     assert not child.done()
                     drain_join.set()
-            outcome = await actual_owned_join(child)
+            outcome = await actual_owned_join(child, *args, **kwargs)
             if outcome.cancellation is not None:
                 withdrawals.append(outcome.cancellation)
             return outcome
 
         async def observed_legacy_join(child, *args, **kwargs):
+            if reconcile_route and child.get_name() == "agent_manager:reconcile_removed_child_tracking":
+                assert manager._lock.locked() and not child.done()
+                reconcile_join.set()
             if records and child is records[0].task:
                 assert not child.done()
                 drain_join.set()
@@ -124,7 +131,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
         monkeypatch.setattr(manager_module, "await_lifecycle_task_completion", observed_legacy_join)
         monkeypatch.setattr(manager, "_acquire_quarantined_shutdown_drain", observed_acquire)
     child = child_db = None
-    if route == "registered-component":
+    if removal_route == "registered-component":
         from kestrel_sovereign.kestrel_agent import KestrelAgent
         from kestrel_sovereign.llm.service import LLMService
         from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -156,7 +163,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
 
     async def consume():
         with bind_execution_custody(GenerationFence()):
-            if route in {"remove", "registered-component"}:
+            if removal_route in {"remove", "registered-component"}:
                 return await manager.remove_agent("child", offboard_runtime=False)
             record = manager._start_child_budget_release("child")
             records.append(record)
@@ -181,15 +188,23 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             task = create_owned_task(consume(), retain_originals=True)
             await asyncio.wait_for(entered.wait(), 5)
             assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=184') == 1
-            if route in {"remove", "registered-component"}:
+            if removal_route in {"remove", "registered-component"}:
                 records.append(manager._inflight_removal_budget_releases_by_child["child"])
             if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"}:
                 await asyncio.wait_for((drain_waiter if drain_route == "drain-waiter" else drain_join).wait(), 5)
             if source_cancel:
                 deposit_owners[0].cancel("actual original refund COMMIT observer withdrawal")
+            if reconcile_route:
+                await manager._lock.acquire()
+                reconcile_lock_owned = True
+                release.set()
+                await asyncio.wait_for(reconcile_join.wait(), 5)
             if caller_cancel:
                 task.cancel("actual refund caller withdrawal")
             release.set()
+            if reconcile_lock_owned:
+                manager._lock.release()
+                reconcile_lock_owned = False
             outcome = await await_owned_task(task)
         assert len(originals) == 1 and execution_commit_outcome(originals[0]) == "unknown"
         if source_cancel:
@@ -201,7 +216,7 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
             import inspect
             assert refused and refusal in tuple(_explicit_control_chain(outcome.error))
             assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
-        if drain_route in {"drain-live", "drain-waiter", "drain-quarantine"} and caller_cancel:
+        if (drain_route in {"drain-live", "drain-waiter", "drain-quarantine"} or reconcile_route) and caller_cancel:
             chain = tuple(_explicit_control_chain(outcome.error))
             assert any(isinstance(error, asyncio.CancelledError) and error.args == ("actual refund caller withdrawal",)
                        for error in chain), "live terminal refund drain lost its actual caller withdrawal"
@@ -245,6 +260,8 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=184') == 1
     finally:
         loop.set_task_factory(previous_factory)
+        if reconcile_lock_owned:
+            manager._lock.release()
         for pair in refused:
             for coroutine in pair:
                 coroutine.close()
