@@ -45,7 +45,7 @@ from kestrel_sovereign.signals import (
     SourceRegistry,
 )
 from kestrel_sovereign.waits import WaitRegistry
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 
 
 class FeatureContributionRuntimeError(RuntimeError):
@@ -1113,15 +1113,20 @@ class FeatureContributionRuntime:
             self.context_clause_registry.unregister_batch(exact_context)
 
         failed = False
+        controls = []
 
         def attempt(operation) -> None:
             nonlocal failed
             try:
                 operation()
-            except Exception:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
                 # The public error below is deliberately fixed text. Registry
                 # exceptions can include third-party names or representations.
                 failed = True
+                if is_execution_control_error(error) or isinstance(error, asyncio.CancelledError):
+                    controls.append(error)
+                elif not isinstance(error, Exception):
+                    raise
 
         def quarantine_operator_set(registration_set: OperatorRegistrationSet) -> None:
             nonlocal failed
@@ -1132,10 +1137,14 @@ class FeatureContributionRuntime:
                 withdrawn = self.operator_registry.quarantine_registration_set(
                     registration_set
                 )
-            except Exception:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
                 # Keep the retained capability unmarked so a later repair can
                 # retry its authenticated withdrawal.
                 failed = True
+                if is_execution_control_error(error) or isinstance(error, asyncio.CancelledError):
+                    controls.append(error)
+                elif not isinstance(error, Exception):
+                    raise
                 return
             if withdrawn is not True:
                 failed = True
@@ -1187,8 +1196,9 @@ class FeatureContributionRuntime:
         )
         attempt(lambda: self.source_registry.quarantine_claims(feature, sources))
         if failed:
-            raise FeatureContributionRuntimeError(
-                "feature contributions could not be quarantined"
+            raise execution_terminal_error(
+                FeatureContributionRuntimeError("feature contributions could not be quarantined"),
+                *controls, retain_originals=True, isolate_control_originals=True,
             ) from None
 
         del self._active[id(feature)]

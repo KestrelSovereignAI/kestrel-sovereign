@@ -10,6 +10,27 @@ from kestrel_sovereign.execution_custody import (
 )
 
 
+def llm_close_observation_control(outcome):
+    """Keep nonlocal native originals without retaining mere observer history.
+
+    Withdrawal may already carry a separate original native receipt as its
+    explicit cause. Keep that source, not the caller wrapper. If the actual
+    cancellation itself is the sole native receipt, its facts cannot be
+    discarded or replaced with a fabricated successful-retirement projection.
+    """
+    if outcome is None:
+        return None
+    controls = [outcome.error]
+    withdrawal = outcome.cancellation
+    if is_execution_control_error(withdrawal):
+        originals = [error for error in _explicit_control_chain(withdrawal)
+                     if error is not withdrawal and is_execution_control_error(error)]
+        controls.extend(originals or [withdrawal])
+    return execution_terminal_error(
+        *controls, retain_originals=True, isolate_control_originals=True,
+    )
+
+
 def start_llm_close_task(owner, key, operation, *, resource=None):
     """Own each native close once and harvest its canonical disposition.
 
@@ -165,9 +186,10 @@ class UnpublishedLLMOwner:
             outcome.error, outcome.cancellation, retain_originals=True,
             isolate_control_originals=True,
         )
-        if self.control is not None or is_execution_control_error(outcome.error):
+        observed_control = llm_close_observation_control(outcome)
+        if self.control is not None or is_execution_control_error(observed_control):
             self.control = execution_terminal_error(
-                self.control, outcome.error, retain_originals=True,
+                self.control, observed_control, retain_originals=True,
                 isolate_control_originals=True,
             )
         if join_native and not joins_native:

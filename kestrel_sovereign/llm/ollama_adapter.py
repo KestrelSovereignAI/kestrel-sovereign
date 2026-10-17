@@ -38,7 +38,7 @@ from .adapter import (
     ToolCall,
     split_thinking_from_content,
 )
-from .lifecycle import harvest_llm_close_task, start_llm_close_task
+from .lifecycle import harvest_llm_close_task, llm_close_observation_control, start_llm_close_task
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     RawResponse,
@@ -290,7 +290,7 @@ class OllamaAdapter(LLMAdapter):
             raise
         self._discovery_clients[client] = task
         outcome = await await_owned_task(task) if task is not None else None
-        failure = harvest_llm_close_task(client, key, task, observation_error=outcome.error) if task is not None else None
+        failure = harvest_llm_close_task(client, key, task, observation_error=llm_close_observation_control(outcome)) if task is not None else None
         publication = vars(client).get("_llm_close_control")
         self._retain_discovery_control(failure)
         self._retain_discovery_control(publication)

@@ -1974,3 +1974,32 @@ READY seams refuse while that uncertainty remains. These are component recovery
 proofs, not whole-Agent READY or deployed recovery acceptance. Private host-ingress
 retention, isolated-runtime terminal admission and the wider recovery/consumer
 inventory remain subject to the cumulative independent review ledger.
+
+Finite teardown evidence is not an unbounded worker history. Feature owners keep
+one strongest completed-worker receipt; their current terminal join separately
+retains its accepted observations and actual caller withdrawal in an isolated
+carrier. Health and scheduler do the same, without re-notifying an already
+harvested physical result. A close-owned interruption of an ordinary SQLite drain
+is not cancellation of the close caller. Native inventory debt also belongs on a
+finite carrier, never appended to the original shared receipt.
+
+A withdrawal can carry a separate original native receipt from earlier work.
+Private LLM close owners retain that explicit native source for later readers,
+not the current caller wrapper. A cancellation which is itself the sole native
+receipt cannot be discarded as ordinary withdrawal. Original resource owners
+remain unchanged; replay of control never starts another physical closer.
+
+Failed initialization enters the same retained private cleanup as failed batch
+publication. Its actual candidate remains on the name admission before withdrawal.
+Prepublication rollback likewise inventories its one original attempt and retains
+failed-resource debt. Final name-release refusal cannot replace the opening and
+rollback evidence which made that name unsafe to reuse.
+
+Contribution preflight fences boot registration, runtime activation and package
+enable on native uncertainty. Context suppression still removes stale optional
+prompt bytes, but cannot turn native failure into successful privacy recovery.
+Synchronous callers latch in-memory Safe Mode and original control without
+inventing an asynchronous owner; the async lifecycle persists the restriction.
+Registry quarantine continues independent withdrawals and retains native failures
+while ordinary third-party error details remain redacted. These remain component
+proofs, not whole-Agent or deployed privacy-transition acceptance.

@@ -24,7 +24,7 @@ from kestrel_sdk.llm import (
 from kestrel_sdk.llm.types import BackendType
 
 from kestrel_sovereign._async_ownership import await_owned_task
-from .lifecycle import harvest_llm_close_task, start_llm_close_task
+from .lifecycle import harvest_llm_close_task, llm_close_observation_control, start_llm_close_task
 from kestrel_sovereign.execution_custody import (
     await_execution_work, bind_execution_custody_snapshot,
     current_execution_custody, execution_terminal_error,
@@ -81,11 +81,12 @@ class RemoteBackendMixin:
         owner = start_llm_close_task(self, key, client.close, resource=client)
         outcome = await await_owned_task(owner) if owner is not None else None
         if owner is not None:
-            harvest_llm_close_task(self, key, owner, observation_error=outcome.error)
+            harvest_llm_close_task(self, key, owner, observation_error=llm_close_observation_control(outcome))
         terminal = execution_terminal_error(
             vars(self).get("_llm_close_control"),
             outcome.error if outcome is not None else None,
             outcome.cancellation if outcome is not None else None,
+            retain_originals=True, isolate_control_originals=True,
         )
         if terminal is not None:
             raise terminal
@@ -294,7 +295,10 @@ class RemoteBackendMixin:
                 try:
                     await self._close_remote_client(client, lease_id=lease.lease_id)
                 except BaseException as close_failure:
-                    raise execution_terminal_error(activation_failure, close_failure)
+                    raise execution_terminal_error(
+                        activation_failure, close_failure, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
             raise
 
         if activation_error is not None:

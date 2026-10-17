@@ -3069,9 +3069,12 @@ class AgentManager:
                 if is_execution_control_error(initialization_failure):
                     agent._remember_shutdown_control(initialization_failure)
                 try:
-                    await self._discard_unpublished_initialized_agent(name, agent)
+                    await self._discard_unpublished_initialized_agents([(name, agent)])
                 except BaseException as cleanup_failure:
-                    terminal = execution_terminal_error(initialization_failure, cleanup_failure)
+                    terminal = execution_terminal_error(
+                        initialization_failure, cleanup_failure, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                     if terminal is not None and is_execution_control_error(terminal):
                         raise terminal
                     raise
@@ -6151,6 +6154,9 @@ class AgentManager:
                 slot = vars(admission).get("_spawn_slot_retirement_owner")
                 if slot is not None and slot.failure is not None:
                     raise slot.failure
+                rollback = vars(admission).get("_before_publish_rollback_owner")
+                if rollback is not None and rollback.failure is not None:
+                    raise rollback.failure
                 if (
                     self._agent_operations.get(admission.canonical_name)
                     is admission
@@ -6531,12 +6537,19 @@ class AgentManager:
                     rollback_cancelled = False
                     rollback_failure: BaseException | None = None
                     if admission.before_publish_rollback is not None:
-                        rollback_task = asyncio.create_task(
-                            admission.before_publish_rollback(agent),
-                            name=f"agent_before_publish_rollback:{name}",
-                        )
+                        owner = vars(admission).get("_before_publish_rollback_owner")
+                        if owner is None:
+                            owner = _OwnedLifecycleOperation(
+                                lambda rollback=admission.before_publish_rollback, candidate=agent: rollback(candidate),
+                                phase="agent_before_publish_rollback", resource=admission,
+                            )
+                            admission._before_publish_rollback_owner = owner
+                        # Retain the actual private candidate before admission
+                        # can fail. Terminal Task status is not permission to
+                        # release a name whose signed rollback never retired.
+                        admission.child = agent
                         rollback_cancelled, rollback_failure = (
-                            await await_lifecycle_task_completion(rollback_task)
+                            await owner.join(name)
                         )
                     if rollback_failure is None:
                         is_uncommitted_spawn_candidate = (
@@ -6594,7 +6607,16 @@ class AgentManager:
         finally:
             if owns_admission:
                 original_failure = sys.exc_info()[1]
-                release_cancelled = await self._release_agent_operations([admission])
+                try:
+                    release_cancelled = await self._release_agent_operations([admission])
+                except BaseException as release_failure:
+                    # Name-release refusal is independent terminal evidence;
+                    # it cannot replace the opening/rollback originals which
+                    # made that exact candidate unsafe to release.
+                    raise execution_terminal_error(
+                        original_failure, release_failure, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                 # Once the agent is fully published, returning cancellation
                 # would report failure while leaving a live agent and a config
                 # handoff that the caller may never persist. The admission is
@@ -7660,7 +7682,10 @@ class AgentManager:
                                 )
                             except BaseException as error:
                                 cleanup_failure = error
-                        terminal = execution_terminal_error(onboarding_failure, cleanup_failure)
+                        terminal = execution_terminal_error(
+                            onboarding_failure, cleanup_failure, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
                         if terminal is not None and is_execution_control_error(terminal):
                             raise terminal
                         if (
@@ -7718,7 +7743,10 @@ class AgentManager:
                         )
                     except BaseException as error:
                         cleanup_failure = error
-                terminal = execution_terminal_error(publication_failure, cleanup_failure)
+                terminal = execution_terminal_error(
+                    publication_failure, cleanup_failure, retain_originals=True,
+                    isolate_control_originals=True,
+                )
                 if terminal is not None and is_execution_control_error(terminal):
                     raise terminal
                 if (
@@ -7752,7 +7780,10 @@ class AgentManager:
                 )
             except BaseException as error:
                 release_failure = error
-            terminal = execution_terminal_error(batch_failure, release_failure)
+            terminal = execution_terminal_error(
+                batch_failure, release_failure, retain_originals=True,
+                isolate_control_originals=True,
+            )
             if terminal is not None and is_execution_control_error(terminal):
                 raise terminal
             if release_failure is not None:

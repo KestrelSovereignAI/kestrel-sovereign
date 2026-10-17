@@ -513,7 +513,7 @@ class Feature(_SdkFeature):
                 failures.append(error)
         if failures:
             from kestrel_sovereign.execution_custody import execution_terminal_error
-            raise execution_terminal_error(*failures)
+            raise execution_terminal_error(*failures, retain_originals=True, isolate_control_originals=True)
 
     # ------------------------------------------------------------------
     # Signal-source ownership (#2522 P2)
@@ -962,7 +962,6 @@ class Feature(_SdkFeature):
         from kestrel_sovereign.execution_custody import execution_terminal_error
         self._owned_background_control = execution_terminal_error(
             vars(self).get("_owned_background_control"), error,
-            retain_originals=True, isolate_control_originals=True,
         )
 
     def _track_owned_runtime_task(self, coro, *, name: str) -> asyncio.Task:
@@ -1000,13 +999,15 @@ class Feature(_SdkFeature):
             await_owned_task,
         )
         from kestrel_sovereign.execution_custody import execution_terminal_error
-        cancellations = []
+        cancellations, observations = [], []
         joined = []
         for task in tasks:
             if task is current or task in owned_task_join_ancestors(current):
                 continue
             outcome = await await_owned_task(task)
             self._remember_background_control(outcome.error)
+            if is_execution_control_error(outcome.error):
+                observations.append(outcome.error)
             joined.append(task)
             if outcome.cancellation is not None:
                 cancellations.append(outcome.cancellation)
@@ -1019,7 +1020,10 @@ class Feature(_SdkFeature):
             for task in joined:
                 if task in owned:
                     owned.remove(task)
-        terminal = execution_terminal_error(vars(self).get("_owned_background_control"), *cancellations)
+        terminal = execution_terminal_error(
+            vars(self).get("_owned_background_control"), *observations, *cancellations,
+            retain_originals=True, isolate_control_originals=True,
+        )
         if terminal is not None:
             raise terminal
 

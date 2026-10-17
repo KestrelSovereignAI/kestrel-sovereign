@@ -156,7 +156,7 @@ def genai_stream(function):
 
 async def close_genai_client(client):
     """Join the SAME original SDK/session/pool close on every observer."""
-    from .lifecycle import harvest_llm_close_task, start_llm_close_task
+    from .lifecycle import harvest_llm_close_task, llm_close_observation_control, start_llm_close_task
 
     original = sys.exc_info()[1]
     try:
@@ -178,7 +178,7 @@ async def close_genai_client(client):
         return
     outcome = await await_owned_task(task)
     terminal = execution_terminal_error(
-        original, harvest_llm_close_task(client, "genai-native-client", task, observation_error=outcome.error),
+        original, harvest_llm_close_task(client, "genai-native-client", task, observation_error=llm_close_observation_control(outcome)),
         vars(client).get("_llm_close_control"), outcome.error, outcome.cancellation,
         retain_originals=True, isolate_control_originals=True,
     )

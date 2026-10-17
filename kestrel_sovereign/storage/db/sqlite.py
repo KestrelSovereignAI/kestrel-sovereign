@@ -1351,8 +1351,14 @@ class SQLiteBackend(DatabaseBackend):
                     # a stubborn drain once; repeated cancellation cannot
                     # abandon this owner or replace native control evidence.
                     outcome = await await_owned_task(drain, cancel_on_caller_cancellation=True)
+                    observation = outcome.error
+                    if isinstance(observation, asyncio.CancelledError) and not is_execution_control_error(observation):
+                        # Close itself interrupted this drain after its bound;
+                        # that physical child cancellation is not withdrawal of
+                        # the caller or an independent observation failure.
+                        observation = None
                     failure = execution_terminal_error(
-                        failure, outcome.error, retain_originals=True,
+                        failure, observation, retain_originals=True,
                         isolate_control_originals=True,
                     )
                     pending_cancellation = pending_cancellation or outcome.cancellation

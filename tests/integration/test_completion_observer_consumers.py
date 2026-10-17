@@ -28,11 +28,11 @@ from tests.utils.original_failure import OriginalFailure
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["service-wait", "unpublished"])
+@pytest.mark.parametrize("surface", ["service-wait", "unpublished", "remote-close"])
 @pytest.mark.parametrize("remove", [False, True])
 @pytest.mark.parametrize("withdraw", [False, True])
 async def test_native_service_observation_keeps_withdrawal_out_of_shared_control(native_pg, tmp_path, monkeypatch, surface, remove, withdraw):
-    from kestrel_sovereign.llm import lifecycle as lifecycle_module, service as service_module
+    from kestrel_sovereign.llm import lifecycle as lifecycle_module, service as service_module, remote_backend as remote_module
     from kestrel_sovereign.llm.lifecycle import UnpublishedLLMOwner, retire_unpublished_llm, start_llm_close_task
 
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch))
@@ -48,7 +48,7 @@ async def test_native_service_observation_keeps_withdrawal_out_of_shared_control
             entered.set()
             await release.wait()
     monkeypatch.setattr(httpx.AsyncClient, "aclose", close)
-    module = service_module if surface == "service-wait" else lifecycle_module
+    module = {"service-wait": service_module, "unpublished": lifecycle_module, "remote-close": remote_module}[surface]
     actual_join = module.await_owned_task
     async def join(task, *args, **kwargs):
         outcome = await actual_join(task, *args, **kwargs)
@@ -70,6 +70,8 @@ async def test_native_service_observation_keeps_withdrawal_out_of_shared_control
     async def retire():
         if surface == "unpublished":
             await retire_unpublished_llm(owners, "original-service", service, (), join_native=True)
+        elif surface == "remote-close":
+            await service._close_remote_client(client, lease_id="declared-local-route")
         else:
             await service.wait_for_close_completion()
     loop.set_task_factory(factory)
@@ -77,7 +79,7 @@ async def test_native_service_observation_keeps_withdrawal_out_of_shared_control
     try:
         if surface == "unpublished":
             service.providers = [{"name": "no-request-local-native", "client": client}]
-        else:
+        elif surface == "service-wait":
             start_llm_close_task(service, "observed-native-client", client.close, resource=client)
         owner = create_owned_task(retire(), retain_originals=True)
         await asyncio.wait_for(entered.wait(), 5)

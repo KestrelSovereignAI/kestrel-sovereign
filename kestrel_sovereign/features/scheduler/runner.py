@@ -1663,7 +1663,10 @@ class SchedulerRunner:
                 ),
             )
         logger.info("SchedulerRunner %s stopped", self._owner_id)
-        terminal = execution_terminal_error(getattr(self, "_execution_control_error", None), pending_cancellation)
+        terminal = execution_terminal_error(
+            getattr(self, "_execution_control_error", None), pending_cancellation,
+            retain_originals=True, isolate_control_originals=True,
+        )
         if terminal is not None:
             raise terminal
 
@@ -1707,7 +1710,7 @@ class SchedulerRunner:
     def _harvest_runtime_status_publication(self, task, *, observation_error=None):
         """Keep a cancelled native receipt before releasing its task graph."""
         error = owned_task_error(task)
-        if is_execution_control_error(observation_error):
+        if observation_error is not error and is_execution_control_error(observation_error):
             self._latch_protocol_failure(observation_error)
         if not getattr(task, "_kestrel_status_control_harvested", False):
             task._kestrel_status_control_harvested = True

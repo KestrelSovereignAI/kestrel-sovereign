@@ -150,6 +150,8 @@ class HealthFeature(Feature):
         for task in pending_persists:
             outcome = await await_owned_task(task)
             self._harvest_health_persistence(task, observation_error=outcome.error)
+            if is_execution_control_error(outcome.error):
+                errors.append(outcome.error)
             errors.append(outcome.cancellation)
         self._health_persist_tasks = set()
         try:
@@ -158,7 +160,7 @@ class HealthFeature(Feature):
             errors.append(error)
         errors.append(getattr(self, "_health_persist_control", None))
         logger.info("HealthFeature: background loop stopped")
-        terminal = execution_terminal_error(*errors, retain_originals=True)
+        terminal = execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
         if terminal is not None:
             raise terminal
 
@@ -169,7 +171,6 @@ class HealthFeature(Feature):
         if is_execution_control_error(observation_error):
             self._health_persist_control = execution_terminal_error(
                 getattr(self, "_health_persist_control", None), observation_error,
-                retain_originals=True, isolate_control_originals=True,
             )
         if error is not None and is_execution_control_error(error):
             self._health_persist_control = execution_terminal_error(
@@ -192,6 +193,7 @@ class HealthFeature(Feature):
                 getattr(self, "_health_persist_control", None),
                 outcome.error if is_execution_control_error(outcome.error) else None,
                 outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
             )
             self._background_task = None
             if terminal is not None:

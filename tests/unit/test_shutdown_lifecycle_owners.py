@@ -3793,26 +3793,38 @@ async def test_batch_claims_failed_onboarding_result_before_cleanup_failure(tmp_
     agent = SimpleNamespace(agent_id="did:test:batch-cleanup-once")
     config = LocalAgentConfig(data_dir="batch-once", port=8801)
     cleanup_calls = 0
+    opening = RuntimeError("host onboarding failed")
+    cleanup = RuntimeError("owned cleanup failed")
 
     async def initialize(*_args, **_kwargs):
         return agent
 
     async def reject_onboarding(*_args, **_kwargs):
-        raise RuntimeError("host onboarding failed")
+        raise opening
 
     async def fail_shutdown(_name, _agent):
         nonlocal cleanup_calls
         cleanup_calls += 1
-        raise RuntimeError("owned cleanup failed")
+        raise cleanup
 
     manager._initialize_agent = initialize
     manager._shutdown_unregistered_agent = fail_shutdown
     manager.set_agent_registration_hook(reject_onboarding)
 
-    with pytest.raises(ExceptionGroup, match="claimed cleanup failed"):
+    with pytest.raises(ExceptionGroup) as caught:
         await manager.load_from_config(MultiAgentConfig(agents={"B": config}))
+    from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+    chain = tuple(_explicit_control_chain(caught.value))
+    assert opening in chain and cleanup in chain
     assert cleanup_calls == 1
-    assert manager._agent_operations == {}
+    admission = manager._agent_operations["b"]
+    assert admission.child is agent, "failed original cleanup lost the private candidate"
+    assert any(resource is agent and task is not None and task.done()
+               for resource, task in execution_cleanup_debts(caught.value))
+    with pytest.raises(BaseException) as repeated:
+        await manager._release_agent_operations([admission])
+    assert cleanup in tuple(_explicit_control_chain(repeated.value))
+    assert manager._agent_operations.get("b") is admission and cleanup_calls == 1
 
 
 @pytest.mark.asyncio

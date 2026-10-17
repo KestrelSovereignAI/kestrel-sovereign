@@ -502,6 +502,25 @@ def require_feature_lifecycle_integrity(agent: object) -> None:
         raise RuntimeError("feature lifecycle integrity requires verified repair")
 
 
+def _retain_feature_lifecycle_safe_mode(agent: object, reason: str, *errors) -> None:
+    """Synchronous fail-closed state, including context refresh without await.
+
+    The async lifecycle owner persists this state separately. Neither a failed
+    persistence attempt nor a synchronous caller can reopen native uncertainty.
+    Only native originals enter the shared latch; caller withdrawal is finite.
+    """
+    agent._feature_lifecycle_integrity_uncertain = True
+    agent._feature_lifecycle_repair_verified = False
+    agent._safe_mode = True
+    agent._safe_mode_reason = reason
+    agent._safe_mode_cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+    agent._feature_lifecycle_control = execution_terminal_error(
+        vars(agent).get("_feature_lifecycle_control"),
+        *(error for error in errors if is_execution_control_error(error)),
+        retain_originals=True, isolate_control_originals=True,
+    )
+
+
 async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors, features=()) -> None:
     """One fail-closed transition for activation, restoration and config repair.
 
@@ -510,8 +529,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
     into a public cause. Persistence failure cannot clear the in-memory latch.
     """
     cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
-    agent._feature_lifecycle_integrity_uncertain = True
-    agent._feature_lifecycle_repair_verified = False
+    _retain_feature_lifecycle_safe_mode(agent, reason, *errors)
     controls = [error for error in errors if is_execution_control_error(error)]
     withdrawals = [error for error in errors if isinstance(error, asyncio.CancelledError)
                    and not is_execution_control_error(error)]
@@ -540,13 +558,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
         elif isinstance(error, BaseExceptionGroup):
             _raise_unexpected_lifecycle_exception_group(error)
     finally:
-        agent._safe_mode = True
-        agent._safe_mode_reason = reason
-        agent._safe_mode_cause = cause
-        agent._feature_lifecycle_control = execution_terminal_error(
-            vars(agent).get("_feature_lifecycle_control"), *controls,
-            retain_originals=True, isolate_control_originals=True,
-        )
+        _retain_feature_lifecycle_safe_mode(agent, reason, *controls)
     terminal = execution_terminal_error(
         agent._feature_lifecycle_control, *withdrawals, retain_originals=True,
         isolate_control_originals=True,
@@ -5410,7 +5422,7 @@ class KestrelAgent(
             await self.prepare_and_refresh_all_feature_context_clauses(
                 fail_closed=True
             )
-        except (Exception, asyncio.CancelledError) as suppression_exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as suppression_exc:
             logging.critical(
                 "Feature context suppression during privacy transition "
                 "reported %s; entering Safe Mode",
@@ -5420,19 +5432,10 @@ class KestrelAgent(
                 "Feature context suppression failed during a privacy transition; "
                 "cognition is blocked until lifecycle integrity is restored"
             )
-            self._feature_lifecycle_integrity_uncertain = True
-            self._feature_lifecycle_repair_verified = False
-            try:
-                await self.enter_safe_mode(
-                    safe_mode_reason,
-                    cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
-                )
-            except (Exception, asyncio.CancelledError):
-                self._safe_mode = True
-                self._safe_mode_reason = safe_mode_reason
-                self._safe_mode_cause = (
-                    SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
-                )
+            await enter_feature_lifecycle_safe_mode(
+                self, safe_mode_reason,
+                suppression_exc if is_execution_control_error(suppression_exc) else None,
+            )
             raise RuntimeError(
                 "feature context could not be suppressed during privacy transition"
             ) from None
@@ -6463,12 +6466,17 @@ class KestrelAgent(
         :meth:`prepare_and_refresh_all_feature_context_clauses` instead.
         """
 
+        require_feature_lifecycle_integrity(self)
         runtime = getattr(self, "feature_contribution_runtime", None)
         if runtime is None:
             return ()
         try:
             return runtime.refresh_all_context_clauses()
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            if is_execution_control_error(exc) and not fail_closed:
+                _retain_feature_lifecycle_safe_mode(self, "Feature context refresh reported native control", exc)
+            if isinstance(exc, (asyncio.CancelledError, BaseExceptionGroup)) and not is_execution_control_error(exc):
+                raise
             if not fail_closed:
                 raise
             return self._suppress_failed_feature_context_refresh(runtime, exc)
@@ -6480,6 +6488,7 @@ class KestrelAgent(
     ):
         """Prepare async feature state, then atomically republish all clauses."""
 
+        require_feature_lifecycle_integrity(self)
         runtime = getattr(self, "feature_contribution_runtime", None)
         if runtime is None:
             return ()
@@ -6488,15 +6497,22 @@ class KestrelAgent(
         except asyncio.CancelledError as exc:
             if fail_closed:
                 self._suppress_failed_feature_context_refresh(runtime, exc)
+            if is_execution_control_error(exc):
+                _retain_feature_lifecycle_safe_mode(self, "Feature context preparation reported native control", exc)
             raise
-        except Exception as exc:
+        except (Exception, BaseExceptionGroup) as exc:
+            if is_execution_control_error(exc) and not fail_closed:
+                _retain_feature_lifecycle_safe_mode(self, "Feature context preparation reported native control", exc)
+            if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception) and not is_execution_control_error(exc):
+                raise
             if not fail_closed:
                 raise
             return self._suppress_failed_feature_context_refresh(runtime, exc)
 
-    @staticmethod
-    def _suppress_failed_feature_context_refresh(runtime, exc):
+    def _suppress_failed_feature_context_refresh(self, runtime, exc):
         """Replace all feature clauses with empty bodies after refresh failure."""
+
+        from kestrel_sovereign.execution_custody import retained_execution_error
 
         # Do not log the exception or its chained feature-code cause: an
         # out-of-tree hook or renderer may have included private bytes there.
@@ -6505,7 +6521,25 @@ class KestrelAgent(
             "suppressing contributed context (%s)",
             type(exc).__name__,
         )
-        return runtime.suppress_all_context_clauses()
+        native = exc if is_execution_control_error(exc) else None
+        if native is not None:
+            _retain_feature_lifecycle_safe_mode(self, "Feature context suppression follows native uncertainty", native)
+        try:
+            result = runtime.suppress_all_context_clauses()
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as cleanup:
+            if native is None and not is_execution_control_error(cleanup):
+                raise
+            controls = (native, cleanup if is_execution_control_error(cleanup)
+                        or isinstance(cleanup, asyncio.CancelledError) else
+                        RuntimeError("feature context suppression did not complete"))
+            _retain_feature_lifecycle_safe_mode(self, "Feature context suppression reported native control", *controls)
+            raise execution_terminal_error(
+                *controls, exc if isinstance(exc, asyncio.CancelledError) else None,
+                retain_originals=True, isolate_control_originals=True,
+            ) from None
+        if native is not None:
+            raise retained_execution_error(native)
+        return result
 
     def _record_contribution_rejections(self, transition) -> None:
         """Log and RETAIN the features refused activation.
@@ -6866,9 +6900,17 @@ class KestrelAgent(
         mandatory = feature_class_name in MANDATORY_FEATURES
         require_feature_lifecycle_integrity(self)
         if prepared_contributions is None:
-            prepared_contributions = self._prepare_feature_contribution_transition(
-                (feature,)
-            ).only()
+            try:
+                prepared_contributions = self._prepare_feature_contribution_transition(
+                    (feature,)
+                ).only()
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_error:
+                if is_execution_control_error(preparation_error):
+                    await enter_feature_lifecycle_safe_mode(
+                        self, "Feature activation preflight reported unresolved native control",
+                        preparation_error, features=(feature,),
+                    )
+                raise
         # Held from before initialize(), which may start workers or child
         # processes, until a teardown's release is confirmed (#3522).
         self._hold_feature(feature)
@@ -7103,9 +7145,17 @@ class KestrelAgent(
         """
         require_feature_lifecycle_integrity(self)
         if prepared_contributions is None:
-            prepared_contributions = self._prepare_feature_contribution_transition(
-                (feature,)
-            ).only()
+            try:
+                prepared_contributions = self._prepare_feature_contribution_transition(
+                    (feature,)
+                ).only()
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_error:
+                if is_execution_control_error(preparation_error):
+                    await enter_feature_lifecycle_safe_mode(
+                        self, "Feature activation preflight reported unresolved native control",
+                        preparation_error, features=(feature,),
+                    )
+                raise
         self._hold_feature(feature)
         try:
             # An isolated re-enable starts from a terminal proxy with no live

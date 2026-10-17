@@ -9,6 +9,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from tests.unit.test_execution_custody_review29 import native_owner
 from tests.unit.test_execution_custody_review32 import receipt
+from tests.utils.original_failure import OriginalFailure
 
 
 @pytest.mark.asyncio
@@ -24,6 +25,7 @@ async def test_actual_native_startup_collector_preserves_receipt_after_caller_ca
     peer, peer_db = await native_owner(peer_path)
     release, entered, closed, peer_closed = (asyncio.Event() for _ in range(4))
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
     manager = AgentManager(base_data_dir=tmp_path)
 
     async def native_tail():
@@ -65,7 +67,16 @@ async def test_actual_native_startup_collector_preserves_receipt_after_caller_ca
         outcome = await await_owned_task(waiter)
         assert closed.is_set() and peer_closed.is_set()
         assert db.backend._connection is None and peer_db.backend._connection is None
-        assert outcome.error is failure, "startup collector replaced the native receipt with cancellation"
+        if surface == "unpublished_batch":
+            # The finite canonical cleanup now also retains its actual caller
+            # withdrawal and failed original owner. Neither may replace or
+            # mutate the shared native receipt.
+            source.assert_retained(outcome.error)
+            from kestrel_sovereign.execution_custody import execution_cleanup_debts
+            assert any(resource is agent and task is not None and task.done()
+                       for resource, task in execution_cleanup_debts(outcome.error))
+        else:
+            assert outcome.error is failure, "startup collector replaced the native receipt with cancellation"
     finally:
         release.set()
         for task in (waiter, continuation, *tasks):

@@ -673,7 +673,15 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
         for _class_name, feature in loaded
         if not bool(getattr(feature, "enabled", True))
     )
-    prepared = agent._prepare_feature_contribution_transition(to_activate)
+    try:
+        prepared = agent._prepare_feature_contribution_transition(to_activate)
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_error:
+        if is_execution_control_error(preparation_error):
+            await _enter_feature_quarantine_safe_mode(
+                agent, "Package enable preflight reported unresolved native control",
+                preparation_error, features=to_activate,
+            )
+        raise
     if prepared.rejected:
         # A package enable is a GROUP transaction: its members go live together
         # or not at all. Silently enabling the survivors would hand back a

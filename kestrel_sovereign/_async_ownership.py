@@ -560,7 +560,10 @@ class OwnedAsyncIterator(Generic[_T]):
                 # from the producer's physical result. Its original watcher
                 # remains owned by this iterator and is harvested below.
                 raise outcome.error
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                raise
             if self._owner.done():
                 return
             if self._item_outstanding:

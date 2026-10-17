@@ -71,7 +71,7 @@ from .invocation_context import (
 )
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import REMOTE_ROUTE_NAME, BackendType, RemoteBackendMixin
-from .lifecycle import harvest_llm_close_task, start_llm_close_task
+from .lifecycle import harvest_llm_close_task, llm_close_observation_control, start_llm_close_task
 from .decision_service import DecisionServiceMixin
 from .modality_recording import ModalityRecordingMixin
 from .provider_policy import (
@@ -6308,9 +6308,10 @@ No other text or formatting.
                 error = outcome.error
                 if task not in resource_closers and error is not None and not is_execution_control_error(error):
                     error = None
-                if is_execution_control_error(error):
+                observed_control = llm_close_observation_control(outcome)
+                if is_execution_control_error(observed_control):
                     self._llm_close_control = execution_terminal_error(
-                        vars(self).get("_llm_close_control"), error,
+                        vars(self).get("_llm_close_control"), observed_control,
                         retain_originals=True, isolate_control_originals=True,
                     )
                 observations.extend((error, outcome.cancellation))

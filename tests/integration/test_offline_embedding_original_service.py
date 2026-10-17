@@ -150,15 +150,19 @@ async def test_retired_private_service_never_admits_another_close_task(assertion
 
 
 @pytest.mark.asyncio
-async def test_retired_private_owner_still_replays_actual_nonlocal_observer_control(native_pg, assertion_store, tmp_path, monkeypatch):
-    from kestrel_sovereign.llm import lifecycle
+@pytest.mark.parametrize("surface", ["resolution", "service", "remote"])
+async def test_retired_private_owner_still_replays_actual_nonlocal_observer_control(native_pg, assertion_store, tmp_path, monkeypatch, surface):
+    from kestrel_sovereign.llm import lifecycle, remote_backend
+    from tests.utils.original_failure import OriginalFailure
     original = await _original_control(native_pg[0], monkeypatch)
+    source = OriginalFailure.capture(original)
     service, http, _ = _private_service(monkeypatch, tmp_path)
     storage = _GOVERNED_STORAGES[id(assertion_store)]
-    resolution = await cli_embeddings.resolve_agent_embedding(assertion_store._database, storage.agent_id)
+    resolution = await cli_embeddings.resolve_agent_embedding(assertion_store._database, storage.agent_id) if surface == "resolution" else None
     entered, release = asyncio.Event(), asyncio.Event()
-    actual_close, actual_join = httpx.AsyncClient.aclose, lifecycle.await_owned_task
-    closes = []
+    module = {"resolution": lifecycle, "service": service_module, "remote": remote_backend}[surface]
+    actual_close, actual_join = httpx.AsyncClient.aclose, module.await_owned_task
+    closes, withdrawals = [], []
     async def close(self):
         await actual_close(self)
         if self is http:
@@ -171,27 +175,44 @@ async def test_retired_private_owner_still_replays_actual_nonlocal_observer_cont
             # A real join observer can carry earlier native uncertainty.
             # This does not change the original successful physical closer.
             result.cancellation.__cause__ = original
+            withdrawals.append(result.cancellation)
         return result
     monkeypatch.setattr(httpx.AsyncClient, "aclose", close)
-    monkeypatch.setattr(lifecycle, "await_owned_task", join)
-    owner = create_owned_task(resolution.aclose(), retain_originals=True)
+    monkeypatch.setattr(module, "await_owned_task", join)
+    client = service.providers[0]["client"]
+    if surface == "service":
+        lifecycle.start_llm_close_task(service, ("client", id(client)), client.close, resource=client)
+    async def retire():
+        if surface == "resolution":
+            await resolution.aclose()
+        elif surface == "service":
+            await service.wait_for_close_completion()
+        else:
+            await service._close_remote_client(client, lease_id="declared-local-native-replay")
+    owner = create_owned_task(retire(), retain_originals=True)
     try:
         await asyncio.wait_for(entered.wait(), 5)
         owner.cancel("actual private-service observer with prior native control")
         await asyncio.sleep(0)
         release.set()
         first = await await_owned_task(owner)
-        repeated = await await_owned_task(create_owned_task(resolution.aclose(), retain_originals=True))
+        repeated = await await_owned_task(create_owned_task(retire(), retain_originals=True))
         for result in (first, repeated):
-            assert original in tuple(_explicit_control_chain(result.error)), "retired private owner forgot original nonlocal control"
+            source.assert_retained(result.error)
             assert execution_commit_outcome(result.error) == "unknown"
-        assert resolution._private_owner.retired and http.is_closed
+        assert withdrawals and all(error in tuple(_explicit_control_chain(first.error)) for error in withdrawals)
+        assert all(error not in tuple(_explicit_control_chain(repeated.error)) for error in withdrawals), "native source retention stored the caller wrapper as shared history"
+        assert http.is_closed and not service.has_pending_close_owners()
+        if resolution is not None:
+            assert resolution._private_owner.retired
         assert len(closes) == 1 and closes[0].done()
     finally:
         release.set()
         await await_owned_task(owner)
-        await service.close()
-        await service.wait_for_close_completion()
+        for cleanup in (service.close, service.wait_for_close_completion):
+            settled = await await_owned_task(create_owned_task(cleanup(), retain_originals=True))
+            if settled.error is not None:
+                source.assert_retained(settled.error)
 
 
 @pytest.mark.asyncio

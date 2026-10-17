@@ -147,7 +147,9 @@ class NativeExecutionObserver:
             for record in unresolved:
                 for receipt in record.acknowledgments:
                     retain_acknowledged_execution_commit(debt, receipt)
-            error = execution_terminal_error(error, debt)
+            error = execution_terminal_error(
+                error, debt, retain_originals=True, isolate_control_originals=True,
+            )
         return OwnedTaskOutcome(None, error, cancellation)
 
 
