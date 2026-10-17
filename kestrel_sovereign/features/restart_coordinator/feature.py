@@ -499,8 +499,7 @@ class RestartCoordinatorFeature(Feature):
         # supervised by a background ack task in THIS process. Guards the
         # cron-tick retry from re-enqueuing a duplicate wake while a long
         # cognition turn is still in flight (#1796).
-        if not hasattr(self, "_inflight_restart_acks"):
-            self._inflight_restart_acks: set = set()
+        self._inflight_restart_acks = self._restart_ack_guards()
         # request_id -> monotonic time THIS process crossed it into
         # ``executing``. Used to tell a dispatch still in flight from one that
         # silently failed, without a schema column: a row stamped with this
@@ -592,6 +591,20 @@ class RestartCoordinatorFeature(Feature):
         # agent calls at the END of initialize() once everything is up, so the
         # FIRST wake attempt succeeds immediately. The cron tick remains the
         # backstop for undelivered wakes (#1809).
+
+    def _restart_ack_guards(self) -> set:
+        """The original pending-row guard belongs to the Agent, not a feature.
+
+        Replacement instances borrow the SAME existing set. No second index or
+        terminal history is created; original producer callbacks retire its
+        entries only when their dispatch and acknowledgement have settled.
+        """
+        guards = vars(self.agent).get("_inflight_restart_acks")
+        if guards is None:
+            guards = vars(self).get("_inflight_restart_acks", set())
+            self.agent._inflight_restart_acks = guards
+        self._inflight_restart_acks = guards
+        return guards
 
     async def shutdown(self) -> None:
         """Stop owned wake acknowledgements before shared storage shuts down.
@@ -3839,7 +3852,7 @@ class RestartCoordinatorFeature(Feature):
         # A supervisor from this process is already awaiting this row's
         # wake — don't enqueue a duplicate (avoids a wake storm while a
         # long cognition turn is still running).
-        if row.id in self._inflight_restart_acks:
+        if row.id in self._restart_ack_guards():
             return None
 
         # Stamp BEFORE the signal is handed over. ``enqueue_signal`` starts
@@ -3907,6 +3920,7 @@ class RestartCoordinatorFeature(Feature):
         re-dispatch lands ``OK``.
         """
 
+        self._restart_ack_guards()
         borrowed = getattr(handle, "task", None)
         if not isinstance(borrowed, asyncio.Future):
             borrowed = None

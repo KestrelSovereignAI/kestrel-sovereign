@@ -1831,6 +1831,11 @@ owner. Feature disable/re-enable does not erase that pending guard. A replacemen
 Feature also checks the Agent's existing original control before retrying, so
 instance replacement cannot turn retained uncertainty into undelivered absence.
 
+Pending restart rows use that SAME guard set on the existing Agent owner.
+Feature instances borrow it; replacing a Feature while its original dispatch
+is still pending cannot create a fresh retry namespace. The original producer
+and ACK callbacks settle entries in this shared set, not a parallel task index.
+
 Durable cognition settlement registration is an awaited admission boundary.
 Task allocation, request binding and callback publication refusal retire the
 exact original request generation before returning; an accepted idle barrier
@@ -1840,6 +1845,21 @@ fails, finite isolated composition keeps the opening and cleanup failures plus
 the exact Agent/request/generation debt instead of claiming Stop completion.
 Constructor/SQLite registration tests establish this finite component boundary,
 not distributed Stop, Agent initialization or durable ACK/NACK acceptance.
+
+Invocation child admission applies the same boundary: canonical Task refusal
+closes the unstarted operation, and binding/callback-publication failure cancels
+and physically joins the exact accepted child before registration cleanup.
+Binding rollback removes only its own operation/callback; the caller retains
+physical ownership. An abandoned admission cannot resolve completion waiters as
+successful execution or release a prior nested registration's reference.
+
+A fired durable-owner monitor timer is not liveness after Task admission or
+callback publication fails. Refusal schedules a bounded retry. An accepted
+monitor stays in its existing owner slot; the retry observes that SAME Task,
+without replacing pending work, and harvests it after physical completion if
+its normal callback could not be published. Native ledger/component tests
+exercise the cleanup-only owner CAS and preserved lease token, not cognition
+execution or initialized Agent readiness.
 
 Failed Hold admission keeps both the actual read failure and exact-token native
 rollback outcome. Local pending-admission bookkeeping can unwind after release,

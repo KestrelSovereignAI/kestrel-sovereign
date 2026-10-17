@@ -342,9 +342,17 @@ class RequestLifecycleMixin:
             if not current:
                 operations.pop(key, None)
 
-        operation.add_done_callback(release)
-        if self.is_request_cancelled(request_id):
-            operation.cancel()
+        try:
+            operation.add_done_callback(release)
+            if self.is_request_cancelled(request_id):
+                operation.cancel()
+        except BaseException:
+            # The caller still owns this accepted Task and must physically
+            # retire it before releasing the request generation. Undo only
+            # this failed binding, including partial callback publication.
+            operation.remove_done_callback(release)
+            release(operation)
+            raise
 
     def _request_generation_for_current_task(
         self,

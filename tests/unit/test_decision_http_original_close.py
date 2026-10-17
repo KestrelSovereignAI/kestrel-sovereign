@@ -7,6 +7,7 @@ import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
     execution_cleanup_debts,
     is_execution_control_error,
 )
@@ -47,6 +48,8 @@ async def test_actual_decision_http_close_keeps_original_native_debt(monkeypatch
     listener = await asyncio.start_server(peer, "127.0.0.1", 0)
     native_close, clients = httpx.AsyncClient.aclose, []
     original = httpx.ReadError("private original physical-close ACK lost")
+    source_graph = tuple(_explicit_control_chain(original))
+    source_debts = tuple(execution_cleanup_debts(original))
 
     async def native_close_then_lose_ack(client):
         clients.append(client)
@@ -65,9 +68,11 @@ async def test_actual_decision_http_close_keeps_original_native_debt(monkeypatch
         await asyncio.wait_for(closed.wait(), 2)
         assert received == [b'{"model":"local-native-proof"}']
         assert len(clients) == 1 and clients[0].is_closed
-        assert caught.value is original and is_execution_control_error(caught.value), (
+        assert original in tuple(_explicit_control_chain(caught.value)) and is_execution_control_error(caught.value), (
             "decision transport normalization discarded original native control"
         )
+        assert tuple(_explicit_control_chain(original)) == source_graph
+        assert tuple(execution_cleanup_debts(original)) == source_debts
         debts = execution_cleanup_debts(caught.value)
         assert any(resource is clients[0] and owner.done() for resource, owner in debts)
     finally:

@@ -467,6 +467,8 @@ async def test_timely_agent_snapshot_and_stop_retain_both_native_failures(
         OSError("actual timely periodic native close ACK lost"),
         OSError("actual timely final snapshot native close ACK lost"),
     ]
+    source_graphs = [tuple(_explicit_control_chain(error)) for error in state["close_errors"]]
+    source_debts = [tuple(execution_cleanup_debts(error)) for error in state["close_errors"]]
     state["release_server"].set()
     release_close.set()
     await service.start()
@@ -477,7 +479,8 @@ async def test_timely_agent_snapshot_and_stop_retain_both_native_failures(
             if worker.done():
                 break
             await asyncio.sleep(0.01)
-        assert worker.done() and owned_task_error(worker) is state["close_errors"][0]
+        assert worker.done() and state["close_errors"][0] in tuple(_explicit_control_chain(owned_task_error(worker)))
+        assert source_errors and source_errors[0] in tuple(_explicit_control_chain(owned_task_error(worker)))
         await agent._run_durable_shutdown_tail(5)
         assert len(close_tasks) == 2 and all(owner.done() for owner in close_tasks)
         terminal = vars(agent).get("_shutdown_control")
@@ -485,6 +488,8 @@ async def test_timely_agent_snapshot_and_stop_retain_both_native_failures(
         assert all(error in chain for error in state["close_errors"]), (
             "timely harvest replaced an original native close error"
         )
+        assert all(tuple(_explicit_control_chain(error)) == before for error, before in zip(state["close_errors"], source_graphs))
+        assert all(tuple(execution_cleanup_debts(error)) == before for error, before in zip(state["close_errors"], source_debts))
         assert all(
             any(
                 resource is client and owner in close_tasks
@@ -611,6 +616,8 @@ async def test_timely_native_cancel_receipt_survives_an_earlier_completion_reade
         "original timely native close cancellation"
     )
     state["close_error"].__cause__ = OSError("actual original native close failure")
+    source_graph = tuple(_explicit_control_chain(state["close_error"]))
+    source_debts = tuple(execution_cleanup_debts(state["close_error"]))
     state["release_server"].set()
     release_close.set()
     loop, factory = (
@@ -641,10 +648,14 @@ async def test_timely_native_cancel_receipt_survives_an_earlier_completion_reade
     loop.set_task_factory(observe_admitted_task)
     try:
         await agent._run_durable_shutdown_tail(5)
-        assert observed == [state["close_error"]], (
+        assert len(observed) == 1 and state["close_error"] in tuple(_explicit_control_chain(observed[0])), (
             "first native completion reader did not observe original cancellation"
         )
-        assert all(owner.done() for owner in close_tasks)
+        assert is_execution_control_error(observed[0])
+        assert source_errors and source_errors[0] in tuple(_explicit_control_chain(observed[0]))
+        assert tuple(_explicit_control_chain(state["close_error"])) == source_graph
+        assert tuple(execution_cleanup_debts(state["close_error"])) == source_debts
+        assert len(close_tasks) == 1 and all(owner.done() for owner in close_tasks)
         terminal = vars(agent).get("_shutdown_control")
         assert state["close_error"] in tuple(_explicit_control_chain(terminal)), (
             "later harvest manufactured cause-free cancellation"

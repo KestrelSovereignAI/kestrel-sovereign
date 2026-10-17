@@ -554,20 +554,37 @@ def bind_async_invocation(
                                 ):
                                     return await invoke_governed()
 
-                        isolated_operation = asyncio.create_task(
-                            run_isolated_operation(),
-                            name=(
-                                "invocation-turn:"
-                                f"{invocation_log_correlation(invocation_id)}"
-                            ),
-                            context=operation_context,
-                        )
-                        if callable(bind_operation):
-                            bind_operation(
-                                lifecycle_owner,
-                                invocation_id,
-                                isolated_operation,
+                        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+                        try:
+                            isolated_operation = create_owned_task(
+                                run_isolated_operation(),
+                                name=(
+                                    "invocation-turn:"
+                                    f"{invocation_log_correlation(invocation_id)}"
+                                ),
+                                context=operation_context,
+                                retain_originals=True,
                             )
+                            if callable(bind_operation):
+                                bind_operation(
+                                    lifecycle_owner,
+                                    invocation_id,
+                                    isolated_operation,
+                                )
+                        except BaseException as opening:
+                            cleanup_abandoned = True
+                            if isolated_operation is not None:
+                                isolated_operation.cancel()
+                                outcome = await await_owned_task(isolated_operation)
+                                cleanup_error = outcome.error
+                                if isinstance(cleanup_error, asyncio.CancelledError) and not is_execution_control_error(cleanup_error):
+                                    cleanup_error = None
+                                raise execution_terminal_error(
+                                    opening, cleanup_error, outcome.cancellation,
+                                    retain_originals=True, prefer_cancellation=True,
+                                    isolate_control_originals=True,
+                                )
+                            raise
                         try:
                             result = await isolated_operation
                             require_execution_work(lifecycle_owner)
@@ -668,7 +685,7 @@ def bind_async_invocation(
                     await preserve_failed_effects(error)
                     raise
                 except BaseException as error:
-                    if registered:
+                    if registered and not cleanup_abandoned:
                         request_cancelled = getattr(
                             type(lifecycle_owner),
                             "is_request_cancelled",

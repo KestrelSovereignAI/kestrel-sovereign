@@ -3100,12 +3100,30 @@ class SignalDispatcher:
         self._runtime_owner_heartbeat_timer = None
         if self._durable_shutdown and not self._runtime_owner_cleanup_required():
             return
-        task = self._agent._track_background_task(
-            self._heartbeat_runtime_owner(),
-            name=f"durable_signal_owner_heartbeat:{self._agent.did}",
-        )
-        self._runtime_owner_heartbeat_task = task
-        task.add_done_callback(self._finish_runtime_owner_heartbeat)
+        task = self._runtime_owner_heartbeat_task
+        if task is not None:
+            # Publication can fail after this exact monitor was accepted.
+            # Its fallback timer observes it; it may never create a competing
+            # heartbeat or mistake missing callback publication for settlement.
+            if task.done():
+                self._finish_runtime_owner_heartbeat(task)
+            else:
+                self._schedule_runtime_owner_heartbeat(retry=True)
+            return
+        try:
+            task = self._agent._track_background_task(
+                self._heartbeat_runtime_owner(),
+                name=f"durable_signal_owner_heartbeat:{self._agent.did}",
+            )
+            self._runtime_owner_heartbeat_task = task
+            task.add_done_callback(self._finish_runtime_owner_heartbeat)
+        except BaseException:
+            # The fired timer no longer owns liveness. Canonical Agent Task
+            # admission closes an unstarted operation on refusal; an accepted
+            # monitor remains in the original slot through publication failure.
+            self._runtime_owner_heartbeat_failures += 1
+            self._schedule_runtime_owner_heartbeat(retry=True)
+            raise
 
     async def _retain_runtime_owner_cleanup_liveness(self) -> None:
         """Refresh only the already-owned shutdown/terminalization metadata."""

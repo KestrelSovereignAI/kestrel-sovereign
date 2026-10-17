@@ -58,7 +58,7 @@ async def test_restart_ack_keeps_original_control_and_borrowed_dispatch_owner(
     child.dispatcher = dispatcher
     entered, release = asyncio.Event(), asyncio.Event()
     originals, graphs, debts, calls = [], [], [], []
-    handle = watcher = ack = None
+    handle = watcher = ack = pending_replacement = None
 
     async def native_effect():
         calls.append(asyncio.current_task())
@@ -134,6 +134,12 @@ async def test_restart_ack_keeps_original_control_and_borrowed_dispatch_owner(
                     assert row.id in feature._inflight_restart_acks, "withdrawn ACK released retry guard while original dispatch still owns work"
                     await feature.shutdown()
                     assert row.id in feature._inflight_restart_acks, "feature disable released borrowed dispatch retry guard"
+                    replacement = RestartCoordinatorFeature(child)
+                    replacement._db = db
+                    replacement._inflight_restart_acks = set()
+                    pending_replacement = await replacement._deliver_restart_completed(row, child.did, dispatcher, True)
+                    assert pending_replacement is None, "replacement admitted second wake while original dispatch pending"
+                    assert len(calls) == 1 and not handle.task.done() and not handle.task.cancelling()
                 release.set()
                 completed = await await_owned_task(handle.task)
                 if route == "late-ack":
@@ -175,7 +181,7 @@ async def test_restart_ack_keeps_original_control_and_borrowed_dispatch_owner(
         assert not (await get_request(db, row.id)).wake_delivered, "withdrawn or uncertain ACK falsely marked wake delivered"
     finally:
         release.set()
-        for task in (watcher, ack, handle.task if handle else None):
+        for task in (watcher, ack, pending_replacement, handle.task if handle else None, *tuple(child._background_tasks)):
             if task is not None:
                 await await_owned_task(task)
         if handle is not None and not handle.durable_admission.done():
