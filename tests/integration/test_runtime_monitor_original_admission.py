@@ -31,6 +31,7 @@ from tests.integration.test_execution_custody_review56_pg import lose_native_ack
     "allocation", "callback-before", "callback-after",
     "tracker-before", "tracker-after", "canonical-before", "canonical-after",
     "tracker-control-before", "tracker-control-after",
+    "tracker-control-stop-before", "tracker-control-stop-after",
 ])
 async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
     native_pg, tmp_path, monkeypatch, mode, eager,
@@ -122,12 +123,18 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
                     native_fault, boundary="commit",
                     original=OSError("actual cleanup-owner CAS COMMIT ACK lost"),
                 )
+            stopped = None
+            if "-stop-" in mode:
+                with pytest.raises(BaseException) as stopped:
+                    await dispatcher._stop_runtime_owner_heartbeat()
             outcome = await await_owned_task(original)
             if "-control-" in mode:
                 native_original = outcome.error
                 assert native_receipts == [True] and is_execution_control_error(native_original)
                 original_graph = tuple(_explicit_control_chain(native_original))
                 original_debts = tuple(execution_cleanup_debts(native_original))
+                if stopped is not None:
+                    assert native_original in tuple(_explicit_control_chain(stopped.value))
                 native_fault_context.__exit__(None, None, None)
                 native_fault = None
             else:
@@ -139,7 +146,7 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
                 timer.cancel()
                 dispatcher._start_runtime_owner_heartbeat()
             assert dispatcher._runtime_owner_heartbeat_task is None, "completed monitor without published callback was not harvested by retry"
-            assert original not in child._background_tasks, "fallback did not finish original Agent bookkeeping"
+            assert original not in child._background_tasks, "terminal monitor harvester did not finish original Agent bookkeeping"
             if native_original is not None:
                 with pytest.raises(BaseException) as retained:
                     child._raise_shutdown_control(control_only=True)
@@ -149,7 +156,8 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
                 assert tuple(execution_cleanup_debts(native_original)) == original_debts
             # A delayed duplicate callback may never retire its successor.
             # Canonical refusal ran no SQL; the fresh attempt must refresh CAS.
-            dispatcher._runtime_owner_heartbeat_timer.cancel()
+            if dispatcher._runtime_owner_heartbeat_timer is not None:
+                dispatcher._runtime_owner_heartbeat_timer.cancel()
             dispatcher._start_runtime_owner_heartbeat()
             successor = dispatcher._runtime_owner_heartbeat_task
             assert successor is not None and successor is not original
@@ -173,6 +181,14 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
         retained = await store.get_delivery(agent_id=child.did, consumer_id=consumer, delivery_id=delivery.delivery_id)
         assert retained.lease_token == delivery.lease_token and retained.lease_owner == dispatcher._durable_delivery_owner
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=227') == 1
+        if "-stop-" in mode:
+            release.set()
+            await await_owned_task(producer)
+            dispatcher._retained_durable_cognition_tasks.discard(producer)
+            for _ in range(2):
+                with pytest.raises(BaseException) as repeated:
+                    await dispatcher.shutdown_durable_delivery()
+                assert native_original in tuple(_explicit_control_chain(repeated.value)), "repeated shutdown lost original monitor control"
     finally:
         loop.set_task_factory(previous)
         if native_fault is not None:

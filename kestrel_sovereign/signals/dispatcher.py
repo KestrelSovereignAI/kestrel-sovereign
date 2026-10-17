@@ -3081,7 +3081,12 @@ class SignalDispatcher:
                 # otherwise successful teardown. Join the original bounded SQL
                 # operation; caller cancellation cannot close its store early.
                 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
-                raise_owned_outcome(await await_owned_task(task), operation="runtime-owner heartbeat retirement")
+                outcome = await await_owned_task(task)
+                # Callback publication can have failed before the Agent
+                # harvester was installed. Stop owns the same terminal receipt
+                # as the retry path, before its finally clears the slot.
+                self._finish_runtime_owner_heartbeat(task)
+                raise_owned_outcome(outcome, operation="runtime-owner heartbeat retirement")
         finally:
             if self._runtime_owner_heartbeat_task is task:
                 self._runtime_owner_heartbeat_task = None

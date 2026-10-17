@@ -3930,6 +3930,11 @@ class RestartCoordinatorFeature(Feature):
             terminal = e
             for original in originals:
                 outcome = await await_owned_task(original)
+                finish = getattr(type(self.agent), "_finish_background_task", None)
+                if callable(finish) and isinstance(original, asyncio.Task):
+                    # Harvest the original source, never this observer's
+                    # cancellation, before a replacement can borrow the row.
+                    finish(self.agent, original)
                 terminal = execution_terminal_error(
                     terminal, outcome.error, outcome.cancellation,
                     retain_originals=True, prefer_cancellation=True,

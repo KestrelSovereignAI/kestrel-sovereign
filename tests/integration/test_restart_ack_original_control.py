@@ -316,7 +316,7 @@ async def test_restart_ack_keeps_original_control_and_borrowed_dispatch_owner(
                     with pytest.raises(BaseException) as blocked:
                         await feature._deliver_restart_completed(row, child.did, dispatcher, True)
                     assert originals[0] in tuple(_explicit_control_chain(blocked.value)), "restart sweep retried original uncertain wake"
-                if route == "late-ack":
+                if route in {"late-ack", "publication-before", "publication-after"}:
                     replacement = RestartCoordinatorFeature(child)
                     replacement._db = db
                     replacement._inflight_restart_acks = set()

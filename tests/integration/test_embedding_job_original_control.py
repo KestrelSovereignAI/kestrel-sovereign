@@ -71,6 +71,9 @@ def _job_agent(n):
     agent._track_background_task = MethodType(
         KestrelAgent._track_background_task, agent
     )
+    agent._finish_background_task = MethodType(
+        KestrelAgent._finish_background_task, agent
+    )
     return agent
 
 

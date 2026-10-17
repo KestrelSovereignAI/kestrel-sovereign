@@ -1871,6 +1871,15 @@ Agent/global and dispatcher ownership retain that same Task. Their shared
 idempotent finisher harvests control before retiring bookkeeping, and delayed
 callbacks cannot clear a successor monitor.
 
+Shutdown's physical monitor join uses that SAME terminal harvester before
+clearing its slot. An unpublished Agent completion callback cannot make native
+control disappear between the first failed shutdown and a later retry. Restart
+delivery's exceptional join likewise invokes the existing Agent finisher on
+each original accepted Task before releasing its row reservation: replacement
+Features see the same source control, not just the old instance's local latch.
+Only original Task errors enter that shared owner; observer withdrawal remains
+part of the caller's finite outcome.
+
 Restart wake sweeps reserve the Agent's same pending-row set synchronously,
 before any stamp or headless-delivery await. One reservation carries one
 idempotent release closure through producer and ACK completion. An accepted but

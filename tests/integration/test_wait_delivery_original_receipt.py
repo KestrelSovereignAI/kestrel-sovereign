@@ -54,6 +54,7 @@ class NativeDispatchInput:
         return self._durable_persistence_gate
 
     _remember_shutdown_control = KestrelAgent._remember_shutdown_control
+    _finish_background_task = KestrelAgent._finish_background_task
 
     def _track_background_task(self, operation, *, name):
         task = KestrelAgent._track_background_task(self, operation, name=name)
