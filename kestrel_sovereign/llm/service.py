@@ -2971,8 +2971,18 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         have landed.
         """
         drain = asyncio.ensure_future(self.drain_preference_persistence())
+        outcome = await await_owned_task(drain)
+        if (outcome.error is not None and outcome.cancellation is not None
+            and any(is_execution_control_error(error)
+                    for error in (outcome.error, outcome.cancellation))):
+            # Project this finite observer's evidence without attaching it to
+            # the retained writer receipt shared by later service readers.
+            raise execution_terminal_error(BaseExceptionGroup(
+                "original model mandate persistence evidence",
+                [outcome.error, outcome.cancellation],
+            ), retain_originals=True)
         raise_owned_outcome(
-            await await_owned_task(drain), operation="model preference persistence"
+            outcome, operation="model preference persistence"
         )
 
     def _refuse_mandate_change_held_elsewhere(self) -> None:
@@ -2993,13 +3003,29 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 task.cancel()
 
         cancellation = None
+        failures = []
         for task in tasks:
             outcome = await await_owned_task(task, cancellation)
             cancellation = outcome.cancellation
+            if outcome.error is not None:
+                failures.append(outcome.error)
             self._remember_preference_control(outcome.error)
         self._preference_persistence_tasks.difference_update(tasks)
+        control = getattr(self, "_preference_persistence_control", None)
+        evidence = []
+        for error in (control, *failures, cancellation):
+            if error is not None and all(error is not prior for prior in evidence):
+                evidence.append(error)
+        if control is not None and len(evidence) > 1:
+            # The long-lived latch retains one strongest writer receipt, not
+            # a history of drain callers. A fresh finite carrier keeps all
+            # joined writer/withdrawal originals without mutating that latch.
+            control = BaseExceptionGroup(
+                "original preference persistence drain evidence", evidence,
+            )
         terminal = execution_terminal_error(
-            getattr(self, "_preference_persistence_control", None), cancellation,
+            control, cancellation,
+            retain_originals=control is not None and len(evidence) > 1,
         )
         if terminal is not None:
             raise terminal

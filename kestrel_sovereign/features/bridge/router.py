@@ -640,7 +640,9 @@ def get_router() -> APIRouter:
         """
         try:
             agent = get_agent(request)
-        except HTTPException:
+        except HTTPException as error:
+            if is_execution_control_error(error):
+                raise
             return {"status": "unavailable", "bridge": False, "agent": False}
 
         features = getattr(agent, "features", {})
@@ -683,7 +685,9 @@ def get_router() -> APIRouter:
 
         try:
             data = await request.json()
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             data = {}
 
         gateway_session_id = data.get("session_id")

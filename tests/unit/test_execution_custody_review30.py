@@ -11,6 +11,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
+    _explicit_control_chain,
     is_execution_control_error,
 )
 from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -373,11 +374,24 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
 @pytest.mark.asyncio
 @pytest.mark.parametrize("owner", ["preference", "modality"])
 async def test_drain_cancellation_joins_all_native_writers_before_strongest_receipt(
-    tmp_path, owner
+    tmp_path, owner, monkeypatch
 ):
     db = await AsyncDatabase.sqlite(str(tmp_path / "siblings.db"))
     await db.execute("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
     service = service_owner()
+    from kestrel_sovereign.llm import service as service_module
+
+    module = service_module if owner == "preference" else modality_recording
+    actual_wait = module.await_owned_task
+    withdrawals = []
+
+    async def observed_wait(task, *args, **kwargs):
+        outcome = await actual_wait(task, *args, **kwargs)
+        if outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+        return outcome
+
+    monkeypatch.setattr(module, "await_owned_task", observed_wait)
     started, release, complete = asyncio.Event(), asyncio.Event(), asyncio.Event()
     failure = carrier("unknown")
 
@@ -425,7 +439,16 @@ async def test_drain_cancellation_joins_all_native_writers_before_strongest_rece
         assert not tasks[1].done()
         release.set()
         result = await await_owned_task(drainer)
-        assert result.error is failure
+        chain = tuple(_explicit_control_chain(result.error))
+        assert failure in chain and withdrawals and withdrawals[0] in chain
+        latched = getattr(service, "_preference_persistence_control" if owner == "preference" else "_modality_record_control")
+        assert latched is failure
+        assert withdrawals[0] not in tuple(_explicit_control_chain(latched))
+        for _ in range(3):
+            with pytest.raises(BaseException) as later:
+                await (service.drain_preference_persistence() if owner == "preference" else service.drain_modality_records())
+            assert later.value is failure
+            assert withdrawals[0] not in tuple(_explicit_control_chain(later.value))
         assert all(task.done() for task in tasks)
         assert not pending
         assert await db.fetchval("SELECT COUNT(*) FROM effects") == 2

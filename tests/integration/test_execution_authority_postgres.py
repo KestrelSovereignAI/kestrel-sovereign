@@ -706,7 +706,6 @@ async def test_pool_release_failure_preserves_committed_outcome(native_pg, monke
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("release", ["error", "cancel", "revoke"])
 async def test_unbound_operational_checkout_retains_participating_admission(native_pg, monkeypatch, explicit, release):
-    from contextlib import asynccontextmanager
     from kestrel_sovereign.execution_custody import execution_commit_outcome
 
     backend, _, _ = native_pg
@@ -876,7 +875,8 @@ async def test_scheduler_preparation_control_error_preserves_original_occurrence
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-async def test_scheduler_marker_rechecks_expiry_after_untouched_row_lock(native_pg, deferred):
+@pytest.mark.parametrize("setup_delay_s", [0.0, 1.1])
+async def test_scheduler_marker_rechecks_expiry_after_untouched_row_lock(native_pg, deferred, setup_delay_s):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
     from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask, SCHEDULER_PROTOCOL_VERSION
@@ -896,12 +896,22 @@ async def test_scheduler_marker_rechecks_expiry_after_untouched_row_lock(native_
     await db.execute("UPDATE scheduled_tasks SET lease_expires_at=(clock_timestamp()+interval '0.6 seconds')::text WHERE id='marker'")
     blocker = control.transaction()
     await blocker.start()
+    # Finite setup overlap, not CPU load or a production latency assertion.
+    await asyncio.sleep(setup_delay_s)
     pending = None
     try:
         await control.fetchrow(f'SELECT id FROM "{schema}".scheduled_tasks WHERE id=\'marker\' FOR UPDATE')
+        # Deliberately cache activity BEFORE the marker can block. The observer
+        # must refresh transaction-local statistics, not win a first-poll race.
+        await control.fetchval("SELECT count(*) FROM pg_stat_activity")
         pending = asyncio.create_task(runner._mark_effect_started(claimed, SimpleNamespace(id=claimed.claim_execution_id), preparation_deferred=deferred))
         async with asyncio.timeout(5):
-            while not await control.fetchval("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%scheduled_tasks%' AND pid<>pg_backend_pid())"):
+            while True:
+                # Activity is cached for this unchanged blocker transaction:
+                # https://www.postgresql.org/docs/16/monitoring-stats.html
+                await control.execute("SELECT pg_stat_clear_snapshot()")
+                if await control.fetchval("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%scheduled_tasks%' AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))"):
+                    break
                 await asyncio.sleep(0.01)
         # Real PostgreSQL evaluates the stale UPDATE predicate before this wait.
         # Holding an unchanged row is crucial: EPQ cannot refresh it afterward.

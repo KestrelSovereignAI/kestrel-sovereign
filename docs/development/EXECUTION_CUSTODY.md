@@ -82,6 +82,40 @@ the initialization closer are physically retired in the regression cases.
 These changes remain subject to whole cumulative independent review; the
 other open lifecycle, admission and provider findings are not waived.
 
+Preference and modality persistence drains project each finite invocation's
+original writer/observer evidence through a fresh explicit carrier after all
+accepted writers join. Mandate-entry's outer drain observer preserves its own
+withdrawal too. The service's long-lived strongest-writer latch remains
+separate: later uncancelled readers receive the original native writer control,
+not previous callers' cancellations or a growing observer history. Original
+PG metadata writes/COMMIT/release, actual Agent callbacks, actual endpoint and
+mandate bodies exercise preference draining; sibling SQLite writers exercise
+the related modality consumer with declared compatibility receipts.
+
+Bridge session, logging, initialization, status/history, tool enumeration and
+HTTP availability consumers likewise propagate canonical control before
+best-effort fallback or success. Native lease denials are delivered after real
+PG/SQLite statements at explicit component callbacks; these tests do not claim
+native lost-COMMIT or authenticated gateway acceptance. The healthy hour count
+uses a bound UTC ISO cutoff matching persisted timestamps on both backends,
+not SQLite-only SQL or a differently formatted text comparison.
+
+Database recovery tests inspect the exact original operation/publication and
+cleanup errors in the full explicit carrier chain and retain the same database
+owner. Selecting only the cleanup exception as an immediate cause would erase
+part of that finite evidence. The inception cases keep the actual SQLite file
+and connection owned while retirement is uncertain, then physically close in
+test cleanup; the lightweight Hold backend contract test is not native PG
+retirement proof. These stronger assertions do not waive uncertain cleanup.
+
+The scheduler lock-expiry fixture refreshes its activity snapshot while its
+original blocker transaction keeps the row unchanged. It observes only waiters
+blocked by that exact session. A deliberately pre-warmed snapshot and bounded
+setup-overlap cases exercise the observer instead of depending on the first
+poll's timing. PostgreSQL documents transaction-local activity caching and
+[snapshot refresh](https://www.postgresql.org/docs/16/monitoring-stats.html).
+Production lease checks, expiry and native retirement deadlines are unchanged.
+
 Endpoint-launched reindex jobs publish through the existing agent background
 owner and canonical original-preserving Task wrapper. Publication accepts fresh
 coroutines, not borrowed Tasks; refused Task creation closes unstarted work.
