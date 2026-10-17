@@ -28,7 +28,7 @@ from kestrel_sdk.llm import (
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
-from .genai_custody import genai_operation, genai_stream, joined_iterator, prepare_genai_client
+from .genai_custody import close_genai_client, genai_operation, genai_stream, joined_iterator, prepare_genai_client
 from .google_adapter import _finish_reason, _normalized_google_genai_usage
 from .gemini_contents import (
     SYSTEM_MARKER_ROLE,
@@ -162,6 +162,13 @@ class VertexAIAdapter(LLMAdapter):
         # Resolve credentials file
         self.credentials_file = credentials_file or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         self._client = None
+        self._closed = False
+
+    async def aclose(self):
+        """Retire only this adapter's cached client, never a supplied route."""
+        self._closed = True
+        if self._client is not None:
+            await close_genai_client(self._client)
 
     def _get_project_from_credentials(self) -> Optional[str]:
         """Extract project_id from GOOGLE_APPLICATION_CREDENTIALS file if available."""
@@ -188,6 +195,8 @@ class VertexAIAdapter(LLMAdapter):
         Lazy initialization to avoid import errors if SDK not installed.
         Prefers GOOGLE_API_KEY (AI Studio) over Vertex AI service account.
         """
+        if self._closed:
+            raise RuntimeError("Vertex adapter is closed")
         if self._client is None:
             try:
                 from google import genai

@@ -106,7 +106,14 @@ Ollama producers share the canonical response owner across SDK normalization
 and retries, including late per-model catalog metadata requests. Availability
 probes cannot suppress that owner's original native control, and fresh caller
 scopes may still reuse a healthy shared client. Temporary client lifetime
-retirement remains distinct from per-operation response ownership.
+retirement remains distinct from per-operation response ownership. Private
+OpenRouter response/stream clients and temporary Google catalog SDKs retire
+before their request lifetime exits; Vertex's cached private client belongs to
+the adapter's `aclose()`. Supplied route clients remain borrowed. All GenAI
+shutdown observers join the same original SDK/session/pool Task, including
+when callback publication fails. Refused or unstarted retirement retains the
+actual resource and original Task rather than reporting physical success.
+Private close debt is carried separately from shared source control errors.
 
 Codex turn shutdown first closes callback admission, directly joins the original
 accepted reader Tasks, and holds the original thread mutex and event sink through
@@ -474,6 +481,10 @@ Current execution truth as of 2026-05-31:
   rather than silently using an unrelated embedding service.
 - RAG and saved-item vector search consume embeddings through storage/vector
   backends once embeddings are written.
+- Provider embedding lookup borrows an explicitly supplied `LLMService`;
+  without that lifecycle owner it returns `None`, never constructs a private
+  service from ambient credentials. Standalone storage callers needing
+  embeddings must construct, inject and close their service themselves.
 - `conversation_history.embedding_vec` exists as SQLAlchemy/vector storage
   groundwork, but the current `MemoryRetriever` semantic score still uses
   keyword/concept overlap.

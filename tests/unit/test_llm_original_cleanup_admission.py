@@ -9,6 +9,7 @@ import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
     execution_cleanup_debts,
     is_execution_control_error,
 )
@@ -358,6 +359,7 @@ async def test_actual_sdk_failed_close_ack_keeps_unpublished_service_fatal(
     agent, db = await _partial_native_agent(tmp_path, monkeypatch)
     service, owners, calls = agent.llm_service, {}, []
     original = OSError("actual original SDK transport close ACK lost")
+    graph, debts = tuple(_explicit_control_chain(original)), tuple(execution_cleanup_debts(original))
     try:
         async with native_phoenix_proxy(tmp_path) as (_supervisor, transport, closed):
             client = openai.AsyncOpenAI(
@@ -377,28 +379,35 @@ async def test_actual_sdk_failed_close_ack_keeps_unpublished_service_fatal(
 
             with monkeypatch.context() as fault:
                 fault.setattr(transport, "aclose", lost_ack)
-                with pytest.raises(OSError) as caught:
+                with pytest.raises(BaseException) as caught:
                     await retire_unpublished_llm(
                         owners, "actual-sdk-owner", service, ()
                     )
-                assert caught.value is original and is_execution_control_error(original)
+                assert original in tuple(_explicit_control_chain(caught.value))
+                assert is_execution_control_error(caught.value)
+                assert tuple(_explicit_control_chain(original)) == graph
+                assert tuple(execution_cleanup_debts(original)) == debts
                 assert any(
-                    resource is client
-                    for resource, _ in execution_cleanup_debts(original)
+                    resource is client and closer is not None and closer.done()
+                    for resource, closer in execution_cleanup_debts(caught.value)
                 )
                 await asyncio.wait_for(closed.wait(), 2)
                 assert transport.is_closed and service.has_pending_close_owners()
                 assert owners["actual-sdk-owner"].provider is service
-                with pytest.raises(OSError) as repeated:
+                with pytest.raises(BaseException) as repeated:
                     await retire_unpublished_llm(
                         owners, "actual-sdk-owner", service, (), join_native=True
                     )
-                assert repeated.value is original and calls == [True]
+                assert original in tuple(_explicit_control_chain(repeated.value)) and calls == [True]
+                assert tuple(_explicit_control_chain(original)) == graph
+                assert tuple(execution_cleanup_debts(original)) == debts
                 assert not agent._runtime_publication_ready.is_set()
     finally:
         try:
-            await agent.shutdown()
-        except BaseException as error:
-            if error is not original:
-                raise
-        await db.close()
+            try:
+                await agent.shutdown()
+            except BaseException as error:
+                if original not in tuple(_explicit_control_chain(error)):
+                    raise
+        finally:
+            await db.close()

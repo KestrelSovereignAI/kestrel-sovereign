@@ -111,6 +111,21 @@ Provider shutdown joins `client.aio.aclose()` as well as synchronous close;
 any transport whose ownership Core made explicit is closed separately. A
 caller-injected HTTPX transport remains borrowed according to the SDK contract.
 
+Private OpenRouter SDKs are owned by their complete response/stream lifetime;
+temporary Google catalog clients are closed before the catalog call exits.
+Vertex's cached private SDK belongs to the adapter and is retired by `aclose()`;
+supplied route clients remain borrowed. GenAI shutdown observers join one
+original close Task across the SDK's async, sync and pinned-HTTPX layers. A
+cancelled observer cannot cancel that physical owner or authorize a second
+close attempt, and private retirement debt never mutates a shared source error.
+
+`get_provider_embedding_service(llm_service)` is a borrowed capability lookup,
+not a factory for an implicit LLM service. Without an explicit owner it returns
+`None`; standalone storage users needing semantic embeddings must construct,
+inject and close an `LLMService`. Agent-owned storage already injects that same
+service. This prevents ambient provider credentials from creating unowned SDK
+pools or usage databases during a synchronous metadata lookup.
+
 Cancellation and explicit irreversible control receipts remain original errors,
 including their causes/groups. Model discovery must not translate them into an
 empty catalog. These built-in integrations are verified with actual SDKs and

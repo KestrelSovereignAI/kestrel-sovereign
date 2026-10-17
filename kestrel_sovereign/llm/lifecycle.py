@@ -3,7 +3,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody, _explicit_control_chain, bind_execution_cleanup, execution_terminal_error,
     is_execution_control_error,
@@ -28,25 +28,41 @@ def start_llm_close_task(owner, key, operation, *, resource=None):
         # Register the original physical owner BEFORE Task admission. A None
         # success tombstone in tasks cannot represent an unaccepted close.
         resources[key] = resource
+    admission = OwnedTaskAdmission()
     try:
         task = create_owned_task(
             operation(), name=f"llm-close:{key}", retain_originals=True,
-            retirement_resource=resource,
+            retirement_resource=resource, admission=admission,
         )
     except BaseException as error:
-        refusals[key] = error
+        task = admission.task
+        if task is None:
+            refusals[key] = error
         if resource is not None or is_execution_control_error(error):
             owner._llm_close_control = execution_terminal_error(
                 vars(owner).get("_llm_close_control"), error, retain_originals=True,
                 isolate_control_originals=True,
             )
-        raise
+        if task is None:
+            raise
+        # Canonical callback publication failed AFTER Task acceptance. Its
+        # start gate prevented the physical operation; retain and join the
+        # accepted original, whose resource debt cannot become a close ACK.
     tasks[key] = task
 
     def completed(done):
         harvest_llm_close_task(owner, key, done)
 
-    task.add_done_callback(completed)
+    try:
+        task.add_done_callback(completed)
+    except BaseException as error:
+        # The Task is already accepted and inventoried. Keep the publication
+        # receipt, but return that SAME Task so the caller physically joins
+        # it and invokes the canonical harvester even without a callback.
+        owner._llm_close_control = execution_terminal_error(
+            vars(owner).get("_llm_close_control"), error, retain_originals=True,
+            isolate_control_originals=True,
+        )
     return task
 
 
@@ -65,9 +81,18 @@ def harvest_llm_close_task(owner, key, task):
     resources = vars(owner).setdefault("_llm_native_retirement_resources", {})
     resource = resources.get(key)
     if error is not None and resource is not None:
-        debts = getattr(error, "_kestrel_native_retirement_debts", ())
-        if not any(held is resource and closer is task for held, closer in debts):
-            error._kestrel_native_retirement_debts = (*debts, (resource, task))
+        # A native closer can return a shared commit/control receipt. Its
+        # private retirement debt belongs on ONE canonical finite carrier,
+        # not on that source or a new wrapper for every shutdown observer.
+        retained = getattr(task, "_kestrel_llm_retirement_error", None)
+        if retained is None:
+            debt = RuntimeError("original LLM native retirement failed")
+            debt._kestrel_native_retirement_debts = ((resource, task),)
+            retained = execution_terminal_error(
+                error, debt, retain_originals=True, isolate_control_originals=True,
+            )
+            task._kestrel_llm_retirement_error = retained
+        error = retained
     if error is not None and is_execution_control_error(error):
         owner._llm_close_control = execution_terminal_error(
             vars(owner).get("_llm_close_control"), error, retain_originals=True,

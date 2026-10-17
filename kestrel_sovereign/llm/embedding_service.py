@@ -991,37 +991,15 @@ def get_embedding_service(
 def get_provider_embedding_service(llm_service: Optional[Any] = None) -> Optional[ProviderEmbeddingService]:
     """Get the active chat provider's embedding service, if it has one.
 
-    When ``llm_service`` is omitted, a process-local ``LLMService`` is created
-    lazily. Callers that already own an agent-scoped ``LLMService`` should pass
-    it so model preference and route disabling are respected exactly.
+    The supplied service is borrowed. Without an explicit lifecycle owner,
+    provider embeddings are unavailable: a synchronous capability lookup may
+    not allocate SDK pools or a usage database that nobody can retire. Agent
+    storage passes its agent-scoped service, preserving route preferences and
+    disabling policy. Standalone callers must own and close their LLMService.
     """
-    if llm_service is not None:
-        return llm_service.get_embedding_service()
-
-    try:
-        from kestrel_sovereign.llm.service import LLMService
-
-        return LLMService().get_embedding_service()
-    except ImportError as exc:
-        if is_execution_control_error(exc):
-            raise
-        # A circular import here means provider embeddings are disabled by a
-        # code-structure bug, not by configuration — surface it loudly (#1792).
-        # Everything that depends on embeddings (RAG, memory retrieval) silently
-        # degrades otherwise, and a WARNING is easy to miss in startup noise.
-        logger.error(
-            "Provider embedding service unavailable due to an import error "
-            "(likely a circular import); provider embeddings are DISABLED and "
-            "any RAG/memory-retrieval path will degrade to a non-embedding "
-            "fallback: %s",
-            exc,
-        )
+    if llm_service is None:
         return None
-    except Exception as exc:
-        if is_execution_control_error(exc):
-            raise
-        logger.warning("Provider embedding service not available: %s", exc)
-        return None
+    return llm_service.get_embedding_service()
 
 
 def reset_embedding_service() -> None:

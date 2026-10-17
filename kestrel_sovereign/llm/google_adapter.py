@@ -21,7 +21,7 @@ from kestrel_sdk.llm import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
-from .genai_custody import genai_operation, genai_stream, joined_iterator, prepare_genai_client
+from .genai_custody import close_genai_client, genai_operation, genai_stream, joined_iterator, prepare_genai_client
 from .gemini_contents import (
     to_gemini_contents,
     tool_call_from_part,
@@ -656,6 +656,7 @@ class GoogleAdapter(LLMAdapter):
         Returns:
             List of ModelInfo objects for each available model
         """
+        temporary_client = None
         try:
             if client is None:
                 api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
@@ -670,6 +671,7 @@ class GoogleAdapter(LLMAdapter):
                     return []
 
                 client = genai.Client(api_key=api_key)
+                temporary_client = client
             prepare_genai_client(client)
             models = []
 
@@ -719,6 +721,9 @@ class GoogleAdapter(LLMAdapter):
                 raise
             logger.error(f"Failed to list Google models: {e}", exc_info=True)
             return []
+        finally:
+            if temporary_client is not None:
+                await close_genai_client(temporary_client)
 
     # ---- Provider metadata (SDK 0.6.0) -------------------------------------
 

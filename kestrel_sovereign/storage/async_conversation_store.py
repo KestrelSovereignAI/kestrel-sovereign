@@ -688,9 +688,9 @@ class AsyncConversationStore:
                 When provided, conversation embeddings are sourced from
                 the active chat provider's embedding capability (OpenAI →
                 text-embedding-3-small, Vertex/Google → text-embedding-004,
-                Ollama → nomic-embed-text). When ``None`` the store falls
-                through to ``get_provider_embedding_service(None)`` which
-                resolves the global default. Set
+                Ollama → nomic-embed-text). When ``None``, provider
+                embeddings are unavailable; a storage lookup never creates
+                an unowned global LLM service. Set
                 ``KESTREL_DISABLE_CONVERSATION_EMBEDDINGS=true`` to opt
                 out entirely (e.g. when the deployment can't reach an
                 embedding provider).

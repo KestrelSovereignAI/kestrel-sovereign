@@ -21,6 +21,7 @@ from kestrel_sdk.llm import (
     InferenceRoute,
 )
 from pydantic import BaseModel, SecretStr
+from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
 
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
@@ -257,9 +258,10 @@ async def llm_service(mock_config, mock_mandate_config, mock_provider_registry):
         if expected_close_error is None:
             await service.close()
         else:
-            with pytest.raises(type(expected_close_error)) as closed:
+            with pytest.raises(BaseException) as closed:
                 await service.close()
-            assert closed.value is expected_close_error
+            assert expected_close_error in tuple(_explicit_control_chain(closed.value))
+            assert not execution_cleanup_debts(expected_close_error)
             assert service.has_pending_close_owners()
 
 
@@ -3110,11 +3112,14 @@ class TestBackendLifecycle:
 
         with pytest.raises(Exception) as closed:
             await llm_service.close()
-        assert closed.value is failure
+        assert failure in tuple(_explicit_control_chain(closed.value))
+        assert not execution_cleanup_debts(failure)
+        assert any(resource is broken_client for resource, _ in execution_cleanup_debts(closed.value))
         assert llm_service.has_pending_close_owners()
         with pytest.raises(Exception) as closed:
             await llm_service.wait_for_close_completion()
-        assert closed.value is failure
+        assert failure in tuple(_explicit_control_chain(closed.value))
+        assert not execution_cleanup_debts(failure)
         broken_client.close.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -3127,9 +3132,11 @@ class TestBackendLifecycle:
         )
         llm_service.close_usage_db = AsyncMock()
 
-        with pytest.raises(LLMServiceError) as closed:
+        with pytest.raises(BaseException) as closed:
             await llm_service.close()
-        assert closed.value is failure
+        assert failure in tuple(_explicit_control_chain(closed.value))
+        assert not execution_cleanup_debts(failure)
+        assert any(resource is llm_service for resource, _ in execution_cleanup_debts(closed.value))
         assert llm_service.has_pending_close_owners()
 
         llm_service.deactivate_inference_lease.assert_awaited_once_with(

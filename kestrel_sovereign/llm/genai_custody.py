@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from functools import partial, wraps
 
-from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign._async_ownership import OwnedAsyncIterator, await_owned_task
 from kestrel_sovereign.execution_custody import (
     NativeExecutionStreamOwner as _StreamOwner,
     _NATIVE_RESPONSE_SINK,
@@ -155,7 +155,32 @@ def genai_stream(function):
 
 
 async def close_genai_client(client):
-    """Close async SDK sessions AND its sync client, joining independent debt."""
+    """Join the SAME original SDK/session/pool close on every observer."""
+    from .lifecycle import harvest_llm_close_task, start_llm_close_task
+
+    original = sys.exc_info()[1]
+    task = start_llm_close_task(
+        client, "genai-native-client", lambda: _close_genai_layers(client), resource=client,
+    )
+    if task is None:
+        if vars(client).get("_llm_close_control") is not None:
+            raise execution_terminal_error(
+                original, client._llm_close_control, retain_originals=True,
+                isolate_control_originals=True,
+            )
+        return
+    outcome = await await_owned_task(task)
+    terminal = execution_terminal_error(
+        original, harvest_llm_close_task(client, "genai-native-client", task),
+        vars(client).get("_llm_close_control"), outcome.cancellation,
+        retain_originals=True, isolate_control_originals=True,
+    )
+    if terminal is not None:
+        raise terminal
+
+
+async def _close_genai_layers(client):
+    """One physical owner attempts independent async, sync and pinned pools."""
     terminal = None
     for close in (client.aio.aclose, client.close,
                   getattr(getattr(client, "_kestrel_genai_httpx_owned", None), "aclose", None)):
@@ -166,6 +191,8 @@ async def close_genai_client(client):
             if inspect.isawaitable(result):
                 await result
         except BaseException as error:
-            terminal = execution_terminal_error(terminal, error)
+            terminal = execution_terminal_error(
+                terminal, error, retain_originals=True, isolate_control_originals=True,
+            )
     if terminal is not None:
         raise terminal
