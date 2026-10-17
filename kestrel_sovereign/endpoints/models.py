@@ -2414,6 +2414,8 @@ async def get_embedding_models(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error listing embedding models: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error listing embedding models.")
 
@@ -2442,6 +2444,8 @@ async def get_embedding_settings(request: Request):
             try:
                 await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
             except Exception as e:  # pragma: no cover - never fail the GET
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(f"embedding capability reconcile skipped in GET: {e}")
         # Resolve the active route's model/dim through the single #2372 resolver
         # so a cleared pin falls through to corpus-match/catalog rather than
@@ -2462,6 +2466,8 @@ async def get_embedding_settings(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error getting embedding settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error getting embedding settings.")
 
@@ -2628,6 +2634,8 @@ async def set_embedding_settings(request: Request):
             try:
                 await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
             except Exception as e:  # pragma: no cover - never block the setter
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(f"embedding capability reconcile skipped in setter: {e}")
 
         try:
@@ -2637,6 +2645,8 @@ async def set_embedding_settings(request: Request):
             # than silently 404'ing to keyword fallback on the next write.
             await agent.llm_service.aset_embedding_route(route, force=force)
         except ValueError as ve:
+            if is_execution_control_error(ve):
+                raise
             raise HTTPException(status_code=400, detail=str(ve))
 
         # Observe the route writer's original outcome before a success echo,
@@ -2736,6 +2746,8 @@ async def set_route_embedding_model(request: Request):
             try:
                 await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
             except Exception as e:  # pragma: no cover - never block the setter
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(
                     f"embedding capability reconcile skipped in model setter: {e}"
                 )
@@ -2746,11 +2758,15 @@ async def set_route_embedding_model(request: Request):
                 route, model, dim, force=force
             )
         except EmbeddingSpaceConflictError as ce:
+            if is_execution_control_error(ce):
+                raise
             # Pinning a model/dim that fragments a VERIFIED shared space is a
             # conflict, not a malformed request (#2440) — refuse at set time
             # instead of storing a phantom pin the space silently overrides.
             raise HTTPException(status_code=409, detail=str(ce))
         except ValueError as ve:
+            if is_execution_control_error(ve):
+                raise
             raise HTTPException(status_code=400, detail=str(ve))
 
         # #2418 — drain the persistence write scheduled by the pin/clear BEFORE
@@ -2780,6 +2796,8 @@ async def set_route_embedding_model(request: Request):
             try:
                 route_service = getter(route)
             except Exception as e:  # pragma: no cover - defensive; fall back to active
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(f"route embedding service build failed for {route}: {e}")
         await _apply_stale_embedding_counts(settings, agent, service=route_service)
         # The echo resolved the route, and a cleared pin leaves it to that
@@ -3099,6 +3117,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
             try:
                 runtime_overrides = llm_service.get_route_embedding_model_overrides()
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug("could not read runtime embedding_model pins: %s", exc)
                 runtime_overrides = {}
             for stale_route in runtime_overrides:
@@ -3109,6 +3129,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
                         stale_route, None, persist=False
                     )
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "could not clear stale embedding_model pin for %s: %s",
                         stale_route,
@@ -3125,6 +3147,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
                     pin_route, model, spec.get("dim"), persist=False
                 )
             except Exception as exc:  # pragma: no cover - defensive; skip bad pin
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "skipping persisted embedding_model pin for %s: %s",
                     pin_route,
@@ -3144,6 +3168,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
         try:
             await llm_service.reconcile_embedding_capabilities(use_cache=True)
         except Exception as exc:  # pragma: no cover - defensive; keep prior behaviour
+            if is_execution_control_error(exc):
+                raise
             logger.debug("reindex embedding capability reconcile skipped: %s", exc)
 
     # (4) Now apply the persisted route — capability has been re-advertised, so a
@@ -3157,6 +3183,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
         try:
             llm_service.set_embedding_route(route, persist=False)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -3176,6 +3204,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
             if active is not None:
                 await llm_service.resolve_route_embedding_model(active)
         except Exception as exc:  # pragma: no cover - defensive; keep prior behaviour
+            if is_execution_control_error(exc):
+                raise
             logger.debug("reindex active-route embedding resolve skipped: %s", exc)
 
     err, embedding_service, target = cli_embeddings._resolve_target(llm_service)
@@ -3223,7 +3253,9 @@ async def reindex_embeddings(request: Request):
     try:
         try:
             data = await request.json()
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             data = {}
         if not isinstance(data, dict):
             data = {}
@@ -3405,7 +3437,9 @@ async def verify_embedding_space(request: Request):
             raise HTTPException(status_code=503, detail="LLM service not available.")
         try:
             data = await request.json()
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             data = {}
         pin_name = data.get("name") if isinstance(data, dict) else None
 
@@ -3429,6 +3463,8 @@ async def verify_embedding_space(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error verifying embedding space: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error verifying embedding space.")
 

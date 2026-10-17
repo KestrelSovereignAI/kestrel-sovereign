@@ -15,7 +15,6 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
-    is_execution_control_error,
 )
 from .db.after_commit import AfterCommitCallback, run_after_commit
 from .db.sqlite import (
@@ -100,24 +99,25 @@ async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseExcept
     if close_exc is not None:
         # Keep the resource-retirement wrapper/owner AND the original control
         # cause. A failed close cannot turn uncertain COMMIT into plain error.
-        cause = (
-            execution_terminal_error(operation_error, close_exc, outcome.cancellation)
-            if any(error is not None and is_execution_control_error(error)
-                   for error in (operation_error, close_exc, outcome.cancellation))
-            else close_exc
+        # This finite lifecycle also retains the actual observer withdrawal;
+        # selecting a stronger close/body receipt must not discard it.
+        cause = execution_terminal_error(
+            operation_error, close_exc, outcome.cancellation,
+            retain_originals=True,
         )
         raise DatabaseRetirementError(db, operation_error, close_exc) from cause
     if db.connection_retirement_pending:
         failure = DatabaseRetirementError(db, operation_error)
-        if operation_error is not None and is_execution_control_error(operation_error):
-            raise failure from operation_error
-        raise failure
+        raise failure from execution_terminal_error(
+            operation_error, outcome.cancellation, retain_originals=True,
+        )
     if outcome.cancellation is not None:
-        terminal = execution_terminal_error(operation_error, outcome.cancellation)
-        if terminal is not None and is_execution_control_error(terminal):
-            terminal.add_note("Caller cancellation occurred during joined database retirement")
-            raise terminal
-        raise outcome.cancellation
+        terminal = execution_terminal_error(
+            operation_error, outcome.cancellation,
+            retain_originals=True, prefer_cancellation=True,
+        )
+        terminal.add_note("Caller cancellation occurred during joined database retirement")
+        raise terminal
 
 
 async def _close_failed_database_initialization(db: "AsyncDatabase", initialization_error: BaseException) -> None:
@@ -128,10 +128,8 @@ async def _close_failed_database_initialization(db: "AsyncDatabase", initializat
         failure = DatabaseInitializationCleanupError(
             initialization_error, retirement_error.cleanup_error, retirement_owner=db,
         )
-        cause = (
-            execution_terminal_error(initialization_error, retirement_error)
-            if is_execution_control_error(initialization_error) or is_execution_control_error(retirement_error)
-            else retirement_error.cleanup_error
+        cause = execution_terminal_error(
+            initialization_error, retirement_error, retain_originals=True,
         )
         raise failure from cause
 

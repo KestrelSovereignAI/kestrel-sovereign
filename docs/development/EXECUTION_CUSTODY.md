@@ -25,9 +25,9 @@ Ordinary availability failures retain their best-effort behavior and legitimate
 bounded split retry. These are component/native proofs, not full Agent READY,
 authenticated HTTP or public-provider acceptance. Explicit component DDL does
 not certify startup migrations; legacy cross-schema migration probes are tracked
-separately in #3673. Remaining settings/CLI outer normalization and sibling
-context tools remain under the open cumulative ledger, not cleared by these
-producer tests. The task-list HTTP wrapper likewise propagates the identity
+separately in #3673. Settings/CLI consumers and sibling context tools remain
+under the cumulative review ledger, not cleared merely by these producer
+tests. The task-list HTTP wrapper likewise propagates the identity
 helper's original receipt instead of replacing it with an ordinary HTTP500.
 
 Shared conversation history, selection, compaction, summary and stash producers
@@ -55,6 +55,32 @@ control before missing-configuration or unavailable-count fallbacks. Ordinary
 availability behavior remains unchanged. The complete settings operation also
 observes profile writers scheduled during its asynchronous response echo, not
 only the writer scheduled by the initial route update.
+
+Embedding discovery/settings/parity HTTP consumers, persisted and runtime pin
+application, reindex target resolution and both offline CLI resolution helpers
+preserve canonical control before best-effort reconciliation, active-route
+fallback, typed HTTP400/409 validation or ordinary HTTP500/refusal conversion.
+Request-body readers also preserve an explicit native control carrier before
+their ordinary malformed-body default. Ordinary unavailable providers and
+invalid operator pins retain their prior compatibility behavior. The boundary
+matrix runs actual scoped corpus/settings SQL, real local-SDK operations and
+the original retired PostgreSQL lease denial at named consumer callbacks. The
+three-dimensional fixture schema/configuration is an explicit component input,
+not startup-migration or full deployed-schema acceptance. Transparent factories
+use an explicitly borrowed usage database and independently retire constructed
+services; this does not clear F63's default/private SDK lifetime inventory.
+
+The existing database retirement owner retains finite original body, closer
+and caller-withdrawal evidence together, including failure wrapping during
+initialization. Physical close is joined before any receipt is returned;
+retirement uncertainty still exposes the same database recovery owner. An
+actual cancellation observed during that join cannot disappear just because
+native control is stronger or the closer also fails. This uses the existing
+canonical original-preserving composition, not another closer, replay grant
+or an unbounded history of subsequent readers. CLI-owned SQLite workers and
+the initialization closer are physically retired in the regression cases.
+These changes remain subject to whole cumulative independent review; the
+other open lifecycle, admission and provider findings are not waived.
 
 Endpoint-launched reindex jobs publish through the existing agent background
 owner and canonical original-preserving Task wrapper. Publication accepts fresh

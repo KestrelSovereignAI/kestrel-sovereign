@@ -464,6 +464,8 @@ async def _apply_persisted_embedding_config(
             )
             print(f"# using persisted embedding_model pin: {route} -> {model}")
         except Exception as exc:  # pragma: no cover - defensive
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "skipping persisted embedding_model pin for %s: %s", route, exc
             )
@@ -477,6 +479,8 @@ async def _apply_persisted_embedding_config(
         try:
             await llm_service.reconcile_embedding_capabilities(use_cache=True)
         except Exception as exc:  # pragma: no cover - discovery must not fail CLI
+            if is_execution_control_error(exc):
+                raise
             logger.debug("embedding capability reconcile skipped: %s", exc)
 
     # (3) Apply the persisted embedding_route (#2263). If it still can't be
@@ -489,6 +493,8 @@ async def _apply_persisted_embedding_config(
             if route:
                 print(f"# using persisted embedding_route: {route}")
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             return (
                 f"the persisted embedding_route {route!r} is no longer valid "
                 f"({exc}). Fix the embedding route (via the settings API/UI or "
@@ -725,27 +731,35 @@ def _resolve_target(
     while doing either. Factored out so unit tests can drive the refusal
     paths without an LLM.
 
-    A provider that raises is an outcome, not a crash: the caller refuses or
+    An ordinary provider failure is an outcome, not a crash: the caller refuses or
     falls back exactly as when nothing resolves. Letting it escape aborted a
     forced ``constitution reanchor`` before its governance write, over an
     embedding outage the re-index used to survive with keyword-only
     chunks (#3418).
+    Original execution control is never an availability refusal: import,
+    construction, route and profile consumers propagate its explicit carrier.
     """
     try:
         from kestrel_sovereign.llm.service import LLMService
     except Exception as exc:  # pragma: no cover - defensive
+        if is_execution_control_error(exc):
+            raise
         return (f"could not import LLMService: {exc}", None, None)
 
     try:
         service_owner = llm_service if llm_service is not None else LLMService()
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         return (f"could not initialize LLM service: {exc}", None, None)
 
     # Explicit "none" means the operator has disabled embeddings — never
     # silently re-embed anyway.
     try:
         route = service_owner.get_embedding_route()
-    except Exception:
+    except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         route = None
     if route and str(route).strip().lower() == "none":
         return (
@@ -758,6 +772,8 @@ def _resolve_target(
     try:
         embedding_service = service_owner.get_embedding_service()
     except Exception as exc:  # noqa: BLE001 — any provider failure is a refusal
+        if is_execution_control_error(exc):
+            raise
         logger.warning("Resolving the embedding service raised.", exc_info=True)
         return (
             f"resolving the embedding service failed "
@@ -777,6 +793,8 @@ def _resolve_target(
     try:
         target = embedding_service.current_profile_id()
     except Exception as exc:  # noqa: BLE001 — any provider failure is a refusal
+        if is_execution_control_error(exc):
+            raise
         logger.warning(
             "The resolved embedding service raised describing itself.",
             exc_info=True,
@@ -844,6 +862,8 @@ async def resolve_agent_embedding(
 
             llm_service = LLMService()
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             return AgentEmbeddingResolution(
                 llm_service=None,
                 embedding_service=None,
