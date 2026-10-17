@@ -318,6 +318,14 @@ Timeouts carrying native commit uncertainty, authority denial or retained
 cleanup debt are control outcomes, not ordinary discovery outages; their
 original carrier propagates instead of becoming an empty catalog.
 
+Implicit Ollama chat/embedding catalogs own their temporary HTTPX pool through
+the same canonical LLM client-close registry as other private clients. The
+adapter inventory references that original Task; no raw wrapper must be admitted
+before cleanup ownership exists. Before-Task refusal retains client/None debt;
+failed receipt publication retains the accepted start-gated Task. Failed closes
+are never repeated. Body, physical-close and actual joiner withdrawal are finite
+isolated evidence, not private cleanup appended to a shared source error.
+
 The process-wide background catalog refresh has one original Task and one
 bounded strongest nonlocal-control receipt. Completion callbacks and concurrent
 or later readers share that original receipt, including cancellation carrying

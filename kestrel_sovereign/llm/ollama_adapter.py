@@ -38,6 +38,7 @@ from .adapter import (
     ToolCall,
     split_thinking_from_content,
 )
+from .lifecycle import harvest_llm_close_task, start_llm_close_task
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     RawResponse,
@@ -262,15 +263,23 @@ class OllamaAdapter(LLMAdapter):
             # A concurrent borrower/retirement waiter already joined the SAME
             # successful close. Failed closes are never removed from this map.
             return
-        task = self._discovery_clients[client]
-        if task is None:
-            with bind_execution_cleanup(self, scopes):
-                task = asyncio.create_task(close_native_execution_stream(client, self))
-            self._discovery_clients[client] = task
-        outcome = await await_owned_task(task)
-        if outcome.error is None:
+        # The native client owns its canonical close registry. The adapter's
+        # existing map retains that SAME Task, not another wrapper/registry
+        # capable of spending a second physical close. Successful private
+        # clients can leave both the adapter inventory and its object graph.
+        key = "ollama-discovery-pool"
+        with bind_execution_cleanup(self, scopes):
+            task = start_llm_close_task(client, key, client.aclose, resource=client)
+        self._discovery_clients[client] = task
+        outcome = await await_owned_task(task) if task is not None else None
+        failure = harvest_llm_close_task(client, key, task) if task is not None else None
+        if failure is None:
             self._discovery_clients.pop(client, None)
-        terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+        terminal = execution_terminal_error(
+            failure, vars(client).get("_llm_close_control"),
+            outcome.cancellation if outcome is not None else None,
+            retain_originals=True, isolate_control_originals=True,
+        )
         if terminal is not None:
             raise terminal
 
@@ -302,7 +311,9 @@ class OllamaAdapter(LLMAdapter):
         try:
             await self._retire_discovery_client(native, scopes)
         except BaseException as error:
-            original = execution_terminal_error(original, error)
+            original = execution_terminal_error(
+                original, error, retain_originals=True, isolate_control_originals=True,
+            )
         if original is not None:
             raise original
 
@@ -315,10 +326,15 @@ class OllamaAdapter(LLMAdapter):
                 borrower = self._discovery_borrowers.get(client)
                 if borrower is not None:
                     joined = await await_owned_task(borrower)
-                    terminal = execution_terminal_error(terminal, joined.error, joined.cancellation)
+                    terminal = execution_terminal_error(
+                        terminal, joined.error, joined.cancellation,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
                 await self._retire_discovery_client(client, current_execution_custody(self))
             except BaseException as error:
-                terminal = execution_terminal_error(terminal, error)
+                terminal = execution_terminal_error(
+                    terminal, error, retain_originals=True, isolate_control_originals=True,
+                )
         if terminal is not None:
             raise terminal
 

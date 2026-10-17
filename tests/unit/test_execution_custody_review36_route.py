@@ -5,6 +5,7 @@ from dataclasses import replace
 import httpx
 import openai
 import pytest
+from tests.utils.original_failure import OriginalFailure
 from pydantic import SecretStr
 
 from kestrel_sovereign._async_ownership import await_owned_task
@@ -21,6 +22,7 @@ async def test_cancelled_rotation_retires_unpublished_native_client(monkeypatch,
     clients, closes = [], []
     sdk_client = openai.AsyncOpenAI
     failure = None if kind == "none" else receipt(kind)
+    source = OriginalFailure.capture(failure) if failure is not None else None
 
     async def request(request):
         entered.set()
@@ -96,10 +98,11 @@ async def test_cancelled_rotation_retires_unpublished_native_client(monkeypatch,
         if failure is None:
             assert isinstance(outcome.error, asyncio.CancelledError)
         else:
-            assert outcome.error is failure, "activation demoted its original native close receipt"
+            source.assert_retained(outcome.error, resource=clients[1][0])
             repeated = await await_owned_task(asyncio.create_task(
                 host._close_remote_client(clients[1][0], lease_id=lease.lease_id)))
-            assert repeated.error is failure and closes == [1]
+            source.assert_retained(repeated.error, resource=clients[1][0])
+            assert closes == [1]
     finally:
         release_lock.set()
         if contender is not None:

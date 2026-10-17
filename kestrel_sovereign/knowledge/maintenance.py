@@ -1233,9 +1233,24 @@ class SemanticMaintenanceService:
                         isolate_control_originals=True,
                     )
             finally:
-                await close_native_execution_stream(
-                    lease, self._database.backend, close_operation=self._release_lease,
-                )
+                try:
+                    await close_native_execution_stream(
+                        lease, self._database.backend, close_operation=self._release_lease,
+                    )
+                except BaseException as retirement:
+                    if body_error is None:
+                        raise
+                    # A handled worker is no longer sys.exception() when its
+                    # successful diagnostic prepares a status return. Keep it
+                    # beside failed retirement without changing that status on
+                    # success or appending cleanup to the shared worker graph.
+                    raise execution_terminal_error(
+                        BaseExceptionGroup(
+                            "original maintenance worker and retirement",
+                            [body_error, retirement],
+                        ),
+                        retain_originals=True, isolate_control_originals=True,
+                    )
 
     async def rebuild(self) -> SemanticMaintenanceResult:
         """Run the explicit, page-oriented semantic repair path under one lease."""

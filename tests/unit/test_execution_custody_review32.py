@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 from tests.utils.receipt_delivery import ReceiptDelivery
 
 from kestrel_sovereign._async_ownership import await_owned_task
@@ -270,6 +271,7 @@ async def test_actual_continuation_closes_unstarted_provider_only_after_dispatch
     service = service_owner()
     client = httpx.AsyncClient()
     close_error = ExecutionCommitOutcomeError("unknown")
+    source = OriginalFailure.capture(close_error)
     client_entered, release_client = asyncio.Event(), asyncio.Event()
 
     async def close_client():
@@ -329,7 +331,10 @@ async def test_actual_continuation_closes_unstarted_provider_only_after_dispatch
             assert "llm_service" in custody.held and "storage" in custody.held
         release_client.set()
         outcome = await await_owned_task(task)
-        assert outcome.error is (close_error if unknown_close else None)
+        if unknown_close:
+            source.assert_retained(outcome.error, resource=service.providers[0]["adapter"])
+        else:
+            assert outcome.error is None
         assert client.is_closed
         if unknown_close:
             # The test can observe HTTPX closure, but the opaque adapter's

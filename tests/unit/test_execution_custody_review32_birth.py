@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -37,6 +38,7 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
     entered, release = asyncio.Event(), asyncio.Event()
     scopes, calls = [], []
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
     if kind != "pending" and not late_receipt:
         release.set()
 
@@ -106,9 +108,11 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
                 # This error came from an ORIGINAL physical adapter close,
                 # not an ordinary writer. Its failed ACK now truthfully owns
                 # native retirement debt and must make startup fail closed.
-                assert is_execution_control_error(failure)
+                source.assert_retained(caught.value, resource=service.providers[0]["adapter"])
+                assert is_execution_control_error(caught.value)
+                assert not is_execution_control_error(failure)
                 assert any(resource is service.providers[0]["adapter"]
-                           for resource, _ in execution_cleanup_debts(failure))
+                           for resource, _ in execution_cleanup_debts(caught.value))
         elif surface == "manager":
             with pytest.raises(ValueError, match="constructor rejected"):
                 await initialize()
@@ -122,9 +126,9 @@ async def test_actual_failed_constructor_retains_native_provider_cleanup(
             # proof, even if this test knows its underlying SQLite is closed.
             # The production owner cannot assume that about arbitrary adapters.
             assert len(owners) == 1
-            with pytest.raises(OSError) as closed:
+            with pytest.raises(BaseException) as closed:
                 await drain_unpublished_llm_owners(owners)
-            assert failure in tuple(_explicit_control_chain(closed.value))
+            source.assert_retained(closed.value, resource=service.providers[0]["adapter"])
             assert service.has_pending_close_owners()
             assert calls == [True]
         else:

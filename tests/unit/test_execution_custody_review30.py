@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 from kestrel_sdk.storage.database import QueryError
 
 from kestrel_sovereign._async_ownership import await_owned_task
@@ -305,6 +306,7 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
     db = await AsyncDatabase.sqlite(str(tmp_path / "resource.db"))
     await db.execute("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
     failure = carrier(kind)
+    source = OriginalFailure.capture(failure)
     retired = []
     release_native_close = asyncio.Event()
 
@@ -351,7 +353,7 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
         release_native_close.set()
         with pytest.raises(BaseException) as caught:
             await service.wait_for_close_completion()
-        assert caught.value is failure
+        source.assert_retained(caught.value, resource=resource, task=failed_owner)
         # A native close raising a control receipt has not proved transport
         # retirement. Preserve its exact owner even after its task settles.
         assert service.has_pending_close_owners()
@@ -359,7 +361,7 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
         assert failed_owner.done()
         with pytest.raises(BaseException) as caught:
             await service.close()
-        assert caught.value is failure
+        source.assert_retained(caught.value, resource=resource, task=failed_owner)
         assert retired == ["later"]
         assert service._llm_close_tasks[(stage, id(resource))] is failed_owner
         assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1

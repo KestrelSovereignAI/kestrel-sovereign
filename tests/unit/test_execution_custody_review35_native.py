@@ -4,6 +4,7 @@ import asyncio
 import httpx
 import openai
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -136,6 +137,7 @@ async def test_actual_remote_native_close_is_not_recreated_after_uncertain_recei
                                 base_url="https://offline.invalid/v1", max_retries=0)
     original_close = client.close
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
     calls = 0
 
     async def native_close():
@@ -150,11 +152,11 @@ async def test_actual_remote_native_close_is_not_recreated_after_uncertain_recei
             outcome = await await_owned_task(asyncio.create_task(
                 service._close_remote_client(client, lease_id="local-only"),
             ))
-            assert outcome.error is failure
+            source.assert_retained(outcome.error, resource=client)
         assert calls == 1, "uncertain native client close was recreated"
         assert http.is_closed
         outcome = await await_owned_task(asyncio.create_task(service.close()))
-        assert outcome.error is failure, "host close forgot rotated/unpublished client receipt"
+        source.assert_retained(outcome.error, resource=client)
     finally:
         await original_close()
 

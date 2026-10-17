@@ -1908,3 +1908,16 @@ observer from that shared writer source. Native tests exercise both a claimed
 lease and an activated initial reservation, preserving attempt-neutral release;
 the volatile sidecar is an explicit private component input, not full ingress
 or privacy-policy startup certification.
+
+An isolated config transition owns heartbeat and hook admission as one finite
+lifetime. Canonical receipts retain accepted Tasks even if callback publication
+fails; an already-failed start-gated hook is joined, not cancelled into a new
+receipt. The hook settles before heartbeat renewal stops, and independent hook
+failure cannot bypass heartbeat stop/join. Original cached Task control survives
+another observer retrieving a cancelled Task first. These component tests use
+real SDK JSON-RPC and native stores, not whole-Agent READY acceptance.
+
+Semantic maintenance keeps a handled worker error after successful diagnostics
+as well as during diagnostic failure. Successful lease retirement preserves the
+ordinary status return; failed retirement/admission or actual observer withdrawal
+composes the worker and cleanup without rewriting either original source graph.

@@ -5,6 +5,7 @@ import json
 import ollama
 import httpx
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
@@ -288,6 +289,7 @@ async def test_inception_transfers_failed_native_provider_and_birth_database(mon
     pool = client._transport._pool
     connections, native_close = list(pool.connections), pool._close_connections
     original, calls = OSError("inception transport did not retire"), []
+    source = OriginalFailure.capture(original)
     async def failed_close(native_connections):
         calls.append(True)
         raise original
@@ -310,14 +312,14 @@ async def test_inception_transfers_failed_native_provider_and_birth_database(mon
         return {"risk_level": 1, "reasoning": "Offline native retirement test"}
     owner = None
     try:
-        with pytest.raises(OSError) as caught:
+        with pytest.raises(BaseException) as caught:
             await inception_service.create_kestrel_identity_async(
                 output_dir=str(tmp_path), is_test_instance=True,
                 genesis_auditor=offline_auditor,
                 identity_method="did:web", did_web_domain="agents.kestrel-sovereign.test",
                 did_web_slug="review57-retirement",
             )
-        assert caught.value is original
+        source.assert_retained(caught.value, resource=client)
         # Prove the physical birth DB and socket stay owned before inspecting
         # the new retention record. Old-source failure must be native custody,
         # not the absence of a newly added helper attribute.
@@ -329,9 +331,10 @@ async def test_inception_transfers_failed_native_provider_and_birth_database(mon
         assert owner.database.backend._connection is not None
         assert not peer_done.is_set()
         first = owner.provider_owner.task
-        with pytest.raises(OSError) as caught:
+        with pytest.raises(BaseException) as caught:
             await owner.retire()
-        assert caught.value is original and caught.value.inception_retirement_owner is owner
+        source.assert_retained(caught.value, resource=client)
+        assert caught.value.inception_retirement_owner is owner
         assert owner.provider_owner.task is first
         assert calls == [True]
         with pytest.raises(Exception, match="inception|lock|busy|held"):

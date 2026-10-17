@@ -9,6 +9,7 @@ import anthropic
 import httpx
 import openai
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -219,15 +220,16 @@ async def test_failed_native_tcp_close_retains_exact_owner(monkeypatch, carrier)
     service = service_owner()
     service.providers = [{"adapter": client}]
     owner = UnpublishedLLMOwner(service, ())
+    source = OriginalFailure.capture(original)
     try:
         with pytest.raises(BaseException) as caught:
             await owner.retire()
-        assert caught.value is original
         first = service._llm_close_tasks[("adapter", id(client))]
+        source.assert_retained(caught.value, resource=client, task=first)
         assert service.has_pending_close_owners() and not peer_done.is_set()
         with pytest.raises(BaseException) as caught:
             await asyncio.wait_for(owner.retire(join_native=True), 2)
-        assert caught.value is original
+        source.assert_retained(caught.value, resource=client, task=first)
         assert service._llm_close_tasks[("adapter", id(client))] is first
         assert calls == [True], "failed physical owner was replaced by a speculative close"
         assert service.has_pending_close_owners()

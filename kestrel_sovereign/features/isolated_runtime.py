@@ -68,6 +68,7 @@ from kestrel_sdk.isolated_feature import (
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
 from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission,
     await_owned_task,
     create_owned_task,
     gather_owned,
@@ -11731,46 +11732,73 @@ class ProxyFeature(Feature):
             return await self._prepare_config_transition(transition.next_config)
 
         stop_heartbeat = asyncio.Event()
-        heartbeat = asyncio.create_task(
-            self._run_transition_lease_heartbeat(transition, stop_heartbeat),
-            name=f"isolated-config-lease:{self.name}",
-        )
-        hook = asyncio.create_task(
-            self._prepare_config_transition(transition.next_config),
-            name=f"isolated-config-hook:{self.name}",
-        )
+        heartbeat_admission, hook_admission = OwnedTaskAdmission(), OwnedTaskAdmission()
+        hook_admitted = False
+        failures = []
+        result = None
         try:
+            heartbeat = create_owned_task(
+                self._run_transition_lease_heartbeat(transition, stop_heartbeat),
+                name=f"isolated-config-lease:{self.name}",
+                retain_originals=True, admission=heartbeat_admission,
+            )
+            hook = create_owned_task(
+                self._prepare_config_transition(transition.next_config),
+                name=f"isolated-config-hook:{self.name}",
+                retain_originals=True, admission=hook_admission,
+            )
+            hook_admitted = True
             done, _ = await asyncio.wait(
                 {hook, heartbeat}, return_when=asyncio.FIRST_COMPLETED
             )
             if heartbeat in done:
                 # A healthy heartbeat only finishes when asked to stop below;
                 # before that, its completion is a lost lease or storage error.
-                heartbeat.result()
+                failure = owned_task_error(heartbeat)
+                if failure is not None:
+                    raise failure
                 raise _ConfigTransitionLeaseLost(
                     "isolated config transition lease heartbeat stopped unexpectedly"
                 )
-            return hook.result()
+            failure = owned_task_error(hook)
+            if failure is not None:
+                raise failure
+            result = hook.result()
+        except BaseException as error:
+            failures.append(error)
+
+        # Admission itself is inside the owning lifetime. An accepted Task is
+        # inventoried even if its callback publication refused the handoff.
+        # Keep renewing until the original hook physically settles; a failed
+        # hook join must never bypass the independent heartbeat stop/join.
+        hook, heartbeat = hook_admission.task, heartbeat_admission.task
+        try:
+            if hook is not None:
+                if not hook.done() and hook_admitted:
+                    hook.cancel()
+                outcome = await await_owned_task(hook)
+                if outcome.error is not None and (
+                    not isinstance(outcome.error, asyncio.CancelledError)
+                    or is_execution_control_error(outcome.error)
+                ):
+                    failures.append(outcome.error)
+                failures.append(outcome.cancellation)
+        except BaseException as error:
+            failures.append(error)
         finally:
-            # If the lease cannot be renewed, cancellation may reach the SDK
-            # child; wait for its cancellation to settle before recovery makes
-            # a replacement decision.  No lifecycle task may outlive the
-            # reload lock.
-            if not hook.done():
-                hook.cancel()
-                try:
-                    await self._await_task_completion(
-                        hook, preserve_cancellation=True
-                    )
-                except asyncio.CancelledError:
-                    pass
             stop_heartbeat.set()
-            try:
-                await self._await_task_completion(
-                    heartbeat, preserve_cancellation=True
-                )
-            except asyncio.CancelledError:
-                pass
+            if heartbeat is not None:
+                try:
+                    outcome = await await_owned_task(heartbeat)
+                    failures.extend((outcome.error, outcome.cancellation))
+                except BaseException as error:
+                    failures.append(error)
+        terminal = execution_terminal_error(
+            *failures, retain_originals=True, isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
+        return result
 
     def _supports_config_transition(self) -> bool:
         """Whether the initialized SDK client explicitly opted into transitions."""

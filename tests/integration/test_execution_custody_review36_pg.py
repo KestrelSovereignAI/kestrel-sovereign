@@ -2,6 +2,7 @@
 from types import SimpleNamespace
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody, ExecutionAuthorityError, bind_execution_custody_snapshot, is_execution_control_error,
@@ -50,6 +51,7 @@ async def test_inception_borrower_native_close_precedes_owned_birth_database(nat
     import httpx
     import openai
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
     providers = []
     def construct(**kwargs):
         service = LLMService(**kwargs)
@@ -58,7 +60,7 @@ async def test_inception_borrower_native_close_precedes_owned_birth_database(nat
         client = openai.AsyncOpenAI(api_key="offline-test-only", http_client=http,
                                     base_url="https://offline.invalid/v1", max_retries=0)
         calls = []
-        providers.append((service, db, http, calls))
+        providers.append((service, db, http, calls, client))
         native_close = client.close
         async def native_close_then_receipt():
             assert db.backend._connection is not None, "birth database closed below its provider borrower"
@@ -81,11 +83,12 @@ async def test_inception_borrower_native_close_precedes_owned_birth_database(nat
                 genesis_auditor=auditor, genesis_audit_provenance="test:review36-borrower",
             )
     outcome = await await_owned_task(asyncio.create_task(incept()))
-    assert len(providers) == 1, "birth consumers did not share one owned accounting borrower"
-    assert outcome.error is failure, "database retirement replaced its borrower's native close receipt"
-    service, database, http, calls = providers[0]
-    retirement = outcome.error.inception_retirement_owner
+    retirement = getattr(outcome.error, "inception_retirement_owner", None)
     try:
+        assert len(providers) == 1, "birth consumers did not share one owned accounting borrower"
+        service, database, http, calls, client = providers[0]
+        source.assert_retained(outcome.error, resource=client)
+        assert retirement is not None
         # Even a physically closed socket does not prove that a close which
         # returned an uncertain effect receipt retired all native borrowers.
         assert retirement.database is database
@@ -96,15 +99,17 @@ async def test_inception_borrower_native_close_precedes_owned_birth_database(nat
         assert service.has_pending_close_owners()
         with pytest.raises(BaseException) as repeated:
             await retirement.retire()
-        assert repeated.value is failure
+        source.assert_retained(repeated.value, resource=client)
         assert retirement.database is database
         assert calls == [True], "reconciliation repeated the failed native close"
         assert tuple(task for task in service._llm_close_tasks.values() if task is not None) == original_owners
     finally:
         # Dispose only this fixture's original database/lock. This is not a
         # production success acknowledgement and never clears close evidence.
-        await database.close()
-        if retirement.directory_custody is not None:
+        for _service, database, http, _calls, _client in providers:
+            await http.aclose()
+            await database.close()
+        if retirement is not None and retirement.directory_custody is not None:
             retirement.directory_custody.close()
 
 

@@ -301,3 +301,86 @@ async def test_maintenance_close_receipt_publication_retains_original_unstarted_
             await await_owned_task(task)
         for lease in leases:
             await service._release_lease(lease)
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body_kind", ["ordinary", "budget", "lease"])
+@pytest.mark.parametrize("retirement", ["failed", "admission", "withdraw"])
+async def test_handled_worker_with_successful_diagnostics_survives_retirement_control(
+    native_pg, assertion_store, monkeypatch, body_kind, retirement,
+):
+    database = assertion_store._database
+    service = SemanticMaintenanceService(assertion_store, inference_profile=None)
+    kinds = {"ordinary": ValueError, "budget": _MaintenanceBudgetExceeded, "lease": MaintenanceLeaseLostError}
+    body = kinds[body_kind]("actual handled maintenance worker failure")
+    body_graph = tuple(_explicit_control_chain(body))
+    native = await _original_control(native_pg[0], monkeypatch)
+    native_graph, native_debts = tuple(_explicit_control_chain(native)), tuple(execution_cleanup_debts(native))
+    actual_read, actual_execute, actual_record = database.fetchone, database.execute, service._record_run_if_current
+    seen, diagnostics, leases = [], [], []
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def read(sql, *args, **kwargs):
+        result = await actual_read(sql, *args, **kwargs)
+        if "FROM semantic_maintenance_state " in sql and not seen:
+            seen.append(True)
+            raise body
+        return result
+    async def record(*args, **kwargs):
+        result = await actual_record(*args, **kwargs)
+        diagnostics.append(True)
+        return result
+    async def execute(sql, *args, **kwargs):
+        result = await actual_execute(sql, *args, **kwargs)
+        if sql.startswith("DELETE FROM semantic_maintenance_leases "):
+            entered.set()
+            await release.wait()
+            if retirement == "failed":
+                raise native
+        return result
+    monkeypatch.setattr(database, "fetchone", read)
+    monkeypatch.setattr(database, "execute", execute)
+    monkeypatch.setattr(service, "_record_run_if_current", record)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refused = RuntimeError("original handled-worker lease closer refused")
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        frame = getattr(operation, "cr_frame", None)
+        stream = frame.f_locals.get("stream") if frame is not None else None
+        if (retirement == "admission"
+                and getattr(getattr(operation, "cr_code", None), "co_qualname", "") == "close_native_execution_stream.<locals>.owned_close"
+                and hasattr(stream, "fencing_token")):
+            leases.append(stream)
+            raise refused
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+    owner = create_owned_task(service.run(), retain_originals=True)
+    loop.set_task_factory(factory)
+    try:
+        if retirement != "admission":
+            await asyncio.wait_for(entered.wait(), 5)
+            if retirement == "withdraw":
+                owner.cancel("actual handled-worker lease retirement observer withdrew")
+                await asyncio.sleep(0)
+                assert not owner.done()
+            release.set()
+        outcome = await await_owned_task(owner)
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert diagnostics, "actual successful diagnostic persistence was not reached"
+        assert body in chain, "successful diagnostics dropped handled worker during failed retirement"
+        if retirement == "failed":
+            assert native in chain
+            assert tuple(_explicit_control_chain(native)) == native_graph
+            assert tuple(execution_cleanup_debts(native)) == native_debts
+        elif retirement == "admission":
+            assert refused in chain and leases
+            assert any(resource is leases[0] and task is None for resource, task in execution_cleanup_debts(outcome.error))
+        else:
+            assert any(isinstance(error, asyncio.CancelledError) for error in chain)
+        assert tuple(_explicit_control_chain(body)) == body_graph, "handled worker source graph changed during retirement composition"
+        assert await database.fetchval("SELECT count(*) FROM semantic_maintenance_runs") == 1
+    finally:
+        loop.set_task_factory(previous)
+        release.set()
+        await await_owned_task(owner)
+        for lease in leases:
+            await service._release_lease(lease)

@@ -3869,6 +3869,16 @@ async def test_main_and_cli_do_not_swallow_terminal_cleanup_failure(
     tmp_path, monkeypatch,
 ) -> None:
     """Interactive entry points must not let a live backend disappear on error."""
+    from kestrel_sovereign import hold
+    from kestrel_sovereign._async_ownership import gather_owned
+    original_initialize = hold.initialize_with_bound_hold_context
+    contexts = []
+    original_threads = set(threading.enumerate())
+    async def initialize(*args, **kwargs):
+        context = await original_initialize(*args, **kwargs)
+        contexts.append(context)
+        return context
+    monkeypatch.setattr(hold, "initialize_with_bound_hold_context", initialize)
     main_agent = _TerminalFailureShutdownAgent()
     monkeypatch.setattr(main, "KestrelAgent", lambda **_kwargs: main_agent)
     monkeypatch.setattr(main, "LLMService", MagicMock())
@@ -3877,22 +3887,36 @@ async def test_main_and_cli_do_not_swallow_terminal_cleanup_failure(
     monkeypatch.setattr(sys, "argv", ["kestrel-main", str(tmp_path)])
     monkeypatch.setattr("builtins.input", lambda _prompt: "!quit")
 
-    with pytest.raises(RuntimeError, match="durable cleanup failed"):
-        await main.main()
+    try:
+        with pytest.raises(RuntimeError, match="durable cleanup failed"):
+            await main.main()
 
-    cli_agent = _TerminalFailureShutdownAgent()
-    storage = MagicMock()
-    storage.initialize = AsyncMock()
-    storage.close = AsyncMock()
-    storage.get_nodes_by_type = AsyncMock(
-        return_value=[SimpleNamespace(node_id=cli_agent.agent_id)]
-    )
-    monkeypatch.setattr("kestrel_sovereign.storage.AsyncStorage", lambda _path: storage)
-    monkeypatch.setattr(
-        "kestrel_sovereign.kestrel_agent.KestrelAgent", lambda **_kwargs: cli_agent
-    )
-    monkeypatch.setattr("kestrel_sovereign.llm.service.LLMService", MagicMock())
-    monkeypatch.setattr("kestrel_sovereign.kestrel_config.constants.SHUTDOWN_TIMEOUT", 0.01)
+        cli_agent = _TerminalFailureShutdownAgent()
+        storage = MagicMock()
+        storage.initialize = AsyncMock()
+        storage.close = AsyncMock()
+        storage.get_nodes_by_type = AsyncMock(
+            return_value=[SimpleNamespace(node_id=cli_agent.agent_id)]
+        )
+        monkeypatch.setattr("kestrel_sovereign.storage.AsyncStorage", lambda _path: storage)
+        monkeypatch.setattr(
+            "kestrel_sovereign.kestrel_agent.KestrelAgent", lambda **_kwargs: cli_agent
+        )
+        monkeypatch.setattr("kestrel_sovereign.llm.service.LLMService", MagicMock())
+        monkeypatch.setattr("kestrel_sovereign.kestrel_config.constants.SHUTDOWN_TIMEOUT", 0.01)
 
-    with pytest.raises(RuntimeError, match="durable cleanup failed"):
-        await cli._run_shell(Path(tmp_path), SimpleNamespace(app=None))
+        with pytest.raises(RuntimeError, match="durable cleanup failed"):
+            await cli._run_shell(Path(tmp_path), SimpleNamespace(app=None))
+        assert len(contexts) == 2
+    finally:
+        # The deliberately failed Agent shutdown cannot acknowledge release
+        # of its real Hold database. Retire our fixture-owned contexts only
+        # after both production failures have been observed, even on assertion.
+        await gather_owned(
+            (hold.close_bound_host_context(context) for context in contexts),
+            cancel_siblings_on_error=False, retain_originals=True,
+            isolate_control_originals=True,
+        )
+    assert not [worker for worker in threading.enumerate()
+                if worker not in original_threads
+                and getattr(getattr(worker, "_target", None), "__module__", "") == "aiosqlite.core"], "entry-point fixture abandoned a native SQLite worker"
