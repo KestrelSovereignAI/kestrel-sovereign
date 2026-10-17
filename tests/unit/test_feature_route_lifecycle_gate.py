@@ -573,6 +573,8 @@ def test_current_feature_route_keeps_app_overrides_and_live_dependencies(nested_
     path = f"{nested_prefix}/test-feature-lifecycle/dependency-bound"
     try:
         with TestClient(app) as client:
+            schema = client.get("/openapi.json", headers={"X-API-Key": API_KEY}).json()
+            assert path in schema["paths"]
             response = client.get(
                 f"/api/agents/bob{path}",
                 headers={"X-API-Key": API_KEY},
