@@ -51,11 +51,9 @@ from kestrel_sovereign._async_ownership import (
 )
 from kestrel_sovereign.execution_custody import (
     current_execution_custody,
-    execution_cleanup_debts,
-    execution_commit_outcome,
-    execution_denial_scopes,
     execution_terminal_error,
     is_execution_control_error,
+    is_scope_local_execution_control,
     owned_native_http_client,
 )
 
@@ -854,10 +852,7 @@ class CodexAppServerClient:
 
     def _retain_request_failure(self, error: BaseException, *, caller_scopes: tuple = ()) -> None:
         if is_execution_control_error(error):
-            denied = execution_denial_scopes(error)
-            if (denied and all(any(scope is admitted for admitted in caller_scopes) for scope in denied)
-                    and execution_commit_outcome(error) is None
-                    and not execution_cleanup_debts(error)):
+            if is_scope_local_execution_control(error, caller_scopes):
                 # Original typed callback refusal stays on its owning turn's
                 # bridge receipt. It does not authorize that turn to continue
                 # or imply failure of the shared native connection. Reader,

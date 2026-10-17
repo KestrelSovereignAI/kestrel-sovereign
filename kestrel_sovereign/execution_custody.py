@@ -282,6 +282,21 @@ def execution_denial_scopes(error: BaseException | None) -> tuple | None:
     return tuple(scopes) if scopes or settled_commit else None
 
 
+def is_scope_local_execution_control(error: BaseException | None, captured_scopes: tuple) -> bool:
+    """Classify a settled source refusal, never authorize replacement work.
+
+    Only exact original typed admission objects may localize their own denial.
+    A trusted caller supplies its immutable source snapshot, not identifiers,
+    current reader scopes, or scopes inferred from the failure itself.
+    """
+    denied = execution_denial_scopes(error)
+    # The canonical provenance reader already excludes cleanup debt, UNKNOWN
+    # and unscoped control. A settled acknowledged COMMIT still forbids locality.
+    return bool(denied and all(any(scope is admitted for admitted in captured_scopes)
+                              for scope in denied)
+                and execution_commit_outcome(error) is None)
+
+
 def execution_terminal_error(*errors: BaseException | None, retain_originals: bool = False,
                              prefer_cancellation: bool = False,
                              isolate_control_originals: bool = False) -> BaseException | None:

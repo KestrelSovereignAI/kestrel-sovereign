@@ -413,6 +413,7 @@ testpaths = ["tests"]
 norecursedirs = ["scripts", ".venv", "*.egg-info", ".git", "node_modules"]
 addopts = "-x --tb=short"
 markers = [
+    "native_postgres: Resolved native_pg fixture consumers; mandatory isolated PostgreSQL CI lane",
     "e2e: marks tests as end-to-end (slow)",
     "integration: marks tests as integration tests",
     "load: Load/stress tests (opt-in with --run-load)",

@@ -25,12 +25,14 @@ import asyncio
 import os
 import logging
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Any, Awaitable, Callable, Optional, Literal
 
 import httpx
 
 from kestrel_sovereign.execution_custody import (
-    current_execution_custody, is_execution_control_error, require_execution_work,
+    await_execution_work, current_execution_custody, execution_terminal_error,
+    execution_work_operation, is_execution_control_error, require_execution_work,
+    retain_native_execution_http_client_close,
 )
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.kestrel_config.defaults import get_openrouter_api_base
@@ -132,6 +134,9 @@ class OpenRouterProvisioningService:
                 },
                 timeout=HTTP_TIMEOUT_DEFAULT,
             )
+            # Revalidate each request at the original native transport, after
+            # arbitrary HTTPX request observers, not merely before client.post.
+            retain_native_execution_http_client_close(self._client)
         return self._client
 
     async def close(self):
@@ -140,6 +145,7 @@ class OpenRouterProvisioningService:
             await self._client.aclose()
             self._client = None
 
+    @execution_work_operation
     async def create_agent_key(
         self,
         agent_name: str,
@@ -226,6 +232,7 @@ class OpenRouterProvisioningService:
         # Should not reach here, but just in case
         raise OpenRouterProvisioningError(f"Max retries exceeded for agent '{agent_name}'")
 
+    @execution_work_operation
     async def get_key_usage(self, key_hash: str) -> KeyUsage:
         """
         Get usage information for an agent's API key.
@@ -259,6 +266,7 @@ class OpenRouterProvisioningService:
             logger.error(error_msg)
             raise OpenRouterProvisioningError(error_msg) from e
 
+    @execution_work_operation
     async def update_key_limit(
         self,
         key_hash: str,
@@ -295,6 +303,7 @@ class OpenRouterProvisioningService:
             logger.error(error_msg)
             raise OpenRouterProvisioningError(error_msg) from e
 
+    @execution_work_operation
     async def delete_key(self, key_hash: str) -> bool:
         """
         Delete an agent's API key (e.g., on retirement).
@@ -322,6 +331,7 @@ class OpenRouterProvisioningService:
             logger.error(error_msg)
             raise OpenRouterProvisioningError(error_msg) from e
 
+    @execution_work_operation
     async def list_keys(self) -> list[dict]:
         """
         List all API keys under this management key.
@@ -340,6 +350,31 @@ class OpenRouterProvisioningService:
             error_msg = f"Failed to list keys: {e.response.text}"
             logger.error(error_msg)
             raise OpenRouterProvisioningError(error_msg) from e
+
+
+async def _run_provisioning_lifecycle(
+    service: OpenRouterProvisioningService, operation: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Keep the original admission through operation AND existing client close."""
+    async def run():
+        original = None
+        result = None
+        try:
+            result = await operation()
+        except BaseException as error:
+            original = error
+        try:
+            await service.close()
+        except BaseException as cleanup:
+            raise execution_terminal_error(original, cleanup, retain_originals=True,
+                                           isolate_control_originals=True)
+        if original is not None:
+            raise original
+        return result
+
+    # The last disclosure check is AFTER the public wrapper's awaited close,
+    # not only at the inner service method's earlier successful return.
+    return await await_execution_work(service, run)
 
 
 async def provision_agent_key(
@@ -361,14 +396,13 @@ async def provision_agent_key(
         AgentKeyInfo with the new key
     """
     service = OpenRouterProvisioningService()
-    try:
-        return await service.create_agent_key(
+    return await _run_provisioning_lifecycle(
+        service, lambda: service.create_agent_key(
             agent_name=agent_name,
             limit_usd=limit_usd,
             limit_reset=limit_reset,
-        )
-    finally:
-        await service.close()
+        ),
+    )
 
 
 async def get_agent_usage(key_hash: str) -> KeyUsage:
@@ -382,10 +416,7 @@ async def get_agent_usage(key_hash: str) -> KeyUsage:
         KeyUsage with current stats
     """
     service = OpenRouterProvisioningService()
-    try:
-        return await service.get_key_usage(key_hash)
-    finally:
-        await service.close()
+    return await _run_provisioning_lifecycle(service, lambda: service.get_key_usage(key_hash))
 
 
 async def delete_agent_key(key_hash: str) -> bool:
@@ -401,10 +432,7 @@ async def delete_agent_key(key_hash: str) -> bool:
         True if deleted
     """
     service = OpenRouterProvisioningService()
-    try:
-        return await service.delete_key(key_hash)
-    finally:
-        await service.close()
+    return await _run_provisioning_lifecycle(service, lambda: service.delete_key(key_hash))
 
 
 # ---------------------------------------------------------------------------
@@ -435,14 +463,13 @@ async def mint_managed_openrouter_key(
         AgentKeyInfo with the new key (``key`` is only available here).
     """
     service = OpenRouterProvisioningService(management_key=management_key)
-    try:
-        return await service.create_agent_key(
+    return await _run_provisioning_lifecycle(
+        service, lambda: service.create_agent_key(
             agent_name=name,
             limit_usd=limit_usd,
             limit_reset=reset,
-        )
-    finally:
-        await service.close()
+        ),
+    )
 
 
 async def update_provider_key_limit(
@@ -464,14 +491,13 @@ async def update_provider_key_limit(
         Updated KeyUsage.
     """
     service = OpenRouterProvisioningService(management_key=management_key)
-    try:
-        return await service.update_key_limit(
+    return await _run_provisioning_lifecycle(
+        service, lambda: service.update_key_limit(
             key_hash=key_hash,
             limit_usd=limit_usd,
             limit_reset=reset,
-        )
-    finally:
-        await service.close()
+        ),
+    )
 
 
 async def get_provider_key_usage(
@@ -488,7 +514,4 @@ async def get_provider_key_usage(
         KeyUsage with current usage and limits.
     """
     service = OpenRouterProvisioningService(management_key=management_key)
-    try:
-        return await service.get_key_usage(key_hash)
-    finally:
-        await service.close()
+    return await _run_provisioning_lifecycle(service, lambda: service.get_key_usage(key_hash))
