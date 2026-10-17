@@ -354,12 +354,14 @@ jobs:
         run: uv sync --python ${{ matrix.python-version }} --locked --extra phoenix
       - name: Import the native SDK and tracing integrations together
         run: uv run --no-sync python -c "from mcp import Client; import phoenix, pydantic_ai, openai"
-      - name: Check tracing, web authentication and OpenAI behavior
+      - name: Check tracing, native router lifecycle and provider behavior
         run: >-
           uv run --no-sync python -m pytest
           tests/unit/test_phoenix_supervisor.py tests/unit/test_phoenix_assets_redirect.py
           tests/unit/test_server_auth.py tests/unit/test_openai_cache_usage.py
-          tests/unit/test_openai_thinking_channel.py tests/unit/test_openai_plan_autocompact.py -q
+          tests/unit/test_openai_thinking_channel.py tests/unit/test_openai_plan_autocompact.py
+          tests/unit/test_feature_route_lifecycle_gate.py tests/unit/test_bridge_router_mounted.py
+          tests/unit/test_anthropic_output_ceiling.py -q
 
   # Unit tests (no services needed)
   unit-tests:

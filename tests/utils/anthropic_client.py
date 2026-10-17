@@ -30,6 +30,7 @@ def anthropic_model_record(model_id: str, *, max_tokens: Any) -> AnthropicModelI
         id=model_id,
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         display_name=model_id,
+        lifecycle="active",
         max_input_tokens=1_000_000,
         max_tokens=max_tokens,
         type="model",

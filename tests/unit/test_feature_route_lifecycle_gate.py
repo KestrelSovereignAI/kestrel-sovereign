@@ -18,19 +18,10 @@ actual server/app path, asserting:
   resumes on re-enable — proving the receiver set is live, not a stale startup
   snapshot.
 
-Mutation notes (#3258). The match gate (``_gated_matches`` in ``server.py``)
-and the dispatch gate (``_feature_route_gone_response``) refuse the same
-routes with outcomes a plain 404 or a bare disconnect cannot tell apart.
-The assertions that pin the MATCH gate specifically are the websocket close
-code (1000 from the match gate, 1008 from dispatch) and the wrong-method
-requests to a refused path (404 from the match gate; a neutered match gate
-lets Starlette answer 405). Mutants that must fail this module:
-``_gated_matches`` returning Starlette's match unconditionally; its
-live-route check dropped; ``_resolve_live_route_agent`` rebinding with
-more than one survivor (``if survivors:``) or keeping a scoped agent the
-manager no longer lists (``return scoped_agent``). Its ``agent is None``
-guards are redundant with ``_live_feature_route(None, ...) -> None`` and
-are equivalent mutants: dropping one changes nothing observable.
+Mutation notes: the native router match gate and dispatch gate both refuse
+withdrawn features. Wrong-method requests pin matching (404 instead of 405),
+and a feature removed between matching and handling pins the dispatch check.
+Cross-agent requests and app dependencies also pin the native inclusion wiring.
 """
 
 import os
@@ -41,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from fastapi.routing import iter_route_contexts
 from starlette.websockets import WebSocketDisconnect
 
 from kestrel_sovereign.features.bridge.feature import BridgeFeature
@@ -300,7 +292,8 @@ def _event_count(stub: "_WebhookFeatureStub") -> int:
 
 def _bridge_health_route_count(app) -> int:
     return sum(
-        1 for r in app.routes if getattr(r, "path", None) == "/api/bridge/health"
+        1 for route in iter_route_contexts(app.routes)
+        if route.path == "/api/bridge/health"
     )
 
 
@@ -390,14 +383,18 @@ def test_invalid_feature_router_rolls_back_partially_included_routes():
     normal_path = "/test-feature-lifecycle/partial-normal"
 
     server._mount_feature_routers(app)
-    assert not any(getattr(route, "path", None) == normal_path for route in app.routes)
+    assert not any(
+        route.path == normal_path for route in iter_route_contexts(app.routes)
+    )
     assert getattr(app.state, "_feature_routes", []) == []
     assert getattr(app.state, "_feature_router_keys", set()) == set()
 
     # A retry sees the same invalid shape but cannot accumulate an earlier
     # copied route; this guards both runtime reloads and repeated cold wakes.
     server._mount_feature_routers(app)
-    assert not any(getattr(route, "path", None) == normal_path for route in app.routes)
+    assert not any(
+        route.path == normal_path for route in iter_route_contexts(app.routes)
+    )
     assert getattr(app.state, "_feature_routes", []) == []
     assert getattr(app.state, "_feature_router_keys", set()) == set()
 
@@ -477,7 +474,9 @@ def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
     app, restore = _boot_multi_agent(agents)
     path = "/test-feature-lifecycle/instance-bound"
     try:
-        assert sum(1 for route in app.routes if getattr(route, "path", None) == path) == 1
+        assert sum(
+            route.path == path for route in iter_route_contexts(app.routes)
+        ) == 1
         headers = {"X-API-Key": API_KEY}
         with TestClient(app) as client:
             assert client.get(f"/api/agents/alice{path}", headers=headers).json() == {
@@ -500,7 +499,7 @@ def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
             agents["bob"].features.pop("ProxyFeature")
             assert client.get(f"/api/agents/bob{path}", headers=headers).status_code == 404
             assert sum(
-                1 for route in app.routes if getattr(route, "path", None) == path
+                route.path == path for route in iter_route_contexts(app.routes)
             ) == 1
     finally:
         restore()
@@ -533,13 +532,14 @@ def test_request_scoped_feature_route_closes_when_target_is_unpublished():
         restore()
 
 
-def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
+@pytest.mark.parametrize("nested_prefix", ["", "/nested"])
+def test_current_feature_route_keeps_app_overrides_and_live_dependencies(nested_prefix):
     """Current feature dispatch must preserve FastAPI's app-bound execution.
 
     The mounted route belongs to Alice, but this request selects Bob. The
     router-level dependency must therefore be Bob's, while the app-level
     dependency and dependency override still run through the app-owned route
-    copy rather than Bob's source ``current.app``.
+    inclusion context rather than Bob's source route.
     """
 
     os.environ["KESTREL_API_KEY"] = API_KEY
@@ -553,6 +553,11 @@ def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
 
     alice = _DependencyBoundRouterFeature("alice", events)
     bob = _DependencyBoundRouterFeature("bob", events)
+    if nested_prefix:
+        for feature in (alice, bob):
+            outer = APIRouter()
+            outer.include_router(feature.get_router(), prefix=nested_prefix)
+            feature._router = outer
     agents = {
         "alice": _make_agent({"ProxyFeature": alice}),
         "bob": _make_agent({"ProxyFeature": bob}),
@@ -565,7 +570,7 @@ def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
     app.dependency_overrides[_overrideable_feature_route_dependency] = (
         dependency_override
     )
-    path = "/test-feature-lifecycle/dependency-bound"
+    path = f"{nested_prefix}/test-feature-lifecycle/dependency-bound"
     try:
         with TestClient(app) as client:
             response = client.get(
@@ -626,7 +631,7 @@ def test_first_dynamic_webhook_candidate_mounts_shared_dispatch_before_publish()
     assert getattr(app.state, "_feature_webhook_dispatch_mounted", False)
     assert any(
         getattr(route, "path", None) == "/webhooks/{webhook_name}"
-        for route in app.routes
+        for route in iter_route_contexts(app.routes)
     )
     # Simulate the later atomic publication commit. The already-mounted live
     # provider must now resolve and dispatch to this receiver.

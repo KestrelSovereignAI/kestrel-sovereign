@@ -14,9 +14,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Security, status
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.routing import APIRoute, APIWebSocketRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute, iter_route_contexts
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -723,63 +723,20 @@ def _resolve_route_agent(scope, mount_agent):
     return state.get("agent") or mount_agent
 
 
-def _feature_router_route_selector(router, route_index: int) -> tuple:
-    """Describe one child route without retaining its instance-bound callable.
+def _current_feature_router(feature, signature: tuple):
+    """Resolve the live router only while its complete mounted shape matches.
 
-    ``FastAPI.include_router`` copies a route's endpoint at mount time.  That
-    is fine for module-level handlers, but is wrong for a per-agent feature
-    whose route closes over ``self``: a route first mounted for Alice would
-    otherwise call Alice's feature when a request is addressed to Bob.  Keep
-    only structural coordinates here and resolve Bob's current child route at
-    request time.
+    FastAPI preserves included routers. Its public traversal provides the
+    effective paths, including nested prefixes, without depending on the
+    framework's private inclusion nodes or retaining a tenant's endpoints.
     """
-
-    routes = tuple(getattr(router, "routes", ()) or ())
-    if route_index < 0 or route_index >= len(routes):
-        raise IndexError("feature router child route index is out of range")
-    route = routes[route_index]
-    return (
-        getattr(router, "prefix", ""),
-        route_index,
-        type(route).__name__,
-        getattr(route, "path", None),
-        tuple(sorted(getattr(route, "methods", ()) or ())),
-    )
-
-
-def _current_feature_router_route(feature, selector: tuple):
-    """Resolve the request target's current matching child route, or ``None``.
-
-    A replacement feature is eligible only if it still exposes exactly the
-    router shape that was mounted.  Returning ``None`` on removal/reload shape
-    drift is intentionally fail-closed: the old captured callable must never
-    serve a request merely because a similarly named feature was once loaded.
-    """
-
     get_router = getattr(feature, "get_router", None)
     if not callable(get_router):
         return None
-    try:
-        router = get_router()
-    except Exception:  # noqa: BLE001 - optional feature boundary
-        logger.warning("Failed to resolve current router from feature", exc_info=True)
+    router = get_router()
+    if router is None or _feature_router_signature("", router) != signature:
         return None
-    if router is None:
-        return None
-    prefix, index, route_type, path, methods = selector
-    routes = tuple(getattr(router, "routes", ()) or ())
-    if index >= len(routes):
-        return None
-    current = routes[index]
-    if (
-        getattr(router, "prefix", "") != prefix
-        or type(current).__name__ != route_type
-        or getattr(current, "path", None) != path
-        or tuple(sorted(getattr(current, "methods", ()) or ())) != methods
-        or not callable(getattr(current, "app", None))
-    ):
-        return None
-    return current
+    return router
 
 
 def _stable_agent_did(agent) -> Optional[str]:
@@ -800,8 +757,8 @@ def _stable_agent_did(agent) -> Optional[str]:
         return None
 
 
-def _live_feature_route(agent, feature_name: str, selector: tuple):
-    """The current child route ``agent`` serves for one mounted shape, or None.
+def _live_feature_router(agent, feature_name: str, signature: tuple):
+    """The current router ``agent`` serves for one mounted router shape, or None.
 
     One check for "this agent still serves this route": the feature is
     present, enabled, and exposes the mounted shape now. The owner
@@ -813,7 +770,7 @@ def _live_feature_route(agent, feature_name: str, selector: tuple):
     feature = features.get(feature_name) if hasattr(features, "get") else None
     if feature is None or not bool(getattr(feature, "enabled", True)):
         return None
-    return _current_feature_router_route(feature, selector)
+    return _current_feature_router(feature, signature)
 
 
 def _resolve_live_route_agent(
@@ -821,7 +778,7 @@ def _resolve_live_route_agent(
     scope,
     mount_agent,
     feature_name: str,
-    selector: tuple,
+    signature: tuple,
 ):
     """Resolve a live owner for one physically shared feature route.
 
@@ -871,7 +828,7 @@ def _resolve_live_route_agent(
     survivors = [
         candidate
         for candidate in managed_agents
-        if _live_feature_route(candidate, feature_name, selector) is not None
+        if _live_feature_router(candidate, feature_name, signature) is not None
     ]
     if len(survivors) == 1:
         return survivors[0]
@@ -887,217 +844,86 @@ async def _feature_route_gone_response(scope, receive, send) -> None:
     await Response(status_code=404)(scope, receive, send)
 
 
-def _feature_route_host_dependencies(route, initial_current) -> tuple:
-    """Keep dependencies added by the app while a feature route hot-reloads.
-
-    ``include_router`` concatenates the app/router dependencies before the
-    source route's own dependencies. Strip that initial source suffix so a
-    request can use the selected feature's current router dependencies without
-    retaining a stale sibling feature's closure.
-    """
-
-    mounted = tuple(getattr(route, "dependencies", ()) or ())
-    initial = tuple(getattr(initial_current, "dependencies", ()) or ())
-    if not initial or len(mounted) < len(initial):
-        return mounted
-    if all(left == right for left, right in zip(mounted[-len(initial):], initial)):
-        return mounted[:-len(initial)]
-    # An unusual custom router did not preserve FastAPI's normal suffix
-    # identity. Keep the app-bound dependencies rather than dropping a host
-    # authorization dependency.
-    return mounted
-
-
-def _app_bound_current_feature_route_app(
-    app: FastAPI,
-    mounted_route,
-    current_route,
-    host_dependencies: tuple,
-):
-    """Build a current-feature route with FastAPI's app-owned execution seam.
-
-    The mounted copy carries host dependencies and the app's
-    ``dependency_overrides`` provider; the current child supplies the
-    request-target feature's endpoint and per-router dependencies. Rebuilding
-    the tiny route wrapper per request deliberately avoids retaining a stale
-    bound feature across a reload or a multi-agent request.
-    """
-
-    dependencies = [
-        *host_dependencies,
-        *(getattr(current_route, "dependencies", ()) or ()),
-    ]
-    if isinstance(mounted_route, APIRoute) and isinstance(current_route, APIRoute):
-        rebound = type(mounted_route)(
-            path=mounted_route.path,
-            endpoint=current_route.endpoint,
-            response_model=current_route.response_model,
-            status_code=current_route.status_code,
-            tags=current_route.tags,
-            dependencies=dependencies,
-            summary=current_route.summary,
-            description=current_route.description,
-            response_description=current_route.response_description,
-            responses=current_route.responses,
-            deprecated=current_route.deprecated,
-            methods=mounted_route.methods,
-            operation_id=current_route.operation_id,
-            response_model_include=current_route.response_model_include,
-            response_model_exclude=current_route.response_model_exclude,
-            response_model_by_alias=current_route.response_model_by_alias,
-            response_model_exclude_unset=current_route.response_model_exclude_unset,
-            response_model_exclude_defaults=current_route.response_model_exclude_defaults,
-            response_model_exclude_none=current_route.response_model_exclude_none,
-            include_in_schema=mounted_route.include_in_schema,
-            response_class=current_route.response_class,
-            name=current_route.name,
-            dependency_overrides_provider=app,
-            callbacks=current_route.callbacks,
-            openapi_extra=current_route.openapi_extra,
-            generate_unique_id_function=current_route.generate_unique_id_function,
-            strict_content_type=current_route.strict_content_type,
-        )
-        return rebound.app
-    if isinstance(mounted_route, APIWebSocketRoute) and isinstance(
-        current_route, APIWebSocketRoute
-    ):
-        rebound = APIWebSocketRoute(
-            path=mounted_route.path,
-            endpoint=current_route.endpoint,
-            name=current_route.name,
-            dependencies=dependencies,
-            dependency_overrides_provider=app,
-        )
-        return rebound.app
-    if isinstance(mounted_route, StarletteRoute) and isinstance(
-        current_route, StarletteRoute
-    ):
-        rebound = StarletteRoute(
-            path=mounted_route.path,
-            endpoint=current_route.endpoint,
-            methods=mounted_route.methods,
-            name=current_route.name,
-            include_in_schema=mounted_route.include_in_schema,
-        )
-        return rebound.app
-    if isinstance(mounted_route, StarletteWebSocketRoute) and isinstance(
-        current_route, StarletteWebSocketRoute
-    ):
-        rebound = StarletteWebSocketRoute(
-            path=mounted_route.path,
-            endpoint=current_route.endpoint,
-            name=current_route.name,
-        )
-        return rebound.app
-    return None
-
-
-def _gate_feature_route(
-    app: FastAPI,
-    route,
-    feature_name: str,
-    mount_agent,
-    selector: tuple,
-    initial_current,
-) -> None:
-    """Wrap ``route`` so it only serves while its owning feature is live-enabled.
-
-    Feature routers are mounted ONCE at startup, but features can be
-    soft-disabled or removed at runtime. Rather than unmount/remount (which
-    risks duplicate routes on re-enable and drift from the enable/disable
-    lifecycle), the route stays physically mounted and this gate rejects the
-    request at match time when the owning feature is currently disabled or
-    gone (kestrel-sovereign#2522). Re-enabling the feature flips the gate back
-    on with no route churn. Only the feature-contributed routes are gated;
-    core/server routes are never touched.
-
-    The gate lives at ``route.matches()`` rather than ``route.app``: Starlette
-    otherwise produces a 405 for a wrong-method request before it calls the
-    app, and a WebSocket route would receive an invalid HTTP ``JSONResponse``.
-    Returning :class:`starlette.routing.Match.NONE` removes a disabled route
-    from both HTTP and WebSocket matching before either protocol is handled.
-
-    Starlette's own match runs first. The live-owner and live-route checks
-    — which call ``feature.get_router()`` and, for a withdrawn mount owner,
-    scan every managed agent — run only for a request whose path this
-    route matches at all (#3253). Every request that reached the end of the
-    route table used to pay one router construction per gated feature
-    route, matching or not — every 404 (twice, via the trailing-slash
-    retry) and every request Starlette could only match PARTIAL; a request
-    a core route matched FULL never got this far. A path match with the
-    wrong method (``Match.PARTIAL``) still consults the gate, so a
-    disabled feature answers NONE there too, never 405.
-    """
-    original_matches = route.matches
-    host_dependencies = _feature_route_host_dependencies(route, initial_current)
-
-    def _gated_matches(scope):
-        matched = original_matches(scope)
-        if matched[0] is Match.NONE:
-            return matched
-        agent = _resolve_live_route_agent(
-            app, scope, mount_agent, feature_name, selector
-        )
-        # Dynamic feature routes stay physically mounted so a live feature can
-        # be disabled/re-enabled without route churn.  When their mount owner
-        # has been DELETEd, however, an unprefixed request must not keep using
-        # that stale captured object while a scheduler races to cold-wake it.
-        # Request-scoped routes still work for another currently managed agent
-        # that exposes the same feature.
-        if agent is None:
-            return Match.NONE, {}
-        if _live_feature_route(agent, feature_name, selector) is None:
-            return Match.NONE, {}
-        return matched
-
-    route.matches = _gated_matches
-    # Do not call the copied ``route.app`` directly: it retains the first
-    # feature's bound endpoint. Do not call ``current.app`` either: that source
-    # child bypasses the app's dependency overrides and host dependencies.
-    # Rebind the current endpoint through a fresh app-owned FastAPI route.
-    async def _dispatch_current_feature_route(scope, receive, send):
-        agent = _resolve_live_route_agent(
-            app, scope, mount_agent, feature_name, selector
-        )
-        if agent is None:
-            await _feature_route_gone_response(scope, receive, send)
-            return
-        current = _live_feature_route(agent, feature_name, selector)
-        if current is None:
-            await _feature_route_gone_response(scope, receive, send)
-            return
-        current_app = _app_bound_current_feature_route_app(
-            app,
-            route,
-            current,
-            host_dependencies,
-        )
-        if current_app is None:
-            await _feature_route_gone_response(scope, receive, send)
-            return
-        await current_app(scope, receive, send)
-
-    route.app = _dispatch_current_feature_route
+def _feature_route_shape(context) -> tuple:
+    """The canonical effective shape for a native HTTP/WebSocket leaf."""
+    return (
+        type(context.original_route).__name__,
+        context.path,
+        tuple(sorted(context.methods or ())),
+    )
 
 
 def _feature_router_signature(feature_name: str, router) -> tuple:
-    """Return a stable de-duplication key for one feature router.
-
-    Cold agent registration can happen after the startup mount pass.  Router
-    objects are freshly constructed by many features, so object identity is
-    not sufficient to avoid duplicate FastAPI routes; use the exposed route
-    shape instead.  The feature name keeps intentionally distinct features
-    from being conflated merely because they happen to share a path.
-    """
+    """Identify an entire native router, with effective nested route paths."""
     routes = tuple(
-        (
-            type(route).__name__,
-            getattr(route, "path", None),
-            tuple(sorted(getattr(route, "methods", ()) or ())),
-        )
-        for route in getattr(router, "routes", ())
+        _feature_route_shape(context)
+        for context in iter_route_contexts(router.routes)
     )
-    return (feature_name, getattr(router, "prefix", ""), routes)
+    return (feature_name, router.prefix, routes)
+
+
+class _LiveFeatureRouter(APIRouter):
+    """Match a fixed API shape and dispatch through its current agent's router.
+
+    FastAPI owns inclusion, dependencies, WebSockets, and route metadata. The
+    host only gates the feature lifecycle and selects the current owner. A
+    fresh native parent at dispatch keeps the app's dependency overrides and
+    mount-time host dependencies without retaining a replaced feature closure.
+    """
+
+    def __init__(self, app: FastAPI, router, feature_name: str, mount_agent):
+        super().__init__()
+        supported = (APIRoute, APIWebSocketRoute, StarletteRoute, StarletteWebSocketRoute)
+        if any(
+            not isinstance(context.original_route, supported)
+            for context in iter_route_contexts(router.routes)
+        ):
+            raise TypeError("Feature routers must expose HTTP or WebSocket routes")
+        self.include_router(router)
+        self._host_app = app
+        self._feature_name = feature_name
+        self._mount_agent = mount_agent
+        self._signature = _feature_router_signature("", router)
+        parent = app.router
+        self._host_options = {
+            "dependencies": list(parent.dependencies),
+            "dependency_overrides_provider": app,
+            "tags": list(parent.tags),
+            "responses": dict(parent.responses),
+            "callbacks": list(parent.callbacks),
+            "deprecated": parent.deprecated,
+            "include_in_schema": parent.include_in_schema,
+            "default_response_class": parent.default_response_class,
+            "generate_unique_id_function": parent.generate_unique_id_function,
+            "strict_content_type": parent.strict_content_type,
+        }
+
+    def _current_router(self, scope):
+        agent = _resolve_live_route_agent(
+            self._host_app, scope, self._mount_agent,
+            self._feature_name, self._signature,
+        )
+        return _live_feature_router(agent, self._feature_name, self._signature)
+
+    def matches(self, scope):
+        matched = super().matches(scope)
+        # Avoid constructing any live feature router for unrelated paths.
+        # Check PARTIAL as well: a disabled wrong-method route must be 404.
+        if matched[0] is Match.NONE:
+            return matched
+        if self._current_router(scope) is None:
+            return Match.NONE, {}
+        return matched
+
+    async def handle(self, scope, receive, send):
+        # A feature can disappear after matching, before dispatch.
+        current = self._current_router(scope)
+        if current is None:
+            await _feature_route_gone_response(scope, receive, send)
+            return
+        bound = APIRouter(**self._host_options)
+        bound.include_router(current)
+        await bound.handle(scope, receive, send)
 
 
 def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
@@ -1108,7 +934,7 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     it in the FastAPI app. This allows feature packages (voice, spawn,
     observability, etc.) to contribute HTTP endpoints dynamically.
 
-    Each contributed route is wrapped by :func:`_gate_feature_route` so that
+    Each contributed router is wrapped by :class:`_LiveFeatureRouter` so that
     disabling or removing the owning feature at runtime makes its routes 404
     without unmounting them — the Bridge router, for instance, stops serving
     the moment its feature is disabled and resumes on re-enable, with no
@@ -1142,38 +968,13 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 if router_key in mounted_keys:
                     continue
                 routes_before_include = len(app.routes)
-                app.include_router(router)
-                # Gate exactly the routes this feature just contributed so a
-                # runtime disable/remove makes them 404 (never a core route).
-                selectors = tuple(
-                    (_feature_router_route_selector(router, index), candidate)
-                    for index, candidate in enumerate(
-                        tuple(getattr(router, "routes", ()) or ())
-                    )
-                    if hasattr(candidate, "app")
-                )
-                added = tuple(
-                    candidate
-                    for candidate in app.routes[routes_before_include:]
-                    if hasattr(candidate, "app")
-                )
-                if len(added) != len(selectors):
-                    raise RuntimeError(
-                        "Feature router mount did not preserve child-route shape"
-                    )
-                for added_route, (selector, initial_current) in zip(added, selectors):
-                    _gate_feature_route(
-                        app, added_route, name, agent, selector, initial_current
-                    )
+                app.include_router(_LiveFeatureRouter(app, router, name, agent))
                 mounted_keys.add(router_key)
                 mounted.append(name)
             except Exception as exc:
                 if routes_before_include is not None:
-                    # ``include_router`` can copy ordinary routes before it
-                    # reaches a child it cannot preserve (for example a
-                    # mounted sub-application). Treat validation as an atomic
-                    # mount: never leave those partial, ungated routes in the
-                    # app or let a later retry add duplicates.
+                    # Treat router validation/inclusion as an atomic mount:
+                    # never retain a partial, ungated feature contribution.
                     del app.routes[routes_before_include:]
                 logger.warning("Failed to mount router from feature %s: %s", name, exc)
 
@@ -1711,7 +1512,10 @@ async def _onboard_host_registered_agent(
                 id(route)
                 for route in app.routes
                 if id(route) in owned_feature_route_ids
-                and "webhook" in str(getattr(route, "path", "")).lower()
+                and any(
+                    "webhook" in str(context.path).lower()
+                    for context in iter_route_contexts([route])
+                )
             )
 
         removable_route_ids = owned_route_ids - preserved_route_ids
@@ -1861,19 +1665,14 @@ async def _onboard_host_registered_agent(
     ]
     for key in owned_router_keys:
         _feature_name, _prefix, route_shapes = key
-        # APIRouter stores its prefix in every child route's ``path`` already;
-        # ``include_router`` copies that exact path into the app.  The stable
-        # signature is therefore also the physical mounted shape.
         expected_shapes = set(route_shapes)
         owned_router_route_ids[key] = {
             id(route)
             for route in owned_feature_routes
-            if (
-                type(route).__name__,
-                getattr(route, "path", None),
-                tuple(sorted(getattr(route, "methods", ()) or ())),
-            )
-            in expected_shapes
+            if {
+                _feature_route_shape(context)
+                for context in iter_route_contexts([route])
+            } == expected_shapes
         }
     owned_ui_mount_ids.update(
         id(route)

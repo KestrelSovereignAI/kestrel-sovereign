@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from fastapi.routing import iter_route_contexts
 
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
@@ -12871,8 +12872,8 @@ class TestLoadFromConfig:
         assert await second is agents["Second"]
         assert manager.get_agent("Second") is agents["Second"]
         assert any(
-            getattr(route, "path", None) == "/second-candidate-route"
-            for route in app.routes
+            route.path == "/second-candidate-route"
+            for route in iter_route_contexts(app.routes)
         )
 
     @pytest.mark.asyncio
@@ -12964,12 +12965,12 @@ class TestLoadFromConfig:
             {"state": {}},
             agents["FirstReady"],
             "SharedReadyFeature",
-            server._feature_router_route_selector(second_router, 0),
+            server._feature_router_signature("", second_router),
         ) is agents["SecondReady"]
         expected_path = f"{router_prefix}/shared-ready-route"
         assert sum(
-            getattr(route, "path", None) == expected_path
-            for route in app.routes
+            route.path == expected_path
+            for route in iter_route_contexts(app.routes)
         ) == 1
         with TestClient(app) as client:
             response = client.get(expected_path)
