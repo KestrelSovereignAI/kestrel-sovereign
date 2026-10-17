@@ -276,15 +276,27 @@ class _StoppedCognitionResult(SignalResult):
 class SignalDispatchHandle(SignalHandle):
     """SDK terminal handle plus the earlier durable-admission receipt.
 
-    ``SignalHandle.wait()`` remains the released SDK 0.35.1 terminal dispatch
-    contract.  ACK-bearing Core ingress uses this explicit receipt instead of
-    mistaking background-task creation for a durable commit.
+    Terminal and admission waits observe their original dispatcher owners;
+    withdrawing a reader never cancels those borrowed operations. ACK-bearing
+    ingress uses the earlier receipt rather than mistaking Task creation for
+    a durable commit. Explicit ``cancel()`` retains the SDK Stop contract.
     """
 
     durable_admission: asyncio.Future[DurableAdmissionResult]
 
+    async def wait(self) -> SignalResult:
+        from kestrel_sovereign._async_ownership import await_owned_task
+        outcome = await await_owned_task(self.task, defer_cancellation=False)
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.result
+
     async def wait_for_durable_admission(self) -> DurableAdmissionResult:
-        return await asyncio.shield(self.durable_admission)
+        from kestrel_sovereign._async_ownership import await_owned_task
+        outcome = await await_owned_task(self.durable_admission, defer_cancellation=False)
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.result
 
 
 # ---------------------------------------------------------------------------
@@ -1863,7 +1875,7 @@ class SignalDispatcher:
 
         try:
             deferred = await self._durable_claim_deferred_by_hold(consumer_id)
-        except BaseException:
+        except BaseException as opening:
             # The claim is private until this method returns. A failed or
             # cancelled Hold read must return the exact token before propagating
             # so no unexecuted attempt remains leased or spent.
@@ -1874,14 +1886,10 @@ class SignalDispatcher:
                         delivery_id=delivery.delivery_id,
                         lease_token=delivery.lease_token,
                     )
-                except BaseException:
-                    # Preserve the admission failure as the public result.
-                    # Lease expiry/restart recovery still owns the row if the
-                    # database also disappears during the exact rollback.
-                    logger.exception(
-                        "Could not return unpublished durable lease after "
-                        "Hold-state read failure: delivery=%s",
-                        delivery.delivery_id,
+                except BaseException as cleanup:
+                    raise execution_terminal_error(
+                        opening, cleanup, retain_originals=True,
+                        prefer_cancellation=True, isolate_control_originals=True,
                     )
             raise
         if not deferred:
@@ -2073,7 +2081,7 @@ class SignalDispatcher:
             await self.initialize_durable_delivery()
             try:
                 deferred = await self._durable_claim_deferred_by_hold(consumer_id)
-            except BaseException:
+            except BaseException as opening:
                 # Unknown Hold state must not hand work off, and must not
                 # leave this event's reservation leased to a claimant that is
                 # about to fail. Return it exactly as a Hold deferral would,
@@ -2083,12 +2091,10 @@ class SignalDispatcher:
                         consumer_id=consumer_id,
                         event_id=event_id,
                     )
-                except BaseException:
-                    logger.exception(
-                        "Could not return initial durable reservation after "
-                        "Hold-state read failure: consumer=%s event=%s",
-                        consumer_id,
-                        event_id,
+                except BaseException as cleanup:
+                    raise execution_terminal_error(
+                        opening, cleanup, retain_originals=True,
+                        prefer_cancellation=True, isolate_control_originals=True,
                     )
                 raise
             if deferred:
@@ -2344,6 +2350,12 @@ class SignalDispatcher:
                     delivery_id=delivery_id,
                     lease_token=lease_token,
                 )
+        except BaseException as error:
+            # Clearing the local pending phase is not a native release ACK.
+            # The same bounded durable-writer latch must fence new claims
+            # even after this private claimant has unwound.
+            self._retain_durable_writer_control(error)
+            raise
         finally:
             # Hold has ended this local admission whether or not the immediate
             # database repair succeeded. The durable pending-phase marker lets

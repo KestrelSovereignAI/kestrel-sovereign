@@ -3811,6 +3811,12 @@ class RestartCoordinatorFeature(Feature):
         to 1 once the COGNITION dispatch returns ``Status.OK``; until then the
         row is re-swept and the wake retried.
         """
+        # An uncertain original wake is not retryable absence. Reuse the
+        # feature's existing bounded background-control owner, including the
+        # synchronous enqueue edge before an ACK supervisor can exist.
+        retained = vars(self).get("_owned_background_control")
+        if retained is not None:
+            raise retained
         # The wake must report when the restart actually COMPLETED, not when
         # this (possibly retried) dispatch runs — otherwise a cron-retried wake
         # would claim a later "landed at" time than the row/status event (#1819
@@ -3856,7 +3862,11 @@ class RestartCoordinatorFeature(Feature):
             handle = dispatcher.enqueue_signal(signal)
             if asyncio.iscoroutine(handle):
                 handle = await handle
-        except Exception as e:
+        except BaseException as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            self._remember_background_control(e)
+            if not isinstance(e, Exception) or is_execution_control_error(e):
+                raise
             # Enqueue raised synchronously — leave wake_delivered=0 so a
             # later sweep retries (codex P2 on PR #1512 round 1).
             logger.warning(
@@ -3898,7 +3908,11 @@ class RestartCoordinatorFeature(Feature):
 
             try:
                 result = await handle.wait()
-            except Exception as e:
+            except BaseException as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                self._remember_background_control(e)
+                if not isinstance(e, Exception) or is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "restart sweep: restart.completed wake for %s raised "
                     "(%s); wake stays undelivered for retry", row.id, e,

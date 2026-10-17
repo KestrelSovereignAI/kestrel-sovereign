@@ -1788,3 +1788,31 @@ behavior is measured separately against localhost with real PostgreSQL ACK-loss
 receipts, including independently produced original receipts and actual
 cause-bearing Task cancellation. These tests make no paid provider requests
 and do not claim newer SDK transport/error contracts were exercised.
+
+HTTPX may close an acquired response while still handling a response-observer
+failure, before that failure reaches the SDK retry boundary. The same native
+response closer therefore uses canonical admission, retaining the exact
+response/Task-none debt and closing an unstarted coroutine on refusal. Accepted
+native closers and the finite response inventory preserve original body,
+retirement and actual observer-withdrawal receipts through isolated composition.
+Private close debt does not mutate a shared source exception. Loopback SDK
+cases cover both the underlying response close and the actual SDK retry path
+with refused inner cleanup; they are not public-provider acceptance.
+
+Core signal terminal/admission handles explicitly borrow their dispatcher-owned
+operations. Withdrawing an ACK observer does not cancel a dispatch; explicit
+handle cancellation remains available for that purpose. Restart wake consumers
+retain original enqueue/ACK control in the feature's existing bounded background
+failure owner and fence later wake retries rather than treating UNKNOWN as
+retryable absence. These tests use actual Core handles, Agent constructor/task
+components and native SQL fault fixtures, not cognition, Agent READY or a host
+restart. This does not change or certify standalone SDK consumers outside Core.
+
+Failed Hold admission keeps both the actual read failure and exact-token native
+rollback outcome. Local pending-admission bookkeeping can unwind after release,
+but that is not a native ACK: the existing durable-writer latch retains release
+control and fences fresh claims. Finite outer composition isolates the read
+observer from that shared writer source. Native tests exercise both a claimed
+lease and an activated initial reservation, preserving attempt-neutral release;
+the volatile sidecar is an explicit private component input, not full ingress
+or privacy-policy startup certification.

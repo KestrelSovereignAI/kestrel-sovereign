@@ -11,13 +11,15 @@ import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task, owned_task_join_ancestors
 from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError, bind_execution_custody,
+    ExecutionAuthorityError, _explicit_control_chain, bind_execution_custody,
+    execution_cleanup_debts, is_execution_control_error,
 )
 from kestrel_sovereign.llm.cancellation import anext_or_cancelled, await_or_cancelled
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.openrouter_adapter import OpenRouterAdapter
 from tests.unit.test_execution_custody_review29 import native_owner, retire
 from tests.unit.test_execution_custody_review32 import receipt
+from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 
 class Body(httpx.AsyncByteStream):
@@ -67,8 +69,9 @@ async def test_native_sdk_handle_survives_post_open_authority_denial(provider, t
     actual_create = asyncio.create_task
 
     def observe_close(operation, *args, **kwargs):
+        native = _actual_operation(operation)
         task = actual_create(operation, *args, **kwargs)
-        if getattr(operation, "cr_code", None) is httpx.Response.aclose.__code__:
+        if getattr(native, "cr_code", None) is httpx.Response.aclose.__code__:
             native_closes.append(task)
         return task
 
@@ -107,7 +110,10 @@ async def test_native_sdk_handle_survives_post_open_authority_denial(provider, t
         )
         body.release_close.set()
         outcome = await await_owned_task(task)
-        assert outcome.error is original
+        assert original in tuple(_explicit_control_chain(outcome.error))
+        assert is_execution_control_error(outcome.error)
+        assert tuple(_explicit_control_chain(original)) == (original,)
+        assert not execution_cleanup_debts(original)
         assert body.closed
     finally:
         body.release_close.set()
@@ -186,7 +192,10 @@ async def test_native_anthropic_acquisition_closes_before_denial_is_reported():
         assert not task.done()
         body.release_close.set()
         outcome = await await_owned_task(task)
-        assert outcome.error is original
+        assert original in tuple(_explicit_control_chain(outcome.error))
+        assert is_execution_control_error(outcome.error)
+        assert tuple(_explicit_control_chain(original)) == (original,)
+        assert not execution_cleanup_debts(original)
         assert body.closed
     finally:
         body.release_close.set()

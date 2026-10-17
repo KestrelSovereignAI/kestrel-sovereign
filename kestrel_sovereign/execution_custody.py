@@ -906,7 +906,7 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
     cancelled first close therefore cannot safely be repaired by calling the
     original close again. Retain its task before iteration can start it.
     """
-    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
     response = stream if isinstance(stream, _NativeHTTPXResponse) else getattr(stream, "response", None)
     if not isinstance(response, _NativeHTTPXResponse):
@@ -921,19 +921,34 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
         nonlocal task
         original = sys.exc_info()[1]
         if task is None:
-            with bind_execution_cleanup(owner, captured):
-                task = asyncio.create_task(native_close())
+            try:
+                with bind_execution_cleanup(owner, captured):
+                    task = create_owned_task(
+                        native_close(), retirement_resource=response,
+                        retain_originals=True,
+                    )
+            except BaseException as error:
+                raise execution_terminal_error(
+                    original, error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
         outcome = await await_owned_task(task)
+        retirement = None
         if outcome.error is not None:
-            outcome.error._kestrel_native_retirement_debts = (
-                *getattr(outcome.error, "_kestrel_native_retirement_debts", ()),
-                (response, task),
-            )
+            # The failed closer may itself report a shared native receipt.
+            # Its private resource/Task debt belongs on this finite carrier,
+            # never on the source exception owned by another operation.
+            retirement = RuntimeError("original native HTTP response retirement failed")
+            retirement._kestrel_native_retirement_debts = ((response, task),)
         if outcome.error is not None or outcome.cancellation is not None:
             if (outcome.error is None and outcome.cancellation is not None
                 and (original is None or not is_execution_control_error(original))):
                 raise outcome.cancellation
-            raise execution_terminal_error(original, outcome.error, outcome.cancellation)
+            raise execution_terminal_error(
+                original, outcome.error, retirement, outcome.cancellation,
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
 
     response.extensions["kestrel.native_close_owner"] = joined_close
     response.aclose = joined_close
@@ -961,7 +976,10 @@ class _CustodyHTTPBody(_NativeHTTPXAsyncByteStream):
             try:
                 await close_native_execution_stream(self.response)
             except BaseException as cleanup:
-                raise execution_terminal_error(original, cleanup)
+                raise execution_terminal_error(
+                    original, cleanup, retain_originals=True,
+                    isolate_control_originals=True,
+                )
             raise
 
     async def aclose(self):
@@ -1084,19 +1102,24 @@ async def close_native_execution_stream(
             isolate_control_originals=isolate_control_originals,
         )
     outcome = await await_owned_task(close_task)
+    retirement = None
     if outcome.error is not None:
         # Keep the exact failed attempt reachable even if the native SDK has
         # already set an optimistic "closed" flag. Never retry that closer.
-        outcome.error._kestrel_native_retirement_debts = (
-            *getattr(outcome.error, "_kestrel_native_retirement_debts", ()),
-            (stream, close_task),
-        )
+        if isolate_control_originals:
+            retirement = RuntimeError("original native stream retirement failed")
+            retirement._kestrel_native_retirement_debts = ((stream, close_task),)
+        else:
+            outcome.error._kestrel_native_retirement_debts = (
+                *getattr(outcome.error, "_kestrel_native_retirement_debts", ()),
+                (stream, close_task),
+            )
     if outcome.error is not None or outcome.cancellation is not None:
         if (not retain_originals and outcome.error is None and outcome.cancellation is not None
             and not is_execution_control_error(original)):
             raise outcome.cancellation
         raise execution_terminal_error(
-            original, outcome.error, outcome.cancellation,
+            original, outcome.error, retirement, outcome.cancellation,
             retain_originals=retain_originals, prefer_cancellation=retain_originals,
             isolate_control_originals=isolate_control_originals,
         )
@@ -1131,17 +1154,28 @@ class NativeExecutionStreamOwner:
     async def close(self, original=None):
         # SDKs can wrap a hook's original denial as APIConnectionError. The
         # physical response owner retains the exact pre-normalization receipt.
-        terminal = execution_terminal_error(self.control, original, self.retirement_error)
+        terminal = execution_terminal_error(
+            self.control, original, self.retirement_error,
+            retain_originals=True, isolate_control_originals=True,
+        )
         if self.retirement_error is not None:
             terminal._kestrel_native_retirement_owner = self
             raise terminal
         for handle in reversed(tuple(self.handles)):
             try:
-                await close_native_execution_stream(handle)
+                await close_native_execution_stream(
+                    handle, retain_originals=True, isolate_control_originals=True,
+                )
             except BaseException as error:
                 if execution_cleanup_debts(error):
-                    self.retirement_error = execution_terminal_error(self.retirement_error, error)
-                    terminal = execution_terminal_error(terminal, error)
+                    self.retirement_error = execution_terminal_error(
+                        self.retirement_error, error, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
+                    terminal = execution_terminal_error(
+                        terminal, error, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                 else:
                     # Caller cancellation AFTER a successful physical close is
                     # a request receipt, not failed transport retirement. Keep
@@ -1151,7 +1185,10 @@ class NativeExecutionStreamOwner:
                     if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(terminal):
                         terminal = error
                     else:
-                        terminal = execution_terminal_error(terminal, error)
+                        terminal = execution_terminal_error(
+                            terminal, error, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
             else:
                 self.handles[:] = [retained for retained in self.handles if retained is not handle]
         if self.retirement_error is not None:

@@ -6,7 +6,7 @@ import httpx
 
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator, await_owned_task
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
-from kestrel_sovereign.execution_custody import NativeExecutionStreamOwner, execution_cleanup_debts
+from kestrel_sovereign.execution_custody import NativeExecutionStreamOwner, execution_cleanup_debts, _explicit_control_chain
 
 
 @pytest.mark.asyncio
@@ -243,14 +243,20 @@ async def test_failed_original_httpx_close_is_retained_and_never_retried():
     response = httpx.Response(200, stream=Body())
     owner = NativeExecutionStreamOwner()
     owner.retain(response)
+    terminal = None
     for _ in range(2):
-        with pytest.raises(OSError) as caught:
+        with pytest.raises(BaseException) as caught:
             await owner.close()
-        assert caught.value is original
+        assert original in tuple(_explicit_control_chain(caught.value))
+        if terminal is None:
+            terminal = caught.value
+        assert caught.value is terminal, "repeated close grew a new terminal history"
         assert owner.handles == [response]
-        assert original._kestrel_native_retirement_owner is owner
-        assert execution_cleanup_debts(original)[0][0] is response
-        assert execution_cleanup_debts(original)[0][1].done()
+        assert caught.value._kestrel_native_retirement_owner is owner
+        assert execution_cleanup_debts(caught.value)
+        assert all(resource is response and task.done() for resource, task in execution_cleanup_debts(caught.value))
+        assert tuple(_explicit_control_chain(original)) == (original,)
+        assert not execution_cleanup_debts(original), "private close debt contaminated original source"
     assert response.is_closed and attempts == 1
 
 
