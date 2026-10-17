@@ -404,7 +404,14 @@ def test_every_model_call_is_on_an_answer_path_or_declared_not_to_be_one():
 #: the cases that need it run under it (:func:`_bound_for`): a short bound also
 #: trips on a provider that answers at once whenever a loaded test host stalls
 #: the event loop for longer, so every other case keeps a bound it cannot reach.
+#: For the same reason it applies only from the generation under test: the
+#: calls before it answer at once too, and under the short bound a stalled
+#: loop abandoned one, so the turn never reached its repair (#3669).
 TURN_BOUND = 1.0
+#: How long a ``watchdog`` case's calls before the generation under test are
+#: silent: longer than the short bound, as a loaded host made one of them.
+#: Only the generation's own bound may end the turn.
+STALL = TURN_BOUND * 1.5
 #: The inactivity bound of every case that does not need the short one.
 UNREACHED_BOUND = 60.0
 #: How long a turn may take to end once Stop lands. Stop is polled every
@@ -460,6 +467,11 @@ REPAIRED = ("invoke_repair", "stream_repair")
 MARKUP = '<function_calls><invoke name="state_of_mind"></invoke></function_calls>'
 
 
+def _generation_is_first(path: str) -> bool:
+    """Whether the turn's first model call is the generation under test."""
+    return path not in TOOL_RAN and path not in REPAIRED
+
+
 def _bound_for(cause: str) -> float:
     """The inactivity bound a table case runs under.
 
@@ -473,13 +485,17 @@ def _bound_for(cause: str) -> float:
 
 
 class _Body(httpx.AsyncByteStream):
-    """A daemon response body: ``chunks``, then how it ends (``tail``)."""
+    """A daemon response body: silence for ``delay``, ``chunks``, then how it
+    ends (``tail``)."""
 
-    def __init__(self, chunks: List[bytes], tail: Any = None) -> None:
+    def __init__(self, chunks: List[bytes], tail: Any = None, delay: float = 0.0) -> None:
         self._chunks = chunks
         self._tail = tail
+        self._delay = delay
 
     async def __aiter__(self):
+        if self._delay:
+            await asyncio.sleep(self._delay)
         for chunk in self._chunks:
             yield chunk
         if self._tail == "hang":
@@ -524,12 +540,12 @@ def _complete(content: str, *, streamed: bool) -> httpx.Response:
     return _respond(_Body([_line(_final("stop", content))]))
 
 
-def _tool_call() -> httpx.Response:
+def _tool_call(delay: float = 0.0) -> httpx.Response:
     reply = _final("stop")
     reply["message"]["tool_calls"] = [
         {"function": {"name": "state_of_mind", "arguments": {}}}
     ]
-    return _respond(_Body([_line(reply)]))
+    return _respond(_Body([_line(reply)], delay=delay))
 
 
 def _ending(cause: str, *, streamed: bool, stop: Callable[[], None]) -> httpx.Response:
@@ -647,16 +663,32 @@ def _is_repair(body: Dict[str, Any]) -> bool:
     )
 
 
-def _answers(path: str, cause: str, stop: Callable[[], None]):
-    """The daemon answers for route A (and B, on two-route paths)."""
+def _answers(
+    path: str,
+    cause: str,
+    stop: Callable[[], None],
+    bound_the_generation: Callable[[], None],
+):
+    """The daemon answers for route A (and B, on two-route paths).
+
+    ``bound_the_generation`` is called as route A answers the last call
+    before the generation under test, so the next call is the first to run
+    under the case's bound. On a path whose first call is the generation the
+    test calls it before the turn (:func:`_generation_is_first`). In a
+    ``watchdog`` case those earlier calls answer only after :data:`STALL`.
+    """
     streamed = path == "stream_fallback"
+    stall = STALL if cause == "watchdog" else 0.0
 
     def route_a(body: Dict[str, Any]) -> httpx.Response:
         if not _is_repair(body):
             if path in TOOL_RAN and body["messages"][-1]["role"] != "tool":
-                return _tool_call()
+                if path not in REPAIRED:
+                    bound_the_generation()
+                return _tool_call(delay=stall)
             if path in REPAIRED:
-                return _respond(_Body([_line(_final("stop", MARKUP))]))
+                bound_the_generation()
+                return _respond(_Body([_line(_final("stop", MARKUP))], delay=stall))
         return _ending(cause, streamed=streamed, stop=stop)
 
     def route_b(body: Dict[str, Any]) -> httpx.Response:
@@ -711,7 +743,11 @@ async def _run_turn(agent, path: str, session_id: str) -> Dict[str, Any]:
 @pytest.mark.parametrize("cause", CAUSES)
 @pytest.mark.parametrize("path", PATHS)
 async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path, cause):
-    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", _bound_for(cause))
+    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", UNREACHED_BOUND)
+
+    def bound_the_generation() -> None:
+        monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", _bound_for(cause))
+
     # Retries of a transient provider error are not under test; without them
     # a provider timeout fails its attempt at once.
     from kestrel_sovereign.llm import ollama_adapter
@@ -730,7 +766,9 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
             stopped_at.append(loop.time())
             agent.cancel_current_request()
 
-        route_a, route_b = _answers(path, cause, stop=stop)
+        route_a, route_b = _answers(
+            path, cause, stop=stop, bound_the_generation=bound_the_generation,
+        )
         daemon_a, daemon_b = _Daemon(route_a), _Daemon(route_b)
         service = agent.llm_service
         providers = [_route(agent, "local", daemon_a)]
@@ -749,6 +787,8 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
                 lambda providers, tools, model_override: None,
             )
 
+        if _generation_is_first(path):
+            bound_the_generation()
         started = loop.time()
         seen = await asyncio.wait_for(_run_turn(agent, path, session_id), 30)
         ended = loop.time()

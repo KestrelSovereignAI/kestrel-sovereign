@@ -194,7 +194,7 @@ def test_new_text_without_an_amendment_viii_section_refuses():
     assert refusal is not None
 
 
-@pytest.mark.parametrize("anchored", [DORMANT_TEXT, "# Empty\n"])
+@pytest.mark.parametrize("anchored", [DORMANT_TEXT, "# Empty\n"], ids=["dormant", "empty"])
 def test_non_active_anchored_bytes_never_refuse(anchored):
     assert _call(None, anchored, DORMANT_TEXT) is None
 

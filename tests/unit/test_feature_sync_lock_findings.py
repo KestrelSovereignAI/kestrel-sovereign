@@ -949,13 +949,20 @@ def test_no_report_is_none_and_the_coordinator_says_why(tmp_path):
 
 
 @pytest.mark.parametrize("raw, says", [
-    (b"not json", "is not JSON"),
-    (b"\xff\xfe", "is not JSON"),
-    (b"[" * 100_000, "is not JSON"),
-    (b'{"findings": {}}', "is not a lock report"),
-    (b'{"findings": [{"kind": "lock_downgrade"}]}', "is not a lock report"),
-    (b'["findings"]', "is not a lock report"),
-    (b" " * (cl.LOCK_REPORT_MAX_BYTES + 1), "is larger than"),
+    pytest.param(b"not json", "is not JSON", id="not-json"),
+    pytest.param(b"\xff\xfe", "is not JSON", id="not-utf8"),
+    # Explicit ids: as their own ids, these two payloads printed 100 KB and
+    # 1 MB lines that `gh run view --log` stops reading at (#3669).
+    pytest.param(b"[" * 100_000, "is not JSON", id="nested-past-recursion-limit"),
+    pytest.param(b'{"findings": {}}', "is not a lock report", id="findings-not-a-list"),
+    pytest.param(
+        b'{"findings": [{"kind": "lock_downgrade"}]}', "is not a lock report",
+        id="finding-missing-fields",
+    ),
+    pytest.param(b'["findings"]', "is not a lock report", id="not-an-object"),
+    pytest.param(
+        b" " * (cl.LOCK_REPORT_MAX_BYTES + 1), "is larger than", id="over-size-cap",
+    ),
 ])
 def test_a_report_that_will_not_read_is_unavailable_never_empty(tmp_path, raw, says):
     from kestrel_sovereign.features.restart_coordinator.feature import (
