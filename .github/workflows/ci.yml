@@ -361,7 +361,11 @@ jobs:
           tests/unit/test_server_auth.py tests/unit/test_openai_cache_usage.py
           tests/unit/test_openai_thinking_channel.py tests/unit/test_openai_plan_autocompact.py
           tests/unit/test_feature_route_lifecycle_gate.py tests/unit/test_bridge_router_mounted.py
-          tests/unit/test_anthropic_output_ceiling.py -q
+          tests/unit/test_anthropic_output_ceiling.py
+          tests/unit/test_host_features.py tests/unit/test_stream_progress_watchdog.py
+          tests/unit/test_provider_registry_no_sdk_retries.py -q
+      - name: Verify live Phoenix UI assets through the host proxy
+        run: uv run --no-sync python -m pytest tests/integration/test_phoenix_runtime.py -q
 
   # Unit tests (no services needed)
   unit-tests:

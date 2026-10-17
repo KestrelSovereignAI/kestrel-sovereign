@@ -21,7 +21,7 @@ from contextlib import suppress
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock
 
-import httpx
+import httpx2
 import openai
 import pytest
 
@@ -57,7 +57,7 @@ HANG_GUARD = 30
 #: A request the endpoint never answers.
 HANG = object()
 
-Reply = Callable[[Dict[str, Any]], httpx.Response]
+Reply = Callable[[Dict[str, Any]], httpx2.Response]
 
 
 def _sse_event(event: Dict[str, Any]) -> bytes:
@@ -86,9 +86,9 @@ _USAGE_CHUNK = {
 def _answer(content: str) -> Reply:
     """A finished reply, streamed or not as the request asked."""
 
-    def reply(body: Dict[str, Any]) -> httpx.Response:
+    def reply(body: Dict[str, Any]) -> httpx2.Response:
         if body.get("stream"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
                 content=_sse([
@@ -97,7 +97,7 @@ def _answer(content: str) -> Reply:
                     _USAGE_CHUNK,
                 ]),
             )
-        return httpx.Response(200, json={
+        return httpx2.Response(200, json={
             "id": "gen-1", "object": "chat.completion", "created": 0,
             "model": MODEL,
             "choices": [{
@@ -125,7 +125,7 @@ class _OpenRouter:
         self.cancelled = 0
         self.stalled = asyncio.Event()
 
-    async def handle(self, request: httpx.Request) -> httpx.Response:
+    async def handle(self, request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
         self.requests.append(body)
         reply = self._replies[min(len(self.requests), len(self._replies)) - 1]
@@ -159,7 +159,7 @@ def _on_the_incident_route(
     provider["client"] = openai.AsyncOpenAI(
         api_key="sk-or-test", base_url="https://openrouter.test/api/v1",
         max_retries=0, timeout=client_timeout,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(endpoint.handle)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(endpoint.handle)),
     )
     assert not provider["is_local"]
     monkeypatch.setattr(service, "providers", [provider])
@@ -502,8 +502,8 @@ async def test_a_stream_progressing_past_the_bound_is_not_cut(tmp_path, monkeypa
                 yield _sse_event(_USAGE_CHUNK)
                 yield b"data: [DONE]\n\n"
 
-            def slow(_body: Dict[str, Any]) -> httpx.Response:
-                return httpx.Response(
+            def slow(_body: Dict[str, Any]) -> httpx2.Response:
+                return httpx2.Response(
                     200, headers={"content-type": "text/event-stream"},
                     content=slow_body(),
                 )

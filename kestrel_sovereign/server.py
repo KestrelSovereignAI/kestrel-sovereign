@@ -855,6 +855,8 @@ def _feature_route_shape(context) -> tuple:
 
 def _feature_router_signature(feature_name: str, router) -> tuple:
     """Identify an entire native router, with effective nested route paths."""
+    if not isinstance(router, APIRouter):
+        raise TypeError("Feature.get_router() must return a FastAPI APIRouter or None")
     routes = tuple(
         _feature_route_shape(context)
         for context in iter_route_contexts(router.routes)
@@ -867,8 +869,8 @@ class _LiveFeatureRouter(APIRouter):
 
     FastAPI owns inclusion, dependencies, WebSockets, and route metadata. The
     host only gates the feature lifecycle and selects the current owner. A
-    fresh native parent at dispatch keeps the app's dependency overrides and
-    mount-time host dependencies without retaining a replaced feature closure.
+    native parent keeps the app's dependency overrides and mount-time host
+    dependencies; a replacement router always receives a new binding.
     """
 
     def __init__(self, app: FastAPI, router, feature_name: str, mount_agent):
@@ -879,7 +881,14 @@ class _LiveFeatureRouter(APIRouter):
             for context in iter_route_contexts(router.routes)
         ):
             raise TypeError("Feature routers must expose HTTP or WebSocket routes")
+        # FastAPI serves frontend() fallbacks outside normal matches()/handle().
+        # Its native low-priority traversal includes nested router fallbacks;
+        # none may bypass the per-agent lifecycle boundary. Feature UI belongs
+        # to the host's typed UI contribution contract instead.
+        if next(router._iter_low_priority_routes(), None) is not None:
+            raise TypeError("Feature frontend() routes must use get_ui_contributions()")
         self.include_router(router)
+        self._binding: tuple[APIRouter, APIRouter] | None = None
         self._host_app = app
         self._feature_name = feature_name
         self._mount_agent = mount_agent
@@ -921,9 +930,14 @@ class _LiveFeatureRouter(APIRouter):
         if current is None:
             await _feature_route_gone_response(scope, receive, send)
             return
-        bound = APIRouter(**self._host_options)
-        bound.include_router(current)
-        await bound.handle(scope, receive, send)
+        # Cache only the exact source router. A matching shape alone cannot
+        # justify reusing a closure from a different tenant or a fresh factory.
+        # One slot bounds retained feature instances across tenant/reload churn.
+        if self._binding is None or self._binding[0] is not current:
+            bound = APIRouter(**self._host_options)
+            bound.include_router(current)
+            self._binding = (current, bound)
+        await self._binding[1].handle(scope, receive, send)
 
 
 def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:

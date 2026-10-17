@@ -19,7 +19,7 @@ actual server/app path, asserting:
   snapshot.
 
 Mutation notes: the native router match gate and dispatch gate both refuse
-withdrawn features. Wrong-method requests pin matching (404 instead of 405),
+withdrawn features. WebSocket close codes pin matching (1000 instead of 1008),
 and a feature removed between matching and handling pins the dispatch check.
 Cross-agent requests and app dependencies also pin the native inclusion wiring.
 """
@@ -1496,3 +1496,100 @@ def test_a_disabled_feature_answers_not_found_even_for_the_wrong_method():
             assert alice.served == 0
     finally:
         restore()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_ungated_frontend_routes_are_rejected_atomically(tmp_path, caplog, nested):
+    from kestrel_sovereign import server
+
+    (tmp_path / "index.html").write_text("<html>private tenant frontend</html>")
+    router = APIRouter()
+
+    @router.get("/frontend-probe")
+    async def probe():
+        return {"private": True}
+
+    router.frontend("/tenant-spa", directory=tmp_path)
+    if nested:
+        outer = APIRouter()
+        outer.include_router(router, prefix="/nested")
+        router = outer
+    feature = SimpleNamespace(enabled=True, get_router=lambda: router)
+    app = FastAPI()
+    app.state.agent = _make_agent({"FrontendFeature": feature})
+    app.state.agent_manager = None
+    server._mount_feature_routers(app)
+    feature.enabled = False
+    prefix = "/nested" if nested else ""
+    with TestClient(app) as client:
+        assert client.get(f"{prefix}/tenant-spa/").status_code == 404
+        assert client.get(f"{prefix}/frontend-probe").status_code == 404
+    assert app.state._feature_routes == []
+    assert "get_ui_contributions" in caplog.text
+
+
+def test_stable_native_router_does_not_rebuild_handlers_per_request(monkeypatch):
+    from kestrel_sovereign import server
+    from fastapi.routing import APIRoute
+
+    events = []
+    feature = _DependencyBoundRouterFeature("stable", events)
+    app = FastAPI()
+    app.state.agent = _make_agent({"StableFeature": feature})
+    app.state.agent_manager = None
+    server._mount_feature_routers(app)
+    with TestClient(app) as client:
+        assert client.get("/test-feature-lifecycle/dependency-bound").status_code == 200
+        builds = []
+        original = APIRoute.get_route_handler
+
+        def tracked(route):
+            builds.append(route.path)
+            return original(route)
+
+        monkeypatch.setattr(APIRoute, "get_route_handler", tracked)
+        for _ in range(3):
+            assert client.get("/test-feature-lifecycle/dependency-bound").json() == {"owner": "stable"}
+        assert builds == []
+
+
+def test_same_feature_factory_can_change_its_closure_without_changing_shape():
+    from kestrel_sovereign import server
+
+    generations = []
+
+    def current_router():
+        generation = len(generations)
+        generations.append(generation)
+        router = APIRouter()
+
+        @router.get("/factory-generation")
+        async def current():
+            return {"generation": generation}
+
+        return router
+
+    feature = SimpleNamespace(enabled=True, get_router=current_router)
+    app = FastAPI()
+    app.state.agent = _make_agent({"FactoryFeature": feature})
+    app.state.agent_manager = None
+    server._mount_feature_routers(app)
+    with TestClient(app) as client:
+        first = client.get("/factory-generation").json()["generation"]
+        second = client.get("/factory-generation").json()["generation"]
+    assert second > first
+
+
+def test_invalid_live_router_contract_fails_clearly():
+    from kestrel_sovereign import server
+
+    invalid = SimpleNamespace(get_router=lambda: SimpleNamespace(routes=[]))
+    with pytest.raises(TypeError, match="FastAPI APIRouter or None"):
+        server._current_feature_router(invalid, ())
+
+    def broken():
+        raise RuntimeError("feature router construction failed")
+
+    # A broken plugin must report its error instead of being silently omitted.
+    with pytest.raises(RuntimeError, match="router construction failed"):
+        server._current_feature_router(SimpleNamespace(get_router=broken), ())

@@ -111,7 +111,9 @@ dependencies = [
     # Core's safety floor to make an older downstream resolver succeed.
     "kestrel-sovereign-sdk[tracing]>=0.39.0,<0.40",
     # Core web framework
-    "fastapi>=0.143.3,<1",
+    # Pre-1.0 router internals changed in a minor release. Advance this tested
+    # current line with the native router/CSRF/frontend acceptance checks.
+    "fastapi>=0.143.3,<0.144",
     "uvicorn==0.48.0",
     "pydantic==2.13.4",
     # HTTP clients
@@ -119,6 +121,7 @@ dependencies = [
     # present in the 3.13/3.14.0 lines (#2546).
     "aiohttp>=3.14.1",
     "httpx>=0.27.0",
+    "httpx2>=2.10,<3",
     # >=2.33.0 fixes unsafe .netrc credential handling (#2546).
     "requests>=2.33.0",
     # Cloud LLM providers
@@ -225,9 +228,9 @@ dependencies = [
     # >=5.9.0 fixes an uncontrolled-recursion DoS on malformed input.
     "cbor2>=5.9.0",
     # LLM provider SDKs (used at runtime via dynamic import)
-    # >=0.77: GA structured outputs (`output_config`), which the Anthropic
-    # adapter uses for every response_format request (#3492).
-    "anthropic>=0.77.0",
+    # SDK 1.x uses httpx2 and the current Messages API. Keep the adapter and
+    # its progress-body hook on this SDK's native transport types.
+    "anthropic>=1,<2",
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
     # Floor at 1.0: 0.x used ml_dsa_65.generate_keypair() and a verify()
