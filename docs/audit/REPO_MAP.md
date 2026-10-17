@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-16
-**Scope:** 2753 tracked files (1961 `.py`, 352 `.md`, 440 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-17
+**Scope:** 2765 tracked files (1971 `.py`, 353 `.md`, 441 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1420,7 +1420,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/bm25_index.py** — BM25 search index for RAG fallback/boost.
   - `class BM25Result`; `class BM25Index`; `class AsyncBM25Index`; `def create_bm25_index()`; `def create_async_bm25_index()`
 - **kestrel_sovereign/storage/car_builder.py** — CAR v1 (Content Addressable aRchive) builder and reader.
-  - `def encode_varint(n)`; `def decode_varint(data, offset)`; `def build_cid_bytes(codec, data)`; `def cid_bytes_to_string(cid_bytes)`; `def cid_string_to_bytes(cid_str)`; `def compute_raw_cid(data)`; `def compute_dag_cbor_cid(cbor_data)`; `def make_cid_link(cid_bytes)`; `…`
+  - `def encode_varint(n)`; `def decode_varint(data, offset)`; `def cid_bytes_from_sha256(codec, digest)`; `def build_cid_bytes(codec, data)`; `def cid_bytes_to_string(cid_bytes)`; `def cid_string_to_bytes(cid_str)`; `def compute_raw_cid(data)`; `def compute_dag_cbor_cid(cbor_data)`; `…`
 - **kestrel_sovereign/storage/consolidation_drain.py** — Durable evidence that a timed-out consolidation pass left database work running (#2978).
   - `def consolidation_drain_record_dir(db)`; `def legacy_consolidation_drain_record_path(db)`; `def database_connection_generation(db)`; `def new_consolidation_drain_record()`; `def isolated_consolidation_drain_record(record, reason)`; `def done_consolidation_drain_record(record, cleanup)`; `def write_consolidation_drain_record(path, record)`; `def read_consolidation_drain_record(path)`; `…`
 - **kestrel_sovereign/storage/conversation_created_at.py** — What may be stored in ``conversation_history.created_at`` (#3009).
@@ -1495,7 +1495,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/providers/lighthouse_provider.py** — Lighthouse Storage Provider
   - `class LighthouseProvider`; `def create_lighthouse_provider(api_key, tier, key_resolver)`; `async def resolve_lighthouse_storage(agent_did)`; `async def lighthouse_api_key_for(resolved)`; `async def lighthouse_provider_for(resolved)`
 - **kestrel_sovereign/storage/providers/lighthouse_rest.py** — Async REST client for Lighthouse storage API.
-  - `class LighthouseDownloadLimitError`; `def deal_records(status)`; `async def list_all_uploads(client)`; `class LighthouseGateway`; `class LighthouseRestClient`
+  - `class LighthouseDownloadLimitError`; `def deal_records(status)`; `async def list_all_uploads(client)`; `class UploadBody`; `def describe_upload_failure(exc)`; `class LighthouseGateway`; `class LighthouseRestClient`
 - **kestrel_sovereign/storage/retention.py** — Retention helpers for the soft-delete migration (#764).
   - `def load_trash_config()`; `def resolve_retention_days()`; `def load_forgetting_config()`; `def agent_privacy_mode(agent)`
 - **kestrel_sovereign/storage/saved_items_store.py** — Saved Items Store for Kestrel.
@@ -1650,6 +1650,8 @@ Repo entry points and standard project files.
   - `def cmd_wizard_artifacts(args)`; `def cmd_identity(args)`; `def cmd_constitution(args)`; `def cmd_memory(args)`; `def cmd_start_and_health(args)`; `def cmd_host_and_chat_503(args)`; `def cmd_test_instance(args)`; `def cmd_did_persists(args)`; `…`
 - **scripts/ci/create_issues.py** — Create GitHub issues for high-confidence recurring patterns.
   - `def get_feedback_entries(db_path)`; `def analyze_patterns(entries)`; `def issue_exists(title, repo, token)`; `def create_issue(insight, repo, token)`; `def main()`
+- **scripts/ci/throughput_report.py** — Measure where a repository's development time goes, from GitHub alone.
+  - `def parse_time(value)`; `def gh_json()`; `def merged_prs(repo, since)`; `def quantile(values, fraction)`; `def describe(label, values, unit)`; `def label_times(pr, label)`; `def report_prs(prs, since)`; `def report_ci(repo, workflow, runs)`; `…`
 - **scripts/convene_agent_participation.py** — Convene Constitutional Council: Agent Participation in Own Governance
   - `def print_token_usage(session)`; `def build_evidence()`; `async def run_council_session()`
 - **scripts/convene_council.py** — Convene Constitutional Council for Emma Genesis Decision
@@ -2130,6 +2132,7 @@ Repo entry points and standard project files.
 - **docs/proposals/ui-extension-slots/SLOTS.md** — SLOTS.md — UI extension slot taxonomy & contribution contract — **Status:** Spec (design spike, ticket 01 of epic #2038) **Implements against:** nothing yet — this is the contract tickets 02 and 04 build to.
 - **docs/releases/v0.47.0.md** — v0.47.0 — Fail-Closed Constitution Integrity — > **⚠️ Read this BEFORE upgrading a deployment from ≤ 0.46.2.** This release ships fail-closed constitution integrity enforcement.
 - **docs/releases/v0.53.27.md** — Core 0.53.27 — Named `kestrel start <name>` launches now direct child output to the agent's append-only log file.
+- **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
 - **docs/research/KV_CACHE_QUANTIZATION.md** — KV Cache Quantization Benchmark — ## Mac Studio M3 Ultra 512GB — Kimi K2.5 (1T params, Q2_K_XL)
@@ -2225,6 +2228,7 @@ Repo entry points and standard project files.
 - **tests/frontend/capability_derivation.test.mjs** — (mjs asset)
 - **tests/frontend/chat_component_mount.test.mjs** — (mjs asset)
 - **tests/frontend/chat_header_action_xss.test.mjs** — (mjs asset)
+- **tests/frontend/chat_mount_idempotent.test.mjs** — (mjs asset)
 - **tests/frontend/chat_restart_status_dedupe.test.mjs** — (mjs asset)
 - **tests/frontend/chat_revising_event.test.mjs** — (mjs asset)
 - **tests/frontend/chat_scroll_follow.test.mjs** — (mjs asset)
@@ -2648,18 +2652,26 @@ Repo entry points and standard project files.
 - **tests/llm/test_vertex_adapter.py** — Tests for Vertex AI Adapter.
   - `def has_gcp_credentials()`; `def adapter()`; `def sample_png_path(tmp_path)`; `class TestVertexAIAdapterInit`; `class TestMessageCreation`; `class TestToolConversion`; `class TestModelDiscovery`; `class TestGeneration`; `…`
 - **tests/load/__init__.py** — Load tests for Kestrel framework.
+- **tests/load/test_lighthouse_tls_write_ceiling.py** — The ~1.9 GB single-TLS-write ceiling behind #3662, on a real TLS stack.
+  - `def skip_unless_load(request)`; `def tls_contexts(tmp_path)`; `def test_one_tls_write_past_the_memory_bio_fails_with_emmas_error(skip_unless_load, tls_contexts)`; `async def test_a_car_past_the_ceiling_uploads_over_real_tls(skip_unless_load, tls_contexts)`
 - **tests/load/test_load_storage.py** — Storage load tests for performance benchmarking.
   - `def skip_unless_load(request)`; `async def load_test_storage(tmp_path)`; `async def test_concurrent_write_throughput(skip_unless_load, load_test_storage)`; `async def test_mixed_read_write_workload(skip_unless_load, load_test_storage)`; `async def test_rag_indexing_at_scale(skip_unless_load, load_test_storage)`; `async def test_large_conversation_history(skip_unless_load, load_test_storage)`; `async def test_concurrent_agent_sessions(skip_unless_load, tmp_path)`
 - **tests/shared/__init__.py** — Shared test utilities for Kestrel and kestrel test suites.
   - `def has_llm_credentials()`; `def no_llm_credentials()`; `def no_docker()`
 - **tests/shared/booted_agent.py** — A real agent on real storage, booted for tests that script its model calls.
   - `async def booted_agent(tmp_path)`
+- **tests/shared/child_pytest.py** — Run a child pytest that takes nothing from the session that starts it (#3669).
+  - `def child_pytest_env()`; `def run_child_pytest(directory)`
 - **tests/shared/cost_tracker.py** — Cost tracking for cloud resource usage during tests.
   - `class ResourceUsage`; `class CostTracker`; `class track_cost`
 - **tests/shared/genesis_audit.py** — Deterministic genesis auditor for tests that exercise later boundaries.
   - `async def deterministic_safe_genesis_auditor(_prompt)`; `async def complete_deterministic_genesis_audit(agent)`
+- **tests/shared/hang_backstop.py** — End a test that its pytest-timeout did not end, naming it and dumping every stack (#3669).
+  - `def configure(config)`; `def pytest_configure_node(node)`; `def pytest_handlecrashitem(crashitem, report, sched)`; `def pytest_runtest_protocol(item, nextitem)`; `def pytest_exception_interact(node, call, report)`; `def pytest_enter_pdb(config, pdb)`
 - **tests/shared/host_runtime_isolation.py** — Keep every test away from the operator's real runtime state (#3286).
   - `def allowed_storage_roots(basetemp)`; `def allow_storage_roots(roots)`; `def pin_runtime_paths(root, setenv, delenv)`; `def isolate_host_runtime_paths(root, monkeypatch)`; `def install_session_guard()`; `class Refusal`; `class RefusalRecorder`; `def refusal_failure_message(refusals)`
+- **tests/shared/node_id_length.py** — Refuse a test ID too long for the tools that read a CI log (#3669).
+  - `def refuse_overlong_node_ids(items)`; `def pytest_xdist_node_collection_finished(node, ids)`
 - **tests/shared/postgres_requirement.py** — Make the PostgreSQL leg of dual-backend tests fail instead of skip (#3381).
   - `def postgres_required(environ)`; `def check_session(environ)`; `def is_postgres_case(item)`; `def fail_skipped_postgres_case(item, report)`
 - **tests/shared/postgres_worker_isolation.py** — Give each xdist worker its own PostgreSQL database (#3383).
@@ -2970,6 +2982,8 @@ Repo entry points and standard project files.
   - `class TestPolicyGuardCoverage`; `class TestCheckPolicyBehavior`
 - **tests/unit/test_check_task_status_surfaces_request.py** — ``check_task_status``, ``get_task_result`` and ``list_my_tasks`` must surface the SENDER'S request text — not just the (often empty) agent reply slot.
   - `async def test_check_task_status_returns_request_content_for_submitted_task()`; `async def test_check_task_status_returns_both_request_and_reply_for_completed_task()`; `async def test_list_my_tasks_includes_request_content_per_row()`; `async def test_list_my_tasks_status_filter_queries_full_table_not_pending()`; `async def test_list_my_tasks_invalid_status_rejected()`; `async def test_list_my_tasks_type_filter_overfetches_then_truncates()`; `async def test_get_task_result_includes_request_content_for_completed_task()`; `async def test_check_task_status_surfaces_sender_attached_artifacts()`
+- **tests/unit/test_child_pytest.py** — A child pytest takes nothing from the session that starts it (#3669).
+  - `def test_the_child_inherits_no_pytest_variable_of_the_session(monkeypatch)`; `def test_the_child_imports_from_the_package_root_only(monkeypatch)`
 - **tests/unit/test_ci_console_smoke_job.py** — The pull-request Sovereign Console smoke job (#2682).
   - `def test_runs_on_pull_requests_like_the_other_browserless_tiers()`; `def test_is_bounded()`; `def test_references_no_secret_and_reads_only()`; `def test_runs_the_isolated_smoke_on_a_non_live_port_in_a_fresh_home()`; `def test_installs_one_browser_and_caches_node_dependencies()`; `def test_teardown_runs_on_success_failure_and_cancellation()`
 - **tests/unit/test_ci_duplicate_run_gate.py** — Decision table for the duplicate-run gate in ``.github/workflows/ci.yml``.
@@ -3508,6 +3522,8 @@ Repo entry points and standard project files.
   - `async def db(db_backend)`; `async def test_edge_to_a_target_outside_the_graph_is_admitted(db)`; `async def test_repeated_external_reference_edge_is_one_edge(db)`; `async def test_target_owned_by_the_writer_is_admitted(db)`; `async def test_edge_between_two_tenants_nodes_is_still_refused(db)`; `async def test_another_tenants_reservation_is_not_an_external_reference(db)`; `async def test_ownerless_legacy_node_is_not_an_external_reference(db)`; `async def test_source_owned_by_another_tenant_is_refused(db)`; `…`
 - **tests/unit/test_graph_property_indexes.py** — Tests for JSON-path property indexes and query_nodes_by_type_and_property.
   - `async def db(tmp_path)`; `async def graph(db)`; `class TestJsonExtract`; `class TestJsonExtractPostgres`; `class TestJsonPathIndexes`; `class TestPostgresIndexParity`; `class TestQueryNodesByTypeAndProperty`; `class TestIndexUsage`; `…`
+- **tests/unit/test_hang_backstop.py** — A hang pytest-timeout cannot end becomes a named failure with a stack dump (#3669).
+  - `def xdist_output(tmp_path_factory)`; `def test_each_hang_is_a_named_failure_with_its_stack_and_the_run_finishes(xdist_output)`; `def test_a_crash_the_backstop_did_not_cause_keeps_its_report(xdist_output)`; `def test_an_ordinary_timeout_keeps_its_report_and_its_worker(xdist_output)`; `def test_without_xdist_each_hang_ends_the_run_with_its_stack(tmp_path, name)`; `def test_under_the_thread_method_a_hang_after_a_failure_is_a_named_failure_with_its_stack(tmp_path)`; `def test_under_the_thread_method_without_xdist_a_hang_after_a_failure_ends_the_run_with_its_stack(tmp_path)`; `def test_without_pytest_timeout_loaded_the_backstop_stays_out_of_the_way(tmp_path)`
 - **tests/unit/test_health_check_ollama.py** — Unit tests for kestrel_sovereign.health_check._resolve_expected_ollama_model.
   - `def test_explicit_model_in_route_returns_that_model()`; `def test_auto_model_uses_route_selection_hints_on_resolver_failure()`; `def test_no_route_config_falls_back_to_single_installed()`; `def test_multiple_installed_no_hints_no_resolver_returns_none()`; `def test_legacy_flat_ollama_block_is_ignored()`
 - **tests/unit/test_health_feature.py** — Unit Tests for the Heartbeat Feature (#151).
@@ -3648,6 +3664,8 @@ Repo entry points and standard project files.
   - `class TestLighthousePayment`; `class TestLighthouseBalance`; `class TestLighthousePaymentIntegration`
 - **tests/unit/test_lighthouse_rest.py** — Tests for Lighthouse REST client.
   - `def client()`; `def mock_response()`; `class TestLighthouseRestClient`; `async def test_upload_car_budget_is_proportional_to_the_payload(client, mock_response)`; `async def test_upload_budget_is_sized_from_the_content_too(client, mock_response)`; `async def test_download_is_given_the_transfer_budget_when_the_size_is_known(client)`; `def test_a_small_upload_keeps_the_default_budget(client)`; `def test_the_budget_is_the_larger_of_the_default_and_the_payload_rate(client)`; `…`
+- **tests/unit/test_lighthouse_upload_streaming.py** — Lighthouse snapshot uploads reach TLS in bounded writes (#3662).
+  - `async def test_a_car_larger_than_one_tls_write_is_uploaded_in_bounded_writes()`; `async def test_the_upload_door_sovereignty_exports_use_is_bounded_too()`; `async def test_a_snapshot_whose_car_outgrows_one_tls_write_is_backed_up(tmp_path, monkeypatch)`; `async def test_a_snapshot_over_2_gib_is_never_held_whole_in_memory(tmp_path, monkeypatch)`; `async def test_an_upload_failure_logs_type_errno_bytes_sent_and_elapsed(tmp_path, monkeypatch, caplog)`; `async def test_a_refused_upload_logs_its_status_and_the_whole_body_sent(caplog)`; `def test_the_failure_line_finds_the_errno_beneath_httpx_and_anyio()`; `def test_the_failure_line_for_emmas_error()`; `…`
 - **tests/unit/test_list_trashed_messages_tool.py** — Message-level trash navigation (#2025).
   - `async def store()`; `async def test_lists_only_trashed_messages(store)`; `async def test_discover_then_restore_round_trip(store)`; `async def test_preview_unwraps_sent_form(store)`; `async def test_trashed_session_markers_are_hidden(store)`; `async def test_empty_trash_returns_zero(store)`; `async def test_ephemeral_and_isolated_expose_no_trash(store)`
 - **tests/unit/test_llm_call_watchdog.py** — #3552: every orchestrator LLM call a turn makes has one inactivity bound.
@@ -3790,6 +3808,8 @@ Repo entry points and standard project files.
   - `class TestNoViolation`; `class TestViolation`; `class TestLegacySuccessEdgeCases`; `class TestSummarizeForAudit`; `class TestVerdictShape`; `class TestMergeNarrationVerdicts`; `class TestEscalationAttributionNoViolation`; `class TestEscalationAttributionViolation`; `…`
 - **tests/unit/test_nellie_backend_smoke.py** — Nellie backend smoke-proof tests (issue #427, updated for epic #688).
   - `class TestNellieAnthropicPlan`; `class TestNellieOpenAIPlan`; `class TestNellieFailureModes`; `class TestNellieBackendSwitch`
+- **tests/unit/test_node_id_length.py** — A test ID too long for a CI log reader refuses the run, serially and under xdist (#3669).
+  - `def test_an_overlong_id_refuses_the_run_and_says_why(tmp_path, workers)`; `def test_an_id_at_the_limit_runs(tmp_path, workers)`; `def test_the_controller_refuses_a_worker_collection_over_the_limit()`; `def test_the_refusal_itself_has_no_line_over_the_limit()`
 - **tests/unit/test_non_streaming_turn_privacy_span.py** — #3310 — the non-streaming turn must hold the privacy-transition mutex.
   - `async def test_non_streaming_turn_body_holds_the_privacy_transition_lock()`; `async def test_transition_lock_writer_cannot_land_inside_the_turn()`; `async def test_in_turn_cross_task_tool_re_enters_the_span()`; `async def test_privacy_transition_waits_for_an_in_flight_non_streaming_turn()`; `async def test_streamed_turn_signal_turn_and_transition_do_not_deadlock()`; `async def test_bootstrap_transition_lock_writers_run_inside_the_span()`; `async def test_an_in_turn_privacy_transition_reenters_rather_than_wedging()`; `def test_process_input_takes_conversation_before_the_transition_lock()`
 - **tests/unit/test_oauth_credential_identity.py** — The plan route must name which credential it bound to.
@@ -4500,6 +4520,8 @@ Repo entry points and standard project files.
   - `async def rig(tmp_path, sqlite_database_factory)`; `async def test_registration_targets_the_providers_own_wake(rig)`; `async def test_terminal_handle_resumes_its_parked_consumer(rig)`; `async def test_another_handles_wake_does_not_resume_it(rig)`; `async def test_poll_data_cannot_redirect_the_wake(rig)`; `async def test_wake_committed_before_registration_is_backfilled(rig)`; `async def test_elided_wake_before_registration_reports_terminal(rig, preset)`; `async def test_post_registration_poll_failure_is_not_reported_as_running(rig, monkeypatch)`; `…`
 - **tests/unit/test_wait_signal_store.py** — CRUD tests for ``WaitSignalStore`` (Wave 2 of #1860).
   - `def make_store(tmp_path, sqlite_database_factory)`; `async def test_get_missing_returns_none(make_store)`; `async def test_record_pending_then_get(make_store)`; `async def test_record_pending_preserves_signaled_outcome(make_store)`; `async def test_record_delivery_locks_outcome_and_clears_pending(make_store)`; `async def test_record_delivery_soft_fail_does_not_lock_outcome(make_store)`; `async def test_list_pending_filters_to_unharvested(make_store)`; `async def test_clear_pending_nulls_only_pending_fields(make_store)`; `…`
+- **tests/unit/test_wait_watch_origin_session.py** — #3663: a signal-mode wait wakes the session that registered it.
+  - `async def boot(tmp_path, monkeypatch)`; `async def test_a_ci_wait_registered_from_a_session_wakes_that_session(boot)`; `async def test_a_task_wait_registered_from_a_session_wakes_that_session(boot)`; `async def test_a_watch_registered_from_another_session_wakes_there(boot)`; `async def test_a_watch_armed_before_a_restart_still_wakes_its_session(boot)`; `async def test_rearming_after_a_restart_from_outside_a_session_keeps_it(boot)`; `async def test_a_watch_registered_outside_any_session_stays_unbound(boot)`; `async def test_a_task_detached_from_a_finished_turn_records_no_session(boot)`; `…`
 - **tests/unit/test_wait_watch_rearm.py** — A re-registered wait watch wakes on the next distinct terminal EVENT (#3399).
   - `def make_agent(tmp_path, sqlite_database_factory)`; `async def test_a_rearmed_watch_fires_on_the_next_distinct_terminal_event(make_agent)`; `async def test_a_rearmed_watch_does_not_refire_on_the_delivered_event(make_agent)`; `async def test_identity_excludes_the_outcome_so_a_reclassified_event_is_not_news(make_agent)`; `async def test_a_provider_without_an_identity_keeps_the_outcome_token(make_agent)`; `async def test_an_unusable_identity_falls_back_to_the_outcome_token(make_agent, identity)`; `async def test_an_upgrade_to_identities_replays_no_delivered_wake(make_agent)`; `async def test_an_upgrade_adoption_keeps_a_rearmed_watch_armed(make_agent)`; `…`
 - **tests/unit/test_wake_provider_deferral.py** — #3302: a wake retried through a provider's advised rate-limit wait.
