@@ -27,7 +27,12 @@ tool execution and refresh are observed.
 ## Dependency survey
 
 Surveyed all 18 entries of the local host feature manifest before changing
-production constraints. Metadata came from PyPI's package JSON API. Three
+production constraints. These are entries of this operator's ignored local
+manifest, which includes the Phoenix/Pydantic AI packages as well as feature
+packages. They are not all entries of the tracked example manifest. A sanitized
+[snapshot of package names, versions and requirements](evidence/native-protocols/published-caps.json)
+records the exact survey inputs without operator paths or credentials.
+Metadata came from PyPI's package JSON API. Three
 entries are editable packages with no PyPI distribution; their source manifests
 were inspected instead. These observations are a dated survey, not pins to
 retain indefinitely.
@@ -50,17 +55,22 @@ retain indefinitely.
 | kestrel-feature-features | 0.3.2 | SDK >=0.36.0,<0.40 |
 | kestrel-feature-mcp | 0.4.1 | MCP >=1.26.0,<2; SDK >=0.10,<1 |
 | kestrel-feature-observability[fleet] | 0.17.15 | SDK >=0.38.1,<1 |
-| arize-phoenix | 20.23.0 | FastAPI >=0.137.0; Pydantic AI >=2.53.0,<3 |
+| arize-phoenix | 20.23.0 | FastAPI >=0.137.0; Pydantic AI >=2.53.0,<3; fastmcp-slim[client,server] >=4,<5 |
 | pydantic-ai-slim[anthropic,bedrock,google,mcp,openai,ui] | 2.57.0 | OpenAI >=3.26.0; MCP integration through fastmcp-slim[client] >=3.3.0,<5 |
 
 Core at `9c69e9bed` pins FastAPI 0.136.3 and idna 3.16, caps OpenAI below
 3, and its Phoenix extra caps Phoenix below 18 and Pydantic AI below 2.
 MCP 2.3.0 requires httpx2 >=2.10.0, which requires idna >=3.18. Thus changing
-only the MCP and Phoenix pins cannot resolve. The source SDK owns the old A2A
+only the MCP and Phoenix pins cannot resolve. Published MCP feature 0.4.1 also
+requires `mcp<2`, while Phoenix 20's FastMCP dependency requires MCP 2.x. The
+feature's native-client release must precede the host release; a new host lock
+cannot make the old feature wheel compatible. The source SDK owns the old A2A
 wire types; core's versions are re-exports.
 
 The isolated Python 3.13 resolver candidate retained core's other direct
-requirements and made these changes:
+requirements and made these changes. The protocol SDK rows are additional
+experimental inputs; the MCP feature owns the production MCP requirement and
+core owns its resulting host lock, not a second MCP client implementation:
 
 | Dependency | Candidate |
 | --- | --- |
@@ -72,22 +82,42 @@ requirements and made these changes:
 | Phoenix | 20.23.0 |
 | Pydantic AI slim, existing extras | 2.57.0 |
 
-`uv pip compile --python-version 3.13` resolved that candidate, and an isolated
+The committed [candidate input](evidence/native-protocols/dependencies.in) is
+reproducible from the repository root:
+
+```sh
+uv pip compile docs/architecture/evidence/native-protocols/dependencies.in --python-version 3.13 -o /tmp/native-protocols-resolved.txt
+uv venv --python 3.13 /tmp/native-protocols-spike
+uv pip install --python /tmp/native-protocols-spike/bin/python -r /tmp/native-protocols-resolved.txt
+/tmp/native-protocols-spike/bin/python -c "import mcp, pydantic_ai, phoenix, a2a, fastapi"
+```
+
+The resolver selected 211 packages, and an isolated
 environment installed it. Imports of `mcp`, `pydantic_ai`, `phoenix`, `a2a` and
 `fastapi` succeeded. Pydantic remained 2.13.4. Production manifests and locks
-have not been changed by this spike. This is not yet a resolve of the complete
-host manifest, a Core/Phoenix startup test, or a test of provider behavior after
+were not changed by this spike. A separate local experiment also resolved 244
+packages for all surveyed host entries, substituting metadata-only candidate
+core/MCP packages and using the three editable source manifests. That is an
+exploratory metadata-closure result, not an install or release of those packages;
+only the committed 211-package input above is directly replayable here. The
+whole-manifest gate must be repeated with the actual implementation worktrees
+and release artifacts. Neither experiment is a Core/Phoenix startup test or a
+test of provider behavior after
 the OpenAI major upgrade. Those are release gates, including Python/platform
 coverage supported by each affected package.
 
 ## Three live vendor discovery probes
 
-Sent an unauthenticated `server/discover` JSON-RPC POST to the documented
+Initially sent an unauthenticated `server/discover` JSON-RPC POST to the documented
 Streamable HTTP URL with `Accept: application/json, text/event-stream` and
 `MCP-Protocol-Version: 2026-07-28`. Each returned 401 with a
 `WWW-Authenticate` protected-resource metadata URL. Fetched that metadata and
 the authorization-server metadata without credentials or automatic redirects.
-These 401 responses do not establish the vendors' negotiated MCP revision.
+That manual probe omitted the required `Mcp-Method` header, so it establishes
+only the returned auth challenge, not protocol conformance. Repeat using the
+official SDK, capturing `Mcp-Method` and operation-specific `Mcp-Name`, before
+using any request as protocol acceptance evidence. These 401 responses do not
+establish the vendors' negotiated MCP revision.
 
 | Vendor | MCP endpoint | RFC 9728 resource metadata | CIMD advertised | PKCE |
 | --- | --- | --- | --- | --- |
@@ -119,7 +149,8 @@ with a declared callback. Record the following as independent outcomes:
 1. Metadata/resource/issuer validation and client identity selection.
 2. Acceptance or explicit rejection of the CIMD client ID and loopback redirect.
 3. Consent, PKCE exchange and validation of state/issuer/resource.
-4. Negotiated wire revision and one authorized read-only tool result.
+4. Negotiated wire revision and one authorized read-only tool result; capture
+   required `Mcp-Method`/`Mcp-Name` headers and per-request version metadata.
 5. Token refresh, including rotation, after restarting the client.
 6. Any vendor allowlist, tenant policy or hosted-callback constraint.
 

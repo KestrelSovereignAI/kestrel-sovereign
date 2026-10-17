@@ -25,7 +25,7 @@ and open gates are recorded in [the spike report](NATIVE_PROTOCOL_SPIKES.md).
 ## Protocol lock and ownership
 
 Use the published [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
-and [A2A 1.0 specification](https://a2a-protocol.org/v1.0/specification/).
+and [A2A 1.0 specification](https://a2a-protocol.org/v1.0.0/specification/).
 Use official Python SDKs at every network boundary. The initial candidates are
 `mcp==2.3.0` and `a2a-sdk==1.2.2`; exact versions belong in dependency locks,
 and dependency ranges must admit the releases we actually test. Old dependency
@@ -43,6 +43,9 @@ handwritten models are in `kestrel_sdk/a2a/`. Removing only the core files
 would leave the private wire intact. Inventory both namespaces and their
 consumers before the coordinated SDK/core release. Keep the SDK lightweight:
 the official A2A dependency belongs to consumers of A2A, not every feature.
+The MCP feature owns the direct `mcp` requirement. Core owns the compatible
+lock and Phoenix dependencies; the dependency spike adds protocol packages as
+experimental resolver inputs, not as new production dependencies of core.
 
 No second protocol handler, compatibility route, or old-to-new network
 translation layer is introduced. Internal database rows remain storage models;
@@ -66,7 +69,21 @@ Use the SDK's modern protocol mode (`2026-07-28`) and extension APIs. Do not
 manually serialize `_meta`, call `initialize`, retain `Mcp-Session-Id`, or
 silently negotiate the draft protocol. Test captured HTTP requests to establish
 that this is the protocol actually sent. Gateway/container releases must pass
-the same modern-protocol test before their upgrade ships.
+the same modern-protocol test before their upgrade ships. Capture and assert the
+SDK's required `Mcp-Method` and tool/resource-specific `Mcp-Name` headers.
+Retire the removed `notifications/initialized`, `ping`, `logging/setLevel`,
+`notifications/roots/list_changed`, resource subscribe/unsubscribe, standalone
+HTTP GET stream and SSE resumption (`Last-Event-ID`/event IDs). New subscriptions
+use the core `subscriptions/listen` method. Roots, Sampling and Logging are
+also deprecated. Track removals separately from deprecations; forwarding an old
+request through a new HTTP endpoint does not upgrade it.
+
+Do not automatically replay a failed `tools/call` after stream loss. The
+protocol requires a fresh request ID for a re-issued request, but gives no
+blanket exactly-once guarantee. Mark the governed dispatch outcome unknown if
+execution may have started. A retry requires policy approval and an explicit
+server-supported idempotency mechanism or a tool known to be safe to repeat;
+link any retry dispatch to the original rather than inventing a success.
 
 | Host duty | Implementation and evidence |
 | --- | --- |
@@ -74,11 +91,27 @@ the same modern-protocol test before their upgrade ships.
 | Client identity | Operator-configured stable HTTPS CIMD URL; public client, `token_endpoint_auth_method=none`; no embedded client secret |
 | Authorization | PKCE S256 and one-use state bound to agent DID, connection, issuer, redirect URI, resource, scopes and expiry |
 | Resource binding | RFC 8707 resource parameter on authorization and token requests; never forward a token to another resource/origin |
-| Callback validation | SDK RFC 9207 issuer checks; missing advertised issuer, mismatched state/issuer, duplicate and expired callbacks fail before token exchange |
+| Callback validation | SDK RFC 9207 issuer checks with exact comparison (table below); state, expiry and one-use callback checks before exchange |
 | Refresh | Agent-scoped encrypted token bundle; serialize refresh/rotation for the same connection across requests; commit rotated credentials atomically |
 | Discovery | Official Registry alongside Docker/local catalogs; explicit source and namespaced identity, opaque pagination, no arbitrary executable installation from search results |
 | Apps | Preserve tool metadata, structured content and `ui://` resource association through a typed part; isolated renderer and governed app calls |
-| Tasks/input | Versioned extensions via SDK; durable wait provider and pending input record, no conversation lock held across human response |
+| Tasks | Versioned extension via SDK and a durable wait provider |
+| Operator input | Core MRTR (`InputRequiredResult`), governed input surface, no lock held across an interactive response |
+
+### Authorization response issuer checks
+
+Apply these RFC 9207 cases before sending a code to the token endpoint:
+
+| `authorization_response_iss_parameter_supported` | Response `iss` | Action |
+| --- | --- | --- |
+| true | present | Compare exactly with the validated recorded issuer |
+| true | absent | Reject |
+| false or absent | present | Compare exactly with the validated recorded issuer |
+| false or absent | absent | Continue with the other callback checks |
+
+Compare the form-decoded string without case folding, default-port elision,
+trailing-slash changes or additional percent-decoding/normalization. The same
+checks apply to error callbacks before trusting or displaying error details.
 
 ### Credential storage and connect UI
 
@@ -121,6 +154,11 @@ identity. Local explicit configuration wins only through a documented override,
 not an accidental name collision. Pagination failures and malformed entries
 produce actionable errors; they must not become an empty successful catalog.
 
+Initially disable the SDK response cache. When enabling it, honor each result's
+`ttlMs` and `cacheScope`; private resources/listings stay scoped to the exact
+agent, connection and authorization identity. Never share private `ui://`
+responses across agents. Disconnect and identity changes invalidate the cache.
+
 An MCP App resource is loaded from the same authorized connection as its tool.
 The host validates MIME type and resource association, then renders it in an
 iframe with sandbox/CSP restrictions and the official Apps bridge. Never inject
@@ -139,11 +177,22 @@ wait-provider contract. Advertise only supported extension versions. Poll,
 cancel and result retrieval use the same authorized connection and policy
 checks as the original call. Cancellation does not invent a completed result.
 
-Input-required responses create a pending approval/input item and release the
-turn lock before waiting. Resume a new owned continuation after an authenticated
-operator response. Reject stale responses and input for a different agent or
-task. This must be exercised against the real turn scheduler, reproducing
-[#3439](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3439)'s lock-contention scenario.
+MCP's Multi Round-Trip Requests (MRTR) are core protocol, independent of the
+Tasks extension. A normal tool/resource/prompt request can return
+`InputRequiredResult` with `resultType: "input_required"`, `inputRequests` and
+opaque `requestState`. Persist a pending continuation only when the turn has
+an interactive operator. Release the turn lock before receiving the response;
+a new owned continuation reissues the **original operation** with the SDK's
+`inputResponses` and unchanged opaque `requestState`. Preserve request binding,
+expiry and the SDK's round limit. Results without `resultType` are treated as
+`complete` by the SDK as required; do not reinterpret them as pending input.
+
+Signal-driven turns and `NON_INTERACTIVE_SESSION_IDS` keep the shipped #3439
+behavior: `allow_blocking=False` and an auditable `no_approver` denial. They do
+not create an indefinite human wait or acquire interactive authority through a
+continuation. For interactive input, reject stale/wrong-agent/wrong-operation
+responses; never persist secrets as conversation content. Exercise both paths
+against the real turn scheduler, including #3439's lock-contention scenario.
 
 ## A2A 1.0 cutover
 
@@ -152,11 +201,29 @@ Python's `context_id`/`supported_interfaces` serialize as `contextId`/
 `supportedInterfaces`; `Part` uses the content member, not the 0.2 `kind`
 discriminator. Test the serialized HTTP, not just Python attributes.
 
-Use per-agent routing under `/api/agents/{agent_id}`. Publish the card at
-`/api/agents/{agent_id}/.well-known/agent-card.json`. Its supported interfaces
-advertise the agent's absolute JSON-RPC and HTTP+JSON base URLs. Let the SDK
-define method names, resource paths, error mappings and event serialization.
-The authenticated console projection is a separate view of this same card.
+A host explicitly selects its public discovery agent and serves that agent's
+signed card at the standard authority-root `/.well-known/agent-card.json`.
+Other per-agent public cards are reached by **direct configuration**, at
+`/api/agent-routes/{encoded_routing_name}/agent-card.json`; these nested URLs are
+not called well-known discovery. Encode the manager's registration key using
+`multi_agent/route_name.py::encode_agent_route_name`. `agent.agent_id` is a DID,
+and a mutable display name is also unsuitable for routing.
+
+Both bindings use the manager's stable routing key to select the agent. The
+AgentInterface entries carry the exact `tenant` value to be sent on every SDK
+request. Validate that tenant against the route-selected recipient for send,
+get/list/cancel/subscribe and push configuration before authorization or side
+effects; do not silently route based on a caller-supplied tenant. A mismatch
+fails with the binding's standard error. The sender copies the selected
+interface tenant exactly, including its field-presence semantics.
+
+The public card endpoints need narrowly matched, prefix-aware exemptions in
+host authentication middleware, which runs before agent prefix stripping.
+Exempt only the configured public cards; publish only explicitly public fields.
+Authenticated details use the standard `extendedAgentCard` capability and
+`GetExtendedAgentCard`, enforced through the same recipient identity/policy
+path. A console list projection is not a replacement for either SDK method.
+Let the SDK define method names, binding resource paths, errors and events.
 
 `SDK request handler → verified principal + recipient policy → TaskManager → stores/worker`.
 
@@ -192,7 +259,12 @@ holds extension payloads. Unknown required extensions fail before task creation.
 The extension contains sender DID, recipient DID, operation, timestamp, nonce
 and the sender proof. Bind the complete official request payload (including
 non-text parts, configuration and all behavior-affecting extension metadata)
-using RFC 8785 canonicalization, excluding only the proof field itself.
+using RFC 8785 canonicalization, excluding only the proof field itself. Both
+signer and verifier first serialize with the official protobuf JSON presence
+rules: omit unset optional fields and implicit defaults, retain required fields
+and explicitly set optional defaults. Include the interface `tenant` with the
+same presence as the official request; test equivalent forms and deliberate
+presence changes. Do not hash an arbitrary Pydantic `model_dump()` projection.
 Do not reuse the draft envelope's projection of selected text fields. Preserve
 hybrid sender verification through the existing identity and verification-policy
 services. Define algorithm identifiers and canonical-byte test vectors in the
@@ -201,7 +273,12 @@ Reserve replay nonces through the existing shared replay store, with documented
 retry/idempotency behavior. Reads/cancels also bind method, target and audience.
 
 The Agent Card has a separate standard JWS signature over the SDK card's JCS
-representation, excluding signatures as the spec requires. Use the agent's
+representation. Before JCS, apply A2A 1.0 section 5.7/8.4.1 presence rules:
+omit optional-and-unset fields and implicit defaults, retain required fields
+and explicitly set optional defaults, and exclude `signatures`. This includes
+the special presence requirements for each interface's `tenant`. Use the SDK's
+signing/serialization helpers and published vectors; plain `model_dump()` plus
+JCS is insufficient. Use the agent's
 Ed25519 verification method and a DID-bound `kid`; the existing hybrid message
 proof is not substituted for an interoperable Agent Card signature. Verify the
 card against a trusted DID resolution result before trusting advertised URLs
@@ -261,8 +338,11 @@ changes). Signing a card does not authorize arbitrary callback egress.
 1. Review this design in its worktree; complete dependency/import and three
    real-vendor OAuth spikes. Record capability advertisement separately from
    successful authorization, refresh and tool calls.
-2. Upgrade the dependency set and MCP transports together, including gateway
-   and container tests. Resolve the full host feature manifest before release.
+2. Complete the MCP feature transport change and publish its 0.5 release
+   admitting `mcp>=2.3,<3` before releasing the host dependency update. Published
+   feature 0.4.1's `mcp<2` cannot resolve with Phoenix 20's FastMCP dependency.
+   Stage and test both changes together from worktrees, then release feature
+   before host. Resolve the full host feature manifest before host release.
 3. Add remote connections/OAuth/registry, then Apps and Tasks. Remote write
    scopes remain gated on [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
 4. Release the coordinated SDK/core A2A cutover with storage migration and
@@ -279,4 +359,7 @@ Do not label a skipped 2026 scenario or a mocked interop peer a conformance pass
 Acceptance includes governed dispatch database evidence, Apps bridge denial
 tests, OAuth restart/rotation, cross-agent token isolation, signature tampering,
 replay, recipient denial, question forgery, cancellation races and lock-free
-operator input. Final acceptance also searches for every retired wire surface.
+operator input, exact issuer comparison (including present unadvertised `iss`),
+MRTR operation rebinding, unknown outcomes after stream loss, private cache
+isolation, tenant mismatch, public discovery without an operator key and
+protobuf-presence signature vectors. Final acceptance also searches for every retired wire surface.
