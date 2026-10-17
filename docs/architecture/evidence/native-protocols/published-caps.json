@@ -144,7 +144,18 @@
     "manifest_keys": [
       "name",
       "editable"
-    ]
+    ],
+    "source": "editable pyproject.toml",
+    "version": "0.4.3",
+    "requires_python": ">=3.11,<3.15",
+    "requires_dist": [
+      "click>=8.1",
+      "kestrel-sovereign-sdk>=0.37.1,<0.40",
+      "kestrel-sovereign>=0.53.9",
+      "rich>=13.0"
+    ],
+    "source_revision": "28f0e1c8bf20f27d0feeed314f6cf2f9fad955ad",
+    "source_manifest_sha256": "08ebb4ba75ee1049dbacea81502574ef9d08bbfde504e236c2ca3c0f760a3562"
   },
   {
     "requested": "kestrel-feature-eye",
@@ -153,7 +164,17 @@
     "manifest_keys": [
       "name",
       "editable"
-    ]
+    ],
+    "source": "editable pyproject.toml",
+    "version": "0.4.4",
+    "requires_python": ">=3.11,<3.15",
+    "requires_dist": [
+      "fastapi>=0.115,<1",
+      "kestrel-feature-workflows>=0.5.0,<0.8",
+      "kestrel-sovereign-sdk>=0.37.1,<0.40"
+    ],
+    "source_revision": "6c7ceee94466dcd5f1f37f7268626e28167ed243",
+    "source_manifest_sha256": "90a0262cd549e0254ffcac6451e294f4d3c11d2c751062a4464cca2125628ee6"
   },
   {
     "requested": "kestrel-feature-flight",
@@ -162,7 +183,17 @@
     "manifest_keys": [
       "name",
       "editable"
-    ]
+    ],
+    "source": "editable pyproject.toml",
+    "version": "0.4.3",
+    "requires_python": ">=3.11,<3.15",
+    "requires_dist": [
+      "fastapi>=0.115,<1",
+      "kestrel-feature-workflows>=0.7.0,<0.8",
+      "kestrel-sovereign-sdk>=0.37.1,<0.40"
+    ],
+    "source_revision": "ef41ecdc82599e93e65f12743944fd8e2d4393ba",
+    "source_manifest_sha256": "0b829086666836f807c216ed5c9e86275976945be26aa69b638b4001cee2e8de"
   },
   {
     "requested": "kestrel-feature-features",

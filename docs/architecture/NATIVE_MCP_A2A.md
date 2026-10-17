@@ -65,18 +65,26 @@ Docker daemon. An unavailable or unsupported transport fails explicitly.
 Retire the legacy HTTP+SSE client, `/sse` defaults, and container fixtures that
 only speak it. SSE response bodies within Streamable HTTP are still standard.
 
-Use the SDK's modern protocol mode (`2026-07-28`) and extension APIs. Do not
-manually serialize `_meta`, call `initialize`, retain `Mcp-Session-Id`, or
-silently negotiate the draft protocol. Test captured HTTP requests to establish
-that this is the protocol actually sent. Gateway/container releases must pass
-the same modern-protocol test before their upgrade ships. Capture and assert the
-SDK's required `Mcp-Method` and tool/resource/prompt-specific `Mcp-Name` headers.
-Retire the removed `notifications/initialized`, `ping`, `logging/setLevel`,
+Use the official SDK's standard `Client(mode="auto")` negotiation at connect,
+including `server/discover`. Publish the selected revision in connection/tool
+status before making the connection available. The SDK chooses a shared
+published revision; a peer sharing none fails connection setup with its supported
+versions preserved in the error. Do not implement a Kestrel negotiation fallback
+or wire adapter. Existing connectors on a published handshake revision remain
+usable through the official SDK; this does not preserve the private A2A format.
+Gate extension support on the negotiated revision and capabilities.
+
+For `2026-07-28` peers, use the modern extension APIs and per-request metadata.
+Do not manually serialize `_meta` or retain session IDs in Kestrel. Capture HTTP
+to verify no `initialize` or `Mcp-Session-Id` on modern connections, and assert
+`Mcp-Method` plus tool/resource/prompt-specific `Mcp-Name`. On that revision,
+retire `notifications/initialized`, `ping`, `logging/setLevel`,
 `notifications/roots/list_changed`, resource subscribe/unsubscribe, standalone
-HTTP GET stream and SSE resumption (`Last-Event-ID`/event IDs). New subscriptions
-use the core `subscriptions/listen` method. Roots, Sampling and Logging are
-also deprecated. Track removals separately from deprecations; forwarding an old
-request through a new HTTP endpoint does not upgrade it.
+HTTP GET streams and SSE resumption (`Last-Event-ID`/event IDs). New subscriptions
+use core `subscriptions/listen`. Roots, Sampling and Logging are deprecated.
+The SDK owns any handshake/session behavior needed for a negotiated earlier
+standard. Test modern-peer conformance and gateway interoperability separately;
+a successful older-revision call is not a modern conformance result.
 
 Do not automatically replay a failed `tools/call` after stream loss. The
 protocol requires a fresh request ID for a re-issued request, but gives no
@@ -181,7 +189,17 @@ responses across agents. Disconnect and identity changes invalidate the cache.
 
 An MCP App resource is loaded from the same authorized connection as its tool.
 The host validates MIME type and resource association, then renders it in an
-iframe with sandbox/CSP restrictions and the official Apps bridge. Never inject
+iframe with sandbox/CSP restrictions and the official Apps bridge. Treat the
+resource's `_meta.ui.csp` and `_meta.ui.permissions` as requests, not grants.
+Intersect requested network/resource/frame/base origins with host-owned,
+connection-scoped allowlists, and reject unsupported requests clearly. Device
+permissions (camera, microphone, geolocation, clipboard) require explicit host
+policy and user authorization; a vendor declaration cannot widen them. Default
+egress/device policy denies access. Apply CSP and Permissions Policy before
+loading content, including nested frames and navigation. See the official
+[Apps CSP contract](https://apps.extensions.modelcontextprotocol.io/api/documents/csp-and-cors.html)
+and [resource metadata schema](https://apps.extensions.modelcontextprotocol.io/api/variables/app.McpUiResourceMetaSchema.html).
+Never inject
 vendor HTML into the console DOM. No host credentials enter the iframe. Bind
 each bridge message to the iframe source, session nonce, agent, connection and
 origin; allow only the Apps methods the host implements. A requested tool must
@@ -196,6 +214,20 @@ wait registration survives restart and maps terminal status into the existing
 wait-provider contract. Advertise only supported extension versions. Poll,
 cancel and result retrieval use the same authorized connection and policy
 checks as the original call. Cancellation does not invent a completed result.
+Declaring `io.modelcontextprotocol/tasks` allows a server to return
+`CreateTaskResult` instead of a final result on any supported `tools/call`,
+`resources/read` or `prompts/get`; there is no per-call task opt-in. Do not
+advertise it until the durable wait provider and every eligible result path
+handle both shapes. Register the task before releasing the originating dispatch.
+
+When `tasks/get` reports `input_required`, classify its `inputRequests` using
+the same machine/operator rules and policy below. Respond through
+`tasks/update(taskId, inputResponses)`, then resume observing status. This path
+does not reissue the original operation or use MRTR `requestState`. Deduplicate
+input keys for the task lifetime; bind responses to agent, connection, task and
+outstanding key. Operator waits release the turn lock, survive restart and
+respect unattended-turn denial. Test both input paths against the published
+[Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks).
 
 MCP's Multi Round-Trip Requests (MRTR) are core protocol, independent of the
 Tasks extension. A normal tool/resource/prompt request can return
@@ -352,9 +384,14 @@ before submission and record the returned task identity without losing failure
 evidence. Local routing enters the same official-type submission contract.
 
 Ship inbound and outbound together. Delete `POST /api/agent/tasks/send`, old
-task read/cancel/subscribe routes and their transport-key path patterns, all
-draft wire models and all callers. Do not repurpose the operator API key as
-peer authority. Drain or explicitly stop old in-flight work during the host
+task read/cancel/subscribe routes, all draft wire models and all callers.
+Replace the retired entries in `kestrel_sovereign/a2a/transport_auth.py` with
+narrow method/path allowlists for the SDK's JSON-RPC and HTTP+JSON binding
+endpoints, before host authentication runs. Cover bare routes plus both
+`/api/agents/{routing_name}` and `/api/agent-routes/{encoded_routing_name}`
+forms; test every binding and alias using the peer transport credential.
+Adjacent operator endpoints must remain denied. Do not repurpose the operator
+API key as peer authority. Drain or explicitly stop old in-flight work during the host
 upgrade; mixed draft/new workers are unsupported. Rollback requires the saved
 pre-migration database and a coherent old host/SDK set, not a parallel handler.
 
@@ -372,9 +409,11 @@ changes). Signing a card does not authorize arbitrary callback egress.
    feature 0.4.1's `mcp<2` cannot resolve with Phoenix 20's FastMCP dependency.
    Stage and test both changes together from worktrees, then release feature
    before host. Resolve the full host feature manifest before host release.
-   Docker gateway native support is currently blocked by [#3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683);
-   the latest published gateway rejects the target protocol. Its retirement or
-   upstream upgrade requires a scope decision, never a protocol downgrade.
+   Docker gateway 0.44.1 works via the official SDK's standard negotiation at
+   `2025-11-25`. Its newer-protocol capability gap remains tracked in
+   [#3683](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3683).
+   Verify each negotiated revision and gate extensions; no retirement decision
+   is required for ordinary tool access.
 3. Add remote connections/OAuth/registry, then Apps and Tasks. Remote write
    scopes remain gated on [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
 4. Before the breaking A2A core/SDK release, publish/test consumers admitting
@@ -393,9 +432,11 @@ findings fixed and meaningful regression tests. Pin the conformance runner
 versions/commits and record which protocol scenarios they actually support.
 Do not label a skipped 2026 scenario or a mocked interop peer a conformance pass.
 Acceptance includes governed dispatch database evidence, Apps bridge denial
-tests, OAuth restart/rotation, cross-agent token isolation, signature tampering,
+tests (including vendor CSP/permission escalation), task result handling on all
+eligible operations, `tasks/get` → `tasks/update` input/restart, OAuth restart/rotation, cross-agent token isolation, signature tampering,
 replay, recipient denial, question forgery, cancellation races and lock-free
 operator input, exact issuer comparison (including present unadvertised `iss`),
 MRTR operation rebinding, unknown outcomes after stream loss, private cache
-isolation, tenant mismatch, public discovery without an operator key and
+isolation, tenant mismatch, peer transport admission for both bindings/aliases,
+public discovery without an operator key, no-common-revision failure and
 protobuf-presence signature vectors. Final acceptance also searches for every retired wire surface.

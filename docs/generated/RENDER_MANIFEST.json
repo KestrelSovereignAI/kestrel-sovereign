@@ -438,6 +438,7 @@
     {
       "existing_code_refs": [
         "kestrel_sovereign/a2a/agent_card.py",
+        "kestrel_sovereign/a2a/transport_auth.py",
         "kestrel_sovereign/a2a/types.py",
         "kestrel_sovereign/features/keys/feature.py",
         "kestrel_sovereign/multi_agent/route_name.py",
