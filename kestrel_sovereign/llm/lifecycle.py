@@ -5,7 +5,7 @@ from typing import Any
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import (
-    ExecutionCustody, bind_execution_cleanup, execution_terminal_error,
+    ExecutionCustody, _explicit_control_chain, bind_execution_cleanup, execution_terminal_error,
     is_execution_control_error,
 )
 
@@ -38,6 +38,7 @@ def start_llm_close_task(owner, key, operation, *, resource=None):
         if resource is not None or is_execution_control_error(error):
             owner._llm_close_control = execution_terminal_error(
                 vars(owner).get("_llm_close_control"), error, retain_originals=True,
+                isolate_control_originals=True,
             )
         raise
     tasks[key] = task
@@ -70,6 +71,7 @@ def harvest_llm_close_task(owner, key, task):
     if error is not None and is_execution_control_error(error):
         owner._llm_close_control = execution_terminal_error(
             vars(owner).get("_llm_close_control"), error, retain_originals=True,
+            isolate_control_originals=True,
         )
     if error is None:
         tasks[key] = None
@@ -105,16 +107,25 @@ class UnpublishedLLMOwner:
                         retain_originals=True, retirement_resource=self.provider,
                     )
                 except BaseException as error:
-                    self.admission_failure = error
-                    self.control = execution_terminal_error(self.control, error, retain_originals=True)
-                    raise
+                    self.control = execution_terminal_error(
+                        self.control, error, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
+                    self.admission_failure = self.control
+                    raise self.admission_failure
         task, joins_native = self.task, self.task_joins_native
         outcome = await await_owned_task(task)
-        if self.task is task and outcome.error is None:
+        if self.task is task and outcome.error is None and self.control is None:
             self.task = None
-        terminal = execution_terminal_error(outcome.error, outcome.cancellation)
-        if terminal is not None and is_execution_control_error(terminal):
-            self.control = execution_terminal_error(self.control, terminal)
+        terminal = execution_terminal_error(
+            outcome.error, outcome.cancellation, retain_originals=True,
+            isolate_control_originals=True,
+        )
+        if self.control is not None or terminal is not None and is_execution_control_error(terminal):
+            self.control = execution_terminal_error(
+                self.control, terminal, retain_originals=True,
+                isolate_control_originals=True,
+            )
         if join_native and not joins_native:
             # A drain may encounter an in-flight bounded startup attempt. Its
             # completion is not the terminal host join; upgrade the SAME owner
@@ -123,7 +134,13 @@ class UnpublishedLLMOwner:
             # join needs a new wrapper task around the SAME retained resource
             # owners, not recursive rejoining of this completed attempt.
             self.task = None
-            await self.retire(join_native=True)
+            try:
+                await self.retire(join_native=True)
+            except BaseException as error:
+                raise execution_terminal_error(
+                    terminal, error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
             if outcome.cancellation is not None:
                 raise outcome.cancellation
             return
@@ -146,19 +163,29 @@ class UnpublishedLLMOwner:
             try:
                 await waiter(self.provider)
             except BaseException as error:
-                failure = execution_terminal_error(failure, error)
+                failure = execution_terminal_error(
+                    failure, error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
             if retained:
                 # The first failure may only have reported bounded cleanup
                 # debt. Query the SAME idempotent owner after physical join;
                 # never discard an original authority/commit receipt.
                 original_control = (
                     failure if failure is not None and is_execution_control_error(failure)
-                    else None
+                    else execution_terminal_error(
+                        *(error for error in _explicit_control_chain(failure)
+                          if isinstance(error, asyncio.CancelledError)),
+                        retain_originals=True, prefer_cancellation=True,
+                    )
                 )
                 try:
                     await self.provider.close()
                 except BaseException as error:
-                    failure = execution_terminal_error(original_control, error)
+                    failure = execution_terminal_error(
+                        original_control, error, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                 else:
                     failure = original_control
         if failure is not None:
@@ -199,6 +226,8 @@ async def drain_unpublished_llm_owners(owners: dict[str, UnpublishedLLMOwner]) -
         except BaseException as error:
             failures.append(error)
     if failures:
-        terminal = execution_terminal_error(*failures)
+        terminal = execution_terminal_error(
+            *failures, retain_originals=True, isolate_control_originals=True,
+        )
         assert terminal is not None
         raise terminal

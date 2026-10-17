@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.hold import HoldTurnRefusal
-from kestrel_sovereign._async_ownership import owned_task_error
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error, is_execution_control_error, retained_execution_error,
 )
@@ -577,24 +577,27 @@ class SpawnFeature(Feature):
         # the enabled feature can concurrently own the same runtime.
         existing_shutdown = getattr(self, "_standalone_shutdown_task", None)
         if existing_shutdown is not None:
-            from kestrel_sovereign.kestrel_agent import (
-                await_lifecycle_task_completion,
-            )
-
-            cancelled, failure = await await_lifecycle_task_completion(
-                existing_shutdown
-            )
-            if self._standalone_shutdown_task is existing_shutdown:
-                self._standalone_shutdown_task = None
+            outcome = await await_owned_task(existing_shutdown)
             recorded_failure = getattr(
                 self, "_standalone_shutdown_failure", None
             )
-            self._standalone_shutdown_failure = None
-            failure = recorded_failure if recorded_failure is not None else failure
+            failure = execution_terminal_error(
+                recorded_failure, outcome.error, outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            # Native producer uncertainty is not consumed by observing it.
+            if not is_execution_control_error(failure):
+                self._standalone_shutdown_task = None
+                self._standalone_shutdown_failure = None
             if failure is not None:
                 raise failure
-            if cancelled:
-                raise asyncio.CancelledError()
+
+        shutdown_failure = vars(self).get("_standalone_shutdown_failure")
+        if is_execution_control_error(shutdown_failure):
+            raise retained_execution_error(shutdown_failure)
+        restore_control = vars(self).get("_standalone_restore_control")
+        if restore_control is not None:
+            raise retained_execution_error(restore_control)
 
         control = vars(self).get("_delegated_control")
         if control is not None:
@@ -614,6 +617,7 @@ class SpawnFeature(Feature):
             else None
         )
         self._standalone_restore_pending = retained_manager is not None
+        self._standalone_restore_control: BaseException | None = None
         self._standalone_restore_task: asyncio.Task | None = None
         self._standalone_shutdown_task: asyncio.Task | None = None
         self._standalone_shutdown_failure: BaseException | None = None
@@ -744,6 +748,9 @@ class SpawnFeature(Feature):
     async def _get_ready_agent_manager(self):
         """Resolve the manager and restore a standalone host exactly once."""
 
+        control = vars(self).get("_standalone_restore_control")
+        if control is not None:
+            raise retained_execution_error(control)
         manager = self._get_agent_manager()
         if not getattr(self, "_standalone_restore_pending", False):
             return manager
@@ -754,22 +761,20 @@ class SpawnFeature(Feature):
             return manager
         task = getattr(self, "_standalone_restore_task", None)
         if task is None:
-            task = asyncio.create_task(
-                manager.restore_spawn_authority_tree(self.agent),
-                name="standalone_spawn_authority_restore",
-            )
+            try:
+                task = create_owned_task(
+                    manager.restore_spawn_authority_tree(self.agent),
+                    name="standalone_spawn_authority_restore",
+                    retain_originals=True,
+                )
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    self._standalone_restore_control = error
+                raise
             self._standalone_restore_task = task
-        from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
-
-        caller_cancelled = False
-        try:
-            caller_cancelled, failure = await await_lifecycle_task_completion(task)
-            if failure is not None:
-                raise failure
-        except BaseException:
-            # Keep the pending bit so a later ready hook or tool call can retry.
-            raise
-        else:
+        outcome = await await_owned_task(task)
+        failure = outcome.error
+        if failure is None:
             # ``load_from_config`` deliberately reports per-agent startup
             # failures out of band so a multi-agent host can keep healthy
             # peers online.  A standalone parent has no lifespan handler to
@@ -777,6 +782,10 @@ class SpawnFeature(Feature):
             # would permanently suppress retries for a transiently unavailable
             # child.  Only a failure-free pass consumes the pending restore.
             failures = manager.init_failures
+            failure = execution_terminal_error(
+                *(error for _, error in failures if is_execution_control_error(error)),
+                retain_originals=True, isolate_control_originals=True,
+            )
             if failures:
                 logger.warning(
                     "Standalone spawn-authority restore retained for retry: %s",
@@ -787,11 +796,18 @@ class SpawnFeature(Feature):
                 )
             else:
                 self._standalone_restore_pending = False
-        finally:
-            if task.done() and self._standalone_restore_task is task:
-                self._standalone_restore_task = None
-        if caller_cancelled:
-            raise asyncio.CancelledError()
+        if is_execution_control_error(failure):
+            # Producer uncertainty survives every later readiness observer and
+            # re-enable. A caller's withdrawal is local, never latch history.
+            self._standalone_restore_control = failure
+        if task.done() and self._standalone_restore_task is task:
+            self._standalone_restore_task = None
+        terminal = execution_terminal_error(
+            failure, outcome.cancellation, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
         return manager
 
     async def on_agent_ready(self, agent=None) -> None:
@@ -1636,16 +1652,16 @@ class SpawnFeature(Feature):
         self,
         manager,
         child_tasks: list[asyncio.Task],
+        prior_outcomes: tuple[BaseException, ...] = (),
     ) -> None:
         """Quiesce delegated turns before closing their standalone runtimes."""
 
-        from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
-
-        outcomes: list[BaseException] = []
-        caller_cancelled = False
+        outcomes: list[BaseException] = list(prior_outcomes)
         for task in child_tasks:
-            cancelled, failure = await await_lifecycle_task_completion(task)
-            caller_cancelled = caller_cancelled or cancelled
+            outcome = await await_owned_task(task)
+            failure = outcome.error
+            if outcome.cancellation is not None:
+                outcomes.append(outcome.cancellation)
             if failure is not None and (
                 not isinstance(failure, asyncio.CancelledError)
                 or is_execution_control_error(failure)
@@ -1654,12 +1670,19 @@ class SpawnFeature(Feature):
 
         failure = None
         if manager is not None:
-            descendant_shutdown = asyncio.create_task(
-                manager.shutdown_spawn_authority_tree(self.agent),
-                name="standalone_spawn_descendant_shutdown",
-            )
-            cancelled, failure = await await_lifecycle_task_completion(descendant_shutdown)
-            caller_cancelled = caller_cancelled or cancelled
+            try:
+                descendant_shutdown = create_owned_task(
+                    manager.shutdown_spawn_authority_tree(self.agent),
+                    name="standalone_spawn_descendant_shutdown",
+                    retain_originals=True, retirement_resource=manager,
+                )
+            except BaseException as error:
+                failure = error
+            else:
+                outcome = await await_owned_task(descendant_shutdown)
+                failure = outcome.error
+                if outcome.cancellation is not None:
+                    outcomes.append(outcome.cancellation)
             if failure is not None:
                 outcomes.append(failure)
 
@@ -1677,44 +1700,37 @@ class SpawnFeature(Feature):
                 self._lifecycle = None
                 self._standalone_manager_owned = False
 
-        if caller_cancelled:
-            outcomes.append(asyncio.CancelledError())
-        control = execution_terminal_error(vars(self).get("_delegated_control"), *outcomes)
-        if control is not None and is_execution_control_error(control):
-            raise retained_execution_error(control)
-        if len(outcomes) == 1:
-            raise outcomes[0]
-        if outcomes:
-            raise BaseExceptionGroup(
-                "Spawn feature shutdown had terminal failures",
-                outcomes,
-            )
+        terminal = execution_terminal_error(
+            vars(self).get("_delegated_control"), *outcomes,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
 
     async def shutdown(self):
         """Join private restore and retain descendant owners before root shutdown."""
-        from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
         from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 
-        outcomes: list[BaseException] = []
-        caller_cancelled = False
+        recorded = vars(self).get("_standalone_shutdown_failure")
+        outcomes: list[BaseException] = [recorded] if recorded is not None else []
+        withdrawals: list[BaseException] = []
         existing_shutdown = getattr(self, "_standalone_shutdown_task", None)
         if existing_shutdown is not None:
             if not existing_shutdown.done():
                 # The retained owner from an earlier bounded shutdown remains
                 # responsible for both delegated turns and descendant cleanup.
                 return
-            self._standalone_shutdown_task = None
-            cancelled, failure = await await_lifecycle_task_completion(
-                existing_shutdown
-            )
-            caller_cancelled = caller_cancelled or cancelled
+            outcome = await await_owned_task(existing_shutdown)
             recorded_failure = self._standalone_shutdown_failure
-            self._standalone_shutdown_failure = None
-            failure = recorded_failure if recorded_failure is not None else failure
+            failure = execution_terminal_error(
+                recorded_failure, outcome.error, outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if not is_execution_control_error(failure):
+                self._standalone_shutdown_task = None
+                self._standalone_shutdown_failure = None
             if failure is not None:
                 raise failure
-            if caller_cancelled:
-                raise asyncio.CancelledError()
             return
         delegated_owners = getattr(self, "_delegated_task_owners", set())
         child_tasks = list(
@@ -1730,8 +1746,10 @@ class SpawnFeature(Feature):
         if restore_task is not None:
             if not restore_task.done():
                 restore_task.cancel()
-            cancelled, failure = await await_lifecycle_task_completion(restore_task)
-            caller_cancelled = caller_cancelled or cancelled
+            outcome = await await_owned_task(restore_task)
+            failure = outcome.error
+            if outcome.cancellation is not None:
+                withdrawals.append(outcome.cancellation)
             if failure is not None and (
                 not isinstance(failure, asyncio.CancelledError)
                 or is_execution_control_error(failure)
@@ -1739,19 +1757,34 @@ class SpawnFeature(Feature):
                 outcomes.append(failure)
             if self._standalone_restore_task is restore_task:
                 self._standalone_restore_task = None
+        restore_control = vars(self).get("_standalone_restore_control")
+        if restore_control is not None:
+            outcomes.append(restore_control)
 
         manager = self._agent_manager
         if not (getattr(self, "_standalone_manager_owned", False)
                 and isinstance(manager, AgentManager)):
             manager = None
         if manager is not None or child_tasks:
-            standalone_shutdown = asyncio.create_task(
-                self._shutdown_after_delegated_tasks(
-                    manager,
-                    child_tasks,
-                ),
-                name="standalone_spawn_shutdown_owner",
-            )
+            try:
+                standalone_shutdown = create_owned_task(
+                    self._shutdown_after_delegated_tasks(
+                        manager, child_tasks, tuple(outcomes),
+                    ),
+                    name="standalone_spawn_shutdown_owner",
+                    retain_originals=True,
+                )
+            except BaseException as error:
+                # No owner was admitted. Keep original child/manager custody
+                # and all restoration evidence for the next observer.
+                self._standalone_shutdown_failure = execution_terminal_error(
+                    *outcomes, error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+                raise execution_terminal_error(
+                    self._standalone_shutdown_failure, *withdrawals,
+                    retain_originals=True, isolate_control_originals=True,
+                )
             self._standalone_shutdown_task = standalone_shutdown
             if any(not task.done() for task in child_tasks):
                 # Cancellation-resistant cognition cannot be joined inside the
@@ -1776,24 +1809,31 @@ class SpawnFeature(Feature):
 
                 standalone_shutdown.add_done_callback(retain_shutdown_outcome)
                 self._standalone_restore_pending = False
+                terminal = execution_terminal_error(
+                    *outcomes, *withdrawals, retain_originals=True,
+                    isolate_control_originals=True,
+                ) if withdrawals else None
+                if terminal is not None:
+                    raise terminal
                 return
-            cancelled, failure = await await_lifecycle_task_completion(
-                standalone_shutdown
-            )
-            caller_cancelled = caller_cancelled or cancelled
-            if failure is not None:
-                outcomes.append(failure)
+            outcome = await await_owned_task(standalone_shutdown)
+            self._standalone_shutdown_failure = outcome.error
+            outcomes = [outcome.error] if outcome.error is not None else []
+            if outcome.cancellation is not None:
+                withdrawals.append(outcome.cancellation)
         self._standalone_restore_pending = False
 
-        if caller_cancelled:
-            outcomes.append(asyncio.CancelledError())
-        control = execution_terminal_error(vars(self).get("_delegated_control"), *outcomes)
-        if control is not None and is_execution_control_error(control):
-            raise retained_execution_error(control)
-        if len(outcomes) == 1:
-            raise outcomes[0]
-        if outcomes:
-            raise BaseExceptionGroup(
-                "Spawn feature shutdown had terminal failures",
-                outcomes,
-            )
+        producer = execution_terminal_error(
+            vars(self).get("_standalone_shutdown_failure"),
+            vars(self).get("_delegated_control"), *outcomes,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        self._standalone_shutdown_failure = (
+            producer if is_execution_control_error(producer) else None
+        )
+        terminal = execution_terminal_error(
+            producer, *withdrawals, retain_originals=True,
+            isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal

@@ -19,17 +19,22 @@ from kestrel_sdk.signals import (
 )
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     is_execution_control_error,
 )
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
     SourceRegistry,
 )
-from kestrel_sovereign.signals.constitution_canary import CanaryStatus
+from kestrel_sovereign.signals.constitution_canary import (
+    PHANTOM_RECEIPT_TOOL_NAME,
+    CanaryStatus,
+)
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 
 DOORS = (
@@ -41,6 +46,9 @@ DOORS = (
     "post-anchor",
     "inline-doctrine",
     "turn-doctrine",
+    "receipt-registration",
+    "process-input",
+    "verify",
 )
 
 
@@ -95,6 +103,14 @@ async def test_actual_constitution_consumers_keep_original_native_control(
     class GovernanceInput:
         did = "did:test:constitution-consumer"
 
+        def __init__(self):
+            self._direct_tools = {"existing-safe-tool": None}
+            self._tool_to_feature = {"existing-safe-tool": "existing"}
+            self._direct_tool_defs = [{"function": {"name": "existing-safe-tool"}}]
+            self._constitution_receipt_expected = None
+            self._constitution_receipt_tool_calls = []
+            self._tool_registry_generation = 0
+
         async def ensure_doctrine_bundle_anchored(self):
             await boundary("audit-anchor")
 
@@ -126,10 +142,13 @@ async def test_actual_constitution_consumers_keep_original_native_control(
             )
             return {"AGENTS.md": "Declared component doctrine"}
 
-        def register_constitution_receipt_tool(self, **kwargs):
+        async def register_constitution_receipt_tool(self, **kwargs):
+            KestrelAgent.register_constitution_receipt_tool(self, **kwargs)
             receipt.append(kwargs)
+            await boundary("receipt-registration")
 
         def clear_constitution_receipt_tool(self):
+            KestrelAgent.clear_constitution_receipt_tool(self)
             receipt.clear()
 
         def _set_current_chain(self, value):
@@ -139,6 +158,10 @@ async def test_actual_constitution_consumers_keep_original_native_control(
             chain.reset(token)
 
         async def verify_constitution_echo(self, **kwargs):
+            if door in {"receipt-registration", "process-input", "verify"}:
+                if door == "verify":
+                    await boundary("verify")
+                return ConstitutionMixin.verify_constitution_echo(self, **kwargs)
             return CanaryStatus.VERIFIED
 
         def _track_background_task(self, coro, *, name):
@@ -150,6 +173,15 @@ async def test_actual_constitution_consumers_keep_original_native_control(
             # Local component cognition body, NOT a fabricated provider reply.
             process_calls.append((prompt, kwargs))
             await backend.execute("INSERT INTO doctrine_turns VALUES (1)")
+            if door == "process-input":
+                assert PHANTOM_RECEIPT_TOOL_NAME in self._direct_tools
+                assert self._constitution_receipt_expected is not None
+                await boundary("process-input")
+            if self._constitution_receipt_expected is not None:
+                await KestrelAgent._handle_constitution_receipt_tool(
+                    self,
+                    canary=self._constitution_receipt_expected["canary"],
+                )
             return "local component body completed"
 
     agent = GovernanceInput()
@@ -168,7 +200,14 @@ async def test_actual_constitution_consumers_keep_original_native_control(
         log_redaction=RedactionPolicy(summarize=lambda p: "<redacted>"),
         constitution_injection="full",
         prompt_template_format="local" if door == "inline-doctrine" else "claude_code",
-        require_constitution_echo=door in {"inline-doctrine", "turn-doctrine"},
+        require_constitution_echo=door
+        in {
+            "inline-doctrine",
+            "turn-doctrine",
+            "receipt-registration",
+            "process-input",
+            "verify",
+        },
     )
     registry.register(registration)
     signal = Signal(
@@ -204,26 +243,38 @@ async def test_actual_constitution_consumers_keep_original_native_control(
                 and originals[0] in tuple(_explicit_control_chain(caught))
             ), f"native constitution control normalized: {door} {caught!r} {result!r}"
             assert is_execution_control_error(caught) == kind.startswith("native")
-            assert not process_calls, "native control admitted fresh cognition"
-            assert (
-                await observer.fetchval(
-                    f'SELECT count(*) FROM "{schema}".doctrine_turns'
-                )
-                == 0
+            assert len(process_calls) == (
+                1 if door in {"process-input", "verify"} else 0
             )
+            assert await observer.fetchval(
+                f'SELECT count(*) FROM "{schema}".doctrine_turns'
+            ) == (1 if door in {"process-input", "verify"} else 0)
         else:
             assert caught is None
             assert result.status is (
                 Status.DROPPED_VALIDATION
                 if kind == "ordinary" and door == "governing"
+                else Status.FAILED
+                if kind == "ordinary"
+                and door in {"receipt-registration", "process-input", "verify"}
                 else Status.OK
             )
             assert len(process_calls) == (
-                0 if kind == "ordinary" and door == "governing" else 1
+                0
+                if kind == "ordinary" and door in {"governing", "receipt-registration"}
+                else 1
             )
         assert not receipt, (
             "pre-turn native refusal leaked ephemeral receipt capability"
         )
+        assert PHANTOM_RECEIPT_TOOL_NAME not in agent._direct_tools
+        assert PHANTOM_RECEIPT_TOOL_NAME not in agent._tool_to_feature
+        assert all(
+            item.get("function", {}).get("name") != PHANTOM_RECEIPT_TOOL_NAME
+            for item in agent._direct_tool_defs
+        )
+        assert agent._constitution_receipt_expected is None
+        assert "existing-safe-tool" in agent._direct_tools
         assert chain_at_exit == [None], (
             "pre-turn native refusal leaked causation binding"
         )

@@ -31,7 +31,17 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("door", ["drain", "route-http", "model-http", "mandate", "close-completion"])
+@pytest.mark.parametrize(
+    "door",
+    [
+        "drain",
+        "route-http",
+        "model-http",
+        "mandate",
+        "close-completion",
+        "bounded-close",
+    ],
+)
 @pytest.mark.parametrize(
     "kind", ["native-control", "native-cancel", "ordinary", "healthy"]
 )
@@ -70,6 +80,33 @@ async def test_actual_preference_drain_keeps_withdrawal_without_polluting_latch(
     observer = None
     fired, sources, writers, withdrawals, entered = [], [], [], [], []
     original = OSError("actual preference release acknowledgement lost")
+    actual_terminal = service_module.execution_terminal_error
+    actual_harvest = service_module.harvest_llm_close_task
+    harvest_withdrawn = False
+
+    def harvest(service_owner, key, task):
+        nonlocal harvest_withdrawn
+        result = actual_harvest(service_owner, key, task)
+        if (
+            door == "bounded-close"
+            and key == "preference-writers"
+            and asyncio.current_task() is observer
+            and not harvest_withdrawn
+        ):
+            harvest_withdrawn = True
+            observer.cancel("actual preference observer withdrawn")
+        return result
+
+    def terminal(*errors, **kwargs):
+        if asyncio.current_task() is observer:
+            for error in errors:
+                if (
+                    isinstance(error, asyncio.CancelledError)
+                    and error.args == ("actual preference observer withdrawn",)
+                    and error not in withdrawals
+                ):
+                    withdrawals.append(error)
+        return actual_terminal(*errors, **kwargs)
 
     @asynccontextmanager
     async def release(native):
@@ -78,8 +115,9 @@ async def test_actual_preference_drain_keeps_withdrawal_without_polluting_latch(
         if armed and not fired:
             fired.append(True)
             # Cancel THAT endpoint/drain observer, never the accepted writer.
-            observer.cancel("actual preference observer withdrawn")
-            await asyncio.sleep(0)
+            if door != "bounded-close":
+                observer.cancel("actual preference observer withdrawn")
+                await asyncio.sleep(0)
             if kind == "native-control":
                 raise original
             if kind == "native-cancel":
@@ -115,6 +153,8 @@ async def test_actual_preference_drain_keeps_withdrawal_without_polluting_latch(
 
     monkeypatch.setattr(db, "execute", execute)
     monkeypatch.setattr(service_module, "await_owned_task", wait)
+    monkeypatch.setattr(service_module, "execution_terminal_error", terminal)
+    monkeypatch.setattr(service_module, "harvest_llm_close_task", harvest)
     n.backend._pool = PostgresPoolAdapter(pool, release)
     n.backend._execution_custody = ExecutionCustody(GenerationFence())
     payload = (
@@ -142,6 +182,8 @@ async def test_actual_preference_drain_keeps_withdrawal_without_polluting_latch(
         service.set_embedding_route(None)
         if door == "close-completion":
             await service.wait_for_close_completion()
+        elif door == "bounded-close":
+            await service.close()
         elif door == "mandate":
             async with service.mandate_change():
                 entered.append(True)
@@ -154,7 +196,9 @@ async def test_actual_preference_drain_keeps_withdrawal_without_polluting_latch(
             operation(), name="actual-preference-observer", retain_originals=True
         )
         outcome = await _async_ownership.await_owned_task(owner)
-        if door == "close-completion" and not kind.startswith("native"):
+        if door in {"close-completion", "bounded-close"} and not kind.startswith(
+            "native"
+        ):
             n.retirement_withdrawals.extend(withdrawals)
         assert (
             fired and writers and withdrawals and all(task.done() for task in writers)

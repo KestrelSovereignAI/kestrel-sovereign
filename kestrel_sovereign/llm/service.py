@@ -2977,10 +2977,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                     for error in (outcome.error, outcome.cancellation))):
             # Project this finite observer's evidence without attaching it to
             # the retained writer receipt shared by later service readers.
-            raise execution_terminal_error(BaseExceptionGroup(
-                "original model mandate persistence evidence",
-                [outcome.error, outcome.cancellation],
-            ), retain_originals=True)
+            raise execution_terminal_error(
+                outcome.error, outcome.cancellation, retain_originals=True,
+                isolate_control_originals=True,
+            )
         raise_owned_outcome(
             outcome, operation="model preference persistence"
         )
@@ -3012,20 +3012,11 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             self._remember_preference_control(outcome.error)
         self._preference_persistence_tasks.difference_update(tasks)
         control = getattr(self, "_preference_persistence_control", None)
-        evidence = []
-        for error in (control, *failures, cancellation):
-            if error is not None and all(error is not prior for prior in evidence):
-                evidence.append(error)
-        if control is not None and len(evidence) > 1:
-            # The long-lived latch retains one strongest writer receipt, not
-            # a history of drain callers. A fresh finite carrier keeps all
-            # joined writer/withdrawal originals without mutating that latch.
-            control = BaseExceptionGroup(
-                "original preference persistence drain evidence", evidence,
-            )
+        # Ordinary callback failures remain best effort. Native evidence and
+        # this finite caller's withdrawal never mutate the shared writer latch.
         terminal = execution_terminal_error(
-            control, cancellation,
-            retain_originals=control is not None and len(evidence) > 1,
+            control, *(failures if control is not None else ()), cancellation,
+            retain_originals=True, isolate_control_originals=True,
         )
         if terminal is not None:
             raise terminal
@@ -6288,7 +6279,9 @@ No other text or formatting.
             tasks[key] = task
         if resources:
             self._llm_close_control = execution_terminal_error(
-                vars(self).get("_llm_close_control"), error)
+                vars(self).get("_llm_close_control"), error,
+                retain_originals=True, isolate_control_originals=True,
+            )
 
     async def wait_for_close_completion(self) -> None:
         """Join exact native owners before a host retires their borrowed storage.
@@ -6316,9 +6309,15 @@ No other text or formatting.
                 if task not in resource_closers and error is not None and not is_execution_control_error(error):
                     error = None
                 observations.extend((error, outcome.cancellation))
-                failure = execution_terminal_error(error, outcome.cancellation)
+                failure = execution_terminal_error(
+                    error, outcome.cancellation, retain_originals=True,
+                    isolate_control_originals=True,
+                )
                 if failure is not None:
-                    terminal = execution_terminal_error(terminal, failure)
+                    terminal = execution_terminal_error(
+                        terminal, failure, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
             # Completion callbacks drop settled task graphs. Allow every
             # already-queued canonical harvester to finish before resnapshot.
             for key, task in tuple(closing.items()):
@@ -6330,21 +6329,17 @@ No other text or formatting.
                 observations.append(withdrawal)
                 terminal = execution_terminal_error(
                     terminal, withdrawal, retain_originals=True,
+                    isolate_control_originals=True,
                 )
             if terminal is not None and all(task.done() for task in owners):
                 break
-        evidence = []
-        for error in (terminal, *observations, vars(self).get("_llm_close_control"),
-                      vars(self).get("_preference_persistence_control"),
-                      vars(self).get("_modality_record_control")):
-            if error is not None and all(error is not prior for prior in evidence):
-                evidence.append(error)
         # This finite owner joins distinct drain observers. Keep each original
         # withdrawal without attaching it to their shared strongest-writer latch.
         terminal = execution_terminal_error(
-            BaseExceptionGroup("original LLM close observation evidence", evidence)
-            if len(evidence) > 1 else (evidence[0] if evidence else None),
-            retain_originals=True,
+            terminal, *observations, vars(self).get("_llm_close_control"),
+            vars(self).get("_preference_persistence_control"),
+            vars(self).get("_modality_record_control"),
+            retain_originals=True, isolate_control_originals=True,
         )
         if terminal is not None:
             self._llm_close_control = terminal
@@ -6375,7 +6370,9 @@ No other text or formatting.
             try:
                 task = start_llm_close_task(self, key, operation, resource=resource)
             except BaseException as error:
-                terminal = execution_terminal_error(terminal, error, retain_originals=True)
+                terminal = execution_terminal_error(
+                    terminal, error, retain_originals=True, isolate_control_originals=True,
+                )
                 interrupted = interrupted or isinstance(error, asyncio.CancelledError)
                 return
             if task is None:
@@ -6383,7 +6380,9 @@ No other text or formatting.
             try:
                 await asyncio.wait({task}, timeout=0 if interrupted else CLIENT_CLOSE_TIMEOUT)
             except asyncio.CancelledError as cancellation:
-                terminal = execution_terminal_error(terminal, cancellation)
+                terminal = execution_terminal_error(
+                    terminal, cancellation, retain_originals=True, isolate_control_originals=True,
+                )
                 interrupted = True
             if not task.done() and not interrupted and cancel_on_timeout:
                 # Send cancellation only once. A retry joins the SAME pending
@@ -6394,17 +6393,23 @@ No other text or formatting.
                 try:
                     await asyncio.wait({task}, timeout=0.1)
                 except asyncio.CancelledError as cancellation:
-                    terminal = execution_terminal_error(terminal, cancellation)
+                    terminal = execution_terminal_error(
+                        terminal, cancellation, retain_originals=True, isolate_control_originals=True,
+                    )
                     interrupted = True
             if not task.done():
                 return
             error = harvest_llm_close_task(self, key, task)
             if error is not None and is_execution_control_error(error):
-                terminal = execution_terminal_error(terminal, error)
+                terminal = execution_terminal_error(
+                    terminal, error, retain_originals=True, isolate_control_originals=True,
+                )
             elif error is not None:
                 logger.warning("LLM shutdown %s failed (%s)", label, type(error).__name__)
                 if label not in ("preference-writers", "modality-writers"):
-                    terminal = execution_terminal_error(terminal, error)
+                    terminal = execution_terminal_error(
+                        terminal, error, retain_originals=True, isolate_control_originals=True,
+                    )
 
         await retire("preference-writers", self.drain_preference_persistence)
         await retire("modality-writers", self.drain_modality_records)
@@ -6458,7 +6463,7 @@ No other text or formatting.
                 if outcome.error is not None and is_execution_control_error(outcome.error):
                     self._llm_close_control = execution_terminal_error(
                         vars(self).get("_llm_close_control"), outcome.error,
-                        retain_originals=True,
+                        retain_originals=True, isolate_control_originals=True,
                     )
             # The writer's original receipt is not a failed DATABASE close.
             # Retain it independently, allowing successful physical retirement
@@ -6466,7 +6471,7 @@ No other text or formatting.
             if withdrawal is not None:
                 self._llm_close_control = execution_terminal_error(
                     vars(self).get("_llm_close_control"), withdrawal,
-                    retain_originals=True,
+                    retain_originals=True, isolate_control_originals=True,
                 )
             await self.close_usage_db()
 
@@ -6477,6 +6482,7 @@ No other text or formatting.
             terminal, vars(self).get("_llm_close_control"),
             vars(self).get("_preference_persistence_control"),
             vars(self).get("_modality_record_control"), retain_originals=True,
+            isolate_control_originals=True,
         )
         if terminal is not None:
             raise terminal

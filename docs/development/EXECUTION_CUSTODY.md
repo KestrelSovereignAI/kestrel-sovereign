@@ -1544,4 +1544,28 @@ authenticated HTTP acceptance. Corpus-profile and embedding-settings/reindex
 producer gaps remain separate open findings; these consumer repairs do not
 waive their native ownership or publication requirements.
 
+Finite native-control projections use the canonical terminal composer with
+isolated original retention. They preserve actual writer/observer identities
+without modifying a shared strongest-writer receipt; observing an existing
+enclosing carrier again does not build a new wrapper history. Preference and
+modality drains, public bounded/native LLM close, and unpublished-provider joins
+share that composer. A later successful physical close does not erase an actual
+earlier observer withdrawal. Ordinary best-effort writer failures remain ordinary.
+
+Standalone restoration passes original producer outcomes into the same retained
+descendant shutdown owner before a bounded return. Later shutdown/readiness and
+re-enable observers cannot consume native uncertainty or silently retry restoration.
+Actual caller withdrawal stays separate from that retained producer receipt.
+Canonical Task admission closes unstarted coroutines; refusal never detaches the
+original manager. Native tests cover accepted Tasks and real PG effects with a
+retired advisory lease; injected restoration bodies are component seams, not full
+manager-tree recovery, verified descendant registration, or Agent READY.
+
+The constitution receipt capability has one dispatch-scoped finally cleanup,
+covering partial asynchronous registration, pre-turn resolution, cognition and
+post-turn verification. Verification consumes actual receipt records before
+cleanup. Actual cancellation is not a missing-receipt result. Tests exercise the
+real Agent registry methods and verifier with native PG component effects, not
+constitutional amendment approval or a provider-generated answer.
+
 These are candidate contracts, not whole-branch review or release approval.

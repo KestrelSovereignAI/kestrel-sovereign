@@ -194,19 +194,11 @@ class ModalityRecordingMixin:
             self._remember_modality_control(outcome.error)
         self._pending_modality_records().difference_update(tasks)
         control = getattr(self, "_modality_record_control", None)
-        evidence = []
-        for error in (control, *failures, cancellation):
-            if error is not None and all(error is not prior for prior in evidence):
-                evidence.append(error)
-        if control is not None and len(evidence) > 1:
-            # Finite drain observers do not become part of the service's
-            # bounded strongest-writer latch shared by subsequent callers.
-            control = BaseExceptionGroup(
-                "original modality persistence drain evidence", evidence,
-            )
+        # Finite observers share the canonical isolated projection, never
+        # attach caller history to the bounded strongest-writer latch.
         terminal = execution_terminal_error(
-            control, cancellation,
-            retain_originals=control is not None and len(evidence) > 1,
+            control, *(failures if control is not None else ()), cancellation,
+            retain_originals=True, isolate_control_originals=True,
         )
         if terminal is not None:
             raise terminal

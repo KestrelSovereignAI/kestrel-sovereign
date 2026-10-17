@@ -6389,303 +6389,284 @@ class SignalDispatcher:
             )
 
         receipt_tool_registered = False
-        if (
-            registration.require_constitution_echo
-            and registration.prompt_template_format == "claude_code"
-            and audit.canary is not None
-        ):
-            register_receipt = getattr(
-                self._agent, "register_constitution_receipt_tool", None
+
+        def clear_registered_receipt(error: BaseException | None = None) -> None:
+            nonlocal receipt_tool_registered
+            if not receipt_tool_registered:
+                return
+            clear_receipt = getattr(
+                self._agent, "clear_constitution_receipt_tool", None,
             )
-            if not callable(register_receipt):
+            try:
+                if callable(clear_receipt):
+                    clear_receipt()
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(
+                    error, cleanup_error, retain_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
+                )
+            receipt_tool_registered = False
+
+        receipt_failure = None
+        try:
+            if (
+                registration.require_constitution_echo
+                and registration.prompt_template_format == "claude_code"
+                and audit.canary is not None
+            ):
+                register_receipt = getattr(
+                    self._agent, "register_constitution_receipt_tool", None
+                )
+                if not callable(register_receipt):
+                    return self._fail(
+                        signal,
+                        start,
+                        Status.DROPPED_VALIDATION,
+                        error=(
+                            "require_constitution_echo=True for claude_code "
+                            "but agent cannot register the ephemeral "
+                            "_constitution_receipt tool"
+                        ),
+                        registration=registration,
+                        audit=audit,
+                    )
+                receipt_tool_registered = True
+                value = register_receipt(canary=audit.canary, signal_id=signal.id)
+                if asyncio.iscoroutine(value):
+                    await value
+
+            # Set the in-flight turn's causation chain (already extended
+            # with this hop's frame in step 2 of the pipeline) so outbound
+            # A2A tasks created during the turn carry the lineage forward
+            # (#905 review P1). The chain lives in a ContextVar so
+            # concurrent COGNITION dispatches stay isolated — agent-level
+            # mutable state would race here (#906 review P1: dispatcher
+            # set/clear runs OUTSIDE the CONVERSATION lock that
+            # process_input acquires inside its body).
+            set_chain = getattr(self._agent, "_set_current_chain", None)
+            clear_chain = getattr(self._agent, "_clear_current_chain", None)
+            token = None
+            if set_chain is not None:
+                token = set_chain(signal.causation_chain)
+
+            budget = registration.system_prompt_budget_bytes
+            accepts_anchored = _agent_accepts_kwarg(
+                self._agent.process_input, "anchored_doctrine"
+            )
+            # Resolve anchored doctrine for full-injection sources so the
+            # agent's system-prompt assembler can deliver doctrine content
+            # (TORTOISE_DOCTRINE.md, AGENTS.md). Codex round-16 P2 fix —
+            # without this, the audit recorded the bundle hash but the
+            # model never received the doctrine.
+            anchored_doctrine = None
+            if (
+                registration.constitution_injection == "full"
+                and accepts_anchored
+            ):
+                getter = getattr(self._agent, "get_anchored_doctrine_files", None)
+                if callable(getter):
+                    try:
+                        value = getter()
+                        if asyncio.iscoroutine(value):
+                            value = await value
+                        if value:
+                            anchored_doctrine = value
+                    except BaseException as exc:
+                        from kestrel_sovereign.agent.system_prompt_assembler import (
+                            SystemPromptNamespaceError,
+                        )
+
+                        if (not isinstance(exc, Exception)
+                            or is_execution_control_error(exc)
+                            or isinstance(exc, SystemPromptNamespaceError)):
+                            # Receipt registration and causation binding happen
+                            # before doctrine resolution. This validation error is
+                            # intentionally loud, but it must not leave either
+                            # ephemeral capability visible to a later turn.
+                            if clear_chain is not None:
+                                clear_chain(token)
+                            raise
+                        logger.exception(
+                            "agent.get_anchored_doctrine_files raised for "
+                            "signal %s; proceeding without anchored doctrine",
+                            signal.id,
+                        )
+            process_input_kwargs: dict[str, Any] = {}
+            # Give signal cognition a known lifecycle address. Durable cognition
+            # holds a second registration for this same generation until its
+            # selected delivery is settled, so cooperative Stop cannot publish a
+            # receipt in the process-input/terminal-NACK crash window.
+            if _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
+                process_input_kwargs["invocation_id"] = signal.id
+            if pre_turn_guard is not None:
+                # Bind the signal now; evaluate inside the turn's span. The turn
+                # decides an admission, it does not read signal envelopes, so what
+                # crosses the boundary is a zero-argument verdict. The agent's
+                # capability was already checked above, so this cannot be dropped
+                # silently here.
+                process_input_kwargs["pre_turn_guard"] = functools.partial(
+                    pre_turn_guard, signal
+                )
+            if addendum is not None and accepts_addendum:
+                process_input_kwargs["system_prompt_addendum"] = addendum
+            if budget is not None and accepts_budget:
+                process_input_kwargs["system_prompt_budget_bytes"] = budget
+            if anchored_doctrine is not None:
+                process_input_kwargs["anchored_doctrine"] = anchored_doctrine
+            # A wake turn's session is ONE value, fixed here before the turn starts
+            # (#3429). A bound signal resumes its originating session (e.g. the
+            # restart.completed wake carries the session the restart was requested
+            # from, #1809), so the turn lands in that chat window. An unbound
+            # signal gets a fresh session of its own. Passing None instead left the
+            # turn running with no session while the store filed each row through
+            # the 30-minute time-gap heuristic at write time — gluing unattended
+            # work into whatever chat was newest, or minting a new session per
+            # wake — and work dispatched from that turn stamped an empty origin,
+            # so its own wake was unbound again. With an explicit session, the
+            # turn's rows, its live binding, and the origin its dispatches record
+            # are the same value: one session per autonomous chain. Visibility is
+            # still the signal's: nobody is watching a minted session, so the wake
+            # stays INTERNAL. Guarded by signature inspection like the other
+            # optional kwargs.
+            if _agent_accepts_kwarg(self._agent.process_input, "session_id"):
+                process_input_kwargs["session_id"] = (
+                    signal.session_id or new_session_id()
+                )
+
+            # Tag the persisted wake turn so the transcript renderer collapses this
+            # internal COGNITION prompt to an "Autonomous wake" chip on reload
+            # instead of surfacing the raw instruction template as a user message.
+            # Guarded by signature inspection like the other optional kwargs.
+            if _agent_accepts_kwarg(self._agent.process_input, "signal_wake"):
+                process_input_kwargs["signal_wake"] = {
+                    "source": signal.source,
+                    "mode": signal.mode.value,
+                }
+
+            # The event's ``result_summary`` is capped, so the chat console loads a
+            # long reply from the row that stores it (#3655). The turn names that
+            # row here: by this wake's own stamp, never "the newest reply in the
+            # session", which in an autonomous chain can be another wake's.
+            wake_reply: Optional[WakeReplyReceipt] = None
+            if _agent_accepts_kwarg(self._agent.process_input, "wake_reply"):
+                wake_reply = WakeReplyReceipt(signal_id=signal.id)
+                process_input_kwargs["wake_reply"] = wake_reply
+
+            execution_withdrawal = None
+            pre_turn_refusal: Optional[str] = None
+            injection_tracking = None
+            with capture_turn_ids() as cognition_turn_ids:
+                try:
+                    if process_input_kwargs:
+                        result, execution_withdrawal, injection_tracking = (
+                            await await_monitored_execution(
+                                self._agent.process_input(prompt, **process_input_kwargs)
+                            )
+                        )
+                    else:
+                        result, execution_withdrawal, injection_tracking = (
+                            await await_monitored_execution(
+                                self._agent.process_input(prompt)
+                            )
+                        )
+                except PreTurnRefusal as refusal:
+                    # #3310: the source's guard refused from inside the turn's
+                    # privacy-transition span, before any of the turn body ran.
+                    # That is a policy decision, not a failure — it gets the same
+                    # DROPPED_VALIDATION shape as a durable withdrawal, so the
+                    # occurrence is non-success and no turn is behind it.
+                    pre_turn_refusal = str(refusal) or "pre_turn_guard refused the turn"
+                finally:
+                    if clear_chain is not None:
+                        clear_chain(token)
+
+            if wake_reply is not None:
+                setattr(signal, _REPLY_MESSAGE_ID_ATTR, wake_reply.message_id)
+
+            if pre_turn_refusal is not None:
                 return self._fail(
                     signal,
                     start,
                     Status.DROPPED_VALIDATION,
-                    error=(
-                        "require_constitution_echo=True for claude_code "
-                        "but agent cannot register the ephemeral "
-                        "_constitution_receipt tool"
-                    ),
+                    error=pre_turn_refusal,
                     registration=registration,
                     audit=audit,
                 )
-            value = register_receipt(canary=audit.canary, signal_id=signal.id)
-            if asyncio.iscoroutine(value):
-                await value
-            receipt_tool_registered = True
 
-        # Set the in-flight turn's causation chain (already extended
-        # with this hop's frame in step 2 of the pipeline) so outbound
-        # A2A tasks created during the turn carry the lineage forward
-        # (#905 review P1). The chain lives in a ContextVar so
-        # concurrent COGNITION dispatches stay isolated — agent-level
-        # mutable state would race here (#906 review P1: dispatcher
-        # set/clear runs OUTSIDE the CONVERSATION lock that
-        # process_input acquires inside its body).
-        set_chain = getattr(self._agent, "_set_current_chain", None)
-        clear_chain = getattr(self._agent, "_clear_current_chain", None)
-        token = None
-        if set_chain is not None:
-            token = set_chain(signal.causation_chain)
-
-        budget = registration.system_prompt_budget_bytes
-        accepts_anchored = _agent_accepts_kwarg(
-            self._agent.process_input, "anchored_doctrine"
-        )
-        # Resolve anchored doctrine for full-injection sources so the
-        # agent's system-prompt assembler can deliver doctrine content
-        # (TORTOISE_DOCTRINE.md, AGENTS.md). Codex round-16 P2 fix —
-        # without this, the audit recorded the bundle hash but the
-        # model never received the doctrine.
-        anchored_doctrine = None
-        if (
-            registration.constitution_injection == "full"
-            and accepts_anchored
-        ):
-            getter = getattr(self._agent, "get_anchored_doctrine_files", None)
-            if callable(getter):
-                try:
-                    value = getter()
-                    if asyncio.iscoroutine(value):
-                        value = await value
-                    if value:
-                        anchored_doctrine = value
-                except BaseException as exc:
-                    from kestrel_sovereign.agent.system_prompt_assembler import (
-                        SystemPromptNamespaceError,
-                    )
-
-                    if (not isinstance(exc, Exception)
-                        or is_execution_control_error(exc)
-                        or isinstance(exc, SystemPromptNamespaceError)):
-                        # Receipt registration and causation binding happen
-                        # before doctrine resolution. This validation error is
-                        # intentionally loud, but it must not leave either
-                        # ephemeral capability visible to a later turn.
-                        try:
-                            if receipt_tool_registered:
-                                clear_receipt = getattr(
-                                    self._agent,
-                                    "clear_constitution_receipt_tool",
-                                    None,
-                                )
-                                if callable(clear_receipt):
-                                    clear_receipt()
-                        finally:
-                            if clear_chain is not None:
-                                clear_chain(token)
-                        raise
-                    logger.exception(
-                        "agent.get_anchored_doctrine_files raised for "
-                        "signal %s; proceeding without anchored doctrine",
-                        signal.id,
-                    )
-        process_input_kwargs: dict[str, Any] = {}
-        # Give signal cognition a known lifecycle address. Durable cognition
-        # holds a second registration for this same generation until its
-        # selected delivery is settled, so cooperative Stop cannot publish a
-        # receipt in the process-input/terminal-NACK crash window.
-        if _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
-            process_input_kwargs["invocation_id"] = signal.id
-        if pre_turn_guard is not None:
-            # Bind the signal now; evaluate inside the turn's span. The turn
-            # decides an admission, it does not read signal envelopes, so what
-            # crosses the boundary is a zero-argument verdict. The agent's
-            # capability was already checked above, so this cannot be dropped
-            # silently here.
-            process_input_kwargs["pre_turn_guard"] = functools.partial(
-                pre_turn_guard, signal
-            )
-        if addendum is not None and accepts_addendum:
-            process_input_kwargs["system_prompt_addendum"] = addendum
-        if budget is not None and accepts_budget:
-            process_input_kwargs["system_prompt_budget_bytes"] = budget
-        if anchored_doctrine is not None:
-            process_input_kwargs["anchored_doctrine"] = anchored_doctrine
-        # A wake turn's session is ONE value, fixed here before the turn starts
-        # (#3429). A bound signal resumes its originating session (e.g. the
-        # restart.completed wake carries the session the restart was requested
-        # from, #1809), so the turn lands in that chat window. An unbound
-        # signal gets a fresh session of its own. Passing None instead left the
-        # turn running with no session while the store filed each row through
-        # the 30-minute time-gap heuristic at write time — gluing unattended
-        # work into whatever chat was newest, or minting a new session per
-        # wake — and work dispatched from that turn stamped an empty origin,
-        # so its own wake was unbound again. With an explicit session, the
-        # turn's rows, its live binding, and the origin its dispatches record
-        # are the same value: one session per autonomous chain. Visibility is
-        # still the signal's: nobody is watching a minted session, so the wake
-        # stays INTERNAL. Guarded by signature inspection like the other
-        # optional kwargs.
-        if _agent_accepts_kwarg(self._agent.process_input, "session_id"):
-            process_input_kwargs["session_id"] = (
-                signal.session_id or new_session_id()
-            )
-
-        # Tag the persisted wake turn so the transcript renderer collapses this
-        # internal COGNITION prompt to an "Autonomous wake" chip on reload
-        # instead of surfacing the raw instruction template as a user message.
-        # Guarded by signature inspection like the other optional kwargs.
-        if _agent_accepts_kwarg(self._agent.process_input, "signal_wake"):
-            process_input_kwargs["signal_wake"] = {
-                "source": signal.source,
-                "mode": signal.mode.value,
-            }
-
-        # The event's ``result_summary`` is capped, so the chat console loads a
-        # long reply from the row that stores it (#3655). The turn names that
-        # row here: by this wake's own stamp, never "the newest reply in the
-        # session", which in an autonomous chain can be another wake's.
-        wake_reply: Optional[WakeReplyReceipt] = None
-        if _agent_accepts_kwarg(self._agent.process_input, "wake_reply"):
-            wake_reply = WakeReplyReceipt(signal_id=signal.id)
-            process_input_kwargs["wake_reply"] = wake_reply
-
-        execution_withdrawal = None
-        pre_turn_refusal: Optional[str] = None
-        injection_tracking = None
-        with capture_turn_ids() as cognition_turn_ids:
-            try:
-                if process_input_kwargs:
-                    result, execution_withdrawal, injection_tracking = (
-                        await await_monitored_execution(
-                            self._agent.process_input(prompt, **process_input_kwargs)
-                        )
-                    )
-                else:
-                    result, execution_withdrawal, injection_tracking = (
-                        await await_monitored_execution(
-                            self._agent.process_input(prompt)
-                        )
-                    )
-            except PreTurnRefusal as refusal:
-                # #3310: the source's guard refused from inside the turn's
-                # privacy-transition span, before any of the turn body ran.
-                # That is a policy decision, not a failure — it gets the same
-                # DROPPED_VALIDATION shape as a durable withdrawal, so the
-                # occurrence is non-success and no turn is behind it.
-                if receipt_tool_registered:
-                    clear_receipt = getattr(
-                        self._agent, "clear_constitution_receipt_tool", None
-                    )
-                    if callable(clear_receipt):
-                        clear_receipt()
-                    receipt_tool_registered = False
-                pre_turn_refusal = str(refusal) or "pre_turn_guard refused the turn"
-            except Exception:
-                if receipt_tool_registered:
-                    clear_receipt = getattr(
-                        self._agent, "clear_constitution_receipt_tool", None
-                    )
-                    if callable(clear_receipt):
-                        clear_receipt()
-                raise
-            finally:
-                if clear_chain is not None:
-                    clear_chain(token)
-
-        if wake_reply is not None:
-            setattr(signal, _REPLY_MESSAGE_ID_ATTR, wake_reply.message_id)
-
-        if pre_turn_refusal is not None:
-            return self._fail(
-                signal,
-                start,
-                Status.DROPPED_VALIDATION,
-                error=pre_turn_refusal,
-                registration=registration,
-                audit=audit,
-            )
-
-        if execution_withdrawal is not None:
-            if receipt_tool_registered:
-                clear_receipt = getattr(
-                    self._agent, "clear_constitution_receipt_tool", None
-                )
-                if callable(clear_receipt):
-                    clear_receipt()
-            return self._fail(
-                signal,
-                start,
-                Status.DROPPED_VALIDATION,
-                error=execution_withdrawal,
-                registration=registration,
-                audit=audit,
-            )
-
-        # Codex round-13/14 P2: surface the agent's actual
-        # injected/dropped clause tracking from the budget-aware
-        # assembler into the signal_log audit. The tracking is
-        # published per-async-task via a ContextVar in
-        # `kestrel_sovereign.agent.context_manager`, so concurrent
-        # COGNITION dispatches don't race on a shared attribute.
-        if injection_tracking is not None:
-            tracked_injected, tracked_dropped = injection_tracking
-            if tracked_injected is not None:
-                # Merge: dispatcher's KESTREL_CONSTITUTION marker
-                # plus the assembler's own clause list. Use a
-                # de-duplicated, order-preserving merge.
-                merged = list(audit.injected_clauses or [])
-                for clause in tracked_injected:
-                    if clause not in merged:
-                        merged.append(clause)
-                audit.injected_clauses = merged
-            if tracked_dropped:
-                audit.dropped_clauses = list(tracked_dropped)
-
-        # Step B: post-dispatch echo verification. If the source
-        # opted in to `require_constitution_echo=True` the dispatcher
-        # asks the agent for the format-specific receipt — checking
-        # against the SAME canary that was injected pre-dispatch
-        # (audit.canary, derived in Step A.5). Anything other than
-        # VERIFIED flips the dispatch to FAILED with
-        # `error="constitution_not_received"` per design §3 — codex
-        # round-3 P2 fix: NOT_REQUIRED returned by a verifier when
-        # echo IS required is a contract violation, not a pass.
-        if registration.require_constitution_echo:
-            await self._verify_canary_post_dispatch(
-                signal, registration, audit, response=result
-            )
-            if receipt_tool_registered:
-                clear_receipt = getattr(
-                    self._agent, "clear_constitution_receipt_tool", None
-                )
-                if callable(clear_receipt):
-                    clear_receipt()
-                receipt_tool_registered = False
-            if audit.echo_canary_status is CanaryStatus.VERIFIED:
-                record_echo_verified(signal.source)
-            else:
-                record_echo_missing(signal.source)
+            if execution_withdrawal is not None:
                 return self._fail(
                     signal,
                     start,
-                    Status.FAILED,
-                    error="constitution_not_received",
+                    Status.DROPPED_VALIDATION,
+                    error=execution_withdrawal,
                     registration=registration,
                     audit=audit,
                 )
 
-        if receipt_tool_registered:
-            clear_receipt = getattr(
-                self._agent, "clear_constitution_receipt_tool", None
-            )
-            if callable(clear_receipt):
-                clear_receipt()
+            # Codex round-13/14 P2: surface the agent's actual
+            # injected/dropped clause tracking from the budget-aware
+            # assembler into the signal_log audit. The tracking is
+            # published per-async-task via a ContextVar in
+            # `kestrel_sovereign.agent.context_manager`, so concurrent
+            # COGNITION dispatches don't race on a shared attribute.
+            if injection_tracking is not None:
+                tracked_injected, tracked_dropped = injection_tracking
+                if tracked_injected is not None:
+                    # Merge: dispatcher's KESTREL_CONSTITUTION marker
+                    # plus the assembler's own clause list. Use a
+                    # de-duplicated, order-preserving merge.
+                    merged = list(audit.injected_clauses or [])
+                    for clause in tracked_injected:
+                        if clause not in merged:
+                            merged.append(clause)
+                    audit.injected_clauses = merged
+                if tracked_dropped:
+                    audit.dropped_clauses = list(tracked_dropped)
 
-        return self._success(
-            signal,
-            start,
-            registration,
-            audit=audit,
-            cognition_result=result,
-            turn_id=(
-                cognition_turn_ids[0]
-                if len(cognition_turn_ids) == 1
-                else None
-            ),
-        )
+            # Step B: post-dispatch echo verification. If the source
+            # opted in to `require_constitution_echo=True` the dispatcher
+            # asks the agent for the format-specific receipt — checking
+            # against the SAME canary that was injected pre-dispatch
+            # (audit.canary, derived in Step A.5). Anything other than
+            # VERIFIED flips the dispatch to FAILED with
+            # `error="constitution_not_received"` per design §3 — codex
+            # round-3 P2 fix: NOT_REQUIRED returned by a verifier when
+            # echo IS required is a contract violation, not a pass.
+            if registration.require_constitution_echo:
+                await self._verify_canary_post_dispatch(
+                    signal, registration, audit, response=result
+                )
+                if audit.echo_canary_status is CanaryStatus.VERIFIED:
+                    record_echo_verified(signal.source)
+                else:
+                    record_echo_missing(signal.source)
+                    return self._fail(
+                        signal,
+                        start,
+                        Status.FAILED,
+                        error="constitution_not_received",
+                        registration=registration,
+                        audit=audit,
+                    )
+
+
+            return self._success(
+                signal,
+                start,
+                registration,
+                audit=audit,
+                cognition_result=result,
+                turn_id=(
+                    cognition_turn_ids[0]
+                    if len(cognition_turn_ids) == 1
+                    else None
+                ),
+            )
+        except BaseException as error:
+            receipt_failure = error
+            raise
+        finally:
+            clear_registered_receipt(receipt_failure)
 
     async def _ensure_doctrine_bundle_anchored(self) -> None:
         """Codex round-18 P1: ensure the doctrine bundle is anchored
@@ -6876,7 +6857,9 @@ class SignalDispatcher:
             value = verifier(**verifier_kwargs)
             if asyncio.iscoroutine(value):
                 value = await value
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.exception(
                 "agent.verify_constitution_echo raised for signal %s",
                 signal.id,

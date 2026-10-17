@@ -283,7 +283,8 @@ def execution_denial_scopes(error: BaseException | None) -> tuple | None:
 
 
 def execution_terminal_error(*errors: BaseException | None, retain_originals: bool = False,
-                             prefer_cancellation: bool = False) -> BaseException | None:
+                             prefer_cancellation: bool = False,
+                             isolate_control_originals: bool = False) -> BaseException | None:
     """Keep irreversible control evidence ahead of cancellation/cleanup noise.
 
     Native lifecycle boundaries can retain all original body/closer carriers
@@ -293,9 +294,30 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
     A lifecycle drain may prefer actual caller withdrawal over an ordinary
     opening failure after cleanup settles. Original native control still wins;
     retain_originals keeps the opening failure as explicit evidence.
+    When a native receipt is also a shared strongest-writer latch, finite
+    lifecycle callers can isolate_control_originals: retain unrelated originals
+    in a fresh carrier instead of mutating that source receipt. Already-enclosing
+    carriers are reused, so repeated observation does not grow wrapper history.
     """
     import asyncio
     present = tuple(error for error in errors if error is not None)
+    if isolate_control_originals:
+        retain_originals = True
+        if any(is_execution_control_error(error) for error in present):
+            unique = []
+            for error in present:
+                if all(error is not prior for prior in unique):
+                    unique.append(error)
+            enclosing = [error for error in unique if not any(
+                parent is not error
+                and any(error is member for member in _explicit_control_chain(parent))
+                for parent in unique
+            )]
+            # A pre-existing explicit cycle cannot justify dropping its
+            # originals; one enclosing original already traverses that cycle.
+            enclosing = enclosing or unique[:1]
+            present = ((BaseExceptionGroup("original execution terminal evidence", enclosing),)
+                       if len(enclosing) > 1 else tuple(enclosing))
     def retain(selected):
         if retain_originals:
             # A selected cause cannot point back to its enclosing original
@@ -1420,8 +1442,6 @@ async def close_execution_stream(
     owner: Any, stream: Any, captured: tuple[ExecutionCustody, ...] = (),
 ) -> None:
     """Join an owned source's close despite repeated caller cancellation."""
-    import asyncio
-
     from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
     close = getattr(stream, "aclose", None)
