@@ -9718,72 +9718,382 @@ class AgentManager:
         # silently retaining money because there is no routing entry.
         ordinary_budget_release: Optional[InflightRemovalBudgetRelease] = None
         removal_withdrawals: list[BaseException] = []
-        handoff_offboarding_pending: Optional[
-            RuntimeOffboardingRetainedError
-        ] = None
-        unpublished_offboarding_failure: Optional[
-            RuntimeOffboardingRetainedError
-        ] = None
-        async with self._lock:
-            if self._quarantined_shutdown_handoffs_sealed:
-                logger.warning(
-                    "Refusing removal of agent %r after terminal manager shutdown "
-                    "handoffs were sealed",
-                    name,
-                )
-                return False
-            unpublished_hold = name not in self._agents and name in self._child_budgets
-            if unpublished_hold:
-                unpublished_agent_id = self._budgeted_child_agent_id(name)
-                if offboard_runtime:
-                    unpublished_config = self._created_configs.get(name)
-                    hosted_factory = self._hosted_agent_runtime_factory_configured(
-                        os.environ.get("KESTREL_DB_BACKEND", "sqlite"),
-                        os.environ.get("KESTREL_DATABASE_URL"),
+        try:
+            handoff_offboarding_pending: Optional[
+                RuntimeOffboardingRetainedError
+            ] = None
+            unpublished_offboarding_failure: Optional[
+                RuntimeOffboardingRetainedError
+            ] = None
+            async with self._lock:
+                if self._quarantined_shutdown_handoffs_sealed:
+                    logger.warning(
+                        "Refusing removal of agent %r after terminal manager shutdown "
+                        "handoffs were sealed",
+                        name,
                     )
-                    if unpublished_agent_id is None or (
-                        hosted_factory and unpublished_config is None
-                    ):
-                        unpublished_offboarding_failure = (
-                            RuntimeOffboardingRetainedError(
-                                agent_name=name,
-                                agent_id="<unknown>",
-                                runtime_path=None,
-                                cause=RuntimeError(
-                                    "unpublished child identity is unavailable"
-                                ),
+                    return False
+                unpublished_hold = name not in self._agents and name in self._child_budgets
+                if unpublished_hold:
+                    unpublished_agent_id = self._budgeted_child_agent_id(name)
+                    if offboard_runtime:
+                        unpublished_config = self._created_configs.get(name)
+                        hosted_factory = self._hosted_agent_runtime_factory_configured(
+                            os.environ.get("KESTREL_DB_BACKEND", "sqlite"),
+                            os.environ.get("KESTREL_DATABASE_URL"),
+                        )
+                        if unpublished_agent_id is None or (
+                            hosted_factory and unpublished_config is None
+                        ):
+                            unpublished_offboarding_failure = (
+                                RuntimeOffboardingRetainedError(
+                                    agent_name=name,
+                                    agent_id="<unknown>",
+                                    runtime_path=None,
+                                    cause=RuntimeError(
+                                        "unpublished child identity is unavailable"
+                                    ),
+                                )
                             )
+                        else:
+                            pending_offboarding.append(
+                                self._start_agent_runtime_offboarding_identity(
+                                    name=name,
+                                    agent_id=unpublished_agent_id,
+                                    config=unpublished_config,
+                                    retire_persistent_registration=(
+                                        offboarding_admission is not None
+                                        or self._has_exact_persistent_spawn_registration(
+                                            name,
+                                            unpublished_agent_id,
+                                        )
+                                    ),
+                                )
+                            )
+                    ordinary_budget_release = self._start_child_budget_release(name)
+            if unpublished_hold:
+                assert ordinary_budget_release is not None
+                release_failure = None
+                try:
+                    release_cancelled = (
+                        await self._await_child_budget_release_cancellation_safe(
+                            ordinary_budget_release.task, withdrawals=removal_withdrawals,
+                        )
+                    )
+                except BaseException as error:
+                    if not _is_lifecycle_terminal_outcome(error):
+                        raise
+                    release_failure = error
+                    release_cancelled = _contains_lifecycle_cancellation(error)
+                reconciliation_cancelled = False
+                reconciliation_failure = None
+                reconciliation_withdrawals = removal_withdrawals
+                try:
+                    reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking(
+                        withdrawals=reconciliation_withdrawals,
+                    )
+                except BaseException as error:
+                    if not _is_lifecycle_terminal_outcome(error):
+                        raise
+                    reconciliation_failure = error
+                terminal = execution_terminal_error(
+                    release_failure, reconciliation_failure,
+                    unpublished_offboarding_failure, *reconciliation_withdrawals,
+                    retain_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
+                )
+                if terminal is not None:
+                    raise terminal
+                if release_cancelled or reconciliation_cancelled:
+                    raise asyncio.CancelledError()
+                return True
+
+            async with self._lock:
+                if self._quarantined_shutdown_handoffs_sealed:
+                    logger.warning(
+                        "Refusing removal of agent %r after terminal manager shutdown "
+                        "handoffs were sealed",
+                        name,
+                    )
+                    return False
+                agent = self._agents.get(name)
+                if agent is None:
+                    return False
+
+                # ``wait_for(agent.shutdown())`` loses the actual task on timeout
+                # and on cancellation.  KestrelAgent deliberately runs its
+                # cancellation tail before re-raising, so that task is the primary
+                # evidence that cleanup is terminal even when no deferred
+                # continuation was necessary.
+                shutdown_task = asyncio.create_task(
+                    agent.shutdown(), name=f"agent_shutdown:{name}"
+                )
+                shutdown_task.add_done_callback(owned_task_error)
+                caller_cancelled = False
+                shutdown_timed_out = False
+                shutdown_handed_off = False
+                budget_handed_off = False
+                ordinary_budget_release = None
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(shutdown_task), timeout=SHUTDOWN_TIMEOUT
+                    )
+                except asyncio.CancelledError as withdrawal:
+                    caller_cancelled = asyncio.current_task().cancelling() > 0
+                    if caller_cancelled:
+                        removal_withdrawals.append(withdrawal)
+                    if not shutdown_task.done():
+                        shutdown_task.cancel()
+                    shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
+                        name=name,
+                        agent=agent,
+                        shutdown_task=shutdown_task,
+                        offboard_runtime=offboard_runtime,
+                        retire_persistent_registration=(
+                            offboarding_admission is not None
+                            or self._has_exact_persistent_spawn_registration(
+                                name,
+                                _loaded_agent_did(agent),
+                            )
+                        ),
+                    )
+                    if (
+                        shutdown_handed_off
+                        and offboard_runtime
+                        and offboarding_admission is not None
+                    ):
+                        offboarding_admission.started = True
+                    if shutdown_handed_off and offboard_runtime:
+                        handoff_offboarding_pending = RuntimeOffboardingRetainedError(
+                            agent_name=name,
+                            agent_id=_loaded_agent_did(agent) or "<unknown>",
+                            runtime_path=_agent_runtime_path(agent),
+                            cause=RuntimeError(
+                                "runtime offboarding is owned by quarantined shutdown"
+                            ),
+                            cleanup_pending=True,
+                        )
+                    if shutdown_handed_off:
+                        logger.warning(
+                            "Agent '%s' shutdown was cancelled; durable cleanup is "
+                            "quarantined while control-plane removal continues.",
+                            name,
                         )
                     else:
+                        logger.warning(
+                            "Agent '%s' shutdown was cancelled; joining its actual "
+                            "shutdown task and durable cleanup before unpublishing.",
+                            name,
+                        )
+                except asyncio.TimeoutError:
+                    shutdown_timed_out = True
+                    shutdown_task.cancel()
+                    shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
+                        name=name,
+                        agent=agent,
+                        shutdown_task=shutdown_task,
+                        offboard_runtime=offboard_runtime,
+                        retire_persistent_registration=(
+                            offboarding_admission is not None
+                            or self._has_exact_persistent_spawn_registration(
+                                name,
+                                _loaded_agent_did(agent),
+                            )
+                        ),
+                    )
+                    if (
+                        shutdown_handed_off
+                        and offboard_runtime
+                        and offboarding_admission is not None
+                    ):
+                        offboarding_admission.started = True
+                    if shutdown_handed_off and offboard_runtime:
+                        handoff_offboarding_pending = RuntimeOffboardingRetainedError(
+                            agent_name=name,
+                            agent_id=_loaded_agent_did(agent) or "<unknown>",
+                            runtime_path=_agent_runtime_path(agent),
+                            cause=TimeoutError(
+                                "runtime offboarding awaits quarantined shutdown"
+                            ),
+                            cleanup_pending=True,
+                        )
+                    if shutdown_handed_off:
+                        logger.warning(
+                            "Agent '%s' exceeded its shutdown bound; durable cleanup "
+                            "is quarantined while control-plane removal continues.",
+                            name,
+                        )
+                    else:
+                        logger.warning(
+                            "Agent '%s' shutdown timed out; joining its actual "
+                            "shutdown task before deciding removal.",
+                            name,
+                        )
+                except BaseException as exc:
+                    # A normal shutdown error has no general proof that the agent
+                    # reached its cancellation tail.  Keep the historical safe
+                    # behaviour for that case; timeouts/cancellation are handled
+                    # below by joining the task that did run the tail.
+                    logger.warning(
+                        "Agent '%s' shutdown failed; retaining it until cleanup "
+                        "can be confirmed: %s",
+                        name,
+                        exc,
+                        exc_info=True,
+                    )
+                    try:
+                        await await_agent_shutdown_completion(
+                            agent, prior_error=exc, withdrawals=removal_withdrawals,
+                        )
+                    except BaseException as terminal:
+                        if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
+                            raise
+                        if removal_withdrawals:
+                            raise execution_terminal_error(
+                                terminal, *removal_withdrawals, retain_originals=True,
+                                prefer_cancellation=True, isolate_control_originals=True,
+                            )
+                    return False
+
+                if not shutdown_handed_off:
+                    (
+                        join_cancelled,
+                        shutdown_failure,
+                    ) = await await_lifecycle_task_completion(
+                        shutdown_task, withdrawals=removal_withdrawals,
+                    )
+                    caller_cancelled = caller_cancelled or join_cancelled
+                    try:
+                        caller_cancelled = await await_agent_shutdown_completion(
+                            agent, prior_error=shutdown_failure,
+                            withdrawals=removal_withdrawals,
+                        ) or caller_cancelled
+                    except BaseException as terminal:
+                        if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
+                            raise
+                        if removal_withdrawals:
+                            raise execution_terminal_error(
+                                terminal, *removal_withdrawals, retain_originals=True,
+                                prefer_cancellation=True, isolate_control_originals=True,
+                            )
+                        logger.warning(
+                            "Agent '%s' shutdown task failed; retaining it until "
+                            "cleanup can be confirmed: %s",
+                            name,
+                            terminal,
+                            exc_info=(
+                                type(terminal),
+                                terminal,
+                                terminal.__traceback__,
+                            ),
+                        )
+                        return False
+                    if shutdown_timed_out and shutdown_failure is None:
+                        logger.warning(
+                            "Agent '%s' exceeded its shutdown budget but completed "
+                            "while being joined; continuing durable cleanup.",
+                            name,
+                        )
+
+                    # A tail that spent its dispatcher guard continues in the
+                    # agent-owned completion task.  Do not unpublish the agent or
+                    # release its delegated budget until that task has released the
+                    # owner and closed storage. Legacy lifecycle implementations
+                    # remain on this conservative path; KestrelAgent's explicit
+                    # handoff contract above is what permits bounded removal.
+                    if offboard_runtime:
+                        # Admit the destructive worker while the manager lock still
+                        # linearizes this removal, but never await filesystem I/O
+                        # here. The public wrapper joins it only after scheduler,
+                        # A2A, and manager lifecycle locks have all been released.
                         pending_offboarding.append(
-                            self._start_agent_runtime_offboarding_identity(
+                            self._start_agent_runtime_offboarding(
                                 name=name,
-                                agent_id=unpublished_agent_id,
-                                config=unpublished_config,
+                                agent=agent,
                                 retire_persistent_registration=(
                                     offboarding_admission is not None
                                     or self._has_exact_persistent_spawn_registration(
                                         name,
-                                        unpublished_agent_id,
+                                        _loaded_agent_did(agent),
                                     )
                                 ),
                             )
                         )
-                ordinary_budget_release = self._start_child_budget_release(name)
-        if unpublished_hold:
-            assert ordinary_budget_release is not None
-            release_failure = None
-            try:
-                release_cancelled = (
-                    await self._await_child_budget_release_cancellation_safe(
-                        ordinary_budget_release.task, withdrawals=removal_withdrawals,
-                    )
+
+                # Successful shutdown always withdraws routing. Requested
+                # offboarding may have completed, failed with retained state, or
+                # been handed to an explicit reaper; none of those states permits
+                # republishing a process whose shutdown already completed.
+                self._agents.pop(name, None)
+                self._agent_names.pop(agent.agent_id, None)
+                self._non_governing_spawn_lineage.difference_update(
+                    _loaded_agent_bound_dids(agent)
                 )
-            except BaseException as error:
-                if not _is_lifecycle_terminal_outcome(error):
-                    raise
-                release_failure = error
-                release_cancelled = _contains_lifecycle_cancellation(error)
+                self._revoke_a2a_hosted_policy(agent)
+                if vars(agent).get("_agent_manager") is self:
+                    agent._agent_manager = None
+                if shutdown_handed_off:
+                    # Keep both quarantine handoffs under the same lock that
+                    # linearizes terminal sealing.  This synchronous fence is
+                    # still immediately after routing withdrawal, as before.
+                    budget_handed_off = (
+                        self._handoff_child_budget_release_to_quarantined_reaper(
+                            name, agent_id=_loaded_agent_did(agent) or "<unknown>"
+                        )
+                    )
+                if not budget_handed_off:
+                    # Admission is deliberately before we release ``_lock``. A
+                    # terminal drain that follows routing withdrawal can then
+                    # either observe this exact ordinary release or seal before a
+                    # removal begins; it can never see both routing and the hold
+                    # gone while this task is still unowned.
+                    ordinary_budget_release = self._start_child_budget_release(name)
+                logger.info(f"Agent '{name}' shut down")
+
+            # Release THIS agent's own budget hold AFTER it is stopped (#2113):
+            # releasing before shutdown would let a still-running child spend
+            # already-refunded funds. remove_agent is a SINGLE-AGENT primitive — it
+            # does not cascade. Budgeted subtrees are torn down via terminate_child
+            # (cascade) or shutdown_all (leaf-first), which release nested holds in
+            # the correct order; directly remove_agent-ing a budgeted PARENT is not a
+            # supported budget teardown (folded into #2348 with reload durability).
+            # Idempotent — a no-op when those paths already released this entry.
+            # The routing entry is gone, so this release is now the last mutation
+            # required for removal.  Retain its task through repeated cancellation
+            # before propagating cancellation to the caller; otherwise a closed
+            # child can strand its delegated hold.
+            # The shutdown reaper proves the agent's durable owner/storage are
+            # retained, but a still-running cognition can also be blocked inside
+            # DelegatedWallet.spend(). In that case the budget handoff above keeps
+            # DELETE bounded. Otherwise this is the same ordinary stop-then-
+            # release task DELETE has always joined, now admitted early enough for
+            # a terminal manager drain to join it too.
+            release_cancelled = False
+            release_failure: Optional[BaseException] = None
+            release_withdrawal: Optional[asyncio.CancelledError] = None
+            if ordinary_budget_release is not None:
+                try:
+                    release_cancelled = (
+                        await self._await_child_budget_release_cancellation_safe(
+                            ordinary_budget_release.task, withdrawals=removal_withdrawals,
+                        )
+                    )
+                except BaseException as exc:
+                    if not _is_lifecycle_terminal_outcome(exc):
+                        raise
+                    # The task completion callback has already retained bounded
+                    # unsafe-refund evidence. Continue reconciliation so a runtime
+                    # offboarding failure cannot be hidden by this independent
+                    # budget failure, then surface both below.
+                    if isinstance(exc, asyncio.CancelledError) and not is_execution_control_error(exc):
+                        release_withdrawal = exc
+                    else:
+                        release_failure = exc
+                    release_cancelled = _contains_lifecycle_cancellation(exc)
+            # Direct DELETE is also a supported child-removal path. Reconcile its
+            # parent edge before releasing the same A2A lifecycle boundary used by
+            # name admission. Quarantined cleanup remains reserved because the
+            # pruning predicate treats its live reaper as authoritative ownership.
             reconciliation_cancelled = False
             reconciliation_failure = None
             reconciliation_withdrawals = removal_withdrawals
@@ -9795,342 +10105,43 @@ class AgentManager:
                 if not _is_lifecycle_terminal_outcome(error):
                     raise
                 reconciliation_failure = error
-            terminal = execution_terminal_error(
-                release_failure, reconciliation_failure,
-                unpublished_offboarding_failure, *reconciliation_withdrawals,
-                retain_originals=True,
-                prefer_cancellation=True, isolate_control_originals=True,
+            removal_cancelled = (
+                caller_cancelled or release_cancelled or reconciliation_cancelled
             )
-            if terminal is not None:
-                raise terminal
-            if release_cancelled or reconciliation_cancelled:
-                raise asyncio.CancelledError()
+            terminal_outcomes: list[BaseException] = []
+            if removal_cancelled and not reconciliation_withdrawals:
+                terminal_outcomes.append(release_withdrawal or asyncio.CancelledError())
+            elif release_withdrawal is not None:
+                terminal_outcomes.append(release_withdrawal)
+            terminal_outcomes.extend(reconciliation_withdrawals)
+            if release_failure is not None:
+                terminal_outcomes.append(release_failure)
+            if reconciliation_failure is not None:
+                terminal_outcomes.append(reconciliation_failure)
+            if handoff_offboarding_pending is not None:
+                terminal_outcomes.append(handoff_offboarding_pending)
+            if reconciliation_withdrawals:
+                terminal = execution_terminal_error(
+                    *terminal_outcomes, retain_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
+                )
+                if terminal is not None:
+                    raise terminal
+            _raise_lifecycle_outcomes(
+                f"Agent {name!r} removal had terminal budget outcomes",
+                terminal_outcomes,
+            )
             return True
-
-        async with self._lock:
-            if self._quarantined_shutdown_handoffs_sealed:
-                logger.warning(
-                    "Refusing removal of agent %r after terminal manager shutdown "
-                    "handoffs were sealed",
-                    name,
-                )
-                return False
-            agent = self._agents.get(name)
-            if agent is None:
-                return False
-
-            # ``wait_for(agent.shutdown())`` loses the actual task on timeout
-            # and on cancellation.  KestrelAgent deliberately runs its
-            # cancellation tail before re-raising, so that task is the primary
-            # evidence that cleanup is terminal even when no deferred
-            # continuation was necessary.
-            shutdown_task = asyncio.create_task(
-                agent.shutdown(), name=f"agent_shutdown:{name}"
-            )
-            shutdown_task.add_done_callback(owned_task_error)
-            caller_cancelled = False
-            shutdown_timed_out = False
-            shutdown_handed_off = False
-            budget_handed_off = False
-            ordinary_budget_release = None
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(shutdown_task), timeout=SHUTDOWN_TIMEOUT
-                )
-            except asyncio.CancelledError as withdrawal:
-                caller_cancelled = asyncio.current_task().cancelling() > 0
-                if caller_cancelled:
-                    removal_withdrawals.append(withdrawal)
-                if not shutdown_task.done():
-                    shutdown_task.cancel()
-                shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
-                    name=name,
-                    agent=agent,
-                    shutdown_task=shutdown_task,
-                    offboard_runtime=offboard_runtime,
-                    retire_persistent_registration=(
-                        offboarding_admission is not None
-                        or self._has_exact_persistent_spawn_registration(
-                            name,
-                            _loaded_agent_did(agent),
-                        )
-                    ),
-                )
-                if (
-                    shutdown_handed_off
-                    and offboard_runtime
-                    and offboarding_admission is not None
-                ):
-                    offboarding_admission.started = True
-                if shutdown_handed_off and offboard_runtime:
-                    handoff_offboarding_pending = RuntimeOffboardingRetainedError(
-                        agent_name=name,
-                        agent_id=_loaded_agent_did(agent) or "<unknown>",
-                        runtime_path=_agent_runtime_path(agent),
-                        cause=RuntimeError(
-                            "runtime offboarding is owned by quarantined shutdown"
-                        ),
-                        cleanup_pending=True,
-                    )
-                if shutdown_handed_off:
-                    logger.warning(
-                        "Agent '%s' shutdown was cancelled; durable cleanup is "
-                        "quarantined while control-plane removal continues.",
-                        name,
-                    )
-                else:
-                    logger.warning(
-                        "Agent '%s' shutdown was cancelled; joining its actual "
-                        "shutdown task and durable cleanup before unpublishing.",
-                        name,
-                    )
-            except asyncio.TimeoutError:
-                shutdown_timed_out = True
-                shutdown_task.cancel()
-                shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
-                    name=name,
-                    agent=agent,
-                    shutdown_task=shutdown_task,
-                    offboard_runtime=offboard_runtime,
-                    retire_persistent_registration=(
-                        offboarding_admission is not None
-                        or self._has_exact_persistent_spawn_registration(
-                            name,
-                            _loaded_agent_did(agent),
-                        )
-                    ),
-                )
-                if (
-                    shutdown_handed_off
-                    and offboard_runtime
-                    and offboarding_admission is not None
-                ):
-                    offboarding_admission.started = True
-                if shutdown_handed_off and offboard_runtime:
-                    handoff_offboarding_pending = RuntimeOffboardingRetainedError(
-                        agent_name=name,
-                        agent_id=_loaded_agent_did(agent) or "<unknown>",
-                        runtime_path=_agent_runtime_path(agent),
-                        cause=TimeoutError(
-                            "runtime offboarding awaits quarantined shutdown"
-                        ),
-                        cleanup_pending=True,
-                    )
-                if shutdown_handed_off:
-                    logger.warning(
-                        "Agent '%s' exceeded its shutdown bound; durable cleanup "
-                        "is quarantined while control-plane removal continues.",
-                        name,
-                    )
-                else:
-                    logger.warning(
-                        "Agent '%s' shutdown timed out; joining its actual "
-                        "shutdown task before deciding removal.",
-                        name,
-                    )
-            except BaseException as exc:
-                # A normal shutdown error has no general proof that the agent
-                # reached its cancellation tail.  Keep the historical safe
-                # behaviour for that case; timeouts/cancellation are handled
-                # below by joining the task that did run the tail.
-                logger.warning(
-                    "Agent '%s' shutdown failed; retaining it until cleanup "
-                    "can be confirmed: %s",
-                    name,
-                    exc,
-                    exc_info=True,
-                )
-                try:
-                    await await_agent_shutdown_completion(
-                        agent, prior_error=exc, withdrawals=removal_withdrawals,
-                    )
-                except BaseException as terminal:
-                    if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
-                        raise
-                    if removal_withdrawals:
-                        raise execution_terminal_error(
-                            terminal, *removal_withdrawals, retain_originals=True,
-                            prefer_cancellation=True, isolate_control_originals=True,
-                        )
-                return False
-
-            if not shutdown_handed_off:
-                (
-                    join_cancelled,
-                    shutdown_failure,
-                ) = await await_lifecycle_task_completion(
-                    shutdown_task, withdrawals=removal_withdrawals,
-                )
-                caller_cancelled = caller_cancelled or join_cancelled
-                try:
-                    caller_cancelled = await await_agent_shutdown_completion(
-                        agent, prior_error=shutdown_failure,
-                        withdrawals=removal_withdrawals,
-                    ) or caller_cancelled
-                except BaseException as terminal:
-                    if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
-                        raise
-                    if removal_withdrawals:
-                        raise execution_terminal_error(
-                            terminal, *removal_withdrawals, retain_originals=True,
-                            prefer_cancellation=True, isolate_control_originals=True,
-                        )
-                    logger.warning(
-                        "Agent '%s' shutdown task failed; retaining it until "
-                        "cleanup can be confirmed: %s",
-                        name,
-                        terminal,
-                        exc_info=(
-                            type(terminal),
-                            terminal,
-                            terminal.__traceback__,
-                        ),
-                    )
-                    return False
-                if shutdown_timed_out and shutdown_failure is None:
-                    logger.warning(
-                        "Agent '%s' exceeded its shutdown budget but completed "
-                        "while being joined; continuing durable cleanup.",
-                        name,
-                    )
-
-                # A tail that spent its dispatcher guard continues in the
-                # agent-owned completion task.  Do not unpublish the agent or
-                # release its delegated budget until that task has released the
-                # owner and closed storage. Legacy lifecycle implementations
-                # remain on this conservative path; KestrelAgent's explicit
-                # handoff contract above is what permits bounded removal.
-                if offboard_runtime:
-                    # Admit the destructive worker while the manager lock still
-                    # linearizes this removal, but never await filesystem I/O
-                    # here. The public wrapper joins it only after scheduler,
-                    # A2A, and manager lifecycle locks have all been released.
-                    pending_offboarding.append(
-                        self._start_agent_runtime_offboarding(
-                            name=name,
-                            agent=agent,
-                            retire_persistent_registration=(
-                                offboarding_admission is not None
-                                or self._has_exact_persistent_spawn_registration(
-                                    name,
-                                    _loaded_agent_did(agent),
-                                )
-                            ),
-                        )
-                    )
-
-            # Successful shutdown always withdraws routing. Requested
-            # offboarding may have completed, failed with retained state, or
-            # been handed to an explicit reaper; none of those states permits
-            # republishing a process whose shutdown already completed.
-            self._agents.pop(name, None)
-            self._agent_names.pop(agent.agent_id, None)
-            self._non_governing_spawn_lineage.difference_update(
-                _loaded_agent_bound_dids(agent)
-            )
-            self._revoke_a2a_hosted_policy(agent)
-            if vars(agent).get("_agent_manager") is self:
-                agent._agent_manager = None
-            if shutdown_handed_off:
-                # Keep both quarantine handoffs under the same lock that
-                # linearizes terminal sealing.  This synchronous fence is
-                # still immediately after routing withdrawal, as before.
-                budget_handed_off = (
-                    self._handoff_child_budget_release_to_quarantined_reaper(
-                        name, agent_id=_loaded_agent_did(agent) or "<unknown>"
-                    )
-                )
-            if not budget_handed_off:
-                # Admission is deliberately before we release ``_lock``. A
-                # terminal drain that follows routing withdrawal can then
-                # either observe this exact ordinary release or seal before a
-                # removal begins; it can never see both routing and the hold
-                # gone while this task is still unowned.
-                ordinary_budget_release = self._start_child_budget_release(name)
-            logger.info(f"Agent '{name}' shut down")
-
-        # Release THIS agent's own budget hold AFTER it is stopped (#2113):
-        # releasing before shutdown would let a still-running child spend
-        # already-refunded funds. remove_agent is a SINGLE-AGENT primitive — it
-        # does not cascade. Budgeted subtrees are torn down via terminate_child
-        # (cascade) or shutdown_all (leaf-first), which release nested holds in
-        # the correct order; directly remove_agent-ing a budgeted PARENT is not a
-        # supported budget teardown (folded into #2348 with reload durability).
-        # Idempotent — a no-op when those paths already released this entry.
-        # The routing entry is gone, so this release is now the last mutation
-        # required for removal.  Retain its task through repeated cancellation
-        # before propagating cancellation to the caller; otherwise a closed
-        # child can strand its delegated hold.
-        # The shutdown reaper proves the agent's durable owner/storage are
-        # retained, but a still-running cognition can also be blocked inside
-        # DelegatedWallet.spend(). In that case the budget handoff above keeps
-        # DELETE bounded. Otherwise this is the same ordinary stop-then-
-        # release task DELETE has always joined, now admitted early enough for
-        # a terminal manager drain to join it too.
-        release_cancelled = False
-        release_failure: Optional[BaseException] = None
-        release_withdrawal: Optional[asyncio.CancelledError] = None
-        if ordinary_budget_release is not None:
-            try:
-                release_cancelled = (
-                    await self._await_child_budget_release_cancellation_safe(
-                        ordinary_budget_release.task, withdrawals=removal_withdrawals,
-                    )
-                )
-            except BaseException as exc:
-                if not _is_lifecycle_terminal_outcome(exc):
-                    raise
-                # The task completion callback has already retained bounded
-                # unsafe-refund evidence. Continue reconciliation so a runtime
-                # offboarding failure cannot be hidden by this independent
-                # budget failure, then surface both below.
-                if isinstance(exc, asyncio.CancelledError) and not is_execution_control_error(exc):
-                    release_withdrawal = exc
-                else:
-                    release_failure = exc
-                release_cancelled = _contains_lifecycle_cancellation(exc)
-        # Direct DELETE is also a supported child-removal path. Reconcile its
-        # parent edge before releasing the same A2A lifecycle boundary used by
-        # name admission. Quarantined cleanup remains reserved because the
-        # pruning predicate treats its live reaper as authoritative ownership.
-        reconciliation_cancelled = False
-        reconciliation_failure = None
-        reconciliation_withdrawals = removal_withdrawals
-        try:
-            reconciliation_cancelled = await self._reconcile_fully_removed_child_tracking(
-                withdrawals=reconciliation_withdrawals,
-            )
         except BaseException as error:
-            if not _is_lifecycle_terminal_outcome(error):
-                raise
-            reconciliation_failure = error
-        removal_cancelled = (
-            caller_cancelled or release_cancelled or reconciliation_cancelled
-        )
-        terminal_outcomes: list[BaseException] = []
-        if removal_cancelled and not reconciliation_withdrawals:
-            terminal_outcomes.append(release_withdrawal or asyncio.CancelledError())
-        elif release_withdrawal is not None:
-            terminal_outcomes.append(release_withdrawal)
-        terminal_outcomes.extend(reconciliation_withdrawals)
-        if release_failure is not None:
-            terminal_outcomes.append(release_failure)
-        if reconciliation_failure is not None:
-            terminal_outcomes.append(reconciliation_failure)
-        if handoff_offboarding_pending is not None:
-            terminal_outcomes.append(handoff_offboarding_pending)
-        if reconciliation_withdrawals:
-            terminal = execution_terminal_error(
-                *terminal_outcomes, retain_originals=True,
-                prefer_cancellation=True, isolate_control_originals=True,
-            )
-            if terminal is not None:
-                raise terminal
-        _raise_lifecycle_outcomes(
-            f"Agent {name!r} removal had terminal budget outcomes",
-            terminal_outcomes,
-        )
-        return True
+            # Every exceptional exit after captured withdrawal belongs to the
+            # SAME finite removal observer, including later admission refusal.
+            # Never attach caller-private cancellation to the shared latch.
+            if removal_withdrawals:
+                raise execution_terminal_error(
+                    error, *removal_withdrawals, retain_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
+                )
+            raise
 
     def _allocate_port(self) -> int:
         """Pick the first FREE in-range agent port and reserve it.

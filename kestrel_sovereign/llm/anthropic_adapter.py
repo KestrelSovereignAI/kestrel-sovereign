@@ -55,7 +55,7 @@ import sys
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.execution_custody import (
     owned_native_http_client,
-    native_execution_response_owner,
+    native_execution_response_owner, native_sdk_operation,
     retain_native_execution_http_client_close,
     is_execution_control_error,
 )
@@ -587,6 +587,7 @@ class AnthropicAdapter(LLMAdapter):
         """Remember the output ceiling each discovered model reports."""
         self._output_ceilings.learn(models)
 
+    @native_sdk_operation
     async def _model_output_ceiling(
         self,
         client: Any,
@@ -745,6 +746,7 @@ class AnthropicAdapter(LLMAdapter):
             features |= {"token_counting", "raw_passthrough"}
         return frozenset(features)
 
+    @native_sdk_operation
     async def count_tokens(
         self,
         client: Any,
@@ -794,6 +796,7 @@ class AnthropicAdapter(LLMAdapter):
                 out[key] = value
         return out
 
+    @native_sdk_operation
     async def raw_request(
         self,
         client: Any,
@@ -1353,6 +1356,7 @@ class AnthropicAdapter(LLMAdapter):
                 })
         return anthropic_tools
 
+    @native_sdk_operation
     async def get_response(
         self,
         client: Any,
@@ -2036,6 +2040,7 @@ class AnthropicAdapter(LLMAdapter):
             **kwargs
         )
 
+    @native_sdk_operation
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from Anthropic API.
 

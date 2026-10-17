@@ -19,6 +19,7 @@ from tests.integration.test_budget_refund_original_control import registered_cle
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
 from tests.integration.test_execution_custody_review56_pg import lose_native_ack
 from tests.unit.test_host_context_native_cleanup import _actual_operation
+from kestrel_sovereign import _async_ownership as ownership
 
 
 @pytest.mark.asyncio
@@ -26,6 +27,7 @@ from tests.unit.test_host_context_native_cleanup import _actual_operation
     ("direct", "unknown"), ("owned", "unknown"),
     ("direct", "withdrawal"), ("owned", "withdrawal"),
     ("owned", "admission"), ("owned", "publication"),
+    ("shutdown", "unknown"),
 ])
 async def test_uncertain_original_reservation_repair_is_not_retried_or_normalized(
     native_pg, tmp_path, monkeypatch, route, control,
@@ -56,6 +58,40 @@ async def test_uncertain_original_reservation_repair_is_not_retried_or_normalize
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     accepted, refused = [], []
     allocation = RuntimeError("original native reservation repair admission/publication refused")
+    admission_entered, admission_release, shutdown_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    admitted = shutdown_observer = None
+    shutdown_withdrawals = []
+    actual_shield = asyncio.shield
+    actual_join = ownership.await_owned_task
+
+    async def observed_join(completion, *args, **kwargs):
+        selected = asyncio.current_task() is shutdown_observer and completion is dispatcher._durable_shutdown_completion
+        if selected:
+            shutdown_entered.set()
+        try:
+            return await actual_join(completion, *args, **kwargs)
+        except asyncio.CancelledError as cancellation:
+            if selected:
+                shutdown_withdrawals.append(cancellation)
+            raise
+
+    async def previously_admitted():
+        async with dispatcher._admit_durable_operation():
+            admission_entered.set()
+            await admission_release.wait()
+
+    def observed_shield(completion):
+        future = actual_shield(completion)
+        if asyncio.current_task() is shutdown_observer and completion is dispatcher._durable_shutdown_completion:
+            async def observe():
+                shutdown_entered.set()
+                try:
+                    return await future
+                except asyncio.CancelledError as cancellation:
+                    shutdown_withdrawals.append(cancellation)
+                    raise
+            return observe()
+        return future
 
     class RefusedPublication(set):
         def add(self, task):
@@ -102,6 +138,9 @@ async def test_uncertain_original_reservation_repair_is_not_retried_or_normalize
                 await dispatcher._repair_post_commit_reservations(persisted)
 
     try:
+        if route == "shutdown":
+            admitted = create_owned_task(previously_admitted(), retain_originals=True)
+            await asyncio.wait_for(admission_entered.wait(), 5)
         if control == "admission":
             loop.set_task_factory(factory)
         elif control == "publication":
@@ -156,10 +195,39 @@ async def test_uncertain_original_reservation_repair_is_not_retried_or_normalize
         )
         assert tuple(row) == ("retry", None, None), "the original owner/token CAS did not physically commit"
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".durable_signal_events') == 1
+        if route == "shutdown":
+            monkeypatch.setattr(asyncio, "shield", observed_shield)
+            monkeypatch.setattr(ownership, "await_owned_task", observed_join)
+            shutdown_observer = create_owned_task(dispatcher.shutdown_durable_delivery(), retain_originals=True)
+            await asyncio.wait_for(shutdown_entered.wait(), 5)
+            completion = dispatcher._durable_shutdown_completion
+            assert completion is not None and not completion.done()
+            shutdown_observer.cancel("actual outer repair-to-shutdown observer withdrew")
+            observed = await await_owned_task(shutdown_observer)
+            public_chain = tuple(_explicit_control_chain(observed.error))
+            assert len(shutdown_withdrawals) == 1 and shutdown_withdrawals[0] in public_chain, "shutdown observer discarded its actual withdrawal beside retained CAS uncertainty"
+            assert originals[0] in public_chain and execution_commit_outcome(observed.error) == "unknown"
+            assert shutdown_withdrawals[0] not in tuple(_explicit_control_chain(dispatcher._outcome_log_control_error))
+            assert not completion.done() and not completion.cancelled(), "public observer adopted the existing shutdown completion owner"
+            admission_release.set()
+            await await_owned_task(admitted)
+            completed = await await_owned_task(completion)
+            assert is_execution_control_error(completed.error)
+            assert shutdown_withdrawals[0] not in tuple(_explicit_control_chain(completed.error))
+            assert tuple(_explicit_control_chain(originals[0])) == source_graphs[0]
+            assert tuple(execution_cleanup_debts(originals[0])) == source_debts[0]
+            assert await observer.fetchval(f'SELECT stopped_at FROM "{schema}".durable_signal_runtime_owners WHERE agent_id=$1 AND owner_id=$2', child.did, dispatcher._durable_delivery_owner) is None
     finally:
         loop.set_task_factory(previous)
+        admission_release.set()
         if owner is not None:
             await await_owned_task(owner)
+        if admitted is not None:
+            await await_owned_task(admitted)
+        if shutdown_observer is not None:
+            await await_owned_task(shutdown_observer)
+        if dispatcher._durable_shutdown_completion is not None:
+            await await_owned_task(dispatcher._durable_shutdown_completion)
         for task in accepted:
             await await_owned_task(task)
         for pair in refused:

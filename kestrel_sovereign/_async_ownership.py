@@ -740,6 +740,7 @@ async def await_owned_task(
     pending_cancellation: asyncio.CancelledError | None = None,
     *,
     cancel_on_caller_cancellation: bool | Callable[[asyncio.Future[_T]], None] = False,
+    defer_cancellation: bool = True,
 ) -> OwnedTaskOutcome[_T]:
     """Retrieve ``task`` despite repeated cancellation of its caller.
 
@@ -760,8 +761,14 @@ async def await_owned_task(
     routes that first request through the original lifecycle owner's delivery
     policy. A failed forwarder cannot abandon the operation: its error is
     selected with the original task outcome only after physical joining.
-    """
 
+    A borrowed observer can set ``defer_cancellation=False``: it neither
+    cancels nor adopts the original Task, and actual caller withdrawal escapes
+    immediately. The successful completion signal still avoids shield's
+    synthetic cancellation when the original Task itself was cancelled.
+    """
+    if not defer_cancellation and (cancel_on_caller_cancellation or pending_cancellation is not None):
+        raise ValueError("borrowed observation cannot forward or own pending cancellation")
     completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def mark_complete(_task: asyncio.Future[_T]) -> None:
@@ -776,6 +783,8 @@ async def await_owned_task(
             try:
                 await asyncio.shield(completion)
             except asyncio.CancelledError as error:
+                if not defer_cancellation:
+                    raise
                 if pending_cancellation is None:
                     pending_cancellation = error
                 if (callable(cancel_on_caller_cancellation) or cancel_on_caller_cancellation) and not cancellation_forwarded:

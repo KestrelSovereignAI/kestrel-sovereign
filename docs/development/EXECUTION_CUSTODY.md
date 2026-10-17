@@ -1758,3 +1758,33 @@ Paired Hold probes are lazy owned operations at every consumer. Partial Task
 admission joins accepted peers before backend retirement; later peer control
 and actual withdrawals survive finite terminal selection. Failed same-cluster
 preflight tests do not establish successful independent-cluster Hold boot.
+
+The original removal withdrawal collector also governs exceptional exits,
+not only its final success/reconciliation tail. A later quarantine-refund
+admission refusal therefore preserves the already-observed caller cancellation
+without appending it to the shared refund source. The public durable-shutdown
+observer uses the same finite isolation policy beside retained repair control;
+its cancellation neither cancels nor replaces the original completion owner.
+Canonical Task observation supports this borrowed policy explicitly: actual
+caller withdrawal returns immediately, while a successful completion signal
+avoids replacing a cancelled source with shield's synthetic cancellation. The
+default remains an owning physical join; borrowing cannot forward or own a
+pending cancellation request.
+
+### SDK retry and normalization boundaries
+
+Non-stream OpenAI/Anthropic SDK operations share the existing native-response
+owner across their SDK attempts. The HTTPX `send` boundary records actual
+transport, eager-body and async-observer control before SDK normalization; a
+retry checks that same operation's original control before dispatch. This is
+per-operation evidence, never client-wide poisoning or new work authority.
+Fresh caller scopes can reuse the same healthy shared client. Streaming keeps
+its existing explicit acquisition/transfer boundaries; private/temporary SDK
+client-lifetime inventory is a separate acceptance requirement.
+
+The [official Python SDK retry contract](https://developers.openai.com/api/reference/python#retries)
+documents configurable automatic retries. Installed OpenAI2.46.0 and Anthropic
+behavior is measured separately against localhost with real PostgreSQL ACK-loss
+receipts, including independently produced original receipts and actual
+cause-bearing Task cancellation. These tests make no paid provider requests
+and do not claim newer SDK transport/error contracts were exercised.

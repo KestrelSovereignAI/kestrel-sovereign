@@ -75,7 +75,7 @@ from .output_ceiling import (
 from .retry import with_retry
 from kestrel_sovereign.execution_custody import (
     owned_native_http_client,
-    native_execution_response_owner,
+    native_execution_response_owner, native_sdk_operation,
     close_native_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
 )
 
@@ -395,6 +395,7 @@ class OpenAIAdapter(LLMAdapter):
             model=getattr(response, "model", None),
         )
 
+    @native_sdk_operation
     async def aembed(
         self,
         client: openai.AsyncOpenAI,
@@ -426,6 +427,7 @@ class OpenAIAdapter(LLMAdapter):
         embedding = getattr(data[0], "embedding", None)
         return list(embedding) if embedding is not None else None
 
+    @native_sdk_operation
     async def aembed_batch(
         self,
         client: openai.AsyncOpenAI,
@@ -489,6 +491,7 @@ class OpenAIAdapter(LLMAdapter):
             caller_budget=caller_budget,
         )
 
+    @native_sdk_operation
     async def get_response(
         self,
         client: openai.AsyncOpenAI,
@@ -1140,6 +1143,7 @@ class OpenAIAdapter(LLMAdapter):
             "total_tokens": total,
         }
 
+    @native_sdk_operation
     async def batch_submit(
         self,
         client: Any,
@@ -1182,11 +1186,13 @@ class OpenAIAdapter(LLMAdapter):
         batch = await with_retry(client.batches.create, **batch_kwargs)
         return self._batch_handle(batch)
 
+    @native_sdk_operation
     async def batch_poll(self, client: Any, handle: Any, **kwargs: Any) -> Any:
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         batch = await with_retry(client.batches.retrieve, getattr(handle, "id", handle))
         return self._batch_handle(batch)
 
+    @native_sdk_operation
     async def batch_results(self, client: Any, handle: Any, **kwargs: Any) -> List[Any]:
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         raw_handle = getattr(handle, "raw", None) or handle
@@ -1237,11 +1243,13 @@ class OpenAIAdapter(LLMAdapter):
                 )
         return results
 
+    @native_sdk_operation
     async def batch_cancel(self, client: Any, handle: Any, **kwargs: Any) -> Any:
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         batch = await with_retry(client.batches.cancel, getattr(handle, "id", handle))
         return self._batch_handle(batch)
 
+    @native_sdk_operation
     async def file_upload(
         self,
         client: Any,
@@ -1258,16 +1266,19 @@ class OpenAIAdapter(LLMAdapter):
         )
         return self._file_ref(uploaded)
 
+    @native_sdk_operation
     async def file_list(self, client: Any, **kwargs: Any) -> List[Any]:
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.list, **kwargs)
         return [self._file_ref(item) for item in getattr(response, "data", [])]
 
+    @native_sdk_operation
     async def file_get(self, client: Any, file_id: str, **kwargs: Any) -> Any:
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.retrieve, file_id)
         return self._file_ref(response)
 
+    @native_sdk_operation
     async def file_delete(self, client: Any, file_id: str, **kwargs: Any) -> bool:
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.delete, file_id)
@@ -1385,6 +1396,7 @@ class OpenAIAdapter(LLMAdapter):
                     out[key] = value
         return out
 
+    @native_sdk_operation
     async def raw_request(
         self,
         client: Any,
@@ -1409,6 +1421,7 @@ class OpenAIAdapter(LLMAdapter):
             return RawResponse(operation=operation, data=data, raw=data)
         return {"operation": operation, "data": data, "raw": data}
 
+    @native_sdk_operation
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from OpenAI API (or any OpenAI-compatible
         endpoint the route was initialized against).
@@ -1509,6 +1522,7 @@ class OpenAIAdapter(LLMAdapter):
     #: omits embedding models, so it needs a dedicated call.
     derives_embeddings_from_chat_listing: bool = True
 
+    @native_sdk_operation
     async def list_embedding_models(
         self, client: Any = None, chat_models: Any = None
     ) -> List["EmbeddingModelInfo"]:

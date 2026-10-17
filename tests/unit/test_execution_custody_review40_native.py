@@ -8,6 +8,9 @@ import openai
 import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain, execution_cleanup_debts, execution_commit_outcome,
+)
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.openrouter_adapter import OpenRouterAdapter
 from tests.unit.test_execution_custody_review32 import receipt
@@ -61,6 +64,9 @@ async def test_native_post_commit_paths_retain_strongest_original_control(
     from kestrel_sovereign.privacy import get_privacy_preset
     c = dispatcher_components
     original, effects = receipt(kind), []
+    source_graph = tuple(_explicit_control_chain(original))
+    source_debts = tuple(execution_cleanup_debts(original))
+    opening_failure = OSError("ordinary activation failed")
     if boundary == "legacy":
         from kestrel_sovereign.signals.sources.channels import (
             DURABLE_COGNITION_CONSUMER_ID,
@@ -98,7 +104,7 @@ async def test_native_post_commit_paths_retain_strongest_original_control(
     async def activate_then_receipt(*args, **kwargs):
         await activate(*args, **kwargs)
         effects.append(args[0].created)
-        raise original if boundary == "activation" else OSError("ordinary activation failed")
+        raise original if boundary == "activation" else opening_failure
     async def repair_then_receipt(*args, **kwargs):
         await repair(*args, **kwargs)
         raise original
@@ -110,7 +116,13 @@ async def test_native_post_commit_paths_retain_strongest_original_control(
         for wait in (handle.wait, handle.wait_for_durable_admission):
             with pytest.raises(BaseException) as caught:
                 await wait()
-            assert caught.value is original
+            chain = tuple(_explicit_control_chain(caught.value))
+            assert original in chain
+            if boundary == "repair":
+                assert opening_failure in chain
+            assert execution_commit_outcome(caught.value) == "unknown"
+            assert tuple(_explicit_control_chain(original)) == source_graph
+            assert tuple(execution_cleanup_debts(original)) == source_debts
         assert effects == [True]
     finally:
         await c.dispatcher.shutdown_durable_delivery()

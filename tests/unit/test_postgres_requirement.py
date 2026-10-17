@@ -138,6 +138,8 @@ def test_actual_native_consumers_are_marked_before_deselection(tmp_path, selecti
         "        if 'native_pg' in item.fixturenames:\n"
         "            assert item.get_closest_marker('native_postgres'), "
         "'native marker was not available to first-priority collection consumers'\n"
+        "def pytest_collection_finish(session):\n"
+        "    print('NATIVE_SELECTED_COUNT=' + str(len(session.items)))\n"
     )
     env = {key: os.environ[key] for key in ("HOME", "PATH", "SYSTEMROOT") if key in os.environ}
     env.update(PYTHONPATH=os.pathsep.join((str(root), str(tmp_path))), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
@@ -151,8 +153,11 @@ def test_actual_native_consumers_are_marked_before_deselection(tmp_path, selecti
         cwd=root, env=env, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == status, result.stdout + result.stderr
-    selected = [line for line in result.stdout.splitlines() if line.startswith("tests/integration/")]
-    assert len(selected) == count, "native fixture consumers were not marked before selection"
+    # Human warnings can begin with tests/integration/path.py:line too. Read
+    # the actual post-deselection session count, never those display lines.
+    selected = [line.removeprefix("NATIVE_SELECTED_COUNT=") for line in result.stdout.splitlines()
+                if line.startswith("NATIVE_SELECTED_COUNT=")]
+    assert selected == [str(count)], "native fixture consumers were not marked before selection"
 
 
 def test_a_postgres_case_may_still_skip_when_not_required(monkeypatch):

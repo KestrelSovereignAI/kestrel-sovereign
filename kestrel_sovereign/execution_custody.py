@@ -1002,6 +1002,19 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         require_original_native_work()
 
     native_dispatch = client._send_single_request
+    native_send = client.send
+
+    async def send_with_original_control(*args, **kwargs):
+        # The SDK's retry/normalization boundary surrounds HTTPX.send, not
+        # only the socket dispatch. Async response observers and eager body
+        # reads can fail AFTER a real effect, before an SDK sees the result.
+        try:
+            return await native_send(*args, **kwargs)
+        except BaseException as original:
+            sink = _NATIVE_RESPONSE_SINK.get()
+            if sink is not None:
+                sink.retain_control(original)
+            raise
 
     async def dispatch_after_observers(request):
         # HTTPX runs every request observer before this native boundary. A
@@ -1014,12 +1027,16 @@ def retain_native_execution_http_client_close(client: Any) -> None:
             return await native_dispatch(request)
 
     def require_original_native_work():
+        sink = _NATIVE_RESPONSE_SINK.get()
+        if sink is not None and sink.control is not None:
+            # A retry belongs to this SAME operation, not a fresh admission.
+            # Do not replace its original failure with a later scope denial.
+            raise retained_execution_error(sink.control)
         try:
             require_execution_work()
         except BaseException as original:
-            sink = _NATIVE_RESPONSE_SINK.get()
             if sink is not None:
-                sink.control = execution_terminal_error(sink.control, original)
+                sink.retain_control(original)
             raise
 
     # A caller's existing observer may itself read/close the response, or
@@ -1027,6 +1044,7 @@ def retain_native_execution_http_client_close(client: Any) -> None:
     client.event_hooks["response"].insert(0, retain_response)
     client.event_hooks["request"].insert(0, require_request_authority)
     client._send_single_request = dispatch_after_observers
+    client.send = send_with_original_control
     client._kestrel_native_close_hook = retain_response
 
 
@@ -1102,6 +1120,14 @@ class NativeExecutionStreamOwner:
             self.handles.append(handle)
         return handle
 
+    def retain_control(self, error):
+        """Keep finite originals before an SDK can normalize or retry them."""
+        if is_execution_control_error(error):
+            self.control = execution_terminal_error(
+                self.control, error, retain_originals=True,
+                isolate_control_originals=True,
+            )
+
     async def close(self, original=None):
         # SDKs can wrap a hook's original denial as APIConnectionError. The
         # physical response owner retains the exact pre-normalization receipt.
@@ -1150,6 +1176,22 @@ async def native_execution_response_owner(client: Any):
             await owner.close(original)
         finally:
             _NATIVE_RESPONSE_SINK.reset(token)
+
+
+def native_sdk_operation(function: Callable) -> Callable:
+    """Keep one native-response owner around a complete non-stream SDK call.
+
+    SDK retry/normalization happens inside the adapter operation. The same
+    owner therefore spans those attempts, including asynchronously observed
+    failures before an SDK has returned a response to its adapter. Streams
+    keep their existing explicit acquisition/transfer boundary instead.
+    """
+    @wraps(function)
+    async def guarded(self, *args, **kwargs):
+        client = args[0] if args else kwargs.get("client")
+        async with native_execution_response_owner(getattr(client, "_client", None)):
+            return await function(self, *args, **kwargs)
+    return guarded
 
 
 @asynccontextmanager

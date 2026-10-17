@@ -1,4 +1,4 @@
-"""Contract tests for cancellation-safe ownership of internal tasks."""
+"""Contract tests for cancellation-safe ownership and borrowed observation."""
 
 from __future__ import annotations
 
@@ -21,6 +21,62 @@ from kestrel_sovereign._async_ownership import (
     raise_owned_outcome,
     run_blocking_operation,
 )
+
+
+@pytest.mark.asyncio
+async def test_borrowed_observation_withdraws_without_cancelling_or_joining_original():
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def original():
+        await release.wait()
+        return "original result"
+
+    source = create_owned_task(original(), retain_originals=True)
+
+    async def observe():
+        entered.set()
+        return await await_owned_task(source, defer_cancellation=False)
+
+    observer = create_owned_task(observe(), retain_originals=True)
+    try:
+        await entered.wait()
+        observer.cancel("actual borrowed observer withdrew")
+        observed = await await_owned_task(observer)
+        assert isinstance(observed.error, asyncio.CancelledError)
+        assert observed.error.args == ("actual borrowed observer withdrew",)
+        assert not source.done() and not source.cancelling()
+        release.set()
+        assert (await await_owned_task(source)).result == "original result"
+    finally:
+        release.set()
+        await await_owned_task(observer)
+        await await_owned_task(source)
+
+
+@pytest.mark.asyncio
+async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate():
+    original = asyncio.CancelledError("original source cancellation")
+    cause = OSError("original source cause")
+
+    async def exit():
+        raise original from cause
+
+    source = create_owned_task(exit(), retain_originals=True)
+    await await_owned_task(source)
+    observed = await await_owned_task(source, defer_cancellation=False)
+    assert observed.error is original and observed.error.__cause__ is cause
+    assert observed.cancellation is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["pending", "forwarding"])
+async def test_borrowed_observation_refuses_owning_or_forwarding_cancellation(mode):
+    source = asyncio.get_running_loop().create_future()
+    kwargs = ({"pending_cancellation": asyncio.CancelledError("already owned")}
+              if mode == "pending" else {"cancel_on_caller_cancellation": True})
+    with pytest.raises(ValueError, match="borrowed observation"):
+        await await_owned_task(source, defer_cancellation=False, **kwargs)
+    assert not source.done()
 
 
 @pytest.mark.asyncio

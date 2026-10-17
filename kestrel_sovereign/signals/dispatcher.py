@@ -2530,13 +2530,20 @@ class SignalDispatcher:
 
     async def _await_durable_shutdown_completion(self, completion):
         """Keep retained control ahead of shield's synthetic cancellation."""
+        from kestrel_sovereign._async_ownership import await_owned_task
         try:
-            await asyncio.shield(completion)
+            outcome = await await_owned_task(completion, defer_cancellation=False)
+            if outcome.error is not None:
+                raise outcome.error
         except BaseException as error:
             from kestrel_sovereign._async_ownership import owned_task_error
             debt = tuple(original for _, original in self._retained_cognition_control_debt.values())
             completed_error = owned_task_error(completion) if completion.done() else None
-            raise execution_terminal_error(*debt, self._outcome_log_control_error, completed_error, error)
+            raise execution_terminal_error(
+                *debt, self._outcome_log_control_error, completed_error, error,
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
 
     def _start_durable_shutdown_completion(self) -> asyncio.Task[None]:
         """Close durable admission and return the one owned teardown task.
