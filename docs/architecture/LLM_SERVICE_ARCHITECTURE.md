@@ -325,6 +325,11 @@ before cleanup ownership exists. Before-Task refusal retains client/None debt;
 failed receipt publication retains the accepted start-gated Task. Failed closes
 are never repeated. Body, physical-close and actual joiner withdrawal are finite
 isolated evidence, not private cleanup appended to a shared source error.
+Successful physical pool retirement removes obsolete client ownership, but
+first retains independent canonical publication control at the adapter. That
+control fences new private discovery and survives repeated adapter/service
+shutdown. Its finite history is bounded by borrowers admitted before fencing;
+actual joiner withdrawal stays local to its caller and invents no pool debt.
 
 The process-wide background catalog refresh has one original Task and one
 bounded strongest nonlocal-control receipt. Completion callbacks and concurrent

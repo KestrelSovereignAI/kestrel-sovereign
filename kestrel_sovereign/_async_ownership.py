@@ -22,6 +22,10 @@ _T = TypeVar("_T")
 _ITERATOR_TERMINAL = object()
 _ITERATOR_INTERRUPTED = object()
 _TASK_ERROR_UNSET = object()
+# Only used when publication of the completion callback itself failed. A
+# timer yields to the SAME native owner without another Task/collector or a
+# hot zero-delay loop; ordinary joins remain completion-driven.
+_OWNED_COMPLETION_RECHECK_SECONDS = 0.01
 
 
 @contextmanager
@@ -807,11 +811,22 @@ async def await_owned_task(
 
     cancellation_forwarded = False
     forwarding_error: BaseException | None = None
-    task.add_done_callback(mark_complete)
+    publication_errors = []
+    try:
+        task.add_done_callback(mark_complete)
+    except BaseException as error:
+        publication_errors.append(error)
     try:
         while not task.done():
+            if publication_errors and not defer_cancellation:
+                # This is explicitly a borrowed observer, not its native
+                # lifecycle owner. Its original owner retains the must-join.
+                break
             try:
-                await asyncio.shield(completion)
+                if publication_errors:
+                    await asyncio.sleep(_OWNED_COMPLETION_RECHECK_SECONDS)
+                else:
+                    await asyncio.shield(completion)
             except asyncio.CancelledError as error:
                 if not defer_cancellation:
                     raise
@@ -829,9 +844,25 @@ async def await_owned_task(
                     except BaseException as failure:  # noqa: BLE001 - forwarding failure cannot abandon its owner
                         forwarding_error = failure
     finally:
-        task.remove_done_callback(mark_complete)
+        try:
+            task.remove_done_callback(mark_complete)
+        except BaseException as error:
+            publication_errors.append(error)
 
+    if not task.done():
+        # Only an explicitly borrowed observer may leave before settlement.
+        assert not defer_cancellation and publication_errors
+        raise (publication_errors[0] if len(publication_errors) == 1 else
+               BaseExceptionGroup("borrowed completion publication failed", publication_errors))
     error = owned_task_error(task)
+    if publication_errors:
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        failures = ([error] if error is not None else []) + publication_errors
+        error = execution_terminal_error(
+            failures[0] if len(failures) == 1 else
+            BaseExceptionGroup("original completion publication evidence", failures),
+            retain_originals=True, isolate_control_originals=True,
+        )
     if forwarding_error is not None:
         from kestrel_sovereign.execution_custody import execution_terminal_error
         error = execution_terminal_error(error, forwarding_error)

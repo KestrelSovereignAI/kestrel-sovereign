@@ -280,6 +280,7 @@ async def test_actual_batch_cancel_preserves_unpublished_native_cleanup_receipt(
     manager = AgentManager(base_data_dir=tmp_path)
     second_entered, release, closing = (asyncio.Event() for _ in range(3))
     failure = receipt(kind)
+    original = OriginalFailure.capture(failure)
 
     async def initialize(name, *_args, **_kwargs):
         await _BATCH_STAGE_CALLBACK.get()(name, agent if name == "Alpha" else None)
@@ -316,7 +317,7 @@ async def test_actual_batch_cancel_preserves_unpublished_native_cleanup_receipt(
         release.set()
         outcome = await await_owned_task(batch)
         assert db.backend._connection is None and not manager.list_agents()
-        assert outcome.error is failure, "batch boundary demoted original native receipt to cancellation"
+        original.assert_retained(outcome.error)
     finally:
         release.set()
         await await_owned_task(batch)

@@ -877,6 +877,24 @@ after all independent cleanup joins. Isolated stage, promote, abort and legacy
 authority reconciliation likewise quarantine without retrying a native
 uncertainty as a fresh read/CAS. Lifecycle deadlines retain the first child
 receipt without accumulating abandoned waiter callbacks or reader tracebacks.
+Provisional host onboarding keeps its original rollback record before Task
+admission. Refused admission closes the unstarted coroutine; accepted callback
+publication failure joins that same start-gated Task. Failed rollback remains
+in the original agent slot and cannot be committed or retried as a new native
+attempt. Batch initialization inventories acceptance inside its protected
+lifetime and releases the construction barrier before joining cancellation
+unwind; an already-cancelling initializer never receives a second interrupt.
+If a Task rejects the canonical join's completion callback, the must-join owner
+retains that publication error and observes the same Task through a yielding
+timer, without a replacement collector, native cancellation or zero-delay
+loop. Explicitly borrowed observers retain their non-owning withdrawal policy.
+Agent shutdown gives each accepted prefix cleanup one scheduling opportunity,
+including a step reached after the live prefix budget has expired. That turn
+is charged to the existing absolute slice, not a renewed timeout. Its deadline
+timer and actual observer withdrawals share one cooperative interrupt; the
+same native Task is then joined through repeated cancellation before durable
+storage is closed. Refused admission closes the original coroutine, and failed
+publication joins the accepted start gate instead of losing its native error.
 Explicit terminal retirement retries serialize on the same exact-client lock;
 another owner's uncertain stop cannot silently skip that fresh bounded retry.
 Agent, Feature and A2A background owners retain one strongest control receipt

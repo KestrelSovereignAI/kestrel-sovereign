@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
@@ -640,6 +640,57 @@ class TerminalDescendantSpawnFence:
 
     parent_did: str
     nonce: int
+
+
+@dataclass(slots=True)
+class _HostOnboardingRollback:
+    """One provisional host mutation and its original rollback attempt.
+
+    This record replaces the callback in the existing agent custody slot.
+    Failed admission/retirement stays here, never a second native attempt or
+    a successful publication ACK. Observer withdrawal is finite caller state,
+    not shared registration history.
+    """
+
+    operation: Callable[[], Awaitable[None]]
+    admission: OwnedTaskAdmission = field(default_factory=OwnedTaskAdmission)
+    attempted: bool = False
+    opening: BaseException | None = None
+    failure: BaseException | None = None
+    harvested: bool = False
+
+    async def join(self, name: str) -> tuple[bool, BaseException | None]:
+        if not self.attempted:
+            self.attempted = True
+            try:
+                create_owned_task(
+                    self.operation(), name=f"host_onboarding_rollback:{name}",
+                    retain_originals=True, admission=self.admission,
+                )
+            except BaseException as error:
+                self.opening = error
+        task = self.admission.task
+        outcome = await await_owned_task(task) if task is not None else None
+        if not self.harvested:
+            physical = execution_terminal_error(
+                self.opening, outcome.error if outcome is not None else None,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if physical is not None:
+                debt = RuntimeError("original host onboarding rollback did not retire")
+                debt._kestrel_native_retirement_debts = ((self, task),)
+                self.failure = execution_terminal_error(
+                    physical, debt, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            self.harvested = True
+        withdrawal = outcome.cancellation if outcome is not None else None
+        joiner = asyncio.current_task()
+        cancelled = withdrawal is not None or bool(joiner and joiner.cancelling())
+        return cancelled, execution_terminal_error(
+            self.failure, withdrawal, retain_originals=True,
+            isolate_control_originals=True,
+        )
 
 
 class _DynamicSchedulerTenantRegistration:
@@ -2458,7 +2509,7 @@ class AgentManager:
             if rollback is not None and not callable(rollback):
                 raise TypeError("agent registration hook rollback must be callable")
             if rollback is not None:
-                agent._host_onboarding_rollback = rollback
+                agent._host_onboarding_rollback = _HostOnboardingRollback(rollback)
 
     async def _complete_registered_agent_readiness(
         self,
@@ -3090,6 +3141,14 @@ class AgentManager:
     def _commit_host_onboarding(agent: KestrelAgent) -> None:
         """Retire rollback custody after routing publication commits."""
 
+        rollback = vars(agent).get("_host_onboarding_rollback")
+        if isinstance(rollback, _HostOnboardingRollback) and rollback.attempted:
+            pending = RuntimeError("cannot commit host onboarding after rollback began")
+            pending._kestrel_native_retirement_debts = ((rollback, rollback.admission.task),)
+            raise execution_terminal_error(
+                rollback.failure, pending, retain_originals=True,
+                isolate_control_originals=True,
+            )
         vars(agent).pop("_host_onboarding_rollback", None)
 
     @staticmethod
@@ -3099,17 +3158,19 @@ class AgentManager:
     ) -> tuple[bool, Optional[BaseException]]:
         """Join app-state rollback while the registration writer is held."""
 
-        onboarding_rollback = vars(agent).pop(
+        onboarding_rollback = vars(agent).get(
             "_host_onboarding_rollback",
             None,
         )
         if onboarding_rollback is None:
             return False, None
-        rollback_task = asyncio.create_task(
-            onboarding_rollback(),
-            name=f"host_onboarding_rollback:{name}",
-        )
-        return await await_lifecycle_task_completion(rollback_task)
+        if not isinstance(onboarding_rollback, _HostOnboardingRollback):
+            onboarding_rollback = _HostOnboardingRollback(onboarding_rollback)
+            agent._host_onboarding_rollback = onboarding_rollback
+        result = await onboarding_rollback.join(name)
+        if onboarding_rollback.failure is None:
+            vars(agent).pop("_host_onboarding_rollback", None)
+        return result
 
     @staticmethod
     async def _shutdown_unregistered_agent(
@@ -3123,20 +3184,10 @@ class AgentManager:
         cleanup explicitly.
         """
         cancelled = False
-        onboarding_failure: Optional[BaseException] = None
-        onboarding_rollback = vars(agent).pop(
-            "_host_onboarding_rollback",
-            None,
+        rollback_cancelled, onboarding_failure = (
+            await AgentManager._rollback_host_onboarding(name, agent)
         )
-        if onboarding_rollback is not None:
-            rollback_task = asyncio.create_task(
-                onboarding_rollback(),
-                name=f"host_onboarding_rollback:{name}",
-            )
-            rollback_cancelled, onboarding_failure = (
-                await await_lifecycle_task_completion(rollback_task)
-            )
-            cancelled = cancelled or rollback_cancelled
+        cancelled = cancelled or rollback_cancelled
         rollback_failure: Optional[BaseException] = None
         registration = getattr(
             agent, "_dynamic_scheduler_tenant_registration", None
@@ -7290,20 +7341,7 @@ class AgentManager:
                     _BATCH_STAGE_CALLBACK.reset(stage_token)
 
             init_tasks = []
-            for name, agent_cfg, admission in admitted:
-                init_task = asyncio.create_task(
-                    _bounded_initialize(name, agent_cfg, admission),
-                    name=f"agent_batch_initialize:{admission.canonical_name}",
-                )
-                # A finite child owns only its initializer during the concurrent
-                # phase. asyncio cannot run the new task until this loop yields,
-                # so the watchdog can never observe the earlier batch owner.
-                admission.owner_task = init_task
-                # gather synthesizes CancelledError for a cancelled child and
-                # may consume its native cause. Cache the canonical original
-                # before gather installs its own result callback.
-                init_task.add_done_callback(owned_task_error)
-                init_tasks.append(init_task)
+            failed_admission_task = None
 
             async def collect_initializer_results():
                 gathered = await asyncio.gather(*init_tasks, return_exceptions=True)
@@ -7314,9 +7352,35 @@ class AgentManager:
                 ]
 
             try:
+                for name, agent_cfg, admission in admitted:
+                    receipt = OwnedTaskAdmission()
+                    try:
+                        create_owned_task(
+                            _bounded_initialize(name, agent_cfg, admission),
+                            name=f"agent_batch_initialize:{admission.canonical_name}",
+                            retain_originals=True, admission=receipt,
+                        )
+                    except BaseException:
+                        failed_admission_task = receipt.task
+                        raise
+                    finally:
+                        if receipt.task is not None:
+                            # Inventory acceptance even when canonical callback
+                            # publication refused. Its start gate prevents an
+                            # unowned initializer body, including eager Tasks.
+                            admission.owner_task = receipt.task
+                            init_tasks.append(receipt.task)
                 results = await collect_initializer_results()
             except BaseException as initial_failure:
-                # ``gather`` cancellation cancels pending initializers.  Results
+                # A later admission can fail before gather exists. Release the
+                # construction barrier first: a cancelled native initializer
+                # can itself need that barrier to finish its original unwind.
+                all_candidates_staged.set()
+                for initializer in init_tasks:
+                    if (initializer is not failed_admission_task
+                        and not initializer.done() and not initializer.cancelling()):
+                        initializer.cancel()
+                # ``gather`` cancellation cancels pending initializers. Results
                 # that already initialized are invisible to shutdown_all(), so
                 # this batch still owns their cleanup.  Cancellation wins only
                 # after all of those ownership transfers have settled.
@@ -7328,7 +7392,8 @@ class AgentManager:
                 for initializer in init_tasks:
                     outcome = await await_owned_task(initializer)
                     initial_failure = execution_terminal_error(
-                        initial_failure, outcome.cancellation, retain_originals=True)
+                        initial_failure, outcome.cancellation, retain_originals=True,
+                        isolate_control_originals=True)
                     settled.append(outcome.error if outcome.error is not None else outcome.result)
                 initialized = [
                     (name, result)
@@ -7344,6 +7409,7 @@ class AgentManager:
                         initial_failure, *(
                             result for result in settled if isinstance(result, BaseException)
                         ), cleanup_failure,
+                        retain_originals=True, isolate_control_originals=True,
                     )
                     if terminal is not None and is_execution_control_error(terminal):
                         raise terminal
@@ -7352,7 +7418,7 @@ class AgentManager:
                     raise
                 terminal = execution_terminal_error(initial_failure, *(
                     result for result in settled if isinstance(result, BaseException)
-                ))
+                ), retain_originals=True, isolate_control_originals=True)
                 if terminal is not None and is_execution_control_error(terminal):
                     raise terminal
                 if isinstance(initial_failure, asyncio.CancelledError) or cleanup_cancelled:

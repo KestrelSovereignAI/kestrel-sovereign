@@ -18,7 +18,7 @@ from kestrel_sovereign.execution_custody import (
     owned_execution_stream, close_native_execution_stream, retain_native_execution_http_client_close,
     is_execution_control_error,
     current_execution_custody, bind_execution_cleanup, require_execution_work,
-    execution_terminal_error,
+    execution_terminal_error, retained_execution_error,
 )
 from collections.abc import Mapping
 from typing import (
@@ -257,26 +257,47 @@ class OllamaAdapter(LLMAdapter):
         self._discovery_clients = {}
         self._discovery_borrowers = {}
         self._discovery_closed = False
+        self._discovery_control = None
+
+    def _retain_discovery_control(self, error):
+        if is_execution_control_error(error):
+            # Once fenced, no new discovery borrower can enter. This finite
+            # aggregate is bounded by already admitted original owners, not
+            # an append-only catalog history. Never retain observer withdrawal.
+            self._discovery_control = execution_terminal_error(
+                self._discovery_control, error, retain_originals=True,
+                isolate_control_originals=True,
+            )
 
     async def _retire_discovery_client(self, client, scopes):
         if client not in self._discovery_clients:
             # A concurrent borrower/retirement waiter already joined the SAME
             # successful close. Failed closes are never removed from this map.
+            if self._discovery_control is not None:
+                raise retained_execution_error(self._discovery_control)
             return
         # The native client owns its canonical close registry. The adapter's
         # existing map retains that SAME Task, not another wrapper/registry
         # capable of spending a second physical close. Successful private
         # clients can leave both the adapter inventory and its object graph.
         key = "ollama-discovery-pool"
-        with bind_execution_cleanup(self, scopes):
-            task = start_llm_close_task(client, key, client.aclose, resource=client)
+        try:
+            with bind_execution_cleanup(self, scopes):
+                task = start_llm_close_task(client, key, client.aclose, resource=client)
+        except BaseException as error:
+            self._retain_discovery_control(vars(client).get("_llm_close_control"))
+            self._retain_discovery_control(error)
+            raise
         self._discovery_clients[client] = task
         outcome = await await_owned_task(task) if task is not None else None
         failure = harvest_llm_close_task(client, key, task) if task is not None else None
+        publication = vars(client).get("_llm_close_control")
+        self._retain_discovery_control(failure)
+        self._retain_discovery_control(publication)
         if failure is None:
             self._discovery_clients.pop(client, None)
         terminal = execution_terminal_error(
-            failure, vars(client).get("_llm_close_control"),
+            self._discovery_control, failure, publication,
             outcome.cancellation if outcome is not None else None,
             retain_originals=True, isolate_control_originals=True,
         )
@@ -285,6 +306,8 @@ class OllamaAdapter(LLMAdapter):
 
     @asynccontextmanager
     async def _discovery_client(self, client=None):
+        if self._discovery_control is not None:
+            raise retained_execution_error(self._discovery_control)
         require_execution_work(self)
         if self._discovery_closed:
             raise RuntimeError("Ollama discovery owner is retired")
@@ -320,7 +343,7 @@ class OllamaAdapter(LLMAdapter):
     async def aclose(self):
         """Join exact discovery pool owners; a failed close is never repeated."""
         self._discovery_closed = True
-        terminal = None
+        terminal = self._discovery_control
         for client in tuple(self._discovery_clients):
             try:
                 borrower = self._discovery_borrowers.get(client)

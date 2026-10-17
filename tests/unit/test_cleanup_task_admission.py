@@ -451,6 +451,8 @@ async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel
         # Actual completion of Alpha's original initializer, not a fabricated
         # successful aggregate or a replacement batch observer.
         frame = getattr(coroutine, "cr_frame", None)
+        operation = frame.f_locals.get("operation", coroutine) if frame is not None else coroutine
+        frame = getattr(operation, "cr_frame", None)
         if (
             frame is not None
             and frame.f_locals.get("name") == "Alpha"

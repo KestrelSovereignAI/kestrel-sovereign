@@ -8,7 +8,6 @@ NO mock-returns-mock tests - each test verifies real logic.
 import pytest
 import asyncio
 import contextlib
-import inspect
 import os
 import sys
 import threading
@@ -2333,8 +2332,9 @@ class TestLifecycle:
         mock_storage.close.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix_overrun", [False, True])
     async def test_hung_early_feature_does_not_starve_later_feature_or_storage(
-        self, tmp_path
+        self, tmp_path, prefix_overrun, monkeypatch,
     ):
         """Coherent deadline composition under the production outer wait_for (#2409).
 
@@ -2358,6 +2358,12 @@ class TestLifecycle:
 
         async def _never_returns():
             hung_started.set()
+            if prefix_overrun:
+                # A bounded, CPU-idle scheduling gap reproduces the CI clock
+                # overrun without stress processes or background busy loops.
+                # The later fast step must still receive a scheduling turn.
+                import time
+                time.sleep(0.7)
             await asyncio.Event().wait()
 
         async def _late_shutdown():
@@ -2377,6 +2383,30 @@ class TestLifecycle:
         mock_storage.close = AsyncMock()
         agent.storage = mock_storage
 
+        loop = asyncio.get_running_loop()
+        actual_call_at = loop.call_at
+        previous_factory = loop.get_task_factory()
+        admission_ends = []
+        def observe_admission(loop, coroutine, **kwargs):
+            frame = getattr(coroutine, "cr_frame", None)
+            operation = frame.f_locals.get("operation", coroutine) if frame is not None else coroutine
+            if prefix_overrun and getattr(operation, "cr_code", None) is _never_returns.__code__:
+                import time
+                time.sleep(0.35)
+                admission_ends.append(loop.time())
+            return previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
+        monkeypatch.setattr(loop, "_task_factory", observe_admission)
+        charged = []
+        def observe_timeout(when, callback, *args, context=None):
+            if getattr(callback, "__name__", "") == "expire_step" and args:
+                coroutine = args[0].get_coro()
+                frame = getattr(coroutine, "cr_frame", None)
+                operation = frame.f_locals.get("operation", coroutine) if frame is not None else coroutine
+                if getattr(operation, "cr_code", None) is _never_returns.__code__:
+                    charged.append(when)
+            return actual_call_at(when, callback, *args, context=context)
+        monkeypatch.setattr(loop, "call_at", observe_timeout)
+
         # Shrink the internal budget so the test is fast, but keep the shape
         # identical to production: the internal budget is composed BELOW the
         # outer wait_for deadline, and each feature fair-divides it.
@@ -2395,6 +2425,9 @@ class TestLifecycle:
         assert hung_started.is_set()
         # The hung early feature did not starve the later feature...
         assert late_started.is_set()
+        assert len(charged) == 1
+        if prefix_overrun:
+            assert len(admission_ends) == 1 and charged[0] < admission_ends[0], "Task admission renewed the exhausted shutdown budget"
         # ...nor the durable storage close.
         mock_storage.close.assert_called_once()
 

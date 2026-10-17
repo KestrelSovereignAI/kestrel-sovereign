@@ -10072,9 +10072,87 @@ Expected Duration: {expected_duration}
 
             async def step() -> ReleaseOutcome:
                 nonlocal reported
-                reported = reported_outcome(
-                    await asyncio.wait_for(operation(), timeout=budget)
+                from kestrel_sovereign._async_ownership import (
+                    OwnedTaskAdmission, await_owned_task, create_owned_task,
                 )
+
+                admission = OwnedTaskAdmission()
+                admitted = False
+                step_deadline = loop.time() + budget
+                deadline_expired = False
+                requested = False
+                deadline_handle = None
+
+                def request_interrupt(task, *, expired=False):
+                    nonlocal requested, deadline_expired
+                    if task.done():
+                        return
+                    deadline_expired = deadline_expired or expired
+                    if not task.cancelling():
+                        requested = True
+                        task.cancel()
+
+                def expire_step(task):
+                    request_interrupt(task, expired=True)
+
+                try:
+                    task = create_owned_task(
+                        operation(), retain_originals=True, admission=admission,
+                    )
+                    admitted = True
+                    # Queue the accepted Task BEFORE its deadline callback.
+                    # Even an expired slice permits that original first turn;
+                    # wait_for(coroutine, 0) never enters the body at all. Keep
+                    # the pre-admission absolute deadline, not a renewed slice.
+                    deadline_handle = loop.call_at(
+                        step_deadline, expire_step, task,
+                    )
+                    # Do not await the child directly through wait_for: every
+                    # repeated caller cancellation would interrupt its native
+                    # unwind again. The original deadline and first withdrawal
+                    # share ONE cancellation request; the join remains owned.
+                    outcome = await await_owned_task(
+                        task, cancel_on_caller_cancellation=request_interrupt,
+                    )
+                    child_error = outcome.error
+                    if (requested and isinstance(child_error, asyncio.CancelledError)
+                        and not is_execution_control_error(child_error)):
+                        child_error = None
+                    terminal = execution_terminal_error(
+                        child_error, outcome.cancellation,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    if terminal is not None:
+                        raise terminal
+                    if deadline_expired:
+                        raise TimeoutError()
+                    result = outcome.result
+                except BaseException as opening:
+                    task = admission.task
+                    if task is None:
+                        raise
+                    # Publication-failed start gates already own their exact
+                    # failure. Only an admitted operation may receive our
+                    # cancellation, and never a second native unwind interrupt.
+                    if admitted:
+                        request_interrupt(task)
+                    outcome = await await_owned_task(task)
+                    child_error = outcome.error
+                    if (requested
+                        and isinstance(child_error, asyncio.CancelledError)
+                        and not is_execution_control_error(child_error)):
+                        # This is the deadline's own cooperative interrupt,
+                        # not another independent native control receipt.
+                        child_error = None
+                    terminal = execution_terminal_error(
+                        opening, child_error, outcome.cancellation,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    raise terminal
+                finally:
+                    if deadline_handle is not None:
+                        deadline_handle.cancel()
+                reported = reported_outcome(result)
                 return reported
 
             try:
