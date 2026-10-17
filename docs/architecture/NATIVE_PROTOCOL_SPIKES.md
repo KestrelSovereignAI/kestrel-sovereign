@@ -183,9 +183,11 @@ older-revision interoperability does not establish modern conformance.
 ## SDK feature support boundary
 
 The dependency spike establishes a usable native core SDK, not every extension.
-`mcp==2.3.0` has no 2026 Tasks implementation. Client result claims accept only
-`tools/call`; task-shaped resource/prompt results fail required-content parsing.
-The SDK's exported `CreateTaskResult` documents the 2025 core format. A6 needs
+`mcp==2.3.0` has no 2026 Tasks implementation: the native `tasks/get`,
+`tasks/update` and `tasks/cancel` APIs are absent. The SDK's exported
+`CreateTaskResult` documents the 2025 core format. Only `tools/call` is
+currently task-eligible; tool-only result claims and rejecting task-shaped
+resource/prompt results are correct protocol behavior, not SDK gaps. A6 needs
 an actual capable official extension/SDK revision before any task capability is
 advertised; track this in [#3684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3684).
 Upgrade beyond the experimental candidate when needed; do not build an adapter
@@ -193,8 +195,12 @@ or label the old core type a native extension result.
 
 The A2A candidate also has an independent signed-card gate. In `a2a-sdk==1.2.2`,
 `AgentCard.documentation_url = ""` has protobuf presence and survives
-`MessageToDict`, but the signing helper removes it; required empty description
-and capabilities disappear too. Both signing and verification use that cleanup.
+`MessageToDict`, but the signing helper removes it along with required empty
+capabilities. Separately, default `MessageToDict` serialization omits required
+no-presence fields at their defaults, including description and repeated fields.
+Both signing and verification share both deviations. Deleting the cleanup alone
+is insufficient; printing all protobuf defaults includes fields that must be
+omitted. The repair must honor required annotations and field presence.
 `AgentInterface.tenant` has no scalar presence in the generated descriptor.
 The normative presence rules must win: upgrade/fix the official SDK under
 [#3685](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3685),

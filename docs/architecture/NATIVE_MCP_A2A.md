@@ -103,7 +103,7 @@ link any retry dispatch to the original rather than inventing a success.
 | Refresh | Agent-scoped encrypted token bundle; serialize refresh/rotation for the same connection across requests; commit rotated credentials atomically |
 | Discovery | Official Registry alongside Docker/local catalogs; explicit source and namespaced identity, opaque pagination, no arbitrary executable installation from search results |
 | Apps | Preserve tool metadata, structured content and `ui://` resource association through a typed part; isolated renderer and governed app calls |
-| Tasks | Capable official extension/SDK release (support gap #3684), all eligible result paths, durable wait provider |
+| Tasks | Capable official extension/SDK release (support gap #3684), tool-call result handling, durable wait provider |
 | Operator input | Core MRTR (`InputRequiredResult`), governed input surface, no lock held across an interactive response |
 
 ### Authorization response issuer checks
@@ -233,18 +233,23 @@ wait-provider contract. Advertise only supported extension versions. Poll,
 cancel and result retrieval use the same authorized connection and policy
 checks as the original call. Cancellation does not invent a completed result.
 Declaring `io.modelcontextprotocol/tasks` allows a server to return
-a `resultType: "task"` result instead of a final result on any supported `tools/call`,
-`resources/read` or `prompts/get`; there is no per-call task opt-in. Do not
-advertise it until the durable wait provider and every eligible result path
-handle both shapes. Register the task before releasing the originating dispatch.
+a `resultType: "task"` result instead of a final result on `tools/call`;
+there is no per-call task opt-in. The 2026-07-28 extension supports task creation
+only on tool calls. A task result on `resources/read` or `prompts/get` is an
+invalid response, not a task to register. Keep the extension registration
+extensible for future supported methods without claiming them today. Do not
+advertise it until the durable wait provider and tool-call result path handle
+both shapes. Register the task before releasing the originating dispatch.
 
 The Phase 0 candidate `mcp==2.3.0` does **not** ship the 2026 Tasks extension.
-Its client result claims attach only to `tools/call`; resource/prompt result
-parsers cannot accept task shapes. Its exported `CreateTaskResult` is the old
-2025 core type and must not be used for this extension. A6 is gated on
+Its exported `CreateTaskResult` is the old 2025 core type and must not be used
+for this extension; the required native `tasks/get`, `tasks/update` and
+`tasks/cancel` implementation is absent. Its tool-call-only result claims and
+resource/prompt parsers follow the extension's current method set; they are not
+support gaps. A6 is gated on
 [#3684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3684): select
-an actual official extension/SDK package and revision supporting all eligible
-methods, or contribute that support to the official SDK, then raise dependency
+an actual official extension/SDK package and revision supporting the published
+tool-call task contract, or contribute that support to the official SDK, then raise dependency
 bounds as needed. The candidate is not a ceiling to retain. No partial
 advertisement, private wire types or generic-result adapter fills this gap.
 Until that gate passes, do not advertise Tasks; surface a server's required-
@@ -405,9 +410,14 @@ and explicitly set optional defaults, and exclude `signatures`. The normative
 is the canonical-byte oracle, not a same-helper signing round trip.
 
 **Signed-card release gate:** `a2a-sdk==1.2.2` does not implement that oracle:
-its signing helper recursively removes empty strings/objects/arrays, including
-explicit optional `documentationUrl: ""` and required empty `description` or
-`capabilities`. Both its signer and verifier share this defect. Resolve
+its default `MessageToDict` serialization omits required no-presence fields
+at their defaults (including `description` and required repeated fields),
+then its recursive empty cleanup removes explicitly present empties such as
+optional `documentationUrl: ""` and required `capabilities: {}`. Both its signer
+and verifier share these two deviations. Removing only the cleanup still loses
+required defaults. Printing every protobuf default is also wrong: it includes
+implicit optional values that the normative rules omit. The official repair
+must respect each field's required annotation and presence. Resolve
 [#3685](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3685) by
 upgrading to a corrected official SDK release or contributing the repair to
 that SDK and consuming a tested release. Do not ship a Kestrel canonicalizer,
@@ -511,8 +521,9 @@ findings fixed and meaningful regression tests. Pin the conformance runner
 versions/commits and record which protocol scenarios they actually support.
 Do not label a skipped 2026 scenario or a mocked interop peer a conformance pass.
 Acceptance includes governed dispatch database evidence, Apps bridge denial
-tests (including vendor CSP/permission escalation), task result handling on all
-eligible operations with a real capable SDK, `tasks/get` → `tasks/update`
+tests (including vendor CSP/permission escalation), tool-call task result
+handling with a real capable SDK and rejection on unsupported methods,
+`tasks/get` → `tasks/update`
 input/restart, form elicitation and explicit URL denial, no implicit DCR,
 OAuth restart/rotation, cross-agent token isolation, signature tampering,
 replay, recipient denial, question forgery, cancellation races and lock-free
