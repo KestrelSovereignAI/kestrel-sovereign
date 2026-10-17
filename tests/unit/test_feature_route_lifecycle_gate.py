@@ -144,8 +144,8 @@ class _DriftedRouterFeature:
         return router
 
 
-class _PartiallyCopiedRouterFeature:
-    """A router whose mounted child FastAPI cannot be copied by include_router."""
+class _UnsupportedChildRouterFeature:
+    """A router whose mounted child is outside the live API-route contract."""
 
     def __init__(self):
         self.enabled = True
@@ -371,12 +371,12 @@ def test_repeated_feature_mounts_are_deduplicated_and_unmounted():
     assert _bridge_health_route_count(app) == 0
 
 
-def test_invalid_feature_router_rolls_back_partially_included_routes():
-    """A non-copyable child cannot leave an ungated route or retry duplicate."""
+def test_unsupported_child_is_rejected_before_native_inclusion():
+    """An unsupported child cannot publish a route or claim a dedup key."""
 
     from kestrel_sovereign import server
 
-    feature = _PartiallyCopiedRouterFeature()
+    feature = _UnsupportedChildRouterFeature()
     app = FastAPI()
     app.state.agent = _make_agent({"PartialFeature": feature})
     app.state.agent_manager = None
@@ -389,14 +389,61 @@ def test_invalid_feature_router_rolls_back_partially_included_routes():
     assert getattr(app.state, "_feature_routes", []) == []
     assert getattr(app.state, "_feature_router_keys", set()) == set()
 
-    # A retry sees the same invalid shape but cannot accumulate an earlier
-    # copied route; this guards both runtime reloads and repeated cold wakes.
+    # A retry must remain an honest refusal without accumulating routes.
     server._mount_feature_routers(app)
     assert not any(
         route.path == normal_path for route in iter_route_contexts(app.routes)
     )
     assert getattr(app.state, "_feature_routes", []) == []
     assert getattr(app.state, "_feature_router_keys", set()) == set()
+
+
+@pytest.mark.parametrize("registration", ["events", "lifespan"])
+def test_failed_projection_reverts_every_native_registration(registration, monkeypatch):
+    from kestrel_sovereign import server
+
+    async def event():
+        pass
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        yield
+
+    options = {"on_startup": [event], "on_shutdown": [event]} if registration == "events" else {"lifespan": lifespan}
+    router = APIRouter(**options)
+
+    @router.get("/projection-failure")
+    async def endpoint():
+        return {"ok": True}
+
+    app = FastAPI()
+    app.state.agent = _make_agent({"ProjectionFeature": SimpleNamespace(enabled=True, get_router=lambda: router)})
+    app.state.agent_manager = None
+    before_routes = list(app.routes)
+    before_startup = list(app.router.on_startup)
+    before_shutdown = list(app.router.on_shutdown)
+    before_lifespan = app.router.lifespan_context
+    observer = APIRouter()
+    observer.include_router(app.router, prefix="/observed")
+
+    def fail_projection(*args):
+        # A native consumer can cache the temporarily included graph before
+        # projection fails. Rollback must invalidate that graph as well.
+        assert any(context.path == "/observed/projection-failure" for context in iter_route_contexts(observer.routes))
+        raise TypeError("projection refused")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(server._LiveFeatureRoute, "bind", fail_projection)
+        server._mount_feature_routers(app)
+        assert app.routes == before_routes
+        assert app.router.on_startup == before_startup
+        assert app.router.on_shutdown == before_shutdown
+        assert app.router.lifespan_context is before_lifespan
+        assert app.state._feature_router_keys == set()
+        assert not any(context.path == "/observed/projection-failure" for context in iter_route_contexts(observer.routes))
+
+    server._mount_feature_routers(app)
+    assert sum(context.path == "/projection-failure" for context in iter_route_contexts(app.routes)) == 1
 
 
 def test_dynamic_feature_routes_invalidate_openapi_schema_on_mount_and_unmount():

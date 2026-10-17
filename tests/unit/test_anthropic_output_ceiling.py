@@ -834,13 +834,21 @@ async def test_streamed_turn_cut_on_a_tool_call_persists_what_was_shown():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["get_response", "get_streaming_response", "get_streaming_response_with_tools"])
 @pytest.mark.parametrize("parameter", ["temperature", "top_p", "top_k"])
-async def test_removed_sampling_parameters_fail_before_contacting_anthropic(method, parameter):
+@pytest.mark.parametrize("origin", ["kwargs", "raw"])
+@pytest.mark.parametrize("value", [0.5, None])
+async def test_removed_sampling_parameters_fail_before_contacting_anthropic(method, parameter, origin, value):
+    from kestrel_sdk.llm import RequestOptions
+
     client = anthropic_client(_message([_text("unused")], stop_reason="end_turn"))
     adapter = AnthropicAdapter()
+    options = (
+        {parameter: value} if origin == "kwargs"
+        else {"request_options": RequestOptions(raw={parameter: value})}
+    )
     with pytest.raises(ValueError, match=parameter):
         result = getattr(adapter, method)(
             client=client, model="claude-opus-5", messages=USER,
-            **{parameter: 0.5},
+            **options,
         )
         if method == "get_response":
             await result
@@ -849,3 +857,15 @@ async def test_removed_sampling_parameters_fail_before_contacting_anthropic(meth
                 pass
     client.messages.stream.assert_not_called()
     client.models.retrieve.assert_not_awaited()
+
+
+@pytest.mark.parametrize("parameter", ["temperature", "top_p", "top_k"])
+def test_request_option_validation_precedes_raw_parameter_merge(parameter):
+    from kestrel_sdk.llm import RequestOptions
+
+    params = {"model": "claude-opus-5"}
+    with pytest.raises(ValueError, match=parameter):
+        AnthropicAdapter().apply_request_options(
+            params, RequestOptions(raw={parameter: None}), model=params["model"],
+        )
+    assert params == {"model": "claude-opus-5"}

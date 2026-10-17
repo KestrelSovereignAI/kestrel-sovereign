@@ -11,7 +11,7 @@ import secrets
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field as dataclass_field, fields
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -789,6 +789,11 @@ def _resolve_live_route_agent(
     object is not. If the owner is gone, the unprefixed address is unbound.
     Only an explicit agent URL may select a different agent. Never inspect an
     unrelated plugin to silently reassign an address whose owner disappeared.
+
+    This deliberately withdraws the one-survivor rebinding rule from
+    #3240/#3216: withdrawing an agent must not transfer its address to another
+    identity. A broken live owner's router contract raises a server error;
+    it is not reported as an absent route or used to choose another owner.
     """
 
     state = scope.get("state") or {}
@@ -941,8 +946,8 @@ class _LiveFeatureRoute(RouteContext):
     host; later source-router mutations cannot publish ungated frontend groups.
     """
 
-    native: RouteContext = field(kw_only=True, repr=False, compare=False)
-    lifecycle: _LiveFeatureRouter = field(kw_only=True, repr=False, compare=False)
+    native: RouteContext = dataclass_field(kw_only=True, repr=False, compare=False)
+    lifecycle: _LiveFeatureRouter = dataclass_field(kw_only=True, repr=False, compare=False)
 
     @classmethod
     def bind(cls, native: RouteContext, lifecycle: _LiveFeatureRouter):
@@ -1000,6 +1005,7 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
             if _is_webhook_receiver(getattr(feature, "receiver", None)):
                 continue
             routes_before_include: Optional[int] = None
+            native_registration_before: Optional[tuple] = None
             try:
                 router = feature.get_router()
                 if router is None:
@@ -1009,6 +1015,10 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                     continue
                 routes_before_include = len(app.routes)
                 lifecycle = _LiveFeatureRouter(app, router, name, agent)
+                native_registration_before = (
+                    list(app.router.on_startup), list(app.router.on_shutdown),
+                    app.router.lifespan_context,
+                )
                 app.include_router(lifecycle)
                 contexts = list(iter_route_contexts(app.routes[routes_before_include:]))
                 app.routes[routes_before_include:] = [
@@ -1021,6 +1031,11 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                     # Treat router validation/inclusion as an atomic mount:
                     # never retain a partial, ungated feature contribution.
                     del app.routes[routes_before_include:]
+                if native_registration_before is not None:
+                    startup, shutdown, lifespan = native_registration_before
+                    app.router.on_startup[:] = startup
+                    app.router.on_shutdown[:] = shutdown
+                    app.router.lifespan_context = lifespan
                 logger.warning("Failed to mount router from feature %s: %s", name, exc)
 
     if agents is None:

@@ -511,11 +511,17 @@ def _system_content_blocks(content: Any) -> List[Dict[str, Any]]:
     return [{"type": "text", "text": _message_content_to_text(content)}]
 
 
-def _validate_sampling_parameters(kwargs: Dict[str, Any]) -> None:
+def _validate_sampling_parameters(kwargs: Dict[str, Any], options: Any = None) -> None:
     """Reject settings removed from the Anthropic 1.x Messages API."""
+    supplied = set(kwargs)
+    if options is None:
+        options = kwargs.get("request_options")
+    raw = getattr(options, "raw", None)
+    if isinstance(raw, dict):
+        supplied.update(raw)
     unsupported = [
         name for name in ("temperature", "top_p", "top_k")
-        if kwargs.get(name) is not None
+        if name in supplied
     ]
     if unsupported:
         raise ValueError(
@@ -751,6 +757,7 @@ class AnthropicAdapter(LLMAdapter):
         only thing honored is an explicit ``raw`` dict escape hatch, merged into
         the outbound request.
         """
+        _validate_sampling_parameters(request_kwargs, options)
         out = request_kwargs
         raw = getattr(options, "raw", None)
         if isinstance(raw, dict):
