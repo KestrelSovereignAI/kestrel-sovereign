@@ -1,6 +1,7 @@
 """Focused contract tests for identity and constitution endpoints."""
 
 from contextlib import asynccontextmanager
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -110,7 +111,14 @@ def test_constitution_endpoint_returns_text_hash_and_metadata():
         _restore_app(app, original)
 
 
-@pytest.mark.parametrize("url", ["http://169.254.169.254/latest/meta-data", "https://127.0.0.1/avatar.png"])
+@pytest.mark.parametrize("url", [
+    "http://169.254.169.254/latest/meta-data",
+    "https://127.0.0.1/avatar.png",
+    "https://bad..example/avatar.png",
+    "https://" + "a" * 64 + ".example/avatar.png",
+    "https://.example/avatar.png",
+    "https://bad\ud800.example/avatar.png",
+])
 def test_avatar_url_rejection_uses_shared_policy_before_transport_creation(url, monkeypatch):
     from kestrel_sdk.security import outbound
 
@@ -122,7 +130,10 @@ def test_avatar_url_rejection_uses_shared_policy_before_transport_creation(url, 
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                response = client.post("/api/identity/avatar", json={"url": url}, headers={"X-API-Key": "test-key"})
+                response = client.post(
+                    "/api/identity/avatar", content=json.dumps({"url": url}),
+                    headers={"X-API-Key": "test-key", "Content-Type": "application/json"},
+                )
         assert response.status_code == 400
         assert "Disallowed avatar URL" in response.json()["detail"]
         factory.assert_not_called()
