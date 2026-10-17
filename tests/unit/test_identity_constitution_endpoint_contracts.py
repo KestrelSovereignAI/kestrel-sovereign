@@ -139,6 +139,8 @@ def test_avatar_fetch_passes_the_shared_validation_result_into_native_transport(
     store_avatar = AsyncMock(return_value="avatar-hash")
     agent = SimpleNamespace(agent_id="did:test:avatar", storage=SimpleNamespace(files=SimpleNamespace(store_avatar=store_avatar)))
     approved = []
+    dial = AsyncMock(side_effect=AssertionError("avatar bypassed its configured transport"))
+    monkeypatch.setattr("httpcore._backends.anyio.AnyIOBackend.connect_tcp", dial)
 
     def transport_factory(validated):
         approved.append(validated)
@@ -160,6 +162,7 @@ def test_avatar_fetch_passes_the_shared_validation_result_into_native_transport(
         assert len(approved) == 1
         assert approved[0].url == url
         assert [str(ip) for ip in approved[0].ip_addresses] == ["8.8.8.8"]
+        dial.assert_not_awaited()
         store_avatar.assert_awaited_once_with(
             image_data=image, agent_id=agent.agent_id, avatar_type="primary", source_url=url,
         )

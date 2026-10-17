@@ -179,18 +179,31 @@ class TestDidWebSSRF:
             _default_fetcher("https://169.254.169.254/.well-known/did.json")
 
     def test_didweb_fetcher_does_not_follow_redirects(self, monkeypatch):
-        """#1727 codex r1: a public DID host that 30x-redirects to a private
-        address must be refused, not followed."""
+        """Drive urllib's real redirect processing with a controlled HTTPS response."""
         from kestrel_sovereign.identity import did_web
-        from urllib.error import HTTPError
+        from email.message import Message
+        from urllib.response import addinfourl
         import io
 
-        def fake_open(self, url, timeout=None):
-            # Simulate a 302 → urllib (no-redirect opener) raising HTTPError.
-            raise HTTPError(url, 302, "Found", {"Location": "https://169.254.169.254/x"}, io.BytesIO(b""))
+        requests = []
 
-        monkeypatch.setattr("urllib.request.OpenerDirector.open", fake_open)
-        # Public LITERAL IP so validate_outbound_url passes WITHOUT real DNS
-        # (keeps the unit test offline-safe); the redirect is what's under test.
+        def https_response(self, request):
+            requests.append(request.full_url)
+            headers = Message()
+            if len(requests) == 1:
+                headers["Location"] = "https://169.254.169.254/x"
+                response = addinfourl(io.BytesIO(b""), headers, request.full_url, 302)
+                response.msg = "Found"
+            else:
+                response = addinfourl(io.BytesIO(b"private metadata"), headers, request.full_url, 200)
+                response.msg = "OK"
+            return response
+
+        def unexpected_socket(*args, **kwargs):
+            pytest.fail("the controlled HTTPS response must not open a socket")
+
+        monkeypatch.setattr("kestrel_sovereign.security.pinned_urllib._PinnedHTTPSHandler.https_open", https_response)
+        monkeypatch.setattr("socket.create_connection", unexpected_socket)
         with pytest.raises(did_web.DidWebError, match="redirect"):
             did_web._default_fetcher("https://93.184.216.34/.well-known/did.json")
+        assert requests == ["https://93.184.216.34/.well-known/did.json"]
