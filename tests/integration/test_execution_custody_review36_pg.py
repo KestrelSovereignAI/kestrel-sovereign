@@ -48,7 +48,7 @@ async def test_real_host_inception_under_original_pg_parent(native_pg, tmp_path)
 @pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group"])
 async def test_inception_borrower_native_close_precedes_owned_birth_database(native_pg, tmp_path, monkeypatch, kind):
     from kestrel_sovereign.llm import service as service_module
-    import httpx
+    import httpx2 as httpx
     import openai
     failure = receipt(kind)
     source = OriginalFailure.capture(failure)

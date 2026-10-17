@@ -2003,3 +2003,10 @@ inventing an asynchronous owner; the async lifecycle persists the restriction.
 Registry quarantine continues independent withdrawals and retains native failures
 while ordinary third-party error details remain redacted. These remain component
 proofs, not whole-Agent or deployed privacy-transition acceptance.
+
+Native HTTP custody recognizes both HTTPX transport families. Current OpenAI
+and Anthropic SDKs use HTTPX 2; Google and Ollama still use HTTPX 1. Both response
+types share the same original physical close owner and guarded body protocol.
+A transport major-version change must not silently bypass request admission,
+response acquisition or physical pool retirement. SDK fixtures use their actual
+required transport, while the older-family coverage remains independently live.

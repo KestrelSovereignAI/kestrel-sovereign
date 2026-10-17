@@ -26,6 +26,9 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 from httpx import AsyncByteStream as _NativeHTTPXAsyncByteStream
 from httpx import AsyncClient as _NativeHTTPXAsyncClient
 from httpx import Response as _NativeHTTPXResponse
+from httpx2 import AsyncByteStream as _NativeHTTPX2AsyncByteStream
+from httpx2 import AsyncClient as _NativeHTTPX2AsyncClient
+from httpx2 import Response as _NativeHTTPX2Response
 from kestrel_sdk.storage.database import TransactionError
 
 from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
@@ -908,8 +911,9 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
     """
     from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
-    response = stream if isinstance(stream, _NativeHTTPXResponse) else getattr(stream, "response", None)
-    if not isinstance(response, _NativeHTTPXResponse):
+    response_types = (_NativeHTTPXResponse, _NativeHTTPX2Response)
+    response = stream if isinstance(stream, response_types) else getattr(stream, "response", None)
+    if not isinstance(response, response_types):
         return
     if "kestrel.native_close_owner" in response.extensions:
         return
@@ -954,7 +958,7 @@ def retain_native_execution_stream_close(stream: Any, owner: Any = None) -> None
     response.aclose = joined_close
 
 
-class _CustodyHTTPBody(_NativeHTTPXAsyncByteStream):
+class _CustodyHTTPBody(_NativeHTTPXAsyncByteStream, _NativeHTTPX2AsyncByteStream):
     """Guard native body advances after arbitrary response observers await."""
 
     def __init__(self, response, scopes):
@@ -994,7 +998,7 @@ def retain_native_execution_http_client_close(client: Any) -> None:
     client. The hook only installs the same per-response physical close owner
     used by exposed SDK streams; it grants no execution or retry authority.
     """
-    if not isinstance(client, _NativeHTTPXAsyncClient):
+    if not isinstance(client, (_NativeHTTPXAsyncClient, _NativeHTTPX2AsyncClient)):
         return
     if getattr(client, "_kestrel_native_close_hook", None) is not None:
         return
@@ -1251,7 +1255,7 @@ async def owned_native_http_client(client: Any):
     HTTPX's context exit is separate from response closure. Retain the whole
     client close, so interrupted pool cleanup cannot erase a request receipt.
     """
-    if not isinstance(client, _NativeHTTPXAsyncClient):
+    if not isinstance(client, (_NativeHTTPXAsyncClient, _NativeHTTPX2AsyncClient)):
         async with client as entered:
             yield entered
         return

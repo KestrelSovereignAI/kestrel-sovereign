@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import aiosqlite
 import anthropic
-import httpx
+import httpx2 as httpx
 import openai
 import pytest
 from tests.utils.original_failure import OriginalFailure

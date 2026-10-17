@@ -32,6 +32,7 @@ from tests.utils.original_failure import OriginalFailure
 @pytest.mark.parametrize("remove", [False, True])
 @pytest.mark.parametrize("withdraw", [False, True])
 async def test_native_service_observation_keeps_withdrawal_out_of_shared_control(native_pg, tmp_path, monkeypatch, surface, remove, withdraw):
+    import httpx2 as httpx
     from kestrel_sovereign.llm import lifecycle as lifecycle_module, service as service_module, remote_backend as remote_module
     from kestrel_sovereign.llm.lifecycle import UnpublishedLLMOwner, retire_unpublished_llm, start_llm_close_task
 

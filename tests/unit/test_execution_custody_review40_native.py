@@ -333,6 +333,7 @@ async def _interrupt_native_close(task, body):
 @pytest.mark.parametrize("provider", ["openai", "openrouter"])
 @pytest.mark.parametrize("tools", [False, True])
 async def test_implicit_sdk_http_close_has_one_retained_owner(provider, tools):
+    import httpx2 as httpx
     body = EndingBody(openai_chunk())
     http = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda _: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
@@ -398,6 +399,7 @@ async def test_actual_codex_turn_releases_a_cancelled_successful_lock_acquisitio
 @pytest.mark.asyncio
 @pytest.mark.parametrize("final_message", [False, True])
 async def test_anthropic_implicit_sdk_close_is_physically_joined(final_message):
+    import httpx2 as httpx
     import anthropic
 
     from kestrel_sovereign.llm.anthropic_adapter import (

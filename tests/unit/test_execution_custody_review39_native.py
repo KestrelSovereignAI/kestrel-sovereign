@@ -6,6 +6,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import httpx
+import httpx2
 import openai
 import pytest
 
@@ -22,7 +23,7 @@ from tests.unit.test_execution_custody_review32 import receipt
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 
-class Body(httpx.AsyncByteStream):
+class Body(httpx.AsyncByteStream, httpx2.AsyncByteStream):
     """Real SDK response resource whose native close must be physically joined."""
     def __init__(self, chunk=b""):
         self.chunk = chunk
@@ -64,6 +65,7 @@ def openai_chunk():
 @pytest.mark.parametrize("tools", [False, True])
 @pytest.mark.parametrize("acquisition_delay", [0, 1.1], ids=["immediate", "delayed"])
 async def test_native_sdk_handle_survives_post_open_authority_denial(provider, tools, acquisition_delay, monkeypatch):
+    import httpx2 as httpx
     body, fence = Body(), Fence()
     native_closes = []
     actual_create = asyncio.create_task
@@ -132,13 +134,14 @@ async def test_native_sdk_handle_survives_post_open_authority_denial(provider, t
 @pytest.mark.parametrize("provider", ["openai", "openrouter", "ollama"])
 @pytest.mark.parametrize("tools", [False, True])
 async def test_native_http_close_is_joined_through_every_adapter_forwarder(provider, tools):
+    native_http = httpx if provider == "ollama" else httpx2
     chunk = openai_chunk() if provider != "ollama" else json.dumps({
         "model": "offline", "message": {"role": "assistant", "content": "hello"}, "done": False,
     }).encode() + b"\n"
     body = Body(chunk)
     async def transport(_request):
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
-    http = httpx.AsyncClient(base_url="http://offline.invalid", transport=httpx.MockTransport(transport))
+        return native_http.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+    http = native_http.AsyncClient(base_url="http://offline.invalid", transport=native_http.MockTransport(transport))
     if provider == "ollama":
         import ollama
         from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
@@ -172,6 +175,7 @@ async def test_native_http_close_is_joined_through_every_adapter_forwarder(provi
 
 @pytest.mark.asyncio
 async def test_native_anthropic_acquisition_closes_before_denial_is_reported():
+    import httpx2 as httpx
     import anthropic
     from kestrel_sovereign.llm.anthropic_adapter import _anthropic_stream_with_retry
     body, fence = Body(), Fence()

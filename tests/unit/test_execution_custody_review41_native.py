@@ -31,6 +31,9 @@ from tests.unit.test_signals_dispatcher import (
 @pytest.mark.parametrize("status", [200, 503])
 @pytest.mark.parametrize("kind", [None, "unknown", "cancel_unknown", "group"])
 async def test_nonstream_sdk_implicit_body_close_is_physically_joined(provider, operation, status, kind, preexisting_observer=False):
+    import httpx2
+
+    native_http = httpx if provider == "ollama" else httpx2
     original = receipt(kind) if kind is not None else None
     class ReceiptBody(EndingBody):
         raised = False
@@ -56,8 +59,8 @@ async def test_nonstream_sdk_implicit_body_close_is_physically_joined(provider, 
     requests = []
     def respond(request):
         requests.append(request)
-        return httpx.Response(status, headers={"content-type": "application/json"}, stream=body)
-    http = httpx.AsyncClient(base_url="http://127.0.0.1:11434", transport=httpx.MockTransport(respond))
+        return native_http.Response(status, headers={"content-type": "application/json"}, stream=body)
+    http = native_http.AsyncClient(base_url="http://127.0.0.1:11434", transport=native_http.MockTransport(respond))
     if preexisting_observer:
         async def observe(response):
             await response.aread()

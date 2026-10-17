@@ -68,6 +68,7 @@ def carries(error, original):
 @pytest.mark.parametrize("status", [200, 503])
 @pytest.mark.parametrize("kind", [None, "unknown", "cancel_unknown", "group"])
 async def test_anthropic_owns_native_body_before_sdk_reads(operation, status, kind):
+    import httpx2 as httpx
     original = receipt(kind) if kind else None
     payload = {"id": "offline", "display_name": "Offline", "max_tokens": 1024,
                "created_at": "2026-01-01T00:00:00Z"}
@@ -188,6 +189,7 @@ async def test_service_retires_real_genai_async_transport_before_success(prepare
 @pytest.mark.asyncio
 @pytest.mark.parametrize("embedding", [False, True])
 async def test_legacy_discovery_actual_openai_constructor_disables_sdk_retry(monkeypatch, embedding):
+    import httpx2 as httpx
     native = openai.AsyncOpenAI
     clients = []
     http = httpx.AsyncClient(transport=httpx.MockTransport(
@@ -226,6 +228,7 @@ async def test_registry_native_client_has_no_sdk_owned_retries(monkeypatch, prov
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sdk", ["anthropic", "openai"])
 async def test_even_external_sdk_retry_cannot_reuse_revoked_request_authority(sdk):
+    import httpx2 as httpx
     requests = []
     scope = None
     def respond(request):
@@ -251,12 +254,15 @@ async def test_even_external_sdk_retry_cannot_reuse_revoked_request_authority(sd
 @pytest.mark.parametrize("provider", ["openai", "ollama"])
 @pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group"])
 async def test_real_catalog_transport_control_is_not_empty_success(provider, kind):
+    import httpx2
+
+    native_http = httpx if provider == "ollama" else httpx2
     original = receipt(kind)
     body = ReceiptBody(json.dumps({"data": [], "models": []}).encode(), original)
     body.release_close.set()
     def respond(request):
-        return httpx.Response(200, headers={"content-type": "application/json"}, stream=body)
-    http = httpx.AsyncClient(base_url="http://127.0.0.1:11434", transport=httpx.MockTransport(respond))
+        return native_http.Response(200, headers={"content-type": "application/json"}, stream=body)
+    http = native_http.AsyncClient(base_url="http://127.0.0.1:11434", transport=native_http.MockTransport(respond))
     previous = None
     if provider == "openai":
         client = openai.AsyncOpenAI(api_key="offline-transport-only", http_client=http, max_retries=0)

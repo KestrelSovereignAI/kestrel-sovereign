@@ -159,6 +159,7 @@ async def test_early_signed_reanchor_native_committed_receipt_is_not_an_unbound_
 
 @pytest.mark.asyncio
 async def test_subsequent_original_sdk_pull_retires_suspended_native_response(tmp_path):
+    import httpx2 as httpx
     import aiosqlite
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_custody_snapshot, execution_stream
     from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
