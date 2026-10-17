@@ -26,6 +26,7 @@ from tests.integration.native_memory_original_control import (
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.utils.postgres_schema import pgvector_schema, quoted_search_path
 
 
 @pytest.mark.asyncio
@@ -212,14 +213,16 @@ async def test_actual_embedding_settings_and_cli_reads_preserve_control(
     service = n.service.get_embedding_service()
     route = n.service.providers[0]["name"]
     monkeypatch.setenv("KESTREL_EMBEDDING_DIM", "3")
-    # Actual component DDL, not whole startup migration acceptance. The public
-    # pgvector type is qualified because the fixture owns a private search_path.
+    # Actual component DDL, not whole startup migration acceptance. Install the
+    # extension when absent and resolve its actual namespace; a fresh CI DB has
+    # no public.vector merely because the image includes pgvector binaries.
+    vector_namespace = quoted_search_path(await pgvector_schema(db))
     for table in ("saved_items", "conversation_history", "document_chunks"):
         await db.execute(
             f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS embedding_profile_id TEXT"
         )
         await db.execute(
-            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS embedding_vec public.vector(3)"
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS embedding_vec {vector_namespace}.vector(3)"
         )
     await db.execute(
         "CREATE TABLE IF NOT EXISTS embedding_profiles (id TEXT PRIMARY KEY, provider TEXT, model TEXT, dim INTEGER, space_id TEXT, normalized BOOLEAN)"

@@ -123,6 +123,10 @@ wrappers keep both the operation and their existing awaited client shutdown
 inside that same admission; publication is checked again after shutdown.
 Cleanup is not replacement-work authority. Independent body and epilogue
 failures retain their original carriers without rewriting a shared source graph.
+Bootstrap route initialization and payer child-key provisioning use that same
+complete lifecycle, including post-close credential/route disclosure. Bootstrap
+cache hits retain the enclosing caller's admission too; a cached credential does
+not authorize a retired runtime to construct a new route.
 
 A registered callback's pure own-scope denial can remain local to that turn only
 when it carries neither canonical commit outcome nor cleanup debt. An acknowledged
@@ -297,6 +301,11 @@ Ordinary provider failures and internal cancellation without native control stay
 cache misses; a withdrawing reader does not acquire or cancel the shared owner.
 Refused Task admission closes the unstarted refresh coroutine without inventing
 a native cleanup acknowledgment.
+Forced discovery (`use_cache=False`) still observes the shared receipt before
+entering discovery. It controls data reuse, not control provenance. Every catalog
+publication, disk restore and outcome amendment rechecks the same receipt under
+the cache lock, so an independent live caller cannot overwrite unresolved source
+uncertainty that appeared while its own discovery was running.
 
 The deadline can only cancel a step that awaits. A listing that blocks the
 event loop cannot be cut off and holds every other route's step and deadline

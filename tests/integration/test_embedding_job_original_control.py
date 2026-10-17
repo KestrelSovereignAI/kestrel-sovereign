@@ -27,16 +27,18 @@ from tests.integration.native_memory_original_control import (
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.utils.postgres_schema import pgvector_schema, quoted_search_path
 
 
 async def _seed_job_corpus(n):
     db = n.pg_storage.db
+    vector_namespace = quoted_search_path(await pgvector_schema(db))
     for table in ("saved_items", "conversation_history", "document_chunks"):
         await db.execute(
             f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS embedding_profile_id TEXT"
         )
         await db.execute(
-            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS embedding_vec public.vector(3)"
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS embedding_vec {vector_namespace}.vector(3)"
         )
     await db.execute(
         "CREATE TABLE IF NOT EXISTS embedding_profiles (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, dim INTEGER NOT NULL, space_id TEXT NOT NULL, normalized BOOLEAN NOT NULL)"
@@ -84,13 +86,14 @@ async def test_actual_reindex_job_keeps_original_control_and_owner(
     monkeypatch.setattr(models, "_REINDEX_JOBS", {})
     db, pool = n.pg_storage.db, n.backend._pool
     armed, reached, fired, sources, launched = False, [], [], [], []
+    search_path = quoted_search_path(n.schema, await pgvector_schema(db))
     original = OSError("actual background reindex release acknowledgement lost")
 
     @asynccontextmanager
     async def vector_checkout(native):
         async with native as connection:
             # Real per-connection setting, reset by the actual pool on release.
-            await connection.execute(f'SET search_path TO "{n.schema}", public')
+            await connection.execute(f'SET search_path TO {search_path}')
             yield connection
         if armed and not fired and kind.startswith("native"):
             fired.append(True)
@@ -226,11 +229,12 @@ async def test_actual_reindex_refusal_cannot_publish_an_unowned_job(
     monkeypatch.setattr(models, "_REINDEX_JOBS", {})
     db, pool = n.pg_storage.db, n.backend._pool
     submitted, sources = [], []
+    search_path = quoted_search_path(n.schema, await pgvector_schema(db))
 
     @asynccontextmanager
     async def checkout(native):
         async with native as connection:
-            await connection.execute(f'SET search_path TO "{n.schema}", public')
+            await connection.execute(f'SET search_path TO {search_path}')
             yield connection
 
     n.backend._pool = PostgresPoolAdapter(pool, checkout)
@@ -461,11 +465,12 @@ async def test_actual_reindex_capacity_refuses_before_second_owner(
     db, pool = n.pg_storage.db, n.backend._pool
     committed, release = asyncio.Event(), asyncio.Event()
     agent = None
+    search_path = quoted_search_path(n.schema, await pgvector_schema(db))
 
     @asynccontextmanager
     async def checkout(native):
         async with native as connection:
-            await connection.execute(f'SET search_path TO "{n.schema}", public')
+            await connection.execute(f'SET search_path TO {search_path}')
             yield connection
 
     n.backend._pool = PostgresPoolAdapter(pool, checkout)

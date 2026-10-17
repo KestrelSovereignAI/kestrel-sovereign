@@ -255,6 +255,7 @@ class SharedModelCache:
         """
         require_execution_work()
         with self._lock:
+            self._raise_refresh_control_locked()
             self._publish(models, outcomes, time.time())
             logger.debug(
                 "Shared model cache updated: %d models (snapshot %d)",
@@ -271,6 +272,7 @@ class SharedModelCache:
         """
         require_execution_work()
         with self._lock:
+            self._raise_refresh_control_locked()
             if self._snapshot is not None and self._snapshot.models is not None:
                 return  # Don't overwrite fresh data with stale
             self._publish(models, None, 0.0)
@@ -315,6 +317,7 @@ class SharedModelCache:
                     f"got {outcome.status.value}"
                 )
         with self._lock:
+            self._raise_refresh_control_locked()
             current = self._snapshot
             if current is None or current.catalog_version != catalog_version:
                 return False

@@ -14,12 +14,13 @@ import pytest
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
+    ExecutionCustody,
     bind_execution_custody,
     execution_denial_scopes,
     is_execution_control_error,
 )
 from kestrel_sovereign.features.llm_keys import openrouter_provisioning as module
-from tests.integration.test_execution_authority_postgres import GenerationFence
+from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
 
 
 @pytest.mark.asyncio
@@ -34,13 +35,49 @@ from tests.integration.test_execution_authority_postgres import GenerationFence
     ("legacy-usage", "close"), ("legacy-delete", "close"),
     ("service", "normalized"), ("service-usage", "entry"),
     ("service-update", "entry"), ("service-delete", "entry"), ("service-list", "entry"),
+    ("bootstrap", "close"), ("registry", "close"),
+    ("bootstrap", "entry"), ("bootstrap", "response-cleanup"),
+    ("bootstrap", "cached-entry"),
+    ("payer", "close"), ("payer", "response-cleanup"),
+    ("payer-revoke", "revoke-control"),
 ])
 async def test_provisioning_original_authority_fences_native_dispatch_and_disclosure(
-    monkeypatch, entry, phase,
+    native_pg, tmp_path, monkeypatch, entry, phase,
 ):
     entered, release = asyncio.Event(), asyncio.Event()
     peers, requests, clients, scopes = set(), [], [], []
     originals, graphs, cleanup_errors = [], [], []
+    from kestrel_sovereign.llm import provider_registry as registry_module
+    monkeypatch.setattr(registry_module, "_BOOTSTRAP_OPENROUTER_KEYS", {})
+    monkeypatch.setattr(registry_module, "_BOOTSTRAP_OPENROUTER_LOCK", None)
+    if phase == "cached-entry":
+        registry_module._BOOTSTRAP_OPENROUTER_KEYS["declared-inert-loopback-management"] = "declared-inert-cached-child"
+    registries = []
+    payer_db = payer_storage = payer = None
+    if entry in {"payer", "payer-revoke"}:
+        from kestrel_sovereign.security.host_key_storage import HostKeyStorage
+        from kestrel_sovereign.services.payer_resolver import FoundationPayerResolver
+        from kestrel_sovereign.storage.async_storage import AsyncStorage
+        from tests.unit.test_payer_resolver_mint import _host_master_policy, _seed_agent_graph_node
+        monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-32-bytes-fixed--")
+        # Declared component graph input, not Agent genesis or READY evidence.
+        payer_storage = AsyncStorage(backend=native_pg[0])
+        await payer_storage.initialize()
+        payer_db = payer_storage.db
+        await _seed_agent_graph_node(payer_db, "did:test:inert-payer-input")
+        await HostKeyStorage(payer_db).store_key("openrouter", "declared-inert-loopback-management")
+        payer = FoundationPayerResolver(_host_master_policy(), db=payer_db)
+    foreign_scope = foreign_original = None
+    foreign_graph = ()
+    if phase == "revoke-control":
+        async with native_pg[0].advisory_locks([(3569, 18231)]) as lease:
+            foreign_scope = ExecutionCustody(GenerationFence(lease=lease))
+        try:
+            foreign_scope.require_work()
+        except BaseException as error:
+            foreign_original = error
+            foreign_graph = tuple(_explicit_control_chain(error))
+        assert is_execution_control_error(foreign_original)
     closed_db = None
     if phase == "response-cleanup":
         closed_db = await aiosqlite.connect(":memory:")
@@ -94,10 +131,18 @@ async def test_provisioning_original_authority_fences_native_dispatch_and_disclo
         entered.set()
         await release.wait()
 
+    async def original_revoke_control(response):
+        if response.request.method == "DELETE":
+            entered.set()
+            await release.wait()
+            raise foreign_original
+
     async def observed_get(service):
         client = await actual_get(service)
         if client not in clients:
             clients.append(client)
+            if phase == "revoke-control":
+                client.event_hooks["response"].append(original_revoke_control)
             if phase == "dispatch":
                 client.event_hooks["request"].append(hold_request)
             elif phase == "client":
@@ -122,7 +167,12 @@ async def test_provisioning_original_authority_fences_native_dispatch_and_disclo
 
     async def observed_create(service, *args, **kwargs):
         try:
-            return await actual_create(service, *args, **kwargs)
+            result = await actual_create(service, *args, **kwargs)
+            if entry == "payer-revoke":
+                # The same real graph row disappears after native mint ACK.
+                await payer_db.execute("DELETE FROM graph_nodes WHERE node_id = ?",
+                                       ("did:test:inert-payer-input",))
+            return result
         except BaseException as error:
             originals.append(error)
             graphs.append(tuple(_explicit_control_chain(error)))
@@ -136,7 +186,7 @@ async def test_provisioning_original_authority_fences_native_dispatch_and_disclo
     async def run():
         with bind_execution_custody(GenerationFence()) as original:
             scopes.append(original)
-            if phase == "entry":
+            if phase in {"entry", "cached-entry"}:
                 original.revoke("actual original runtime retired before service admission")
                 entered.set()
             if entry.startswith("service"):
@@ -152,6 +202,31 @@ async def test_provisioning_original_authority_fences_native_dispatch_and_disclo
                 return await module.mint_managed_openrouter_key(
                     "declared-inert-loopback-management", "native-loopback-agent",
                 )
+            if entry == "bootstrap":
+                return await registry_module._mint_bootstrap_openrouter_key(
+                    "declared-inert-loopback-management", host_db=None,
+                )
+            if entry in {"payer", "payer-revoke"}:
+                from kestrel_sdk.payer_policy import ResourceClass
+                return await payer.resolve_for("did:test:inert-payer-input", ResourceClass.LLM)
+            if entry == "registry":
+                monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+                # Explicit fixture installation inventory: only the configured
+                # built-in loopback route. Never instantiate unrelated installed
+                # third-party providers or their credential discovery chains.
+                monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes",
+                                    lambda group, base: {})
+                registry = registry_module.ProviderRegistry(config={
+                    "route_priority": ["openrouter:api"], "vendors": {"openrouter": {
+                        "is_cloud": True, "routes": {"api": {
+                            "adapter": "OpenRouterAdapter", "model": "auto",
+                            "api_key_env": "OPENROUTER_API_KEY", "base_url": endpoint,
+                        }},
+                    }},
+                })
+                registries.append(registry)
+                assert registry.initialize_providers() == []
+                return await registry.finalize_providers(host_db=None)
             if entry == "sdk-usage":
                 return await module.get_provider_key_usage(
                     "declared-inert-loopback-management", "declared-inert-loopback-hash",
@@ -170,15 +245,24 @@ async def test_provisioning_original_authority_fences_native_dispatch_and_disclo
     try:
         await asyncio.wait_for(entered.wait(), 5)
         assert len(scopes) == 1
-        scopes[0].revoke("actual original provisioning runtime retired")
+        if phase != "revoke-control":
+            scopes[0].revoke("actual original provisioning runtime retired")
         release.set()
         outcome = await asyncio.wait_for(await_owned_task(task), 5)
+        if entry in {"bootstrap", "registry"} and phase != "cached-entry":
+            assert not registry_module._BOOTSTRAP_OPENROUTER_KEYS, "bootstrap published a credential after original runtime authority retired"
+            assert all(not registry.providers for registry in registries), "bootstrap published a route after original runtime authority retired"
         assert outcome.error is not None and outcome.result is None, (
             "provisioning disclosed a key after original runtime authority retired"
         )
-        assert is_execution_control_error(outcome.error)
-        assert scopes[0] in (execution_denial_scopes(outcome.error) or ())
-        expected_requests = 2 if entry == "sdk-update" and phase == "close" else (
+        assert is_execution_control_error(outcome.error), "provisioning normalized original runtime control"
+        if phase == "revoke-control":
+            assert foreign_original in tuple(_explicit_control_chain(outcome.error))
+            assert tuple(_explicit_control_chain(foreign_original)) == foreign_graph
+            assert foreign_scope in (execution_denial_scopes(outcome.error) or ())
+        else:
+            assert scopes[0] in (execution_denial_scopes(outcome.error) or ())
+        expected_requests = 2 if entry == "payer-revoke" or entry == "sdk-update" and phase == "close" else (
             1 if phase.startswith("response") or phase in {"close", "normalized"} else 0
         )
         assert len(requests) == expected_requests, (
@@ -206,6 +290,11 @@ async def test_provisioning_original_authority_fences_native_dispatch_and_disclo
         await actual_close(direct)
         for client in clients:
             await client.aclose()
+        for registry in registries:
+            for provider in registry.providers:
+                await provider.client.close()
+        if payer_storage is not None:
+            await payer_storage.close()
         server.close()
         await server.wait_closed()
         for peer_task in tuple(peers):

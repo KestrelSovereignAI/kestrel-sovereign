@@ -498,6 +498,9 @@ class ModelDiscoveryMixin:
         """:meth:`discover_all_models` within its discovery-call scope."""
         # Check shared process-wide cache
         shared_cache = get_shared_model_cache()
+        # use_cache selects catalog reuse, not permission to bypass an original
+        # shared refresh's unresolved control or enter replacement discovery.
+        shared_cache.snapshot()
         if use_cache:
             async def _return_cached(snapshot: ModelCatalogSnapshot) -> List[ModelInfo]:
                 logger.debug("Using shared model cache")

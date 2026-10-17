@@ -41,6 +41,7 @@ import os
 from typing import List, Dict, Any, Optional, Tuple
 
 import openai
+from kestrel_sovereign.execution_custody import execution_work_operation
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url, get_openrouter_api_base
 
@@ -910,6 +911,7 @@ def _bootstrap_host_provider_id(management_key: str) -> str:
     return f"openrouter_bootstrap_{digest}"
 
 
+@execution_work_operation
 async def _mint_bootstrap_openrouter_key(
     management_key: str,
     limit_usd: float = _BOOTSTRAP_OPENROUTER_LIMIT_USD,
@@ -971,18 +973,13 @@ async def _mint_bootstrap_openrouter_key(
         # Late import: keep the provisioning surface (httpx) out of module
         # import so the registry loads on deployments that never touch it.
         from kestrel_sovereign.features.llm_keys.openrouter_provisioning import (
-            OpenRouterProvisioningService,
+            mint_managed_openrouter_key,
         )
 
-        service = OpenRouterProvisioningService(management_key=management_key)
-        try:
-            key_info = await service.create_agent_key(
-                agent_name="bootstrap-registry-default",
-                limit_usd=limit_usd,
-                limit_reset="monthly",
-            )
-        finally:
-            await service.close()
+        key_info = await mint_managed_openrouter_key(
+            management_key, "bootstrap-registry-default",
+            limit_usd=limit_usd, reset="monthly",
+        )
 
         # Persist so the next process (cold start) reuses this key instead of
         # minting another. Best-effort — a store failure just degrades to the

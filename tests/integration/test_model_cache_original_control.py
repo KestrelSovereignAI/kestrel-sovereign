@@ -7,6 +7,7 @@ uses an empty configured route inventory and the actual shared cache.
 
 import asyncio
 import contextvars
+import sqlite3
 
 import pytest
 
@@ -17,7 +18,7 @@ from kestrel_sovereign.execution_custody import (
     execution_commit_outcome,
     is_execution_control_error,
 )
-from kestrel_sovereign.llm.model_cache import SharedModelCache
+from kestrel_sovereign.llm.model_cache import SharedModelCache, VendorDiscoveryOutcome
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
 from tests.integration.test_execution_custody_review30_pg import lose_ack
@@ -26,9 +27,10 @@ from tests.unit.test_execution_custody_review30 import service_owner
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("carrier", ["error", "cancel"])
-@pytest.mark.parametrize("entry", ["waiter", "late-waiter", "fresh", "stale", "early-snapshot"])
+@pytest.mark.parametrize("entry", ["waiter", "late-waiter", "fresh", "stale", "early-snapshot",
+                                 "forced", "tool", "publish", "restore", "amend"])
 async def test_background_catalog_original_commit_control_survives_callback_and_readers(
-    native_pg, monkeypatch, carrier, entry,
+    native_pg, tmp_path, monkeypatch, carrier, entry,
 ):
     backend, observer, schema = native_pg
     entered, release, finished, observing = (asyncio.Event() for _ in range(4))
@@ -41,10 +43,21 @@ async def test_background_catalog_original_commit_control_survives_callback_and_
         cache.set(models)
     else:
         cache.set_stale(models)
+    initial_snapshot = cache.snapshot()
     monkeypatch.setattr("kestrel_sovereign.llm.model_discovery.get_shared_model_cache", lambda: cache)
     service = service_owner()
     service.config = {}
     originals, original_graphs = [], []
+    selected_path = tmp_path / "actual-discovery-entry.db"
+    actual_select = service._select_discovery_routes
+
+    def observe_actual_selection():
+        with sqlite3.connect(selected_path) as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS actual_entry (id INTEGER)")
+            connection.execute("INSERT INTO actual_entry VALUES (1)")
+        return actual_select()
+
+    monkeypatch.setattr(service, "_select_discovery_routes", observe_actual_selection)
 
     async def refresh():
         try:
@@ -64,6 +77,20 @@ async def test_background_catalog_original_commit_control_survives_callback_and_
                 return await cache.wait_for_refresh()
             if entry == "early-snapshot":
                 return cache.snapshot()
+            if entry == "publish":
+                return cache.set(models)
+            if entry == "restore":
+                return cache.set_stale(models)
+            if entry == "amend":
+                return cache.record_failures(initial_snapshot.catalog_version,
+                    {"native": VendorDiscoveryOutcome.failed("ordinary discovery outage")})
+            if entry == "forced":
+                return await service.discover_all_models(use_cache=False)
+            if entry == "tool":
+                from kestrel_sovereign.features.model.feature import ModelAgent
+                feature = ModelAgent(agent=None)
+                feature.llm_service = service
+                return await feature.list_models(use_cache=False)
             return await service.discover_all_models(stale_while_revalidate=entry == "stale")
 
     source = reader = None
@@ -105,6 +132,7 @@ async def test_background_catalog_original_commit_control_survives_callback_and_
                     reader = create_owned_task(consume(), context=contextvars.Context(), retain_originals=True)
                 outcome = await await_owned_task(reader)
                 reader = None
+                assert not selected_path.exists(), "forced discovery entered new native work before observing original shared control"
                 assert outcome.error is not None, "shared refresh control became an ordinary cache miss or catalog"
                 assert originals[0] in tuple(_explicit_control_chain(outcome.error)), (
                     "shared refresh discarded its actual original native commit receipt"

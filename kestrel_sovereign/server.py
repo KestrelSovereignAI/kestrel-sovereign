@@ -2572,11 +2572,9 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
     try:
         await backend.connect()
     except BaseException as startup_failure:
-        cleanup = asyncio.create_task(
-            backend.close(), name="shared_agent_postgres_startup_cleanup"
-        )
-        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
-            cleanup
+        cleanup_cancelled, cleanup_failure, _ = await _run_lifespan_shutdown_phase(
+            "shared_agent_postgres_startup_cleanup", backend.close,
+            resources=(backend,),
         )
         if cleanup_failure is None:
             app.state.shared_agent_postgres_backend = None
@@ -2585,7 +2583,8 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
                 "Shared PostgreSQL startup cleanup also failed: "
                 f"{type(cleanup_failure).__name__}"
             )
-        terminal = execution_terminal_error(startup_failure, cleanup_failure)
+        terminal = execution_terminal_error(startup_failure, cleanup_failure,
+                                           retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
         if cleanup_cancelled and not isinstance(
@@ -2712,13 +2711,12 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
         # A transient bootstrap pool is invisible to ordinary server teardown,
         # so this helper remains its cancellation-safe lifecycle owner until it
         # is terminal.  Do not allow a repeated cancellation to strand it.
-        close_task = asyncio.create_task(
-            storage.close(), name="host_scheduler_protocol_preflight_close"
+        close_cancelled, close_failure, _ = await _run_lifespan_shutdown_phase(
+            "host_scheduler_protocol_preflight_close", storage.close,
+            resources=(storage,),
         )
-        close_cancelled, close_failure = await await_lifecycle_task_completion(
-            close_task
-        )
-        terminal = execution_terminal_error(preflight_failure, close_failure)
+        terminal = execution_terminal_error(preflight_failure, close_failure,
+                                           retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
         if close_failure is not None:
@@ -2888,12 +2886,9 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
         if callable(configure_registration):
             configure_registration(_register_runtime_scheduler_tenant)
     except BaseException as startup_failure:
-        cleanup = asyncio.create_task(
-            _shutdown_host_scheduler(app),
-            name="host_scheduler_startup_cleanup",
-        )
-        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
-            cleanup
+        cleanup_cancelled, cleanup_failure, _ = await _run_lifespan_shutdown_phase(
+            "host_scheduler_startup_cleanup", lambda: _shutdown_host_scheduler(app),
+            resources=tuple(owner for owner in (storage, runner) if owner is not None),
         )
         if cleanup_failure is not None and not isinstance(
             cleanup_failure, asyncio.CancelledError
@@ -2908,7 +2903,8 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
                     cleanup_failure.__traceback__,
                 ),
             )
-        terminal = execution_terminal_error(startup_failure, cleanup_failure)
+        terminal = execution_terminal_error(startup_failure, cleanup_failure,
+                                           retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
         if cleanup_cancelled and not isinstance(
@@ -3024,10 +3020,10 @@ async def _rollback_startup_agent_manager(manager) -> bool:
     own dispatchers or storage.  Keep the cleanup task alive through repeated
     cancellation and return whether the startup caller was cancelled.
     """
-    rollback = asyncio.create_task(
-        manager.shutdown_all(), name="server_startup:rollback_agents"
+    cancelled, failure, _ = await _run_lifespan_shutdown_phase(
+        "server_startup:rollback_agents", manager.shutdown_all,
+        resources=(manager,),
     )
-    cancelled, failure = await await_lifecycle_task_completion(rollback)
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
     if failure is not None and is_execution_control_error(failure):
@@ -3052,11 +3048,13 @@ async def _run_lifespan_shutdown_phase(
     *,
     resources=(),
 ) -> tuple[bool, BaseException | None, object | None]:
-    """Own one teardown phase through repeated cancellation.
+    """Own one teardown phase, including partial startup, through cancellation.
 
     Each phase receives a distinct task.  A cancellation of the lifespan task
     therefore records cancellation but cannot stop the next independently
-    owned phase from releasing its resources.
+    owned phase from releasing its resources. Startup epilogues use this same
+    admission boundary: a refused cleanup retains its actual original resource
+    and closes the unstarted coroutine, never reporting successful retirement.
     """
     from kestrel_sovereign._async_ownership import create_owned_task
 
