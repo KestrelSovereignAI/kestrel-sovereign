@@ -10,7 +10,7 @@ import inspect
 import sys
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from functools import wraps
+from functools import partial, wraps
 
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.execution_custody import (
@@ -127,10 +127,13 @@ async def joined_iterator(stream):
         await close_native_execution_stream(stream)
 
 
-def genai_operation(function):
+def genai_operation(function=None, *, resolve_client=True):
+    if function is None:
+        return partial(genai_operation, resolve_client=resolve_client)
     @wraps(function)
-    async def owned(self, client, *args, **kwargs):
-        client = client if client is not None else self._get_client()
+    async def owned(self, client=None, *args, **kwargs):
+        if resolve_client and client is None:
+            client = self._get_client()
         async with genai_stream_owner(client):
             return await function(self, client, *args, **kwargs)
     return owned

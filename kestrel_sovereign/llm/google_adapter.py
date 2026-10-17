@@ -21,7 +21,7 @@ from kestrel_sdk.llm import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
-from .genai_custody import genai_operation, genai_stream, joined_iterator
+from .genai_custody import genai_operation, genai_stream, joined_iterator, prepare_genai_client
 from .gemini_contents import (
     to_gemini_contents,
     tool_call_from_part,
@@ -638,6 +638,7 @@ class GoogleAdapter(LLMAdapter):
             **kwargs
         )
 
+    @genai_operation(resolve_client=False)
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from Google Gemini API.
 
@@ -669,6 +670,7 @@ class GoogleAdapter(LLMAdapter):
                     return []
 
                 client = genai.Client(api_key=api_key)
+            prepare_genai_client(client)
             models = []
 
             async for model in await client.aio.models.list():
@@ -712,6 +714,9 @@ class GoogleAdapter(LLMAdapter):
             return models
 
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to list Google models: {e}", exc_info=True)
             return []
 

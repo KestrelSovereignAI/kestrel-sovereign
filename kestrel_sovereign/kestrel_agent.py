@@ -9246,33 +9246,39 @@ Expected Duration: {expected_duration}
         )
         return serialize_chain_for_metadata(chain)
 
-    def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
+    def _track_background_task(self, coro, *, name: str, admission=None) -> asyncio.Task:
         """Start agent-owned background work and remove it when complete."""
-        from kestrel_sovereign._async_ownership import create_owned_task
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
 
         # Keep create_task's fresh-coroutine contract: an already accepted
         # borrowed Task must not be adopted as this agent's background child.
         if not asyncio.iscoroutine(coro):
             raise TypeError("agent background publication requires a fresh coroutine")
-        task = create_owned_task(coro, name=name)
+        receipt = admission if admission is not None else OwnedTaskAdmission()
+        try:
+            task = create_owned_task(coro, name=name, admission=receipt)
+        finally:
+            if receipt.task is not None:
+                receipt.task._kestrel_started_at = time.monotonic()
+                self._background_tasks.add(receipt.task)
         # ``asyncio.Task`` carries no creation time, and age is what separates
         # "busy" from "wedged" when something inspects this set — the restart
         # coordinator's idle gate reports it so an operator can tell a task
         # that appeared once from one stuck for hours (#2665). Stamped at the
         # single chokepoint that owns the set, so nothing has to maintain a
         # parallel map that could outlive the task.
-        task._kestrel_started_at = time.monotonic()  # type: ignore[attr-defined]
-        self._background_tasks.add(task)
         def completed(done):
-            from kestrel_sovereign._async_ownership import owned_task_error
-            # Unbounded publishers keep one strongest receipt, not a history
-            # of completed worker payloads. Finite lifecycle drains opt in.
-            self._remember_shutdown_control(
-                owned_task_error(done), retain_originals=False,
-            )
-            self._background_tasks.discard(done)
+            self._finish_background_task(done)
         task.add_done_callback(completed)
         return task
+
+    def _finish_background_task(self, done) -> None:
+        """Idempotently harvest the exact accepted owner, callback or drain."""
+        if done not in self._background_tasks:
+            return
+        from kestrel_sovereign._async_ownership import owned_task_error
+        self._remember_shutdown_control(owned_task_error(done), retain_originals=False)
+        self._background_tasks.discard(done)
 
     def _runtime_owner_context(self):
         """Original resident context; also used by lifecycle-owned timers.

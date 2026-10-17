@@ -28,7 +28,7 @@ from kestrel_sdk.llm import (
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
-from .genai_custody import genai_operation, genai_stream, joined_iterator
+from .genai_custody import genai_operation, genai_stream, joined_iterator, prepare_genai_client
 from .google_adapter import _finish_reason, _normalized_google_genai_usage
 from .gemini_contents import (
     SYSTEM_MARKER_ROLE,
@@ -685,13 +685,12 @@ class VertexAIAdapter(LLMAdapter):
             **kwargs
         )
 
+    @genai_operation(resolve_client=False)
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from Vertex AI.
 
-        ``client`` is accepted for contract symmetry with
-        :meth:`get_response` (SDK 0.5.0). Vertex discovery uses the
-        adapter's own ``_get_client()`` (project_id + location bound at
-        construction time), so the parameter is ignored here.
+        A supplied route client is borrowed, as for :meth:`get_response`.
+        Without one, use the adapter's project/location-bound cached client.
 
         Uses the google-genai SDK's asynchronous ``aio.models.list()``. The
         listing awaits, so the per-route discovery deadline can cancel it
@@ -703,7 +702,8 @@ class VertexAIAdapter(LLMAdapter):
             List of ModelInfo objects for each available model
         """
         try:
-            genai_client = self._get_client()
+            genai_client = client if client is not None else self._get_client()
+            prepare_genai_client(genai_client)
             models = []
 
             async for model in await genai_client.aio.models.list():
@@ -735,6 +735,9 @@ class VertexAIAdapter(LLMAdapter):
             return models
 
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to discover Vertex AI models: {e}")
             # Return fallback models
             return self._get_fallback_models()

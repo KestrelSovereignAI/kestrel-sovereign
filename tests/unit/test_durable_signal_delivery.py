@@ -97,8 +97,9 @@ class _Agent:
         """Mirror the production agent seam used by durable persistence."""
         return self._durable_persistence_gate
 
-    def _track_background_task(self, coro, *, name: str):
-        task = asyncio.create_task(coro, name=name)
+    def _track_background_task(self, coro, *, name: str, admission=None):
+        from kestrel_sovereign._async_ownership import create_owned_task
+        task = create_owned_task(coro, name=name, admission=admission)
         self.tasks.append(task)
         return task
 

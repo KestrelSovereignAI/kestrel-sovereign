@@ -29,10 +29,12 @@ from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsErr
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     InvocationSelfFencedError,
+    admit_request_operation,
     invocation_id_response_header,
     invocation_log_correlation,
     new_stream_delivery_id,
     register_request_delivery,
+    retire_request_delivery,
     validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
@@ -462,6 +464,9 @@ async def invoke_agent(request: Request, http_response: Response):
     """
     cleanup_agent = None
     cleanup_request_id = None
+    cleanup_abandoned = False
+    cleanup_opening = None
+    cleanup_generation = None
     try:
         data = await _parse_json_body(request)
         user_input = data.get("input")
@@ -497,7 +502,9 @@ async def invoke_agent(request: Request, http_response: Response):
         )
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
-            register_request_delivery(agent, request_id, nested=False)
+            generation = register_request_delivery(agent, request_id, nested=False)
+            if type(generation) is int:
+                cleanup_generation = generation
             await_admission = getattr(
                 type(agent), "await_durable_request_admission", None
             )
@@ -505,10 +512,10 @@ async def invoke_agent(request: Request, http_response: Response):
                 if callable(await_admission):
                     await await_admission(agent, request_id)
             except BaseException as error:
-                if is_execution_control_error(error):
-                    agent._cleanup_cancelled_request(request_id, disposition=RequestCompletionDisposition.ABANDONED)
-                else:
-                    agent._cleanup_cancelled_request(request_id)
+                retire_request_delivery(
+                    agent, request_id, generation=cleanup_generation,
+                    abandoned=is_execution_control_error(error), error=error,
+                )
                 raise
         else:
             agent._current_request_id = request_id
@@ -540,28 +547,29 @@ async def invoke_agent(request: Request, http_response: Response):
             owner_cancellation_baseline = (
                 owner_task.cancelling() if owner_task is not None else 0
             )
-            evidence_task = asyncio.create_task(
-                _kite_runtime_observation(
-                    agent,
-                    request_id=request_id,
-                    provenance=request_invocation_provenance(
-                        request,
-                        source_locator=(
-                            "POST:/api/agent/invoke#kite-release-evidence"
+            try:
+                evidence_task = await admit_request_operation(
+                    agent, request_id,
+                    _kite_runtime_observation(
+                        agent,
+                        request_id=request_id,
+                        provenance=request_invocation_provenance(
+                            request,
+                            source_locator=(
+                                "POST:/api/agent/invoke#kite-release-evidence"
+                            ),
                         ),
+                        request=kite_evidence_request,
                     ),
-                    request=kite_evidence_request,
-                ),
-                name=(
-                    "kite-evidence:"
-                    f"{invocation_log_correlation(request_id)}"
-                ),
-            )
-            bind_operation = getattr(
-                type(agent), "bind_request_operation", None
-            )
-            if callable(bind_operation):
-                bind_operation(agent, request_id, evidence_task)
+                    name=(
+                        "kite-evidence:"
+                        f"{invocation_log_correlation(request_id)}"
+                    ),
+                )
+            except BaseException as opening:
+                cleanup_abandoned = True
+                cleanup_opening = opening
+                raise
             try:
                 operation, observation = await evidence_task
             except asyncio.CancelledError as error:
@@ -734,10 +742,16 @@ async def invoke_agent(request: Request, http_response: Response):
     finally:
         if cleanup_agent is not None and cleanup_request_id is not None:
             error = sys.exception()
-            if error is not None and is_execution_control_error(error):
-                cleanup_agent._cleanup_cancelled_request(cleanup_request_id, disposition=RequestCompletionDisposition.ABANDONED)
-            else:
-                cleanup_agent._cleanup_cancelled_request(cleanup_request_id)
+            if cleanup_opening is not None:
+                error = execution_terminal_error(
+                    cleanup_opening, error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            retire_request_delivery(
+                cleanup_agent, cleanup_request_id, generation=cleanup_generation,
+                abandoned=cleanup_abandoned or (error is not None and is_execution_control_error(error)),
+                error=error,
+            )
 
 
 # Chat attachments (#1662). Images can be sent to the model as vision input

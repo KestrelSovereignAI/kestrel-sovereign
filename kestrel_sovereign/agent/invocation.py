@@ -148,6 +148,60 @@ def register_request_delivery(
     return registrar(request_id)
 
 
+async def admit_request_operation(agent, request_id, operation, *, name, context=None):
+    """Accept and bind one child, or physically retire it before returning.
+
+    Registration belongs to the caller. Even canonical callback refusal must
+    leave the accepted Task reachable, and failure means ABANDONED bookkeeping
+    at that caller, never a successful delivery.
+    """
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
+    from .request_lifecycle import bind_request_operation_if_supported
+    admission = OwnedTaskAdmission()
+    try:
+        task = create_owned_task(operation, name=name, context=context,
+                                 retain_originals=True, admission=admission)
+        bind_request_operation_if_supported(agent, request_id, task)
+        return task
+    except BaseException as opening:
+        if admission.task is not None:
+            cancellation_token = object()
+            induced = not admission.task.done() and not admission.task.cancelling()
+            if induced:
+                admission.task.cancel(cancellation_token)
+            outcome = await await_owned_task(admission.task)
+            cleanup_error = outcome.error
+            if (isinstance(cleanup_error, asyncio.CancelledError)
+                and induced and cleanup_error.args == (cancellation_token,)
+                and cleanup_error.__cause__ is None
+                and cleanup_error.__context__ in (None, opening)
+                and not is_execution_control_error(cleanup_error)):
+                cleanup_error = None
+            raise execution_terminal_error(
+                opening, cleanup_error, outcome.cancellation,
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
+        raise
+
+
+def retire_request_delivery(agent, request_id, *, generation=None, abandoned=False, error=None):
+    """Release exactly one reference, or retain its actual registration debt."""
+    from .request_lifecycle import RequestCompletionDisposition
+    options = {"generation": generation} if generation is not None else {}
+    if abandoned:
+        options["disposition"] = RequestCompletionDisposition.ABANDONED
+    try:
+        agent._cleanup_cancelled_request(request_id, **options)
+    except BaseException as cleanup_error:
+        debt = RuntimeError("original request registration did not retire")
+        debt._kestrel_native_retirement_debts = (((agent, request_id, generation), None),)
+        raise execution_terminal_error(
+            error, cleanup_error, debt, retain_originals=True,
+            isolate_control_originals=True,
+        )
+
+
 def invocation_id_response_header(value: object) -> str:
     """Return an ASCII-safe representation of an accepted invocation ID.
 
@@ -397,6 +451,7 @@ def bind_async_invocation(
                     require_execution_work(lifecycle_owner)
                     return result
                 registered = False
+                registered_generation = None
                 cleanup_abandoned = False
                 isolated_operation: asyncio.Task[Any] | None = None
                 caller_task = asyncio.current_task()
@@ -463,11 +518,13 @@ def bind_async_invocation(
                         None,
                     )
                     if callable(register):
-                        register_request_delivery(
+                        generation = register_request_delivery(
                             lifecycle_owner,
                             invocation_id,
                             nested=True,
                         )
+                        if type(generation) is int:
+                            registered_generation = generation
                         registered = True
                 try:
                     if registered:
@@ -483,11 +540,6 @@ def bind_async_invocation(
                                 "invocation was stopped before durable admission "
                                 f"({invocation_log_correlation(invocation_id)})"
                             )
-                        bind_operation = getattr(
-                            type(lifecycle_owner),
-                            "bind_request_operation",
-                            None,
-                        )
                         parent_context = copy_context()
                         operation_context = parent_context.copy()
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
@@ -554,36 +606,18 @@ def bind_async_invocation(
                                 ):
                                     return await invoke_governed()
 
-                        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
                         try:
-                            isolated_operation = create_owned_task(
+                            isolated_operation = await admit_request_operation(
+                                lifecycle_owner, invocation_id,
                                 run_isolated_operation(),
                                 name=(
                                     "invocation-turn:"
                                     f"{invocation_log_correlation(invocation_id)}"
                                 ),
                                 context=operation_context,
-                                retain_originals=True,
                             )
-                            if callable(bind_operation):
-                                bind_operation(
-                                    lifecycle_owner,
-                                    invocation_id,
-                                    isolated_operation,
-                                )
-                        except BaseException as opening:
+                        except BaseException:
                             cleanup_abandoned = True
-                            if isolated_operation is not None:
-                                isolated_operation.cancel()
-                                outcome = await await_owned_task(isolated_operation)
-                                cleanup_error = outcome.error
-                                if isinstance(cleanup_error, asyncio.CancelledError) and not is_execution_control_error(cleanup_error):
-                                    cleanup_error = None
-                                raise execution_terminal_error(
-                                    opening, cleanup_error, outcome.cancellation,
-                                    retain_originals=True, prefer_cancellation=True,
-                                    isolate_control_originals=True,
-                                )
                             raise
                         try:
                             result = await isolated_operation
@@ -729,24 +763,10 @@ def bind_async_invocation(
                     raise
                 finally:
                     if registered:
-                        if cleanup_abandoned:
-                            # Imported lazily to avoid the module cycle:
-                            # request_lifecycle imports the correlation helper
-                            # from this module during class definition.
-                            from .request_lifecycle import (
-                                RequestCompletionDisposition,
-                            )
-
-                            lifecycle_owner._cleanup_cancelled_request(
-                                invocation_id,
-                                disposition=(
-                                    RequestCompletionDisposition.ABANDONED
-                                ),
-                            )
-                        else:
-                            lifecycle_owner._cleanup_cancelled_request(
-                                invocation_id
-                            )
+                        retire_request_delivery(
+                            lifecycle_owner, invocation_id, generation=registered_generation,
+                            abandoned=cleanup_abandoned, error=sys.exception(),
+                        )
 
         return wrapped
 

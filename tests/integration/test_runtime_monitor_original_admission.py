@@ -12,6 +12,7 @@ import pytest
 from kestrel_sdk.signals import Signal, SignalMode
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts, is_execution_control_error
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.signals import (
     DurableConsumerRegistration, DurableSignalStore, OrderedLockManager,
@@ -21,12 +22,18 @@ from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUME
 from tests.integration.test_budget_refund_original_control import registered_cleanup_component
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.unit.test_host_context_native_cleanup import _actual_operation
+from tests.integration.test_execution_custody_review56_pg import lose_native_ack
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["allocation", "callback-before", "callback-after"])
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+@pytest.mark.parametrize("mode", [
+    "allocation", "callback-before", "callback-after",
+    "tracker-before", "tracker-after", "canonical-before", "canonical-after",
+    "tracker-control-before", "tracker-control-after",
+])
 async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
-    native_pg, tmp_path, monkeypatch, mode,
+    native_pg, tmp_path, monkeypatch, mode, eager,
 ):
     backend, observer, schema = native_pg
     child, db = await registered_cleanup_component(AgentManager(base_data_dir=tmp_path), schema, tmp_path, monkeypatch)
@@ -64,10 +71,17 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     refusal = RuntimeError("actual original monitor " + mode + " refused")
     refused, accepted = [], []
+    native_fault_context = monkeypatch.context()
+    native_fault = native_fault_context.__enter__()
+    native_receipts = None
+    native_original = None
     class RefusedCallback(asyncio.Task):
         def add_done_callback(self, callback, *, context=None):
-            if getattr(callback, "__name__", "") == "_finish_runtime_owner_heartbeat":
-                if mode == "callback-after":
+            target = {"tracker": "completed", "canonical": "close_unstarted"}.get(
+                mode.split("-")[0], "_finish_runtime_owner_heartbeat",
+            )
+            if getattr(callback, "__name__", "") == target:
+                if mode.endswith("-after"):
                     super().add_done_callback(callback, context=context)
                 raise refusal
             return super().add_done_callback(callback, context=context)
@@ -77,7 +91,8 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
             if mode == "allocation":
                 refused.append((coroutine, operation))
                 raise refusal
-            task = RefusedCallback(coroutine, loop=loop, **kwargs)
+            options = {"eager_start": True} if eager else {}
+            task = RefusedCallback(coroutine, loop=loop, **kwargs, **options)
             accepted.append(task)
             return task
         return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
@@ -98,12 +113,25 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
         retry.cancel()
         if accepted:
             original = accepted[0]
-            assert dispatcher._runtime_owner_heartbeat_task is original and not original.done()
+            assert dispatcher._runtime_owner_heartbeat_task is original and not original.done(), "monitor lost original accepted Task across tracker publication"
             dispatcher._start_runtime_owner_heartbeat()
             assert dispatcher._runtime_owner_heartbeat_task is original, "retry replaced accepted original monitor before physical settlement"
             assert len(accepted) == 1
+            if "-control-" in mode:
+                native_receipts = lose_native_ack(
+                    native_fault, boundary="commit",
+                    original=OSError("actual cleanup-owner CAS COMMIT ACK lost"),
+                )
             outcome = await await_owned_task(original)
-            assert outcome.error is None
+            if "-control-" in mode:
+                native_original = outcome.error
+                assert native_receipts == [True] and is_execution_control_error(native_original)
+                original_graph = tuple(_explicit_control_chain(native_original))
+                original_debts = tuple(execution_cleanup_debts(native_original))
+                native_fault_context.__exit__(None, None, None)
+                native_fault = None
+            else:
+                assert outcome.error is (refusal if mode.startswith("canonical") else None)
             await asyncio.sleep(0)
             if dispatcher._runtime_owner_heartbeat_task is original:
                 timer = dispatcher._runtime_owner_heartbeat_timer
@@ -111,6 +139,24 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
                 timer.cancel()
                 dispatcher._start_runtime_owner_heartbeat()
             assert dispatcher._runtime_owner_heartbeat_task is None, "completed monitor without published callback was not harvested by retry"
+            assert original not in child._background_tasks, "fallback did not finish original Agent bookkeeping"
+            if native_original is not None:
+                with pytest.raises(BaseException) as retained:
+                    child._raise_shutdown_control(control_only=True)
+                assert native_original in tuple(_explicit_control_chain(retained.value))
+                assert native_original in tuple(_explicit_control_chain(dispatcher._outcome_log_control_error))
+                assert tuple(_explicit_control_chain(native_original)) == original_graph
+                assert tuple(execution_cleanup_debts(native_original)) == original_debts
+            # A delayed duplicate callback may never retire its successor.
+            # Canonical refusal ran no SQL; the fresh attempt must refresh CAS.
+            dispatcher._runtime_owner_heartbeat_timer.cancel()
+            dispatcher._start_runtime_owner_heartbeat()
+            successor = dispatcher._runtime_owner_heartbeat_task
+            assert successor is not None and successor is not original
+            dispatcher._finish_runtime_owner_heartbeat(original)
+            assert dispatcher._runtime_owner_heartbeat_task is successor, "old monitor callback retired successor owner"
+            assert (await await_owned_task(successor)).error is None
+            await asyncio.sleep(0)
         else:
             dispatcher._start_runtime_owner_heartbeat()
             original = dispatcher._runtime_owner_heartbeat_task
@@ -129,6 +175,8 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=227') == 1
     finally:
         loop.set_task_factory(previous)
+        if native_fault is not None:
+            native_fault_context.__exit__(None, None, None)
         release.set()
         await await_owned_task(producer)
         dispatcher._retained_durable_cognition_tasks.discard(producer)
@@ -137,6 +185,9 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
         for pair in refused:
             for coroutine in pair:
                 coroutine.close()
-        await dispatcher.shutdown_durable_delivery()
+        try:
+            await dispatcher.shutdown_durable_delivery()
+        except BaseException as error:
+            assert native_original is not None and native_original in tuple(_explicit_control_chain(error))
         await child.llm_service.close()
         await db.close()

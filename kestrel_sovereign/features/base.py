@@ -16,14 +16,14 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
-    Type,
+    Type as Type,
     Union,
     runtime_checkable,
 )
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
-from abc import ABC, abstractmethod
+from abc import ABC as ABC, abstractmethod
 
 # Import the A2A types from the SDK directly rather than the
 # ``kestrel_sovereign.a2a`` re-export package. Importing the sovereign a2a
@@ -59,9 +59,9 @@ from kestrel_sdk.features.base import Feature as _SdkFeature
 # real JSON types instead of silently degrading to "string" (review finding
 # F003). The two former in-tree copies were verified behaviourally identical to
 # these across every feature docstring in the tree before removal.
-from kestrel_sdk.features.base import parse_docstring_params, tool
+from kestrel_sdk.features.base import parse_docstring_params as parse_docstring_params, tool as tool
 from kestrel_sdk.features.ui import UIContributions
-from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
+from kestrel_sdk.tools.base import AgentTool, ToolCategory as ToolCategory, ToolParameter as ToolParameter, ToolSchema
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.execution_custody import (
@@ -901,7 +901,7 @@ class Feature(_SdkFeature):
     # loop keeps running against a torn-down feature.
     # ------------------------------------------------------------------
     def _track_owned_background_task(
-        self, coro, *, name: str, _resident_owner: bool = False,
+        self, coro, *, name: str, _resident_owner: bool = False, admission=None,
     ) -> asyncio.Task:
         """Start an agent-owned background task AND record it for feature
         teardown (#2522 P1).
@@ -929,12 +929,18 @@ class Feature(_SdkFeature):
                 "has no _track_background_task; cannot own background task "
                 f"'{name}'"
             )
-        task = track(coro, name=name)
         owned = getattr(self, "_owned_background_tasks", None)
         if owned is None:
             owned = []
             self._owned_background_tasks = owned
-        owned.append(task)
+        options = {"admission": admission} if admission is not None else {}
+        try:
+            task = track(coro, name=name, **options)
+        finally:
+            if admission is not None and admission.task is not None:
+                owned.append(admission.task)
+        if admission is None:
+            owned.append(task)
         # Self-clean on completion so repeated / unbounded spawners (Peers'
         # per-question supervisors, RestartCoordinator's per-restart ack) don't
         # accumulate finished-task refs here — the mirror of the agent's global

@@ -78,8 +78,19 @@ def _tracks_owned_task_join(function):
     return joined
 
 
+@dataclass(slots=True)
+class OwnedTaskAdmission:
+    """Caller-local receipt of native Task acceptance, before publication.
+
+    This is not a second registry. The synchronous creator writes the exact
+    Task here even if a later callback publication fails; its existing owner
+    then joins or retains that Task rather than treating failure as absence.
+    """
+    task: asyncio.Task | None = None
+
+
 def create_owned_task(operation, *, name=None, context=None, retain_originals=False,
-                      retirement_resource=None, loop=None):
+                      retirement_resource=None, loop=None, admission=None):
     """Capture the original carrier inside a child before asyncio can erase it.
 
     Creation retains normal copied-context semantics. The caller still owns
@@ -92,10 +103,15 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     a different loop cannot receive ownership of this caller's operation.
     """
     started = False
+    gate = None
     async def run():
         nonlocal started
-        started = True
         try:
+            if gate is not None:
+                opening = await gate
+                if opening is not None:
+                    raise opening
+            started = True
             return await operation
         except BaseException as error:
             from kestrel_sovereign.execution_custody import (
@@ -110,6 +126,10 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             raise
     wrapper = run()
     try:
+        if admission is not None:
+            if type(admission) is not OwnedTaskAdmission or admission.task is not None:
+                raise TypeError("owned admission requires a fresh original receipt")
+            gate = asyncio.get_running_loop().create_future()
         if loop is None:
             task = asyncio.create_task(wrapper, name=name, context=context)
         else:
@@ -132,7 +152,17 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             close = getattr(operation, "close", None)
             if callable(close):
                 close()
-    task.add_done_callback(close_unstarted)
+    if admission is not None:
+        admission.task = task
+    try:
+        task.add_done_callback(close_unstarted)
+    except BaseException as opening:
+        if gate is not None:
+            close_unstarted(task)
+            gate.set_result(opening)
+        raise
+    if gate is not None:
+        gate.set_result(None)
     return task
 
 

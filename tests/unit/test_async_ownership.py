@@ -14,6 +14,7 @@ import pytest
 import kestrel_sovereign
 from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
+    OwnedTaskAdmission,
     await_owned_task,
     create_owned_task,
     owned_task_error,
@@ -21,6 +22,80 @@ from kestrel_sovereign._async_ownership import (
     raise_owned_outcome,
     run_blocking_operation,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+@pytest.mark.parametrize("mode", ["success", "allocation", "callback-before", "callback-after"])
+async def test_original_admission_cell_precedes_all_callback_publication(
+    tmp_path, mode, eager,
+):
+    import inspect
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+    path = tmp_path / "original-task-admission.db"
+    entered, release = asyncio.Event(), asyncio.Event()
+    body_started = []
+    async def original():
+        body_started.append(asyncio.current_task())
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            await db.execute("CREATE TABLE admission_effects(id INTEGER)")
+            entered.set()
+            await release.wait()
+            return "original native result"
+        finally:
+            await db.close()
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    admission, accepted, refused = OwnedTaskAdmission(), [], []
+    refusal = RuntimeError("actual canonical admission " + mode)
+    class PublicationTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if mode.startswith("callback") and getattr(callback, "__name__", "") == "close_unstarted":
+                assert admission.task is self, "accepted Task was invisible during callback publication"
+                assert not body_started, "eager body ran before canonical publication"
+                if mode.endswith("-after"):
+                    super().add_done_callback(callback, context=context)
+                raise refusal
+            return super().add_done_callback(callback, context=context)
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        if getattr(operation, "cr_code", None) is original.__code__:
+            if mode == "allocation":
+                refused.append((coroutine, operation))
+                raise refusal
+            options = {"eager_start": True} if eager else {}
+            task = PublicationTask(coroutine, loop=loop, **kwargs, **options)
+            accepted.append(task)
+            return task
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+    try:
+        loop.set_task_factory(factory)
+        if mode == "success":
+            task = create_owned_task(original(), admission=admission, retain_originals=True)
+            assert admission.task is task
+            assert not body_started
+        else:
+            with pytest.raises(RuntimeError) as caught:
+                create_owned_task(original(), admission=admission, retain_originals=True)
+            assert caught.value is refusal
+        loop.set_task_factory(previous)
+        if mode == "success":
+            await entered.wait()
+            release.set()
+            assert (await await_owned_task(task)).result == "original native result"
+        elif admission.task is not None:
+            assert admission.task is accepted[0]
+            assert (await await_owned_task(admission.task)).error is refusal
+            assert not path.exists()
+        else:
+            assert not accepted and not path.exists()
+        assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
+    finally:
+        loop.set_task_factory(previous)
+        release.set()
+        for task in accepted:
+            await await_owned_task(task)
 
 
 @pytest.mark.asyncio

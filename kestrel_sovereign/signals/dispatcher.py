@@ -631,7 +631,7 @@ class DispatcherAgent(Protocol):
     async def process_input(self, prompt: str) -> Any: ...
 
     def _track_background_task(
-        self, coro: Coroutine, *, name: str
+        self, coro: Coroutine, *, name: str, admission=None
     ) -> asyncio.Task: ...
 
 
@@ -1263,7 +1263,8 @@ class SignalDispatcher:
             self._durable_cognition_route.reset(durable_route_token)
 
     async def enqueue_signal(
-        self, signal: Signal, *, source_event_id: Optional[str] = None
+        self, signal: Signal, *, source_event_id: Optional[str] = None,
+        admission=None,
     ) -> SignalDispatchHandle:
         """Returns immediately with a tracked handle. The dispatch runs as
         an agent-owned background task; exceptions are logged not swallowed,
@@ -1276,8 +1277,9 @@ class SignalDispatcher:
             source_event_id=source_event_id,
             _durable_admission=durable_admission,
         )
+        options = {"admission": admission} if admission is not None else {}
         task = self._agent._track_background_task(
-            coro, name=f"signal_dispatch:{signal.source}:{signal.id}"
+            coro, name=f"signal_dispatch:{signal.source}:{signal.id}", **options,
         )
         return SignalDispatchHandle(
             signal_id=signal.id,
@@ -1382,16 +1384,16 @@ class SignalDispatcher:
         async def await_settlement_release() -> None:
             await settlement_release.wait()
 
-        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign.agent.invocation import admit_request_operation
         operation = None
         completion_callback = None
         try:
-            operation = create_owned_task(
+            operation = await admit_request_operation(
+                self._agent, request_id,
                 await_settlement_release(),
                 name=f"durable_cognition_settlement:{request_id}",
-                retain_originals=True,
             )
-            bind_operation(self._agent, request_id, operation)
             guard = _DurableCognitionSettlementGuard(
                 request_id=request_id,
                 generation=generation,
@@ -1462,19 +1464,11 @@ class SignalDispatcher:
                     outcome.cancellation, retain_originals=True,
                     prefer_cancellation=True, isolate_control_originals=True,
                 )
-            try:
-                cleanup(
-                    self._agent, request_id,
-                    disposition=RequestCompletionDisposition.ABANDONED,
-                    generation=generation,
-                )
-            except BaseException as cleanup_error:
-                debt = RuntimeError("original Stop settlement registration did not retire")
-                debt._kestrel_native_retirement_debts = (((self._agent, request_id, generation), None),)
-                raise execution_terminal_error(
-                    opening, cleanup_error, debt, retain_originals=True,
-                    isolate_control_originals=True,
-                )
+            from kestrel_sovereign.agent.invocation import retire_request_delivery
+            retire_request_delivery(
+                self._agent, request_id, abandoned=True,
+                generation=generation, error=opening,
+            )
             raise opening
 
     async def enqueue_durable_terminal(
@@ -3110,14 +3104,19 @@ class SignalDispatcher:
             else:
                 self._schedule_runtime_owner_heartbeat(retry=True)
             return
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        admission = OwnedTaskAdmission()
         try:
             task = self._agent._track_background_task(
                 self._heartbeat_runtime_owner(),
                 name=f"durable_signal_owner_heartbeat:{self._agent.did}",
+                admission=admission,
             )
             self._runtime_owner_heartbeat_task = task
             task.add_done_callback(self._finish_runtime_owner_heartbeat)
-        except BaseException:
+        except BaseException as error:
+            self._runtime_owner_heartbeat_task = admission.task
+            self._retain_durable_writer_control(error)
             # The fired timer no longer owns liveness. Canonical Agent Task
             # admission closes an unstarted operation on refusal; an accepted
             # monitor remains in the original slot through publication failure.
@@ -3233,10 +3232,15 @@ class SignalDispatcher:
         )
 
     def _finish_runtime_owner_heartbeat(self, task: asyncio.Task) -> None:
-        if self._runtime_owner_heartbeat_task is task:
-            self._runtime_owner_heartbeat_task = None
+        if self._runtime_owner_heartbeat_task is not task:
+            return
+        self._runtime_owner_heartbeat_task = None
+        finish = getattr(type(self._agent), "_finish_background_task", None)
+        if callable(finish):
+            finish(self._agent, task)
         from kestrel_sovereign._async_ownership import owned_task_error
         error = owned_task_error(task)
+        self._retain_durable_writer_control(error)
         if isinstance(error, asyncio.CancelledError):
             if not self._durable_shutdown or self._runtime_owner_cleanup_required():
                 self._runtime_owner_heartbeat_failures += 1

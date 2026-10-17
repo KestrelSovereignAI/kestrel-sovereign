@@ -938,8 +938,9 @@ class TestChannelFeature:
             def _get_durable_persistence_gate(self):
                 return self._durable_persistence_gate
 
-            def _track_background_task(self, coro, *, name):
-                task = asyncio.create_task(coro, name=name)
+            def _track_background_task(self, coro, *, name, admission=None):
+                from kestrel_sovereign._async_ownership import create_owned_task
+                task = create_owned_task(coro, name=name, admission=admission)
                 tasks.append(task)
                 return task
 

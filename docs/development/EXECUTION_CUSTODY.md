@@ -1861,6 +1861,36 @@ its normal callback could not be published. Native ledger/component tests
 exercise the cleanup-only owner CAS and preserved lease token, not cognition
 execution or initialized Agent readiness.
 
+Original Task acceptance precedes callback publication. Opted-in creators use
+one caller-local `OwnedTaskAdmission` cell, not another registry. The canonical
+wrapper's start gate also enforces this order with eager factories: native
+allocation returns the exact Task into that cell before bookkeeping can fail.
+Canonical publication refusal closes the unstarted body and terminates its
+accepted wrapper with the original refusal; it is not a native commit outcome.
+Agent/global and dispatcher ownership retain that same Task. Their shared
+idempotent finisher harvests control before retiring bookkeeping, and delayed
+callbacks cannot clear a successor monitor.
+
+Restart wake sweeps reserve the Agent's same pending-row set synchronously,
+before any stamp or headless-delivery await. One reservation carries one
+idempotent release closure through producer and ACK completion. An accepted but
+unreturned Core dispatch, or a failed ACK publication, is joined by its existing
+async delivery owner without cancelling the borrowed dispatch. A late callback
+from an older reservation cannot remove a newer reservation.
+
+The invocation decorator and Kite endpoint share child admission/binding and
+exact-generation retirement. Failed admission is ABANDONED even after ordinary
+HTTP error normalization; accepted children physically join first. Failed
+registrar cleanup retains the actual Agent/request/generation debt with the
+opening and cleanup originals. These constructor/SQL component checks are not
+full Kite evidence or initialized Agent acceptance.
+
+Google and Vertex model catalogs, including later SDK pages and discovery-service
+callers, run inside the canonical GenAI response owner. Supplied route clients
+are borrowed; original native control cannot become an empty/cached catalog.
+Loopback API-key-mode protocol tests do not certify authenticated Vertex ADC,
+provider availability, or private-client lifetime retirement.
+
 Failed Hold admission keeps both the actual read failure and exact-token native
 rollback outcome. Local pending-admission bookkeeping can unwind after release,
 but that is not a native ACK: the existing durable-writer latch retains release

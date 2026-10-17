@@ -16,7 +16,7 @@ from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["allocation", "binding", "callback"])
+@pytest.mark.parametrize("mode", ["allocation", "binding", "callback", "canonical-before", "canonical-after"])
 @pytest.mark.parametrize("prior", [False, True])
 async def test_refused_settlement_retires_only_its_original_registration(
     tmp_path, monkeypatch, mode, prior,
@@ -45,6 +45,14 @@ async def test_refused_settlement_retires_only_its_original_registration(
             if mode == "callback" and getattr(callback, "__name__", "") == "release_settlement_owner":
                 callbacks.append(callback)
                 super().add_done_callback(callback, context=context)
+                raise refusal
+            return super().add_done_callback(callback, context=context)
+
+    class RefusedCanonicalPublication(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "close_unstarted":
+                if mode == "canonical-after":
+                    super().add_done_callback(callback, context=context)
                 raise refusal
             return super().add_done_callback(callback, context=context)
 
@@ -77,7 +85,10 @@ async def test_refused_settlement_retires_only_its_original_registration(
         if selected and mode == "allocation":
             refused.append((coroutine, operation))
             raise refusal
-        task = previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+        if selected and mode.startswith("canonical"):
+            task = RefusedCanonicalPublication(coroutine, loop=loop, **kwargs)
+        else:
+            task = previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
         if selected:
             accepted.append(task)
         return task

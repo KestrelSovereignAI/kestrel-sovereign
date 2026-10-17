@@ -618,6 +618,17 @@ class RestartCoordinatorFeature(Feature):
         """
         await super().shutdown()
 
+    def _restart_ack_release(self, row_id):
+        """One reservation's idempotent retirement; late callbacks are inert."""
+        guards = self._restart_ack_guards()
+        released = False
+        def release():
+            nonlocal released
+            if not released:
+                released = True
+                guards.discard(row_id)
+        return release
+
     def get_router(self):
         """Expose the restart status-event API for chat-history reload.
 
@@ -3845,15 +3856,23 @@ class RestartCoordinatorFeature(Feature):
 
         # No dispatcher to wake (headless host, test stub): nothing to deliver
         # to and no point retrying forever, so mark the wake delivered.
-        if not dispatcher_usable:
-            await self._mark_wake_delivered(row)
-            return None
-
         # A supervisor from this process is already awaiting this row's
         # wake — don't enqueue a duplicate (avoids a wake storm while a
         # long cognition turn is still running).
-        if row.id in self._restart_ack_guards():
+        guards = self._restart_ack_guards()
+        if row.id in guards:
             return None
+        guards.add(row.id)
+        release = self._restart_ack_release(row.id)
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskAdmission, await_owned_task,
+        )
+        from kestrel_sovereign.signals.dispatcher import SignalDispatcher
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        producer = OwnedTaskAdmission()
+        acknowledgement = OwnedTaskAdmission()
+        transferred = False
+        handle = None
 
         # Stamp BEFORE the signal is handed over. ``enqueue_signal`` starts
         # the dispatch immediately, so every await after it — this write
@@ -3867,45 +3886,72 @@ class RestartCoordinatorFeature(Feature):
         # means this sweep never tried to wake the row, which is the negative
         # evidence the ticket needs, while a failed handoff is logged and
         # leaves the row undelivered for the next sweep to retry.
-        await self._mark_wake_dispatched(row)
-
         try:
+            if not dispatcher_usable:
+                await self._mark_wake_delivered(row)
+                return None
+            await self._mark_wake_dispatched(row)
+            # A different row's original producer may have failed while this
+            # stamp awaited storage. A reservation is not renewed authority.
+            if callable(runtime_control):
+                runtime_control(self.agent, control_only=True)
+            retained = vars(self).get("_owned_background_control")
+            if retained is not None:
+                raise retained
             from kestrel_sovereign.signals.sources.restart import (
                 build_signal_for_restart_completed,
             )
             signal = build_signal_for_restart_completed(
                 row, target_agent=str(agent_id), completed_at=completed_at,
             )
-            handle = dispatcher.enqueue_signal(signal)
+            options = {"admission": producer} if isinstance(dispatcher, SignalDispatcher) else {}
+            handle = dispatcher.enqueue_signal(signal, **options)
             if asyncio.iscoroutine(handle):
                 handle = await handle
+            waiter = getattr(handle, "wait", None)
+            if not callable(waiter):
+                await self._mark_wake_delivered(row)
+                return None
+            task = self._spawn_ack_supervisor(
+                row, handle, release=release, admission=acknowledgement,
+            )
+            transferred = True
+            return task
         except BaseException as e:
             from kestrel_sovereign.execution_custody import is_execution_control_error
+            # Accepted-but-unreturned producer/ACK publication is not absence.
+            # This async owner joins both originals without cancelling borrowed
+            # dispatch, then publishes their strongest terminal evidence.
+            borrowed = getattr(handle, "task", None)
+            originals = tuple(dict.fromkeys(
+                task for task in (acknowledgement.task, producer.task, borrowed)
+                if isinstance(task, asyncio.Future)
+            ))
+            terminal = e
+            for original in originals:
+                outcome = await await_owned_task(original)
+                terminal = execution_terminal_error(
+                    terminal, outcome.error, outcome.cancellation,
+                    retain_originals=True, prefer_cancellation=True,
+                    isolate_control_originals=True,
+                )
+            e = terminal
             self._remember_background_control(e)
             if not isinstance(e, Exception) or is_execution_control_error(e):
-                raise
-            # Enqueue raised synchronously — leave wake_delivered=0 so a
-            # later sweep retries (codex P2 on PR #1512 round 1).
+                raise e
+            # A preaccept failure leaves the row retryable. An accepted ACK
+            # writer may already have committed despite publication refusal;
+            # only the durable row, not this observer error, determines retry.
             logger.warning(
-                "restart sweep: failed to enqueue signal for %s: %s; "
-                "wake stays undelivered for next-sweep retry", row.id, e,
+                "restart sweep: wake admission or observation failed for %s: %s; "
+                "later sweeps re-read the durable delivery receipt", row.id, e,
             )
             return None
+        finally:
+            if not transferred:
+                release()
 
-        waiter = getattr(handle, "wait", None)
-        if not callable(waiter):
-            # Legacy/stub dispatcher whose enqueue_signal returns no
-            # awaitable handle — the signal was accepted onto the queue, so
-            # treat the wake as delivered.
-            await self._mark_wake_delivered(row)
-            return None
-
-        # Delivery-gated: supervise the wake and only flag wake_delivered
-        # once the COGNITION dispatch actually lands.
-        self._inflight_restart_acks.add(row.id)
-        return self._spawn_ack_supervisor(row, handle)
-
-    def _spawn_ack_supervisor(self, row, handle) -> asyncio.Task[Any]:
+    def _spawn_ack_supervisor(self, row, handle, *, release=None, admission=None) -> asyncio.Task[Any]:
         """Await the ``restart.completed`` dispatch and flag ``wake_delivered``
         only once the wake has actually been DELIVERED (``Status.OK``). A failed
         or dropped wake leaves ``wake_delivered=0`` so a later sweep retries it
@@ -3921,6 +3967,7 @@ class RestartCoordinatorFeature(Feature):
         """
 
         self._restart_ack_guards()
+        release = release if release is not None else self._restart_ack_release(row.id)
         borrowed = getattr(handle, "task", None)
         if not isinstance(borrowed, asyncio.Future):
             borrowed = None
@@ -3929,8 +3976,11 @@ class RestartCoordinatorFeature(Feature):
         def dispatch_finished(source) -> None:
             from kestrel_sovereign._async_ownership import owned_task_error
             self._remember_background_control(owned_task_error(source))
-            if acknowledgement is None or acknowledgement.done():
-                self._inflight_restart_acks.discard(row.id)
+            accepted_ack = acknowledgement if acknowledgement is not None else (
+                admission.task if admission is not None else None
+            )
+            if accepted_ack is None or accepted_ack.done():
+                release()
 
         if borrowed is not None:
             # The Task remains Agent-owned. This callback retains its terminal
@@ -3964,7 +4014,7 @@ class RestartCoordinatorFeature(Feature):
                 await self._mark_wake_delivered(row)
             finally:
                 if borrowed is None or borrowed.done():
-                    self._inflight_restart_acks.discard(row.id)
+                    release()
 
         # FEATURE-owned so ``Feature.shutdown()`` (runtime disable / boot
         # rollback / soft disable) cancels this in-flight ack. The agent-global
@@ -3975,10 +4025,11 @@ class RestartCoordinatorFeature(Feature):
         try:
             acknowledgement = self._track_owned_background_task(
                 _await_and_ack(), name=f"restart_completed_ack:{row.id}",
+                admission=admission,
             )
         except BaseException:
             if borrowed is None:
-                self._inflight_restart_acks.discard(row.id)
+                release()
             elif borrowed.done():
                 dispatch_finished(borrowed)
             raise
