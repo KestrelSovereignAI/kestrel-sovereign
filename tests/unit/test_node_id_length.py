@@ -1,19 +1,16 @@
 """A test ID too long for a CI log reader refuses the run, serially and under xdist (#3669)."""
 
-import os
 from pathlib import Path
 import subprocess
-import sys
 import textwrap
 
 import pytest
 
+from tests.shared.child_pytest import run_child_pytest
 from tests.shared.node_id_length import (
     MAX_NODE_ID_LENGTH,
     pytest_xdist_node_collection_finished,
 )
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 #: A liveness bound on the child, not a measurement: it collects one file.
 SUBPROCESS_TIMEOUT_SECONDS = 120
@@ -33,10 +30,11 @@ CHILD_CONFTEST = textwrap.dedent(
 
 
 def _run_child(tmp_path: Path, payload_length: int, *, workers: int) -> subprocess.CompletedProcess:
-    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
-    (tmp_path / "conftest.py").write_text(CHILD_CONFTEST, encoding="utf-8")
-    (tmp_path / "test_probe.py").write_text(
-        textwrap.dedent(
+    return run_child_pytest(
+        tmp_path,
+        conftest=CHILD_CONFTEST,
+        test_file="test_probe.py",
+        source=textwrap.dedent(
             f"""
             import pytest
 
@@ -46,26 +44,7 @@ def _run_child(tmp_path: Path, payload_length: int, *, workers: int) -> subproce
                 pass
             """
         ),
-        encoding="utf-8",
-    )
-    env = os.environ.copy()
-    # The package root only: forwarding sys.path lets a package directory
-    # shadow a stdlib module in the child.
-    env["PYTHONPATH"] = str(PROJECT_ROOT)
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    env.pop("PYTEST_PLUGINS", None)
-    env.pop("PYTEST_ADDOPTS", None)
-    return subprocess.run(
-        [
-            sys.executable, "-m", "pytest", "test_probe.py",
-            "-c", str(tmp_path / "pytest.ini"), "--rootdir", str(tmp_path),
-            "-p", "xdist", "-p", "no:cacheprovider", "-n", str(workers), "-v",
-        ],
-        cwd=tmp_path,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        args=["test_probe.py", "-p", "xdist", "-n", str(workers), "-v"],
         timeout=SUBPROCESS_TIMEOUT_SECONDS,
     )
 

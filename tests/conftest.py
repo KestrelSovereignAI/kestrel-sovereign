@@ -38,8 +38,10 @@ from tests.shared.pytest_cleanup_plugin import (
 from tests.shared.resource_registry import registry
 from tests.shared.hang_backstop import (
     configure as _hang_backstop_configure,
+    pytest_configure_node,  # noqa: F401 - exposed as a pytest hook
     pytest_enter_pdb,  # noqa: F401 - exposed as a pytest hook
     pytest_exception_interact,  # noqa: F401 - exposed as a pytest hook
+    pytest_handlecrashitem,  # noqa: F401 - exposed as a pytest hook
     pytest_runtest_protocol,  # noqa: F401 - exposed as a pytest hook
 )
 from tests.shared.node_id_length import (
