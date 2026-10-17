@@ -51,7 +51,6 @@ from .output_ceiling import (
 from contextlib import asynccontextmanager
 
 from .retry import with_retry
-import asyncio
 import sys
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.execution_custody import (
@@ -114,7 +113,7 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
             return cm, stream
 
     async def close_acquired(pair):
-        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
         from kestrel_sovereign.execution_custody import bind_execution_cleanup
         from kestrel_sovereign.execution_custody import execution_terminal_error
 
@@ -123,9 +122,21 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
         async def owned_close():
             with bind_execution_cleanup(None):
                 await pair[0].__aexit__(None, None, None)
-        outcome = await await_owned_task(asyncio.create_task(owned_close()))
+        try:
+            task = create_owned_task(
+                owned_close(), retirement_resource=pair[1], retain_originals=True,
+            )
+        except BaseException as admission_error:
+            raise execution_terminal_error(
+                original, admission_error,
+                retain_originals=True, isolate_control_originals=True,
+            )
+        outcome = await await_owned_task(task)
         if outcome.error is not None or outcome.cancellation is not None:
-            raise execution_terminal_error(original, outcome.error, outcome.cancellation)
+            raise execution_terminal_error(
+                original, outcome.error, outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
 
     if retry_open:
         stream_cm, stream = await with_retry(_enter, acquired_result_cleanup=close_acquired)

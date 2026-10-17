@@ -3507,12 +3507,19 @@ class PrivacyEnforcingStorage:
         # its own, and the lease is released only once that task has ended
         # with a known outcome.
         progress = _DeidentifiedCommitProgress()
-        commit = asyncio.create_task(
-            self._commit_deidentified_documents(
-                progress, evidence.evidence_id, evidence_bytes, records_bytes, base_metadata
-            ),
-            name=f"deidentified-save:{evidence.evidence_id}",
-        )
+        try:
+            commit = create_owned_task(
+                self._commit_deidentified_documents(
+                    progress, evidence.evidence_id, evidence_bytes, records_bytes, base_metadata
+                ),
+                name=f"deidentified-save:{evidence.evidence_id}",
+                retain_originals=True,
+            )
+        except BaseException:
+            # No transaction was accepted. The refused operation is closed by
+            # the canonical owner; there is no native save to fence here.
+            self._release_deidentified_save_lease()
+            raise
         withdrawn = False
         try:
             # Until COMMIT is issued, cancelling the commit task rolls its
@@ -3547,6 +3554,14 @@ class PrivacyEnforcingStorage:
                 "outcome is unknown; privacy transitions stay refused until "
                 "restart."
             ) from outcome.error
+        if is_execution_control_error(outcome.error):
+            # Pre-COMMIT withdrawal is a known rollback ONLY after its native
+            # epilogue succeeds. A cancelled child can carry failed rollback
+            # retirement debt; keep this original privacy lease and all actual
+            # observer receipts rather than calling that debt a withdrawal.
+            raise_owned_outcome(
+                outcome, operation="de-identified save", retain_originals=True,
+            )
         self._release_deidentified_save_lease()
         if withdrawn and isinstance(outcome.error, asyncio.CancelledError):
             # That error is the cancellation that withdrew the save, not a

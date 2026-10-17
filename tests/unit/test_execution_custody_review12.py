@@ -8,7 +8,7 @@ import pytest
 
 from kestrel_sovereign.execution_custody import (
     ExecutionCommitOutcomeError, ExecutionCustody, _ExecutionForwarder,
-    execution_commit_outcome,
+    _explicit_control_chain, execution_commit_outcome, is_execution_control_error,
 )
 from tests.unit.test_execution_custody import Authority
 
@@ -138,6 +138,8 @@ async def test_owned_iterator_control_survives_later_ordinary_close_failure(outc
         wrapper = asyncio.CancelledError("effect cancellation")
         wrapper.__cause__ = evidence
         evidence = wrapper
+    original_chain = tuple(_explicit_control_chain(evidence))
+    close_error = ValueError("ordinary late close failure")
     closed = asyncio.Event()
     class Source:
         def __aiter__(self):
@@ -146,12 +148,16 @@ async def test_owned_iterator_control_survives_later_ordinary_close_failure(outc
             raise evidence
         async def aclose(self):
             closed.set()
-            raise ValueError("ordinary late close failure")
+            raise close_error
     stream = OwnedAsyncIterator(Source, operation="native-evidence-precedence")
-    with pytest.raises(type(evidence)) as caught:
+    with pytest.raises(BaseException) as caught:
         await anext(stream)
-    assert caught.value is evidence
-    assert stream.terminal_error is evidence
+    chain = tuple(_explicit_control_chain(caught.value))
+    assert evidence in chain and close_error in chain
+    assert execution_commit_outcome(caught.value) == outcome
+    assert is_execution_control_error(caught.value)
+    assert tuple(_explicit_control_chain(evidence)) == original_chain
+    assert stream.terminal_error is caught.value
     assert closed.is_set()
     await stream.aclose()
 

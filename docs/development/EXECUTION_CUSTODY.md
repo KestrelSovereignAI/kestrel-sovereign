@@ -1634,3 +1634,34 @@ retirement and healthy restart remains valid. That settles only the actual
 pending worker, never independent UNKNOWN effects. Native tests exercise queue
 rows, source/descendant Tasks and PostgreSQL effects; declared local callbacks
 are not remote-provider message acceptance or complete Agent shutdown proof.
+
+### SDK closer admission and callback provenance
+
+Anthropic's acquired-stream context uses canonical Task admission for its
+physical SDK exit. Refused admission closes the unstarted operation, retains
+the actual SDK stream as unstarted retirement debt, and composes the original
+body failure with the refusal. Accepted exit preserves its own original
+cancellation and later observer withdrawal through isolated finite composition;
+the shared body receipt does not acquire unrelated cleanup history. Loopback
+HTTP/real SDK and retired PostgreSQL lease tests cover this boundary, not a
+provider-generated answer. A caused-cancellation case uses an actual closed
+SQLite handle as the ordinary native cause before the SDK's physical close.
+
+The shared Codex connection localizes a settled denial only when every actual
+denied scope belongs to the callback's original registration snapshot. Merely
+having a handler or a thread ID is insufficient. Foreign or mixed control
+retains connection-wide failure; caller-local denial does not poison unrelated
+turns. This snapshot is classification evidence, never a new work admission or
+execution authority. Tests use native PostgreSQL leases and an owned stdio echo
+peer; no Codex binary, credential file or provider call is exercised.
+
+### Withdrawn de-identified saves
+
+A withdrawn pre-COMMIT save releases its privacy lease only after known native
+rollback. Failed rollback may arrive inside the child's cancellation carrier;
+that original cleanup debt and actual caller withdrawals remain composed, and
+the original privacy lease stays held. Writer Task refusal before transaction
+acceptance instead closes the unstarted operation and releases only that unused
+lease. Native tests persist synthetic evidence through actual storage/PG before
+rollback and separately confirm the healthy rollback and refusal paths. They do
+not certify production patient data or whole-Agent readiness.

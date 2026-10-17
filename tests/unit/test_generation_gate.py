@@ -664,7 +664,8 @@ def _is_repair(body: Dict[str, Any]) -> bool:
     )
 
 
-def _answers(path: str, cause: str, stop: Callable[[], None]):
+def _answers(path: str, cause: str, stop: Callable[[], None], *,
+             repair_prelude_complete: Optional[Callable[[], None]] = None):
     """The daemon answers for route A (and B, on two-route paths)."""
     streamed = path == "stream_fallback"
 
@@ -673,6 +674,8 @@ def _answers(path: str, cause: str, stop: Callable[[], None]):
             if path in TOOL_RAN and body["messages"][-1]["role"] != "tool":
                 return _tool_call()
             if path in REPAIRED:
+                if repair_prelude_complete is not None:
+                    repair_prelude_complete()
                 return _respond(_Body([_line(_final("stop", MARKUP))]))
         return _ending(cause, streamed=streamed, stop=stop)
 
@@ -728,7 +731,13 @@ async def _run_turn(agent, path: str, session_id: str) -> Dict[str, Any]:
 @pytest.mark.parametrize("cause", CAUSES)
 @pytest.mark.parametrize("path", PATHS)
 async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path, cause):
-    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", _bound_for(cause))
+    repair_watchdog = path in REPAIRED and cause == "watchdog"
+    # The short bound belongs to the silent generation UNDER TEST. The first
+    # successful reply merely sets up the repair, and may include cold SDK/
+    # schema/parsing work on a loaded CI worker. Arm the unchanged short bound
+    # at the actual protocol prelude; the next production watchdog captures it.
+    monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS",
+                        UNREACHED_BOUND if repair_watchdog else _bound_for(cause))
     # Retries of a transient provider error are not under test; without them
     # a provider timeout fails its attempt at once.
     from kestrel_sovereign.llm import ollama_adapter
@@ -752,7 +761,12 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
             stopped_at.append(loop.time())
             agent.cancel_current_request()
 
-        route_a, route_b = _answers(path, cause, stop=stop)
+        route_a, route_b = _answers(
+            path, cause, stop=stop,
+            repair_prelude_complete=(
+                lambda: monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", TURN_BOUND)
+            ) if repair_watchdog else None,
+        )
         daemon_a, daemon_b = _Daemon(route_a), _Daemon(route_b)
         service = agent.llm_service
         providers = [_route(agent, "local", daemon_a)]
@@ -838,6 +852,26 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
             assert rows == [expected], rows
         else:
             assert all(row == "" for row in rows), rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_process_rate_limiter")
+async def test_repair_watchdog_does_not_bound_the_successful_fixture_prelude(
+    tmp_path, monkeypatch,
+):
+    original_handle = _Daemon.handle
+
+    async def slow_initial_reply(daemon, request):
+        if request.url.path == "/api/chat" and not _is_repair(json.loads(request.content)):
+            # A finite IO delay, not CPU stress. The generation under test is
+            # the subsequent silent repair, not this successful setup reply.
+            await asyncio.sleep(TURN_BOUND + 0.1)
+        return await original_handle(daemon, request)
+
+    monkeypatch.setattr(_Daemon, "handle", slow_initial_reply)
+    await test_only_a_natural_end_becomes_the_answer(
+        tmp_path, monkeypatch, "invoke_repair", "watchdog",
+    )
 
 
 @pytest.mark.asyncio

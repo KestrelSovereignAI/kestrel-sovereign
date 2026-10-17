@@ -328,7 +328,6 @@ async def test_stream_close_uncertainty_preserves_abandoned_settlement():
 @pytest.mark.asyncio
 async def test_codex_inline_uncertainty_latches_turn_and_reaches_owner():
     from kestrel_sovereign.llm.codex_adapter import CodexAdapter
-    from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
     from tests.unit.test_codex_app_server import TestDispatchLogic
 
     client = TestDispatchLogic()._client()
@@ -358,7 +357,6 @@ async def test_codex_inline_uncertainty_latches_turn_and_reaches_owner():
 
 @pytest.mark.asyncio
 async def test_codex_send_rechecks_after_startup_await():
-    from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
     from tests.unit.test_codex_app_server import TestDispatchLogic
 
     client = TestDispatchLogic()._client()
@@ -715,6 +713,17 @@ async def test_public_stream_rename_retains_privacy_lock_reentry(monkeypatch, ho
     lock = ReentrantTransitionLock()
     agent._get_privacy_transition_lock.return_value = lock
     agent._agent_name = "Before"
+    original_acquire = lock._lock.acquire
+    base_acquisitions = []
+
+    async def observe_actual_base_acquire():
+        # There is no unrelated contender in this fixture. Re-acquiring its
+        # held base lock is the actual self-wait bug, not a slow CI response.
+        assert not lock._lock.locked(), "public stream rename lost its original privacy reentry"
+        base_acquisitions.append(asyncio.current_task())
+        return await original_acquire()
+
+    monkeypatch.setattr(lock._lock, "acquire", observe_actual_base_acquire)
     if hosted:
         agent._execution_custody = ExecutionCustody(Authority())
     monkeypatch.setattr(storage_access, "hides_persisted_user_content", lambda owner: True)
@@ -727,11 +736,12 @@ async def test_public_stream_rename_retains_privacy_lock_reentry(monkeypatch, ho
     agent._process_input_streaming_traced_locked = body
     stream = agent.process_input_streaming("rename")
     try:
-        assert await asyncio.wait_for(anext(stream), timeout=0.5) == "renamed"
+        assert await asyncio.wait_for(anext(stream), timeout=5) == "renamed"
         assert agent._agent_name == "After"
     finally:
         await stream.aclose()
     assert not lock.locked()
+    assert len(base_acquisitions) == 1
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ import re
 import shutil
 import tomllib
 from pathlib import Path
+from functools import wraps
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple
 
 from kestrel_sovereign._async_ownership import (
@@ -49,6 +50,7 @@ from kestrel_sovereign._async_ownership import (
     raise_owned_outcome,
 )
 from kestrel_sovereign.execution_custody import (
+    current_execution_custody,
     execution_cleanup_debts,
     execution_denial_scopes,
     execution_terminal_error,
@@ -849,9 +851,10 @@ class CodexAppServerClient:
         if getattr(self, "_closing", False) or getattr(self, "_retiring", False):
             raise CodexAppServerConnectionClosed("codex app-server is retiring")
 
-    def _retain_request_failure(self, error: BaseException, *, caller_local: bool = False) -> None:
+    def _retain_request_failure(self, error: BaseException, *, caller_scopes: tuple = ()) -> None:
         if is_execution_control_error(error):
-            if (caller_local and execution_denial_scopes(error)
+            denied = execution_denial_scopes(error)
+            if (denied and all(any(scope is admitted for admitted in caller_scopes) for scope in denied)
                     and not execution_cleanup_debts(error)):
                 # Original typed callback refusal stays on its owning turn's
                 # bridge receipt. It does not authorize that turn to continue
@@ -868,7 +871,7 @@ class CodexAppServerClient:
         error = owned_task_error(task)
         if error is not None:
             self._retain_request_failure(error,
-                caller_local=getattr(task, "_kestrel_codex_caller_handler", False))
+                caller_scopes=getattr(task, "_kestrel_codex_caller_scopes", ()))
         self._server_request_tasks.discard(task)
 
     async def _join_server_requests(self) -> None:
@@ -880,7 +883,7 @@ class CodexAppServerClient:
             outcome = await await_owned_task(task)
             if outcome.error is not None:
                 self._retain_request_failure(outcome.error,
-                    caller_local=getattr(task, "_kestrel_codex_caller_handler", False))
+                    caller_scopes=getattr(task, "_kestrel_codex_caller_scopes", ()))
         failure = getattr(self, "_server_request_failure", None)
         if failure is not None:
             raise failure
@@ -1206,7 +1209,7 @@ class CodexAppServerClient:
                     handler_selected=True,
                 )
             )
-            task._kestrel_codex_caller_handler = handler is not None
+            task._kestrel_codex_caller_scopes = getattr(handler, "_codex_caller_scopes", ())
             if not hasattr(self, "_server_request_tasks"):
                 self._server_request_tasks = set()
             self._server_request_tasks.add(task)
@@ -1345,7 +1348,7 @@ class CodexAppServerClient:
                 sink = self._turn_sinks.get(tid)
                 if sink is not None:
                     sink.put_nowait({"__bridge_error__": e})
-                self._retain_request_failure(e, caller_local=handler is not None)
+                self._retain_request_failure(e, caller_scopes=getattr(handler, "_codex_caller_scopes", ()))
                 self._send({"id": mid, "error": {"message": "execution requires authority/commit reconciliation"}})
                 return
             logger.warning("codex server-request %s failed: %s", method, e)
@@ -1452,10 +1455,20 @@ class CodexAppServerClient:
         Returns an ``unregister`` callable; safe to call once.
         """
         key = (method, thread_id)
-        self._server_request_handlers[key] = handler
+        # This is a classification snapshot, not a new work admission. Reader
+        # Tasks inherit the shared reader's context, which cannot establish
+        # ownership of a callback's later denial. Keep each registration's
+        # actual typed scopes; neither a thread ID nor "handler exists" proves
+        # that foreign/mixed native control is local to this turn.
+        @wraps(handler)
+        async def registered(params):
+            return await handler(params)
+
+        registered._codex_caller_scopes = current_execution_custody()
+        self._server_request_handlers[key] = registered
 
         def _unregister() -> None:
-            if self._server_request_handlers.get(key) is handler:
+            if self._server_request_handlers.get(key) is registered:
                 self._server_request_handlers.pop(key, None)
 
         return _unregister

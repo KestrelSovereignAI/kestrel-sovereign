@@ -47,8 +47,9 @@ async def test_native_codex_tool_refusal_keeps_original_turn_and_connection_boun
     async def other_tool(params):
         return {"success": True, "original_other_turn": True}
 
-    client._server_request_handlers[("item/tool/call", "original")] = original_tool
-    client._server_request_handlers[("item/tool/call", "other")] = other_tool
+    with captured.bind():
+        client.register_server_request_handler("item/tool/call", original_tool, thread_id="original")
+    client.register_server_request_handler("item/tool/call", other_tool, thread_id="other")
     client._dispatch({"id": 67, "method": "item/tool/call", "params": {"threadId": "original"}})
     tasks = tuple(client._server_request_tasks)
     try:
