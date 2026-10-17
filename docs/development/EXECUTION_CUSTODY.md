@@ -79,6 +79,45 @@ the complete test still has a finite 30-second deadline including cleanup.
 Both implementation and fixture observe and join the actual native Task. No
 production SDK, storage or shutdown deadline is extended by this test change.
 
+Reindex job projection also observes its original Task when cancellation occurs
+before the body takes its first step. The existing Agent shutdown helper cancels
+and joins that accepted owner; public reads and pruning derive terminal state
+from its actual receipt even when an earlier Task-factory observer runs before
+publisher callbacks. Once observed, repeated polls do not manufacture new
+business-progress timestamps. Native control remains private and unprunable;
+ordinary unstarted cancellation becomes a terminal, reclaimable job.
+
+The operator embedding CLI uses the existing owned-database retirement boundary,
+passing its original body receipt. Native import/open control cannot become a
+connection-error exit, and unsuccessful close admission or physical retirement
+cannot leave a successful body result as the CLI outcome. Native tests run the
+actual CLI in its own event loop with a real SQLite connection, independent
+read-only observation, joined workers and an actual retired PostgreSQL lease
+receipt. Lookup/callback failures are explicit component fault boundaries, not
+proof of complete Agent startup, operator authentication or production recovery.
+
+Telemetry publication honors that same fresh-coroutine contract. Refusal cannot
+retry an operation already closed by the canonical Agent publisher; a proxy-owned
+publication also uses the canonical Task constructor. Native control and caller
+cancellation propagate, while ordinary advisory refusal retains coalesced refresh
+flags for a later explicit event without scheduling a retry loop. An invalid
+publisher return is an interface error, not a native publication acknowledgment.
+These component checks construct the actual proxy but do not initialize a child
+or certify READY, observer-executor retirement, or the remaining isolated-runtime
+admission/quarantine boundaries in the cumulative ledger.
+
+The unrelated backup/restore and privacy-persistence unit fixtures have explicit
+scope too. Backup fixtures disable provider embeddings and refuse provider
+resolution; their finite ten-second cleanup window is not a change to the
+production one-second SQLite worker policy. The delayed-close case still runs
+the actual native close and joins its original worker after a failed observation.
+The timestamp-coercion branch test remains SQLite with a declared dialect input,
+not native PostgreSQL restore acceptance. Privacy-persistence fixtures initialize
+the actual Agent with every mandatory sovereignty feature and no optional feature
+catalog or sync service, rather than spending its five-second shutdown fair share
+on unrelated optional workers. Unknown-COMMIT purge errors remain fail-closed;
+no production shutdown or purge budget, control classifier or outcome is relaxed.
+
 Snapshot upload retirement uses the existing native close owner, opting into
 retaining the opening cancellation and original close error together. Refused
 close admission retains the exact unstarted client; repeated caller withdrawal

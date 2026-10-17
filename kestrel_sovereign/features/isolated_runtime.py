@@ -7674,16 +7674,36 @@ class ProxyFeature(Feature):
         coro = deliver()
         name = f"isolated-runtime-telemetry:{self.name}"
         tracker = getattr(self.agent, "_track_background_task", None)
-        task = None
-        if callable(tracker):
-            try:
-                tracked = tracker(coro, name=name)
-                if isinstance(tracked, asyncio.Task):
-                    task = tracked
-            except Exception:  # noqa: BLE001 - test doubles may reject tracking
-                task = None
-        if task is None:
-            task = asyncio.create_task(coro, name=name)
+        try:
+            if callable(tracker):
+                task = tracker(coro, name=name)
+                if not isinstance(task, asyncio.Task):
+                    raise TypeError("telemetry publisher must return its actual Task")
+            else:
+                from kestrel_sovereign._async_ownership import create_owned_task
+                task = create_owned_task(coro, name=name)
+        except BaseException as error:
+            # Canonical refusal already closes the fresh operation; an
+            # unregistered owner must do the same. Never retry this coroutine.
+            coro.close()
+            self._telemetry_emit_pending = True
+            self._telemetry_emit_force_pending |= force
+            self._telemetry_disk_refresh_pending |= refresh_disk
+            self._telemetry_environment_refresh_pending |= refresh_environment
+            if (
+                is_execution_control_error(error)
+                or not isinstance(error, Exception)
+                or isinstance(error, TypeError)
+            ):
+                raise
+            # Ordinary advisory publication may be retried by a later explicit
+            # event, with a fresh operation. Refusal itself starts no retry loop.
+            logger.warning(
+                "Hosted isolated runtime telemetry publication failed for %s",
+                self.name,
+                exc_info=True,
+            )
+            return
         self._telemetry_emit_tasks.add(task)
 
         def consume(completed: asyncio.Task[None]) -> None:

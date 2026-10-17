@@ -2809,8 +2809,46 @@ _REINDEX_JOBS: Dict[str, Dict] = {}
 _REINDEX_JOBS_MAX = 32
 
 
+def _record_reindex_job_failure(job: Dict, error: BaseException) -> None:
+    """Project an actual terminal receipt without discarding native control."""
+    from kestrel_sovereign.execution_custody import (
+        execution_terminal_error,
+        retained_execution_error,
+    )
+
+    terminal = execution_terminal_error(
+        job.get("_control"), error, retain_originals=True,
+    )
+    job["status"] = "error"
+    if is_execution_control_error(terminal):
+        job["_control"] = retained_execution_error(terminal)
+        job["error"] = type(terminal).__name__
+    else:
+        job["error"] = (
+            "Reindex interrupted"
+            if isinstance(terminal, asyncio.CancelledError)
+            else str(terminal)
+        )
+    job["updated_at"] = time.time()
+
+
+def _observe_reindex_job_owner(job: Dict) -> None:
+    """Observe the original completed Task, even if its body never started."""
+    from kestrel_sovereign._async_ownership import owned_task_error
+
+    owner = job.get("_owner_task")
+    if owner is not None and owner.done() and not job.get("_owner_terminal_observed"):
+        error = owned_task_error(owner)
+        if error is not None:
+            _record_reindex_job_failure(job, error)
+        # A Task's terminal receipt is immutable. Repeated polls must not turn
+        # observation into new business progress timestamps or receipt history.
+        job["_owner_terminal_observed"] = True
+
+
 def _reindex_job_public(job: Dict) -> Dict:
     """The subset of a job record that is safe to return to a client."""
+    _observe_reindex_job_owner(job)
     control = job.get("_control")
     if control is not None:
         from kestrel_sovereign.execution_custody import retained_execution_error
@@ -2940,21 +2978,10 @@ async def _run_reindex_job(job: Dict, reindexer, tables, agent_id) -> None:
         _accumulate_reindex_stats(job)
         _finalize_reindex_status(job)
     except BaseException as e:
-        job["status"] = "error"
-        if is_execution_control_error(e):
-            from kestrel_sovereign.execution_custody import retained_execution_error
-
-            # This finite job owns the exact receipt, not a public error
-            # string. The agent's native Task owner also observes it at
-            # completion and shutdown; polling cannot manufacture success.
-            job["_control"] = retained_execution_error(e)
-            job["error"] = type(e).__name__
-            raise
-        if not isinstance(e, Exception):
-            job["error"] = "Reindex interrupted"
+        _record_reindex_job_failure(job, e)
+        if is_execution_control_error(e) or not isinstance(e, Exception):
             raise
         logger.error("reindex job %s failed: %s", job["job_id"], e, exc_info=True)
-        job["error"] = str(e)
     finally:
         job["updated_at"] = time.time()
 
@@ -2966,6 +2993,8 @@ def _prune_reindex_jobs(*, reserve: int = 0) -> None:
     slots are still running or carry control, it must refuse rather than drop
     a live owner or the original receipt merely to make the cap appear met.
     """
+    for job in _REINDEX_JOBS.values():
+        _observe_reindex_job_owner(job)
     limit = _REINDEX_JOBS_MAX - reserve
     if len(_REINDEX_JOBS) <= limit:
         return
@@ -3318,6 +3347,9 @@ async def reindex_embeddings(request: Request):
         job["_owner_task"] = publish(
             _run_reindex_job(job, reindexer, tables, agent_id),
             name=f"embedding-reindex-{job_id}",
+        )
+        job["_owner_task"].add_done_callback(
+            lambda _done: _observe_reindex_job_owner(job)
         )
         _REINDEX_JOBS[job_id] = job
         return {"dry_run": False, **_reindex_job_public(job)}

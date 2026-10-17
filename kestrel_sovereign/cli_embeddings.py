@@ -1432,8 +1432,10 @@ def run(args: argparse.Namespace) -> int:
 
     async def _runner() -> int:
         try:
-            from kestrel_sovereign.storage.async_database import AsyncDatabase
+            from kestrel_sovereign.storage.async_database import AsyncDatabase, _close_owned_database
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             print(f"ERROR: could not import AsyncDatabase: {exc}", file=sys.stderr)
             return 2
 
@@ -1480,6 +1482,8 @@ def run(args: argparse.Namespace) -> int:
                     cold_read=args.embeddings_command == "verify",
                 )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             print(f"ERROR: could not connect to DB: {exc}", file=sys.stderr)
             return 2
         try:
@@ -1509,12 +1513,10 @@ def run(args: argparse.Namespace) -> int:
             )
             return 2
         finally:
-            close = getattr(db, "close", None)
-            if close:
-                try:
-                    await close()
-                except Exception:
-                    pass
+            # The CLI owns this actual database, not an optional borrowed
+            # handle. Preserve both its body receipt and original retirement
+            # owner through admission refusal or observer cancellation.
+            await _close_owned_database(db, sys.exception())
             # A read-only connection can keep a live agent's WAL from being
             # checkpointed away; the cold-read backend says so when it did.
             warn = getattr(db.backend, "warn_if_wal_state_was_stranded", None)

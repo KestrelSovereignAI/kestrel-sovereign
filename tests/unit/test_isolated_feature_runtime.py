@@ -13,7 +13,6 @@ import stat
 import subprocess
 import sys
 import threading
-import time
 import traceback
 import types
 import weakref
@@ -381,6 +380,16 @@ def _idle_test_runtime() -> InstalledFeatureRuntime:
 
 
 def _configure_idle_lifecycle(agent, tmp_path, **kwargs) -> None:
+    # A real Agent publisher returns an actual owned Task. Auto-created Mock
+    # attributes are not native publication acknowledgments.
+    if isinstance(getattr(agent, "_track_background_task", None), Mock):
+        agent._background_tasks = set()
+        agent._remember_shutdown_control = types.MethodType(
+            KestrelAgent._remember_shutdown_control, agent
+        )
+        agent._track_background_task = types.MethodType(
+            KestrelAgent._track_background_task, agent
+        )
     agent.isolated_runtime_root = tmp_path / "runtimes"
     agent.isolated_runtime_namespace = "tenant/agent"
     agent.isolated_runtime_scope = resolve_isolated_runtime_namespace(
