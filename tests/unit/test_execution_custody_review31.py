@@ -164,14 +164,16 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
 @pytest.mark.parametrize("stage", ["preference", "adapter", "client"])
 @pytest.mark.parametrize("kind", ["unknown", "cancel_unknown"])
 @pytest.mark.parametrize("interrupt", [False, True])
+@pytest.mark.parametrize("observer_delay", [0, 0.05])
 async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup(
-    tmp_path, monkeypatch, stage, kind, interrupt,
+    tmp_path, monkeypatch, stage, kind, interrupt, observer_delay,
 ):
     from kestrel_sovereign.llm import service as service_module
 
     agent, db = await native_owner(tmp_path)
     service = service_owner()
     entered, release, settled = (asyncio.Event() for _ in range(3))
+    cancel_delivered, retry_entered, retry_release = (asyncio.Event() for _ in range(3))
     failure, calls = carrier(kind), []
     first_close = retry_close = writer = None
     withdrawals = []
@@ -207,18 +209,31 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
         writer.add_done_callback(service._handle_preference_persistence_done)
         service._preference_persistence_tasks.add(writer)
         service.providers = [{"client": SimpleNamespace(close=later)}]
+        target_key = "preference-writers"
     else:
         resource = SimpleNamespace(close=stubborn, aclose=stubborn)
         service.providers = [{stage: resource}, {"client": SimpleNamespace(close=later)}]
+        target_key = (stage, id(resource))
 
     original_wait = asyncio.wait
 
     async def wait_after_native_setup(tasks, *, timeout):
         if timeout == 0.02 and any(
-            task.get_name() == f"llm-close:{'preference-writers' if stage == 'preference' else stage}"
+            task is vars(service).get("_llm_close_tasks", {}).get(target_key)
             for task in tasks
         ):
             await asyncio.wait_for(entered.wait(), 5)
+            current = asyncio.current_task()
+            if current is first_close and interrupt and not cancel_delivered.is_set():
+                # Withdraw while the original bounded observation is live,
+                # not after a delayed controller finds it already completed.
+                cancel_delivered.set()
+                assert first_close.cancel("actual bounded-close observer withdrawal")
+            if current is retry_close and not retry_entered.is_set():
+                # The retry must observe the SAME owner's late receipt. Its
+                # earlier pending timeout is not evidence about a later error.
+                retry_entered.set()
+                await retry_release.wait()
         return await original_wait(tasks, timeout=timeout)
 
     monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.02)
@@ -226,8 +241,8 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
     try:
         first_close = asyncio.create_task(service.close())
         if interrupt:
-            await asyncio.wait_for(entered.wait(), 5)
-            first_close.cancel()
+            await asyncio.sleep(observer_delay)
+            await asyncio.wait_for(cancel_delivered.wait(), 5)
         done, _ = await original_wait({first_close}, timeout=1.5)
         assert done, "a stubborn owner exceeded bounded LLM cleanup"
         if interrupt:
@@ -243,7 +258,9 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
         if stage == "preference":
             assert "usage" not in calls, "storage retired before its native writer settled"
         retry_close = asyncio.create_task(service.close())
-        await original_wait({retry_close}, timeout=0.01)
+        await asyncio.wait_for(retry_entered.wait(), 5)
+        await asyncio.sleep(observer_delay)
+        assert not retry_close.done()
         assert calls.count(stage) == 1, "retry replaced the actual unfinished operation"
         for task in pending:
             task.add_done_callback(lambda done: settled.set())
@@ -251,6 +268,7 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
         await asyncio.wait_for(settled.wait(), 5)
         for task in pending:
             await await_owned_task(task)
+        retry_release.set()
         with pytest.raises(BaseException) as caught:
             await retry_close
         chain = tuple(_explicit_control_chain(caught.value))
@@ -278,6 +296,7 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
         assert calls.count("usage") == 1
     finally:
         release.set()
+        retry_release.set()
         for task in (first_close, retry_close, writer):
             if task is not None:
                 await await_owned_task(task)

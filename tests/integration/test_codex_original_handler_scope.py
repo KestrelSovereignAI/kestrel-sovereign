@@ -8,6 +8,7 @@ import asyncio
 import json
 import sys
 
+import asyncpg
 import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
@@ -15,6 +16,9 @@ from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     _explicit_control_chain,
     bind_execution_custody_snapshot,
+    execution_cleanup_debts,
+    execution_commit_outcome,
+    execution_denial_scopes,
     execution_terminal_error,
 )
 from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
@@ -22,10 +26,10 @@ from tests.integration.test_execution_authority_postgres import GenerationFence,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("denied", ["own", "foreign", "mixed"])
+@pytest.mark.parametrize("denied", ["own", "foreign", "mixed", "committed"])
 @pytest.mark.parametrize("retirement", ["public", "cancel", "join"])
 async def test_codex_registered_callback_compares_actual_original_scope(
-    native_pg, denied, retirement
+    native_pg, monkeypatch, denied, retirement
 ):
     backend, _, _ = native_pg
     process = await asyncio.create_subprocess_exec(
@@ -45,11 +49,33 @@ async def test_codex_registered_callback_compares_actual_original_scope(
     async def callback(params):
         entered.set()
         await release.wait()
-        for scope in ((owner,) if denied == "own" else (foreign,) if denied == "foreign" else (owner, foreign)):
+        if denied == "committed":
+            original_exit = asyncpg.transaction.Transaction.__aexit__
+
+            async def commit_then_retire(transaction, error_type, error, traceback):
+                result = await original_exit(transaction, error_type, error, traceback)
+                if error is None and not transaction._nested:
+                    owner.revoke("actual original callback scope retired after native COMMIT")
+                return result
+
+            monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", commit_then_retire)
             try:
-                scope.require_work()
+                with bind_execution_custody_snapshot((owner,)):
+                    await backend.execute("INSERT INTO effects VALUES (178, 'original callback committed effect')")
             except BaseException as error:
+                # The SAME original native receipt has physically retired with
+                # its checkout. It is still commit control, not a pure refusal.
+                assert execution_commit_outcome(error) == "committed"
+                assert execution_denial_scopes(error) == (owner,)
+                assert not execution_cleanup_debts(error)
                 originals.append(error)
+            assert await native_pg[1].fetchval(f'SELECT count(*) FROM "{native_pg[2]}".effects') == 1
+        else:
+            for scope in ((owner,) if denied == "own" else (foreign,) if denied == "foreign" else (owner, foreign)):
+                try:
+                    scope.require_work()
+                except BaseException as error:
+                    originals.append(error)
         failure = execution_terminal_error(*originals, retain_originals=True, isolate_control_originals=True)
         if retirement != "public":
             if retirement == "cancel":
@@ -73,7 +99,7 @@ async def test_codex_registered_callback_compares_actual_original_scope(
     tasks = ()
     try:
         async with backend.advisory_locks([(3569, 178221)]) as own_lease:
-            owner = ExecutionCustody(GenerationFence(lease=own_lease))
+            owner = ExecutionCustody(GenerationFence(lease=None if denied == "committed" else own_lease))
             with bind_execution_custody_snapshot((owner,)):
                 client.register_server_request_handler("item/tool/call", callback, thread_id="original")
         async with backend.advisory_locks([(3569, 178222)]) as foreign_lease:

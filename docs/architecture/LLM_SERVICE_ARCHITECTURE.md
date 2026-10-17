@@ -87,6 +87,33 @@ the Codex protocol exposes stable semantic ranks. Live capability negotiation
 remains authoritative; the disk model cache is only a bounded fallback when
 the live catalog RPC is unavailable.
 
+#### Native provider retirement and turn isolation
+
+Withdrawal stops new admission; it does not retire an already acquired native
+resource or an already accepted tool invocation. If authority changes after SDK
+stream acquisition but before publication, `await_execution_work` delegates the
+exact acquired value and its physical exit callback to
+`close_native_execution_stream`. That canonical boundary admits the callback
+lazily under cleanup-only custody, joins its original Task, and retains explicit
+resource/Task debt if admission or physical retirement fails. A denied publication
+must retain the original denial together with actual close errors and observer
+cancellation, without changing their original control graphs.
+
+Codex turn shutdown first closes callback admission, directly joins the original
+accepted reader Tasks, and holds the original thread mutex and event sink through
+any accepted completed-effect checkpoint. It must not allocate an intermediate
+collector to own Tasks already accepted. Checkpoint admission uses the canonical
+owned-Task boundary with the original executor as the retirement resource.
+Physical Task settlement also retires its active-set membership immediately;
+deferred completion bookkeeping must not make that finite drain repeat a join.
+
+A registered callback's pure own-scope denial can remain local to that turn only
+when it carries neither canonical commit outcome nor cleanup debt. An acknowledged
+commit followed by an own-scope denial is still durable execution evidence: the
+shared connection must fail closed rather than treating it as a harmless refusal.
+These rules preserve the original source evidence rather than inferring safety
+from a Task name, exception class, or physical close alone.
+
 ### 3. Model
 
 Which weights. Lives inside a vendor. Always an opaque ID string — **never** a literal in Python.

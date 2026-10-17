@@ -9,7 +9,9 @@ import pytest
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     ExecutionCommitOutcomeError,
+    _explicit_control_chain,
     bind_execution_custody,
+    execution_commit_outcome,
     is_execution_control_error,
 )
 from kestrel_sovereign.features.delivery.feature import DeliveryFeature
@@ -213,6 +215,8 @@ async def test_codex_native_finalization_never_downgrades_original_control(monke
     entered, release = asyncio.Event(), asyncio.Event()
     readers, checkpoints = [], []
     original = receipt("cancel_unknown" if route == "checkpoint_failure" else "unknown")
+    original_graph = tuple(_explicit_control_chain(original))
+    checkpoint_error = OSError("ordinary checkpoint cleanup failure")
     async def nothing(*args, **kwargs):
         pass
     async def request(method, params=None, **kwargs):
@@ -233,7 +237,7 @@ async def test_codex_native_finalization_never_downgrades_original_control(monke
         return {"success": True, "result": "original effect completed"}
     async def checkpoint(executed):
         checkpoints.extend(executed)
-        raise OSError("ordinary checkpoint cleanup failure")
+        raise checkpoint_error
     execute.persist_completed_effects = checkpoint
     async def events(*args, **kwargs):
         await entered.wait()
@@ -252,12 +256,17 @@ async def test_codex_native_finalization_never_downgrades_original_control(monke
     ))
     try:
         outcome = await asyncio.wait_for(await_owned_task(operation), 2)
-        assert outcome.error is original
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert original in chain and execution_commit_outcome(outcome.error) == "unknown"
+        assert tuple(_explicit_control_chain(original)) == original_graph
         assert all(task.done() for task in readers)
         assert not app._turn_sinks
         assert all(not lock.locked() for lock in adapter._thread_locks.values())
         if route == "checkpoint_failure":
             assert checkpoints, "cancellation skipped completed-effect checkpoint"
+            assert checkpoint_error in chain, "checkpoint failure was discarded during original control retention"
+        else:
+            assert outcome.error is original
     finally:
         release.set()
         if not operation.done():

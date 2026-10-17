@@ -6,6 +6,7 @@ are protocol input, not provider acceptance, token output or Agent READY.
 
 import asyncio
 import inspect
+import sys
 
 import aiosqlite
 import anthropic
@@ -14,7 +15,11 @@ import pytest
 from kestrel_sovereign import _async_ownership
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCustody,
+    ProcessRuntimeExecutionFence,
     _explicit_control_chain,
+    bind_execution_custody_snapshot,
     execution_cleanup_debts,
     is_execution_control_error,
 )
@@ -23,15 +28,9 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
 from tests.unit.test_cleanup_task_admission import _operation_name
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("retry_open", [False, True])
-@pytest.mark.parametrize("mode", ["refusal", "body-cancel", "observer", "closer-cancel", "caused-closer-cancel"])
-async def test_actual_anthropic_closer_keeps_original_stream_and_receipts(
-    native_pg, monkeypatch, retry_open, mode
-):
-    backend, _, _ = native_pg
-    async with backend.advisory_locks([(3569, 17828)]) as lease:
-        lease.require_live()
+@pytest.fixture
+async def native_sdk_peer():
+    """One owned native SDK/HTTP lifetime shared by both cleanup boundaries."""
     peers, requests = set(), []
     disconnected = asyncio.Event()
 
@@ -67,6 +66,26 @@ async def test_actual_anthropic_closer_keeps_original_stream_and_receipts(
         max_retries=0,
         http_client=anthropic.DefaultAsyncHttpxClient(trust_env=False),
     )
+    try:
+        yield client, requests, disconnected
+    finally:
+        await client.close()
+        server.close()
+        await server.wait_closed()
+        for task in tuple(peers):
+            await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_open", [False, True])
+@pytest.mark.parametrize("mode", ["refusal", "body-cancel", "observer", "closer-cancel", "caused-closer-cancel"])
+async def test_actual_anthropic_closer_keeps_original_stream_and_receipts(
+    native_pg, native_sdk_peer, monkeypatch, retry_open, mode
+):
+    backend, _, _ = native_pg
+    async with backend.advisory_locks([(3569, 17828)]) as lease:
+        lease.require_live()
+    client, requests, disconnected = native_sdk_peer
     loop, factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     refusal = RuntimeError("actual Anthropic stream closer Task refused")
     refused, sources, streams, cancellations, closer_tasks = [], [], [], [], []
@@ -199,8 +218,136 @@ async def test_actual_anthropic_closer_keeps_original_stream_and_receipts(
             coroutine.close()
         for stream in streams:
             await stream.close()
-        await client.close()
-        server.close()
-        await server.wait_closed()
-        for task in tuple(peers):
-            await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_open", [False, True])
+@pytest.mark.parametrize("mode", ["refusal", "observer", "close-error"])
+async def test_post_open_admission_keeps_actual_acquired_result_and_cleanup(
+    native_sdk_peer, monkeypatch, retry_open, mode
+):
+    client, requests, disconnected = native_sdk_peer
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence("actual-local-sdk-open"))
+    loop, factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refusal = RuntimeError("actual post-open acquired cleanup Task refused")
+    streams, pairs, refused, outer_tasks, denials, withdrawals, close_errors = [], [], [], [], [], [], []
+    denial_graphs = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_stream = client.messages.stream
+    original_join = _async_ownership.await_owned_task
+    closed_db = None
+    if mode == "close-error":
+        closed_db = await aiosqlite.connect(":memory:")
+        await closed_db.close()
+
+    def observed_stream(*args, **kwargs):
+        manager = original_stream(*args, **kwargs)
+        kind = type(manager)
+        original_enter, original_exit = kind.__aenter__, kind.__aexit__
+
+        async def enter(selected):
+            stream = await original_enter(selected)
+            streams.append(stream)
+            # Actual original authority changes AFTER native HTTP acquisition,
+            # before await_execution_work's final result-publication check.
+            scope.revoke("actual SDK-open admission retired before handoff")
+            return stream
+
+        async def exit(selected, *exit_args):
+            entered.set()
+            await release.wait()
+            await original_exit(selected, *exit_args)
+            if closed_db is not None:
+                try:
+                    await closed_db.execute("SELECT 1")
+                except ValueError as error:
+                    close_errors.append(error)
+                    raise
+
+        monkeypatch.setattr(kind, "__aenter__", enter)
+        monkeypatch.setattr(kind, "__aexit__", exit)
+        return manager
+
+    monkeypatch.setattr(client.messages, "stream", observed_stream)
+
+    def allocate(loop, coroutine, **kwargs):
+        name = _operation_name(coroutine)
+        selected = name.endswith(".close_acquired") or name.endswith("close_native_execution_stream.<locals>.owned_close")
+        if selected:
+            error = sys.exception()
+            assert isinstance(error, ExecutionAuthorityError)
+            denials.append(error)
+            denial_graphs.append(tuple(_explicit_control_chain(error)))
+            frame = coroutine.cr_frame
+            original = frame.f_locals.get("operation", coroutine)
+            values = original.cr_frame.f_locals
+            pairs.append(values["pair"] if "pair" in values else values["stream"])
+            if mode == "refusal":
+                refused.append(coroutine)
+                raise refusal
+        task = factory(loop, coroutine, **kwargs) if factory else asyncio.Task(coroutine, loop=loop, **kwargs)
+        if selected:
+            outer_tasks.append(task)
+        return task
+
+    async def join(task, *args, **kwargs):
+        outcome = await original_join(task, *args, **kwargs)
+        if task in outer_tasks and outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+        return outcome
+
+    monkeypatch.setattr(_async_ownership, "await_owned_task", join)
+
+    async def open_stream():
+        with bind_execution_custody_snapshot((scope,)):
+            async with _anthropic_stream_with_retry(
+                client,
+                {"model": "local-protocol-input", "max_tokens": 1, "messages": [{"role": "user", "content": "fixture"}]},
+                retry_open=retry_open,
+            ):
+                pytest.fail("retired post-open admission published acquired SDK stream")
+
+    operation = None
+    try:
+        loop.set_task_factory(allocate)
+        operation = create_owned_task(open_stream(), retain_originals=True)
+        if mode != "refusal":
+            await asyncio.wait_for(entered.wait(), 5)
+            if mode == "observer":
+                operation.cancel("actual acquired-result observer withdrawal")
+                await asyncio.sleep(0)
+            release.set()
+        outcome = await asyncio.wait_for(await_owned_task(operation), 5)
+        loop.set_task_factory(factory)
+        assert outcome.error is not None and len(requests) == 1
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert len(denials) == 1 and denials[0] in chain, (
+            "acquired-result cleanup admission replaced its original actual denial"
+        )
+        assert tuple(_explicit_control_chain(denials[0])) == denial_graphs[0]
+        assert len(pairs) == 1 and pairs[0][1] is streams[0]
+        assert is_execution_control_error(outcome.error)
+        if mode == "refusal":
+            assert refusal in chain and refused
+            assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused)
+            assert any(resource is pairs[0] and task is None for resource, task in execution_cleanup_debts(outcome.error))
+            assert not streams[0].response.is_closed and not disconnected.is_set()
+        else:
+            assert streams[0].response.is_closed and all(task.done() for task in outer_tasks)
+            if mode == "observer":
+                assert withdrawals and all(error in chain for error in withdrawals)
+            else:
+                assert close_errors and all(error in chain for error in close_errors)
+                assert any(
+                    resource is pairs[0] and task in outer_tasks
+                    for resource, task in execution_cleanup_debts(outcome.error)
+                ), "failed acquired-result exit lost its original resource/Task debt"
+    finally:
+        loop.set_task_factory(factory)
+        release.set()
+        if operation is not None:
+            await await_owned_task(operation)
+        for coroutine in refused:
+            coroutine.close()
+        for stream in streams:
+            await stream.close()

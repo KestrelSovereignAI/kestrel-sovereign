@@ -69,7 +69,7 @@ from kestrel_sdk.llm import (
 )
 from pydantic import BaseModel
 
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     owned_execution_stream,
@@ -3344,65 +3344,65 @@ class CodexAdapter(LLMAdapter):
                 if isinstance(unwind_error, asyncio.CancelledError)
                 else None
             )
+            checkpoint_error = None
             try:
-                if active_inline_tool_handlers:
-                    async def settle_inline_tools() -> None:
-                        while active_inline_tool_handlers:
-                            outcomes = await asyncio.gather(
-                                *tuple(active_inline_tool_handlers),
-                                return_exceptions=True,
-                            )
-                            inline_terminal_errors.extend(
-                                error for error in outcomes if isinstance(error, BaseException)
-                            )
-
-                    owner = asyncio.create_task(
-                        settle_inline_tools(),
-                        name="codex-inline-tool-stop-boundary",
+                # These handlers already have physical reader-owned Tasks.
+                # Retiring them must not depend on admitting another collector
+                # Task, or an allocator refusal releases the mutex underneath
+                # an accepted effect. Close admission above, then join originals.
+                while active_inline_tool_handlers:
+                    for handler_owner in tuple(active_inline_tool_handlers):
+                        outcome = await await_owned_task(handler_owner)
+                        # Physical settlement, not deferred callback ordering,
+                        # retires this original member of the closed cohort.
+                        active_inline_tool_handlers.discard(handler_owner)
+                        if outcome.error is not None:
+                            inline_terminal_errors.append(outcome.error)
+                        if outcome.cancellation is not None:
+                            inline_terminal_errors.append(outcome.cancellation)
+                            if pending_cleanup_cancellation is None:
+                                pending_cleanup_cancellation = outcome.cancellation
+                if pending_cleanup_cancellation is not None and executed_log:
+                    checkpoint = getattr(
+                        tool_executor,
+                        "persist_completed_effects",
+                        None,
                     )
-                    outcome = await await_owned_task(
-                        owner,
-                        pending_cleanup_cancellation,
-                    )
-                    pending_cleanup_cancellation = outcome.cancellation
-                    if outcome.error is not None:
-                        inline_terminal_errors.append(outcome.error)
+                    if callable(checkpoint):
+                        try:
+                            checkpoint_owner = create_owned_task(
+                                checkpoint(list(executed_log)),
+                                name="codex-inline-tool-stop-checkpoint",
+                                retirement_resource=tool_executor,
+                                retain_originals=True,
+                            )
+                        except BaseException as admission_error:
+                            checkpoint_error = admission_error
+                        else:
+                            checkpoint_outcome = await await_owned_task(checkpoint_owner)
+                            if checkpoint_outcome.cancellation is not None:
+                                inline_terminal_errors.append(checkpoint_outcome.cancellation)
+                            if checkpoint_outcome.error is not None:
+                                checkpoint_outcome.error.add_note(
+                                    "caller cancellation remained pending after an "
+                                    "inline tool effect completed"
+                                )
+                                checkpoint_error = checkpoint_outcome.error
+                            else:
+                                setattr(
+                                    pending_cleanup_cancellation,
+                                    "_kestrel_completed_effect_checkpointed",
+                                    True,
+                                )
             finally:
                 try:
                     app.close_turn_sink(thread_id)
                 finally:
                     lock.release()
-            checkpoint_error = None
-            if pending_cleanup_cancellation is not None and executed_log:
-                checkpoint = getattr(
-                    tool_executor,
-                    "persist_completed_effects",
-                    None,
-                )
-                if callable(checkpoint):
-                    checkpoint_owner = asyncio.create_task(
-                        checkpoint(list(executed_log)),
-                        name="codex-inline-tool-stop-checkpoint",
-                    )
-                    checkpoint_outcome = await await_owned_task(
-                        checkpoint_owner,
-                        pending_cleanup_cancellation,
-                    )
-                    if checkpoint_outcome.error is not None:
-                        checkpoint_outcome.error.add_note(
-                            "caller cancellation remained pending after an "
-                            "inline tool effect completed"
-                        )
-                        checkpoint_error = checkpoint_outcome.error
-                    else:
-                        setattr(
-                            pending_cleanup_cancellation,
-                            "_kestrel_completed_effect_checkpointed",
-                            True,
-                        )
             terminal_error = execution_terminal_error(
                 unwind_error, *inline_terminal_errors,
                 pending_cleanup_cancellation, checkpoint_error,
+                retain_originals=True, isolate_control_originals=True,
             )
             if terminal_error is not None:
                 raise terminal_error

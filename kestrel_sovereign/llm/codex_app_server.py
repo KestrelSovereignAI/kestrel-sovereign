@@ -52,6 +52,7 @@ from kestrel_sovereign._async_ownership import (
 from kestrel_sovereign.execution_custody import (
     current_execution_custody,
     execution_cleanup_debts,
+    execution_commit_outcome,
     execution_denial_scopes,
     execution_terminal_error,
     is_execution_control_error,
@@ -855,6 +856,7 @@ class CodexAppServerClient:
         if is_execution_control_error(error):
             denied = execution_denial_scopes(error)
             if (denied and all(any(scope is admitted for admitted in caller_scopes) for scope in denied)
+                    and execution_commit_outcome(error) is None
                     and not execution_cleanup_debts(error)):
                 # Original typed callback refusal stays on its owning turn's
                 # bridge receipt. It does not authorize that turn to continue

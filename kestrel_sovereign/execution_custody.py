@@ -864,14 +864,22 @@ async def await_execution_work(
             # loss must not erase the sole native handle before its adapter
             # gets an opportunity to install the ordinary stream closer.
             if acquired_result_cleanup is not None:
-                from kestrel_sovereign._async_ownership import await_owned_task
-
-                with bind_execution_cleanup(owner):
-                    close = asyncio.create_task(acquired_result_cleanup(result))
-                    outcome = await await_owned_task(close)
-                terminal = execution_terminal_error(denial, outcome.error, outcome.cancellation)
-                retain_retirement(terminal)
-                raise terminal
+                try:
+                    # The SAME canonical physical-close boundary owns both
+                    # ordinary streams and an acquired SDK context/result.
+                    # Its lazy callback cannot run before Task admission, and
+                    # refusal retains the original acquired value explicitly.
+                    await close_native_execution_stream(
+                        result, owner, close_operation=acquired_result_cleanup,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                except BaseException as cleanup_error:
+                    terminal = execution_terminal_error(
+                        denial, cleanup_error,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    retain_retirement(terminal)
+                    raise terminal
             raise
         return result
 
@@ -1009,22 +1017,28 @@ def retain_native_execution_http_client_close(client: Any) -> None:
 
 async def close_native_execution_stream(
     stream: Any, owner: Any = None, *, retain_originals: bool = False,
+    close_operation: Callable[[Any], Awaitable[None]] | None = None,
+    isolate_control_originals: bool = False,
 ) -> None:
     """Physically join an acquired SDK/native close under cleanup-only custody.
 
     Lifecycle epilogues may retain the opening cancellation and failed native
     closer together. Legacy stream consumers keep their existing selection.
+    An acquired SDK context/result can supply its exact physical exit instead
+    of a method on that value; admission and failed-owner debt stay canonical.
     """
     from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
-    retain_native_execution_stream_close(stream, owner)
-    close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
-    if not callable(close):
-        return  # Legacy in-memory iterators have no native response resource.
+    close = None
+    if close_operation is None:
+        retain_native_execution_stream_close(stream, owner)
+        close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+        if not callable(close):
+            return  # Legacy in-memory iterators have no native response resource.
     original = sys.exc_info()[1]
     async def owned_close():
         with bind_execution_cleanup(owner):
-            result = close()
+            result = close() if close_operation is None else close_operation(stream)
             if inspect.isawaitable(result):
                 await result
     try:
@@ -1032,7 +1046,10 @@ async def close_native_execution_stream(
             owned_close(), retirement_resource=stream, retain_originals=retain_originals,
         )
     except BaseException as error:
-        raise execution_terminal_error(original, error, retain_originals=True)
+        raise execution_terminal_error(
+            original, error, retain_originals=True,
+            isolate_control_originals=isolate_control_originals,
+        )
     outcome = await await_owned_task(close_task)
     if outcome.error is not None:
         # Keep the exact failed attempt reachable even if the native SDK has
@@ -1048,6 +1065,7 @@ async def close_native_execution_stream(
         raise execution_terminal_error(
             original, outcome.error, outcome.cancellation,
             retain_originals=retain_originals, prefer_cancellation=retain_originals,
+            isolate_control_originals=isolate_control_originals,
         )
 
 
