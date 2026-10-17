@@ -70,6 +70,7 @@ from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolS
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
+    gather_owned,
     owned_task_error,
     raise_owned_outcome,
 )
@@ -15208,16 +15209,14 @@ class ProxyFeature(Feature):
                     # can drain it; no third item allocates host memory.
                     pass
 
-            join = asyncio.create_task(queue_entry.events.join())
-            retired = asyncio.create_task(queue_entry.retired.wait())
-            done, pending = await asyncio.wait(
-                (join, retired), return_when=asyncio.FIRST_COMPLETED
+            await gather_owned(
+                (operation() for operation in
+                 (queue_entry.events.join, queue_entry.retired.wait)),
+                return_when=asyncio.FIRST_COMPLETED,
+                retain_originals=True,
+                isolate_control_originals=True,
+                name_prefix="isolated-non-cursor-ingress-observer",
             )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                task.result()
 
     async def _route_non_cursor_inbound_events(
         self, queue_entry: _NonCursorIngressQueue

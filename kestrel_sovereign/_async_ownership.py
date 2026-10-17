@@ -185,7 +185,8 @@ async def wait_owned_tasks_until(tasks, *, deadline: float):
 async def gather_owned(operations, *, cancel_siblings_on_error=True,
                        retirement_resource=None, retain_originals=False,
                        name_prefix: str | None = None,
-                       isolate_control_originals=False):
+                       isolate_control_originals=False,
+                       return_when=asyncio.ALL_COMPLETED):
     """Join accepted children even if later admission or observation fails.
 
     Independent native retirement can disable sibling cancellation: all
@@ -193,14 +194,19 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     and accepted children physically join before terminal control is selected.
     Finite callers can isolate original control carriers from shared source
     receipts. Indexed names are diagnostic only, never a second owner.
+    FIRST_COMPLETED races are finite observers: after the first outcome, every
+    remaining accepted peer is cancelled and physically joined before return.
     """
     from kestrel_sovereign.execution_custody import (
         execution_terminal_error,
         is_execution_control_error,
     )
+    if return_when not in (asyncio.ALL_COMPLETED, asyncio.FIRST_COMPLETED):
+        raise ValueError("owned gather requires ALL_COMPLETED or FIRST_COMPLETED")
     children = []
     pending = set()
     primary = None
+    first_observed = False
     try:
         for index, operation in enumerate(operations):
             try:
@@ -219,16 +225,19 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
         pending = set(children)
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            first_observed = return_when == asyncio.FIRST_COMPLETED
             for child in done:
                 error = owned_task_error(child)
                 if error is not None:
                     raise error
+            if first_observed:
+                break
     except BaseException as error:
         primary = execution_terminal_error(
             primary, error, retain_originals=retain_originals,
             isolate_control_originals=isolate_control_originals,
         )
-    if primary is not None and cancel_siblings_on_error:
+    if first_observed or (primary is not None and cancel_siblings_on_error):
         for child in children:
             if not child.done():
                 child.cancel()

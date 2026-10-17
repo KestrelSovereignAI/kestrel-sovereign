@@ -1587,3 +1587,27 @@ Native component tests use actual eager Tasks, PG effects and allocator refusal;
 they do not establish a complete Agent turn or external tool acceptance.
 
 These are candidate contracts, not whole-branch review or release approval.
+
+### Bounded ingress observer races
+
+Non-cursor queue backpressure owns only its queue-join and retired-event
+observers, not the source worker or its delivery acknowledgement. The canonical
+owned gather's optional `FIRST_COMPLETED` policy closes refused original
+coroutines, cancels and joins every accepted observer on either winning result
+or caller withdrawal, and retains late native cleanup control. Its default
+all-completed policy is unchanged. Unsupported policies are rejected before
+the operation generator is consumed.
+
+The native component regression uses an existing actual bounded queue/worker,
+local PostgreSQL effects and original retired-lease denial. It verifies original
+Tasks and cancellation carriers; it does not certify a launched isolated child,
+full Agent readiness, provider response, or delivery ACK.
+
+The deferred tool-batch receipt also survives a failing streaming consumer.
+An encompassing failure projection joins the original batch outcome, its actual
+observer withdrawal and any checkpoint/audit/consumer error through the same
+isolated finite composer. Existing checkpoint ordering is unchanged. Native
+tests execute all three actual streaming persistence checkpoints after a real
+PostgreSQL COMMIT with lost acknowledgement; an ordinary SQL failure or refused
+checkpoint Task cannot replace that original UNKNOWN receipt. Declared model
+and context inputs are component inputs, not paid-provider or full Agent proof.
