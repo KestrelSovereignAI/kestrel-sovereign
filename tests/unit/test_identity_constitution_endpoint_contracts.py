@@ -123,6 +123,9 @@ def test_constitution_endpoint_returns_text_hash_and_metadata():
     "https://01.2.3.4/avatar.png",
     "https://1。2。3。04/avatar.png",
     "https://public.example/avatar\ud800.png",
+    "https://[v1.example.com]/avatar.png",
+    "https://[2001:4860:4860::8888%en0]/avatar.png",
+    "https://[2001:4860:4860::8888%é]/avatar.png",
 ])
 def test_avatar_url_rejection_uses_shared_policy_before_transport_creation(url, monkeypatch):
     from kestrel_sdk.security import outbound
