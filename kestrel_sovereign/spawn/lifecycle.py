@@ -14,6 +14,7 @@ Lifecycle:
 """
 
 import asyncio
+import inspect
 import logging
 import shutil
 import tempfile
@@ -41,9 +42,6 @@ _COLD_TTL_RETIREMENT_RETRY_SECONDS = 30.0
 def _is_expected_termination_outcome(error: BaseException) -> bool:
     """Accept lifecycle failures/cancellation, never process-control signals."""
 
-    from kestrel_sovereign.execution_custody import is_execution_control_error
-    if is_execution_control_error(error):
-        return True
     if isinstance(error, (Exception, asyncio.CancelledError)):
         return True
     if isinstance(error, BaseExceptionGroup):
@@ -1754,6 +1752,8 @@ class SpawnedAgentLifecycle:
         # still needs this record after manager-side relationship pruning.
         termination_failure: BaseException | None = None
         reconciliation_cancelled = False
+        reconciliation_withdrawals: list[BaseException] = []
+        reconciliation_observations_supported = False
         terminated = False
         finalized_from_absence = False
         try:
@@ -1798,12 +1798,18 @@ class SpawnedAgentLifecycle:
             )
             if callable(await_reconciliation):
                 try:
+                    # Core's reader exposes actual observations; legacy host
+                    # protocol implementations can retain their two-argument
+                    # tuple contract without receiving an unexpected keyword.
+                    observation_kwargs = ({"withdrawals": reconciliation_withdrawals}
+                        if "withdrawals" in inspect.signature(await_reconciliation).parameters else {})
+                    reconciliation_observations_supported = bool(observation_kwargs)
                     reconciliation_result = await await_reconciliation(
-                        tracked.parent_did, child_name
+                        tracked.parent_did, child_name, **observation_kwargs,
                     )
                 except BaseException as reconciliation_error:
                     from kestrel_sovereign.execution_custody import execution_observation_error
-                    raise execution_observation_error(termination_failure, reconciliation_error)
+                    raise execution_observation_error(termination_failure, reconciliation_error, *reconciliation_withdrawals)
             else:
                 class_reconciliation = getattr(
                     type(self._agent_manager),
@@ -1811,22 +1817,28 @@ class SpawnedAgentLifecycle:
                     None,
                 )
                 try:
+                    observation_kwargs = ({"withdrawals": reconciliation_withdrawals}
+                        if callable(class_reconciliation)
+                        and "withdrawals" in inspect.signature(class_reconciliation).parameters else {})
+                    reconciliation_observations_supported = bool(observation_kwargs)
                     reconciliation_result = (
                         await class_reconciliation(
                             self._agent_manager,
                             tracked.parent_did,
                             child_name,
+                            **observation_kwargs,
                         )
                         if callable(class_reconciliation)
                         else None
                     )
                 except BaseException as reconciliation_error:
                     from kestrel_sovereign.execution_custody import execution_observation_error
-                    raise execution_observation_error(termination_failure, reconciliation_error)
+                    raise execution_observation_error(termination_failure, reconciliation_error, *reconciliation_withdrawals)
             if reconciliation_result is not None:
                 terminated, reconciliation_cancelled = reconciliation_result
                 if not terminated and termination_failure is not None:
-                    raise termination_failure
+                    from kestrel_sovereign.execution_custody import execution_observation_error
+                    raise execution_observation_error(termination_failure, *reconciliation_withdrawals)
 
         if not terminated and termination_failure is None:
             if _manager_proves_child_absent(
@@ -1874,7 +1886,7 @@ class SpawnedAgentLifecycle:
                         tracked.ttl_task = asyncio.create_task(
                             self._ttl_monitor(
                                 child_name,
-                                tracked.child_did,
+                            tracked.child_did,
                                 tracked.ttl_seconds,
                             )
                         )
@@ -1958,18 +1970,18 @@ class SpawnedAgentLifecycle:
             status.value,
             termination_reason,
         )
-        terminal_outcomes: list[BaseException] = []
-        if reconciliation_cancelled:
+        from kestrel_sovereign.execution_custody import execution_observation_error, is_execution_control_error
+        terminal_outcomes: list[BaseException] = list(reconciliation_withdrawals)
+        if (reconciliation_cancelled and not reconciliation_withdrawals
+            and not reconciliation_observations_supported
+            and not is_execution_control_error(termination_failure)):
+            # Preserve the legacy ordinary tuple-only protocol. Core native
+            # outcomes never manufacture an observation from a boolean.
             terminal_outcomes.append(asyncio.CancelledError())
         if termination_failure is not None:
             terminal_outcomes.append(termination_failure)
-        if len(terminal_outcomes) == 1:
-            raise terminal_outcomes[0]
         if terminal_outcomes:
-            raise BaseExceptionGroup(
-                "Child termination finalized with terminal outcomes",
-                terminal_outcomes,
-            )
+            raise execution_observation_error(*terminal_outcomes, message="Child termination finalized with terminal outcomes")
         return terminated
 
     async def _fire_hook(

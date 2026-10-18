@@ -407,6 +407,75 @@ async def test_ttl_consumer_preserves_prior_terminal_and_late_native_reader_fail
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["instance", "class"])
+@pytest.mark.parametrize("reconciled", [False, True])
+@pytest.mark.parametrize("source_cancel", [False, True])
+async def test_ttl_successful_reader_never_reconstructs_actual_native_withdrawal(
+    native_pg, onboarding_owner, monkeypatch, entry, reconciled, source_cancel,
+):
+    from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle, SpawnMode, SpawnStatus, _TrackedChild
+    manager, agent, db = onboarding_owner
+    source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch, source_cancel))
+    prior = OriginalFailure.capture(manager_module.RuntimeOffboardingRetainedError(
+        agent_name="Child", agent_id=agent.did, runtime_path=None, cause=source.error, cleanup_pending=True))
+    entered, release, observations = asyncio.Event(), asyncio.Event(), []
+    owner = None
+    async def cleanup():
+        await release.wait()
+        await db.execute("INSERT INTO host_rollback_effects VALUES (292)")
+    original = ownership.create_owned_task(cleanup(), retain_originals=True)
+    manager._retain_quarantined_cleanup(name="Child", agent_id=agent.did, task=original)
+    if not reconciled:
+        manager._agents["Child"] = agent
+    class Platform:
+        def get_agent(self, name):
+            return None
+        async def terminate_child(self, parent, child, **kwargs):
+            raise prior.error
+    platform = Platform()
+    async def reconcile(parent, child, *, withdrawals=None):
+        kwargs = {} if withdrawals is None else {"withdrawals": withdrawals}
+        return await manager.await_child_termination_reconciliation(parent, child, **kwargs)
+    if entry == "instance":
+        platform.await_child_termination_reconciliation = reconcile
+    else:
+        async def class_reconcile(self, parent, child, *, withdrawals=None):
+            return await reconcile(parent, child, withdrawals=withdrawals)
+        Platform.await_child_termination_reconciliation = class_reconcile
+    actual_join = ownership.await_owned_task
+    async def observed(task, *args, **kwargs):
+        if task is original and asyncio.current_task() is owner:
+            entered.set()
+        outcome = await actual_join(task, *args, **kwargs)
+        if asyncio.current_task() is owner and outcome.cancellation is not None:
+            observations.append(OriginalFailure.capture(outcome.cancellation))
+        return outcome
+    monkeypatch.setattr(ownership, "await_owned_task", observed)
+    lifecycle = SpawnedAgentLifecycle(platform)
+    tracked = _TrackedChild("Child", agent.did, "did:test:declared-parent", SpawnMode.PERSISTENT, 0, "declared TTL observer")
+    lifecycle._tracked["Child"] = tracked
+    owner = ownership.create_owned_task(lifecycle._terminate_and_cleanup(
+        "Child", SpawnStatus.TIMED_OUT, _terminal_descendant_fence_active=True), retain_originals=True)
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        owner.cancel("actual successful TTL reconciliation observer withdrew")
+        await asyncio.sleep(0)
+        release.set()
+        outcome = await actual_join(owner)
+        source.assert_retained(outcome.error)
+        prior.assert_retained(outcome.error)
+        assert len(observations) == 1
+        observations[0].assert_retained(outcome.error)
+        assert (lifecycle._tracked.get("Child") is None) is reconciled
+        assert original.done() and await db.fetchval("SELECT count(*) FROM host_rollback_effects") == 1
+    finally:
+        release.set()
+        await actual_join(original)
+        await actual_join(owner)
+        manager._agents.clear()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["quarantine", "runtime", "budget", "descendant", "ttl"])
 @pytest.mark.parametrize("through_cause", [False, True])
 @pytest.mark.parametrize("source_cancel", [False, True])

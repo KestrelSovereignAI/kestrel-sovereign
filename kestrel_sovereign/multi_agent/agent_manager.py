@@ -13582,6 +13582,8 @@ class AgentManager:
         self,
         parent_did: str,
         child_name: str,
+        *,
+        withdrawals: Optional[list[BaseException]] = None,
     ) -> tuple[bool, bool]:
         """Join this child's deferred cleanup before terminal retirement.
 
@@ -13605,7 +13607,8 @@ class AgentManager:
         )
         cancelled = False
         cleanup_failed = False
-        originals, withdrawals = [], []
+        originals = []
+        withdrawals = [] if withdrawals is None else withdrawals
 
         while True:
             records = tuple(
