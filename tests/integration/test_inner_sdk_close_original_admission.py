@@ -5,7 +5,7 @@ import httpx2
 import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
-from kestrel_sovereign.execution_custody import close_native_execution_stream
+from kestrel_sovereign.execution_custody import close_native_execution_stream, execution_cleanup_debts
 from kestrel_sovereign.llm.anthropic_adapter import _anthropic_stream_with_retry
 from tests.integration.test_anthropic_original_close_admission import native_sdk_peer as native_sdk_peer
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
@@ -17,7 +17,7 @@ from tests.utils.original_failure import OriginalFailure
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("door", ["response", "context"])
-@pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("after", [False, True, "refuse"])
 async def test_inner_sdk_close_keeps_accepted_original_before_publication_failure(
     native_pg, native_sdk_peer, monkeypatch, door, after,
 ):
@@ -44,6 +44,9 @@ async def test_inner_sdk_close_keeps_accepted_original_before_publication_failur
         selected = (getattr(actual, "cr_code", None) is held_close.__code__ if door == "response"
                     else _operation_name(coroutine).endswith(".close_acquired.<locals>.owned_close"))
         if selected:
+            if after == "refuse":
+                fired.append(True)
+                raise source.error
             task = PublicationTask(coroutine, loop=loop, **kwargs)
             accepted.append(task)
             return task
@@ -75,9 +78,14 @@ async def test_inner_sdk_close_keeps_accepted_original_before_publication_failur
     owner = create_owned_task(run(), retain_originals=True)
     try:
         outcome = await await_owned_task(owner)
-        assert fired and len(accepted) == 1, "actual inner admission seam was not exercised"
-        assert accepted[0].done(), "inner SDK boundary abandoned accepted publication-failed owner"
-        source.assert_retained(outcome.error, resource=resources[0], task=accepted[0])
+        assert fired, "actual inner admission seam was not exercised"
+        if after == "refuse":
+            assert not accepted
+            source.assert_retained(outcome.error)
+            assert any(resource is resources[0] and task is None for resource, task in execution_cleanup_debts(outcome.error))
+        else:
+            assert len(accepted) == 1 and accepted[0].done(), "inner SDK boundary abandoned accepted publication-failed owner"
+            source.assert_retained(outcome.error, resource=resources[0], task=accepted[0])
         assert not entered.is_set(), "publication-failed original ran physical close before its admission gate"
     finally:
         loop.set_task_factory(previous)

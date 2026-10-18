@@ -128,10 +128,21 @@ async def test_batch_fatal_cleanup_includes_all_native_initializer_receipts(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delayed_write", [False, True])
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("boundary", ["wait", "facade", "facade_cancel", "facade_timeout"])
-async def test_isolated_lifecycle_join_preserves_first_native_receipt(monkeypatch, tmp_path, kind, boundary):
+async def test_isolated_lifecycle_join_preserves_first_native_receipt(monkeypatch, tmp_path, kind, boundary, delayed_write):
     agent, db = await native_owner(tmp_path)
+    if delayed_write:
+        native_execute = db.execute
+        async def delayed_execute(*args, **kwargs):
+            result = await native_execute(*args, **kwargs)
+            if args and args[0].startswith("INSERT INTO effects"):
+                # Transparent post-write latency, not CPU stress or a native
+                # ACK stub. The real SQLite effect must precede the 20ms test.
+                await asyncio.sleep(0.05)
+            return result
+        monkeypatch.setattr(db, "execute", delayed_execute)
     failure = receipt(kind)
     original = OriginalFailure.capture(failure)
     withdrawals = []
@@ -144,7 +155,7 @@ async def test_isolated_lifecycle_join_preserves_first_native_receipt(monkeypatc
             raise
     if boundary == "facade_cancel":
         monkeypatch.setattr(asyncio, "wait_for", observed_wait)
-    entered, release = asyncio.Event(), asyncio.Event()
+    entered, release, admitted = asyncio.Event(), asyncio.Event(), asyncio.Event()
     child = outer = None
     async def native():
         await db.execute("INSERT INTO effects VALUES (1)")
@@ -158,14 +169,18 @@ async def test_isolated_lifecycle_join_preserves_first_native_receipt(monkeypatc
         if boundary == "wait":
             return await runtime._await_task_until_complete(child, preserve_cancellation=False)
         return await runtime._await_owned_facade_lifecycle_operation(
-            child, name="review36-native", on_late_task=lambda _task: pytest.fail("native child orphaned"))
+            child, name="review36-native", on_late_task=lambda _task: pytest.fail("native child orphaned"),
+            on_admitted=lambda _operation: admitted.set())
     try:
         if boundary == "facade_timeout":
             monkeypatch.setattr(runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", 0.02)
         child = asyncio.create_task(native())
-        outer = asyncio.create_task(join())
         await asyncio.wait_for(entered.wait(), 5)
+        # The 20ms facade budget measures an admitted native receipt, NOT the
+        # unrelated time SQLite needed to open/write on a busy CI worker.
+        outer = asyncio.create_task(join())
         if boundary == "facade_cancel":
+            await asyncio.wait_for(admitted.wait(), 5)
             outer.cancel("ordinary owner cancellation")
         if boundary != "facade_timeout":
             release.set()

@@ -13,8 +13,9 @@ from tests.utils.original_failure import OriginalFailure
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source_cancel", [False, True])
+@pytest.mark.parametrize("hold_callbacks", [False, True])
 async def test_late_native_stop_never_becomes_another_physical_attempt(
-    native_pg, tmp_path, monkeypatch, source_cancel,
+    native_pg, tmp_path, monkeypatch, source_cancel, hold_callbacks,
 ):
     entered, release, stops, sources = asyncio.Event(), asyncio.Event(), [], []
     class Client(FakeIsolatedClient):
@@ -33,18 +34,25 @@ async def test_late_native_stop_never_becomes_another_physical_attempt(
     monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", .02)
     monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_CANCELLATION_GRACE", .02)
     first = create_owned_task(feature.shutdown(), retain_originals=True)
-    operation = None
+    operation, held = None, []
     try:
         await asyncio.wait_for(entered.wait(), 5)
         first_outcome = await await_owned_task(first)
         assert first_outcome.error is not None and len(stops) == 1
         (tracked,) = tuple(feature._terminal_lifecycle_tasks)
         operation = tracked.task
+        if hold_callbacks:
+            monkeypatch.setattr(operation, "_schedule_settlement_callback", held.append)
         settled = asyncio.Event()
         operation.add_done_callback(lambda completed: settled.set())
         release.set()
-        await asyncio.wait_for(settled.wait(), 5)
-        assert sources and stops[0].done() and not feature._terminal_lifecycle_tasks
+        if hold_callbacks:
+            await await_owned_task(operation._host_task)
+            assert feature._terminal_lifecycle_tasks
+        else:
+            await asyncio.wait_for(settled.wait(), 5)
+            assert not feature._terminal_lifecycle_tasks
+        assert sources and stops[0].done()
         later = await await_owned_task(create_owned_task(feature.shutdown(), retain_originals=True))
         sources[0].assert_retained(later.error)
         assert len(stops) == 1, "late native completion lost the exact failed per-client operation"
@@ -54,6 +62,8 @@ async def test_late_native_stop_never_becomes_another_physical_attempt(
         assert await native_pg[1].fetchval(f'SELECT count(*) FROM "{native_pg[2]}".effects WHERE id=231') == 1
     finally:
         release.set()
+        for callback in held:
+            callback(operation)
         await await_owned_task(first)
         if operation is not None:
             await await_owned_task(operation._host_task)

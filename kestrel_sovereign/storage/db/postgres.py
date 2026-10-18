@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
 from kestrel_sovereign.native_retirement import (
     _begin_native_resource, _native_observation_requested,
     _require_native_observation_for_connection,
@@ -911,7 +911,7 @@ class PostgresBackend(DatabaseBackend):
     def _refused_native_owner(
         connection: Any, resource: Any, refusal: BaseException,
         scopes: tuple[ExecutionCustody, ...], body_failure: BaseException | None,
-        native_connection: Any,
+        native_connection: Any, *, owner: asyncio.Task | None = None,
     ) -> BaseException:
         """No created task means no native closer owner, never successful reset.
 
@@ -920,15 +920,15 @@ class PostgresBackend(DatabaseBackend):
         factory, inventing a completed closer or leaking its live transaction.
         Keep the exact resource and absence of an owner as retirement debt.
         """
+        debt = ExecutionAuthorityError("original native epilogue ownership refused")
+        debt._kestrel_native_retirement_debts = (
+            (_NativePostgresRetirement(resource, connection, native_connection), owner),
+        )
         terminal = execution_terminal_error(
-            body_failure, refusal, retain_originals=True,
+            body_failure, refusal, debt, retain_originals=True,
             isolate_control_originals=True,
         )
         PostgresBackend._abort_native_connection(connection, terminal)
-        terminal._kestrel_native_retirement_debts = (
-            *getattr(terminal, "_kestrel_native_retirement_debts", ()),
-            (_NativePostgresRetirement(resource, connection, native_connection), None),
-        )
         for scope in scopes:
             scope.revoke("original native epilogue ownership refused")
         return terminal
@@ -1043,14 +1043,25 @@ class PostgresBackend(DatabaseBackend):
         # in its original task, including every ContextVar token and arbitrary
         # caller await. Cancellation cannot abandon an accepted native reset.
         with observation.phase(checkout) if observation is not None else nullcontext() as phase:
+            admission = OwnedTaskAdmission()
             try:
                 retirement = create_owned_task(checkout.__aexit__(
                     type(body_failure) if body_failure is not None else None,
                     body_failure,
                     body_failure.__traceback__ if body_failure is not None else None,
-                ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset", retain_originals=True)
+                ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset",
+                    retain_originals=True, admission=admission)
             except BaseException as refusal:
-                terminal = self._refused_native_owner(connection, checkout, refusal, state.scopes, body_failure, native_connection)
+                accepted = admission.task
+                if phase is not None:
+                    phase.owner = accepted
+                if accepted is not None:
+                    joined = await await_owned_task(accepted)
+                    refusal = execution_terminal_error(refusal, joined.error, joined.cancellation,
+                        retain_originals=True, isolate_control_originals=True)
+                terminal = self._refused_native_owner(connection, checkout, refusal, state.scopes, body_failure, native_connection, owner=accepted)
+                if phase is not None:
+                    phase.record_native_failure(terminal, commit_outcome=state.outcome)
                 raise state.retain_acknowledgments(terminal)
             if phase is not None:
                 phase.owner = retirement
@@ -1058,6 +1069,8 @@ class PostgresBackend(DatabaseBackend):
             retired = await await_owned_task(retirement)
             terminal = execution_terminal_error(body_failure, retired.error, retired.cancellation, retain_originals=True)
             if retired.error is not None:
+                if phase is not None:
+                    phase.record_native_failure(retired.error, commit_outcome=state.outcome, cancellation=retired.cancellation)
                 assert terminal is not None
                 self._abort_native_connection(connection, terminal)
                 for scope in state.scopes:
@@ -1192,20 +1205,34 @@ class PostgresBackend(DatabaseBackend):
         # particular, external resolvers/gates retain normal cancellation.
         observation = commit_state.native_observation if commit_state is not None else None
         with observation.phase(transaction) if observation is not None else nullcontext() as phase:
+            admission = OwnedTaskAdmission()
             try:
                 completion = create_owned_task(transaction.__aexit__(
                     type(body_failure) if body_failure is not None else None,
                     body_failure,
                     body_failure.__traceback__ if body_failure is not None else None,
-                ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit", retain_originals=True)
+                ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit",
+                    retain_originals=True, admission=admission)
             except BaseException as refusal:
-                raise self._refused_native_owner(connection, transaction, refusal, scopes, body_failure, native_connection)
+                accepted = admission.task
+                if phase is not None:
+                    phase.owner = accepted
+                if accepted is not None:
+                    joined = await await_owned_task(accepted)
+                    refusal = execution_terminal_error(refusal, joined.error, joined.cancellation,
+                        retain_originals=True, isolate_control_originals=True)
+                terminal = self._refused_native_owner(connection, transaction, refusal, scopes, body_failure, native_connection, owner=accepted)
+                if phase is not None:
+                    phase.record_native_failure(terminal)
+                raise terminal
             if phase is not None:
                 phase.owner = completion
             if committing and commit_state is not None:
                 commit_state.outcome = "unknown"
             completed = await await_owned_task(completion)
             if completed.error is not None:
+                if phase is not None:
+                    phase.record_native_failure(completed.error, commit_outcome="unknown" if committing else None, cancellation=completed.cancellation)
                 if committing:
                     terminal = execution_terminal_error(completed.error, completed.cancellation, retain_originals=True)
                     outcome = execution_commit_outcome(terminal) or "unknown"
@@ -1234,6 +1261,8 @@ class PostgresBackend(DatabaseBackend):
                 if observation is not None:
                     observation.acknowledgments = tuple(commit_state.acknowledgments)
             terminal = execution_terminal_error(body_failure, completed.cancellation, retain_originals=True)
+            if receipt is not None and completed.cancellation is not None and phase is not None:
+                phase.record_acknowledged_withdrawal(completed.cancellation, receipt)
             if terminal is not None:
                 if receipt is not None:
                     retain_acknowledged_execution_commit(terminal, receipt)

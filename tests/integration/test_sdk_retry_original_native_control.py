@@ -5,6 +5,7 @@ import json
 
 import anthropic
 import httpx
+import httpx2
 import openai
 import pytest
 
@@ -38,7 +39,8 @@ async def test_sdk_retry_cannot_consume_original_native_observer_failure(native_
     responses, refused = [], []
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     refusal = RuntimeError("actual native SDK HTTPX observer cleanup admission refused")
-    native_close = httpx.Response.aclose
+    http_family = httpx2 if provider == "anthropic" else httpx
+    native_close = http_family.Response.aclose
 
     def factory(loop, coroutine, **kwargs):
         operation = _actual_operation(coroutine)
@@ -104,7 +106,7 @@ async def test_sdk_retry_cannot_consume_original_native_observer_failure(native_
 
     server = await asyncio.start_server(peer, "127.0.0.1", 0)
     base = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
-    http = httpx.AsyncClient(event_hooks={"response": [observed_response]})
+    http = http_family.AsyncClient(event_hooks={"response": [observed_response]})
     sdk = openai.AsyncOpenAI if provider == "openai" else anthropic.AsyncAnthropic
     client = sdk(api_key="localhost-only-not-a-credential", base_url=base, http_client=http, max_retries=1)
     adapter = OpenAIAdapter() if provider == "openai" else AnthropicAdapter()

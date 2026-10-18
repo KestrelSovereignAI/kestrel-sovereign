@@ -12,9 +12,10 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from types import MethodType
 from typing import Any
 
-from kestrel_sovereign._async_ownership import OwnedTaskOutcome, await_owned_task
+from kestrel_sovereign._async_ownership import OwnedTaskOutcome, await_owned_task, owned_task_join_ancestors
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     execution_terminal_error,
@@ -28,6 +29,40 @@ class _NativePhaseObservation:
     resource: Any
     owner: asyncio.Future | None = None
     classified: asyncio.Future = field(default_factory=lambda: asyncio.get_running_loop().create_future())
+    observers: tuple = ()
+
+    def record_native_failure(self, error, *, commit_outcome=None, cancellation=None):
+        """Backend-only physical failure/refusal, NOT a transaction body error."""
+        for observer in self.observers:
+            if observer._trusted_phases_only:
+                observer._record_native_failure(self.resource, self.owner, error, commit_outcome, cancellation)
+
+    def record_acknowledged_withdrawal(self, cancellation, receipt):
+        """Backend-proven ACK/current withdrawal, NOT failed retirement."""
+        for observer in self.observers:
+            if not observer._trusted_phases_only:
+                continue
+            observer.native_failures.append(_NativeFailureFact(
+                self.resource, self.owner, cancellation, "committed",
+                cancellation, receipt,
+            ))
+            carrier = RuntimeError("original acknowledged native withdrawal")
+            retain_acknowledged_execution_commit(carrier, receipt)
+            observer._error = execution_terminal_error(
+                observer._error, cancellation, carrier, retain_originals=True,
+                isolate_control_originals=True,
+            )
+            observer.close_admission()
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeFailureFact:
+    resource: Any
+    owner: asyncio.Future | None
+    error: BaseException
+    commit_outcome: str | None
+    cancellation: BaseException | None = None
+    acknowledgment: Any = None
 
 
 @dataclass(eq=False)
@@ -54,14 +89,17 @@ class _NativeResourceObservation:
             owner.add_done_callback(self.body_owners.discard)
 
     def record_error(self, error):
+        if all(observer._trusted_phases_only for observer in self.observers):
+            return  # Foreign body attributes are not consulted for provenance.
         if error is not None and is_execution_control_error(error):
             for observer in self.observers:
-                observer._error = execution_terminal_error(observer._error, error)
+                if not observer._trusted_phases_only:
+                    observer._error = execution_terminal_error(observer._error, error)
 
     @contextmanager
     def phase(self, resource):
         """Reserve before task creation; the backend supplies its ACTUAL owner."""
-        phase = _NativePhaseObservation(resource)
+        phase = _NativePhaseObservation(resource, observers=self.observers)
         self.phases.add(phase)
         try:
             yield phase
@@ -91,10 +129,66 @@ class NativeExecutionObserver:
     not evicted or replaced by a later successful operation.
     """
 
-    def __init__(self):
+    def __init__(self, *, owner_task=None, trusted_phases_only=False):
         self._resources: set[_NativeResourceObservation] = set()
         self._error: BaseException | None = None
         self._closed = False
+        self._owner_task = owner_task
+        self._trusted_phases_only = trusted_phases_only
+        self.native_failures: list[_NativeFailureFact] = []
+
+    def _belongs_to_owner(self):
+        if not self._trusted_phases_only:
+            return True
+        current, root = asyncio.current_task(), self._owner_task
+        if root is None or root.done():
+            return False
+        ancestors = owned_task_join_ancestors(current)
+        if current is root or root in ancestors:
+            return True
+        # Direct Task awaits have a physical waiter edge too; mere inherited
+        # ContextVars do not enroll a long-lived SDK reader or supervisor.
+        seen, pending = set(), [root]
+        while pending:
+            waiter = pending.pop()
+            if waiter in seen:
+                continue
+            if waiter is current or waiter in ancestors:
+                return True
+            seen.add(waiter)
+            awaited = getattr(waiter, "_fut_waiter", None)
+            if isinstance(awaited, asyncio.Task):
+                pending.append(awaited)
+            elif type(awaited) is asyncio.tasks._GatheringFuture:
+                pending.extend(awaited._children)
+        # TaskGroup waits on a classification Future rather than directly on
+        # each child. Verify the ACTUAL stdlib group's child and parent wait,
+        # not a copied context or similarly named foreign attribute.
+        for child in (current, *ancestors):
+            for callback, _context in getattr(child, "_callbacks", None) or ():
+                if type(callback) is not MethodType:
+                    continue
+                group = callback.__self__
+                if type(group) is not asyncio.TaskGroup:
+                    continue
+                parent = group._parent_task
+                if (parent in seen and child in group._tasks
+                    and group._on_completed_fut is not None
+                    and group._on_completed_fut is getattr(parent, "_fut_waiter", None)):
+                    return True
+        return False
+
+    def _record_native_failure(self, resource, owner, error, commit_outcome, cancellation=None):
+        if any(fact.resource is resource and fact.owner is owner for fact in self.native_failures):
+            return
+        self.native_failures.append(_NativeFailureFact(resource, owner, error, commit_outcome, cancellation))
+        debt = ExecutionAuthorityError("original native phase failed")
+        debt._kestrel_native_retirement_debts = ((resource, owner),)
+        self._error = execution_terminal_error(
+            self._error, error, debt, cancellation, retain_originals=True,
+            isolate_control_originals=True,
+        )
+        self.close_admission()
 
     def close_admission(self):
         """Irreversibly refuse NEW resources, not cleanup of retained ones."""
@@ -173,7 +267,7 @@ def bind_native_execution_observer(observer: NativeExecutionObserver):
 
 def _begin_native_resource(resource):
     """Backend-only reservation BEFORE an acquisition can suspend."""
-    observers = _NATIVE_OBSERVERS.get()
+    observers = tuple(observer for observer in _NATIVE_OBSERVERS.get() if observer._belongs_to_owner())
     if not observers:
         return None
     if any(observer._closed for observer in observers):
@@ -186,7 +280,7 @@ def _begin_native_resource(resource):
 
 def _native_observation_requested():
     """Backend fast-path predicate; no owner, resource or authority is minted."""
-    return bool(_NATIVE_OBSERVERS.get())
+    return any(observer._belongs_to_owner() for observer in _NATIVE_OBSERVERS.get())
 
 
 def _require_native_observation_for_connection(connection):
@@ -197,6 +291,8 @@ def _require_native_observation_for_connection(connection):
     an inherited operational lease cannot silently bypass that inventory.
     """
     for observer in _NATIVE_OBSERVERS.get():
+        if not observer._belongs_to_owner():
+            continue
         if observer._closed:
             raise ExecutionAuthorityError(
                 "original native retirement observation closed to new work on its retained connection"

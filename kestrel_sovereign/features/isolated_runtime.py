@@ -42,6 +42,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import wraps
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -77,6 +78,7 @@ from kestrel_sovereign._async_ownership import (
     raise_owned_outcome,
 )
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
+from kestrel_sovereign.native_retirement import NativeExecutionObserver, bind_native_execution_observer
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
@@ -1942,10 +1944,10 @@ class _HostIngressOutcome:
     commit_outcome: str | None = None
 
 
-def _redacted_host_ingress_error(error: BaseException) -> _HostIngressOutcome:
+def _redacted_host_ingress_error(error: BaseException, *, trusted=False) -> _HostIngressOutcome:
     # Only canonical non-sensitive classifications cross the private boundary;
     # no native exception, traceback, request payload or provider prose escapes.
-    if is_execution_control_error(error):
+    if trusted and is_execution_control_error(error):
         return _HostIngressOutcome(_HOST_INGRESS_CONTROL,
             commit_outcome=execution_commit_outcome(error))
     return _HostIngressOutcome(_HOST_INGRESS_CANCELLED if isinstance(error, asyncio.CancelledError)
@@ -1971,6 +1973,138 @@ class _HostIngressOutcomeSlot:
         outcome = self.outcome
         self.outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
         return outcome
+
+
+@dataclass(eq=False)
+class _HostIngressAdmission:
+    """Private owner of ONE admitted worker; never exported in public data."""
+    generation: int
+    scopes: tuple
+    proxy: Any = field(default=None, repr=False)
+    admission: OwnedTaskAdmission = field(default_factory=OwnedTaskAdmission)
+    client: Any = field(default=None, repr=False)
+    traffic_gate: Any = field(default=None, repr=False)
+    observer: NativeExecutionObserver | None = field(default=None, repr=False)
+    native_error: BaseException | None = field(default=None, repr=False)
+    cancellation: asyncio.CancelledError | None = field(default=None, repr=False)
+    core_outcome: _HostIngressOutcome | None = field(default=None, repr=False)
+    core_denied_scopes: tuple = field(default=(), repr=False)
+    opening: BaseException | None = field(default=None, repr=False)
+
+    def require_work(self, agent):
+        """Only THIS known Core validation seam can authenticate a denial."""
+        try:
+            require_execution_work(agent)
+        except BaseException as error:
+            if is_execution_control_error(error):
+                self.native_error = execution_terminal_error(
+                    self.native_error, error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+                # Core's retained scope state authenticates a commit fact;
+                # foreign attributes on a validator's exception do not.
+                commit = ("unknown" if any(scope._uncertain_commit == "unknown" for scope in self.scopes)
+                          else "committed" if any(scope._uncertain_commit == "committed" or scope._acknowledged_commits for scope in self.scopes)
+                          else None)
+                self.core_outcome = _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome=commit)
+                self.core_denied_scopes = tuple(scope for scope in self.scopes if scope._denial is not None)
+            raise
+
+
+def _detached_host_ingress_control(*, cleanup=False):
+    """Project a retained private ingress fence after scrubbing public frames.
+
+    Cleanup still performs its FIRST physical retirement. This wrapper is a
+    public projection, not another task/closer or a lifecycle registry.
+    """
+    def decorate(method):
+        @wraps(method)
+        async def detached(self, *args, **kwargs):
+            outcome = vars(self).get("_host_ingress_public_control")
+            result = None
+            try:
+                if outcome is None or cleanup:
+                    result = await method(self, *args, **kwargs)
+                outcome = vars(self).get("_host_ingress_public_control")
+            except BaseException:
+                outcome = vars(self).get("_host_ingress_public_control")
+                if outcome is None:
+                    raise
+            finally:
+                self = args = kwargs = None
+            if outcome is not None:
+                result = None
+                return _deliver_host_ingress_outcome(outcome, None)
+            return result
+        return detached
+    return decorate
+
+
+def _finish_host_ingress_admission(admission, outcome):
+    """Harvest a refused/unstarted canonical worker without a replacement."""
+    if admission is None:
+        return outcome
+    proxy = admission.proxy
+    task = admission.admission.task
+    if admission.native_error is None:
+        source = execution_terminal_error(
+            admission.opening, owned_task_error(task) if task is not None and task.done() else None,
+            admission.observer._error if admission.observer is not None else None,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        unresolved = admission.observer is not None and bool(admission.observer._resources)
+        if is_execution_control_error(source) or unresolved:
+            debt = ExecutionAuthorityError("original host ingress admission failed")
+            debt._kestrel_native_retirement_debts = ((admission, task),)
+            admission.native_error = execution_terminal_error(
+                source, debt, admission.cancellation, retain_originals=True,
+                isolate_control_originals=True,
+            )
+            # No backend phase ran. Even a control-shaped factory error cannot
+            # manufacture a claim that THIS ingress COMMIT was attempted.
+            facts = admission.observer.native_failures if admission.observer is not None else ()
+            commit = ("unknown" if any(fact.commit_outcome == "unknown" for fact in facts)
+                      else "committed" if any(fact.commit_outcome == "committed" for fact in facts) else None)
+            outcome = _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome=commit)
+            outcome = _retain_host_ingress_public_outcome(proxy, outcome)
+            proxy._retain_execution_control(
+                ExecutionCommitOutcomeError(commit) if commit is not None
+                else ExecutionAuthorityError("host ingress execution authority retired")
+            )
+    if admission.native_error is None:
+        proxy._host_ingress_admissions.discard(admission)
+    return outcome
+
+
+def _retain_host_ingress_public_outcome(proxy, outcome):
+    """Monotonic detached classification, not a raw-error history."""
+    prior = proxy._host_ingress_public_control
+    ranks = {None: 0, "committed": 1, "unknown": 2}
+    if prior is None or ranks[outcome.commit_outcome] > ranks[prior.commit_outcome]:
+        proxy._host_ingress_public_control = outcome
+    return proxy._host_ingress_public_control
+
+
+def _detached_host_ingress_context(method):
+    @wraps(method)
+    @asynccontextmanager
+    async def detached(self, *args, **kwargs):
+        outcome = vars(self).get("_host_ingress_public_control")
+        lease = None
+        try:
+            if outcome is None:
+                async with method(self, *args, **kwargs) as lease:
+                    yield lease
+            outcome = vars(self).get("_host_ingress_public_control")
+        except BaseException:
+            outcome = vars(self).get("_host_ingress_public_control")
+            if outcome is None:
+                raise
+        finally:
+            self = args = kwargs = lease = None
+        if outcome is not None:
+            _deliver_host_ingress_outcome(outcome, None)
+    return detached
 
 
 @dataclass
@@ -2345,6 +2479,7 @@ def _consume_host_ingress_operation(
 async def _wait_for_host_ingress_operation(
     operation: asyncio.Task[Any],
     outcome_slot: _HostIngressOutcomeSlot,
+    admission: _HostIngressAdmission | None = None,
 ) -> tuple[_HostIngressOutcome, tuple[Any, ...] | None]:
     """Drain a shielded worker and remember only caller-originated cancel.
 
@@ -2362,6 +2497,8 @@ async def _wait_for_host_ingress_operation(
             await asyncio.shield(operation)
         except asyncio.CancelledError as error:
             if caller is not None and caller.cancelling():
+                if admission is not None and admission.cancellation is None:
+                    admission.cancellation = error
                 if caller_cancel_args is None:
                     caller_cancel_args = tuple(error.args)
                 continue
@@ -2386,6 +2523,8 @@ async def _wait_for_host_ingress_operation(
         # tracebacks retain every caller frame and could otherwise reach
         # ``outcome.payload`` despite the dataclass's redacted repr.
         outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
+    if outcome.status == _HOST_INGRESS_CONTROL:
+        caller_cancel_args = None
     return outcome, caller_cancel_args
 
 
@@ -7085,6 +7224,8 @@ class ProxyFeature(Feature):
         # Keep exact task ownership so terminal cleanup can cancel them rather
         # than leaving a raw client RPC alive after the proxy is retired.
         self._event_ack_tasks: set[asyncio.Task[None]] = set()
+        self._host_ingress_admissions: set[_HostIngressAdmission] = set()
+        self._host_ingress_public_control: _HostIngressOutcome | None = None
         self._event_ack_clients: list[tuple[Any, asyncio.Task[None]]] = []
         # Full inbound routing can run cognition. Keep it outside the SDK's
         # serial notification reader. Cursor-owning providers retain their own
@@ -7987,6 +8128,7 @@ class ProxyFeature(Feature):
                 "Hosted Telegram route is already owned; refusing to start child"
             )
 
+    @_detached_host_ingress_control()
     async def reconcile_hosted_telegram_route_claim(
         self,
         *,
@@ -8034,6 +8176,7 @@ class ProxyFeature(Feature):
         self._hosted_telegram_ownership_store = ownership_store
         return True
 
+    @_detached_host_ingress_control(cleanup=True)
     async def release_hosted_telegram_route_claim(
         self,
         *,
@@ -8218,6 +8361,7 @@ class ProxyFeature(Feature):
             )
         return node_id
 
+    @_detached_host_ingress_control()
     async def persist_config(self, config: Dict) -> None:
         """Best-effort compatibility persist without clobbering transitions.
 
@@ -8281,6 +8425,7 @@ class ProxyFeature(Feature):
             self.name,
         )
 
+    @_detached_host_ingress_control()
     async def load_persisted_config(
         self, *, raise_on_error: bool = False
     ) -> Optional[Dict]:
@@ -8326,6 +8471,7 @@ class ProxyFeature(Feature):
     def config_schema(self) -> Optional[Dict]:
         return self.runtime.config_schema
 
+    @_detached_host_ingress_control()
     async def initialize(self):
         """Initialize a child as an all-or-terminal lifecycle transaction.
 
@@ -8863,6 +9009,16 @@ class ProxyFeature(Feature):
     ) -> _TerminalStopCompletionMarker | None:
         """Register a supervisor stop before its completion callback can race."""
 
+        self._has_running_terminal_lifecycle_task(client)
+        for prior in tuple(self._terminal_stop_completed_client_markers):
+            if prior.client() is not client:
+                continue
+            if prior.operation is not None and prior.operation.done() and not prior.completed:
+                self._finish_terminal_stop_disposition(prior.operation)
+            if prior.failure is not None:
+                raise retained_execution_error(prior.failure)
+            if prior.completed or (prior.operation is not None and not prior.operation.done()):
+                raise RuntimeError("original physical stop already owns this client")
         marker = self._new_terminal_stop_completion_marker(client)
         if marker is not None:
             self._terminal_stop_completed_client_markers.append(marker)
@@ -8888,8 +9044,23 @@ class ProxyFeature(Feature):
     ) -> None:
         """Discard an abandoned completion record before fencing its facade."""
 
-        self._discard_terminal_stop_completion(marker)
+        self._retain_terminal_stop_failure(marker)
         self._fence_terminal_retirement_timeout(client)
+
+    def _retain_terminal_stop_failure(self, marker, error=None) -> None:
+        """Same disposition handoff for EVERY existing physical stop producer."""
+        if marker is None:
+            return
+        operation = marker.operation
+        if operation is not None:
+            if not operation.done():
+                return  # The exact late owner, not an observer error, decides.
+            self._finish_terminal_stop_disposition(operation)
+        elif is_execution_control_error(error) and execution_denial_scopes(error) != ():
+            marker.failure = error
+            self._retain_execution_control(error)
+        else:
+            self._discard_terminal_stop_completion(marker)
 
     def _mark_terminal_stop_completed(
         self, marker_or_client: _TerminalStopCompletionMarker | Any,
@@ -9282,6 +9453,11 @@ class ProxyFeature(Feature):
                     # and require its completion before a fresh retry.
                     self._terminal_cleanup_uncertain = True
                     return False
+                # Harvest can establish the failure before its callback runs.
+                if any(marker.client() is client and marker.failure is not None
+                       for marker in self._terminal_stop_completed_client_markers):
+                    self._terminal_cleanup_uncertain = True
+                    return False
                 marker = self._begin_terminal_stop_completion(client)
 
                 def admitted(operation: _HostOwnedFacadeOperation) -> None:
@@ -9347,6 +9523,7 @@ class ProxyFeature(Feature):
                     self._discard_terminal_stop_completion(marker)
         return True
 
+    @_detached_host_ingress_control()
     async def reload(self) -> None:
         """Restart the isolated service so the current ``_host_config`` takes
         effect (config is forwarded only at the initialize handshake, so a live
@@ -9418,12 +9595,16 @@ class ProxyFeature(Feature):
         previous_client = self._unpublish_client()
         previous_stop_completed = False
         if previous_client is not None:
+            stop_marker = None
             def remember_previous_stop() -> None:
                 nonlocal previous_stop_completed
 
                 previous_stop_completed = True
+                self._mark_terminal_stop_completed(stop_marker)
+                self._discard_terminal_stop_completion(stop_marker)
 
             try:
+                stop_marker = self._begin_terminal_stop_completion(previous_client)
                 await _await_owned_facade_lifecycle_operation(
                     previous_client.stop(),
                     name=f"isolated-replace-stop:{self.name}",
@@ -9434,8 +9615,10 @@ class ProxyFeature(Feature):
                     on_late_task=lambda task, previous_client=previous_client: self._retain_terminal_lifecycle_task(
                         task, previous_client
                     ),
+                    on_admitted=lambda operation: setattr(stop_marker, "operation", operation),
                 )
-            except BaseException:
+            except BaseException as error:
+                self._retain_terminal_stop_failure(stop_marker, error)
                 # The helper replays caller cancellation after recording a
                 # successful exact stop.  Such a facade is irreversibly
                 # retired: restoring it would republish stale tools and the
@@ -9450,6 +9633,7 @@ class ProxyFeature(Feature):
             register_channel_bridge=register_channel_bridge,
         )
 
+    @_detached_host_ingress_control(cleanup=True)
     async def shutdown(self):
         # Set the latch before scheduling the transaction so a health probe
         # cannot decide to restart the child in the tiny interval before seal.
@@ -9494,6 +9678,7 @@ class ProxyFeature(Feature):
         self._terminal_cleanup_task = attempt.admission.task
         return attempt
 
+    @_detached_host_ingress_control(cleanup=True)
     async def shutdown_with_agent_deadline(self) -> None:
         """Shutdown under KestrelAgent's bounded fair-share lifecycle owner.
 
@@ -9906,6 +10091,7 @@ class ProxyFeature(Feature):
         except Exception:  # noqa: BLE001 - authorization fails closed
             return False
 
+    @_detached_host_ingress_context
     @asynccontextmanager
     async def config_transition_ingress_fence(self):
         """Drain isolated ingress before the endpoint takes CONVERSATION.
@@ -10031,6 +10217,7 @@ class ProxyFeature(Feature):
                     if body_error is None:
                         raise
 
+    @_detached_host_ingress_control()
     async def get_config(self) -> Dict:
         """Return the feature's current host config.
 
@@ -10070,6 +10257,7 @@ class ProxyFeature(Feature):
         await self._ensure_host_config_loaded()
         return dict(self._host_config)
 
+    @_detached_host_ingress_control()
     async def set_config(
         self,
         config: Dict,
@@ -10591,6 +10779,7 @@ class ProxyFeature(Feature):
                     raise execution_terminal_error(terminal_error, cleanup_error)
             raise
 
+    @_detached_host_ingress_control()
     async def set_config_with_secret_preservation(
         self,
         incoming: Dict[str, Any],
@@ -10612,6 +10801,7 @@ class ProxyFeature(Feature):
             _validate_effective_config=validate,
         )
 
+    @_detached_host_ingress_control(cleanup=True)
     async def rollback_config_transition(
         self,
         commit: _ConfigCommitReceipt,
@@ -10830,12 +11020,16 @@ class ProxyFeature(Feature):
         active_stop_completed = False
         try:
             if active_client is not None:
+                stop_marker = None
                 def remember_active_stop() -> None:
                     nonlocal active_stop_completed
 
                     active_stop_completed = True
+                    self._mark_terminal_stop_completed(stop_marker)
+                    self._discard_terminal_stop_completion(stop_marker)
 
                 try:
+                    stop_marker = self._begin_terminal_stop_completion(active_client)
                     await _await_owned_facade_lifecycle_operation(
                         active_client.stop(),
                         name=f"isolated-fenced-recovery-stop:{self.name}",
@@ -10846,8 +11040,10 @@ class ProxyFeature(Feature):
                         on_late_task=lambda task, active_client=active_client: self._retain_terminal_lifecycle_task(
                             task, active_client
                         ),
+                        on_admitted=lambda operation: setattr(stop_marker, "operation", operation),
                     )
-                except BaseException:
+                except BaseException as error:
+                    self._retain_terminal_stop_failure(stop_marker, error)
                     # Put it back only so the standard cleanup can retire or
                     # quarantine it.  It remains unpublished throughout.
                     if not active_stop_completed:
@@ -12170,12 +12366,24 @@ class ProxyFeature(Feature):
         if not callable(call):
             raise RuntimeError("isolated feature lacks external ingress lifecycle RPC")
         outcome_slot = _HostIngressOutcomeSlot()
-        await self._call_host_ingress_rpc(call, request, outcome_slot)
+        if self._host_ingress_public_control is not None:
+            _deliver_host_ingress_outcome(self._host_ingress_public_control, None)
+        # The existing facade lifecycle task is ALREADY the canonical owner;
+        # metadata joins that same task, never a second RPC/closer.
+        admission = _HostIngressAdmission(
+            self._terminal_lifecycle_generation, current_execution_custody(self.agent),
+            proxy=self, client=quiesce.client, traffic_gate=self._traffic_gate,
+        )
+        admission.admission.task = asyncio.current_task()
+        self._host_ingress_admissions.add(admission)
+        await self._run_host_ingress(request, outcome_slot, admission, _rpc_call=call)
         outcome = outcome_slot.outcome
         if outcome is None:
             raise HostIngressError("external ingress lifecycle RPC failed")
         if outcome.status == _HOST_INGRESS_CANCELLED:
             raise asyncio.CancelledError()
+        if outcome.status == _HOST_INGRESS_CONTROL:
+            _deliver_host_ingress_outcome(outcome, None)
         if outcome.status != _HOST_INGRESS_SUCCESS:
             raise HostIngressError("external ingress lifecycle RPC failed")
         return outcome.payload
@@ -12345,6 +12553,7 @@ class ProxyFeature(Feature):
         call: Callable[[str, HostIngressPayload], Any],
         request: _HostIngressRequest,
         outcome_slot: _HostIngressOutcomeSlot,
+        admission: _HostIngressAdmission | None = None,
     ) -> None:
         """Run one RPC and place a detached outcome outside the worker task.
 
@@ -12356,9 +12565,15 @@ class ProxyFeature(Feature):
 
         try:
             try:
-                require_execution_work(self.agent)
+                if admission is not None:
+                    admission.require_work(self.agent)
+                else:
+                    require_execution_work(self.agent)
                 result = await _maybe_await(call(request.name, request.payload))
-                require_execution_work(self.agent)
+                if admission is not None:
+                    admission.require_work(self.agent)
+                else:
+                    require_execution_work(self.agent)
             except BaseException as error:  # noqa: BLE001 - external RPC boundary redaction
                 # The SDK/custom-client boundary is untrusted. Do not retain its
                 # exception object or its potentially secret-bearing message.
@@ -12387,17 +12602,86 @@ class ProxyFeature(Feature):
         self,
         request: _HostIngressRequest,
         outcome_slot: _HostIngressOutcomeSlot,
+        admission: _HostIngressAdmission,
+        *, _rpc_call=None,
+    ) -> None:
+        observer = NativeExecutionObserver(
+            owner_task=asyncio.current_task(), trusted_phases_only=True,
+        )
+        admission.observer = observer
+        try:
+            with bind_native_execution_observer(observer):
+                if _rpc_call is None:
+                    await self._run_host_ingress_admitted(request, outcome_slot, admission)
+                else:
+                    await self._call_host_ingress_rpc(_rpc_call, request, outcome_slot, admission)
+        finally:
+            joined = await observer.join_accepted()
+            facts = observer.native_failures
+            if admission.cancellation is None:
+                admission.cancellation = joined.cancellation or next(
+                    (fact.cancellation for fact in facts if fact.cancellation is not None), None,
+                )
+            admission.native_error = execution_terminal_error(
+                admission.native_error, joined.error,
+                admission.cancellation if joined.error is not None or admission.native_error is not None else None,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if admission.native_error is not None:
+                # Native classification is BACKEND phase data, not error attrs
+                # on a foreign transaction body or a caught facade exception.
+                commits = [fact.commit_outcome for fact in facts]
+                commits.extend(scope._uncertain_commit for scope in admission.scopes)
+                if admission.core_outcome is not None:
+                    commits.append(admission.core_outcome.commit_outcome)
+                commit = "unknown" if "unknown" in commits else "committed" if "committed" in commits else None
+                outcome = (_HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome=commit)
+                           if facts or joined.error is not None else admission.core_outcome)
+                if outcome is not None:
+                    retired_ack = bool(facts) and all(
+                        fact.acknowledgment is not None and fact.acknowledgment.retired
+                        for fact in facts
+                    )
+                    stable_scopes = all(
+                        scope._uncertain_commit is None for scope in admission.scopes
+                    )
+                    scoped = bool(admission.core_denied_scopes) and stable_scopes
+                    localized = (not facts and scoped) or (
+                        retired_ack and stable_scopes and (admission.core_outcome is None or scoped)
+                    )
+                    if localized:
+                        self._host_ingress_admissions.discard(admission)
+                        outcome = self._host_ingress_public_control or outcome
+                    else:
+                        outcome = _retain_host_ingress_public_outcome(self, outcome)
+                        safe = (ExecutionCommitOutcomeError(outcome.commit_outcome) if outcome.commit_outcome
+                                else ExecutionAuthorityError("host ingress execution authority retired"))
+                        self._retain_execution_control(safe)
+                    outcome_slot.outcome = outcome
+            else:
+                self._host_ingress_admissions.discard(admission)
+
+    async def _run_host_ingress_admitted(
+        self, request: _HostIngressRequest, outcome_slot: _HostIngressOutcomeSlot,
+        admission: _HostIngressAdmission,
     ) -> None:
         """Perform an already-snapshotted ingress call inside traffic admission."""
 
         try:
             while True:
-                require_execution_work(self.agent)
+                if self._host_ingress_public_control is not None:
+                    outcome_slot.outcome = self._host_ingress_public_control
+                    return
+                admission.require_work(self.agent)
                 wake_idle = False
                 completed_call = False
                 async with self._traffic_gate.admit():
-                    require_execution_work(self.agent)
+                    if self._host_ingress_public_control is not None:
+                        outcome_slot.outcome = self._host_ingress_public_control
+                        return
+                    admission.require_work(self.agent)
                     client = self._client
+                    admission.client, admission.traffic_gate = client, self._traffic_gate
                     if client is None and self._idle_retired:
                         wake_idle = True
                     elif client is None:
@@ -12435,13 +12719,13 @@ class ProxyFeature(Feature):
                         self._record_runtime_activity()
                         try:
                             await self._call_host_ingress_rpc(
-                                call, request, outcome_slot
+                                call, request, outcome_slot, admission
                             )
                         finally:
                             self._record_runtime_activity()
                         completed_call = True
                 if completed_call:
-                    require_execution_work(self.agent)
+                    admission.require_work(self.agent)
                     self._schedule_runtime_telemetry()
                     return
                 if wake_idle:
@@ -12588,6 +12872,7 @@ class ProxyFeature(Feature):
             allowed_senders=list(allowed_senders),
         )
 
+    @_detached_host_ingress_control()
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         from kestrel_sovereign.execution_custody import bind_execution_runtime
         with bind_execution_runtime(self.agent):
@@ -12693,20 +12978,35 @@ class ProxyFeature(Feature):
         outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
         caller_cancel_args: tuple[Any, ...] | None = None
         operation: asyncio.Task[Any] | None = None
+        admission: _HostIngressAdmission | None = None
         outcome_slot: _HostIngressOutcomeSlot | None = None
         worker: Any = None
         task_name = f"isolated-host-ingress:{self.name}"
-        if request is not None:
+        if self._host_ingress_public_control is not None:
+            outcome = self._host_ingress_public_control
+        elif request is not None:
             try:
                 outcome_slot = _HostIngressOutcomeSlot()
-                worker = self._run_host_ingress(request, outcome_slot)
-                operation = asyncio.create_task(worker, name=task_name)
-            except (RuntimeError, TypeError):
+                admission = _HostIngressAdmission(
+                    self._terminal_lifecycle_generation,
+                    current_execution_custody(self.agent),
+                    proxy=self,
+                )
+                self._host_ingress_admissions.add(admission)
+                worker = self._run_host_ingress(request, outcome_slot, admission)
+                operation = create_owned_task(
+                    worker, name=task_name, retain_originals=True,
+                    admission=admission.admission,
+                )
+            except BaseException as error:
                 # Task construction is not a supported external failure mode,
                 # but it must not cause a request-bearing public traceback.
                 outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
-                if worker is not None:
-                    worker.close()
+                operation = admission.admission.task if admission is not None else None
+                if admission is not None:
+                    admission.opening = error
+                if operation is None and admission is not None:
+                    outcome = _finish_host_ingress_admission(admission, outcome)
 
         # The public error below is deliberately raised only after all frames
         # that received untrusted input or facades have been scrubbed.  Function
@@ -12720,10 +13020,14 @@ class ProxyFeature(Feature):
 
         if operation is not None and outcome_slot is not None:
             outcome, caller_cancel_args = await _wait_for_host_ingress_operation(
-                operation, outcome_slot
+                operation, outcome_slot, admission,
             )
+        outcome = _finish_host_ingress_admission(admission, outcome)
+        if outcome.status == _HOST_INGRESS_CONTROL:
+            caller_cancel_args = None
         operation = None
         outcome_slot = None
+        admission = None
         return _deliver_host_ingress_outcome(outcome, caller_cancel_args)
 
     async def _call_isolated_tool_admitted(
@@ -14663,6 +14967,7 @@ class ProxyFeature(Feature):
                 "Isolated feature could not be prepared after idle retirement."
             ) from exc
 
+    @_detached_host_ingress_control()
     async def reclaim_idle_workspace(self) -> RuntimeNamespaceCleanupOutcome:
         """Securely reclaim this exact idle feature tree under the wake lock.
 
@@ -14971,6 +15276,7 @@ class ProxyFeature(Feature):
                                     on_late_task=lambda task, client=client: self._retain_terminal_lifecycle_task(
                                         task, client
                                     ),
+                                    on_admitted=lambda operation: setattr(stop_completion, "operation", operation),
                                 )
                         except asyncio.CancelledError as stop_error:
                             self._retain_execution_control(stop_error)
@@ -14984,13 +15290,11 @@ class ProxyFeature(Feature):
                                 stop_completion is not None
                                 and not stop_completion.completed
                             ):
-                                self._discard_terminal_stop_completion(
-                                    stop_completion
-                                )
+                                self._retain_terminal_stop_failure(stop_completion, stop_error)
                             raise
                         except BaseException as stop_error:  # noqa: BLE001 - fence hostile stop failures
                             self._retain_execution_control(stop_error)
-                            self._discard_terminal_stop_completion(stop_completion)
+                            self._retain_terminal_stop_failure(stop_completion, stop_error)
                             # Never reopen traffic to a client whose stop
                             # outcome is unknown.  The terminal transaction
                             # keeps the exact private retry handle and, unlike
@@ -16408,6 +16712,7 @@ class ProxyFeature(Feature):
             _cursor_owned_inbound_protocol.reset(token)
             _telegram_terminal_inbound_disposition.reset(terminal_token)
 
+    @_detached_host_ingress_control()
     async def admit_hosted_telegram_ingress(
         self,
         payload: dict[str, Any],

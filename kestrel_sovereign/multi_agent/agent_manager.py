@@ -30,7 +30,7 @@ from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
-from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_terminal_error, is_execution_control_error
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did,
@@ -3428,6 +3428,7 @@ class AgentManager:
             cleanup_owners.append((name, owner))
             owner.start(name)
         cancelled = False
+        withdrawals = []
         failures: list[Exception] = []
         fatal: Optional[BaseException] = None
         control = None
@@ -3439,6 +3440,10 @@ class AgentManager:
             except BaseException as error:
                 cleanup_cancelled, cleanup_failure = False, error
             cancelled = cancelled or cleanup_cancelled
+            if cleanup_failure is not None:
+                withdrawals.extend(error for error in _explicit_control_chain(cleanup_failure)
+                                   if isinstance(error, asyncio.CancelledError)
+                                   and all(error is not prior for prior in withdrawals))
             control = execution_terminal_error(
                 control, cleanup_failure, retain_originals=True,
                 isolate_control_originals=True,
@@ -3457,6 +3462,11 @@ class AgentManager:
         if control is not None and is_execution_control_error(control):
             raise control
         if cancelled:
+            if withdrawals:
+                raise execution_terminal_error(
+                    *withdrawals, control, retain_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
+                )
             raise asyncio.CancelledError()
         if fatal is not None:
             raise fatal

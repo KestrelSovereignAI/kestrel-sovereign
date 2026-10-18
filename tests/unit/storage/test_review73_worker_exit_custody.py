@@ -7,9 +7,11 @@ import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
 )
+from tests.utils.original_failure import OriginalFailure
 from kestrel_sovereign.storage.db.sqlite import (
     SQLiteBackend,
     _prune_retained_aiosqlite_closes,
@@ -74,6 +76,7 @@ async def test_actual_close_and_hook_failures_keep_strongest_original(
     connection = backend._connection
     native_close = connection.close
     original = ExecutionCommitOutcomeError("unknown")
+    original_source = OriginalFailure.capture(original)
     hook_error = (
         asyncio.CancelledError("worker exit hook cancelled")
         if hook_cancellation else ExecutionAuthorityError("worker exit hook denied")
@@ -96,7 +99,8 @@ async def test_actual_close_and_hook_failures_keep_strongest_original(
     owner = create_owned_task(backend.close())
     try:
         outcome = await asyncio.wait_for(await_owned_task(owner), 3)
-        assert outcome.error is original
+        original_source.assert_retained(outcome.error)
+        assert hook_error in tuple(_explicit_control_chain(outcome.error))
         assert calls == ["failing", "joined"]
         assert backend._connection is None
         assert not backend.connection_retirement_pending

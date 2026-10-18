@@ -542,6 +542,8 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
                 if is_execution_control_error(error):
                     controls.append(error)
+                elif isinstance(error, asyncio.CancelledError):
+                    withdrawals.append(error)
                 elif isinstance(error, BaseExceptionGroup):
                     _raise_unexpected_lifecycle_exception_group(error)
     try:
@@ -7244,11 +7246,14 @@ class KestrelAgent(
             # disabled feature can keep contributing prompt bytes.
             quarantine_error = None
             controls = [activation_error] if is_execution_control_error(activation_error) else []
+            withdrawals = [activation_error] if isinstance(activation_error, asyncio.CancelledError) else []
             try:
                 await self._unregister_feature_runtime(feature, unload=False)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as cleanup_exc:
                 if is_execution_control_error(cleanup_exc):
                     controls.append(cleanup_exc)
+                elif isinstance(cleanup_exc, asyncio.CancelledError):
+                    withdrawals.append(cleanup_exc)
                 logging.warning(
                     "Cleanup after failed activation of feature '%s' reported %s; "
                     "quarantining surviving contributions",
@@ -7260,6 +7265,8 @@ class KestrelAgent(
                 except (Exception, asyncio.CancelledError, BaseExceptionGroup) as quarantine_exc:
                     if is_execution_control_error(quarantine_exc):
                         controls.append(quarantine_exc)
+                    elif isinstance(quarantine_exc, asyncio.CancelledError):
+                        withdrawals.append(quarantine_exc)
                     quarantine_error = RuntimeError(
                         "failed activation contributions could not be quarantined"
                     )
@@ -7268,7 +7275,7 @@ class KestrelAgent(
                     "Feature activation contribution quarantine failed; "
                     "cognition is blocked until lifecycle integrity is restored"
                 )
-                await enter_feature_lifecycle_safe_mode(self, safe_mode_reason, *controls)
+                await enter_feature_lifecycle_safe_mode(self, safe_mode_reason, *controls, *withdrawals)
                 # Do not retain a third-party cleanup/quarantine exception as a
                 # printable cause; either may contain feature configuration.
                 raise quarantine_error from None

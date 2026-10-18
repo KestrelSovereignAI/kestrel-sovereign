@@ -555,7 +555,13 @@ async def _finish_aiosqlite_connection_close(
         # connection inside the original lifecycle budget.
         pending_cancellation = exc
         remaining = max(0.0, deadline - loop.time())
-        done, _ = await asyncio.wait({close_task}, timeout=remaining)
+        try:
+            done, _ = await asyncio.wait({close_task}, timeout=remaining)
+        except BaseException as error:
+            raise execution_terminal_error(
+                pending_cancellation, error, retain_originals=True,
+                isolate_control_originals=True,
+            )
 
     if not done:
         overrun_at = loop.time()
@@ -614,6 +620,11 @@ async def _finish_aiosqlite_connection_close(
                 connection, close_task, retained_closes
             )
             raise execution_terminal_error(close_error, pending_cancellation, exc, retain_originals=True, isolate_control_originals=True)
+        except BaseException as error:
+            raise execution_terminal_error(
+                close_error, pending_cancellation, error, retain_originals=True,
+                isolate_control_originals=True,
+            )
 
     terminal = execution_terminal_error(close_error, pending_cancellation, retain_originals=True, isolate_control_originals=True)
     if terminal is not None:

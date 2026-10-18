@@ -8,9 +8,11 @@ from sqlalchemy import event, text
 
 from kestrel_sovereign._async_ownership import create_owned_task
 from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
     ExecutionAuthorityError,
     is_execution_control_error,
 )
+from tests.utils.original_failure import OriginalFailure
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import sqlite as sqlite_module
 from kestrel_sovereign.storage.db.sqlite import (
@@ -215,6 +217,16 @@ async def test_repeated_cancellation_preserves_close_receipt_and_real_worker_own
     await db.execute("CREATE TABLE effects(id INTEGER)")
     await db.execute("INSERT INTO effects VALUES (1)")
     original, native_close = terminal(kind), connection.close
+    original_source = OriginalFailure.capture(original)
+    withdrawals = []
+    actual_worker_wait = sqlite_module._wait_for_aiosqlite_worker_shutdown
+    async def worker_wait(*args, **kwargs):
+        try:
+            return await actual_worker_wait(*args, **kwargs)
+        except asyncio.CancelledError as error:
+            withdrawals.append(error)
+            raise
+    monkeypatch.setattr(sqlite_module, "_wait_for_aiosqlite_worker_shutdown", worker_wait)
 
     async def close_then_receipt():
         await native_close()
@@ -230,7 +242,8 @@ async def test_repeated_cancellation_preserves_close_receipt_and_real_worker_own
         await asyncio.sleep(0.02)
         owner.cancel()
         outcome = await join(owner)
-        assert outcome.error is original
+        original_source.assert_retained(outcome.error)
+        assert withdrawals and all(error in tuple(_explicit_control_chain(outcome.error)) for error in withdrawals)
         assert connection in db.backend._retired_connection_closes
     finally:
         release_worker.set()

@@ -239,3 +239,25 @@ close reports that evidence without issuing a replacement release. Ordinary
 provider release failures retain their existing bounded retry behavior. Local
 component tests do not prove authenticated provider termination or billing
 acceptance; those remain separate provider verification boundaries.
+
+Private host ingress has a caller-local Core admission rooted before task
+publication. Backend observation follows actual joined task lineage, not mere
+ContextVar inheritance into resident readers or supervisors. Native failure
+classification comes from the actual backend phase: a foreign exception's
+attributes, type, cause, or group membership do not prove that this ingress
+attempted COMMIT. Healthy rolled-back foreign failures release their observation.
+
+An unresolved native ingress retains its original resource/phase owners,
+admitted scope snapshot, selected client and actual caller withdrawal privately.
+Public errors contain detached classifications only, including later lifecycle
+and configuration rejections. Terminal shutdown still performs the first
+physical child stop; an unrelated ingress failure cannot substitute for that
+retirement. Every physical stop producer uses the same per-client disposition
+handoff, including when settlement is harvested before its callback runs.
+
+Reserved quiesce/resume RPCs use their existing lifecycle owner outside data
+admission, with the same native observation. An unresolved outcome is monotonic:
+a later failed reset cannot weaken a previously observed UNKNOWN. A fully
+retired known ACK plus withdrawal, or a denial confined to a captured caller
+scope, is delivered finitely without poisoning a distinct live caller's runtime.
+Neither case clears an unresolved commit or physical-retirement debt.
