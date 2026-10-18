@@ -1161,7 +1161,7 @@ async def set_avatar(request: Request, file: Optional[UploadFile] = File(None)):
             source_url = url
             # SSRF guard (#1727): reject URLs whose host resolves to a private /
             # loopback / link-local / metadata address before fetching.
-            from kestrel_sovereign.security.ssrf import (
+            from kestrel_sdk.security.outbound import (
                 SSRFError,
                 assert_safe_url,
                 pinned_httpx_async_transport,
@@ -1175,11 +1175,12 @@ async def set_avatar(request: Request, file: Optional[UploadFile] = File(None)):
                 async with httpx.AsyncClient(
                     timeout=30.0,
                     transport=transport,
+                    follow_redirects=False,
                 ) as client:
-                    resp = await client.get(url)
+                    resp = await client.get(validated_url.url)
                     resp.raise_for_status()
                     image_data = resp.content
-            except httpx.HTTPError as e:
+            except (httpx.HTTPError, httpx.InvalidURL, SSRFError) as e:
                 raise HTTPException(status_code=400, detail=f"Failed to download image: {e}")
             if len(image_data) > _AVATAR_MAX_SIZE:
                 raise HTTPException(status_code=400, detail="Downloaded image too large.")

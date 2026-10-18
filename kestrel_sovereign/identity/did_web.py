@@ -40,6 +40,7 @@ Wave 3 (succession statements) and Wave 4 (CAR import).
 from __future__ import annotations
 
 import json
+from http.client import HTTPException
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote
@@ -342,7 +343,10 @@ Fetcher = Callable[[str], bytes]
 
 
 def _default_fetcher(url: str) -> bytes:
-    """HTTPS-only urllib fetcher with a 10-second timeout.
+    """HTTPS-only fetcher with a shared 10-second TCP/TLS connection budget.
+
+    Socket reads also have a 10-second timeout. DNS and the complete response
+    download are not bounded by a whole-operation deadline.
 
     The DID Core spec mandates HTTPS for ``did:web``. We refuse anything
     else at the resolver level — even the convenience of letting a
@@ -350,35 +354,35 @@ def _default_fetcher(url: str) -> bytes:
     arg with a stub if you need that).
     """
     if not url.startswith("https://"):
-        raise DidWebError(f"did:web resolver requires HTTPS; got {url!r}")
+        raise DidWebError("did:web resolver requires HTTPS")
     # SSRF guard (#1727): the host comes from an attacker-controllable sender DID
     # (e.g. did:web:169.254.169.254 → cloud metadata). Reject non-public targets
     # before the request fires. HTTPS-only is enforced above.
-    from kestrel_sovereign.security.ssrf import (
-        SSRFError,
-        pinned_urllib_https_opener,
-        validate_outbound_url,
-    )
+    from kestrel_sdk.security.outbound import SSRFError, validate_outbound_url
+    from kestrel_sovereign.security.pinned_urllib import pinned_urllib_https_opener
     try:
         validated_url = validate_outbound_url(url, allowed_schemes=("https",))
     except SSRFError as e:
-        raise DidWebError(f"did:web resolver refused non-public URL {url!r}: {e}") from e
+        raise DidWebError(f"did:web resolver refused URL: {e}") from e
     # DISABLE redirects (#1727 codex r1): a public DID host could 30x-redirect to
     # a private/metadata address, which urllib would follow automatically —
     # bypassing the guard above (only the original URL was validated). The
     # did.json must be served directly, so treat any 3xx as an error.
     opener = pinned_urllib_https_opener(validated_url, _NoRedirect)
     try:
-        with opener.open(url, timeout=10) as resp:  # noqa: S310 (HTTPS + SSRF-checked)
+        with opener.open(validated_url.url, timeout=10) as resp:  # noqa: S310 (HTTPS + SSRF-checked)
             if resp.status != 200:
-                raise DidWebError(f"GET {url} returned {resp.status}")
+                raise DidWebError(f"did:web GET returned {resp.status}")
             return resp.read()
     except HTTPError as e:
+        e.close()
         if 300 <= e.code < 400:
             raise DidWebError(
-                f"did:web resolver refuses to follow redirect ({e.code}) from {url!r}"
+                f"did:web resolver refuses to follow redirect ({e.code})"
             ) from e
-        raise DidWebError(f"GET {url} returned {e.code}") from e
+        raise DidWebError(f"did:web GET returned {e.code}") from e
+    except (OSError, HTTPException, SSRFError) as e:
+        raise DidWebError("did:web HTTPS fetch failed") from e
 
 
 def resolve(
