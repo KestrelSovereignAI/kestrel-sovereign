@@ -126,6 +126,11 @@ def _merge_manager_cleanup_control(previous, error):
     for value in (previous, error):
         for source in _native_source_originals(value):
             if isinstance(source, _ManagerCleanupControl):
+                # A completed owner may forward another manager's already
+                # compacted summary. Unwrapping its selected root must not
+                # relocalize discarded scope evidence to that one tenant.
+                compacted |= bool(getattr(source, "_manager_sources_compacted", False))
+                unscoped |= bool(getattr(source, "_kestrel_unscoped_execution_denial", False))
                 source = source.__cause__
             if source is None:
                 continue
@@ -6304,20 +6309,21 @@ class AgentManager:
 
         cancelled = False
         failures: list[BaseException] = []
-        control = None
+        originals, withdrawals = [], []
         for task in tasks:
             try:
-                task_cancelled, failure = await await_lifecycle_task_completion(task)
+                task_cancelled, failure = await await_lifecycle_task_completion(task, withdrawals=withdrawals)
             except BaseException as error:
                 task_cancelled, failure = False, error
             cancelled = cancelled or task_cancelled
-            control = execution_finite_error(control, failure)
+            originals.append(failure)
             if failure is None:
                 continue
             if isinstance(failure, asyncio.CancelledError):
                 cancelled = True
             else:
                 failures.append(failure)
+        control = execution_finite_error(*originals, *withdrawals)
         if control is not None and is_execution_control_error(control):
             raise control
         if cancelled:
@@ -9542,6 +9548,39 @@ class AgentManager:
             release_ids.add(active.release_id)
         return release_ids
 
+    async def _acquire_manager_lifecycle_lock(
+        self, lock, *, name: str, message: str,
+        withdrawals: Optional[list[BaseException]] = None,
+    ) -> bool:
+        """Transfer only an actually acquired lock, retaining its exact Task."""
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        admission, opening = OwnedTaskAdmission(), None
+        observed = withdrawals if withdrawals is not None else []
+        try:
+            create_owned_task(lock.acquire(), name=name, retain_originals=True, admission=admission)
+        except BaseException as error:
+            opening = error
+        task, transferred = admission.task, False
+        def acquired():
+            return task is not None and task.done() and owned_task_error(task) is None and task.result() is True
+        try:
+            cancelled, failure = False, None
+            if task is not None:
+                cancelled, failure = await await_lifecycle_task_completion(task, withdrawals=observed)
+            terminal = execution_observation_error(opening, failure, *(observed if opening is not None or failure is not None else ()))
+            if terminal is not None:
+                raise RuntimeError(message) from terminal
+            if not acquired():
+                raise RuntimeError(message)
+            transferred = True
+            return cancelled
+        finally:
+            # Validation can itself raise an unexpected BaseException after
+            # the physical join. No exceptional exit may strand that lock.
+            if not transferred and acquired():
+                lock.release()
+
     async def _set_quarantined_shutdown_handoffs_sealed(
         self, sealed: bool, *, withdrawals: Optional[list[BaseException]] = None,
     ) -> bool:
@@ -9556,16 +9595,12 @@ class AgentManager:
         in the small gap before it owns the state transition.
         """
 
-        acquire = create_owned_task(
-            self._lock.acquire(),
+        cancelled = await self._acquire_manager_lifecycle_lock(
+            self._lock,
             name="agent_manager:set_quarantined_shutdown_handoff_seal",
-            retain_originals=True,
+            message="Unable to update quarantined shutdown handoff seal",
+            withdrawals=withdrawals,
         )
-        cancelled, failure = await await_lifecycle_task_completion(acquire, withdrawals=withdrawals)
-        if failure is not None:
-            raise RuntimeError(
-                "Unable to update quarantined shutdown handoff seal"
-            ) from failure
         try:
             self._quarantined_shutdown_handoffs_sealed = sealed
             if sealed:
@@ -9581,17 +9616,12 @@ class AgentManager:
     ) -> bool:
         """Serialize terminal drains despite caller cancellation."""
 
-        acquire = create_owned_task(
-            self._quarantined_shutdown_drain_lock.acquire(),
+        return await self._acquire_manager_lifecycle_lock(
+            self._quarantined_shutdown_drain_lock,
             name="agent_manager:drain_quarantined_shutdowns",
-            retain_originals=True,
+            message="Unable to acquire quarantined shutdown drain",
+            withdrawals=withdrawals,
         )
-        cancelled, failure = await await_lifecycle_task_completion(acquire, withdrawals=withdrawals)
-        if failure is not None:
-            raise RuntimeError(
-                "Unable to acquire quarantined shutdown drain"
-            ) from failure
-        return cancelled
 
     async def drain_quarantined_shutdowns(
         self,
@@ -13474,20 +13504,22 @@ class AgentManager:
     ) -> bool:
         """Own child-tracking reconciliation through repeated cancellation."""
 
-        reconciliation = create_owned_task(
-            self._prune_all_fully_removed_child_tracking(),
-            name="agent_manager:reconcile_removed_child_tracking",
-            retain_originals=True,
-        )
-        cancelled, failure = await await_lifecycle_task_completion(
-            reconciliation, withdrawals=withdrawals,
-        )
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        admission, opening = OwnedTaskAdmission(), None
+        observed = withdrawals if withdrawals is not None else []
+        try:
+            create_owned_task(
+                self._prune_all_fully_removed_child_tracking(),
+                name="agent_manager:reconcile_removed_child_tracking",
+                retain_originals=True, admission=admission,
+            )
+        except BaseException as error:
+            opening = error
+        cancelled, failure = False, None
+        if admission.task is not None:
+            cancelled, failure = await await_lifecycle_task_completion(admission.task, withdrawals=observed)
+        failure = execution_observation_error(opening, failure, *(observed if opening is not None or failure is not None else ()))
         if failure is not None:
-            if withdrawals:
-                raise execution_finite_error(
-                    failure, *withdrawals, retain_originals=True,
-                    isolate_control_originals=True,
-                )
             raise failure
         return cancelled
 
@@ -14994,7 +15026,9 @@ class AgentManager:
         if len(candidates) > 1:
             try:
                 verified_relations = await self._verified_spawn_relations()
-            except Exception as exc:
+            except BaseException as exc:
+                if not _is_lifecycle_terminal_outcome(exc):
+                    raise
                 # An unreadable authority graph cannot safely supply teardown
                 # ordering, but it must not prevent unrelated agents from
                 # receiving their own shutdown attempt. Retain the failure for
@@ -15002,6 +15036,11 @@ class AgentManager:
                 # candidate/budget topology available in this process.
                 topology_read_failed = True
                 failures.append(exc)
+                cancelled = cancelled or _contains_lifecycle_cancellation(exc)
+                if withdrawals is not None:
+                    withdrawals.extend(error for error in _explicit_control_chain(exc)
+                                       if isinstance(error, asyncio.CancelledError)
+                                       and all(error is not prior for prior in withdrawals))
                 logger.warning(
                     "Unable to verify signed fleet shutdown topology; "
                     "continuing conservative teardown: %s",
@@ -15137,10 +15176,22 @@ class AgentManager:
                     # Make the successful leaf removal visible before its
                     # parent reaches the direct-removal orphan guard, but only
                     # after every shutdown/refund/quarantine owner is gone.
-                    await self._prune_child_tracking_if_fully_removed(
-                        mandate.parent_did,
-                        name,
-                    )
+                    try:
+                        await self._prune_child_tracking_if_fully_removed(mandate.parent_did, name)
+                    except BaseException as error:
+                        if not _is_lifecycle_terminal_outcome(error):
+                            raise
+                        # Do not let a post-removal bookkeeping withdrawal
+                        # strand independent agents or erase a prior receipt.
+                        # Keep this name's relationships until reconciliation
+                        # actually acknowledges their retirement.
+                        removed_names.discard(name)
+                        record_failure(name, error)
+                        cancelled = cancelled or _contains_lifecycle_cancellation(error)
+                        if withdrawals is not None:
+                            withdrawals.extend(value for value in _explicit_control_chain(error)
+                                               if isinstance(value, asyncio.CancelledError)
+                                               and all(value is not prior for prior in withdrawals))
             elif not failure_recorded:
                 record_failure(
                     name,

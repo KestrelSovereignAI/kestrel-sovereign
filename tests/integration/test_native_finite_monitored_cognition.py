@@ -10,7 +10,7 @@ from kestrel_sdk.signals import SignalMode
 
 from kestrel_sovereign import _async_ownership as ownership
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
-from kestrel_sovereign.execution_custody import _explicit_control_chain
+from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_finite_error
 from tests.integration.test_execution_authority_postgres import native_pg as _native_pg
 from tests.integration.test_maintenance_original_retirement import _original_control
 from tests.integration.test_native_finite_outer_consumers import unstarted_native_close
@@ -24,11 +24,13 @@ native_pg = _native_pg
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["worker", "finish"])
 @pytest.mark.parametrize("source_cancel", [False, True])
+@pytest.mark.parametrize("ordinary_first", [False, True])
 async def test_monitored_cognition_keeps_native_siblings_and_actual_current_c(
-    native_pg, dispatcher_components, tmp_path, monkeypatch, phase, source_cancel,
+    native_pg, dispatcher_components, tmp_path, monkeypatch, phase, source_cancel, ordinary_first,
 ):
     c = dispatcher_components
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch, source_cancel))
+    ordinary = OriginalFailure.capture(OSError("original ordinary sibling failed before later native finish"))
     resource, independent = await unstarted_native_close()
     template = tmp_path / "finite-monitor.md"
     template.write_text("payload: {payload}")
@@ -55,7 +57,7 @@ async def test_monitored_cognition_keeps_native_siblings_and_actual_current_c(
             except asyncio.CancelledError:
                 pass
         await c.backend.execute("INSERT INTO effects VALUES (1)")
-        raise source.error
+        raise ordinary.error if ordinary_first else source.error
     async def monitor(_signal):
         await entered.wait()
         return "original durable source withdrew"
@@ -64,7 +66,7 @@ async def test_monitored_cognition_keeps_native_siblings_and_actual_current_c(
         finishing.set()
         if phase == "finish":
             await finish_release.wait()
-        raise independent.error
+        raise execution_finite_error(source.error, independent.error) if ordinary_first else independent.error
     c.agent.process_input = execute
     c.agent.monitor_cognition_signal_execution = monitor
     c.agent.finish_cognition_signal_execution = finish
@@ -82,6 +84,8 @@ async def test_monitored_cognition_keeps_native_siblings_and_actual_current_c(
         finish_release.set()
         result = await await_owned_task(owner)
         source.assert_retained(result.error)
+        if ordinary_first:
+            ordinary.assert_retained(result.error)
         independent.assert_retained(result.error)
         assert withdrawals and all(value in tuple(_explicit_control_chain(result.error)) for value in withdrawals)
         assert (await c.backend.fetch_all("SELECT count(*) FROM effects"))[0][0] == 2

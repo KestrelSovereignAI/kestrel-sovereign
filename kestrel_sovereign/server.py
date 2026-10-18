@@ -1975,14 +1975,14 @@ async def _supervise_phoenix_startup(app, supervisor) -> None:
 async def _shutdown_single_agent(agent: KestrelAgent) -> None:
     """Bound user-visible shutdown while retaining ownership of its tail."""
     cancelled = False
-    failure = None
+    failures, withdrawals = [], []
     # Failed initialization may already have handed native cleanup to the
     # Agent. Join that exact owner before a fresh shutdown can touch providers.
     if isinstance(getattr(agent, "_durable_shutdown_continuation", None), asyncio.Future):
         try:
-            cancelled = await await_agent_shutdown_completion(agent)
+            cancelled = await await_agent_shutdown_completion(agent, withdrawals=withdrawals, finite_errors=failures)
         except BaseException as error:
-            failure = error
+            failures.append(error)
     try:
         await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
         logger.info("Agent shutdown complete.")
@@ -1993,12 +1993,15 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
         )
     except asyncio.CancelledError as error:
         cancelled = True
-        failure = execution_finite_error(failure, error)
+        failures.append(error)
         logger.debug("Agent shutdown cancelled")
     except BaseException as error:
-        failure = execution_finite_error(failure, error)
+        failures.append(error)
         logger.warning("Error during agent shutdown (%s)", type(error).__name__)
-    cancelled = await await_agent_shutdown_completion(agent, prior_error=failure) or cancelled
+    cancelled = await await_agent_shutdown_completion(agent, withdrawals=withdrawals, finite_errors=failures) or cancelled
+    failure = execution_finite_error(*failures, *withdrawals)
+    if failure is not None and (not isinstance(failure, asyncio.CancelledError) or is_execution_control_error(failure)):
+        raise failure
     if cancelled:
         raise asyncio.CancelledError()
 
@@ -2950,28 +2953,34 @@ async def _run_lifespan_shutdown_phase(
     admission boundary: a refused cleanup retains its actual original resource
     and closes the unstarted coroutine, never reporting successful retirement.
     """
-    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
 
     phase_task = None
+    admission = OwnedTaskAdmission()
     withdrawal = None
     task_had_failure = True
     try:
         phase_task = create_owned_task(
             operation(), name=f"server_shutdown:{name}", retain_originals=True,
+            admission=admission,
         )
     except BaseException as error:
-        # No phase entered, and no native resource was released. Canonical
-        # admission closes both fresh coroutines. Retain the ACTUAL resources
-        # that remain on app.state, not the phase lambda or a successful Future.
-        # Return the failure so later independent phases still get their drain.
-        cancelled, failure = False, _unstarted_lifespan_phase_error(error, resources)
+        # The receipt gate prevents entry, but acceptance is not absence.
+        # Join that actual accepted Task before independent phases proceed.
+        phase_task = admission.task
+        outcome = await await_owned_task(phase_task) if phase_task is not None else None
+        withdrawal = outcome.cancellation if outcome is not None else None
+        cancelled = withdrawal is not None
+        failure = _unstarted_lifespan_phase_error(error, resources, owner=phase_task)
+        failure = execution_finite_error(failure, outcome.error if outcome is not None else None, withdrawal,
+                                         retain_originals=True, isolate_control_originals=True)
     else:
         caller = asyncio.current_task()
         cancelled = bool(caller is not None and caller.cancelling())
         outcome = await await_owned_task(phase_task)
         cancelled = cancelled or outcome.cancellation is not None
         failure, withdrawal = outcome.error, outcome.cancellation
-        task_had_failure = failure is not None
+        task_had_failure = owned_task_error(phase_task) is not None
     original_phase_failure = failure
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
@@ -2995,13 +3004,14 @@ async def _run_lifespan_shutdown_phase(
     return cancelled, failure, result, withdrawal
 
 
-def _unstarted_lifespan_phase_error(error: BaseException, resources) -> BaseException:
+def _unstarted_lifespan_phase_error(error: BaseException, resources, *, owner=None) -> BaseException:
     """Retain original resources whose phase could not safely enter."""
-    error._kestrel_native_retirement_debts = (
-        *getattr(error, "_kestrel_native_retirement_debts", ()),
-        *((resource, None) for resource in resources),
-    )
-    return error
+    if not resources:
+        return error
+    debt = RuntimeError("original server phase admission did not retire its resources")
+    debt.__cause__ = error
+    debt._kestrel_native_retirement_debts = tuple((resource, owner) for resource in resources)
+    return debt
 
 
 def _lifespan_shutdown_phase_resources(app: FastAPI, name: str | None = None) -> tuple:

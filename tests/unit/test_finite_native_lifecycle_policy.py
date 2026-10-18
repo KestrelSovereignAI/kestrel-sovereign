@@ -182,6 +182,9 @@ def test_compacted_scopes_do_not_masquerade_as_only_selected_tenant():
     assert execution_denial_scopes(summary) == (scopes[0],)
     summary = _merge_manager_cleanup_control(summary, errors[1].error)
     assert execution_denial_scopes(summary) is None
+    forwarded = _merge_manager_cleanup_control(None, summary)
+    assert execution_denial_scopes(forwarded) is None
+    assert forwarded.__cause__ is errors[0].error
     for index, snapshot in enumerate(errors):
         snapshot.assert_retained(snapshot.error)
         assert execution_denial_scopes(snapshot.error) == (scopes[index],)

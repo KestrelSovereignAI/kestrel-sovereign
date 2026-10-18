@@ -277,6 +277,25 @@ mutable original retirement record, including an owner not yet published.
 Only that receipt's actual retirement permits its redundant ownership record
 to be compacted; a successful unrelated Task or Future is not a retirement ACK.
 
+Coordinator and lock-acquisition Tasks need admission receipts too: their body
+must not enter before completion-callback publication succeeds. A failed
+publication joins the actual accepted Task, rather than describing acceptance
+as no-Task refusal. Lock observation is separate from acquisition; a lock
+physically acquired before an observer failure is released unless ownership
+has explicitly transferred. An unentered server phase keeps private debt for
+its actual resources and accepted Task (or genuine None), without modifying
+the original failure. An existing Agent continuation remains owned and joined
+even when admission of its new observing waiter fails.
+
+Finite multi-owner boundaries keep originals and actual withdrawals unreduced
+until later owners finish. An ordinary-first failure cannot erase cancellation
+before a later native result arrives. Nested writer drains and shutdown waiters
+can pass caller-local finite collectors; these lists never become shared control
+history. Fleet topology and post-removal reconciliation failures preserve
+conservative relationship state while independent cleanup still receives its
+attempt. Forwarding an already compacted manager summary preserves its unscoped
+classification instead of attributing discarded sources to its selected tenant.
+
 Session-training acquisition and rejected-session release retain the actual
 physical hook task and session when native retirement is unresolved. A later
 close reports that evidence without issuing a replacement release. Ordinary

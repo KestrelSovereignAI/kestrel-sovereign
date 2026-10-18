@@ -611,7 +611,8 @@ async def await_lifecycle_task_completion(
     failure = outcome.error
     if any(error is not None and is_execution_control_error(error)
            for error in (failure, outcome.cancellation)):
-        failure = execution_terminal_error(failure, outcome.cancellation)
+        from kestrel_sovereign.execution_custody import execution_finite_error
+        failure = execution_finite_error(failure, outcome.cancellation)
     if isinstance(failure, BaseExceptionGroup):
         # A task can already be terminal when this helper is entered, in which
         # case the loop above never observes its raised group.
@@ -624,50 +625,64 @@ async def await_lifecycle_task_completion(
 async def await_agent_shutdown_completion(
     agent: object, *, prior_error: BaseException | None = None,
     withdrawals: list[BaseException] | None = None,
+    finite_errors: list[BaseException] | None = None,
 ) -> bool:
-    """Join an agent's deferred durable cleanup without dropping it on cancel.
+    """Join the actual shutdown waiter and any accepted-but-unreturned owner.
 
-    ``KestrelAgent.shutdown`` may transfer dispatcher release and shared
-    storage close to a continuation after its bounded user-facing shutdown
-    budget expires.  The lifecycle caller that reported that timeout remains
-    responsible for joining the continuation before its event loop exits.
-
-    Returns whether this *join* observed cancellation.  Callers choose whether
-    to re-raise after cleanup; either way the continuation has already reached
-    a terminal result, so no SQLite worker or runtime owner is orphaned.
+    An outer multi-owner boundary can collect unreduced finite originals.
+    Otherwise retain the existing ordinary terminal-selection contract.
     """
-    # A child's terminal cancellation (including our own timeout request) is
-    # not evidence that the caller was cancelled while joining its cleanup.
+    from kestrel_sovereign._async_ownership import (
+        OwnedTaskAdmission, create_owned_task, owned_task_join_ancestors,
+        pending_owned_retirement_error,
+    )
+    from kestrel_sovereign.execution_custody import execution_finite_error
+
     cancelled = False
-    failure = prior_error
-    observed_withdrawals = withdrawals if withdrawals is not None else []
+    errors = [prior_error] if prior_error is not None else []
+    observed = withdrawals if withdrawals is not None else []
+    async def join_original(task):
+        nonlocal cancelled
+        join_cancelled, failure = await await_lifecycle_task_completion(task, withdrawals=observed)
+        cancelled = cancelled or join_cancelled
+        if failure is not None:
+            errors.append(failure)
     waiter = getattr(agent, "wait_for_shutdown_completion", None)
     if callable(waiter):
+        admission, task, creation_failed = OwnedTaskAdmission(), None, False
         try:
             completion = waiter()
             if inspect.isawaitable(completion):
-                from kestrel_sovereign._async_ownership import create_owned_task
-
-                task = (completion if isinstance(completion, asyncio.Future) else
-                        create_owned_task(completion, retain_originals=True))
-                join_cancelled, join_failure = await await_lifecycle_task_completion(
-                    task, withdrawals=observed_withdrawals,
-                )
-                cancelled = join_cancelled or cancelled
-                failure = execution_terminal_error(
-                    failure, join_failure,
-                    retain_originals=True, isolate_control_originals=True,
-                )
-        except BaseException as join_failure:
-            failure = execution_terminal_error(
-                failure, join_failure,
-                retain_originals=True, isolate_control_originals=True,
-            )
-    if observed_withdrawals:
-        failure = execution_terminal_error(
-            failure, *observed_withdrawals,
-            retain_originals=True, isolate_control_originals=True,
-        )
+                if isinstance(completion, asyncio.Future):
+                    task = completion
+                else:
+                    try:
+                        task = create_owned_task(completion, retain_originals=True, admission=admission)
+                    except BaseException as opening:
+                        creation_failed = True
+                        task = admission.task
+                        errors.append(opening)
+                if task is not None:
+                    await join_original(task)
+        except BaseException as error:
+            errors.append(error)
+        if creation_failed:
+            # The receipt's gate can refuse the new waiter before entry. That
+            # does not retire an ALREADY existing Agent continuation. Join the
+            # original directly, never allocate a replacement cleanup attempt.
+            continuation = vars(agent).get("_durable_shutdown_continuation")
+            if isinstance(continuation, asyncio.Future) and continuation is not task:
+                if continuation is asyncio.current_task() or continuation in owned_task_join_ancestors():
+                    debt = pending_owned_retirement_error(agent, (continuation,), message="original shutdown continuation still owns reentrant cleanup")
+                    if debt is not None:
+                        errors.append(debt)
+                else:
+                    await join_original(continuation)
+    if finite_errors is not None:
+        finite_errors.extend(errors)
+        finite_errors.extend(value for value in observed if all(value is not old for old in finite_errors))
+        return cancelled
+    failure = execution_finite_error(*errors, *observed, retain_originals=True, isolate_control_originals=True)
     if failure is not None:
         if not isinstance(failure, asyncio.CancelledError) or is_execution_control_error(failure):
             raise failure

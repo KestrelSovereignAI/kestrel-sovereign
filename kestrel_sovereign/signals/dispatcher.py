@@ -2639,12 +2639,16 @@ class SignalDispatcher:
         # committed reservation task created immediately before its parent
         # completed.
         await self._durable_admissions_drained.wait()
-        cleanup_error = None
+        cleanup_errors = []
         for drain in (self._drain_outcome_log_tasks, self._drain_post_commit_reservation_repairs):
             try:
-                await drain()
+                if drain == self._drain_outcome_log_tasks:
+                    await drain(finite_errors=cleanup_errors)
+                else:
+                    await drain()
             except BaseException as error:
-                cleanup_error = execution_finite_error(cleanup_error, error)
+                cleanup_errors.append(error)
+        cleanup_error = execution_finite_error(*cleanup_errors)
         if cleanup_error is not None:
             # Still join every accepted writer/repair, but uncertain storage
             # control is not permission to publish an ordinary owner release.
@@ -2774,7 +2778,7 @@ class SignalDispatcher:
             await self._terminalize_failed_cognition(delivery, error)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
 
-    async def _drain_outcome_log_tasks(self) -> None:
+    async def _drain_outcome_log_tasks(self, *, finite_errors=None) -> None:
         """Join every accepted outcome log before releasing shared storage.
 
         Each task owns a lifecycle reservation, so normally the admission
@@ -2786,7 +2790,7 @@ class SignalDispatcher:
         """
         while self._outcome_log_tasks:
             tasks = tuple(self._outcome_log_tasks)
-            await self._join_outcome_log_tasks(tasks)
+            await self._join_outcome_log_tasks(tasks, finite_errors=finite_errors)
         if self._outcome_log_control_error is not None:
             raise execution_finite_error(self._outcome_log_control_error)
 
@@ -2797,13 +2801,17 @@ class SignalDispatcher:
         if self._outcome_log_control_error is not None:
             raise execution_finite_error(self._outcome_log_control_error)
 
-    async def _join_outcome_log_tasks(self, tasks) -> None:
+    async def _join_outcome_log_tasks(self, tasks, *, finite_errors=None) -> None:
         from kestrel_sovereign._async_ownership import await_owned_task
-        error = None
+        originals = []
         for task in tasks:
             outcome = await await_owned_task(task)
-            error = execution_finite_error(error, outcome.error, outcome.cancellation)
-        error = execution_finite_error(self._outcome_log_control_error, error)
+            originals.extend((outcome.error, outcome.cancellation))
+        if finite_errors is not None:
+            # This local writer batch can be ordinary while a later repair
+            # supplies native control to the SAME shutdown boundary.
+            finite_errors.extend(error for error in (self._outcome_log_control_error, *originals) if error is not None)
+        error = execution_finite_error(self._outcome_log_control_error, *originals)
         if error is not None:
             raise error
 
@@ -4894,6 +4902,8 @@ class SignalDispatcher:
             routing_signal.id
         )
         routing_task: asyncio.Task[SignalResult] | None = None
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        routing_admission = OwnedTaskAdmission()
         deferred_outcomes: list[_DeferredOutcomeLog] = []
         lease_loss_reason: Optional[str] = None
         lease_loss_error: BaseException | None = None
@@ -4930,6 +4940,7 @@ class SignalDispatcher:
                     routing_task = create_owned_task(
                         route_durable_cognition(),
                         name=f"durable_cognition_route:{delivery.delivery_id}",
+                        retain_originals=True, admission=routing_admission,
                     )
                 finally:
                     self._durable_retry_skips_coalescing.reset(coalescing_token)
@@ -4990,6 +5001,12 @@ class SignalDispatcher:
                 lease_loss_error = execution_finite_error(lease_loss_error, lease_lost.result())
                 raise lease_loss_error
         except asyncio.CancelledError as error:
+            if routing_task is None and routing_admission.task is not None:
+                from kestrel_sovereign._async_ownership import await_owned_task
+                routing_task = routing_admission.task
+                outcome = await await_owned_task(routing_task)
+                error = execution_finite_error(error, outcome.error, outcome.cancellation,
+                                               retain_originals=True, isolate_control_originals=True)
             error = execution_finite_error(lease_loss_error, error)
             if is_execution_control_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
@@ -5004,6 +5021,12 @@ class SignalDispatcher:
             raise
 
         except BaseException as error:
+            if routing_task is None and routing_admission.task is not None:
+                from kestrel_sovereign._async_ownership import await_owned_task
+                routing_task = routing_admission.task
+                outcome = await await_owned_task(routing_task)
+                error = execution_finite_error(error, outcome.error, outcome.cancellation,
+                                               retain_originals=True, isolate_control_originals=True)
             error = execution_finite_error(lease_loss_error, error)
             if is_execution_control_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
@@ -6184,6 +6207,7 @@ class SignalDispatcher:
             import sys
 
             from kestrel_sovereign._async_ownership import await_owned_task
+            finite_originals = []
 
             async def join_sibling(task):
                 outcome = await await_owned_task(task)
@@ -6192,7 +6216,7 @@ class SignalDispatcher:
                 # the worker carries no stronger native control receipt.
                 if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
                     error = None
-                return execution_finite_error(error, outcome.cancellation)
+                return error, outcome.cancellation
 
             async def execute_with_tracking():
                 from kestrel_sovereign.hold import source_owns_hold_disposition
@@ -6289,14 +6313,16 @@ class SignalDispatcher:
                     if withdrawal is not None:
                         if not execution_task.done():
                             execution_task.cancel()
-                        error = await join_sibling(execution_task)
+                        originals = await join_sibling(execution_task)
+                        finite_originals.extend(originals)
+                        error = execution_finite_error(*originals)
                         if error is not None:
                             raise error
                         return None, str(withdrawal), None
                 result, tracking = await execution_task
                 return result, None, tracking
             finally:
-                error = sys.exc_info()[1]
+                originals = [sys.exc_info()[1], *finite_originals]
                 tasks = tuple(
                     task for task in (execution_task, monitor_task)
                     if task is not None
@@ -6307,7 +6333,7 @@ class SignalDispatcher:
                     if not task.done():
                         task.cancel()
                 for task in tasks:
-                    error = execution_finite_error(error, await join_sibling(task))
+                    originals.extend(await join_sibling(task))
                 finish_execution = getattr(
                     self._agent,
                     "finish_cognition_signal_execution",
@@ -6319,9 +6345,10 @@ class SignalDispatcher:
                         if inspect.isawaitable(finished):
                             finished_task = asyncio.ensure_future(finished)
                             outcome = await await_owned_task(finished_task)
-                            error = execution_finite_error(error, outcome.error, outcome.cancellation)
+                            originals.extend((outcome.error, outcome.cancellation))
                     except BaseException as finish_error:
-                        error = execution_finite_error(error, finish_error)
+                        originals.append(finish_error)
+                error = execution_finite_error(*originals)
                 if error is not None:
                     raise error
 

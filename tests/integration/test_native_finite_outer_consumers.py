@@ -101,7 +101,7 @@ async def test_outer_consumers_keep_independent_native_sources_immutable(
         else:
             agent, dispatcher, delivery, _ = await setup_delivery(native_pg)
             if surface == "shutdown-drain":
-                async def first():
+                async def first(*, finite_errors=None):
                     calls.append("first")
                     await native_pg[1].execute('INSERT INTO "' + native_pg[2] + '".effects VALUES (381,\'first actual drain\')')
                     raise source.error

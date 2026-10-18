@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
@@ -97,6 +98,7 @@ async def test_actual_lifecycle_caller_joins_native_tail_before_control(
     agent, db = await native_owner(tmp_path)
     release, closed = asyncio.Event(), asyncio.Event()
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
 
     async def native_tail():
         await release.wait()
@@ -129,7 +131,7 @@ async def test_actual_lifecycle_caller_joins_native_tail_before_control(
         assert db.backend._connection is not None
         release.set()
         outcome = await await_owned_task(waiter)
-        assert outcome.error is failure
+        source.assert_retained(outcome.error)
         assert closed.is_set() and db.backend._connection is None
     finally:
         release.set()
@@ -192,6 +194,7 @@ async def test_actual_failed_agent_birth_is_not_provider_only_cleanup(monkeypatc
 async def test_actual_manager_quarantine_retains_native_terminal_receipt(tmp_path, kind):
     manager = AgentManager(base_data_dir=tmp_path)
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
     db = await AsyncDatabase.sqlite(str(tmp_path / "native.db"))
 
     async def retire_then_report():
@@ -205,7 +208,7 @@ async def test_actual_manager_quarantine_retains_native_terminal_receipt(tmp_pat
     assert not manager._quarantined_shutdown_reapers
     with pytest.raises(BaseException) as caught:
         await manager.drain_quarantined_shutdowns()
-    assert caught.value is failure, "manager replaced native evidence with generic history text"
+    source.assert_retained(caught.value)
 
 
 @pytest.mark.asyncio
