@@ -42,6 +42,8 @@ from tests.unit.test_inference_lease_coordinator import (
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", KINDS)
 async def test_successful_cognition_cas_returns_original_stronger_child(tmp_path, kind):
+    from tests.utils.original_failure import OriginalFailure
+    from kestrel_sovereign.execution_custody import execution_commit_outcome
     backend, agent, dispatcher = await _dispatcher(tmp_path / "cognition.db", "did:test:review50")
     store = dispatcher._durable_store
     await store.register_consumer(DurableConsumerRegistration(
@@ -54,6 +56,8 @@ async def test_successful_cognition_cas_returns_original_stronger_child(tmp_path
     assert delivery is not None
     await backend.execute("CREATE TABLE effects(id INTEGER PRIMARY KEY)")
     original = terminal(kind)
+    source = OriginalFailure.capture(original)
+    weaker = OriginalFailure.capture(ExecutionAuthorityError("renewal lost authority"))
 
     async def route():
         await backend.execute("INSERT INTO effects VALUES (1)")
@@ -63,10 +67,12 @@ async def test_successful_cognition_cas_returns_original_stronger_child(tmp_path
         child = create_owned_task(route())
         assert (await join(child)).error is original
         outcome = await join(create_owned_task(dispatcher._settle_cognition_control(
-            delivery, ExecutionAuthorityError("renewal lost authority"), child,
+            delivery, weaker.error, child,
         )))
         assert outcome.error is None
-        assert outcome.result is original
+        source.assert_retained(outcome.result)
+        weaker.assert_retained(outcome.result)
+        assert execution_commit_outcome(outcome.result) == execution_commit_outcome(original)
         assert delivery.delivery_id not in dispatcher._retained_cognition_control_debt
         row = await store.get_delivery(agent_id=agent.did, consumer_id="review50",
                                        delivery_id=delivery.delivery_id)

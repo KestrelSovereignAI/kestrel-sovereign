@@ -362,6 +362,30 @@ def execution_native_source_error(*errors: BaseException | None) -> BaseExceptio
                                     isolate_control_originals=True)
 
 
+def execution_observation_error(*errors: BaseException | None) -> BaseException | None:
+    """Compose a Core-owned join without making observers genuine sources.
+
+    A fresh group preserves even ordinary physical errors without decorating
+    their graphs. Only the originals' authenticated native-source projections
+    cross a later shared boundary. Genuine unmarked source groups remain whole;
+    this does not authorize flattening a foreign group containing cancellation.
+    """
+    present = []
+    sources = []
+    for error in errors:
+        if error is None or any(error is prior for prior in present):
+            continue
+        present.append(error)
+        for source in _native_source_originals(error):
+            if all(source is not prior for prior in sources):
+                sources.append(source)
+    if len(present) < 2:
+        return present[0] if present else None
+    terminal = BaseExceptionGroup("original completion observation evidence", present)
+    terminal._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, tuple(sources))
+    return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
+
+
 def execution_terminal_error(*errors: BaseException | None, retain_originals: bool = False,
                              prefer_cancellation: bool = False,
                              isolate_control_originals: bool = False) -> BaseException | None:

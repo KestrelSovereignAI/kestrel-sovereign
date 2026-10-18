@@ -983,20 +983,20 @@ async def await_owned_task(
     if not task.done():
         # Only an explicitly borrowed observer may leave before settlement.
         assert not defer_cancellation and publication_errors
-        raise (publication_errors[0] if len(publication_errors) == 1 else
-               BaseExceptionGroup("borrowed completion publication failed", publication_errors))
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        raise execution_observation_error(*publication_errors)
     error = owned_task_error(task)
     if publication_errors:
-        from kestrel_sovereign.execution_custody import execution_terminal_error
+        from kestrel_sovereign.execution_custody import execution_observation_error
         failures = ([error] if error is not None else []) + publication_errors
-        error = execution_terminal_error(
-            failures[0] if len(failures) == 1 else
-            BaseExceptionGroup("original completion publication evidence", failures),
-            retain_originals=True, isolate_control_originals=True,
-        )
+        error = execution_observation_error(*failures)
     if forwarding_error is not None:
-        from kestrel_sovereign.execution_custody import execution_terminal_error
-        error = execution_terminal_error(error, forwarding_error)
+        from kestrel_sovereign.execution_custody import (
+            execution_observation_error, execution_terminal_error, is_execution_control_error,
+        )
+        error = (execution_observation_error(error, forwarding_error)
+                 if is_execution_control_error(error) or is_execution_control_error(forwarding_error)
+                 else execution_terminal_error(error, forwarding_error))
         if error is not forwarding_error:
             error.add_note(f"cancellation forwarding also failed: {forwarding_error}")
     if error is not None:

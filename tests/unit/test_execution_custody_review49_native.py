@@ -560,9 +560,13 @@ async def test_isolated_supervisor_retains_native_stop_failure(tmp_path, monkeyp
 @pytest.mark.parametrize("kind", KINDS)
 async def test_completed_cognition_selects_original_native_receipt_before_failed_cas(tmp_path, kind):
     from tests.unit.test_durable_signal_delivery import _close, _dispatcher
+    from tests.utils.original_failure import OriginalFailure
+    from kestrel_sovereign.execution_custody import execution_commit_outcome
     backend, agent, dispatcher = await _dispatcher(tmp_path / "cognition.db", "did:test:original-route")
     await backend.execute("CREATE TABLE effects(id INTEGER PRIMARY KEY)")
     original = terminal(kind)
+    source = OriginalFailure.capture(original)
+    weaker = OriginalFailure.capture(ExecutionAuthorityError("renewal lost authority"))
     async def route():
         await backend.execute("INSERT INTO effects VALUES (1)")
         raise original
@@ -573,9 +577,13 @@ async def test_completed_cognition_selects_original_native_receipt_before_failed
     delivery = ReceiptDelivery(delivery_id="stale-original", consumer_id="original-consumer", lease_token="original-token")
     try:
         await join(child)
-        result = await join(create_owned_task(dispatcher._settle_cognition_control(delivery, ExecutionAuthorityError("renewal lost authority"), child)))
-        assert result.error is original
-        assert dispatcher._retained_cognition_control_debt[delivery.delivery_id][1] is original
+        result = await join(create_owned_task(dispatcher._settle_cognition_control(delivery, weaker.error, child)))
+        source.assert_retained(result.error)
+        weaker.assert_retained(result.error)
+        retained = dispatcher._retained_cognition_control_debt[delivery.delivery_id][1]
+        source.assert_retained(retained)
+        weaker.assert_retained(retained)
+        assert execution_commit_outcome(retained) == execution_commit_outcome(original)
         assert await backend.fetch_val("SELECT COUNT(*) FROM effects") == 1
     finally:
         # This test's deliberately stale lease owns no durable row. Retire only

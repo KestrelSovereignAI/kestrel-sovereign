@@ -369,9 +369,11 @@ async def test_owned_cancellation_forwarder_uses_original_owner_once(already_sto
 @pytest.mark.parametrize("control", [False, True])
 async def test_forwarder_failure_preserves_original_owned_error(control):
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from tests.utils.original_failure import OriginalFailure
 
     entered, release, forwarded = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original = ExecutionAuthorityError("original work denied") if control else LookupError("original work failed")
+    source = OriginalFailure.capture(original)
     forwarding_failure = ValueError("original forwarding failure")
 
     async def operation():
@@ -392,7 +394,9 @@ async def test_forwarder_failure_preserves_original_owned_error(control):
         assert not owner.done()
         release.set()
         result = (await await_owned_task(owner)).result
-        assert result.error is original
+        source.assert_retained(result.error)
+        if not control:
+            assert result.error is original
         assert any(str(forwarding_failure) in note for note in result.error.__notes__)
         assert result.cancellation.args == ("original caller stop",)
     finally:

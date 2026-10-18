@@ -99,4 +99,3 @@ for (const phase of ['history', 'restart']) {
         });
     }
 }
-

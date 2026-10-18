@@ -758,7 +758,7 @@ class PostgresBackend(DatabaseBackend):
         Borrowed primary pools are only detached; their caller retains custody.
         """
         errors: list[BaseException] = []
-        from kestrel_sovereign._async_ownership import owned_task_admission_error
+        from kestrel_sovereign._async_ownership import owned_task_admission_error, owned_task_error
         owners = vars(self).setdefault("_pool_close_owners", {})
         for attribute in ("_advisory_pool", "_pool"):
             pool = getattr(self, attribute)
@@ -787,10 +787,11 @@ class PostgresBackend(DatabaseBackend):
                 continue
             outcome = await await_owned_task(task)
             errors.extend((opening, outcome.error, outcome.cancellation))
-            if opening is None and outcome.error is None and getattr(self, attribute) is pool:
+            physical = owned_task_error(task)
+            if opening is None and physical is None and getattr(self, attribute) is pool:
                 setattr(self, attribute, None)
                 owners.pop(attribute, None)
-            elif opening is None and outcome.error is not None and not is_execution_control_error(outcome.error):
+            elif opening is None and physical is not None and not is_execution_control_error(physical):
                 # An ordinary, physically joined availability failure keeps
                 # the pool handle and its legacy explicit-call retry contract.
                 # Refused/unpublished admission or native uncertainty never

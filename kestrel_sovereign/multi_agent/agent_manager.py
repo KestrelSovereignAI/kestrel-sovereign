@@ -9258,7 +9258,8 @@ class AgentManager:
             record.completed_monotonic = time.monotonic()
             failure = owned_task_error(task)
             if failure is not None and is_execution_control_error(failure):
-                self._quarantined_shutdown_control = execution_terminal_error(
+                from kestrel_sovereign.execution_custody import execution_native_source_error
+                self._quarantined_shutdown_control = execution_native_source_error(
                     self._quarantined_shutdown_control, failure,
                 )
             if task.cancelled():
@@ -11116,7 +11117,8 @@ class AgentManager:
             # The existing terminal custody latch outlives public metadata
             # acknowledgement/eviction. A display record cannot settle an
             # original uncertain refund or retire its native evidence.
-            self._quarantined_shutdown_control = execution_terminal_error(
+            from kestrel_sovereign.execution_custody import execution_native_source_error
+            self._quarantined_shutdown_control = execution_native_source_error(
                 self._quarantined_shutdown_control, failure,
             )
         unsafe = UnsafeRemovalBudgetReleaseFailure(

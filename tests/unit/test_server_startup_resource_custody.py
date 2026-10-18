@@ -190,6 +190,8 @@ async def test_cached_original_phoenix_close_cannot_retire_replacement(
         # Exercise defensive generation binding even if an external caller
         # bypasses the public lifespan preflight and installs another owner.
         app.state.phoenix = replacement
+        cached = app.state.phoenix_proxy_close_error
+        cached_source = OriginalFailure.capture(cached)
         with pytest.raises(BaseException) as repeated:
             await server._shutdown_phoenix(app)
         assert is_execution_control_error(repeated.value)
@@ -201,6 +203,14 @@ async def test_cached_original_phoenix_close_cannot_retire_replacement(
         assert app.state.phoenix is replacement
         assert app.state.phoenix_proxy_close_task is original_task
         assert app.state.phoenix_proxy_close_supervisor is original_supervisor
+        assert not replacement_client.is_closed and not replacement_closed.is_set()
+        for _ in range(20):
+            with pytest.raises(BaseException) as later:
+                await server._shutdown_phoenix(app)
+            snapshot.assert_retained(later.value)
+            cached_source.assert_retained(app.state.phoenix_proxy_close_error)
+            assert app.state.phoenix_proxy_close_error is cached
+            assert app.state.phoenix_proxy_close_task is original_task
         assert not replacement_client.is_closed and not replacement_closed.is_set()
         with pytest.raises(RuntimeError, match="retire"):
             server._require_retired_server_resources(app)

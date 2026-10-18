@@ -244,7 +244,7 @@ async def start_host_features(
             cleanup = await _rollback_started_host_features(started, ctx, runtime)
             ctx.started_host_features = previously_started
             if _host_control_failure(exc) or cleanup:
-                raise execution_terminal_error(exc, *cleanup)
+                raise execution_terminal_error(exc, *cleanup, retain_originals=True, isolate_control_originals=True)
             if isinstance(exc, FeatureContributionCollectionError):
                 raise
             raise FeatureContributionRuntimeError(
@@ -269,7 +269,7 @@ async def start_host_features(
             if _host_control_failure(exc, *cleanup) or cleanup:
                 cleanup += await _rollback_started_host_features(started, ctx, runtime)
                 ctx.started_host_features = previously_started
-                raise execution_terminal_error(exc, *cleanup)
+                raise execution_terminal_error(exc, *cleanup, retain_originals=True, isolate_control_originals=True)
             logger.error(
                 "Host feature %s did not start — %s",
                 _host_feature_name(feature),
@@ -286,7 +286,7 @@ async def start_host_features(
         # reverse every successfully started member before reporting failure.
         cleanup = await _rollback_started_host_features(started, ctx, runtime)
         ctx.started_host_features = previously_started
-        raise execution_terminal_error(exc, *cleanup)
+        raise execution_terminal_error(exc, *cleanup, retain_originals=True, isolate_control_originals=True)
     ctx.started_host_features = (*previously_started, *started)
     started_ids = {id(feature) for feature in started}
     return [feature for feature in features if id(feature) in started_ids]
@@ -339,6 +339,7 @@ async def _retire_host_features(features, ctx, runtime, *, deactivate_first=Fals
     returned as ORIGINAL carriers, never consumed as warning strings.
     """
     owners = _host_close_owners(ctx)
+    finite_errors = []
     for feature in features:
 
         async def stop():
@@ -349,6 +350,7 @@ async def _retire_host_features(features, ctx, runtime, *, deactivate_first=Fals
             except BaseException as error:
                 logger.warning("Host feature %s stop failed: %s", feature, error)
                 if _host_control_failure(error):
+                    finite_errors.append(error)
                     # Retain the original resource/error BEFORE deactivation
                     # can remove its contribution and a repeat can skip it.
                     _retain_host_cleanup_failure(
@@ -364,6 +366,7 @@ async def _retire_host_features(features, ctx, runtime, *, deactivate_first=Fals
                 logger.warning(
                     "Host feature %s declarative teardown failed: %s", feature, error
                 )
+                finite_errors.append(error)
                 _retain_host_cleanup_failure(
                     ctx, feature, error, operation="host-feature-deactivate"
                 )
@@ -375,7 +378,10 @@ async def _retire_host_features(features, ctx, runtime, *, deactivate_first=Fals
             deactivate()
     # Do this AFTER every independent peer, including when none are active on
     # a repeat. Never replay an uncertain original hook merely to recover it.
-    failure = _retained_host_cleanup_error(ctx)
+    failure = execution_terminal_error(
+        _retained_host_cleanup_error(ctx), *finite_errors,
+        retain_originals=True, isolate_control_originals=True,
+    )
     return [] if failure is None else [failure]
 
 
@@ -420,7 +426,7 @@ async def stop_host_features(features: List[HostFeature], ctx: Any) -> None:
         if id(feature) not in removed_ids
     )
     if errors:
-        raise execution_terminal_error(*errors)
+        raise execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
 
 
 __all__ = [

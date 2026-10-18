@@ -2269,6 +2269,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
 
     from kestrel_sovereign._async_ownership import (
         OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
+        owned_task_error,
     )
     from kestrel_sovereign.execution_custody import execution_native_source_error
 
@@ -2283,7 +2284,9 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
                 RuntimeError("previous Phoenix supervisor must retire before replacement"),
                 tuple(original for original in (previous_supervisor or resource, phoenix) if original is not None),
             )
-            close_failure = execution_terminal_error(close_failure, mismatch, retain_originals=True)
+            close_failure = execution_terminal_error(
+                close_failure, mismatch, retain_originals=True, isolate_control_originals=True,
+            )
             raise close_failure
         if close_task is None and close_failure is None:
             app.state.phoenix_proxy_close_supervisor = phoenix
@@ -2308,8 +2311,12 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             cancelled = cancelled or outcome.cancellation is not None
             if outcome.cancellation is not None:
                 withdrawals.append(outcome.cancellation)
+            if outcome.error is not None:
+                failures.append(outcome.error)
+            physical = owned_task_error(close_task)
             close_failure = execution_terminal_error(
-                close_failure, outcome.error, retain_originals=True,
+                close_failure, execution_native_source_error(physical) or physical,
+                retain_originals=True,
                 isolate_control_originals=True,
             )
         if close_failure is not None:

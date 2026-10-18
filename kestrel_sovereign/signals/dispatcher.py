@@ -4946,7 +4946,7 @@ class SignalDispatcher:
                         # Publish debt before cancelling the child. Liveness
                         # cleanup cannot switch back to ordinary admission if
                         # that child refuses cancellation or returns normally.
-                        self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, loss)
+                        self._retain_cognition_native_control(delivery, loss)
                         self._rearm_cleanup_runtime_owner_heartbeat()
                         lease_loss_reason = str(loss)
                     else:
@@ -5270,9 +5270,10 @@ class SignalDispatcher:
             # Task.result() can erase a cancellation cause on a second read.
             error = owned_task_error(completed_task)
             debt = getattr(self, "_retained_cognition_control_debt", {}).get(delivery.delivery_id)
-            retained_error = execution_terminal_error(control_error, debt[1] if debt else None)
+            from kestrel_sovereign.execution_custody import execution_native_source_error
+            retained_error = execution_native_source_error(control_error, debt[1] if debt else None)
             if error is not None and is_execution_control_error(error):
-                retained_error = execution_terminal_error(retained_error, error)
+                retained_error = execution_native_source_error(retained_error, error)
             elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # The route's final disposition was already made visible when
                 # retention began.  Harvest this late exception so it cannot
@@ -5293,7 +5294,7 @@ class SignalDispatcher:
             if retained_error is not None:
                 if not hasattr(self, "_retained_cognition_control_debt"):
                     self._retained_cognition_control_debt = {}
-                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained_error)
+                retained_error = self._retain_cognition_native_control(delivery, retained_error)
                 self._rearm_cleanup_runtime_owner_heartbeat()
             self._retained_durable_cognition_tasks.discard(completed_task)
             cleanup = asyncio.create_task(
@@ -5310,10 +5311,7 @@ class SignalDispatcher:
                 error = owned_task_error(cleanup_task)
                 self._retained_durable_cognition_cleanup_tasks.discard(cleanup_task)
                 if error is not None and is_execution_control_error(error):
-                    debt = self._retained_cognition_control_debt.get(delivery.delivery_id)
-                    self._retained_cognition_control_debt[delivery.delivery_id] = (
-                        delivery, execution_terminal_error(debt[1] if debt else None, error),
-                    )
+                    self._retain_cognition_native_control(delivery, error)
                     self._rearm_cleanup_runtime_owner_heartbeat()
                 elif error is not None and not isinstance(error, asyncio.CancelledError):
                     logger.error(
@@ -5363,7 +5361,7 @@ class SignalDispatcher:
 
     async def _settle_cognition_control(self, delivery, error, routing_task):
         """Never terminalize a delivery while its original route can still act."""
-        self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
+        self._retain_cognition_native_control(delivery, error)
         self._rearm_cleanup_runtime_owner_heartbeat()
         if routing_task is not None and not routing_task.done():
             # A late renewal control can replace cancellation of the context
@@ -5375,9 +5373,31 @@ class SignalDispatcher:
             if routing_task is not None:
                 from kestrel_sovereign._async_ownership import owned_task_error
                 from kestrel_sovereign.execution_custody import execution_terminal_error
-                error = execution_terminal_error(error, owned_task_error(routing_task))
+                error = execution_terminal_error(
+                    error, owned_task_error(routing_task), retain_originals=True,
+                    isolate_control_originals=True,
+                )
             await self._terminalize_failed_cognition(delivery, error)
         return error
+
+    def _retain_cognition_native_control(self, delivery, *errors):
+        """One source-only boundary for every existing cognition-debt writer."""
+        from kestrel_sovereign.execution_custody import (
+            _native_source_originals, execution_native_source_error,
+        )
+        prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
+        previous = None if prior is None else prior[1]
+        sources = _native_source_originals(previous)
+        incoming = tuple(source for error in errors for source in _native_source_originals(error))
+        if previous is not None and incoming and all(
+            any(source is old for old in sources) for source in incoming
+        ):
+            retained = previous
+        else:
+            retained = execution_native_source_error(previous, *errors)
+        if retained is not None:
+            self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
+        return retained
 
     async def _terminalize_failed_cognition(
         self, delivery: DurableDelivery, error: BaseException,
@@ -5388,22 +5408,10 @@ class SignalDispatcher:
             owned_task_admission_error,
         )
         from kestrel_sovereign.execution_custody import (
-            _native_source_originals, execution_cleanup_debts, execution_native_source_error, execution_terminal_error,
+            execution_cleanup_debts, execution_native_source_error, execution_terminal_error,
         )
 
-        prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
-        previous = None if prior is None else prior[1]
-        incoming_sources = _native_source_originals(error)
-        prior_sources = _native_source_originals(previous)
-        if previous is not None and incoming_sources and all(
-            any(source is old for old in prior_sources) for source in incoming_sources
-        ):
-            retained_error = previous
-        else:
-            retained_error = execution_native_source_error(previous, error) or execution_terminal_error(
-                previous, error, retain_originals=True, isolate_control_originals=True,
-            )
-        self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained_error)
+        retained_error = self._retain_cognition_native_control(delivery, error)
         self._rearm_cleanup_runtime_owner_heartbeat()
         key = (self._agent.did, delivery.consumer_id, delivery.delivery_id,
             self._durable_delivery_owner, delivery.lease_token or "")
@@ -5447,7 +5455,7 @@ class SignalDispatcher:
                 )
                 retained = (retained_error if already_unadmitted else
                             execution_native_source_error(terminal) or retained_error)
-                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
+                self._retain_cognition_native_control(delivery, retained)
                 if task is None:
                     raise terminal
             owners[key] = task
@@ -5476,8 +5484,7 @@ class SignalDispatcher:
                 # An observer's finite C and ordinary retryable metadata error
                 # are not new shared native source facts. Genuine native
                 # terminalizer uncertainty does remain with this delivery.
-                shared = execution_native_source_error(retained_error, opening, outcome.error)
-                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, shared or retained_error)
+                self._retain_cognition_native_control(delivery, retained_error, opening, outcome.error)
                 self._rearm_cleanup_runtime_owner_heartbeat()
             raise terminal
 

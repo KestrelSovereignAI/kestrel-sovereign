@@ -253,6 +253,12 @@ must not invent a replacement close or replay observer debt. Failed native
 attempts reuse their existing private error carrier instead of growing a new
 exception ancestry on every Stop. Cached publication diagnostics and subsequent
 native failures are composed in isolation from their original source graphs.
+Core-owned completion-observation groups carry canonical source provenance;
+genuine foreign source groups remain whole. Host hook rollback returns its
+current finite failures separately from retained context control. All cognition
+debt writers use the same bounded source-only retention boundary, including
+late route and cleanup completion callbacks. PostgreSQL and Phoenix close
+accounting uses the original Task's physical result, not its joiner's aggregate.
 
 Session-training acquisition and rejected-session release retain the actual
 physical hook task and session when native retirement is unresolved. A later
