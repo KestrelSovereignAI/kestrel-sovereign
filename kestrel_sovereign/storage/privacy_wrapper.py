@@ -30,7 +30,10 @@ from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error, raise_owned_outcome
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission, _retain_owned_admission_error, await_owned_task,
+    create_owned_task, owned_task_error, raise_owned_outcome,
+)
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.deidentification import (
     DEIDENTIFICATION_ASSURANCES,
@@ -463,30 +466,52 @@ class ReentrantTransitionLock:
         if token is None:
             token = _captured_token
         state = {"entered": foreign}
-        retained = asyncio.Event()
+        retained = asyncio.get_running_loop().create_future()
         async def run():
             # Even an eager task factory cannot dispatch the body before its
             # exact dependency and terminal-harvesting records are installed.
-            await retained.wait()
+            opening = await retained
+            if opening is not None:
+                raise opening
             if foreign:
                 return await operation()
             with bind_transition_lock_reentry(token):
                 async with self:
                     state["entered"] = True
                     return await operation()
-        task = create_owned_task(run(), name="privacy-owned-native-work", context=context)
-        self._native_work.add(task)
-        task._kestrel_native_privacy_state = state
-        if foreign:
-            self._native_foreign_frames[task] = frame
-            self._foreign_native_dependencies.setdefault(frame, set()).add(task)
+        admission = OwnedTaskAdmission()
+        try:
+            task = create_owned_task(run(), name="privacy-owned-native-work", context=context,
+                admission=admission, retain_originals=True)
+        except BaseException:
+            if admission.task is None:
+                raise
+            return admission.task  # Same failed native gate, never allocation absence.
         def completed(finished):
             owned_task_error(finished)
             self._native_work.discard(finished)
             self._native_foreign_frames.pop(finished, None)
             self._native_foreign_depths.pop(finished, None)
-        task.add_done_callback(completed)
-        retained.set()
+        try:
+            self._native_work.add(task)
+            task._kestrel_native_privacy_state = state
+            if foreign:
+                self._native_foreign_frames[task] = frame
+                self._foreign_native_dependencies.setdefault(frame, set()).add(task)
+            task.add_done_callback(completed)
+        except BaseException as opening:
+            terminal = _retain_owned_admission_error(task, opening)
+            self._native_work.discard(task)
+            self._native_foreign_frames.pop(task, None)
+            self._native_foreign_depths.pop(task, None)
+            dependencies = self._foreign_native_dependencies.get(frame)
+            if dependencies is not None:
+                dependencies.discard(task)
+                if not dependencies:
+                    self._foreign_native_dependencies.pop(frame, None)
+            retained.set_result(terminal)
+            return task
+        retained.set_result(None)
         return task
 
     async def join_owned_native_work(self):

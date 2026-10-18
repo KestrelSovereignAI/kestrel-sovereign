@@ -93,6 +93,15 @@ class OwnedTaskAdmission:
     task: asyncio.Task | None = None
 
 
+def _retain_owned_admission_error(task, error):
+    """Core-only failed start-gate handoff; the payload must remain unstarted."""
+    from kestrel_sovereign.execution_custody import execution_observation_error, retained_execution_error
+    cached = getattr(task, "_kestrel_owned_terminal_error", None)
+    terminal = retained_execution_error(execution_observation_error(cached, error))
+    task._kestrel_owned_terminal_error = terminal
+    return terminal
+
+
 def create_owned_task(operation, *, name=None, context=None, retain_originals=False,
                       retirement_resource=None, loop=None, admission=None):
     """Capture the original carrier inside a child before asyncio can erase it.
@@ -120,14 +129,15 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         except BaseException as error:
             from kestrel_sovereign.execution_custody import (
                 execution_terminal_error,
+                execution_observation_error,
                 retained_execution_error,
             )
             task = asyncio.current_task()
             cached = getattr(task, "_kestrel_owned_terminal_error", None)
             task._kestrel_owned_terminal_error = retained_execution_error(
-                execution_terminal_error(cached, error,
-                    retain_originals=retain_originals,
-                    isolate_control_originals=cached is not None and cached is not error)
+                execution_observation_error(cached, error)
+                if cached is not None and cached is not error else
+                execution_terminal_error(error, retain_originals=retain_originals)
             )
             raise
     wrapper = run()
@@ -171,6 +181,13 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         task.add_done_callback(close_unstarted)
     except BaseException as opening:
         if gate is not None:
+            # The payload is still behind its failed gate. Retain this actual
+            # source before any later consumer can cancel the Task before its
+            # first step and replace the opening with a synthetic cancellation.
+            from kestrel_sovereign.execution_custody import (
+                execution_terminal_error,
+            )
+            _retain_owned_admission_error(task, execution_terminal_error(opening, retain_originals=retain_originals))
             close_unstarted(task)
             gate.set_result(opening)
         raise
@@ -550,25 +567,39 @@ class OwnedAsyncIterator(Generic[_T]):
         async def run_owned():
             await dispatch.wait()
             await self._run()
-        self._owner = (
-            create_owned_task(run_owned(), name=f"owned_async_iterator:{operation}", context=owner_context)
-            if owner_factory is None else owner_factory(run_owned, owner_context)
-        )
-        # Bound before the producer can run a single step: ``create_task``
-        # only schedules it, so no read can observe an unowned record.
-        self._consumer_close.owner = self._owner
-        self._owner.add_done_callback(self._publish_owner_completion)
+        self._owner = None
+        owner_admission, watcher_admission = OwnedTaskAdmission(), OwnedTaskAdmission()
         try:
+            self._owner = (
+                create_owned_task(run_owned(), name=f"owned_async_iterator:{operation}",
+                    context=owner_context, admission=owner_admission, retain_originals=True)
+                if owner_factory is None else owner_factory(run_owned, owner_context)
+            )
+            # All accepted owners and every subsequent publication belong to
+            # this one construction transaction, including the first callback.
+            self._consumer_close.owner = self._owner
+            self._owner.add_done_callback(self._publish_owner_completion)
             if owner_started is not None:
                 owner_started(self, self._owner)
             self._cancellation_owner = create_owned_task(
                 self._watch_owner_cancellation(),
                 name=f"owned_async_iterator_cancel:{operation}",
+                admission=watcher_admission, retain_originals=True,
             )
             self._cancellation_owner.add_done_callback(
                 self._interrupt_if_watch_never_started
             )
         except BaseException as error:
+            self._owner = self._owner if self._owner is not None else owner_admission.task
+            self._cancellation_owner = (self._cancellation_owner if self._cancellation_owner is not None
+                else watcher_admission.task)
+            if self._owner is None:
+                raise  # True allocation refusal; no accepted owner to join.
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            error = execution_observation_error(error, *(
+                getattr(task, "_kestrel_owned_terminal_error", None)
+                for task in (self._owner, self._cancellation_owner) if task is not None
+            ))
             # No source body has crossed dispatch. Retain the exact partially
             # constructed owner so the async boundary can physically join it;
             # the synchronous constructor cannot manufacture that completion.
@@ -582,7 +613,7 @@ class OwnedAsyncIterator(Generic[_T]):
             self._owner.cancel()
             if self._cancellation_owner is not None:
                 self._cancellation_owner.cancel()
-            raise
+            raise error
         dispatch.set()
 
     def __aiter__(self) -> "OwnedAsyncIterator[_T]":
@@ -698,7 +729,11 @@ class OwnedAsyncIterator(Generic[_T]):
 
     async def _join_source_owners(self):
         """Retain the source AND its original cancellation observer outcomes."""
-        from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+        from kestrel_sovereign.execution_custody import execution_terminal_error, execution_observation_error, is_execution_control_error
+        def compose(*errors):
+            if self._construction_error is not None:
+                return execution_observation_error(*errors)
+            return execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
         watcher_error = watcher.error if watcher is not None else None
@@ -706,11 +741,8 @@ class OwnedAsyncIterator(Generic[_T]):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
         return OwnedTaskOutcome(
             outcome.result,
-            execution_terminal_error(self._terminal_error, outcome.error, watcher_error,
-                retain_originals=True, isolate_control_originals=True),
-            execution_terminal_error(outcome.cancellation,
-                watcher.cancellation if watcher is not None else None,
-                retain_originals=True, isolate_control_originals=True),
+            compose(self._terminal_error, outcome.error, watcher_error),
+            compose(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
 
     def _interrupt_if_watch_never_started(
@@ -858,6 +890,25 @@ class OwnedAsyncIterator(Generic[_T]):
                 if not (debt[0] is self and debt[1] is self._owner)
             )
         raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
+
+
+async def create_owned_iterator(iterator_factory, **options):
+    """Construct a stream and join any accepted partial owner before failure.
+
+    Public async handoffs must use this boundary, not infer that a failed
+    synchronous constructor accepted no producer or cancellation watcher.
+    """
+    try:
+        return OwnedAsyncIterator(iterator_factory, **options)
+    except BaseException as opening:
+        partial = getattr(opening, "_kestrel_failed_owned_iterator", None)
+        if isinstance(partial, OwnedAsyncIterator):
+            try:
+                await partial.aclose()
+            except BaseException as cleanup:
+                from kestrel_sovereign.execution_custody import execution_observation_error
+                raise execution_observation_error(opening, cleanup)
+        raise
 
 
 def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
