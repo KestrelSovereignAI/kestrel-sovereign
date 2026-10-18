@@ -295,3 +295,43 @@ async def test_actual_foreign_privacy_frame_retains_failed_native_handoff(tmp_pa
     finally:
         loop.set_task_factory(previous)
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign", [False, True], ids=["original-consumer", "foreign-consumer"])
+async def test_lazy_genai_stream_retains_original_creation_authority(tmp_path, foreign):
+    from kestrel_sovereign.execution_custody import bind_execution_custody, execution_denial_scopes, require_execution_work
+    from kestrel_sovereign.llm.genai_custody import genai_stream
+    from tests.unit.test_execution_custody import Authority
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "creation-effects.db"))
+    await db.execute("CREATE TABLE effects(id INTEGER)")
+    class Provider:
+        @genai_stream
+        async def source(self, client):
+            require_execution_work()
+            await db.execute_commit("INSERT INTO effects VALUES (1)")
+            yield b"must not borrow the later consumer's context"
+    stream, reader = None, None
+    try:
+        with bind_execution_custody(Authority()) as original:
+            stream = Provider().source(object())
+        if foreign:
+            reader = create_owned_task(anext(stream), retain_originals=True)
+            error = (await await_owned_task(reader)).error
+        else:
+            error = None
+            try:
+                await anext(stream)
+            except BaseException as caught:
+                error = caught
+        assert await db.fetchval("SELECT COUNT(*) FROM effects") == 0
+        assert original in execution_denial_scopes(error)
+    finally:
+        try:
+            if reader is not None:
+                await await_owned_task(reader)
+            if stream is not None:
+                await await_owned_task(create_owned_task(stream.aclose(), retain_originals=True))
+        finally:
+            await db.close()

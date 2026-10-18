@@ -9,7 +9,7 @@ layer and the native body; async-generator finalization is never the owner.
 import inspect
 import sys
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from functools import partial, wraps
 
 from kestrel_sovereign._async_ownership import create_owned_iterator, await_owned_task
@@ -143,6 +143,7 @@ def genai_stream(function):
     @wraps(function)
     def owned(self, client, *args, **kwargs):
         client = client if client is not None else self._get_client()
+        owner_context = copy_context()
         async def produce():
             async with genai_stream_owner(client) as owner:
                 source = owner.retain(function(self, client, *args, **kwargs))
@@ -151,7 +152,7 @@ def genai_stream(function):
         # Acquisition, advancement and closure share ONE task/context even
         # when the caller abandons a read or closes from another task.
         async def forward():
-            iterator = await create_owned_iterator(produce, operation="genai-native-stream")
+            iterator = await create_owned_iterator(produce, operation="genai-native-stream", owner_context=owner_context)
             async with joined_iterator(iterator):
                 async for item in iterator:
                     yield item
