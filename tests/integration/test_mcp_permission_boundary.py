@@ -115,6 +115,7 @@ async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary):
     for generic in ('mcp_call_tool', 'mcp_gateway_call'):
         await peer.store.set_permission('MCPAgent', generic, PermissionLevel.ALLOW)
     result = await peer.invoke('direct-denied')
+    assert await peer.witness() == []
     assert result['success'] is False and 'Permission denied' in result['error']
     for generic, arguments in [
         ('mcp_call_tool', {'container_name': peer.container, 'tool_name': 'record_marker',
