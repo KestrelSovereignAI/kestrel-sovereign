@@ -105,7 +105,7 @@ async def test_outer_consumers_keep_independent_native_sources_immutable(
                     calls.append("first")
                     await native_pg[1].execute('INSERT INTO "' + native_pg[2] + '".effects VALUES (381,\'first actual drain\')')
                     raise source.error
-                async def second():
+                async def second(*, finite_errors=None):
                     calls.append("second")
                     await native_pg[1].execute('INSERT INTO "' + native_pg[2] + '".effects VALUES (382,\'second actual drain\')')
                     raise independent.error

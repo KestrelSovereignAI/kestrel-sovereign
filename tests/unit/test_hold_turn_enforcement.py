@@ -296,7 +296,7 @@ async def test_cli_shell_prints_typed_hold_refusal(
         "initialize_with_bound_hold_context",
         initialize_with_hold,
     )
-    monkeypatch.setattr(hold_module, "close_bound_host_context", close_context)
+    monkeypatch.setattr("kestrel_sovereign.hold.enforcement.close_bound_host_context", close_context)
     monkeypatch.setattr(builtins, "input", lambda _prompt: next(inputs))
 
     result = await cli_module._run_shell(tmp_path, SimpleNamespace(app=None))

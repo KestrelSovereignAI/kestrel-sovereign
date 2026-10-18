@@ -359,6 +359,7 @@ class ChildTerminationReconciliationError(RuntimeError):
     def __init__(self, *, child_name: str, cause: Exception) -> None:
         self.child_name = child_name
         self.cause = cause
+        self.__cause__ = cause
         self.metadata = {
             "code": "child_termination_reconciliation_failed",
             "child_name": child_name,
@@ -752,6 +753,7 @@ class _OwnedLifecycleOperation:
 
     async def join(
         self, name: str, *, withdrawals: list[BaseException] | None = None,
+        finite_errors: list[BaseException] | None = None,
     ) -> tuple[bool, BaseException | None]:
         self.start(name)
         task = self.admission.task
@@ -782,6 +784,10 @@ class _OwnedLifecycleOperation:
         # A pending cancellation count may already have been handled by the
         # body. Only an actual newly delivered withdrawal is a join outcome.
         cancelled = withdrawal is not None
+        if finite_errors is not None:
+            finite_errors.extend(error for error in (self.failure, outcome.error if outcome is not None else None, withdrawal)
+                                 if error is not None)
+            return cancelled, None
         return cancelled, execution_finite_error(
             self.failure, outcome.error if outcome is not None else None, withdrawal, retain_originals=True,
             isolate_control_originals=True,
@@ -2514,6 +2520,7 @@ class AgentManager:
         await lifecycle_lock.acquire()
         lock_owned = True
         authority_added = False
+        withdrawals = []
         try:
             async with self._lock:
                 existing = self._scheduler_authority_by_did.get(agent_id)
@@ -2555,7 +2562,7 @@ class AgentManager:
                 name=f"scheduler_tenant_registration:{name}",
             )
             cancelled, failure = await await_lifecycle_task_completion(
-                registration_task
+                registration_task, withdrawals=withdrawals,
             )
             if failure is not None:
                 raise failure
@@ -2574,11 +2581,13 @@ class AgentManager:
                     name=f"scheduler_tenant_registration_cancel:{name}",
                 )
                 _, rollback_failure = await await_lifecycle_task_completion(
-                    rollback_task
+                    rollback_task, withdrawals=withdrawals,
                 )
                 lock_owned = False
                 if rollback_failure is not None:
-                    raise rollback_failure
+                    raise execution_finite_error(rollback_failure, *withdrawals)
+                if withdrawals:
+                    raise withdrawals[-1]
                 raise asyncio.CancelledError()
             return registration
         except BaseException:
@@ -3256,6 +3265,8 @@ class AgentManager:
     async def _rollback_host_onboarding(
         name: str,
         agent: KestrelAgent,
+        *, withdrawals: list[BaseException] | None = None,
+        finite_errors: list[BaseException] | None = None,
     ) -> tuple[bool, Optional[BaseException]]:
         """Join app-state rollback while the registration writer is held."""
 
@@ -3268,7 +3279,7 @@ class AgentManager:
         if not isinstance(onboarding_rollback, _OwnedLifecycleOperation):
             onboarding_rollback = _OwnedLifecycleOperation(onboarding_rollback)
             agent._host_onboarding_rollback = onboarding_rollback
-        result = await onboarding_rollback.join(name)
+        result = await onboarding_rollback.join(name, withdrawals=withdrawals, finite_errors=finite_errors)
         if onboarding_rollback.failure is None:
             vars(agent).pop("_host_onboarding_rollback", None)
         return result
@@ -3285,8 +3296,9 @@ class AgentManager:
         cleanup explicitly.
         """
         cancelled = False
+        finite_errors, withdrawals = [], []
         rollback_cancelled, onboarding_failure = (
-            await AgentManager._rollback_host_onboarding(name, agent)
+            await AgentManager._rollback_host_onboarding(name, agent, withdrawals=withdrawals, finite_errors=finite_errors)
         )
         cancelled = cancelled or rollback_cancelled
         rollback_failure: Optional[BaseException] = None
@@ -3298,7 +3310,7 @@ class AgentManager:
             # owned rollback task keeps the global protocol cleanup joinable
             # across repeated caller cancellation.
             rollback_cancelled, rollback_failure = (
-                await registration._rollback_owner.join(name)
+                await registration._rollback_owner.join(name, withdrawals=withdrawals, finite_errors=finite_errors)
             )
             cancelled = cancelled or rollback_cancelled
             if registration._rollback_owner.failure is None:
@@ -3330,7 +3342,7 @@ class AgentManager:
         # live. Lightweight test doubles do not expose this contract.
         try:
             cancelled = await await_agent_shutdown_completion(
-                agent, prior_error=shutdown_failure,
+                agent, prior_error=shutdown_failure, withdrawals=withdrawals, finite_errors=finite_errors,
             ) or cancelled
         except BaseException as error:
             shutdown_failure = error
@@ -3339,6 +3351,8 @@ class AgentManager:
             for failure in (onboarding_failure, rollback_failure, shutdown_failure)
             if failure is not None
         ]
+        failures.extend(finite_errors)
+        failures.extend(withdrawals)
         if failures:
             _raise_lifecycle_outcomes(
                 "Unregistered agent integration rollback failed",
@@ -4885,6 +4899,17 @@ class AgentManager:
         task against the deadline instead, fence synchronously, and then join
         cancellation-resistant work before destructive cleanup can overtake it.
         """
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        def expiry_with_originals(expiry, *errors):
+            observed = execution_observation_error(*errors)
+            if observed is not None and is_execution_control_error(observed):
+                return execution_finite_error(expiry, observed)
+            if observed is not None:
+                # This expiry is a fresh private typed refusal. Do not append
+                # independent failures to a shared hook/fence source graph.
+                expiry.__cause__ = observed
+            return expiry
 
         if deadline is None:
             return await operation()
@@ -4892,61 +4917,101 @@ class AgentManager:
             self._require_spawn_admission_time(
                 deadline, phase=phase, agent=agent
             )
-        except PersistedSpawnMandateExpiredError:
+        except PersistedSpawnMandateExpiredError as expiry:
             if on_expiry is not None:
-                on_expiry()
+                try:
+                    on_expiry()
+                except BaseException as error:
+                    raise expiry_with_originals(expiry, error)
             raise
         remaining = deadline - asyncio.get_running_loop().time()
-        task = asyncio.create_task(
-            operation(),
-            name=f"spawn_admission:{phase}",
-        )
+        receipt = OwnedTaskAdmission()
+        try:
+            task = create_owned_task(operation(), name=f"spawn_admission:{phase}",
+                                     retain_originals=True, admission=receipt)
+        except BaseException as opening:
+            task = receipt.task
+            observed = []
+            failure = None
+            if task is not None:
+                _, failure = await await_lifecycle_task_completion(task, withdrawals=observed)
+            raise execution_observation_error(opening, failure, *observed)
+        publications = []
         if admission is not None:
             self._admission_delegate_tasks[task] = admission
 
             def retire_delegate(completed: asyncio.Task) -> None:
                 self._admission_delegate_tasks.pop(completed, None)
 
-            task.add_done_callback(retire_delegate)
+            try:
+                task.add_done_callback(retire_delegate)
+            except BaseException as error:
+                publications.append(error)
         try:
-            done, _pending = await asyncio.wait(
-                {task}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
-            )
-        except asyncio.CancelledError:
-            task.cancel()
-            await await_lifecycle_task_completion(task)
-            raise
-        if task not in done:
-            task.cancel()
-            self._retain_expired_admission_operation(task)
-            if on_expiry is not None:
-                on_expiry()
-            # Fencing is synchronous, but cleanup must not overtake a hook that
-            # retained cancellation and still holds a direct agent reference.
-            # Join its terminal outcome before the caller rolls back routes,
-            # storage, or runtime credentials.
-            _cancelled, failure = await await_lifecycle_task_completion(task)
-            if failure is not None:
-                logger.warning(
-                    "Expired spawn admission work ended with %s during %s",
-                    type(failure).__name__,
-                    phase,
+            try:
+                done, _pending = await asyncio.wait(
+                    {task}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
                 )
-            raise PersistedSpawnMandateExpiredError(
-                f"Persisted spawn mandate expired during {phase}"
-            )
-        result = task.result()
-        # Completion and the timer can become runnable in the same loop turn.
-        # Recheck the signed clock so a just-late result cannot reopen admission.
-        try:
-            self._require_spawn_admission_time(
-                deadline, phase=phase, agent=agent
-            )
-        except PersistedSpawnMandateExpiredError:
-            if on_expiry is not None:
-                on_expiry()
-            raise
-        return result
+            except asyncio.CancelledError as cancellation:
+                task.cancel()
+                withdrawals = [cancellation]
+                _, failure = await await_lifecycle_task_completion(task, withdrawals=withdrawals)
+                if publications or failure is not None and is_execution_control_error(failure):
+                    raise execution_observation_error(*publications, failure, *withdrawals)
+                raise
+            if task not in done:
+                task.cancel()
+                try:
+                    self._retain_expired_admission_operation(task)
+                except BaseException as error:
+                    publications.append(error)
+                fence_failure = None
+                if on_expiry is not None:
+                    try:
+                        on_expiry()
+                    except BaseException as error:
+                        fence_failure = error
+                # Neither bookkeeping publication nor the fence callback may
+                # let destructive cleanup overtake this accepted original.
+                withdrawals = []
+                try:
+                    _cancelled, failure = await await_lifecycle_task_completion(task, withdrawals=withdrawals)
+                except BaseException as error:
+                    failure = error
+                if failure is not None:
+                    logger.warning(
+                        "Expired spawn admission work ended with %s during %s",
+                        type(failure).__name__, phase,
+                    )
+                expiry = PersistedSpawnMandateExpiredError(
+                    f"Persisted spawn mandate expired during {phase}"
+                )
+                raise expiry_with_originals(expiry, *publications, fence_failure, failure, *withdrawals)
+            failure = owned_task_error(task)
+            if failure is not None:
+                raise execution_observation_error(*publications, failure)
+            result = task.result()
+            # A just-late result may not reopen signed admission, even if
+            # reporting its bookkeeping had failed independently.
+            try:
+                self._require_spawn_admission_time(deadline, phase=phase, agent=agent)
+            except PersistedSpawnMandateExpiredError as expiry:
+                fence_failure = None
+                if on_expiry is not None:
+                    try:
+                        on_expiry()
+                    except BaseException as error:
+                        fence_failure = error
+                raise expiry_with_originals(expiry, *publications, fence_failure)
+            if publications:
+                raise execution_observation_error(*publications)
+            return result
+        finally:
+            if task.done():
+                # A failed observer cannot leave settled delegate/expiry
+                # bookkeeping behind after this owner physically joined it.
+                self._admission_delegate_tasks.pop(task, None)
+                self._expired_admission_operations.discard(task)
 
     def _retain_expired_admission_operation(self, task: asyncio.Task) -> None:
         """Own a cancellation-resistant operation beyond its expired wait."""
@@ -4955,10 +5020,9 @@ class AgentManager:
 
         def retire(completed: asyncio.Task) -> None:
             self._expired_admission_operations.discard(completed)
-            try:
-                completed.exception()
-            except (asyncio.CancelledError, Exception):
-                pass
+            # Cache the first actual cancellation carrier before asyncio can
+            # discard its native provenance on a subsequent exception() read.
+            owned_task_error(completed)
 
         task.add_done_callback(retire)
 
@@ -7317,11 +7381,12 @@ class AgentManager:
                     await self.terminate_children(root_did, offboard_runtime=False)
                 except BaseException as exc:
                     outcomes.append(exc)
+            drain_withdrawals = []
             try:
-                if await self.drain_quarantined_shutdowns():
-                    outcomes.append(asyncio.CancelledError())
+                await self.drain_quarantined_shutdowns(withdrawals=drain_withdrawals)
             except BaseException as exc:
                 outcomes.append(exc)
+            outcomes.extend(drain_withdrawals)
             _raise_lifecycle_outcomes(
                 "Standalone spawn descendant shutdown had terminal failures",
                 outcomes,
@@ -8320,9 +8385,10 @@ class AgentManager:
                 "cold-wake lifecycle owner"
             )
         if _spawn_rollback_admission is None:
-            join_cancelled = await self._join_active_spawn_before_removal(name)
+            withdrawals = []
+            join_cancelled = await self._join_active_spawn_before_removal(name, withdrawals=withdrawals)
             if join_cancelled:
-                raise asyncio.CancelledError()
+                raise withdrawals[-1] if withdrawals else asyncio.CancelledError()
             async with self._lock:
                 if self._active_quarantined_cleanup_name_is_reserved(
                     self._canonical_agent_name(name)
@@ -8512,7 +8578,7 @@ class AgentManager:
                 )
         return removed
 
-    async def _join_active_spawn_before_removal(self, name: str) -> bool:
+    async def _join_active_spawn_before_removal(self, name: str, *, withdrawals=None) -> bool:
         """Fence DELETE behind the spawn that still owns receipt rollback.
 
         A published child can remain inside provider I/O before governance
@@ -8552,7 +8618,10 @@ class AgentManager:
                     "governance commit; the spawn owner must revoke its receipt first"
                 )
             return False
-        cancelled, _failure = await await_lifecycle_task_completion(spawn_task)
+        observed = [] if withdrawals is None else withdrawals
+        cancelled, failure = await await_lifecycle_task_completion(spawn_task, withdrawals=observed)
+        if failure is not None and is_execution_control_error(failure):
+            raise execution_finite_error(failure, *observed)
         return cancelled
 
     async def _remove_agent_serialized(
@@ -8843,6 +8912,7 @@ class AgentManager:
 
         assert cold_identity_offboarding is not None
         cold_name, revoked, cold_config = cold_identity_offboarding
+        withdrawals = []
         admitted, admission_cancelled = (
             await self._admit_agent_runtime_offboarding_identity(
                 name=cold_name,
@@ -8850,6 +8920,7 @@ class AgentManager:
                 config=cold_config,
                 revoked=revoked,
                 pending_offboarding=pending_offboarding,
+                withdrawals=withdrawals,
                 retire_persistent_registration=(
                     offboarding_admission is not None
                     or self._has_exact_persistent_spawn_registration(
@@ -8866,14 +8937,16 @@ class AgentManager:
                 cold_name,
             )
             if admission_cancelled:
-                raise asyncio.CancelledError()
+                raise withdrawals[-1] if withdrawals else asyncio.CancelledError()
             return False
-        withdrawals = []
-        reconciliation_cancelled = (
-            await self._reconcile_fully_removed_child_tracking(
-                withdrawals=withdrawals,
+        try:
+            reconciliation_cancelled = (
+                await self._reconcile_fully_removed_child_tracking(
+                    withdrawals=withdrawals,
+                )
             )
-        )
+        except BaseException as error:
+            raise execution_finite_error(error, *withdrawals)
         terminal = execution_finite_error(
             *withdrawals, retain_originals=True, isolate_control_originals=True,
         )
@@ -8884,7 +8957,7 @@ class AgentManager:
             cold_name,
         )
         if admission_cancelled or reconciliation_cancelled:
-            raise asyncio.CancelledError()
+            raise withdrawals[-1] if withdrawals else asyncio.CancelledError()
         return True
 
     def _handoff_shutdown_to_quarantined_reaper(
@@ -9073,6 +9146,7 @@ class AgentManager:
         revoked: Optional[tuple[str, LocalAgentConfig]],
         pending_offboarding: list[InflightRuntimeOffboarding],
         retire_persistent_registration: bool = False,
+        withdrawals: Optional[list[BaseException]] = None,
     ) -> tuple[bool, bool]:
         """Atomically seal-check and register one cold-identity deletion.
 
@@ -9085,15 +9159,12 @@ class AgentManager:
         decision has completed.
         """
 
-        acquire = asyncio.create_task(
-            self._lock.acquire(),
+        cancelled = await self._acquire_manager_lifecycle_lock(
+            self._lock,
             name="agent_manager:admit_identity_runtime_offboarding",
+            message="Unable to serialize identity runtime offboarding admission",
+            withdrawals=withdrawals,
         )
-        cancelled, failure = await await_lifecycle_task_completion(acquire)
-        if failure is not None:
-            raise RuntimeError(
-                "Unable to serialize identity runtime offboarding admission"
-            ) from failure
         try:
             if self._quarantined_shutdown_handoffs_sealed:
                 if revoked is not None:
@@ -9627,6 +9698,7 @@ class AgentManager:
         self,
         *,
         reported_budget_release_failures: Optional[set[str]] = None,
+        withdrawals: Optional[list[BaseException]] = None,
     ) -> bool:
         """Join every active quarantined shutdown before retiring this manager.
 
@@ -9649,7 +9721,7 @@ class AgentManager:
         # this drain has already declared empty.  The seal is released after
         # every attempt: a failure that leaves an agent or a delegated hold
         # retained must remain retryable by a later startup/server shutdown.
-        withdrawals: list[BaseException] = []
+        withdrawals = [] if withdrawals is None else withdrawals
         acquired = False
         try:
             cancelled = await self._acquire_quarantined_shutdown_drain(withdrawals=withdrawals)
@@ -9697,6 +9769,7 @@ class AgentManager:
         observed_cleanup_tasks: set[int] = set()
         observed_budget_releases: set[str] = set()
         refund_withdrawals = [] if withdrawals is None else withdrawals
+        join_originals, boundary_errors = [], []
         # ``shutdown_all`` may have already joined and reported a release
         # before this terminal drain gets to its retained unsafe metadata.
         # That evidence must remain for a later drain, but one fleet-shutdown
@@ -9777,6 +9850,8 @@ class AgentManager:
                     )
                     cancelled = cancelled or join_cancelled
                     classified_outcome = False
+                    if failure is not None:
+                        join_originals.append(failure)
                     if failure is None and record.runtime_outcome_required:
                         failure = _runtime_offboarding_outcome_error(
                             agent_name=record.agent_name,
@@ -9806,6 +9881,8 @@ class AgentManager:
                     ) = await await_lifecycle_task_completion(runtime_offboarding.task, withdrawals=refund_withdrawals)
                     cancelled = cancelled or join_cancelled
                     classified_outcome = False
+                    if offboarding_failure is not None:
+                        join_originals.append(offboarding_failure)
                     if offboarding_failure is None:
                         offboarding_failure = _runtime_offboarding_outcome_error(
                             agent_name=runtime_offboarding.agent_name,
@@ -9843,6 +9920,8 @@ class AgentManager:
                         budget_release.task, withdrawals=refund_withdrawals,
                     )
                     cancelled = cancelled or join_cancelled
+                    if release_failure is not None:
+                        join_originals.append(release_failure)
                     if (
                         release_failure is not None
                         and budget_release.release_id
@@ -9939,11 +10018,16 @@ class AgentManager:
                         "release failure record(s) were evicted before acknowledgement"
                     )
                 )
+        except BaseException as error:
+            boundary_errors.append(error)
         finally:
             if sealed:
-                cancelled = (
-                    await self._set_quarantined_shutdown_handoffs_sealed(False, withdrawals=refund_withdrawals)
-                ) or cancelled
+                try:
+                    cancelled = (
+                        await self._set_quarantined_shutdown_handoffs_sealed(False, withdrawals=refund_withdrawals)
+                    ) or cancelled
+                except BaseException as error:
+                    boundary_errors.append(error)
 
         # Preserve both cancellation and every sanitized cleanup failure after
         # all owned work has settled. A BaseExceptionGroup is required because
@@ -9952,16 +10036,15 @@ class AgentManager:
         # collected. A successful join retains the established ``True`` return
         # value so callers can choose when to re-raise cancellation themselves.
         control = vars(self).get("_quarantined_shutdown_control")
-        if control is not None:
+        if any(is_execution_control_error(error) for error in (control, *join_originals, *boundary_errors)):
             raise execution_finite_error(
-                control, *refund_withdrawals, *failures,
-                retain_originals=bool(refund_withdrawals),
-                isolate_control_originals=bool(refund_withdrawals),
+                control, *join_originals, *boundary_errors, *refund_withdrawals, *failures,
             )
-        if cancelled and failures:
+        _raise_lifecycle_outcomes("Quarantined shutdown boundary failed", boundary_errors)
+        if refund_withdrawals and failures:
             raise BaseExceptionGroup(
                 "Quarantined shutdown drain observed cancellation and failures",
-                [asyncio.CancelledError(), *failures],
+                [*refund_withdrawals, *failures],
             )
         if failures:
             raise ExceptionGroup(
@@ -13572,7 +13655,9 @@ class AgentManager:
                 # a rollback failure and cannot be allowed to abort that
                 # sweep.  Defer it so the terminal report retains both facts
                 # after every live agent has received cleanup.
-                if isinstance(failure, BaseExceptionGroup) and not isinstance(
+                if failure is not None and is_execution_control_error(failure) and _is_lifecycle_terminal_outcome(failure):
+                    failures.append(failure)
+                elif isinstance(failure, BaseExceptionGroup) and not isinstance(
                     failure, Exception
                 ):
                     expected, unexpected = failure.split(
@@ -13611,6 +13696,7 @@ class AgentManager:
 
         cancelled = False
         joined_spawns: set[asyncio.Future[object]] = set()
+        failures, withdrawals = [], []
         try:
             while True:
                 async with self._lock:
@@ -13729,16 +13815,20 @@ class AgentManager:
                     break
                 for spawn_task in earlier_spawns:
                     joined_spawns.add(spawn_task)
-                    task_cancelled, _failure = await await_lifecycle_task_completion(
-                        spawn_task
+                    task_cancelled, failure = await await_lifecycle_task_completion(
+                        spawn_task, withdrawals=withdrawals,
                     )
                     cancelled = cancelled or task_cancelled
+                    if failure is not None and is_execution_control_error(failure):
+                        failures.append(failure)
+            if failures:
+                raise execution_finite_error(*failures, *withdrawals)
         except BaseException:
             self.end_terminal_descendant_spawn_fence(token)
             raise
         if cancelled:
             self.end_terminal_descendant_spawn_fence(token)
-            raise asyncio.CancelledError()
+            raise withdrawals[-1] if withdrawals else asyncio.CancelledError()
         return token
 
     def end_terminal_descendant_spawn_fence(
@@ -14414,6 +14504,9 @@ class AgentManager:
         terminal_outcomes: list[BaseException] = []
 
         # Cascade: terminate grandchildren first. A retained runtime tree is a
+        withdrawals: list[BaseException] = []
+        # Every settlement and compensation contributes to this SAME finite
+        # call. A True cancellation flag is never a replacement for its cause.
         # terminal offboarding outcome, not permission to abandon later
         # siblings or the now-stopped parent. Preserve it for the caller after
         # every reachable lifecycle target has received its teardown attempt.
@@ -14553,7 +14646,7 @@ class AgentManager:
                 registration_rollback(),
                 name=f"restore_persistent_child_registration:{child_name}",
             )
-            return await await_lifecycle_task_completion(rollback_task)
+            return await await_lifecycle_task_completion(rollback_task, withdrawals=withdrawals)
 
         # NB: the child's own budget hold is released inside remove_agent below
         # (stop-then-release), after the cascade above has already stopped and
@@ -14630,7 +14723,9 @@ class AgentManager:
                     )
                 if startup_registration is not None and offboarding_admission is None:
                     offboarding_admission = RuntimeOffboardingAdmission()
-        except (Exception, asyncio.CancelledError) as setup_error:
+        except BaseException as setup_error:
+            if not _is_lifecycle_terminal_outcome(setup_error):
+                raise
             setup_outcomes: list[BaseException] = [setup_error]
             settlement = asyncio.create_task(
                 self._settle_destructive_spawn_retirement(
@@ -14639,7 +14734,7 @@ class AgentManager:
                 name=f"terminate_child_setup_retirement_settle:{child_name}",
             )
             settlement_cancelled, settlement_failure = (
-                await await_lifecycle_task_completion(settlement)
+                await await_lifecycle_task_completion(settlement, withdrawals=withdrawals)
             )
             if settlement_failure is not None:
                 setup_outcomes.append(settlement_failure)
@@ -14648,8 +14743,7 @@ class AgentManager:
             )
             if rollback_failure is not None:
                 setup_outcomes.append(rollback_failure)
-            if settlement_cancelled or rollback_cancelled:
-                setup_outcomes.append(asyncio.CancelledError())
+            setup_outcomes.extend(withdrawals)
             _raise_lifecycle_outcomes(
                 f"Child {child_name!r} offboarding setup failed",
                 setup_outcomes,
@@ -14709,10 +14803,7 @@ class AgentManager:
                 rollback_outcomes: list[BaseException] = [removal_error]
                 if rollback_failure is not None:
                     rollback_outcomes.append(rollback_failure)
-                if rollback_cancelled and not _contains_lifecycle_cancellation(
-                    removal_error
-                ):
-                    rollback_outcomes.append(asyncio.CancelledError())
+                rollback_outcomes.extend(withdrawals)
                 _raise_lifecycle_outcomes(
                     f"Child {child_name!r} removal and registration compensation failed",
                     rollback_outcomes,
@@ -14722,9 +14813,10 @@ class AgentManager:
                     await compensate_registration_if_not_admitted()
                 )
                 if rollback_failure is not None:
-                    raise rollback_failure
+                    raise execution_finite_error(rollback_failure, *withdrawals)
                 if rollback_cancelled:
-                    raise asyncio.CancelledError()
+                    _raise_lifecycle_outcomes("Child removal compensation observed withdrawal",
+                                              [*terminal_outcomes, *withdrawals])
         except BaseException as exc:
             if (
                 startup_registration is not None
@@ -14745,11 +14837,9 @@ class AgentManager:
             (
                 retirement_cancelled,
                 retirement_failure,
-            ) = await await_lifecycle_task_completion(retirement_settlement)
+            ) = await await_lifecycle_task_completion(retirement_settlement, withdrawals=withdrawals)
             if retirement_failure is not None:
                 terminal_outcomes.append(retirement_failure)
-            if retirement_cancelled:
-                terminal_outcomes.append(asyncio.CancelledError())
             reconciliation = asyncio.create_task(
                 self._prune_child_tracking_if_fully_removed(parent_did, child_name),
                 name=f"terminate_child_terminal_reconcile:{child_name}",
@@ -14757,9 +14847,9 @@ class AgentManager:
             (
                 reconciliation_cancelled,
                 reconciliation_failure,
-            ) = await await_lifecycle_task_completion(reconciliation)
+            ) = await await_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
             if reconciliation_failure is not None:
-                if not isinstance(reconciliation_failure, Exception):
+                if not _is_lifecycle_terminal_outcome(reconciliation_failure):
                     raise reconciliation_failure
                 logger.error(
                     "Unable to reconcile terminal termination of child %r",
@@ -14774,10 +14864,8 @@ class AgentManager:
                     ChildTerminationReconciliationError(
                         child_name=child_name,
                         cause=reconciliation_failure,
-                    )
+                    ) if isinstance(reconciliation_failure, Exception) else reconciliation_failure
                 )
-            if reconciliation_cancelled:
-                terminal_outcomes.append(asyncio.CancelledError())
             if (
                 offboard_runtime
                 and reconciliation_failure is None
@@ -14792,6 +14880,7 @@ class AgentManager:
                 except Exception as retirement_failure:
                     terminal_outcomes.append(retirement_failure)
             terminal_outcomes.append(exc)
+            terminal_outcomes.extend(withdrawals)
             _raise_lifecycle_outcomes(
                 f"Child {child_name!r} termination had terminal failures",
                 terminal_outcomes,
@@ -14840,9 +14929,9 @@ class AgentManager:
         (
             reconciliation_cancelled,
             reconciliation_failure,
-        ) = await await_lifecycle_task_completion(reconciliation)
+        ) = await await_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
         if reconciliation_failure is not None:
-            if not isinstance(reconciliation_failure, Exception):
+            if not _is_lifecycle_terminal_outcome(reconciliation_failure):
                 raise reconciliation_failure
             logger.error(
                 "Unable to reconcile completed termination of child %r",
@@ -14857,10 +14946,8 @@ class AgentManager:
                 ChildTerminationReconciliationError(
                     child_name=child_name,
                     cause=reconciliation_failure,
-                )
+                ) if isinstance(reconciliation_failure, Exception) else reconciliation_failure
             )
-        if reconciliation_cancelled:
-            terminal_outcomes.append(asyncio.CancelledError())
         if (
             offboard_runtime
             and reconciliation_failure is None
@@ -14883,7 +14970,7 @@ class AgentManager:
             )
         _raise_lifecycle_outcomes(
             f"Child {child_name!r} descendant termination failed",
-            terminal_outcomes,
+            [*terminal_outcomes, *withdrawals],
         )
         return True
 

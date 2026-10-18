@@ -376,7 +376,7 @@ async def test_missing_wal_is_reported_absent(tmp_path):
 
 @pytest.mark.asyncio
 async def test_snapshot_close_reports_primary_journal_mode(
-    tmp_path, short_close_window
+    tmp_path, monkeypatch
 ):
     backend = await _connected_wal_backend(tmp_path / "snapshot.db")
     snapshot = await backend._open_snapshot_read_connection()
@@ -387,18 +387,24 @@ async def test_snapshot_close_reports_primary_journal_mode(
     )
     worker = aiosqlite_worker(snapshot)
     try:
-        with pytest.raises(ConnectionError) as raised:
-            await sqlite_backend_module._close_aiosqlite_connection(
-                snapshot,
-                retained_closes=backend._retired_connection_closes,
-                diagnostics=backend._close_diagnostics(),
-            )
+        # Only the deliberately stalled snapshot close has a 60ms budget.
+        # Its independently owned primary connection is ordinary teardown,
+        # not another injected slow-close operation under that short window.
+        with monkeypatch.context() as fault:
+            fault.setattr(sqlite_backend_module, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", _SHORT_WINDOW_S)
+            with pytest.raises(ConnectionError) as raised:
+                await sqlite_backend_module._close_aiosqlite_connection(
+                    snapshot,
+                    retained_closes=backend._retired_connection_closes,
+                    diagnostics=backend._close_diagnostics(),
+                )
     finally:
         await _retire(backend, release, worker)
         await backend.close()
 
     message = str(raised.value)
     assert "database=snapshot.db" in message
+    assert _SHORT_BUDGET in message
     assert "journal_mode=wal" in message
     assert "wal_bytes=" in message
 

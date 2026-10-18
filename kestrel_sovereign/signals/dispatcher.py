@@ -2642,10 +2642,7 @@ class SignalDispatcher:
         cleanup_errors = []
         for drain in (self._drain_outcome_log_tasks, self._drain_post_commit_reservation_repairs):
             try:
-                if drain == self._drain_outcome_log_tasks:
-                    await drain(finite_errors=cleanup_errors)
-                else:
-                    await drain()
+                await drain(finite_errors=cleanup_errors)
             except BaseException as error:
                 cleanup_errors.append(error)
         cleanup_error = execution_finite_error(*cleanup_errors)
@@ -2987,7 +2984,7 @@ class SignalDispatcher:
         if error is not None:
             raise error
 
-    async def _drain_post_commit_reservation_repairs(self) -> None:
+    async def _drain_post_commit_reservation_repairs(self, *, finite_errors=None) -> None:
         """Await every dispatcher-owned committed-reservation repair.
 
         Unlike general agent background work, a reservation repair is part of
@@ -2995,21 +2992,32 @@ class SignalDispatcher:
         therefore run to completion before the owner release below makes any
         remaining work visible to a restart worker.
         """
+        originals = []
+        observed = set()
         while self._post_commit_reservation_repairs:
-            repairs = tuple(self._post_commit_reservation_repairs)
+            repairs = tuple(task for task in self._post_commit_reservation_repairs if task not in observed)
+            if not repairs:
+                # A reentrant join can retain a genuinely pending original.
+                # Its native debt, not a busy re-observation loop, owns it.
+                break
             from kestrel_sovereign._async_ownership import await_owned_task
-            error = None
             for repair in repairs:
+                observed.add(repair)
                 outcome = await await_owned_task(repair)
-                error = execution_finite_error(
-                    error, outcome.error, outcome.cancellation,
-                    retain_originals=True, prefer_cancellation=True,
-                    isolate_control_originals=True,
-                )
-            if error is not None:
-                raise error
-        if self._outcome_log_control_error is not None:
-            raise execution_finite_error(self._outcome_log_control_error)
+                originals.extend((outcome.error, outcome.cancellation))
+                if repair.done():
+                    # The producer's completion callback does the same discard.
+                    # This is physical Task retirement, not a native success ACK.
+                    self._post_commit_reservation_repairs.discard(repair)
+        originals.append(self._outcome_log_control_error)
+        if finite_errors is not None:
+            finite_errors.extend(error for error in originals if error is not None)
+            return
+        error = execution_finite_error(*originals,
+                                       retain_originals=True, prefer_cancellation=True,
+                                       isolate_control_originals=True)
+        if error is not None:
+            raise error
 
     def _retain_durable_writer_control(self, error: BaseException | None) -> None:
         """One existing bounded safety latch for this runtime's native writers."""

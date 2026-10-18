@@ -606,7 +606,6 @@ async def _run_shell(
     from kestrel_sovereign.security.encryption import DecryptionError
     from kestrel_sovereign.kestrel_agent import (
         KestrelAgent,
-        await_agent_shutdown_completion,
     )
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
@@ -638,7 +637,7 @@ async def _run_shell(
         constitution_source_descriptor_path=constitution_source_descriptor,
     )
     from kestrel_sovereign.hold import (
-        close_bound_host_context,
+        complete_bound_agent_shutdown,
         initialize_with_bound_hold_context,
     )
 
@@ -669,6 +668,7 @@ async def _run_shell(
     decryption_error_count = 0
     MAX_DECRYPTION_ERRORS = 3
 
+    body_failure = None
     try:
         while True:
             user_input = input("\n> ")
@@ -709,8 +709,11 @@ async def _run_shell(
 
     except KeyboardInterrupt:
         print("\nDeactivating agent...")
+    except BaseException as error:
+        body_failure = error
+        raise
     finally:
-        cancelled = False
+        failures = [body_failure] if body_failure is not None else []
         try:
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
             print("Agent deactivated.")
@@ -719,15 +722,13 @@ async def _run_shell(
                 f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
                 "waiting for durable cleanup."
             )
-        except asyncio.CancelledError:
-            cancelled = True
+        except asyncio.CancelledError as error:
+            failures.append(error)
             print("Agent shutdown cancelled.")
-        except Exception:
+        except BaseException as error:
+            failures.append(error)
             print("Agent deactivated (with errors).")
-        cancelled = await await_agent_shutdown_completion(agent) or cancelled
-        await close_bound_host_context(hold_context)
-        if cancelled:
-            raise asyncio.CancelledError()
+        await complete_bound_agent_shutdown(agent, hold_context, prior_errors=failures)
 
     return 0
 

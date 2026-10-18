@@ -484,6 +484,10 @@ def _raise_unexpected_lifecycle_exception_group(
 
     _expected, unexpected = error.split((asyncio.CancelledError, Exception))
     if unexpected is not None:
+        if is_execution_control_error(error):
+            # Propagate process-control leaves without filtering away an
+            # independent original native source from this finite envelope.
+            raise error
         raise unexpected
 
 
@@ -9891,11 +9895,19 @@ Expected Duration: {expected_duration}
             raise TypeError("shutdown reaper handoff requires an asyncio future")
 
         async def reap() -> None:
+            originals, withdrawals = [], []
             try:
-                _cancelled, failure = await await_lifecycle_task_completion(shutdown_task)
+                _cancelled, failure = await await_lifecycle_task_completion(shutdown_task, withdrawals=withdrawals)
             except BaseException as error:
                 failure = error
-            await await_agent_shutdown_completion(self, prior_error=failure)
+            if failure is not None:
+                originals.append(failure)
+            await await_agent_shutdown_completion(self, withdrawals=withdrawals, finite_errors=originals)
+            from kestrel_sovereign.execution_custody import execution_finite_error
+            terminal = execution_finite_error(*originals, *withdrawals,
+                                               retain_originals=True, isolate_control_originals=True)
+            if terminal is not None and (not isinstance(terminal, asyncio.CancelledError) or is_execution_control_error(terminal)):
+                raise terminal
 
         return asyncio.create_task(
             reap(), name=f"agent_shutdown_quarantine_reaper:{self.did}"

@@ -1972,7 +1972,7 @@ async def _supervise_phoenix_startup(app, supervisor) -> None:
         )
 
 
-async def _shutdown_single_agent(agent: KestrelAgent) -> None:
+async def _shutdown_single_agent(agent: KestrelAgent, *, finite_errors: list[BaseException] | None = None) -> bool | None:
     """Bound user-visible shutdown while retaining ownership of its tail."""
     cancelled = False
     failures, withdrawals = [], []
@@ -1999,11 +1999,15 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
         failures.append(error)
         logger.warning("Error during agent shutdown (%s)", type(error).__name__)
     cancelled = await await_agent_shutdown_completion(agent, withdrawals=withdrawals, finite_errors=failures) or cancelled
+    if finite_errors is not None:
+        finite_errors.extend(failures)
+        finite_errors.extend(withdrawals)
+        return not failures and not cancelled
     failure = execution_finite_error(*failures, *withdrawals)
     if failure is not None and (not isinstance(failure, asyncio.CancelledError) or is_execution_control_error(failure)):
         raise failure
     if cancelled:
-        raise asyncio.CancelledError()
+        raise failure if isinstance(failure, asyncio.CancelledError) else withdrawals[-1] if withdrawals else asyncio.CancelledError()
 
 
 def _attach_stop_runtime(app: FastAPI, agent) -> None:
@@ -2102,13 +2106,14 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
     except BaseException as error:
         cleanup_cancelled = isinstance(error, asyncio.CancelledError)
         cleanup_failures: list[BaseException] = []
+        withdrawals = []
         if distributed_stop is not None:
             close_registry = asyncio.create_task(
                 distributed_stop.close(),
                 name="stop_receipts_startup:close_registry",
             )
             cancelled, failure = await await_lifecycle_task_completion(
-                close_registry
+                close_registry, withdrawals=withdrawals,
             )
             cleanup_cancelled = cleanup_cancelled or cancelled
             if failure is not None:
@@ -2118,7 +2123,7 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
                 db.close(),
                 name="stop_receipts_startup:close_database",
             )
-            cancelled, failure = await await_lifecycle_task_completion(close_db)
+            cancelled, failure = await await_lifecycle_task_completion(close_db, withdrawals=withdrawals)
             cleanup_cancelled = cleanup_cancelled or cancelled
             if failure is not None:
                 cleanup_failures.append(failure)
@@ -2128,7 +2133,7 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
                 "Durable Stop startup cleanup also failed: "
                 f"{type(failure).__name__}: {failure}"
             )
-        terminal = execution_finite_error(error, *cleanup_failures)
+        terminal = execution_finite_error(error, *cleanup_failures, *withdrawals)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
         if not isinstance(error, (Exception, asyncio.CancelledError)):
@@ -2214,6 +2219,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
     cancelled = False
     failures = []
     withdrawals = []
+    join_originals = []
 
     phoenix_task = getattr(app.state, "phoenix_task", None)
     if phoenix_task is not None:
@@ -2221,8 +2227,10 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             phoenix_task.cancel()
         try:
             join_cancelled, failure = await await_lifecycle_task_completion(
-                phoenix_task
+                phoenix_task, withdrawals=withdrawals,
             )
+            if failure is not None:
+                join_originals.append(failure)
             cancelled = cancelled or join_cancelled
             if failure is not None and is_execution_control_error(failure):
                 failures.append(failure)
@@ -2246,8 +2254,10 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
     if phoenix_start_task is not None:
         try:
             join_cancelled, failure = await await_lifecycle_task_completion(
-                phoenix_start_task
+                phoenix_start_task, withdrawals=withdrawals,
             )
+            if failure is not None:
+                join_originals.append(failure)
             cancelled = cancelled or join_cancelled
             if failure is not None and is_execution_control_error(failure):
                 failures.append(failure)
@@ -2265,7 +2275,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
 
     phoenix = getattr(app.state, "phoenix", None)
     if phoenix is None:
-        terminal = execution_finite_error(*failures, retain_originals=True)
+        terminal = execution_finite_error(*failures, *withdrawals, retain_originals=True) if failures else None
         if terminal is not None:
             raise terminal
         return cancelled
@@ -2354,7 +2364,8 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             app.state.phoenix_proxy_close_supervisor = None
 
     terminal = execution_finite_error(
-        *failures, *(withdrawals if failures else ()),
+        *failures, *(join_originals if any(is_execution_control_error(error) for error in failures) else ()),
+        *(withdrawals if failures else ()),
         retain_originals=True, isolate_control_originals=True,
     )
     if terminal is not None:
@@ -2368,14 +2379,14 @@ async def _shutdown_host_features(app: FastAPI) -> None:
 
     host_features = getattr(app.state, "host_features", []) or []
     host_context = getattr(app.state, "host_context", None)
-    failure = None
+    failures = []
     try:
         if host_features and host_context is not None:
             await _hf.stop_host_features(host_features, host_context)
     except BaseException as exc:
         logger.warning("Host feature shutdown failed: %s", exc)
         if not isinstance(exc, Exception) or is_execution_control_error(exc):
-            failure = exc
+            failures.append(exc)
     # Do not let either the stop catch or a later independent unmount/context
     # close replace the original native receipt. Each original cleanup still
     # runs, and its own failure is propagated only after the entire drain.
@@ -2383,12 +2394,13 @@ async def _shutdown_host_features(app: FastAPI) -> None:
         try:
             unmount(app)
         except BaseException as exc:
-            failure = execution_finite_error(failure, exc, retain_originals=True)
+            failures.append(exc)
     if host_context is not None:
         try:
             await _hf.close_host_context(host_context)
         except BaseException as exc:
-            failure = execution_finite_error(failure, exc, retain_originals=True)
+            failures.append(exc)
+    failure = execution_finite_error(*failures, retain_originals=True)
     if failure is not None:
         raise failure
     if getattr(app.state, "host_context", None) is host_context:
@@ -2875,11 +2887,11 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
         if agent is not None and all(agent is not known for known in owned_agents):
             owned_agents.append(agent)
             try:
-                await _shutdown_single_agent(agent)
+                completed = await _shutdown_single_agent(agent, finite_errors=failures)
             except BaseException as error:
                 failures.append(error)
             else:
-                if getattr(app.state, attribute, None) is agent:
+                if completed and getattr(app.state, attribute, None) is agent:
                     setattr(app.state, attribute, None)
     terminal = execution_finite_error(*failures)
     if terminal is not None:
@@ -3073,6 +3085,7 @@ async def _shutdown_server_resources(
     logger.info("Server shutting down...")
     cancelled = False
     first_failure: BaseException | None = None
+    failures = []
     failed_phases = set()
     # Continue INDEPENDENT drains, not consumers' still-live dependencies.
     # In particular an unretired scheduler can still wake agents, and agents
@@ -3141,14 +3154,16 @@ async def _shutdown_server_resources(
             cancelled = True
         if failure is not None:
             failed_phases.add(name)
-            first_failure = execution_finite_error(first_failure, failure, retain_originals=True,
-                                                     isolate_control_originals=True)
+            failures.append(failure)
 
-    if any(is_execution_control_error(error) for error in (original_failure, first_failure)):
+    if any(is_execution_control_error(error) for error in (original_failure, *failures)):
         first_failure = execution_finite_error(
-            first_failure, *withdrawals, retain_originals=True,
+            original_failure, *failures, *withdrawals, retain_originals=True,
             isolate_control_originals=True,
         )
+    else:
+        first_failure = execution_finite_error(*failures, retain_originals=True,
+                                               isolate_control_originals=True)
     app.state._lifespan_teardown_error = first_failure
     return cancelled, first_failure
 

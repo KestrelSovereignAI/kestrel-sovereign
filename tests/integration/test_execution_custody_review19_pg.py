@@ -13,6 +13,9 @@ from kestrel_sovereign.execution_custody import ExecutionCustody, execution_comm
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as _native_pg
 from tests.integration.test_execution_custody_review18_pg import setup_delivery, join_owned, route
 from tests.unit.test_execution_custody_review15 import control_error
+from tests.utils.original_failure import OriginalFailure
+from kestrel_sovereign import _async_ownership as ownership
+from kestrel_sovereign.execution_custody import _explicit_control_chain
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg
@@ -78,6 +81,15 @@ async def test_native_renewal_commit_ack_is_joined_under_repeated_closer_cancel(
     agent, dispatcher, delivery, _signal = await setup_delivery(native_pg)
     delivery = replace(delivery, lease_expires_at=datetime.now(timezone.utc)+timedelta(seconds=0.03))
     original = control_error(control, carrier)
+    snapshot = OriginalFailure.capture(original)
+    withdrawals, task = [], None
+    actual_join = ownership.await_owned_task
+    async def observe(owner, *args, **kwargs):
+        outcome = await actual_join(owner, *args, **kwargs)
+        if asyncio.current_task() is task and outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+        return outcome
+    monkeypatch.setattr(ownership, "await_owned_task", observe)
     scope = ExecutionCustody(GenerationFence())
     backend._execution_custody = scope
     committed, draining, release, native_exit = delayed_native_commit_ack(monkeypatch, original)
@@ -93,9 +105,13 @@ async def test_native_renewal_commit_ack_is_joined_under_repeated_closer_cancel(
     async def close():
         async with dispatcher._renew_durable_cognition_lease(delivery) as loss:
             observed.append(loss)
-            await committed.wait()
-            if phase == "body":
-                await asyncio.Event().wait()
+            try:
+                await committed.wait()
+                if phase == "body":
+                    await asyncio.Event().wait()
+            except asyncio.CancelledError as error:
+                withdrawals.append(error)
+                raise
 
     task = asyncio.create_task(close())
     try:
@@ -113,17 +129,16 @@ async def test_native_renewal_commit_ack_is_joined_under_repeated_closer_cancel(
         release.set()
         with pytest.raises(BaseException) as caught:
             await task
-        assert caught.value is observed[0].result()
+        snapshot.assert_retained(caught.value)
+        assert observed[0].result() in tuple(_explicit_control_chain(caught.value))
+        assert withdrawals and all(error in tuple(_explicit_control_chain(caught.value)) for error in withdrawals)
         # A native acknowledgement carrying its own COMMITTED receipt is
         # evidence, not an ordinary lost acknowledgement to relabel UNKNOWN.
         # Denial alone and an explicit UNKNOWN still require reconciliation.
         assert execution_commit_outcome(caught.value) == (
             "committed" if control == "committed" else "unknown"
         )
-        error = caught.value
-        while error is not original and error.__cause__ is not None:
-            error = error.__cause__
-        assert error is original
+        snapshot.assert_retained(caught.value)
         assert all(child.done() for child in children)
         assert await controller.fetchval("SELECT count(*) FROM effects") == 1
     finally:
@@ -140,6 +155,23 @@ async def test_cancelled_native_dispatch_retains_late_renewal_commit_control(nat
     agent, dispatcher, delivery, signal = await setup_delivery(native_pg)
     delivery = replace(delivery, lease_expires_at=datetime.now(timezone.utc)+timedelta(seconds=0.03))
     original = control_error("unknown", carrier)
+    snapshot = OriginalFailure.capture(original)
+    withdrawals, task = [], None
+    actual_wait, actual_join = asyncio.wait, ownership.await_owned_task
+    async def observe_wait(*args, **kwargs):
+        try:
+            return await actual_wait(*args, **kwargs)
+        except asyncio.CancelledError as error:
+            if asyncio.current_task() is task:
+                withdrawals.append(error)
+            raise
+    async def observe_join(owner, *args, **kwargs):
+        outcome = await actual_join(owner, *args, **kwargs)
+        if asyncio.current_task() is task and outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+        return outcome
+    monkeypatch.setattr(asyncio, "wait", observe_wait)
+    monkeypatch.setattr(ownership, "await_owned_task", observe_join)
     scope = ExecutionCustody(GenerationFence())
     backend._execution_custody = agent._execution_custody = scope
     committed, draining, release, native_exit = delayed_native_commit_ack(monkeypatch, original)
@@ -175,14 +207,17 @@ async def test_cancelled_native_dispatch_retains_late_renewal_commit_control(nat
         with pytest.raises(BaseException) as caught:
             await task
         assert execution_commit_outcome(caught.value) == "unknown"
-        error = caught.value
-        while error is not original and error.__cause__ is not None:
-            error = error.__cause__
-        assert error is original
+        snapshot.assert_retained(caught.value)
+        assert withdrawals and all(error in tuple(_explicit_control_chain(caught.value)) for error in withdrawals)
         monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", native_exit)
         await asyncio.wait_for(cancelled.wait(), timeout=1)
         if stubborn:
-            assert dispatcher._retained_cognition_control_debt == {delivery.delivery_id: (delivery, caught.value)}
+            assert set(dispatcher._retained_cognition_control_debt) == {delivery.delivery_id}
+            retained_delivery, retained_source = dispatcher._retained_cognition_control_debt[delivery.delivery_id]
+            assert retained_delivery is delivery
+            snapshot.assert_retained(retained_source)
+            assert retained_source in tuple(_explicit_control_chain(caught.value))
+            assert all(error not in tuple(_explicit_control_chain(retained_source)) for error in withdrawals)
             assert await controller.fetchval("SELECT status FROM durable_signal_deliveries WHERE delivery_id='delivery1'") == "leased"
         finish.set()
         await asyncio.gather(*route_children, return_exceptions=True)

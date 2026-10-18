@@ -99,7 +99,7 @@ async def test_ordinary_first_join_keeps_current_c_until_later_native_control(
         entered.set()
         await release.wait()
         raise ordinary.error
-    async def later():
+    async def later(*, finite_errors=None):
         await database.execute("INSERT INTO host_rollback_effects VALUES (75)")
         raise source.error
     monkeypatch.setattr(ownership, "await_owned_task", observe)

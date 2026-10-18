@@ -338,3 +338,25 @@ a later failed reset cannot weaken a previously observed UNKNOWN. A fully
 retired known ACK plus withdrawal, or a denial confined to a captured caller
 scope, is delivered finitely without poisoning a distinct live caller's runtime.
 Neither case clears an unresolved commit or physical-retirement debt.
+
+Finite shutdown outcomes are composed only after the enclosing ownership
+boundary finishes collecting its originals. Successful native work can still
+have a failed completion observer: that error belongs to the finite drain, not
+the physical worker's shared failure latch. Reaper, offboarding, refund,
+reconciliation and unsealing outcomes must all survive independently, including
+ordinary-first failures followed by native control and actual caller withdrawal.
+Cold-identity admission uses the same physically balanced manager-lock helper
+as the drain and handoff seal. Spawn expiry and admitted-spawn joins retain
+native unwind failures without weakening signed deadlines or authorizing retry.
+Admission hooks use an acceptance receipt before completion publication.
+Bookkeeping-observer or expiry-fence failures still join the original hook;
+they cannot return while it retains native work. An unexpected observation in
+a finite group must not filter away an independent original native source.
+
+Standalone CLI and main callers own their Hold context separately from the
+Agent. They complete both safe retirements before reporting a settled Agent
+failure. A genuinely pending original Agent Task instead retains that exact
+context/Task dependency; it is neither a successful context close nor permission
+to allocate a replacement cleanup attempt. Component native tests establish
+these ownership boundaries, not whole-Agent genesis, provider billing or deployed
+production acceptance.

@@ -3939,3 +3939,29 @@ async def test_main_and_cli_do_not_swallow_terminal_cleanup_failure(
     assert not [worker for worker in threading.enumerate()
                 if worker not in original_threads
                 and getattr(getattr(worker, "_target", None), "__module__", "") == "aiosqlite.core"], "entry-point fixture abandoned a native SQLite worker"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_later", [False, True])
+async def test_bound_shutdown_keeps_logged_ordinary_prior_compatibility(monkeypatch, native_later):
+    """Finite selection policy only; native physical ownership is tested separately."""
+    from kestrel_sovereign.hold import enforcement
+    from tests.unit.test_execution_custody_review32 import receipt
+    from tests.utils.original_failure import OriginalFailure
+
+    prior = OriginalFailure.capture(OSError("already logged bounded shutdown failure"))
+    native = OriginalFailure.capture(receipt("unknown"))
+    context = object()
+    close = AsyncMock()
+    completion = AsyncMock(side_effect=native.error if native_later else None)
+    agent = SimpleNamespace(wait_for_shutdown_completion=completion)
+    monkeypatch.setattr(enforcement, "close_bound_host_context", close)
+    if native_later:
+        with pytest.raises(BaseException) as caught:
+            await enforcement.complete_bound_agent_shutdown(agent, context, prior_errors=[prior.error])
+        native.assert_retained(caught.value)
+        prior.assert_retained(caught.value)
+    else:
+        await enforcement.complete_bound_agent_shutdown(agent, context, prior_errors=[prior.error])
+        prior.assert_retained(prior.error)
+    close.assert_awaited_once_with(context)

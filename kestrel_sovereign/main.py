@@ -10,7 +10,6 @@ from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
-    await_agent_shutdown_completion,
 )
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.paths import (
@@ -218,7 +217,7 @@ async def main():
     llm_service = LLMService()
     agent = KestrelAgent(did=agent_did, storage_path=storage_path, llm_service=llm_service)
     from kestrel_sovereign.hold import (
-        close_bound_host_context,
+        complete_bound_agent_shutdown,
         initialize_with_bound_hold_context,
     )
 
@@ -245,6 +244,7 @@ async def main():
     decryption_error_count = 0
     MAX_DECRYPTION_ERRORS = 3
 
+    body_failure = None
     try:
         while True:
             user_input = input("\n> ")
@@ -287,8 +287,11 @@ async def main():
 
     except KeyboardInterrupt:
         print("\nDeactivating agent...")
+    except BaseException as error:
+        body_failure = error
+        raise
     finally:
-        cancelled = False
+        failures = [body_failure] if body_failure is not None else []
         # Graceful shutdown with timeout
         try:
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
@@ -298,16 +301,14 @@ async def main():
                 f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
                 "waiting for durable cleanup."
             )
-        except asyncio.CancelledError:
-            cancelled = True
+        except asyncio.CancelledError as error:
+            failures.append(error)
             print("Agent shutdown cancelled.")
-        except Exception as e:
+        except BaseException as e:
+            failures.append(e)
             logger.debug(f"Error during shutdown: {e}")
             print("Agent deactivated (with errors).")
-        cancelled = await await_agent_shutdown_completion(agent) or cancelled
-        await close_bound_host_context(hold_context)
-        if cancelled:
-            raise asyncio.CancelledError()
+        await complete_bound_agent_shutdown(agent, hold_context, prior_errors=failures)
 
 
 if __name__ == "__main__":

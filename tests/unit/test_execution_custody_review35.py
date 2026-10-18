@@ -10,6 +10,8 @@ from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from tests.unit.test_execution_custody_review29 import native_owner
 from tests.unit.test_execution_custody_review32 import receipt
 from tests.utils.original_failure import OriginalFailure
+from kestrel_sovereign import _async_ownership as ownership
+from kestrel_sovereign.execution_custody import _explicit_control_chain
 
 
 @pytest.mark.asyncio
@@ -27,6 +29,16 @@ async def test_actual_native_startup_collector_preserves_receipt_after_caller_ca
     failure = receipt(kind)
     source = OriginalFailure.capture(failure)
     manager = AgentManager(base_data_dir=tmp_path)
+    withdrawals, waiter = [], None
+    actual_join = ownership.await_owned_task
+
+    async def observe(task, *args, **kwargs):
+        result = await actual_join(task, *args, **kwargs)
+        if asyncio.current_task() is waiter and result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+
+    monkeypatch.setattr(ownership, "await_owned_task", observe)
 
     async def native_tail():
         entered.set()
@@ -76,7 +88,10 @@ async def test_actual_native_startup_collector_preserves_receipt_after_caller_ca
             assert any(resource is agent and task is not None and task.done()
                        for resource, task in execution_cleanup_debts(outcome.error))
         else:
-            assert outcome.error is failure, "startup collector replaced the native receipt with cancellation"
+            source.assert_retained(outcome.error)
+            assert withdrawals and all(error in tuple(_explicit_control_chain(outcome.error))
+                                       for error in withdrawals)
+            assert all(task.done() for task in tasks) and continuation.done()
     finally:
         release.set()
         for task in (waiter, continuation, *tasks):
@@ -97,6 +112,15 @@ async def test_actual_stop_startup_joins_database_before_original_native_receipt
 
     agent, db = await native_owner(tmp_path)
     failure = receipt(kind)
+    source = OriginalFailure.capture(failure)
+    withdrawals, waiter = [], None
+    actual_join = ownership.await_owned_task
+    async def observe(task, *args, **kwargs):
+        result = await actual_join(task, *args, **kwargs)
+        if asyncio.current_task() is waiter and result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+    monkeypatch.setattr(ownership, "await_owned_task", observe)
     entered, release, closed = (asyncio.Event() for _ in range(3))
     original_close = db.close
 
@@ -125,7 +149,7 @@ async def test_actual_stop_startup_joins_database_before_original_native_receipt
         if waiter in done:
             outcome = await await_owned_task(waiter)
             assert closed.is_set(), "native group bypassed physical Stop database cleanup"
-            assert outcome.error is failure
+            source.assert_retained(outcome.error)
         else:
             assert observer in done
             waiter.cancel()
@@ -134,7 +158,8 @@ async def test_actual_stop_startup_joins_database_before_original_native_receipt
             release.set()
             outcome = await await_owned_task(waiter)
             assert closed.is_set() and db.backend._connection is None
-            assert outcome.error is failure, "Stop startup replaced original native control"
+            source.assert_retained(outcome.error)
+            assert withdrawals and all(error in tuple(_explicit_control_chain(outcome.error)) for error in withdrawals)
     finally:
         release.set()
         await await_owned_task(waiter)
