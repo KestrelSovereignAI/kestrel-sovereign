@@ -423,3 +423,12 @@ ordinary availability keeps its diagnostic envelope. A descendant fence owns
 every actual withdrawal collected across its original spawn joins, including
 when releasing the same token fails. A previously handled cancellation count
 alone does not create a new observation or force a new cancellation result.
+
+The retained failed-spawn producer follows the same terminal policy. Its four
+restrictive cleanup phases share ordinary-availability retry, but native
+uncertainty is terminal and keeps the existing unsafe reservation and slot
+rather than being erased by a later retry. Returned native control is not a
+successful retirement. Actual finite withdrawal returned after runtime cleanup
+stays with the original worker through witness settlement and slot publication;
+later failures cannot replace it. Completed physical phases do not acquire new
+retirement debt, and current withdrawal is not stored as shared native history.

@@ -13055,71 +13055,68 @@ class AgentManager:
         slot_transferred = False
 
         async def revoke_then_shutdown() -> None:
-            while admission.spawn_receipt_graph is not None:
-                try:
-                    await self._downgrade_uncommitted_spawn_receipt(
-                        admission,
-                        child,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed spawn receipt revocation remains pending for %r",
-                        admission.name,
-                    )
-                    await asyncio.sleep(1.0)
-            while (
-                admission.spawn_startup_config is not None
-                or admission.spawn_startup_config_path is not None
-            ):
-                try:
-                    await self._withdraw_uncommitted_spawn_startup_registration(
-                        admission
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed spawn startup-roster withdrawal remains pending "
-                        "for %r",
-                        admission.name,
-                    )
-                    await asyncio.sleep(1.0)
-            while True:
-                try:
-                    await self._rollback_uncommitted_spawn_runtime(
-                        admission,
-                        child,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed spawn runtime cleanup remains pending for %r",
-                        admission.name,
-                    )
-                    await asyncio.sleep(1.0)
-                    continue
-                break
-            while (
-                admission.spawn_authority_witness_did is not None
-                or admission.spawn_authority_witness_mandate is not None
-            ):
-                try:
-                    await self._withdraw_uncommitted_spawn_authority_witness(
-                        admission
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed spawn authority-witness settlement remains pending "
-                        "for %r",
-                        admission.name,
-                    )
-                    await asyncio.sleep(1.0)
+            outcomes: list[BaseException] = []
 
-            if slot_transferred:
-                async with self._lock:
-                    if self._pending_spawns <= 0:
-                        raise RuntimeError(
-                            "Quarantined spawn cap ownership underflowed"
+            async def retry_ordinary_phase(operation, description):
+                while True:
+                    try:
+                        return await operation()
+                    except Exception as error:
+                        # Ordinary availability may retry restrictive cleanup.
+                        # Native uncertainty is a terminal source, never an
+                        # acknowledgement supplied by a later successful retry.
+                        if is_execution_control_error(error):
+                            raise
+                        logger.exception(
+                            "Failed spawn %s remains pending for %r",
+                            description,
+                            admission.name,
                         )
-                    self._pending_spawns -= 1
-                    self._resolve_spawn_slot_terminal(admission)
+                        await asyncio.sleep(1.0)
+
+            try:
+                while admission.spawn_receipt_graph is not None:
+                    await retry_ordinary_phase(
+                        lambda: self._downgrade_uncommitted_spawn_receipt(admission, child),
+                        "receipt revocation",
+                    )
+                while (
+                    admission.spawn_startup_config is not None
+                    or admission.spawn_startup_config_path is not None
+                ):
+                    await retry_ordinary_phase(
+                        lambda: self._withdraw_uncommitted_spawn_startup_registration(admission),
+                        "startup-roster withdrawal",
+                    )
+                retirement = await retry_ordinary_phase(
+                    lambda: self._rollback_uncommitted_spawn_runtime(admission, child),
+                    "runtime cleanup",
+                )
+                if isinstance(retirement, BaseException):
+                    if is_execution_control_error(retirement):
+                        raise retirement
+                    outcomes.append(retirement)
+                while (
+                    admission.spawn_authority_witness_did is not None
+                    or admission.spawn_authority_witness_mandate is not None
+                ):
+                    await retry_ordinary_phase(
+                        lambda: self._withdraw_uncommitted_spawn_authority_witness(admission),
+                        "authority-witness settlement",
+                    )
+
+                if slot_transferred:
+                    async with self._lock:
+                        if self._pending_spawns <= 0:
+                            raise RuntimeError(
+                                "Quarantined spawn cap ownership underflowed"
+                            )
+                        self._pending_spawns -= 1
+                        self._resolve_spawn_slot_terminal(admission)
+            except BaseException as error:
+                raise execution_observation_error(*outcomes, error)
+            if outcomes:
+                raise execution_observation_error(*outcomes)
 
         observed = withdrawals if withdrawals is not None else []
         cleanup: asyncio.Task[None] | None = None
