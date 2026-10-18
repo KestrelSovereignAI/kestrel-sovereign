@@ -210,3 +210,21 @@ def test_avatar_transport_origin_refusal_is_a_client_error_without_storage(monke
         store.assert_not_awaited()
     finally:
         _restore_app(app, original)
+
+
+def test_avatar_native_url_limits_are_client_errors_before_network_or_storage(monkeypatch):
+    store = AsyncMock()
+    agent = SimpleNamespace(agent_id="did:test:avatar", storage=SimpleNamespace(files=SimpleNamespace(store_avatar=store)))
+    dial = AsyncMock(side_effect=AssertionError("unusable native URL reached the network"))
+    monkeypatch.setattr("httpcore._backends.anyio.AnyIOBackend.connect_tcp", dial)
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post("/api/identity/avatar", json={"url": "https://8.8.8.8/" + "x" * 100000}, headers={"X-API-Key": "test-key"})
+        assert response.status_code == 400
+        assert "URL too long" in response.json()["detail"]
+        dial.assert_not_awaited()
+        store.assert_not_awaited()
+    finally:
+        _restore_app(app, original)

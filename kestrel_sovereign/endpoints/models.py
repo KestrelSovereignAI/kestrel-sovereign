@@ -1180,7 +1180,7 @@ async def set_avatar(request: Request, file: Optional[UploadFile] = File(None)):
                     resp = await client.get(validated_url.url)
                     resp.raise_for_status()
                     image_data = resp.content
-            except (httpx.HTTPError, SSRFError) as e:
+            except (httpx.HTTPError, httpx.InvalidURL, SSRFError) as e:
                 raise HTTPException(status_code=400, detail=f"Failed to download image: {e}")
             if len(image_data) > _AVATAR_MAX_SIZE:
                 raise HTTPException(status_code=400, detail="Downloaded image too large.")
