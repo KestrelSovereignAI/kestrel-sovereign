@@ -14,8 +14,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from kestrel_sovereign.execution_custody import (
+    is_execution_control_error,
+    require_execution_work,
+)
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
@@ -44,7 +48,9 @@ def _durable_user_writes_permitted(storage) -> bool:
         return True
     try:
         return bool(checker())
-    except Exception:  # noqa: BLE001 - never let a policy probe block a write path
+    except Exception as control_error:  # noqa: BLE001 - never let a policy probe block a write path
+        if is_execution_control_error(control_error):
+            raise
         return False
 
 
@@ -216,6 +222,7 @@ async def persist_agent_description(
     # ``transition_lock`` is ``None`` on paths already holding it (SOUL derivation
     # inside ``save_soul_md``) or with no running agent (CLI); those run unguarded.
     async with optional_transition_lock(transition_lock):
+        require_execution_work()
         if not _durable_user_writes_permitted(storage):
             logger.debug(
                 "persist_agent_description: skipping durable description write for "
@@ -235,7 +242,9 @@ async def persist_agent_description(
         )
 
         if storage is not None:
-            from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata
+            from kestrel_sovereign.storage.identity_metadata import (
+                merge_identity_metadata,
+            )
 
             await merge_identity_metadata(storage, agent_id, {"description": description})
 
@@ -378,6 +387,8 @@ class BootstrapService:
             logger.warning(f"Prompt file not found: {filepath}")
             return ""
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error loading prompt {filepath}: {e}")
             return ""
 
@@ -412,7 +423,9 @@ class BootstrapService:
             if history_count and history_count[0][0] > 0:
                 await self._ensure_complete("conversation history exists")
                 return False
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             pass  # Table may not exist for truly new agents
 
         state = await self.get_bootstrap_state()
@@ -450,7 +463,9 @@ class BootstrapService:
             )
             if result:
                 return datetime.fromisoformat(result[0][0])
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             pass
         return None
 
@@ -470,6 +485,8 @@ class BootstrapService:
             # No state stored — could be new agent or missing row
             return BootstrapState.PENDING
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to get bootstrap state: {e}")
             # On DB error, assume complete to avoid hijacking existing agents
             return BootstrapState.COMPLETE
@@ -557,13 +574,17 @@ class BootstrapService:
                 (self.agent_id, self.BOOTSTRAP_STALE_AT_KEY, stale_at, now),
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Failed to persist stale bootstrap metadata: %s", exc)
 
         if storage is None:
             return
 
         try:
-            from kestrel_sovereign.storage.identity_metadata import merge_identity_metadata
+            from kestrel_sovereign.storage.identity_metadata import (
+                merge_identity_metadata,
+            )
 
             updates = {"bootstrap_state": BootstrapState.PENDING.value,
                        "bootstrap_status": self.STALE_BOOTSTRAP_STATUS,
@@ -577,6 +598,8 @@ class BootstrapService:
                 storage, self.agent_id, updates, capability=acquire_control_plane_capability()
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Failed to persist stale bootstrap graph state: %s", exc)
 
     async def _get_bootstrap_state_from_metadata_or_node(self, agent_node: Any) -> BootstrapState:
@@ -592,6 +615,8 @@ class BootstrapService:
             if result:
                 return BootstrapState(result[0][0])
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.debug("Bootstrap metadata state lookup failed: %s", exc)
 
         properties = getattr(agent_node, "properties", {}) or {}
@@ -633,7 +658,9 @@ class BootstrapService:
                 (self.agent_id,),
             )
             return bool(history_count and history_count[0][0] > 0)
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return False
 
     async def _has_canonical_soul_resource(self) -> bool:
@@ -645,7 +672,9 @@ class BootstrapService:
                     SOUL_MARKDOWN_RESOURCE_TYPE
                 )
             )
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return False
 
     async def set_bootstrap_state(self, state: BootstrapState) -> None:
@@ -686,6 +715,8 @@ class BootstrapService:
                     (self.agent_id, self.BOOTSTRAP_STATUS_KEY, "ok", now),
                 )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to set bootstrap state: {e}")
             raise
 
@@ -706,6 +737,8 @@ And how do you like to work together - quick and direct, or more room to think t
         try:
             return await self._load_discovery_history_strict()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to get discovery history: {e}")
             return []
 
@@ -752,6 +785,7 @@ And how do you like to work together - quick and direct, or more room to think t
         # the mode into the ``await`` gap and persist this raw user conversation
         # after the mode became volatile (#2672 review P1 race).
         async with optional_transition_lock(self._privacy_transition_lock):
+            require_execution_work()
             if not _durable_user_writes_permitted(self.storage):
                 # Volatile mode: keep the exchange in memory so subsequent turns see
                 # it (and completion / SOUL generation work), but never persist it.
@@ -773,6 +807,8 @@ And how do you like to work together - quick and direct, or more room to think t
                 )
                 return PersistOutcome.PERSISTED
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Failed to save discovery history: {e}")
                 return PersistOutcome.FAILED
 
@@ -786,6 +822,7 @@ And how do you like to work together - quick and direct, or more room to think t
         race between them (#2672 review P1 race).
         """
         async with optional_transition_lock(self._privacy_transition_lock):
+            require_execution_work()
             if not _durable_user_writes_permitted(self.storage):
                 logger.debug(
                     "Skipping durable user-name persist — persistent writes are "
@@ -802,6 +839,8 @@ And how do you like to work together - quick and direct, or more room to think t
                     (self.agent_id, self.USER_NAME_KEY, name, now),
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Failed to save user name: {e}")
 
     #: Hard cap on the discovery LLM round-trip. Discovery sits inside the
@@ -1097,6 +1136,8 @@ Generate the SOUL.md now, following the template format."""
             )
             return response.content if hasattr(response, 'content') else str(response)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to generate SOUL.md: {e}")
             return self._get_default_soul_template()
 
@@ -1144,6 +1185,8 @@ Keep it warm and personal, not formal or robotic."""
             if DEFAULT_SOUL_FILE.exists():
                 return DEFAULT_SOUL_FILE.read_text(encoding="utf-8")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to load default SOUL template: {e}")
 
         return f"""# SOUL.md - You Are {self.agent_name}
@@ -1202,6 +1245,7 @@ Your preferences matter - tell me what works and what doesn't.
         # already serialized under the lock we hold here (avoids self-deadlock on
         # the non-reentrant asyncio lock).
         async with optional_transition_lock(self._privacy_transition_lock):
+            require_execution_work()
             if not _durable_user_writes_permitted(self.storage):
                 logger.info(
                     "SOUL.md not persisted for %s — the SOUL body is user-derived and "
@@ -1231,10 +1275,14 @@ Your preferences matter - tell me what works and what doesn't.
                         )
                         logger.info("Set agent description from SOUL.md: %r", description)
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     logger.warning("Could not derive description from SOUL.md: %s", exc)
 
                 return True
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Failed to save SOUL.md: {e}")
                 return False
 
@@ -1247,6 +1295,8 @@ Your preferences matter - tell me what works and what doesn't.
                 source=source,
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning("Failed to promote SOUL.md to private resource: %s", exc)
 
     async def complete_bootstrap(self, avatar_description: Optional[str] = None) -> str:
@@ -1319,6 +1369,7 @@ What would you like to help with?"""
         Returns:
             Structured reset result.
         """
+        require_execution_work()
         # Clear discovery history. In a volatile mode the session-only store is
         # the authoritative copy, so reset it explicitly to guarantee a fresh
         # start regardless of the current privacy mode (#2672 review P1); the
@@ -1343,6 +1394,7 @@ What would you like to help with?"""
         if self.agent_data_path:
             soul_path = self.agent_data_path / "SOUL.md"
             soul_path_str = str(soul_path)
+            require_execution_work()
             if soul_path.exists():
                 soul_path.unlink()
                 soul_deleted = True
@@ -1353,6 +1405,8 @@ What would you like to help with?"""
             history_after = await self._load_discovery_history_strict()
             history_count_after = len(history_after)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             history_count_after = -1
             history_clear_error = f"failed to verify discovery history clear: {e}"
 

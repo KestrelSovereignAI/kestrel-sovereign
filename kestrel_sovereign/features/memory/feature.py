@@ -23,6 +23,7 @@ from kestrel_sovereign.storage.schema_router import RESOLVED_TO_PROPERTY
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import (
     STATUS_DONE_CANCELLED_ALIASES,
@@ -827,9 +828,13 @@ class MemoryFeature(Feature):
                 **session_kwargs,
             )
         except (AttributeError, TypeError, KeyError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_emotional failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_emotional failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -1522,6 +1527,8 @@ class MemoryFeature(Feature):
                 # skip only that nested acquisition.
                 result = await memory_system.consolidate()
         except MemoryConsolidationTimeoutError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "memory_consolidate reached its configured deadline: %s", exc
             )
@@ -1533,6 +1540,8 @@ class MemoryFeature(Feature):
                 },
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 

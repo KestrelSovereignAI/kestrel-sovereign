@@ -1,23 +1,24 @@
 """Constitution verification and integrity checking for Kestrel Agent."""
 import asyncio
 import contextvars
-import logging
 import hashlib
+import logging
 import os
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
-from enum import Enum
-from datetime import datetime, timezone
 
 from kestrel_sovereign.command_policy import (
     GENESIS_AUDIT_BYPASS_COMMANDS,
     SAFE_MODE_COMMANDS,
     prefixed_command_token,
 )
+from kestrel_sovereign.paths import PROJECT_ROOT_ENV, runtime_path_env
 
 # Import the concrete submodule, not the ``storage`` package aggregator.
 # constitution.py is pulled into the LLMService import chain (via
@@ -33,8 +34,6 @@ from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
 )
-from kestrel_sovereign.paths import PROJECT_ROOT_ENV, runtime_path_env
-
 
 # Task-local, turn-bound evidence. An agent-global cache would let queued or
 # overlapping requests overwrite the authority of the currently admitted turn.
@@ -200,7 +199,11 @@ class ConstitutionMixin:
         """
         try:
             agent_node = await self.storage.get_node(self.agent_id)
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception(
                 "get_constitution_hash: agent_node lookup failed; "
                 "returning None so dispatcher records NULL"
@@ -230,7 +233,11 @@ class ConstitutionMixin:
         """
         try:
             agent_node = await self.storage.get_node(self.agent_id)
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception(
                 "ensure_doctrine_bundle_anchored: agent_node lookup failed"
             )
@@ -281,13 +288,23 @@ class ConstitutionMixin:
                 if cb is not None:
                     try:
                         bootstrap = OrderedDict(cb._bootstrap_files)
-                    except Exception:
+                    except Exception as control_error:
+                        from kestrel_sovereign.execution_custody import (
+                            is_execution_control_error,
+                        )
+
+                        if is_execution_control_error(control_error):
+                            raise
                         bootstrap = OrderedDict()
                 snapshot = compute_doctrine_bundle_hash(
                     anchored_files=paths, bootstrap_files=bootstrap
                 )
                 agent_node.properties[PROP_BUNDLE_FILES] = list(snapshot.files)
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception(
                 "ensure_doctrine_bundle_anchored: file-list snapshot failed; "
                 "anchoring hash without file list"
@@ -301,7 +318,11 @@ class ConstitutionMixin:
             )
             if result != NodeSwapResult.SWAPPED:
                 return None  # A newer receipt/metadata won; retry on a fresh snapshot.
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception(
                 "ensure_doctrine_bundle_anchored: agent_node persist failed"
             )
@@ -321,7 +342,11 @@ class ConstitutionMixin:
         """
         try:
             agent_node = await self.storage.get_node(self.agent_id)
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception(
                 "get_anchored_doctrine_bundle_hash: agent_node lookup failed"
             )
@@ -348,9 +373,9 @@ class ConstitutionMixin:
         `self.context_builder._bootstrap_files` if available.
         """
         from kestrel_sovereign.agent.doctrine_bundle import (
+            PROP_BUNDLE_ANCHORED_PATHS,
             compute_doctrine_bundle_hash,
             resolve_anchored_paths,
-            PROP_BUNDLE_ANCHORED_PATHS,
         )
 
         project_root = await self._resolve_project_root_for_doctrine()
@@ -364,7 +389,11 @@ class ConstitutionMixin:
                 extra_paths = (
                     agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
                 )
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception(
                 "compute_live_doctrine_bundle_hash: agent_node lookup failed; "
                 "computing bundle without operator-extra paths"
@@ -380,7 +409,13 @@ class ConstitutionMixin:
         if cb is not None:
             try:
                 bootstrap_files = OrderedDict(cb._bootstrap_files)
-            except Exception:
+            except Exception as control_error:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(control_error):
+                    raise
                 logging.exception(
                     "compute_live_doctrine_bundle_hash: bootstrap loader read failed"
                 )
@@ -392,7 +427,11 @@ class ConstitutionMixin:
                 bootstrap_files=bootstrap_files,
             )
             return snapshot.hash
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception(
                 "compute_live_doctrine_bundle_hash: hash computation failed"
             )
@@ -426,7 +465,11 @@ class ConstitutionMixin:
                 extra_paths = (
                     agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
                 )
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception(
                 "get_anchored_doctrine_files: agent_node lookup failed"
             )
@@ -889,6 +932,10 @@ class ConstitutionMixin:
                     "RESTORED DURABLE SAFE MODE for agent %s", self.agent_id
                 )
         except Exception as exc:  # noqa: BLE001 - state failure must fail closed
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             self._mark_constitution_state_unavailable(exc)
 
     def _mark_constitution_state_unavailable(
@@ -1107,6 +1154,13 @@ class ConstitutionMixin:
             self._constitution_state_persistence_pending = False
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                # A committed or unknown native receipt is not evidence that
+                # the state was never written. Let the owner reconcile the
+                # original outcome; do not manufacture an availability fact.
+                raise
             cause = exc
             for _ in range(8):
                 if isinstance(cause, ConstitutionIntegrityAttestationError):
@@ -1363,6 +1417,12 @@ class ConstitutionMixin:
                         await feature.on_audit_complete({"is_valid": is_valid, "message": message})
                         break
             except Exception as e:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"Audit anchor notification failed: {e}")
 
     async def _verify_constitution_integrity(self) -> Tuple[bool, str]:
@@ -1414,6 +1474,10 @@ class ConstitutionMixin:
         try:
             stored_bytes = await self._raw_storage.retrieve_file(stored_hash)
         except Exception as e:  # noqa: BLE001 — decrypt/IO failure = integrity failure
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(e):
+                raise
             logging.critical(
                 "CONSTITUTION INTEGRITY: cannot retrieve/decrypt anchored blob "
                 "%s: %s", stored_hash, e,
@@ -1449,6 +1513,10 @@ class ConstitutionMixin:
         try:
             governance_edges = await self.storage.get_edges_from(self.agent_id)
         except Exception as e:  # noqa: BLE001
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(e):
+                raise
             logging.critical(
                 "CONSTITUTION INTEGRITY: cannot read governance edges: %s", e,
             )
@@ -1506,6 +1574,10 @@ class ConstitutionMixin:
                 contract, source=governing_source
             )
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(e):
+                raise
             # FAIL CLOSED (#2463 review, #2553): the governing source — the
             # wheel-shipped packaged file, or a descriptor-verified external
             # one — MUST always be present, readable, and (when a descriptor
@@ -1619,6 +1691,10 @@ class ConstitutionMixin:
             if agent_node:
                 anchor = agent_node.properties.get(self.OVERLAY_HASH_PROPERTY)
         except Exception as e:  # noqa: BLE001
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(e):
+                raise
             # Can't read the anchor → can't trust an overlay if one is present.
             if overlay_sha is not None:
                 self.constitution_overlay_verified = False
@@ -1782,7 +1858,13 @@ class ConstitutionMixin:
                     "safe_mode_entry",
                     {"reason": reason},
                 )
-            except Exception:
+            except Exception as control_error:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(control_error):
+                    raise
                 pass  # Never block on consent failure -- safe mode is critical
 
         # Consent is an awaited provider-bearing boundary. A transaction owner
@@ -1823,6 +1905,12 @@ class ConstitutionMixin:
                     },
                 )
             except Exception as exc:  # noqa: BLE001 - boundary is already durable
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(exc):
+                    raise
                 logging.warning(
                     "Could not append Safe Mode conversation event: %s",
                     type(exc).__name__,
@@ -1860,11 +1948,16 @@ class ConstitutionMixin:
         PostgreSQL evidence-row locks, and verify again inside the commit owner.
         SQLite's owning writer transaction supplies the same serialization.
         """
-        from kestrel_sovereign.constitution.genesis_audit import (
-            GENESIS_AUDIT_PASSED, GenesisAuditError, reconcile_genesis_receipt, validate_completed_genesis_audit,
-        )
-        from kestrel_sdk.security.encryption import DecryptionError
         from json import JSONDecodeError
+
+        from kestrel_sdk.security.encryption import DecryptionError
+
+        from kestrel_sovereign.constitution.genesis_audit import (
+            GENESIS_AUDIT_PASSED,
+            GenesisAuditError,
+            reconcile_genesis_receipt,
+            validate_completed_genesis_audit,
+        )
 
         raw = self._raw_storage
         try:
@@ -1873,12 +1966,19 @@ class ConstitutionMixin:
             raise ConstitutionIntegrityAttestationError("Malformed governing identity metadata") from exc
         digest = node.properties.get("constitution_hash") if node is not None else None
         await raw.lock_nodes_for_update([self.agent_id, digest] if digest else [self.agent_id])
-        from kestrel_sovereign.constitution.anchored_bytes import lock_governance_rows, lock_governing_file
+        from kestrel_sovereign.constitution.anchored_bytes import (
+            lock_governance_rows,
+            lock_governing_file,
+        )
 
         try:
             await lock_governance_rows(raw, self.agent_id, required_target=digest)
             await lock_governing_file(raw, digest)
         except (RuntimeError, DecryptionError, JSONDecodeError) as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             raise ConstitutionIntegrityAttestationError(str(exc)) from exc
         # A different pointer won while we waited for the graph locks. Do not
         # widen the lock set out of canonical order or adopt its newer proof.
@@ -1898,6 +1998,12 @@ class ConstitutionMixin:
                 receipt = reconcile_genesis_receipt(fresh.properties, digest)
                 status = validate_completed_genesis_audit(receipt, digest)
             except GenesisAuditError as exc:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(exc):
+                    raise
                 raise ConstitutionIntegrityAttestationError(str(exc)) from exc
             if status != GENESIS_AUDIT_PASSED:
                 raise ConstitutionIntegrityAttestationError("Safe Mode exit requires a passed genesis receipt for its governing bytes")
@@ -1925,6 +2031,12 @@ class ConstitutionMixin:
                 try:
                     repaired = verifier() is True
                 except Exception as exc:  # noqa: BLE001 - never trust partial repair
+                    from kestrel_sovereign.execution_custody import (
+                        is_execution_control_error,
+                    )
+
+                    if is_execution_control_error(exc):
+                        raise
                     logging.error(
                         "Feature lifecycle repair verification reported %s",
                         type(exc).__name__,
@@ -1998,6 +2110,12 @@ class ConstitutionMixin:
                     },
                 )
             except Exception as exc:  # noqa: BLE001 - transition is already durable
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(exc):
+                    raise
                 logging.warning(
                     "Could not append Safe Mode exit conversation event: %s",
                     type(exc).__name__,
@@ -2020,6 +2138,10 @@ class ConstitutionMixin:
         try:
             ConstitutionMixin._require_owned_constitution_commit(self)
         except RuntimeError as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             self._constitution_refusal_generation = vars(self).get("_constitution_refusal_generation", 0) + 1
             self._constitution_state_persistence_pending = True
             self._mark_constitution_state_unavailable(
@@ -2274,13 +2396,18 @@ class ConstitutionMixin:
         try:
             ConstitutionMixin._require_owned_constitution_commit(self)
         except RuntimeError as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             return f"Error: {exc}; nothing was written."
         agent_node = await self._raw_storage.get_node(self.agent_id)
         if not agent_node:
             return "Error: Agent identity node not found."
 
         from kestrel_sovereign.constitution.anchored_bytes import (
-            governance_evidence, revalidate_governance_evidence,
+            governance_evidence,
+            revalidate_governance_evidence,
         )
 
         governance_rows = await self._raw_storage.db.fetchall(
@@ -2328,6 +2455,10 @@ class ConstitutionMixin:
         except FileNotFoundError:
             return "Error: No constitution file found on disk."
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(e):
+                raise
             # FAIL CLOSED: an unreadable/ambiguous/drifted governing source, or
             # a source descriptor that does not verify, must not be anchored
             # (#2463, #2553).
@@ -2353,7 +2484,10 @@ class ConstitutionMixin:
         # any crypto or write. Shared with the offline CLI so the two entry
         # points cannot diverge on this.
         from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
-        from kestrel_sovereign.constitution.reanchor_receipt import is_constitution_hash, reanchor_prior_pointer_fields
+        from kestrel_sovereign.constitution.reanchor_receipt import (
+            is_constitution_hash,
+            reanchor_prior_pointer_fields,
+        )
 
         try:
             # A malformed pointer, like a missing one, cannot make actual
@@ -2365,6 +2499,10 @@ class ConstitutionMixin:
                 validated_properties.get("constitution_hash"), historical_hash,
             )
         except Exception as exc:  # noqa: BLE001 - incomplete history cannot waive rights
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             return f"Error: Cannot inspect historical governance: {exc}; nothing was written."
         if historical_hash and historical_hash != "none":
             from kestrel_sovereign.constitution.anchored_bytes import (
@@ -2401,6 +2539,12 @@ class ConstitutionMixin:
                 if not is_constitution_hash(validated_properties.get("constitution_hash")) and not anchored_present:
                     return "Error: Historical governing bytes could not be read; restore the exact prior pointer before signed repair."
             except Exception as exc:  # noqa: BLE001 — a database failure, not a key one
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(exc):
+                    raise
                 # Undecryptable bytes come back as UNREADABLE; anything that
                 # escapes is the storage layer itself failing, and that is a
                 # different message. Still fails closed — an active Amendment
@@ -2474,9 +2618,12 @@ class ConstitutionMixin:
         # update would durably commit the property/edge disagreement this
         # very command exists to repair, and a concurrent integrity audit
         # could observe it.
+        consumed = None
         try:
             async with ConstitutionMixin._constitution_state_guard(self), self._raw_storage.transaction():
-                from kestrel_sovereign.constitution.anchored_bytes import store_verified_governing_file
+                from kestrel_sovereign.constitution.anchored_bytes import (
+                    store_verified_governing_file,
+                )
 
                 # The full write set is known from the verified bytes. Take
                 # custody and revalidate before writing even a file owner: a
@@ -2570,7 +2717,23 @@ class ConstitutionMixin:
                 await self._raw_storage.add_node(agent_node, capability=acquire_control_plane_capability())
                 consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
             ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
-        except Exception as e:
+        except BaseException as e:
+            from kestrel_sovereign.execution_custody import execution_commit_outcome
+
+            outcome = execution_commit_outcome(e)
+            if outcome is not None:
+                if outcome == "committed" and consumed is not None:
+                    ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
+                # Never continue cognition using an unreconciled in-memory
+                # anchor. No provider notice or fresh work admission is minted.
+                self._safe_mode = True
+                self._safe_mode_reason = "Reanchor commit requires durable-state reconciliation"
+                raise
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
+            if not isinstance(e, Exception):
+                raise
             return (
                 f"Error: Reanchor failed mid-write and was rolled back; "
                 f"no changes were committed: {e}"
@@ -2599,6 +2762,10 @@ class ConstitutionMixin:
                 },
             )
         except (QueryError, TransactionError) as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             # The authoritative repair has committed. Observational SQL
             # delivery failure cannot turn it into an ambiguous failed write.
             # Cancellation remains BaseException and is not swallowed.
@@ -2658,11 +2825,20 @@ class ConstitutionMixin:
 
         constitution_hash = agent_node.properties.get("constitution_hash")
         if witness:
-            from kestrel_sovereign.constitution.genesis_audit import GenesisAuditError, reconcile_genesis_receipt
+            from kestrel_sovereign.constitution.genesis_audit import (
+                GenesisAuditError,
+                reconcile_genesis_receipt,
+            )
 
             try:
                 reconcile_genesis_receipt(agent_node.properties, constitution_hash)
-            except GenesisAuditError:
+            except GenesisAuditError as control_error:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(control_error):
+                    raise
                 return "Error: Governing genesis receipt history changed after this turn's audited admission."
         if witness and (
             constitution_hash != witness[2]
@@ -2683,6 +2859,12 @@ class ConstitutionMixin:
             try:
                 ConstitutionMixin._require_owned_constitution_commit(self)
             except RuntimeError as exc:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(exc):
+                    raise
                 return f"Error: {exc}; nothing was written."
             bootstrap = await store.load(self.agent_id)
             if (
@@ -2727,6 +2909,12 @@ class ConstitutionMixin:
             except FileNotFoundError:
                 return "Error: No constitution file found."
             except Exception as e:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(e):
+                    raise
                 # FAIL CLOSED: never anchor an unreadable/ambiguous source.
                 return f"Error: Cannot resolve authoritative governing constitution: {e}"
 
@@ -2751,7 +2939,9 @@ class ConstitutionMixin:
                     # not authority to prune a lost anchor without a signature.
                     # Refuse before file/CAS writes and before expanding the
                     # held graph set into stale targets out of canonical order.
-                    from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+                    from kestrel_sovereign.constitution.anchored_bytes import (
+                        historical_anchor_hash,
+                    )
 
                     prior_targets = await self._raw_storage.db.fetchall(
                         "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'",
@@ -2769,7 +2959,9 @@ class ConstitutionMixin:
                         or bootstrap.generation != self._constitution_state_generation
                     ):
                         raise ValueError("durable new-identity bootstrap custody changed")
-                    from kestrel_sovereign.constitution.anchored_bytes import _store_exact_governing_file
+                    from kestrel_sovereign.constitution.anchored_bytes import (
+                        _store_exact_governing_file,
+                    )
 
                     # The resolver and durable new-identity CAS above are the
                     # authority for this first-party public governance write.
@@ -2795,6 +2987,12 @@ class ConstitutionMixin:
                 ConstitutionMixin._publish_consumed_anchor_custody(self, persisted_state)
                 logging.info(f"Anchored constitution with hash: {constitution_hash}")
             except Exception as e:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(e):
+                    raise
                 return f"Error: Failed to anchor constitution: {e}"
 
         try:
@@ -2825,6 +3023,10 @@ class ConstitutionMixin:
                 constitution_text = f"{constitution_text}\n\n{block}"
             return constitution_text
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(e):
+                raise
             return f"Error: Could not retrieve constitution for hash {constitution_hash}. Reason: {e}"
 
     async def _genesis_publication_witness(self, agent_node: GraphNode) -> dict:
@@ -2854,6 +3056,10 @@ class ConstitutionMixin:
                 self, agent_node, expected=expected,
             )
         except (RuntimeError, QueryError, TransactionError) as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             # The owning transaction has finished rollback before returning
             # here. Cancellation and process termination remain BaseException
             # and must not be translated into an ordinary model refusal.
@@ -2865,6 +3071,12 @@ class ConstitutionMixin:
             try:
                 await self.privacy_agent.add_conversation(**conversation)
             except (QueryError, TransactionError) as exc:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(exc):
+                    raise
                 # SQL notice delivery cannot change the already committed
                 # verdict or replace a rejection with a storage exception.
                 # Do not log private notice contents or provider diagnostics.
@@ -2902,8 +3114,12 @@ class ConstitutionMixin:
             await write(agent_node)
             return
 
-        from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
-        from kestrel_sovereign.constitution.runtime_state import ConstitutionStateConflictError
+        from kestrel_sovereign.constitution.anchored_bytes import (
+            revalidate_governance_evidence,
+        )
+        from kestrel_sovereign.constitution.runtime_state import (
+            ConstitutionStateConflictError,
+        )
 
         ConstitutionMixin._require_owned_constitution_commit(self)
         committed_state = None
@@ -2919,7 +3135,9 @@ class ConstitutionMixin:
                     required_target=agent_node.properties["constitution_hash"],
                 )
                 if agent_node.properties["genesis_audit"].get("status") == "passed":
-                    from kestrel_sovereign.constitution.anchored_bytes import lock_governing_file
+                    from kestrel_sovereign.constitution.anchored_bytes import (
+                        lock_governing_file,
+                    )
 
                     # A provider await can outlive native blob corruption or
                     # ownership loss without changing graph/CAS evidence.
@@ -3007,7 +3225,8 @@ class ConstitutionMixin:
 
     async def _reconcile_runtime_genesis_receipt(self, agent_node: GraphNode) -> None:
         from kestrel_sovereign.constitution.genesis_audit import (
-            archive_genesis_receipt, reconcile_genesis_receipt,
+            archive_genesis_receipt,
+            reconcile_genesis_receipt,
         )
 
         digest = agent_node.properties.get("constitution_hash")
@@ -3083,7 +3302,11 @@ class ConstitutionMixin:
         # those are not part of this content-addressed governing receipt.
         try:
             constitution = await self._raw_storage.retrieve_file(constitution_hash)
-        except Exception:
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             constitution = None
         if not isinstance(constitution, (bytes, str)):
             await self._persist_genesis_audit_pending_attempt(
@@ -3118,6 +3341,10 @@ class ConstitutionMixin:
                 provenance=provenance,
             )
         except GenesisAuditPendingError as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             await self._persist_genesis_audit_pending_attempt(
                 agent_node,
                 code=exc.code,
@@ -3126,6 +3353,10 @@ class ConstitutionMixin:
             )
             raise
         except GenesisAuditRejectedError as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             await self._persist_genesis_audit_completion(agent_node, exc.record, expected=expected)
             logging.error(
                 "Genesis audit rejected governing constitution for %s at risk %s",
@@ -3220,7 +3451,11 @@ class ConstitutionMixin:
 
         try:
             await self._ensure_genesis_audit_ready()
-        except GenesisAuditPendingError:
+        except GenesisAuditPendingError as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             return (
                 "⏳ GENESIS AUDIT PENDING\n\n"
                 "This agent cannot begin cognition until an audit-capable LLM "
@@ -3228,12 +3463,20 @@ class ConstitutionMixin:
                 "sent. Configure an auditor and retry this turn."
             )
         except GenesisAuditRejectedError as exc:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(exc):
+                raise
             return (
                 "🚨 GENESIS AUDIT FAILED\n\n"
                 "The governing constitution was rejected, so cognition remains "
                 f"blocked. {exc.record.get('reasoning', 'No reason recorded.')}"
             )
-        except GenesisAuditError:
+        except GenesisAuditError as control_error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+
+            if is_execution_control_error(control_error):
+                raise
             logging.exception("Genesis audit readiness failed closed")
             return (
                 "🚨 GENESIS AUDIT BLOCKED\n\n"
@@ -3269,14 +3512,60 @@ class ConstitutionMixin:
                         or ConstitutionMixin._constitution_time_audit_due(self._constitution_now(), state.last_successful_audit_at)
                     ):
                         raise RuntimeError("Native constitutional runtime custody changed or requires an integrity audit")
-                    from kestrel_sovereign.constitution.genesis_audit import GENESIS_AUDIT_PASSED, validate_completed_genesis_audit
+                    from kestrel_sovereign.constitution.genesis_audit import (
+                        GENESIS_AUDIT_PASSED,
+                        validate_completed_genesis_audit,
+                    )
                     if not isinstance(receipt, Mapping) or validate_completed_genesis_audit(receipt, digest) != GENESIS_AUDIT_PASSED:
                         raise RuntimeError("Native governing receipt changed at turn admission")
                     _CONSTITUTION_ADMISSION.set((self, binding.turn_id, digest, deepcopy(receipt)))
             except Exception as exc:  # Admission uncertainty must never authorize cognition.
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+
+                if is_execution_control_error(exc):
+                    raise
                 self._mark_constitution_state_unavailable(exc)
                 return safe_mode_cognition_block(self, user_input)
         return None
+
+    async def require_cognition_admission(self):
+        """Read-only canonical admission for external realtime cognition.
+
+        This does not run an auditor, mint a new turn, repair an anchor, or
+        authorize delayed future work. The caller must retain its original
+        execution/privacy span across composition and native dispatch.
+        """
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error
+        from kestrel_sovereign.constitution.genesis_audit import GENESIS_AUDIT_PASSED, validate_completed_genesis_audit
+        try:
+            async with ConstitutionMixin._constitution_state_guard(self):
+                # A failed restriction write must not lend the previous healthy
+                # durable row to realtime cognition. These are the same local
+                # restrictive/pending states observed by ordinary turn admission.
+                if any(getattr(self, flag, False) for flag in (
+                    "_safe_mode", "_constitution_state_persistence_pending",
+                    "_constitution_state_migration_pending", "_constitution_bootstrap_pending",
+                    "_constitution_audit_pending",
+                )):
+                    raise RuntimeError("Local constitutional cognition admission is not ready")
+                store = vars(self).get("_constitution_state_store")
+                if store is None:
+                    raise RuntimeError("Native constitutional runtime custody is unavailable")
+                state, digest, receipt = await ConstitutionMixin._locked_turn_governance(self, store)
+                if (state is None or not state.generation or state.safe_mode or state.bootstrap_pending
+                    or state.last_successful_audit_at is None or state.interaction_count >= self.AUDIT_INTERVAL
+                    or ConstitutionMixin._constitution_time_audit_due(self._constitution_now(), state.last_successful_audit_at)
+                    or (state.revision, state.generation) != (self._constitution_state_revision, self._constitution_state_generation)
+                    or not isinstance(receipt, Mapping)
+                    or validate_completed_genesis_audit(receipt, digest) != GENESIS_AUDIT_PASSED):
+                    raise RuntimeError("Native constitutional cognition admission is not ready")
+                return state.revision, state.generation, digest
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            raise ExecutionAuthorityError("constitutional cognition admission refused") from error
 
     async def _locked_turn_governance(self, store):
         """Capture one native runtime/graph snapshot, never mixed revisions.
@@ -3286,7 +3575,8 @@ class ConstitutionMixin:
         these locks; later retrieval is bound to the captured hash and receipt.
         """
         from kestrel_sovereign.constitution.anchored_bytes import (
-            lock_governance_rows, lock_governing_file,
+            lock_governance_rows,
+            lock_governing_file,
         )
 
         ConstitutionMixin._require_owned_constitution_commit(self)
@@ -3309,7 +3599,9 @@ class ConstitutionMixin:
             fresh = await raw.get_node(self.agent_id)
             if fresh is None or fresh.properties.get("constitution_hash") != digest:
                 raise RuntimeError("Native governing pointer changed during turn custody acquisition")
-            from kestrel_sovereign.constitution.genesis_audit import reconcile_genesis_receipt
+            from kestrel_sovereign.constitution.genesis_audit import (
+                reconcile_genesis_receipt,
+            )
 
             receipt = reconcile_genesis_receipt(fresh.properties, digest)
         return state, digest, receipt

@@ -10,6 +10,7 @@ from .enforcement import (
     HoldTurnRefusal,
     build_bound_host_context,
     close_bound_host_context,
+    complete_bound_agent_shutdown,
     get_effective_hold_state,
     initialize_with_bound_hold_context,
     require_context_hold_store,
@@ -54,6 +55,7 @@ from .state import (
 )
 
 __all__ = [
+    "complete_bound_agent_shutdown",
     "HOST_HOLD_TARGET",
     "SELF_HOLD_HISTORY_LIMIT",
     "SELF_HOLD_REDACTION_POLICY",

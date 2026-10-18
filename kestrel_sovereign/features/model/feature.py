@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.llm.provider_policy import (
     ProviderPolicyRefusal,
     current_override_writer,
@@ -163,6 +164,8 @@ class ModelAgent(Feature):
         try:
             models = await self.llm_service.discover_all_models(use_cache=use_cache)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error listing models: {e}")
             return ToolResult.failed(str(e))
 
@@ -201,12 +204,16 @@ class ModelAgent(Feature):
                 progress_callback=progress_callback
             )
         except HostAuthorityError as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Refused shared model pull of {model_name!r}: {e}")
             return ToolResult.failed(
                 str(e),
                 data={"model_name": model_name, "pulled": False, "authority": "sovereign"},
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error pulling model {model_name}: {e}")
             return ToolResult.failed(str(e))
 
@@ -231,6 +238,8 @@ class ModelAgent(Feature):
         try:
             info = await self.llm_service.get_storage_info(use_cache=use_cache)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error getting storage info: {e}")
             return ToolResult.failed(str(e))
 
@@ -269,6 +278,8 @@ class ModelAgent(Feature):
         try:
             roster = self._fleet_model_roster()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Could not read the host roster: {e}")
             return ToolResult.failed(
                 str(e)
@@ -302,12 +313,16 @@ class ModelAgent(Feature):
                 protected_models=roster.protected,
             )
         except HostAuthorityError as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Refused shared model cleanup: {e}")
             return ToolResult.failed(
                 str(e),
                 data={"dry_run": dry_run, "authority": "sovereign"},
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error cleaning up models: {e}")
             return ToolResult.failed(str(e))
 
@@ -400,6 +415,8 @@ class ModelAgent(Feature):
         try:
             models = await self.llm_service.discover_all_models(use_cache=True)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error getting model info for {model_name}: {e}")
             return ToolResult.failed(str(e))
 
@@ -421,6 +438,8 @@ class ModelAgent(Feature):
             if model_info:
                 result['last_used'] = model_info.get('last_used', 'never')
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Storage lookup is enrichment, not load-bearing — log but
             # don't fail the entire info call.
             logger.debug(f"storage info enrichment skipped for {model_name}: {e}")
@@ -602,6 +621,8 @@ class ModelAgent(Feature):
                         {"from": current_model, "to": model_name, "vendor": vendor, "route": route},
                     )
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"consent recording failed (non-blocking): {e}")
 
             # Safe to switch. One mandate change, serialized with a
@@ -643,6 +664,8 @@ class ModelAgent(Feature):
                 data={"success": False, **refusal.to_dict()},
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error setting model to {model}: {e}")
             return ToolResult.failed(
                 str(e),
@@ -693,6 +716,8 @@ class ModelAgent(Feature):
                     return True
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"Error checking if {model_id} is OpenRouter model: {e}")
 
         return False

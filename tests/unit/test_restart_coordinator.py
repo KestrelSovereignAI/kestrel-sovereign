@@ -3262,8 +3262,9 @@ class _RealDispatchAgent(TurnLifecycleMixin, OrchestratorEngineMixin):
                 await self.restart_feature.request_restart(reason=reason)
             return "resumed"
 
-    def _track_background_task(self, coro, *, name: str):
-        task = asyncio.create_task(coro, name=name)
+    def _track_background_task(self, coro, *, name: str, admission=None):
+        from kestrel_sovereign._async_ownership import create_owned_task
+        task = create_owned_task(coro, name=name, admission=admission)
         self.background_tasks.append(task)
         return task
 
@@ -5826,6 +5827,7 @@ def test_kinds_only_description_withholds_every_per_instance_tail():
         "wait_fallback_reconcile",
         # Durable dispatcher owner-liveness tick, a fresh task every ~40s.
         "durable_signal_owner_heartbeat:did:pkh:eip155:1:0xabc",
+        "workflows:lease-recovery",
     ],
 )
 def test_permanent_bookkeeping_daemons_are_infrastructure(name):
@@ -5844,6 +5846,7 @@ def test_permanent_bookkeeping_daemons_are_infrastructure(name):
         "post_response_memory_enrichment",
         # A lookalike must not ride on the heartbeat's exclusion.
         "durable_signal_owner:did:x",
+        "workflows:stage:real-user-effect",
     ],
 )
 def test_real_work_is_not_infrastructure(name):
@@ -6799,9 +6802,9 @@ async def test_the_dispatch_is_stamped_before_the_signal_is_handed_over(
     real_enqueue = agent.dispatcher.enqueue_signal
     real_mark = fm.mark_wake_dispatched
 
-    def _record_enqueue(signal):
+    def _record_enqueue(signal, **kwargs):
         order.append("enqueue")
-        return real_enqueue(signal)
+        return real_enqueue(signal, **kwargs)
 
     async def _record_mark(*args, **kwargs):
         order.append("stamp")

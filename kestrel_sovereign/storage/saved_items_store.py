@@ -20,6 +20,12 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from kestrel_sovereign.execution_custody import (
+    current_execution_custody,
+    is_execution_control_error,
+    require_execution_work,
+)
+
 from .async_database import AsyncDatabase
 from .embedding_column import (
     decode_stored_embedding,
@@ -389,6 +395,8 @@ class SavedItemsStore:
 
             return get_provider_embedding_service(self._llm_service)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Embedding service not available: {e}")
             return None
 
@@ -490,6 +498,8 @@ class SavedItemsStore:
                     text_to_embed = summary or content[:1000]
                     embedding = await embedding_service.aembed(text_to_embed) or None
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Failed to compute embedding: {e}")
 
         # Pin to IPFS if requested
@@ -549,6 +559,8 @@ class SavedItemsStore:
                 try:
                     profile_id = embedding_service.current_profile_id()
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "current_profile_id() failed for saved_item %s: %s",
                         item_id, exc,
@@ -564,6 +576,8 @@ class SavedItemsStore:
                         self.db, embedding_service, profile_id,
                     )
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "embedding_profiles registry upsert failed for "
                         "saved_item %s: %s", item_id, exc,
@@ -857,6 +871,8 @@ class SavedItemsStore:
                 )
             return
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Most likely cause: a migration hasn't run yet on this DB
             # (one of the columns doesn't exist). Try the two columns
             # INDEPENDENTLY so each one lands wherever its column is
@@ -885,6 +901,8 @@ class SavedItemsStore:
                     (_serialize_embedding(embedding), item_id),
                 )
         except Exception as e2:
+            if is_execution_control_error(e2):
+                raise
             logger.warning(
                 "saved_items.embedding_vec write failed for %s: %s. The "
                 "item has no stored vector until it is re-embedded.",
@@ -901,6 +919,8 @@ class SavedItemsStore:
                     (profile_id, item_id),
                 )
             except Exception as e3:
+                if is_execution_control_error(e3):
+                    raise
                 logger.debug(
                     "saved_items.embedding_profile_id write failed for "
                     "%s: %s (column likely missing — #1477 migration "
@@ -917,16 +937,21 @@ class SavedItemsStore:
         backend shape) — callers then fall back to the legacy
         in-Python search path.
         """
-        if getattr(self, "_sqla_factory", None) is not None:
+        execution_owner = getattr(self.db, "backend", None)
+        require_execution_work(execution_owner)
+        scoped = bool(current_execution_custody(execution_owner))
+        if getattr(self, "_sqla_factory", None) is not None and not scoped:
             return self._sqla_factory
         # Don't keep retrying once we've decided it isn't available.
         if getattr(self, "_sqla_factory_unavailable", False):
             return None
         try:
             from kestrel_sovereign.storage.sqla import make_session_factory
-            self._sqla_factory = make_session_factory(self.db)
+            self._sqla_factory = make_session_factory(self.db, native_read_fallback=True)
             return self._sqla_factory
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.info(
                 "SQLAlchemy session factory unavailable for saved_items "
                 "vector search (%s); falling back to in-Python search.",
@@ -981,6 +1006,8 @@ class SavedItemsStore:
                     embedding_service, query
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"Failed to embed query: {e}")
 
         if not query_embedding:
@@ -1063,6 +1090,8 @@ class SavedItemsStore:
                         embedding_service_for_profile.current_profile_id()
                     )
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "current_profile_id() failed at read time: %s", exc
                     )
@@ -1076,6 +1105,8 @@ class SavedItemsStore:
                 packed, k=limit, filter=filter_kwargs
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "Vector-backend search failed (%s); falling back to "
                 "in-Python legacy path.", e,
@@ -1142,6 +1173,8 @@ class SavedItemsStore:
                     embedding_service_for_profile.current_profile_id()
                 )
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "current_profile_id() failed in legacy search: %s", exc,
                 )
@@ -1176,6 +1209,8 @@ class SavedItemsStore:
         try:
             rows = await _fetch(with_profile=current_profile_id is not None)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             # Profile column doesn't exist yet (#1477 migration
             # hasn't run on this DB). Retry without the filter.
             logger.debug(
@@ -1234,6 +1269,8 @@ class SavedItemsStore:
                     embedding_service_for_profile.current_profile_id()
                 )
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "current_profile_id() failed in text_search: %s", exc,
                 )
@@ -1282,6 +1319,8 @@ class SavedItemsStore:
         try:
             rows = await _run(with_profile=current_profile_id is not None)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             # Profile column missing → pre-#1477 DB. Retry without
             # the filter so the legacy behaviour still works.
             logger.debug(

@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
@@ -662,6 +663,9 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
 async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
     """Enable a feature group while the agent's turn boundary is held."""
 
+    from kestrel_sovereign.kestrel_agent import require_feature_lifecycle_integrity
+    require_feature_lifecycle_integrity(agent)
+
     loaded = _get_loaded_features_or_404(agent, name)
 
     to_activate = tuple(
@@ -669,7 +673,15 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
         for _class_name, feature in loaded
         if not bool(getattr(feature, "enabled", True))
     )
-    prepared = agent._prepare_feature_contribution_transition(to_activate)
+    try:
+        prepared = agent._prepare_feature_contribution_transition(to_activate)
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_error:
+        if is_execution_control_error(preparation_error):
+            await _enter_feature_quarantine_safe_mode(
+                agent, "Package enable preflight reported unresolved native control",
+                preparation_error, features=to_activate,
+            )
+        raise
     if prepared.rejected:
         # A package enable is a GROUP transaction: its members go live together
         # or not at all. Silently enabling the survivors would hand back a
@@ -697,15 +709,18 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
                 notify_ready=False,
             )
             activated.append((class_name, feature))
-    except (Exception, asyncio.CancelledError):
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as opening:
         # Group transaction: roll the already-activated members back to the
         # disabled state (soft-toggle) so a partial package-enable never leaves
         # a mix of live and dead members.
         quarantine_error = None
+        controls = [opening] if is_execution_control_error(opening) else []
         for class_name, feature in reversed(activated):
             try:
                 await agent._unregister_feature_runtime(feature, unload=False)
-            except (Exception, asyncio.CancelledError) as cleanup_exc:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as cleanup_exc:
+                if is_execution_control_error(cleanup_exc):
+                    controls.append(cleanup_exc)
                 logger.error(
                     "Enable rollback (re-disable) for feature '%s' reported %s; "
                     "quarantining surviving contributions",
@@ -722,17 +737,20 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
                     continue
                 try:
                     agent._quarantine_feature_contributions(feature)
-                except (Exception, asyncio.CancelledError):
+                except (Exception, asyncio.CancelledError, BaseExceptionGroup) as quarantine_exc:
+                    if is_execution_control_error(quarantine_exc):
+                        controls.append(quarantine_exc)
                     quarantine_error = RuntimeError(
                         "package enable rollback contributions could not be quarantined"
                     )
             else:
                 logger.info("Rolled back enable of feature '%s'", class_name)
-        if quarantine_error is not None:
+        if quarantine_error is not None or controls:
             await _enter_feature_quarantine_safe_mode(
                 agent,
                 "Package enable rollback contribution quarantine failed; "
                 "cognition is blocked until lifecycle integrity is restored",
+                *controls,
             )
             # A disabled member must never retain prompt authority. Surface a
             # fixed error without chaining arbitrary feature cleanup details.
@@ -753,31 +771,21 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
     }
 
 
-async def _enter_feature_quarantine_safe_mode(agent: object, reason: str) -> None:
+async def _enter_feature_quarantine_safe_mode(agent: object, reason: str, *errors, features=()) -> None:
     """Latch cognition closed when contribution ownership cannot be repaired."""
 
-    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.kestrel_agent import enter_feature_lifecycle_safe_mode
+    await enter_feature_lifecycle_safe_mode(agent, reason, *errors, features=features)
 
-    lifecycle_cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
-    setattr(agent, "_feature_lifecycle_integrity_uncertain", True)
-    setattr(agent, "_feature_lifecycle_repair_verified", False)
-    setattr(agent, "_safe_mode_cause", lifecycle_cause)
-    entered = False
-    enter_safe_mode = getattr(agent, "enter_safe_mode", None)
-    if callable(enter_safe_mode):
-        try:
-            result = enter_safe_mode(reason, cause=lifecycle_cause)
-            if inspect.isawaitable(result):
-                await result
-            entered = getattr(agent, "_safe_mode", False) is True
-        except (Exception, asyncio.CancelledError):
-            pass
-    if not entered:
-        # A lightweight compatibility agent may not expose the constitutional
-        # persistence API. The in-memory latch is still the minimum safe state.
-        setattr(agent, "_safe_mode", True)
-        setattr(agent, "_safe_mode_reason", reason)
-        setattr(agent, "_safe_mode_cause", lifecycle_cause)
+
+async def _fence_native_feature_recovery(agent: object, feature: object, *errors) -> None:
+    """Recovery cannot replay config or READY across unresolved native control."""
+    if not any(is_execution_control_error(error) for error in errors):
+        return
+    await _enter_feature_quarantine_safe_mode(
+        agent, "Feature recovery requires retirement of the original native resources",
+        *errors, features=(feature,),
+    )
 
 
 @router.post(
@@ -863,7 +871,7 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
                 continue
             attempted.append((class_name, feature))
             await agent._unregister_feature_runtime(feature, unload=False)
-    except (Exception, asyncio.CancelledError):
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as opening:
         await _restore_feature_group(
             agent,
             tuple(
@@ -871,6 +879,7 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
                 for class_name, feature in attempted
             ),
             operation="Disable",
+            opening=opening,
         )
         raise
 
@@ -887,12 +896,14 @@ async def _restore_feature_group(
     attempted: tuple[tuple[str, Any, bool], ...],
     *,
     operation: str,
+    opening: BaseException | None = None,
 ) -> None:
     """Best-effort restore of one prevalidated package feature generation."""
 
     enabled = tuple(
         feature for _class_name, feature, was_enabled in attempted if was_enabled
     )
+    quarantine_failures = []
     quarantine_descriptor = inspect.getattr_static(
         agent, "_quarantine_feature_contributions", None
     )
@@ -906,7 +917,8 @@ async def _restore_feature_group(
                 # imperative cleanup. Withdraw those exact survivors before the
                 # complete package generation is prepared again.
                 agent._quarantine_feature_contributions(feature)
-            except (Exception, asyncio.CancelledError) as quarantine_exc:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as quarantine_exc:
+                quarantine_failures.append(quarantine_exc)
                 logger.error(
                     "%s rollback contribution quarantine for feature '%s' "
                     "reported %s",
@@ -914,6 +926,13 @@ async def _restore_feature_group(
                     class_name,
                     type(quarantine_exc).__name__,
                 )
+
+    if is_execution_control_error(opening) or quarantine_failures:
+        await _enter_feature_quarantine_safe_mode(
+            agent, f"{operation} rollback cannot reopen an uncertain original generation",
+            opening, *quarantine_failures,
+        )
+        raise RuntimeError(f"{operation.lower()} rollback could not restore the complete feature generation") from None
 
     prepared_by_feature: Dict[int, Any] = {}
     if enabled:
@@ -926,7 +945,12 @@ async def _restore_feature_group(
                 id(feature): item
                 for feature, item in prepared.activatable(enabled)
             }
-        except (Exception, asyncio.CancelledError) as preparation_exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_exc:
+            if is_execution_control_error(preparation_exc):
+                await _enter_feature_quarantine_safe_mode(
+                    agent, f"{operation} rollback preparation reported native control",
+                    preparation_exc,
+                )
             logger.error(
                 "%s rollback contribution batch preparation reported %s",
                 operation,
@@ -958,7 +982,12 @@ async def _restore_feature_group(
                     operation,
                     class_name,
                 )
-        except (Exception, asyncio.CancelledError) as activation_exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as activation_exc:
+            if is_execution_control_error(activation_exc):
+                await _enter_feature_quarantine_safe_mode(
+                    agent, f"{operation} rollback activation reported native control",
+                    activation_exc,
+                )
             restore_complete = False
             logger.error(
                 "%s rollback re-activation for feature '%s' reported %s",
@@ -1089,7 +1118,7 @@ async def _remove_feature_locked(
             # drained (kestrel-sovereign#2522 P1).
             attempted.append((class_name, feature, was_enabled))
             await agent._unregister_feature_runtime(feature, unload=True)
-    except (Exception, asyncio.CancelledError):
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as opening:
         # Package removal has not crossed its irreversible on_remove/pip
         # boundary yet. Restore the complete group before propagating a hook
         # failure (including an internally-originated CancelledError).
@@ -1097,6 +1126,7 @@ async def _remove_feature_locked(
             agent,
             tuple(attempted),
             operation="Remove",
+            opening=opening,
         )
         raise
 
@@ -1381,6 +1411,12 @@ async def _settle_feature_transition(
         pending_cancellation=pending_cancellation,
     )
     task.remove_done_callback(mark_terminal_before_admission)
+    terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+    if terminal is not None and is_execution_control_error(terminal):
+        # A caller disconnect is not stronger than the admitted child's
+        # original authority/commit receipt. Ordinary package errors remain
+        # sanitized below; do not chain or stringify their config bytes.
+        raise terminal
     if outcome.cancellation is not None:
         if outcome.error is not None and not (
             isinstance(outcome.error, asyncio.CancelledError)
@@ -1414,6 +1450,8 @@ async def _update_feature_config_locked(
     allowed to diverge merely because rendering the new snapshot failed.
     """
 
+    from kestrel_sovereign.kestrel_agent import require_feature_lifecycle_integrity
+    require_feature_lifecycle_integrity(agent)
     schema = feature.config_schema
     incoming = dict(body.config)
     previous = await feature.get_config()
@@ -1458,16 +1496,18 @@ async def _update_feature_config_locked(
         # not run the ambiguous-commit reconciliation path below: this narrow
         # exception certifies that no stage or live hook was attempted.
         raise
-    except (Exception, asyncio.CancelledError):
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as setter_error:
         # A setter can durably mutate and then surface an internally-originated
         # CancelledError (or another late error). With no returned receipt its
         # commit status is ambiguous, so do not issue a blind rollback that may
         # overwrite a newer hosted generation. Republish from the authoritative
         # current config before the error leaves the turn boundary instead.
+        await _fence_native_feature_recovery(agent, feature, setter_error)
         if should_refresh:
             try:
                 await _refresh_feature_context(refresh_context, feature)
-            except (Exception, asyncio.CancelledError):
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as refresh_error:
+                await _fence_native_feature_recovery(agent, feature, setter_error, refresh_error)
                 await _disable_feature_after_config_reconciliation_failure(
                     agent, feature, name
                 )
@@ -1480,7 +1520,8 @@ async def _update_feature_config_locked(
     if should_refresh:
         try:
             await _refresh_feature_context(refresh_context, feature)
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as refresh_error:
+            await _fence_native_feature_recovery(agent, feature, refresh_error)
             try:
                 rollback_descriptor = inspect.getattr_static(
                     feature, "rollback_config_transition", None
@@ -1491,7 +1532,8 @@ async def _update_feature_config_locked(
                 else:
                     await feature.set_config(previous)
                 await _refresh_feature_context(refresh_context, feature)
-            except (Exception, asyncio.CancelledError):
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as rollback_error:
+                await _fence_native_feature_recovery(agent, feature, refresh_error, rollback_error)
                 # The old prompt bytes cannot safely coexist with a config we
                 # failed to restore.  Canonical teardown removes both the
                 # cached clauses and the feature's live tools before the error
@@ -1535,12 +1577,15 @@ async def _disable_feature_after_config_reconciliation_failure(
 
     teardown = getattr(agent, "_unregister_feature_runtime", None)
     quarantine_error = None
+    controls = []
     if callable(teardown):
         try:
             deactivated = teardown(feature, unload=False)
             if inspect.isawaitable(deactivated):
                 await deactivated
-        except (Exception, asyncio.CancelledError) as teardown_exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as teardown_exc:
+            if is_execution_control_error(teardown_exc):
+                controls.append(teardown_exc)
             # Out-of-tree teardown errors may contain private config bytes. Log
             # only their type while preserving the fail-closed disabled state.
             logger.error(
@@ -1559,16 +1604,19 @@ async def _disable_feature_after_config_reconciliation_failure(
             else:
                 try:
                     agent._quarantine_feature_contributions(feature)
-                except (Exception, asyncio.CancelledError):
+                except (Exception, asyncio.CancelledError, BaseExceptionGroup) as quarantine_exc:
+                    if is_execution_control_error(quarantine_exc):
+                        controls.append(quarantine_exc)
                     quarantine_error = RuntimeError(
                         "feature contributions could not be quarantined"
                     )
     feature.enabled = False
-    if quarantine_error is not None:
+    if quarantine_error is not None or controls:
         await _enter_feature_quarantine_safe_mode(
             agent,
             "Feature configuration contribution quarantine failed; "
             "cognition is blocked until lifecycle integrity is restored",
+            *controls,
         )
         # Raise after leaving the teardown handler so a third-party exception
         # cannot survive in __context__ and leak private configuration bytes.

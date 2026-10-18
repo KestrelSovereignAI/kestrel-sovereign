@@ -34,7 +34,7 @@ import { getOrCreateChatPane } from '../ui.js';
 import UI from '../ui-ext/registry.js';
 import bus from '../ui-ext/bus.js';
 import { Events } from './events.js';
-import { createRealtimeClient, normalizeToolBatchResults } from './realtime.js';
+import { createRealtimeClient, normalizeToolBatchResults, readToolBatchResponse } from './realtime.js';
 import { createPipelineClient } from './pipeline.js';
 import {
   applyVoiceCatalogAttribution,
@@ -865,6 +865,9 @@ async function startSession(session = activeSession()) {
   // can't clobber a newer session. Bumped per start, captured in `onEvent`.
   session.startSeq = (session.startSeq || 0) + 1;
   const startSeq = session.startSeq;
+  session.startupSeq = startSeq;
+  const isCurrentStartup = () => session.startSeq === startSeq;
+  let startupPending = true;
   setState(State.CONNECTING, session);
   resetTurnState(session);
   if (session === controlSession()) setPathBadge('', '');
@@ -876,7 +879,12 @@ async function startSession(session = activeSession()) {
   session.realtimeVendor = '';
   setArmedAgent(agent);
 
-  const onEvent = (ev) => handleClientEvent(agent, ev, startSeq);
+  const onEvent = (ev) => {
+    // A startup failure retires its own client. Its close is not an operator
+    // Stop and must not disarm an expected realtime→pipeline handoff.
+    if (startupPending && ev.kind === Events.SESSION_CLOSED) return;
+    handleClientEvent(agent, ev, startSeq);
+  };
 
   // Apply user picker overrides (mode + TTS) to drive routing.
   const overrides = pickerOverridesFromUI(
@@ -891,8 +899,9 @@ async function startSession(session = activeSession()) {
   // work and the 409 looks like a bug to anyone reading the network tab.
   // Mode selection is the user's contract — honor it.
   if (overrides.prefer_realtime !== false) {
+    let realtimeClient;
     try {
-      session.client = await createRealtimeClient({
+      realtimeClient = await createRealtimeClient({
         onEvent,
         // Rewrite to /api/agents/<host>/voice/realtime/session in multi_agent
         // mode; identity in standalone mode.
@@ -906,11 +915,19 @@ async function startSession(session = activeSession()) {
           preferred_conversation: overrides.preferred_conversation || '',
         },
       });
-      await session.client.start();
+      if (!isCurrentStartup()) { await realtimeClient.close(); return; }
+      session.client = realtimeClient;
+      await realtimeClient.start();
+      if (!isCurrentStartup() || session.client !== realtimeClient) {
+        await realtimeClient.close();
+        return;
+      }
+      startupPending = false;
+      session.startupSeq = null;
       applyActiveSessionPolicy();
-      const realtimeModel = session.client.session?.model || 'realtime';
-      const realtimeProvider = session.client.session?.provider || 'realtime';
-      const realtimeVendor = session.client.session?.vendor || realtimeProvider;
+      const realtimeModel = realtimeClient.session?.model || 'realtime';
+      const realtimeProvider = realtimeClient.session?.provider || 'realtime';
+      const realtimeVendor = realtimeClient.session?.vendor || realtimeProvider;
       session.realtimeModel = realtimeModel;
       session.realtimeProvider = realtimeProvider;
       session.realtimeVendor = realtimeVendor.replace(/_realtime$/i, '');
@@ -935,6 +952,7 @@ async function startSession(session = activeSession()) {
       );
       return;
     } catch (err) {
+      if (!isCurrentStartup()) { await realtimeClient?.close(); return; }
       if (err && err.code === 'REALTIME_UNAVAILABLE') {
         const fallback = err.fallback || {};
         const canUsePipeline =
@@ -957,8 +975,9 @@ async function startSession(session = activeSession()) {
   }
 
   // Pipeline path.
+  let pipelineClient;
   try {
-    session.client = await createPipelineClient({
+    pipelineClient = await createPipelineClient({
       onEvent,
       apiKey: API.getApiKey() || '',
       wsPath: buildAgentUrlForAgent('/voice/chat', agent),
@@ -973,7 +992,15 @@ async function startSession(session = activeSession()) {
       // so Whisper doesn't hallucinate language switches mid-utterance.
       language: (navigator.language || 'en').split('-')[0],
     });
-    await session.client.start();
+    if (!isCurrentStartup()) { await pipelineClient.close(); return; }
+    session.client = pipelineClient;
+    await pipelineClient.start();
+    if (!isCurrentStartup() || session.client !== pipelineClient) {
+      await pipelineClient.close();
+      return;
+    }
+    startupPending = false;
+    session.startupSeq = null;
     applyActiveSessionPolicy();
     session.path = 'pipeline';
     session.pathLabel = 'Pipeline';
@@ -982,12 +1009,21 @@ async function startSession(session = activeSession()) {
       setPathBadge(session.pathLabel, session.pathTooltip, session.path);
     }
   } catch (err) {
+    if (!isCurrentStartup()) { await pipelineClient?.close(); return; }
     surfaceFatalError(err, session);
   }
 }
 
 
+function invalidatePendingStartup(session) {
+  if (session.startupSeq !== null && session.startupSeq === session.startSeq) {
+    session.startSeq = (session.startSeq || 0) + 1;
+    session.startupSeq = null;
+  }
+}
+
 async function stopSession(session = activeSession()) {
+  invalidatePendingStartup(session);
   const c = session.client;
   // close() emits SESSION_CLOSED synchronously, by which point session.client
   // is already null — stash the client so that handler can still await its
@@ -1013,6 +1049,13 @@ async function stopSession(session = activeSession()) {
 
 
 function surfaceFatalError(err, session = activeSession()) {
+  invalidatePendingStartup(session);
+  const retiringClient = session.client;
+  session.closingClient = retiringClient;
+  session.client = null;
+  if (retiringClient) void retiringClient.close().catch(closeError => {
+    console.error('[voice/ui] voice retirement failed:', closeError);
+  });
   console.error('[voice/ui] fatal voice error:', err);
   setState(State.ERROR, session);
   // Surface as an agent message so the user sees it inline with the chat.
@@ -1168,7 +1211,11 @@ function handleClientEvent(agent, ev, startSeq) {
           } catch (_) { /* non-DOM context — ignore */ }
         });
       }
+      const retiringClient = session.client;
       session.client = null;
+      if (retiringClient) void retiringClient.close().catch(closeError => {
+        console.error('[voice/ui] voice retirement failed:', closeError);
+      });
       session.closingClient = null;
       session.pathLabel = '';
       session.pathTooltip = '';
@@ -1298,6 +1345,10 @@ async function handleToolBatch(session, ev) {
     return;
   }
   const sessionId = sessionClient.session.session_id;
+  const responseGeneration = ev.response_generation ?? sessionClient.responseGeneration;
+  const originalResponseIsLive = () => (
+    session.client === sessionClient && sessionClient.responseGeneration === responseGeneration
+  );
   const calls = Array.isArray(ev.calls) ? ev.calls : [];
   if (!calls.length) return;
 
@@ -1329,24 +1380,35 @@ async function handleToolBatch(session, ev) {
   session.persistedAny = true;
   let results;
   try {
+    const authHeaders = await voiceAuthHeaders();
+    // Authentication can outlive Stop or a replacement session. Never send
+    // a tool effect using that retired session's freshly completed token.
+    if (!originalResponseIsLive()) {
+      if (session.client !== sessionClient) await sessionClient.close();
+      return;
+    }
     const resp = await fetch(buildAgentUrlForAgent(
       `/voice/realtime/tools/${encodeURIComponent(sessionId)}/batch`,
       session.agent,
     ), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...await voiceAuthHeaders() },
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify({ calls }),
     });
-    const body = await resp.json().catch(() => ({}));
-    if (!resp.ok) {
-      throw new Error(body.detail || `tool dispatch HTTP ${resp.status}`);
-    }
-    results = Array.isArray(body.results) ? body.results : [];
+    results = await readToolBatchResponse(resp, calls);
   } catch (err) {
-    results = calls.map((call) => ({
-      call_id: call.call_id,
-      result: { error: `tool dispatch threw: ${err.message}` },
-    }));
+    // Transport/control failure may follow a committed effect. Never invent
+    // a function error or request a model continuation for that operation.
+    for (const { card, cardDiv } of cards) {
+      card.status = 'error';
+      card.events.push({ phase: 'error', name: card.name, detail: 'Acknowledgement uncertain; reconcile before continuing.' });
+      updateVoiceToolCard(cardDiv, card);
+    }
+    await sessionClient.close();
+    if (session.client === sessionClient) {
+      surfaceFatalError(err, session);
+    }
+    return;
   }
 
   const commitResults = normalizeToolBatchResults(calls, results);
@@ -1375,8 +1437,14 @@ async function handleToolBatch(session, ev) {
   // If the session ended while we were awaiting the dispatch, the model is
   // gone and there's nowhere to commit. Drop silently — the model already
   // closed.
-  if (sessionClient !== session.client) {
+  if (!originalResponseIsLive()) {
     console.info('[voice/ui] session ended before tool result; dropping commit');
+    // Losing the UI pointer is not physical retirement. A fatal RTC error
+    // may clear it while the request is still pending; retire the captured
+    // original client, never a subsequently-created replacement session.
+    if (sessionClient !== session.client) {
+      try { await sessionClient.close(); } catch (_) {}
+    }
     return;
   }
 

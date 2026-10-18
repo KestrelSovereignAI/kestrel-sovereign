@@ -10,15 +10,22 @@ import contextlib
 import dataclasses
 import logging
 from contextvars import ContextVar
-from typing import (
-    List, Dict, Any, AsyncIterator, Iterator, Optional, Set, Tuple, TYPE_CHECKING,
-)
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Iterator, List, Optional, Set, Tuple
 
 from kestrel_sdk.llm import ModelInfo as SDKModelInfo
 
+from kestrel_sovereign.execution_custody import (
+    await_execution_work,
+    await_execution_work_group,
+    execution_work_operation,
+    is_execution_control_error,
+    execution_cleanup_debts,
+    owned_native_http_client,
+    require_execution_work,
+)
+from kestrel_sovereign.turn_scope import capture_turn_scope
+
 from .discovery_deadline import DiscoveryStepTimeout, discovery_route_deadline_seconds
-from .model_metadata import ModelInfo, ModelCategory
-from .model_catalog import get_catalog_service
 from .model_cache import (
     DiscoveryStatus,
     ModelCatalogSnapshot,
@@ -26,6 +33,8 @@ from .model_cache import (
     VendorDiscoveryOutcome,
     get_shared_model_cache,
 )
+from .model_catalog import get_catalog_service
+from .model_metadata import ModelCategory, ModelInfo
 
 if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
@@ -220,7 +229,9 @@ def _resolve_deployment_embedding_dim() -> Optional[int]:
 
         dim = resolve_embedding_dim()
         return int(dim) if dim else None
-    except Exception:  # pragma: no cover - defensive
+    except Exception as execution_error:  # pragma: no cover - defensive
+        if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
+            raise
         return None
 
 
@@ -355,6 +366,8 @@ class ModelDiscoveryMixin:
             async with asyncio.timeout(seconds) as scope:
                 yield
         except TimeoutError as exc:
+            if is_execution_control_error(exc) or execution_cleanup_debts(exc):
+                raise
             timeout = DiscoveryStepTimeout(
                 vendor=vendor,
                 route=route,
@@ -428,9 +441,12 @@ class ModelDiscoveryMixin:
                 vendor, route.get("name") or vendor, "chat catalog"
             ):
                 return await self._discover_for_vendor_route(vendor, route)
-        except DiscoveryStepTimeout:
+        except DiscoveryStepTimeout as error:
+            if is_execution_control_error(error) or execution_cleanup_debts(error):
+                raise
             return []
 
+    @execution_work_operation
     async def discover_all_models(
         self,
         use_cache: bool = True,
@@ -482,6 +498,9 @@ class ModelDiscoveryMixin:
         """:meth:`discover_all_models` within its discovery-call scope."""
         # Check shared process-wide cache
         shared_cache = get_shared_model_cache()
+        # use_cache selects catalog reuse, not permission to bypass an original
+        # shared refresh's unresolved control or enter replacement discovery.
+        shared_cache.snapshot()
         if use_cache:
             async def _return_cached(snapshot: ModelCatalogSnapshot) -> List[ModelInfo]:
                 logger.debug("Using shared model cache")
@@ -521,6 +540,10 @@ class ModelDiscoveryMixin:
                 self._amend_catalog_failures(
                     shared_cache, snapshot, reconcile_outcomes
                 )
+                # Reconciliation yields to the original shared refresh. A
+                # healthy earlier snapshot cannot outlive its newly known
+                # control, even when there are no availability amendments.
+                shared_cache.snapshot()
                 return self._filter_models(
                     cached_models,
                     featured_only=featured_only,
@@ -534,7 +557,7 @@ class ModelDiscoveryMixin:
 
             if (
                 not stale_while_revalidate
-                and await shared_cache.wait_for_refresh()
+                and await await_execution_work(self, lambda: shared_cache.wait_for_refresh())
             ):
                 cached = shared_cache.fresh_snapshot()
                 if cached is not None:
@@ -568,9 +591,11 @@ class ModelDiscoveryMixin:
         with collect_discovery_outcomes() as discovery_outcomes:
             for vendor, route in self._select_discovery_routes():
                 discovery_vendors.append(vendor)
-                discovery_tasks.append(self._discover_vendor_catalog(vendor, route))
+                discovery_tasks.append(
+                    lambda vendor=vendor, route=route: self._discover_vendor_catalog(vendor, route)
+                )
 
-            results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
+            results = await await_execution_work_group(self, discovery_tasks, return_exceptions=True)
 
             # Zip vendors back onto results (#3190): ``gather`` returns a bare
             # list, so the previous loop could neither name the failing vendor
@@ -783,6 +808,7 @@ class ModelDiscoveryMixin:
                 by_route[route_name] = by_vendor.get(vendor, [])
         self._chat_models_by_route = by_route
 
+    @execution_work_operation
     async def discover_models_for_route(
         self,
         vendor: str,
@@ -843,6 +869,7 @@ class ModelDiscoveryMixin:
             providers=None,
         )
 
+    @execution_work_operation
     async def discover_embedding_models(
         self,
         *,
@@ -888,6 +915,7 @@ class ModelDiscoveryMixin:
             models = [m for m in models if m.route == route]
         return models
 
+    @execution_work_operation
     async def _discover_embedding_models_coalesced(
         self,
     ) -> List["EmbeddingModelInfo"]:
@@ -910,24 +938,36 @@ class ModelDiscoveryMixin:
         starter's context, so they are recorded only there.
         """
         inflight = getattr(self, "_embedding_discovery_inflight", None)
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            create_owned_task,
+            raise_owned_outcome,
+        )
         if inflight is not None and not inflight.done():
-            models, overruns = await inflight
+            models, overruns = raise_owned_outcome(
+                await await_owned_task(inflight), operation="shared embedding discovery"
+            )
             self._absorb_shared_overruns(overruns)
         else:
-            task = asyncio.ensure_future(self._discover_embedding_models_uncached())
+            task = create_owned_task(self._discover_embedding_models_uncached())
             self._embedding_discovery_inflight = task
             try:
-                models, overruns = await task
+                models, overruns = raise_owned_outcome(
+                    await await_owned_task(task), operation="shared embedding discovery"
+                )
             finally:
                 if getattr(self, "_embedding_discovery_inflight", None) is task:
                     self._embedding_discovery_inflight = None
+            require_execution_work(self)
             if not overruns:
                 self._embedding_discovery_cache = list(models)
+        require_execution_work(self)
         call = _current_discovery_call()
         if overruns and call is not None:
             call.embedding_sweeps[id(self)] = list(models)
         return models
 
+    @execution_work_operation
     async def _discover_embedding_models_uncached(
         self,
     ) -> Tuple[List["EmbeddingModelInfo"], List[DiscoveryStepTimeout]]:
@@ -968,12 +1008,12 @@ class ModelDiscoveryMixin:
             vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
             route_name = provider.get("name")
             tasks.append(
-                self._discover_embedding_for_route(
+                lambda vendor=vendor, provider=provider, route_name=route_name: self._discover_embedding_for_route(
                     vendor, provider, chat_by_route.get(route_name)
                 )
             )
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await await_execution_work_group(self, tasks, return_exceptions=True)
         discovered: List[EmbeddingModelInfo] = []
         overruns: List[DiscoveryStepTimeout] = []
         for result in results:
@@ -1053,6 +1093,7 @@ class ModelDiscoveryMixin:
             return False
         return bool(caps.get("embedding_model") or caps.get("supports_embeddings"))
 
+    @execution_work_operation
     async def _discover_embedding_for_route(
         self, vendor: str, route: dict, chat_model_ids: Optional[List[str]] = None
     ) -> List["EmbeddingModelInfo"]:
@@ -1080,11 +1121,11 @@ class ModelDiscoveryMixin:
                 vendor, route_name, "embedding discovery"
             ):
                 if getattr(adapter, "derives_embeddings_from_chat_listing", False):
-                    models = await adapter.list_embedding_models(
+                    models = await await_execution_work(self, lambda: adapter.list_embedding_models(
                         client, chat_models=chat_model_ids
-                    )
+                    ))
                 else:
-                    models = await adapter.list_embedding_models(client)
+                    models = await await_execution_work(self, lambda: adapter.list_embedding_models(client))
             # Retag to the vendor key so aggregation/filtering is consistent
             # even if an adapter reports its own name, AND stamp the originating
             # route so capability advertisement stays route-specific (#2338).
@@ -1098,11 +1139,15 @@ class ModelDiscoveryMixin:
             else:
                 logger.info("%s: no embedding models discovered", route_name)
             return models or []
-        except NotImplementedError:
+        except NotImplementedError as execution_error:
+            if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
+                raise
             return []
         except DiscoveryStepTimeout:
             raise
         except Exception as e:
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
+                raise
             if self._route_claims_embedding_support(route):
                 logger.error(
                     "%s: embedding discovery failed for a route that claims "
@@ -1245,6 +1290,7 @@ class ModelDiscoveryMixin:
             )
         return options
 
+    @execution_work_operation
     async def resolve_default_embedding_model(
         self,
         provider: dict,
@@ -1395,6 +1441,7 @@ class ModelDiscoveryMixin:
         discovery mixin has no listener.
         """
 
+    @execution_work_operation
     async def reconcile_embedding_capabilities(self, *, use_cache: bool = True) -> None:
         """Fold live embedding discovery into each route's static capabilities (#2338).
 
@@ -1435,6 +1482,8 @@ class ModelDiscoveryMixin:
         try:
             discovered = await self.discover_embedding_models(use_cache=use_cache)
         except Exception as e:  # pragma: no cover - never break init on discovery
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
+                raise
             logger.debug("embedding capability reconcile skipped: %s", e)
             return
 
@@ -1475,6 +1524,8 @@ class ModelDiscoveryMixin:
                     deployment_dim=deployment_dim,
                 )
             except Exception as exc:  # pragma: no cover - never break init
+                if is_execution_control_error(exc) or execution_cleanup_debts(exc):
+                    raise
                 logger.debug(
                     "embedding capability resolve skipped for %s: %s",
                     route_name,
@@ -1571,9 +1622,12 @@ class ModelDiscoveryMixin:
                 result = await result
             return result or None
         except Exception as exc:  # pragma: no cover - never break reconcile
+            if is_execution_control_error(exc) or execution_cleanup_debts(exc):
+                raise
             logger.debug("corpus embedding profile lookup failed: %s", exc)
             return None
 
+    @execution_work_operation
     async def resolve_route_embedding_model(
         self,
         provider: dict,
@@ -1738,6 +1792,7 @@ class ModelDiscoveryMixin:
         """Drop the per-instance embedding-discovery cache to force rediscovery."""
         self._embedding_discovery_cache = None
 
+    @execution_work_operation
     async def _resolve_local_auto_routes(self) -> None:
         """Resolve ``model="auto"`` LOCAL routes WITHOUT contacting cloud.
 
@@ -1768,6 +1823,8 @@ class ModelDiscoveryMixin:
                 # route ``auto`` instead of stalling the turn (#3646).
                 models.extend(await self._discover_vendor_catalog(vendor, route))
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc) or execution_cleanup_debts(exc):
+                    raise
                 logger.warning(
                     "Local-only discovery failed for %s: %s", route.get("name"), exc
                 )
@@ -1846,7 +1903,9 @@ class ModelDiscoveryMixin:
             return
         try:
             from .codex_adapter import CodexAdapter
-        except Exception:  # pragma: no cover - import-safety
+        except Exception as execution_error:  # pragma: no cover - import-safety
+            if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
+                raise
             return
         for provider in self.providers:
             adapter = provider.get("adapter")
@@ -1854,6 +1913,7 @@ class ModelDiscoveryMixin:
             if route_key and isinstance(adapter, CodexAdapter):
                 yield route_key, adapter
 
+    @execution_work_operation
     async def _build_route_catalogs(self) -> None:
         """Populate ``self._route_catalogs`` from route-specific adapters.
 
@@ -1867,6 +1927,7 @@ class ModelDiscoveryMixin:
         """
         self._route_catalogs = await self._collect_route_catalogs()
 
+    @execution_work_operation
     async def _collect_route_catalogs(self) -> dict:
         """Build and RETURN the route-scoped catalog map (no self mutation).
 
@@ -1877,10 +1938,14 @@ class ModelDiscoveryMixin:
         catalogs: dict[str, list] = {}
         for route_key, adapter in self._route_specific_catalog_adapters():
             try:
-                models = await adapter.list_models()
-            except NotImplementedError:
+                models = await await_execution_work(self, lambda: adapter.list_models())
+            except NotImplementedError as execution_error:
+                if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
+                    raise
                 continue
             except Exception as e:  # pragma: no cover - defensive
+                if is_execution_control_error(e) or execution_cleanup_debts(e):
+                    raise
                 logger.warning("route %s: catalog build failed: %s", route_key, e)
                 models = []
             # Register even when empty: membership marks the route as
@@ -1901,8 +1966,8 @@ class ModelDiscoveryMixin:
         on a worker thread when a loop is already running. No-op if catalogs
         were already built by the async discovery phase.
         """
-        import asyncio
 
+        require_execution_work(self)
         if getattr(self, "_route_catalogs", None) is not None:
             return
         try:
@@ -1912,6 +1977,8 @@ class ModelDiscoveryMixin:
             try:
                 asyncio.run(self._build_route_catalogs())
             except Exception as e:  # pragma: no cover - defensive
+                if is_execution_control_error(e) or execution_cleanup_debts(e):
+                    raise
                 logger.debug("sync route-catalog build skipped: %s", e)
                 self._route_catalogs = {}
         else:
@@ -1928,13 +1995,20 @@ class ModelDiscoveryMixin:
             # later overwrites with the real catalog.
             import concurrent.futures
 
+            original_scope = capture_turn_scope(self)
+
             def _build_in_thread() -> dict:
-                return asyncio.run(self._collect_route_catalogs())
+                with original_scope.bind():
+                    return asyncio.run(self._collect_route_catalogs())
 
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    self._route_catalogs = pool.submit(_build_in_thread).result()
+                    catalogs = pool.submit(_build_in_thread).result()
+                    require_execution_work(self)
+                    self._route_catalogs = catalogs
             except Exception as e:  # pragma: no cover - defensive
+                if is_execution_control_error(e) or execution_cleanup_debts(e):
+                    raise
                 logger.debug("threaded route-catalog build skipped: %s", e)
                 self._route_catalogs = {
                     route_key: []
@@ -2047,6 +2121,7 @@ class ModelDiscoveryMixin:
             chosen.append((vendor, (non_sub or routes)[0]))
         return chosen
 
+    @execution_work_operation
     async def _discover_for_vendor_route(self, vendor: str, route: dict) -> List[ModelInfo]:
         """Run discovery for one vendor using the chosen route.
 
@@ -2124,6 +2199,8 @@ class ModelDiscoveryMixin:
             # The route's deadline records a timeout (#3646).
             raise
         except Exception as e:  # noqa: BLE001 - discovery must never break init
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
+                raise
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, e)
             return []
@@ -2150,6 +2227,7 @@ class ModelDiscoveryMixin:
         self._note_discovery_outcome(vendor, None)
         return models
 
+    @execution_work_operation
     async def _safe_list_models(self, vendor: str, adapter, client) -> List[ModelInfo]:
         """Call adapter.list_models(client) with full error tolerance.
 
@@ -2165,12 +2243,14 @@ class ModelDiscoveryMixin:
         try:
             if hasattr(adapter, 'list_models'):
                 models = _as_framework_models(
-                    vendor, await adapter.list_models(client)
+                    vendor, await await_execution_work(self, lambda: adapter.list_models(client))
                 )
                 logger.debug("%s: discovered %d models", vendor, len(models))
                 self._note_discovery_outcome(vendor, None)
                 return models
-        except NotImplementedError:
+        except NotImplementedError as execution_error:
+            if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
+                raise
             # Not a failure: the adapter simply publishes no catalog, so no
             # request was issued and the pass records the vendor as not
             # attempted. Recording a failure would report every such vendor's
@@ -2181,10 +2261,13 @@ class ModelDiscoveryMixin:
             # deadline records it, the same as when the deadline fires first.
             raise
         except Exception as e:
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
+                raise
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, e)
         return []
 
+    @execution_work_operation
     async def _discover_local_openai_compatible(
         self, provider_name: str, provider_config: dict
     ) -> List[ModelInfo]:
@@ -2199,7 +2282,7 @@ class ModelDiscoveryMixin:
         import httpx
         models_url = f"{base_url.rstrip('/')}/models"
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=5.0)) as client:
                 resp = await client.get(models_url)
                 resp.raise_for_status()
                 data = resp.json()
@@ -2234,6 +2317,8 @@ class ModelDiscoveryMixin:
             )
             return results
         except Exception as e:
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
+                raise
             # Raise rather than return [] (#3190): an empty list is also what a
             # server with no models returns, and the caller cannot tell those
             # apart. _record_discovery logs and converts this to [] after
@@ -2242,6 +2327,7 @@ class ModelDiscoveryMixin:
                 f"local model discovery failed ({models_url}): {e}"
             ) from e
 
+    @execution_work_operation
     async def _discover_openai_compatible_remote(
         self, provider_name: str, provider_config: dict
     ) -> List[ModelInfo]:
@@ -2266,7 +2352,7 @@ class ModelDiscoveryMixin:
         import httpx
         models_url = f"{base_url.rstrip('/')}/models"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=10.0)) as client:
                 resp = await client.get(
                     models_url,
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -2294,6 +2380,8 @@ class ModelDiscoveryMixin:
             logger.info(f"{provider_name}: discovered {len(results)} models from {models_url}")
             return results
         except Exception as e:
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
+                raise
             # See _discover_local_openai_compatible: failure must be
             # distinguishable from "serves nothing" (#3190).
             raise RuntimeError(
@@ -2313,7 +2401,7 @@ class ModelDiscoveryMixin:
 
         for endpoint in ["/props", "/slots"]:
             try:
-                async with httpx_module.AsyncClient(timeout=3.0) as client:
+                async with owned_native_http_client(httpx_module.AsyncClient(timeout=3.0)) as client:
                     resp = await client.get(f"{stripped}{endpoint}")
                     if resp.status_code != 200:
                         continue
@@ -2333,7 +2421,9 @@ class ModelDiscoveryMixin:
                         if ctx:
                             logger.info(f"Detected context window {ctx} from {endpoint}")
                             return int(ctx)
-            except Exception:
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error) or execution_cleanup_debts(execution_error):
+                    raise
                 continue
         return None
 

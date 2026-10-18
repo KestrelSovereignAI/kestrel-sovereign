@@ -35,6 +35,7 @@
 import { Events, makeEvent } from './events.js';
 import { createVoiceCapture } from './capture.js';
 import { createVoicePlayback } from './playback.js';
+import { createStartupSettlement } from './startup.js';
 
 const FRAME_JSON = 0x00;
 const FRAME_AUDIO = 0x01;
@@ -74,6 +75,14 @@ export async function createPipelineClient({
   let capture = null;
   let playback = null;
   let closed = false;
+  let closeOwner = null;
+  const startupSettlement = createStartupSettlement();
+
+  async function requireOpen() {
+    if (!closed) return;
+    await retireAcquired();
+    throw new Error('Pipeline client retired during startup');
+  }
   let sessionReady = false;
   // When true, captured mic frames are dropped instead of sent — used to
   // disarm a backgrounded agent's input so the user's speech isn't routed to
@@ -151,16 +160,34 @@ export async function createPipelineClient({
     return { tag, payload };
   }
 
-  async function start() {
+  function start() { return startupSettlement.run(startNative); }
+
+  async function startNative() {
+    await requireOpen();
     if (ws) throw new Error('Pipeline client already started');
+    try {
 
     // 1. Set up audio pipes first so the first mic frame after open() has
     // somewhere to go. Playback starts muted until audio arrives.
-    capture = await createVoiceCapture({ targetSampleRate: sampleRate });
-    playback = await createVoicePlayback({ sampleRate });
+    capture = await createVoiceCapture({ targetSampleRate: sampleRate, onAcquire: owner => {
+      capture = owner;
+      if (closed) void owner.destroy();
+    } });
+    await requireOpen();
+    playback = await createVoicePlayback({ sampleRate, onError: error => {
+      if (closed) return;
+      void close(error);
+      onEvent(makeEvent(Events.ERROR, {
+        message: error.message, code: 'AUDIO_OUTPUT_CONTROL_FAILED', fatal: true,
+      }));
+    }, onAcquire: owner => {
+      playback = owner;
+      if (closed) void owner.destroy();
+    } });
+    await requireOpen();
 
     capture.onchunk((pcm) => {
-      if (inputMuted) return;
+      if (inputMuted || closed) return;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       try {
         ws.send(encodeAudioFrame(pcm));
@@ -186,6 +213,7 @@ export async function createPipelineClient({
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
+      if (closed) { ws.close(); return; }
       sessionReady = true;
       onEvent(makeEvent(Events.SESSION_READY, {
         session_id: '',  // Pipeline has no discrete session ID today.
@@ -193,6 +221,7 @@ export async function createPipelineClient({
       }));
     };
     ws.onmessage = (ev) => {
+      if (closed) return;
       // Server can send either binary (audio/JSON-framed) or text (rare).
       if (typeof ev.data === 'string') {
         try {
@@ -232,18 +261,29 @@ export async function createPipelineClient({
       }));
     };
     ws.onclose = () => {
-      if (closed) return;
-      onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'ws_closed' }));
+      if (!closed) void close();
     };
+    } catch (error) {
+      await close(error);
+      await retireAcquired();
+      throw error;
+    }
   }
 
-  async function close() {
-    if (closed) return;
-    closed = true;
+  async function retireAcquired() {
     try { ws?.close(); } catch (_) {}
     try { await capture?.destroy(); } catch (_) {}
     try { await playback?.destroy(); } catch (_) {}
-    onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
+  }
+
+  function close(error) {
+    if (closeOwner) return closeOwner;
+    closed = true;
+    startupSettlement.close(error);
+    closeOwner = retireAcquired().then(() => {
+      onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
+    });
+    return closeOwner;
   }
 
   /**
@@ -288,6 +328,7 @@ export async function createPipelineClient({
   return {
     path: 'pipeline',
     start,
+    whenStartupSettled: startupSettlement.whenSettled,
     close,
     cancelResponse,
     updateInstructions,

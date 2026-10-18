@@ -13,6 +13,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 import httpx
 
 from ._session_training_lifecycle import (
@@ -110,11 +112,15 @@ class VastAITrainingAdapter:
                 from kestrel_cloud_vastai.manager import VastAIManager
                 self._manager = VastAIManager()
             except ImportError as e:
+                if is_execution_control_error(e):
+                    raise
                 raise ProviderNotAvailableError(
                     f"Vast.ai manager not available — install kestrel-cloud-vastai "
                     f"to enable Vast.ai-as-training-provider: {e}"
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 raise ProviderNotAvailableError(
                     f"Failed to initialize Vast.ai manager: {e}"
                 )
@@ -126,9 +132,13 @@ class VastAITrainingAdapter:
             manager = self._get_manager()
             # VastAI requires VASTAI_API_KEY
             return manager is not None and manager.api_key is not None
-        except (ProviderNotAvailableError, ImportError):
+        except (ProviderNotAvailableError, ImportError) as error:
+            if is_execution_control_error(error):
+                raise
             return False
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.debug("Vast.ai availability check failed", exc_info=True)
             return False
 
@@ -171,9 +181,13 @@ class VastAITrainingAdapter:
         except TrainingProviderError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Vast.ai training connection error: {e}")
             raise TrainingSubmissionError(f"Failed to start Vast.ai training: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Vast.ai training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start Vast.ai training: {e}")
 
@@ -320,12 +334,18 @@ class VastAITrainingAdapter:
         except TrainingProviderError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Vast.ai training status network error: {e}")
             raise TrainingStatusError(f"Status check failed: {e}")
         except (KeyError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Vast.ai training status parse error: {e}")
             raise TrainingStatusError(f"Status check failed: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to get Vast.ai training status: {e}", exc_info=True)
             raise TrainingStatusError(f"Status check failed: {e}")
 
@@ -362,9 +382,13 @@ class VastAITrainingAdapter:
         except TrainingProviderError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Vast.ai LoRA download network error: {e}")
             raise DownloadError(f"Download failed: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to download Vast.ai LoRA weights: {e}", exc_info=True)
             raise DownloadError(f"Download failed: {e}")
 
@@ -502,12 +526,18 @@ class VastAITrainingAdapter:
         except GenerationError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Vast.ai generation connection error: {e}")
             raise GenerationError(f"Generation failed: {e}")
         except (KeyError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Vast.ai generation response error: {e}")
             raise GenerationError(f"Generation failed: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Vast.ai generation failed: {e}", exc_info=True)
             raise GenerationError(f"Generation failed: {e}")
 

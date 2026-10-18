@@ -290,9 +290,9 @@ async def test_cancellation_during_config_application_tears_the_feature_down(
     torn_down = []
     original = agent._shutdown_failed_feature
 
-    async def _record(f):
+    async def _record(f, **kwargs):
         torn_down.append(f)
-        await original(f)
+        await original(f, **kwargs)
 
     agent._shutdown_failed_feature = _record
 

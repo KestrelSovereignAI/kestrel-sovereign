@@ -385,6 +385,9 @@ function animateOut(rowEl) {
  *     auto-load-most-recent. `nextCursor` is the server's token for the page
  *     after these rows (null at the end of the list), so a consumer that must
  *     look further back (#3653) can do so without driving the painted list.
+ *   - `onLoadStart({ view, agentName })` — synchronous before every page-one
+ *     request, including view switches and failed reloads. A host can retire
+ *     derived work immediately rather than waiting for replacement data.
  *   - `onMutated(action, conv)` — fires after a successful archive / unarchive
  *     / trash / purge / restore; the sidebar uses it to coordinate chat state
  *     (start a fresh session when the currently-open conversation is deleted).
@@ -867,6 +870,9 @@ export function mountConversations(containerEl, config = {}) {
         // rows shown with Archived actions). Same guard identity.js's list had
         // (conversationListRequestSeq, #1358).
         const seq = ++refreshSeq;
+        if (typeof config.onLoadStart === 'function') {
+            config.onLoadStart({ view, agentName });
+        }
         // Any continuation still fetching belongs to the generation this
         // supersedes. Cleared HERE rather than only in setView/retarget,
         // because an ordinary same-view reload — after a rename, an archive, a
@@ -1188,6 +1194,7 @@ export function mountConversationsPane(containerEl, config = {}) {
         onNewConversation: config.onNewConversation,
         agentName: config.agentName,
         getActiveSessionId: config.getActiveSessionId,
+        onLoadStart: config.onLoadStart,
         onLoaded: config.onLoaded,
         onMutated: config.onMutated,
         autoLoad: config.autoLoad,

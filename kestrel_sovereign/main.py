@@ -10,7 +10,6 @@ from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
-    await_agent_shutdown_completion,
 )
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.paths import (
@@ -218,7 +217,7 @@ async def main():
     llm_service = LLMService()
     agent = KestrelAgent(did=agent_did, storage_path=storage_path, llm_service=llm_service)
     from kestrel_sovereign.hold import (
-        close_bound_host_context,
+        complete_bound_agent_shutdown,
         initialize_with_bound_hold_context,
     )
 
@@ -227,25 +226,26 @@ async def main():
         agent_data_root=storage_dir,
     )
 
-    if args.app:
-        extension_class = None
-        if args.app == 'elderly':
-            from kestrel_sovereign.extensions.elderly_extension import ElderlyExtension
-            extension_class = ElderlyExtension
-        
-        if extension_class:
-            agent.extension = extension_class(agent)
-            agent.app_context = args.app
-            print(f"   Extension Loaded: {args.app}")
-
-    print("✅ Kestrel Agent Initialized.")
-    print(f"   DID: {agent.agent_id}")
-    print(f"   Memory: {db_path}")
-
-    decryption_error_count = 0
-    MAX_DECRYPTION_ERRORS = 3
-
+    body_failure = None
     try:
+        if args.app:
+            extension_class = None
+            if args.app == 'elderly':
+                from kestrel_sovereign.extensions.elderly_extension import ElderlyExtension
+                extension_class = ElderlyExtension
+
+            if extension_class:
+                agent.extension = extension_class(agent)
+                agent.app_context = args.app
+                print(f"   Extension Loaded: {args.app}")
+
+        print("✅ Kestrel Agent Initialized.")
+        print(f"   DID: {agent.agent_id}")
+        print(f"   Memory: {db_path}")
+
+        decryption_error_count = 0
+        MAX_DECRYPTION_ERRORS = 3
+
         while True:
             user_input = input("\n> ")
             if user_input.lower() == '!quit':
@@ -287,27 +287,32 @@ async def main():
 
     except KeyboardInterrupt:
         print("\nDeactivating agent...")
+    except BaseException as error:
+        body_failure = error
+        raise
     finally:
-        cancelled = False
-        # Graceful shutdown with timeout
+        failures = [body_failure] if body_failure is not None else []
         try:
-            await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
-            print("Agent deactivated.")
-        except asyncio.TimeoutError:
-            print(
-                f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
-                "waiting for durable cleanup."
-            )
-        except asyncio.CancelledError:
-            cancelled = True
-            print("Agent shutdown cancelled.")
-        except Exception as e:
-            logger.debug(f"Error during shutdown: {e}")
-            print("Agent deactivated (with errors).")
-        cancelled = await await_agent_shutdown_completion(agent) or cancelled
-        await close_bound_host_context(hold_context)
-        if cancelled:
-            raise asyncio.CancelledError()
+            try:
+                await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
+                print("Agent deactivated.")
+            except asyncio.TimeoutError:
+                print(
+                    f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
+                    "waiting for durable cleanup."
+                )
+            except asyncio.CancelledError as error:
+                failures.append(error)
+                print("Agent shutdown cancelled.")
+            except BaseException as e:
+                failures.append(e)
+                logger.debug(f"Error during shutdown: {e}")
+                print("Agent deactivated (with errors).")
+        except BaseException as reporting_failure:
+            failures.append(reporting_failure)
+            raise
+        finally:
+            await complete_bound_agent_shutdown(agent, hold_context, prior_errors=failures)
 
 
 if __name__ == "__main__":

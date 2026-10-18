@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Iterable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 from uuid import UUID, uuid4
 
 try:  # pragma: no cover - exercised on Kestrel's POSIX deployment targets
@@ -34,7 +34,7 @@ try:  # pragma: no cover - imported only on Windows
 except ImportError:  # pragma: no cover - POSIX has no Windows byte-range locks
     msvcrt = None  # type: ignore[assignment]
 
-from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+from kestrel_sovereign._async_ownership import await_owned_task, gather_owned, raise_owned_outcome
 from kestrel_sovereign.private_storage import (
     PrivateStorageError,
     absolute_without_following_leaf,
@@ -727,28 +727,18 @@ def postgres_hold_custody_snapshot_from_rows(
 
 
 async def _gather_database_probes(
-    *probes: Awaitable[Any],
+    *probes: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, ...]:
-    """Cancel and await every sibling before a failed probe leaves its scope."""
+    """Admit lazily and join every accepted probe before backend retirement.
 
-    tasks = tuple(asyncio.ensure_future(probe) for probe in probes)
-    try:
-        return tuple(await asyncio.gather(*tasks))
-    except BaseException as failure:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        cleanup = asyncio.gather(*tasks, return_exceptions=True)
-        while not cleanup.done():
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                # Repeated cancellation must not let a database probe escape
-                # into host-context pool cleanup. Re-raise the original failure
-                # only after every owned child has reached a terminal state.
-                continue
-        await cleanup
-        raise
+    Later admission refusal must not strand earlier peers or leave unstarted
+    coroutines behind. Finite original selection also preserves peer native
+    uncertainty and actual observer withdrawal without mutating source errors.
+    """
+    return tuple(await gather_owned(
+        (probe() for probe in probes), retain_originals=True,
+        isolate_control_originals=True,
+    ))
 
 
 @asynccontextmanager
@@ -951,29 +941,41 @@ async def _read_postgres_hold_custody_snapshot(
 
 async def _close_postgres_preflight_backends(
     *backends: Any,
+    prior_error: BaseException | None = None,
 ) -> tuple[BaseException, ...]:
     """Finish every raw-pool close even under repeated caller cancellation."""
+    from kestrel_sovereign._async_ownership import (
+        OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
+    )
+    from kestrel_sovereign.execution_custody import execution_terminal_error
 
-    async def close_all() -> tuple[Any, ...]:
-        return tuple(
-            await asyncio.gather(
-                *(backend.close() for backend in backends),
-                return_exceptions=True,
-            )
-        )
-
-    cleanup = asyncio.create_task(close_all())
-    cancelled = False
-    while not cleanup.done():
+    # Admit each independent native closer before joining any one of them.
+    # A refused admission retains that exact resource and must not skip peers.
+    owners, failures, withdrawals = [], [], []
+    for backend in backends:
+        admission = OwnedTaskAdmission()
         try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            cancelled = True
-            continue
-    results = cleanup.result()
-    if cancelled:
-        raise asyncio.CancelledError()
-    return tuple(result for result in results if isinstance(result, BaseException))
+            owners.append(create_owned_task(
+                backend.close(), retirement_resource=backend,
+                retain_originals=True, name="hold:preflight-native-close",
+                admission=admission,
+            ))
+        except BaseException as failure:
+            if admission.task is not None:
+                owners.append(admission.task)
+            failures.append(owned_task_admission_error(backend, admission, failure))
+    for owner in owners:
+        outcome = await await_owned_task(owner)
+        if outcome.error is not None:
+            failures.append(outcome.error)
+        if outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
+    if prior_error is not None or withdrawals:
+        raise execution_terminal_error(
+            prior_error, *failures, *withdrawals, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
+    return tuple(failures)
 
 
 async def preflight_postgres_hold_custody(
@@ -999,9 +1001,13 @@ async def preflight_postgres_hold_custody(
         evidence_backend,
     )
     if close_errors:
-        raise HoldStateError(
-            "could not close PostgreSQL Hold custody preflight connections"
-        ) from close_errors[0]
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+
+        raise execution_terminal_error(
+            HoldStateError("could not close PostgreSQL Hold custody preflight connections"),
+            *close_errors, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
 
 
 async def _connect_postgres_hold_custody_backends(
@@ -1024,15 +1030,15 @@ async def _connect_postgres_hold_custody_backends(
     )
     try:
         await _gather_database_probes(
-            primary_backend.connect(),
-            evidence_backend.connect(),
+            primary_backend.connect,
+            evidence_backend.connect,
         )
         primary_cluster, evidence_cluster = await _gather_database_probes(
-            _read_raw_postgres_cluster_identity(
+            lambda: _read_raw_postgres_cluster_identity(
                 primary_backend,
                 label="primary",
             ),
-            _read_raw_postgres_cluster_identity(
+            lambda: _read_raw_postgres_cluster_identity(
                 evidence_backend,
                 label="evidence",
             ),
@@ -1048,11 +1054,11 @@ async def _connect_postgres_hold_custody_backends(
             # two unlocked per-database reads can otherwise construct a state
             # that never existed as one custody snapshot.
             primary, evidence = await _gather_database_probes(
-                _read_postgres_hold_custody_snapshot(
+                lambda: _read_postgres_hold_custody_snapshot(
                     primary_backend,
                     label="primary",
                 ),
-                _read_postgres_hold_custody_snapshot(
+                lambda: _read_postgres_hold_custody_snapshot(
                     evidence_backend,
                     label="evidence",
                 ),
@@ -1067,20 +1073,10 @@ async def _connect_postgres_hold_custody_backends(
                 )
             pair_id = validate_postgres_hold_custody(primary, evidence)
     except BaseException as failure:
-        close_errors: tuple[BaseException, ...] = ()
-        try:
-            close_errors = await _close_postgres_preflight_backends(
-                primary_backend,
-                evidence_backend,
-            )
-        except asyncio.CancelledError as cancellation:
-            failure = cancellation
-        for close_error in close_errors:
-            failure.add_note(
-                "Additional PostgreSQL Hold custody preflight close failure: "
-                f"{close_error!r}"
-            )
-        raise failure.with_traceback(failure.__traceback__)
+        await _close_postgres_preflight_backends(
+            primary_backend, evidence_backend, prior_error=failure,
+        )
+        raise
     return (
         primary_backend,
         evidence_backend,
@@ -1179,29 +1175,19 @@ async def initialize_postgres_hold_databases(
         )
         return primary_db, evidence_db, pair_id
     except BaseException as failure:
-        close_errors: tuple[BaseException, ...] = ()
-        try:
-            remaining_owners = []
-            if primary_db is not None:
-                remaining_owners.append(primary_db)
-            elif not primary_backend_consumed:
-                remaining_owners.append(primary_backend)
-            if evidence_db is not None:
-                remaining_owners.append(evidence_db)
-            elif not evidence_backend_consumed:
-                remaining_owners.append(evidence_backend)
-            if remaining_owners:
-                close_errors = await _close_postgres_preflight_backends(
-                    *remaining_owners
-                )
-        except asyncio.CancelledError as cancellation:
-            failure = cancellation
-        for close_error in close_errors:
-            failure.add_note(
-                "Additional PostgreSQL Hold database initialization close failure: "
-                f"{close_error!r}"
-            )
-        raise failure.with_traceback(failure.__traceback__)
+        remaining_owners = []
+        if primary_db is not None:
+            remaining_owners.append(primary_db)
+        elif not primary_backend_consumed:
+            remaining_owners.append(primary_backend)
+        if evidence_db is not None:
+            remaining_owners.append(evidence_db)
+        elif not evidence_backend_consumed:
+            remaining_owners.append(evidence_backend)
+        await _close_postgres_preflight_backends(
+            *remaining_owners, prior_error=failure,
+        )
+        raise
 
 
 def _domain_error_from_chain(error: BaseException) -> Optional[HoldStateError]:
@@ -2839,8 +2825,8 @@ class HoldStore:
                 "PostgreSQL Hold requires an independent evidence database"
             )
         primary, evidence = await _gather_database_probes(
-            self._postgres_cluster_identity(self._db, label="primary"),
-            self._postgres_cluster_identity(evidence_db, label="evidence"),
+            lambda: self._postgres_cluster_identity(self._db, label="primary"),
+            lambda: self._postgres_cluster_identity(evidence_db, label="evidence"),
         )
         if primary == evidence:
             raise HoldStateError(
@@ -2882,22 +2868,22 @@ class HoldStore:
 
         return tuple(
             await _gather_database_probes(
-                self._read_postgres_binding(
+                lambda: self._read_postgres_binding(
                     self._db,
                     _POSTGRES_PRIMARY_BINDING_KEY,
                     label="primary",
                 ),
-                self._read_postgres_binding(
+                lambda: self._read_postgres_binding(
                     evidence_db,
                     _POSTGRES_EVIDENCE_BINDING_KEY,
                     label="evidence",
                 ),
-                self._read_postgres_binding(
+                lambda: self._read_postgres_binding(
                     self._db,
                     _POSTGRES_EVIDENCE_BINDING_KEY,
                     label="primary",
                 ),
-                self._read_postgres_binding(
+                lambda: self._read_postgres_binding(
                     evidence_db,
                     _POSTGRES_PRIMARY_BINDING_KEY,
                     label="evidence",
@@ -2937,8 +2923,8 @@ class HoldStore:
         if evidence_db is None:
             return
         primary, evidence = await _gather_database_probes(
-            self._postgres_domain_identity(self._db, label="primary"),
-            self._postgres_domain_identity(evidence_db, label="evidence"),
+            lambda: self._postgres_domain_identity(self._db, label="primary"),
+            lambda: self._postgres_domain_identity(evidence_db, label="evidence"),
         )
         if primary == evidence:
             raise HoldStateError(

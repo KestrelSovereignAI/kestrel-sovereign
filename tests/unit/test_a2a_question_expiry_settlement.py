@@ -1908,8 +1908,9 @@ class _DurableRecipient(EventManagerMixin):
     def _get_durable_persistence_gate(self):
         return self._durable_persistence_gate
 
-    def _track_background_task(self, coroutine, *, name):
-        task = asyncio.create_task(coroutine, name=name)
+    def _track_background_task(self, coroutine, *, name, admission=None):
+        from kestrel_sovereign._async_ownership import create_owned_task
+        task = create_owned_task(coroutine, name=name, admission=admission)
         self.background_tasks.append(task)
         return task
 

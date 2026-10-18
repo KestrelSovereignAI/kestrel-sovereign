@@ -16,16 +16,23 @@ from contextvars import ContextVar, copy_context
 from functools import wraps
 import hashlib
 import inspect
+import sys
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, TypeVar
 from urllib.parse import quote, unquote_to_bytes
 import uuid
 
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
+    current_execution_custody, require_execution_work,
+    execution_terminal_error, is_execution_control_error, execution_commit_outcome,
+)
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
     caller_context_lifetime,
     caller_context_scope,
 )
+from kestrel_sovereign.turn_scope import turn_scoped
 
 
 MAX_INVOCATION_ID_LENGTH = 256
@@ -50,6 +57,23 @@ class InvocationEffectCheckpoint:
 
 _current_effect_checkpoint: ContextVar[InvocationEffectCheckpoint | None] = (
     ContextVar("kestrel_current_effect_checkpoint", default=None)
+)
+
+
+@contextmanager
+def _bind_effect_checkpoint(state: InvocationEffectCheckpoint | None) -> Iterator[None]:
+    token = _current_effect_checkpoint.set(state)
+    try:
+        yield
+    finally:
+        _current_effect_checkpoint.reset(token)
+
+
+turn_scoped(
+    "invocation_effect_checkpoint",
+    variables=(_current_effect_checkpoint,),
+    capture=lambda owner: _current_effect_checkpoint.get(),
+    bind=_bind_effect_checkpoint,
 )
 
 
@@ -122,6 +146,60 @@ def register_request_delivery(
     if supports_boundary:
         return registrar(request_id, nested=nested)
     return registrar(request_id)
+
+
+async def admit_request_operation(agent, request_id, operation, *, name, context=None):
+    """Accept and bind one child, or physically retire it before returning.
+
+    Registration belongs to the caller. Even canonical callback refusal must
+    leave the accepted Task reachable, and failure means ABANDONED bookkeeping
+    at that caller, never a successful delivery.
+    """
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
+    from .request_lifecycle import bind_request_operation_if_supported
+    admission = OwnedTaskAdmission()
+    try:
+        task = create_owned_task(operation, name=name, context=context,
+                                 retain_originals=True, admission=admission)
+        bind_request_operation_if_supported(agent, request_id, task)
+        return task
+    except BaseException as opening:
+        if admission.task is not None:
+            cancellation_token = object()
+            induced = not admission.task.done() and not admission.task.cancelling()
+            if induced:
+                admission.task.cancel(cancellation_token)
+            outcome = await await_owned_task(admission.task)
+            cleanup_error = outcome.error
+            if (isinstance(cleanup_error, asyncio.CancelledError)
+                and induced and cleanup_error.args == (cancellation_token,)
+                and cleanup_error.__cause__ is None
+                and cleanup_error.__context__ in (None, opening)
+                and not is_execution_control_error(cleanup_error)):
+                cleanup_error = None
+            raise execution_terminal_error(
+                opening, cleanup_error, outcome.cancellation,
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
+        raise
+
+
+def retire_request_delivery(agent, request_id, *, generation=None, abandoned=False, error=None):
+    """Release exactly one reference, or retain its actual registration debt."""
+    from .request_lifecycle import RequestCompletionDisposition
+    options = {"generation": generation} if generation is not None else {}
+    if abandoned:
+        options["disposition"] = RequestCompletionDisposition.ABANDONED
+    try:
+        agent._cleanup_cancelled_request(request_id, **options)
+    except BaseException as cleanup_error:
+        debt = RuntimeError("original request registration did not retire")
+        debt._kestrel_native_retirement_debts = (((agent, request_id, generation), None),)
+        raise execution_terminal_error(
+            error, cleanup_error, debt, retain_originals=True,
+            isolate_control_originals=True,
+        )
 
 
 def invocation_id_response_header(value: object) -> str:
@@ -363,10 +441,17 @@ def bind_async_invocation(
                 provenance=bound.arguments.get("invocation_provenance"),
             ) as invocation_id, caller_context_scope(
                 bound.arguments.get("caller")
-            ):
+            ), bind_execution_runtime(args[0] if args else None):
                 bound.arguments[parameter] = invocation_id
                 lifecycle_owner = args[0] if args else None
+
+                async def invoke_governed():
+                    require_execution_work(lifecycle_owner)
+                    result = await function(*bound.args, **bound.kwargs)
+                    require_execution_work(lifecycle_owner)
+                    return result
                 registered = False
+                registered_generation = None
                 cleanup_abandoned = False
                 isolated_operation: asyncio.Task[Any] | None = None
                 caller_task = asyncio.current_task()
@@ -389,12 +474,42 @@ def bind_async_invocation(
                         None,
                     )
                     if not callable(checkpoint):
-                        return
+                        raise RuntimeError("completed-effect checkpoint is unavailable")
                     await checkpoint(
                         session_id=state.session_id,
                         request_id=invocation_id,
                     )
                     state.checkpointed = True
+
+                async def preserve_failed_effects(error: BaseException) -> None:
+                    nonlocal cleanup_abandoned
+                    if is_execution_control_error(error):
+                        # Authority/commit control can arrive during owned
+                        # cleanup, before a tool marks completion. Retain the
+                        # exact lifecycle identity without acknowledging Stop.
+                        cleanup_abandoned = True
+                    if execution_commit_outcome(error) is not None:
+                        return
+                    state = _current_effect_checkpoint.get()
+                    if state is None or not state.completed or state.checkpointed:
+                        return
+                    try:
+                        with bind_execution_cleanup(lifecycle_owner):
+                            await checkpoint_completed_effects()
+                    except BaseException as checkpoint_error:
+                        # A completed effect without durable anti-repeat
+                        # evidence remains unresolved, not a clean failure.
+                        # Keep irreversible evidence from either failure;
+                        # an ordinary turn error is not rollback proof for
+                        # its failed checkpoint. Never reopen ordinary work.
+                        cleanup_abandoned = True
+                        error.add_note(
+                            "completed-effect checkpoint remains unresolved: "
+                            f"{type(checkpoint_error).__name__}"
+                        )
+                        terminal = execution_terminal_error(error, checkpoint_error)
+                        if terminal is not error:
+                            raise terminal
 
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
@@ -403,11 +518,13 @@ def bind_async_invocation(
                         None,
                     )
                     if callable(register):
-                        register_request_delivery(
+                        generation = register_request_delivery(
                             lifecycle_owner,
                             invocation_id,
                             nested=True,
                         )
+                        if type(generation) is int:
+                            registered_generation = generation
                         registered = True
                 try:
                     if registered:
@@ -423,11 +540,6 @@ def bind_async_invocation(
                                 "invocation was stopped before durable admission "
                                 f"({invocation_log_correlation(invocation_id)})"
                             )
-                        bind_operation = getattr(
-                            type(lifecycle_owner),
-                            "bind_request_operation",
-                            None,
-                        )
                         parent_context = copy_context()
                         operation_context = parent_context.copy()
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
@@ -477,7 +589,7 @@ def bind_async_invocation(
                                 from_task=caller_task,
                             ):
                                 if transition_delegation is None:
-                                    return await function(*bound.args, **bound.kwargs)
+                                    return await invoke_governed()
                                 bind_transition_delegation = getattr(
                                     type(lifecycle_owner),
                                     "_bind_committed_feature_transition_delegation",
@@ -492,24 +604,24 @@ def bind_async_invocation(
                                     lifecycle_owner,
                                     transition_delegation,
                                 ):
-                                    return await function(*bound.args, **bound.kwargs)
+                                    return await invoke_governed()
 
-                        isolated_operation = asyncio.create_task(
-                            run_isolated_operation(),
-                            name=(
-                                "invocation-turn:"
-                                f"{invocation_log_correlation(invocation_id)}"
-                            ),
-                            context=operation_context,
-                        )
-                        if callable(bind_operation):
-                            bind_operation(
-                                lifecycle_owner,
-                                invocation_id,
-                                isolated_operation,
+                        try:
+                            isolated_operation = await admit_request_operation(
+                                lifecycle_owner, invocation_id,
+                                run_isolated_operation(),
+                                name=(
+                                    "invocation-turn:"
+                                    f"{invocation_log_correlation(invocation_id)}"
+                                ),
+                                context=operation_context,
                             )
+                        except BaseException:
+                            cleanup_abandoned = True
+                            raise
                         try:
                             result = await isolated_operation
+                            require_execution_work(lifecycle_owner)
                             # ``Task.cancel()`` is a no-op once the isolated
                             # child has produced a result.  Stop can linearize
                             # in the narrow window between that completion and
@@ -545,6 +657,11 @@ def bind_async_invocation(
                                 )
                             return result
                         except asyncio.CancelledError as error:
+                            # Cancellation is a carrier, not rollback proof.
+                            # Preserve native irreversible/control evidence
+                            # before checkpointing or classifying typed Stop.
+                            if is_execution_control_error(error):
+                                raise
                             # An adapter/tool batch may have returned normally
                             # before cancellation lands at a later await in the
                             # turn.  The mutable checkpoint state is shared with
@@ -593,15 +710,16 @@ def bind_async_invocation(
                                     and child_value != parent_value
                                 ):
                                     variable.set(child_value)
-                    return await function(*bound.args, **bound.kwargs)
-                except (InvocationCancelledError, InvocationSelfFencedError):
+                    return await invoke_governed()
+                except (InvocationCancelledError, InvocationSelfFencedError) as error:
                     # The isolated child cooperatively unwound after Stop or a
                     # lease self-fence. Its cancellation is a successful
                     # lifecycle cleanup, not abandonment. Keep the typed errors
                     # distinct so callers retry only the infrastructure case.
+                    await preserve_failed_effects(error)
                     raise
                 except BaseException as error:
-                    if registered:
+                    if registered and not cleanup_abandoned:
                         request_cancelled = getattr(
                             type(lifecycle_owner),
                             "is_request_cancelled",
@@ -641,27 +759,14 @@ def bind_async_invocation(
                             # cancellation predicate is conservatively treated
                             # as failed cleanup.
                             cleanup_abandoned = True
+                    await preserve_failed_effects(error)
                     raise
                 finally:
                     if registered:
-                        if cleanup_abandoned:
-                            # Imported lazily to avoid the module cycle:
-                            # request_lifecycle imports the correlation helper
-                            # from this module during class definition.
-                            from .request_lifecycle import (
-                                RequestCompletionDisposition,
-                            )
-
-                            lifecycle_owner._cleanup_cancelled_request(
-                                invocation_id,
-                                disposition=(
-                                    RequestCompletionDisposition.ABANDONED
-                                ),
-                            )
-                        else:
-                            lifecycle_owner._cleanup_cancelled_request(
-                                invocation_id
-                            )
+                        retire_request_delivery(
+                            lifecycle_owner, invocation_id, generation=registered_generation,
+                            abandoned=cleanup_abandoned, error=sys.exception(),
+                        )
 
         return wrapped
 
@@ -713,6 +818,7 @@ def bind_async_generator_invocation(
             registered = False
             cleanup_abandoned = False
             effect_checkpoint = InvocationEffectCheckpoint()
+            admitted_custody = ()
 
             async def checkpoint_completed_effects() -> None:
                 if (
@@ -727,7 +833,7 @@ def bind_async_generator_invocation(
                     None,
                 )
                 if not callable(checkpoint):
-                    return
+                    raise RuntimeError("completed-effect checkpoint is unavailable")
                 persistence = asyncio.create_task(
                     checkpoint(
                         session_id=effect_checkpoint.session_id,
@@ -757,8 +863,10 @@ def bind_async_generator_invocation(
                     None,
                 )
                 if callable(register):
-                    register(lifecycle_owner, effective_id)
-                    registered = True
+                    with bind_execution_runtime(lifecycle_owner):
+                        admitted_custody = current_execution_custody(lifecycle_owner)
+                        register(lifecycle_owner, effective_id)
+                        registered = True
             iterator = None
             with caller_context_lifetime(
                 bound.arguments.get("caller")
@@ -770,46 +878,62 @@ def bind_async_generator_invocation(
                             "await_durable_request_admission",
                             None,
                         )
-                        if callable(await_admission) and not await await_admission(
-                            lifecycle_owner, effective_id
-                        ):
-                            raise InvocationCancelledError(
-                                "streaming invocation was stopped before durable "
-                                "admission "
-                                f"({invocation_log_correlation(effective_id)})"
-                            )
+                        with bind_execution_custody_snapshot(admitted_custody), bind_execution_runtime(lifecycle_owner):
+                            if callable(await_admission) and not await await_admission(
+                                lifecycle_owner, effective_id
+                            ):
+                                raise InvocationCancelledError(
+                                    "streaming invocation was stopped before durable "
+                                    "admission "
+                                    f"({invocation_log_correlation(effective_id)})"
+                                )
+                            require_execution_work(lifecycle_owner)
                     iterator = function(*bound.args, **bound.kwargs)
                     while True:
                         with _exact_invocation_scope(
                             effective_id,
                             effective_provenance,
                             effect_checkpoint,
-                        ), caller_context_binding_scope(caller_binding):
+                        ), caller_context_binding_scope(caller_binding), bind_execution_custody_snapshot(admitted_custody), bind_execution_runtime(lifecycle_owner):
+                            admitted_custody = current_execution_custody(lifecycle_owner)
                             try:
                                 item = await anext(iterator)
                             except StopAsyncIteration:
+                                require_execution_work(lifecycle_owner)
                                 return
+                            require_execution_work(lifecycle_owner)
                         yield item
                 finally:
+                    active_error = sys.exception()
+                    source_close_error = None
+                    if active_error is not None and is_execution_control_error(active_error):
+                        cleanup_abandoned = True
                     try:
                         with _exact_invocation_scope(
                             effective_id,
                             effective_provenance,
                             effect_checkpoint,
-                        ), caller_context_binding_scope(caller_binding):
+                        ), caller_context_binding_scope(caller_binding), bind_execution_cleanup(lifecycle_owner, admitted_custody):
                             try:
                                 close_iterator = getattr(iterator, "aclose", None)
                                 if callable(close_iterator):
                                     await close_iterator()
+                            except BaseException as close_error:
+                                source_close_error = close_error
+                                if is_execution_control_error(close_error):
+                                    cleanup_abandoned = True
+                                raise execution_terminal_error(active_error, source_close_error)
                             finally:
                                 try:
                                     await checkpoint_completed_effects()
-                                except BaseException:
-                                    cleanup_abandoned = (
+                                except BaseException as checkpoint_error:
+                                    cleanup_abandoned = cleanup_abandoned or (
                                         effect_checkpoint.completed
                                         and not effect_checkpoint.checkpointed
                                     )
-                                    raise
+                                    raise execution_terminal_error(
+                                        active_error, source_close_error, checkpoint_error
+                                    )
                     finally:
                         if registered:
                             if cleanup_abandoned:

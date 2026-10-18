@@ -20,12 +20,13 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from kestrel_sovereign.endpoints import models as model_endpoints
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.embedding_reindex import EmbeddingReindexer
 from tests.unit.test_embedding_reindex import (
@@ -139,11 +140,21 @@ class _FakeRequest:
 
 
 def _agent(db, service, route: str = "ollama:local", agent_id: str = "a1"):
-    return SimpleNamespace(
+    agent = SimpleNamespace(
         llm_service=_FakeLLM(service, route=route),
         storage=SimpleNamespace(db=db, agent_id=agent_id),
         agent_id=agent_id,
+        _background_tasks=set(),
     )
+    # The real owner protocol, not an untracked task factory. Other Agent
+    # fields above remain declared unit inputs, not Agent READY acceptance.
+    agent._remember_shutdown_control = MethodType(
+        KestrelAgent._remember_shutdown_control, agent
+    )
+    agent._track_background_task = MethodType(
+        KestrelAgent._track_background_task, agent
+    )
+    return agent
 
 
 @pytest.fixture

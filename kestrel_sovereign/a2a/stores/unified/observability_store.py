@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from kestrel_sovereign.a2a.stores.base import generate_id, json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.execution_custody import execution_terminal_error
 
 logger = logging.getLogger(__name__)
 
@@ -568,6 +569,7 @@ class ObservabilityStore(UnifiedStoreBase):
         since_param = self._normalize_since_param(since_iso)
         counts: dict[str, int] = {}
         failures: dict[str, str] = {}
+        original_errors: list[BaseException] = []
 
         dispatch_where = "ts >= ?"
         dispatch_params: list[Any] = [since_param]
@@ -582,6 +584,7 @@ class ObservabilityStore(UnifiedStoreBase):
         except Exception as exc:  # noqa: BLE001 - retained, never collapsed to a clean 0
             logger.warning("purge_observability_since: tool-dispatch sweep failed: %s", exc)
             failures["a2a_tool_dispatches"] = repr(exc)
+            original_errors.append(exc)
 
         obs_where = "timestamp >= ?"
         obs_params: list[Any] = [since_param]
@@ -596,12 +599,18 @@ class ObservabilityStore(UnifiedStoreBase):
         except Exception as exc:  # noqa: BLE001 - retained, never collapsed to a clean 0
             logger.warning("purge_observability_since: observability sweep failed: %s", exc)
             failures["a2a_observability"] = repr(exc)
+            original_errors.append(exc)
 
         if failures:
             # Both sweeps were attempted; surface the failure(s) (with the
             # successful counts riding along) so the EPHEMERAL purge records the
             # failed table as FAILED rather than a clean zero (#2673).
-            raise ObservabilityPurgeError(counts, failures)
+            # Keep the existing table/count diagnostics without reducing
+            # native outcome/debt owners to strings. The explicit chain is
+            # required by privacy cleanup's fatal-control classification.
+            raise ObservabilityPurgeError(counts, failures) from execution_terminal_error(
+                *original_errors, retain_originals=True
+            )
 
         return counts
 

@@ -61,6 +61,7 @@ from tests.shared.host_runtime_isolation import (
 from tests.shared.postgres_requirement import (
     check_session as _check_postgres_requirement,
     fail_skipped_postgres_case as _fail_skipped_postgres_case,
+    mark_native_postgres_cases as _mark_native_postgres_cases,
 )
 from tests.shared.postgres_worker_isolation import (
     isolate_xdist_worker as _isolate_xdist_worker,
@@ -137,8 +138,10 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     """Skip cloud_resource tests unless --run-cloud is provided; refuse overlong IDs."""
+    _mark_native_postgres_cases(items)
     _cleanup_collection_modifyitems(config, items)
     refuse_overlong_node_ids(items)
 

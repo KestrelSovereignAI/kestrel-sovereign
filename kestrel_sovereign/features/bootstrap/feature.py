@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.bootstrap import BootstrapState
@@ -202,6 +203,8 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
         )
         db_row_written = True
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Agent rename failed before metadata write: {e}", exc_info=True)
         return RenameOutcome(
             success=False,
@@ -222,6 +225,8 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
         )
         graph_updated = updated_node is not None
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Agent rename failed after metadata write: {e}", exc_info=True)
         return RenameOutcome(
             success=False,
@@ -241,6 +246,8 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
             agent.bootstrap_service.agent_name = new_name
         memory_updated = True
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Agent rename failed after graph update: {e}", exc_info=True)
         return RenameOutcome(
             success=False,
@@ -255,6 +262,8 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
     try:
         soul_md_updated = await _update_soul_name(agent, old_name, new_name)
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Agent rename failed during SOUL.md update: {e}", exc_info=True)
         return RenameOutcome(
             success=False,
@@ -445,6 +454,8 @@ class BootstrapFeature(Feature):
         try:
             loader.reload()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"bootstrap_reload failed during loader.reload(): {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -455,6 +466,8 @@ class BootstrapFeature(Feature):
                 try:
                     cb.reload_bootstrap_files()
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     # The loader did reload; the context_builder cache
                     # refresh is the secondary side-effect. Surface as
                     # PARTIAL so the LLM can't claim a clean reload
@@ -636,6 +649,8 @@ class BootstrapFeature(Feature):
                 )
                 db_persisted = True
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"Failed to persist bootstrap config to DB: {e}")
                 db_persist_error = str(e)
 
@@ -655,7 +670,9 @@ class BootstrapFeature(Feature):
         actual_loaded_path: Optional[str] = None
         try:
             actual_loaded_path = loader._resolved_paths.get(filename)  # noqa: SLF001
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             actual_loaded_path = None
         path_mismatch = bool(
             loaded
@@ -785,6 +802,8 @@ class BootstrapFeature(Feature):
                 await loader.delete_db_entry(name)
                 db_removed = True
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"Failed to remove bootstrap config from DB: {e}")
                 db_remove_error = str(e)
 
@@ -797,6 +816,8 @@ class BootstrapFeature(Feature):
                 try:
                     cb.reload_bootstrap_files()
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Failed to refresh context_builder cache: {e}")
                     cache_refreshed = False
                     cache_refresh_error = str(e)
@@ -868,6 +889,8 @@ class BootstrapFeature(Feature):
         try:
             state = await self.agent.bootstrap_service.get_bootstrap_state()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"skip_discovery state lookup failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -913,6 +936,8 @@ class BootstrapFeature(Feature):
         try:
             result = await self.agent.bootstrap_service.skip_discovery()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"skip_discovery failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -934,6 +959,8 @@ class BootstrapFeature(Feature):
                 if not loaded:
                     self.agent.context_builder._load_soul_md()
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(
                     f"skip_discovery: bootstrap skipped but SOUL.md "
                     f"reload failed: {e}",
@@ -1010,6 +1037,8 @@ class BootstrapFeature(Feature):
         try:
             result = await self.agent.bootstrap_service.restart_discovery()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"restart_discovery failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -1043,6 +1072,8 @@ class BootstrapFeature(Feature):
                     "persisted entr(ies) after reset"
                 )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(
                 f"restart_discovery history verification failed: {e}",
                 exc_info=True,
@@ -1081,6 +1112,8 @@ class BootstrapFeature(Feature):
             try:
                 self.agent.context_builder._soul_content = None
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 # Setting an attribute almost never fails, but if it
                 # somehow did the reset is incomplete.
                 logger.error(
@@ -1127,6 +1160,8 @@ class BootstrapFeature(Feature):
         try:
             status = await service.get_bootstrap_status()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"bootstrap_status failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
@@ -1147,6 +1182,8 @@ class BootstrapFeature(Feature):
             if agent_data_path:
                 soul_exists = (Path(agent_data_path) / "SOUL.md").exists()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"bootstrap_status structured fields unavailable: {e}")
 
         return ToolResult.ok(
@@ -1196,6 +1233,8 @@ class BootstrapFeature(Feature):
         except ValueError as e:
             return ToolResult.failed(str(e))
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to rename agent: {e}")
             return ToolResult.failed(f"Failed to rename: {str(e)}")
 
@@ -1268,7 +1307,9 @@ class BootstrapFeature(Feature):
         soul_path = Path(agent_data) / "SOUL.md"
         try:
             return soul_path.exists(), str(soul_path)
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             return False, str(soul_path)
 
     def _get_db(self):

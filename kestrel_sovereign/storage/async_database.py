@@ -13,12 +13,8 @@ from contextlib import asynccontextmanager, closing
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from .db import (
-    ConnectionError,
-    DatabaseBackend,
-    SQLiteBackend,
-    get_backend,
-    normalize_schema,
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
 )
 from .db.after_commit import AfterCommitCallback, run_after_commit
 from .db.sqlite import (
@@ -27,6 +23,8 @@ from .db.sqlite import (
 )
 from .conversation_created_at import (
     CONSTRAINT_NAME as CREATED_AT_CONSTRAINT,
+)
+from .conversation_created_at import (
     UNDATED_DDL,
     UNDATED_TABLE,
     canonical_created_at,
@@ -36,6 +34,13 @@ from .conversation_created_at import (
     derived_stamp,
     noncanonical_predicate,
     repairable_bulk_update,
+)
+from .db import (
+    ConnectionError,
+    DatabaseBackend,
+    SQLiteBackend,
+    get_backend,
+    normalize_schema,
 )
 from .session_id_column import backfill_statement
 
@@ -75,29 +80,37 @@ class DatabaseInitializationCleanupError(ConnectionError):
 async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseException | None = None) -> None:
     """Settle the one owned close through repeated cancellation on every exit."""
 
-    cleanup = asyncio.create_task(
-        db.close(), name="owned-database-retirement"
+    from kestrel_sovereign._async_ownership import await_owned_operation
+
+    outcome = await await_owned_operation(
+        db.close(), name="owned-database-retirement",
+        retain_originals=True, retirement_resource=db,
     )
-    cancelled = False
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            cancelled = True
-            continue
-        except Exception:  # noqa: BLE001 - deliver joined cleanup failure below
-            # Do not let the shield's exception obscure the lifecycle result.
-            # The joined task below distinguishes failed initialization from
-            # uncertain retirement, which must never permit file cleanup.
-            continue
-    try:
-        await cleanup
-    except (asyncio.CancelledError, Exception) as close_exc:
-        raise DatabaseRetirementError(db, operation_error, close_exc) from close_exc
+    close_exc = outcome.error
+    if close_exc is not None:
+        # Keep the resource-retirement wrapper/owner AND the original control
+        # cause. A failed close cannot turn uncertain COMMIT into plain error.
+        # This finite lifecycle also retains the actual observer withdrawal;
+        # selecting a stronger close/body receipt must not discard it.
+        cause = execution_terminal_error(
+            operation_error, close_exc, outcome.cancellation,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        raise DatabaseRetirementError(db, operation_error, close_exc) from cause
     if db.connection_retirement_pending:
-        raise DatabaseRetirementError(db, operation_error)
-    if cancelled:
-        raise asyncio.CancelledError()
+        failure = DatabaseRetirementError(db, operation_error)
+        raise failure from execution_terminal_error(
+            operation_error, outcome.cancellation, retain_originals=True,
+            isolate_control_originals=True,
+        )
+    if outcome.cancellation is not None:
+        terminal = execution_terminal_error(
+            operation_error, outcome.cancellation,
+            retain_originals=True, prefer_cancellation=True,
+            isolate_control_originals=True,
+        )
+        terminal.add_note("Caller cancellation occurred during joined database retirement")
+        raise terminal
 
 
 async def _close_failed_database_initialization(db: "AsyncDatabase", initialization_error: BaseException) -> None:
@@ -108,7 +121,10 @@ async def _close_failed_database_initialization(db: "AsyncDatabase", initializat
         failure = DatabaseInitializationCleanupError(
             initialization_error, retirement_error.cleanup_error, retirement_owner=db,
         )
-        raise failure from retirement_error.cleanup_error
+        cause = execution_terminal_error(
+            initialization_error, retirement_error, retain_originals=True,
+        )
+        raise failure from cause
 
 
 #: ``(name, table, columns)`` of the index that makes the #2959 projection worth
@@ -2690,27 +2706,27 @@ class AsyncDatabase:
         contract it implements and the column list the triggers watch. This
         method owns HOW to create things safely; that module owns WHAT.
         """
-        from .session_grouping import session_order_index_columns
         from .conversation_sessions import (
+            CHANGES_PRE_SLOT_TABLE,
+            CHANGES_SLOT_COLUMN,
             FUNCTION_NAME_PREFIX,
+            NON_NULL_PROJECTION_COLUMNS,
             TRIGGER_NAME_PREFIX,
+            WATERMARK_EPOCH_COLUMN,
+            WATERMARK_REVISION_COLUMN,
             active_history_predicate,
             archived_history_predicate,
             canonical_order_index_columns,
+            changes_slot_migration,
+            emptied_cache_invalidation,
             live_history_predicate,
             mutation_trigger_functions,
             mutation_triggers,
-            NON_NULL_PROJECTION_COLUMNS,
-            emptied_cache_invalidation,
-            publishing_agent_ledger_seed,
-            CHANGES_PRE_SLOT_TABLE,
-            CHANGES_SLOT_COLUMN,
-            changes_slot_migration,
-            WATERMARK_EPOCH_COLUMN,
-            WATERMARK_REVISION_COLUMN,
             projection_tables,
+            publishing_agent_ledger_seed,
             shape_change_invalidation,
         )
+        from .session_grouping import session_order_index_columns
 
         tables = projection_tables()
         triggers = mutation_triggers(self.backend_type)
@@ -4076,54 +4092,41 @@ class AsyncDatabase:
         Propagate cancellation only after those owned lifecycles have had their
         chance to complete.
         """
-        cancelled = False
-        factory_error: Exception | None = None
-        try:
-            await self.dispose_cached_sqla_factory()
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception as exc:
-            # Keep going: the primary backend owns a separate aiosqlite worker
-            # and must always receive its close opportunity.  The failure is
-            # surfaced only after that attempt so callers never observe a
-            # successful close with an abandoned cached factory.
-            factory_error = exc
-
-        try:
-            await self._backend.close()
-        except Exception as backend_error:
-            if factory_error is not None:
-                logger.error(
-                    "Cached SQLAlchemy session factory close failed after "
-                    "the primary backend close was attempted: %s",
-                    factory_error,
-                )
-            raise backend_error from factory_error
-        finally:
-            self._initialized = False
+        from kestrel_sovereign._async_ownership import (
+            await_owned_operation,
+        )
+        errors = []
+        # Independent resource retirement must finish even if an earlier owner
+        # reports grouped control or the caller is cancelled during a join.
+        for index, operation in enumerate((self.dispose_cached_sqla_factory, self._backend.close)):
+            outcome = await await_owned_operation(
+                operation(), retirement_resource=self, retain_originals=True,
+                cancel_on_caller_cancellation=index == 0,
+            )
+            errors.extend((outcome.error, outcome.cancellation))
+        self._initialized = False
 
         retirement_owner = getattr(
             self, "_sovereign_sqla_retirement_owner", None
         )
         if retirement_owner is not None:
             if retirement_owner.retirement_pending:
-                if factory_error is None:
-                    raise ConnectionError(
+                if not any(error is not None for error in errors):
+                    errors.append(ConnectionError(
                         "SQLAlchemy engine or connection retirement is still "
                         "pending after the primary database connection closed"
-                    )
+                    ))
             else:
-                await self.finalize_retired_sqla_factory()
-
-        if cancelled:
-            raise asyncio.CancelledError()
-        if factory_error is not None:
-            logger.error(
-                "Cached SQLAlchemy session factory close failed after the "
-                "primary backend close completed: %s",
-                factory_error,
-            )
-            raise factory_error
+                # This finalizer has no suspension and native retirement has
+                # already settled. Harvest its reporting inline, never in an
+                # unreturned Task that could consume unseen terminal evidence.
+                try:
+                    await self.finalize_retired_sqla_factory()
+                except BaseException as error:
+                    errors.append(error)
+        terminal = execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
+        if terminal is not None:
+            raise terminal
 
         logger.debug("Database connection closed")
     

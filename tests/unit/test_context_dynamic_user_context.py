@@ -217,16 +217,12 @@ async def test_memory_access_recorded_only_after_context_insertion():
 
 
 @pytest.mark.asyncio
-async def test_record_accesses_failure_warns_and_continues():
-    """Access-rehearsal bookkeeping is non-critical: a ``record_accesses``
-    RuntimeError must NOT propagate out of ``build_context``.
+async def test_record_accesses_admission_failure_fails_closed():
+    """The plan is not published until its actual owners have settled.
 
-    Regression for the #2523 decomposition (fresh GPT-5.6 Terra review): the
-    ``record_accesses`` await moved out of the former broad memory-retrieval
-    handler, so a failure in this post-commit bookkeeping call escaped the
-    build instead of degrading to a warning. The memory block is already
-    committed to the dynamic context by the time bookkeeping runs, so we
-    warn-and-continue and still return a normal ContextResult.
+    Ordinary database availability is handled inside update_access. An error
+    escaping record_accesses is admission/ownership failure, not permission
+    to render the uncommitted plan as a successful context (#3569 F57).
     """
     cm = _make_cm(memories_result="placeholder", rag_result="")
     cm.memory_manager.retrieve_memories.return_value = RetrievedMemoryBlock(
@@ -237,22 +233,14 @@ async def test_record_accesses_failure_warns_and_continues():
         side_effect=RuntimeError("access ledger unavailable")
     )
 
-    result = await cm.build_context(
-        query="substantive memory query",
-        constitution="CONSTITUTION_TEXT",
-    )
-
-    # A normal result, not a raised RuntimeError.
-    assert isinstance(result, ContextResult)
-    # The already-committed memory block survives — bookkeeping is post-commit.
-    assert "[Memory 1] inserted" in result.dynamic_user_context
-    # The failure is surfaced as a build warning, not swallowed silently.
+    with pytest.raises(RuntimeError, match="access ledger unavailable"):
+        await cm.build_context(
+            query="substantive memory query",
+            constitution="CONSTITUTION_TEXT",
+        )
     cm.memory_retriever.record_accesses.assert_awaited_once_with(
         (41, 42), "test-agent"
     )
-    assert any(
-        "access ledger unavailable" in w for w in result.warnings
-    ), result.warnings
 
 
 @pytest.mark.asyncio

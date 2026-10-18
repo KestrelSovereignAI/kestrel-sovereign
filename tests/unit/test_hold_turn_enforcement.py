@@ -78,9 +78,9 @@ async def test_agent_closes_legacy_owned_hold_context_after_shutdown_work() -> N
     assert failure is None
     assert events == ["factory", "database"]
     assert agent._standalone_hold_context is None
-    assert "await self._close_standalone_hold_context()" in inspect.getsource(
-        KestrelAgent.shutdown
-    )
+    shutdown_source = inspect.getsource(KestrelAgent.shutdown)
+    assert "await self._close_standalone_hold_context(" in shutdown_source
+    assert "withdrawals=context_withdrawals" in shutdown_source
 
 
 @pytest.mark.asyncio
@@ -296,7 +296,7 @@ async def test_cli_shell_prints_typed_hold_refusal(
         "initialize_with_bound_hold_context",
         initialize_with_hold,
     )
-    monkeypatch.setattr(hold_module, "close_bound_host_context", close_context)
+    monkeypatch.setattr("kestrel_sovereign.hold.enforcement.close_bound_host_context", close_context)
     monkeypatch.setattr(builtins, "input", lambda _prompt: next(inputs))
 
     result = await cli_module._run_shell(tmp_path, SimpleNamespace(app=None))

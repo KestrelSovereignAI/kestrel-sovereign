@@ -19,6 +19,13 @@ Key features:
 """
 import os
 import logging
+from contextlib import asynccontextmanager
+from kestrel_sovereign.execution_custody import (
+    close_native_execution_stream,
+    owned_native_http_client,
+    owned_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
+    execution_cleanup_debts,
+)
 from dataclasses import replace
 import httpx
 from typing import List, Optional, Dict, Any, Type, AsyncIterator, TYPE_CHECKING, Union
@@ -209,6 +216,18 @@ class OpenRouterAdapter(OpenAIAdapter):
             max_retries=0,
         )
 
+    @asynccontextmanager
+    async def _client_lifetime(self, client):
+        """A supplied route is borrowed; an implicit SDK is request-owned."""
+        if client is not None:
+            yield client
+            return
+        client = self._get_client()
+        try:
+            yield client
+        finally:
+            await close_native_execution_stream(client)
+
     @staticmethod
     def _with_usage_accounting(kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Inject OpenRouter's ``usage: {include: true}`` into ``extra_body``.
@@ -242,19 +261,16 @@ class OpenRouterAdapter(OpenAIAdapter):
 
         If no client is provided, creates one configured for OpenRouter.
         """
-        # Use OpenRouter client if none provided
-        if client is None:
-            client = self._get_client()
-
-        return await super().get_response(
-            client=client,
-            model=model,
-            messages=messages,
-            format=format,
-            tools=tools,
-            response_format=response_format,
-            **self._with_usage_accounting(kwargs)
-        )
+        async with self._client_lifetime(client) as client:
+            return await super().get_response(
+                client=client,
+                model=model,
+                messages=messages,
+                format=format,
+                tools=tools,
+                response_format=response_format,
+                **self._with_usage_accounting(kwargs)
+            )
 
     async def get_streaming_response(
         self,
@@ -266,18 +282,17 @@ class OpenRouterAdapter(OpenAIAdapter):
         **kwargs
     ) -> AsyncIterator[str]:
         """Get a streaming response from an OpenRouter model."""
-        if client is None:
-            client = self._get_client()
-
-        async for chunk in super().get_streaming_response(
-            client=client,
-            model=model,
-            messages=messages,
-            tools=tools,
-            response_format=response_format,
-            **kwargs
-        ):
-            yield chunk
+        async with self._client_lifetime(client) as client:
+            async with owned_execution_stream(self, super().get_streaming_response(
+                client=client,
+                model=model,
+                messages=messages,
+                tools=tools,
+                response_format=response_format,
+                **kwargs
+            )) as owned_stream:
+                async for chunk in owned_stream:
+                    yield chunk
 
     async def get_streaming_response_with_tools(
         self,
@@ -289,18 +304,17 @@ class OpenRouterAdapter(OpenAIAdapter):
         **kwargs
     ) -> AsyncIterator[Union[str, LLMResponse]]:
         """Get a streaming response with tool call detection."""
-        if client is None:
-            client = self._get_client()
-
-        async for item in super().get_streaming_response_with_tools(
-            client=client,
-            model=model,
-            messages=messages,
-            tools=tools,
-            response_format=response_format,
-            **self._with_usage_accounting(kwargs)
-        ):
-            yield item
+        async with self._client_lifetime(client) as client:
+            async with owned_execution_stream(self, super().get_streaming_response_with_tools(
+                client=client,
+                model=model,
+                messages=messages,
+                tools=tools,
+                response_format=response_format,
+                **self._with_usage_accounting(kwargs)
+            )) as owned_stream:
+                async for item in owned_stream:
+                    yield item
 
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """Fetch models from OpenRouter API with rich metadata.
@@ -329,7 +343,8 @@ class OpenRouterAdapter(OpenAIAdapter):
             return []
 
         try:
-            async with httpx.AsyncClient() as http_client:
+            async with owned_native_http_client(httpx.AsyncClient()) as http_client:
+                retain_native_execution_http_client_close(http_client)
                 response = await http_client.get(
                     f"{self.base_url}/models",
                     headers={"Authorization": f"Bearer {self.api_key}"},
@@ -406,9 +421,13 @@ class OpenRouterAdapter(OpenAIAdapter):
             return models
 
         except httpx.HTTPError as e:
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
+                raise
             logger.warning(f"OpenRouter HTTP error during model discovery: {e}")
             return []
         except Exception as e:
+            if is_execution_control_error(e) or execution_cleanup_debts(e):
+                raise
             logger.warning(f"OpenRouter model discovery failed: {e}")
             return []
 
@@ -449,7 +468,8 @@ class OpenRouterAdapter(OpenAIAdapter):
             return []
 
         url = f"{self.base_url}/embeddings/models"
-        async with httpx.AsyncClient() as http_client:
+        async with owned_native_http_client(httpx.AsyncClient()) as http_client:
+            retain_native_execution_http_client_close(http_client)
             response = await http_client.get(
                 url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
@@ -512,7 +532,8 @@ class OpenRouterAdapter(OpenAIAdapter):
         """
         if not self.api_key:
             return []
-        async with httpx.AsyncClient() as http_client:
+        async with owned_native_http_client(httpx.AsyncClient()) as http_client:
+            retain_native_execution_http_client_close(http_client)
             response = await http_client.get(
                 f"{self.base_url}/models",
                 params={"output_modalities": "decisions"},

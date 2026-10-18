@@ -730,7 +730,7 @@ def test_package_resources_are_available_from_an_installed_wheel(tmp_path):
     assert len(wheels) == 1, f"expected one Kestrel wheel, found {wheels}"
 
     subprocess.run(
-        ["uv", "venv", "--no-project", str(venv_dir)],
+        ["uv", "venv", "--no-project", "--python", sys.executable, str(venv_dir)],
         cwd=tmp_path,
         env=environment,
         check=True,

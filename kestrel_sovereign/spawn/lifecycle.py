@@ -14,6 +14,7 @@ Lifecycle:
 """
 
 import asyncio
+import inspect
 import logging
 import shutil
 import tempfile
@@ -26,6 +27,7 @@ from typing import Any, Dict, Optional
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 
 from kestrel_sovereign.hooks.manager import HooksManager
+from kestrel_sovereign.execution_custody import execution_observation_error, is_execution_control_error
 from kestrel_sovereign.spawn.mandate import (
     PersistedSpawnMandateExpiredError,
     SpawnMandate,
@@ -41,6 +43,9 @@ _COLD_TTL_RETIREMENT_RETRY_SECONDS = 30.0
 def _is_expected_termination_outcome(error: BaseException) -> bool:
     """Accept lifecycle failures/cancellation, never process-control signals."""
 
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    if is_execution_control_error(error):
+        return True
     if isinstance(error, (Exception, asyncio.CancelledError)):
         return True
     if isinstance(error, BaseExceptionGroup):
@@ -101,7 +106,9 @@ def _typed_termination_proves_removal(
         return False
     try:
         return get_agent(child_name) is None
-    except Exception:
+    except Exception as error:
+        if is_execution_control_error(error):
+            raise
         return False
 
 
@@ -130,7 +137,9 @@ def _manager_proves_child_absent(
         if get_agent(child_name) is not None:
             return False
         children = get_children(parent_did)
-    except Exception:
+    except Exception as error:
+        if is_execution_control_error(error):
+            raise
         return False
     if not isinstance(children, (list, tuple, set, frozenset)):
         return False
@@ -164,7 +173,9 @@ def _manager_proves_child_live(
         if get_agent(child_name) is None:
             return False
         children = get_children(parent_did)
-    except Exception:
+    except Exception as error:
+        if is_execution_control_error(error):
+            raise
         return False
     if not isinstance(children, (list, tuple, set, frozenset)):
         return False
@@ -568,7 +579,9 @@ class SpawnedAgentLifecycle:
             return True
         try:
             witness = registry.get(child_did)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.exception(
                 "Could not prove durable retirement settled for child %r; "
                 "lifecycle custody retained",
@@ -797,8 +810,8 @@ class SpawnedAgentLifecycle:
         self._cold_ttl_tasks[key] = task
 
         def release(completed: asyncio.Task) -> None:
-            if not completed.cancelled():
-                completed.exception()
+            from kestrel_sovereign._async_ownership import owned_task_error
+            self._retain_timer_terminal_control(owned_task_error(completed))
             if self._cold_ttl_tasks.get(key) is completed:
                 self._cold_ttl_tasks.pop(key, None)
 
@@ -1157,6 +1170,7 @@ class SpawnedAgentLifecycle:
             logger.warning("report_result for untracked child '%s'", child_name)
             return None
         owned_child_did = initially_tracked.child_did
+        finite_errors: list[BaseException] = []
         self._claim_finalization(child_name, owned_child_did)
         # Hold the lifecycle lock so report_result and the TTL monitor can't
         # BOTH finalize the same child concurrently (double cleanup / result
@@ -1187,8 +1201,14 @@ class SpawnedAgentLifecycle:
                 )
 
                 return result if terminated else None
+        except BaseException as error:
+            finite_errors.append(error)
+            raise
         finally:
-            self._release_finalization(child_name, owned_child_did)
+            try:
+                self._release_finalization(child_name, owned_child_did)
+            except BaseException as error:
+                raise execution_observation_error(*finite_errors, error)
 
     def get_result(self, child_name: str) -> Optional[SpawnResult]:
         """Retrieve the result for a terminated child.
@@ -1303,6 +1323,7 @@ class SpawnedAgentLifecycle:
         if initially_tracked is None:
             return None
         owned_child_did = initially_tracked.child_did
+        finite_errors: list[BaseException] = []
         self._claim_finalization(child_name, owned_child_did)
         # Serialize explicit termination with result reports and TTL expiry.
         # A refused manager removal must leave the exact child and its timer
@@ -1330,8 +1351,14 @@ class SpawnedAgentLifecycle:
                 )
 
                 return result if terminated else None
+        except BaseException as error:
+            finite_errors.append(error)
+            raise
         finally:
-            self._release_finalization(child_name, owned_child_did)
+            try:
+                self._release_finalization(child_name, owned_child_did)
+            except BaseException as error:
+                raise execution_observation_error(*finite_errors, error)
 
     async def shutdown(self) -> None:
         """Shut down all tracked children and clean up.
@@ -1339,6 +1366,7 @@ class SpawnedAgentLifecycle:
         Called when the parent agent or the entire system shuts down.
         Cascading: terminates all tracked children.
         """
+        from kestrel_sovereign.execution_custody import execution_observation_error
         children = list(self._tracked.keys())
         terminal_outcomes: list[BaseException] = []
         for child_name in children:
@@ -1353,16 +1381,12 @@ class SpawnedAgentLifecycle:
                         ChildTerminationNotPerformedError(child_name=child_name)
                     )
             except BaseException as exc:
-                if not _is_expected_termination_outcome(exc):
-                    raise
+                if (not _is_expected_termination_outcome(exc)
+                    and not any(is_execution_control_error(error) for error in terminal_outcomes)):
+                    raise execution_observation_error(*terminal_outcomes, exc)
                 terminal_outcomes.append(exc)
-        if len(terminal_outcomes) == 1:
-            raise terminal_outcomes[0]
         if terminal_outcomes:
-            raise BaseExceptionGroup(
-                "One or more spawned children retained terminal cleanup",
-                terminal_outcomes,
-            )
+            raise execution_observation_error(*terminal_outcomes, message="One or more spawned children retained terminal cleanup")
 
     async def _ttl_monitor(
         self,
@@ -1370,10 +1394,50 @@ class SpawnedAgentLifecycle:
         child_did: str,
         ttl_seconds: int,
     ) -> None:
-        """Background task that auto-terminates a child when TTL expires."""
+        """Keep the exact timer's terminal carrier through every observer."""
+        from kestrel_sovereign.execution_custody import execution_observation_error, retained_execution_error
+        try:
+            return await self._run_ttl_monitor(child_name, child_did, ttl_seconds)
+        except BaseException as error:
+            # These legacy timer Tasks also have callback and direct readers.
+            # Cache the SAME escaping result before asyncio can consume a
+            # cancelled Task's original; canonical readers share this slot.
+            task = asyncio.current_task()
+            dedicated = getattr(task.get_coro(), "cr_code", None) is type(self)._ttl_monitor.__code__
+            terminal = execution_observation_error(
+                getattr(task, "_kestrel_owned_terminal_error", None) if dedicated else None, error,
+            )
+            try:
+                self._retain_timer_terminal_control(terminal)
+            except BaseException as retention:
+                terminal = execution_observation_error(terminal, retention)
+            if dedicated:
+                task._kestrel_owned_terminal_error = retained_execution_error(terminal)
+            if terminal is error:
+                raise
+            raise terminal
+
+    def _retain_timer_terminal_control(self, error: BaseException | None) -> None:
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        if is_execution_control_error(error):
+            from kestrel_sovereign.multi_agent.agent_manager import _merge_manager_cleanup_control
+            manager = self._agent_manager
+            manager._quarantined_shutdown_control = _merge_manager_cleanup_control(
+                vars(manager).get("_quarantined_shutdown_control"), error,
+            )
+
+    async def _run_ttl_monitor(
+        self, child_name: str, child_did: str, ttl_seconds: int,
+    ) -> None:
+        """Background timer body; ordinary availability keeps its retry policy."""
+        from kestrel_sovereign.execution_custody import (
+            _explicit_control_chain, execution_observation_error, is_execution_control_error,
+        )
         try:
             await asyncio.sleep(ttl_seconds)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                raise
             return
 
         exact = self._tracked.get(child_name)
@@ -1397,129 +1461,150 @@ class SpawnedAgentLifecycle:
                 # selecting a same-name replacement.
                 child_name = matches[0]
 
-        self._claim_finalization(child_name, child_did)
-        # Same lock as report_result so TTL expiry and a just-in-time result
-        # report can't both finalize the child (#1729). Idempotent.
+        originals, withdrawals = [], []
         try:
-            async with self._lock:
-                tracked = self._tracked.get(child_name)
-                if tracked is None:
-                    # An ordinary explicit Stop withdraws running work but is
-                    # intentionally restartable until its signed TTL.  Its
-                    # live timer remains the expiry owner after local tracking
-                    # is removed, so the retained host witness cannot become a
-                    # permanent name/cap reservation.
-                    from kestrel_sovereign.kestrel_agent import (
-                        await_lifecycle_task_completion,
+            self._claim_finalization(child_name, child_did)
+            # Same lock as report_result so TTL expiry and a just-in-time result
+            # report can't both finalize the child (#1729). Idempotent.
+            try:
+                async with self._lock:
+                    tracked = self._tracked.get(child_name)
+                    if tracked is None:
+                        # An ordinary explicit Stop withdraws running work but is
+                        # intentionally restartable until its signed TTL.  Its
+                        # live timer remains the expiry owner after local tracking
+                        # is removed, so the retained host witness cannot become a
+                        # permanent name/cap reservation.
+                        from kestrel_sovereign._async_ownership import (
+                            OwnedTaskAdmission, await_owned_task, create_owned_task,
+                        )
+
+                        try:
+                            admission, opening = OwnedTaskAdmission(), None
+                            try:
+                                create_owned_task(
+                                    self._retire_stopped_authority_at_expiry(child_name, child_did),
+                                    name=f"expired_stopped_spawn_authority:{child_name}",
+                                    retain_originals=True, admission=admission,
+                                )
+                            except BaseException as error:
+                                opening = error
+                            outcome = (await await_owned_task(admission.task)
+                                       if admission.task is not None else None)
+                            if outcome is not None and outcome.cancellation is not None:
+                                withdrawals.append(outcome.cancellation)
+                            failure = execution_observation_error(
+                                opening, outcome.error if outcome is not None else None, *withdrawals,
+                            )
+                            if failure is not None:
+                                raise failure
+                            if outcome is None:
+                                raise RuntimeError("cold retirement has no accepted original owner")
+                            settled = bool(outcome.result)
+                        except BaseException as exc:
+                            if (is_execution_control_error(exc) or withdrawals
+                                or (asyncio.current_task().cancelling()
+                                    and any(isinstance(error, asyncio.CancelledError) for error in _explicit_control_chain(exc)))):
+                                raise
+                            if not _is_expected_termination_outcome(exc):
+                                raise
+                            logger.error(
+                                "Cold authority retirement failed for child '%s'; "
+                                "retained owner will retry: %s",
+                                child_name,
+                                exc,
+                            )
+                            settled = False
+                        if not settled:
+                            retry = asyncio.create_task(
+                                self._ttl_monitor(
+                                    child_name,
+                                    child_did,
+                                    _COLD_TTL_RETIREMENT_RETRY_SECONDS,
+                                ),
+                                name=f"retry_cold_spawn_retirement:{child_name}",
+                            )
+                            self._retain_cold_ttl_owner(
+                                (child_name.casefold(), child_did),
+                                retry,
+                            )
+                        return
+                    if (
+                        tracked.child_did != child_did
+                        or tracked.result is not None
+                    ):
+                        return  # already finalized by report_result
+
+                    logger.info(
+                        "TTL expired for child '%s' after %ds",
+                        child_name,
+                        ttl_seconds,
                     )
 
+                    result = SpawnResult(
+                        child_name=child_name,
+                        child_did=tracked.child_did,
+                        status=SpawnStatus.TIMED_OUT,
+                        started_at=tracked.started_at,
+                        parent_did=tracked.parent_did,
+                    )
                     try:
-                        retirement = asyncio.create_task(
-                            self._retire_stopped_authority_at_expiry(
-                                child_name,
-                                child_did,
-                            ),
-                            name=f"expired_stopped_spawn_authority:{child_name}",
+                        terminated = await self._terminate_and_cleanup(
+                            child_name,
+                            SpawnStatus.TIMED_OUT,
+                            reason="TTL expired",
+                            result=result,
                         )
-                        cancelled, failure = await await_lifecycle_task_completion(
-                            retirement
-                        )
-                        if failure is not None:
-                            raise failure
-                        if cancelled:
-                            raise asyncio.CancelledError()
-                        settled = bool(retirement.result())
+                        if not terminated:
+                            still_tracked = self._tracked.get(child_name)
+                            if (
+                                still_tracked is not None
+                                and still_tracked.termination_refusal is None
+                            ):
+                                logger.warning(
+                                    "TTL termination was refused for child '%s'; "
+                                    "tracking and periodic retry remain active",
+                                    child_name,
+                                )
                     except BaseException as exc:
+                        if (is_execution_control_error(exc) or withdrawals
+                            or (asyncio.current_task().cancelling()
+                                and any(isinstance(error, asyncio.CancelledError) for error in _explicit_control_chain(exc)))):
+                            raise
                         if not _is_expected_termination_outcome(exc):
                             raise
                         logger.error(
-                            "Cold authority retirement failed for child '%s'; "
-                            "retained owner will retry: %s",
+                            "TTL termination retained cleanup for child '%s': %s",
                             child_name,
                             exc,
                         )
-                        settled = False
-                    if not settled:
-                        retry = asyncio.create_task(
-                            self._ttl_monitor(
-                                child_name,
-                                child_did,
-                                _COLD_TTL_RETIREMENT_RETRY_SECONDS,
-                            ),
-                            name=f"retry_cold_spawn_retirement:{child_name}",
-                        )
-                        self._retain_cold_ttl_owner(
-                            (child_name.casefold(), child_did),
-                            retry,
-                        )
-                    return
-                if (
-                    tracked.child_did != child_did
-                    or tracked.result is not None
-                ):
-                    return  # already finalized by report_result
-
-                logger.info(
-                    "TTL expired for child '%s' after %ds",
-                    child_name,
-                    ttl_seconds,
-                )
-
-                result = SpawnResult(
-                    child_name=child_name,
-                    child_did=tracked.child_did,
-                    status=SpawnStatus.TIMED_OUT,
-                    started_at=tracked.started_at,
-                    parent_did=tracked.parent_did,
-                )
-                try:
-                    terminated = await self._terminate_and_cleanup(
-                        child_name,
-                        SpawnStatus.TIMED_OUT,
-                        reason="TTL expired",
-                        result=result,
-                    )
-                    if not terminated:
                         still_tracked = self._tracked.get(child_name)
                         if (
                             still_tracked is not None
-                            and still_tracked.termination_refusal is None
+                            and still_tracked.child_did == child_did
+                            and still_tracked.result is None
+                            and still_tracked.ttl_task is asyncio.current_task()
                         ):
-                            logger.warning(
-                                "TTL termination was refused for child '%s'; "
-                                "tracking and periodic retry remain active",
-                                child_name,
+                            # Runtime removal can succeed before the durable witness
+                            # advances from retiring to retired. Keep both the local
+                            # record and one automatic owner until that terminal
+                            # write settles; explicit report_result remains a second
+                            # safe retry path in the meantime.
+                            still_tracked.ttl_task = asyncio.create_task(
+                                self._ttl_monitor(
+                                    child_name,
+                                    child_did,
+                                    _COLD_TTL_RETIREMENT_RETRY_SECONDS,
+                                ),
+                                name=f"retry_live_spawn_retirement:{child_name}",
                             )
-                except BaseException as exc:
-                    if not _is_expected_termination_outcome(exc):
-                        raise
-                    logger.error(
-                        "TTL termination retained cleanup for child '%s': %s",
-                        child_name,
-                        exc,
-                    )
-                    still_tracked = self._tracked.get(child_name)
-                    if (
-                        still_tracked is not None
-                        and still_tracked.child_did == child_did
-                        and still_tracked.result is None
-                        and still_tracked.ttl_task is asyncio.current_task()
-                    ):
-                        # Runtime removal can succeed before the durable witness
-                        # advances from retiring to retired. Keep both the local
-                        # record and one automatic owner until that terminal
-                        # write settles; explicit report_result remains a second
-                        # safe retry path in the meantime.
-                        still_tracked.ttl_task = asyncio.create_task(
-                            self._ttl_monitor(
-                                child_name,
-                                child_did,
-                                _COLD_TTL_RETIREMENT_RETRY_SECONDS,
-                            ),
-                            name=f"retry_live_spawn_retirement:{child_name}",
-                        )
-        finally:
-            self._release_finalization(child_name, child_did)
+            except BaseException as error:
+                originals.append(error)
+                raise
+            finally:
+                self._release_finalization(child_name, child_did)
+        except BaseException as error:
+            raise execution_observation_error(*originals, error, *withdrawals)
 
     async def _retire_stopped_authority_at_expiry(
         self,
@@ -1569,6 +1654,7 @@ class SpawnedAgentLifecycle:
         if not callable(begin_fence) or not callable(end_fence):
             return False
         fence = await begin_fence(self._agent_manager, witness.child_did)
+        originals = []
         try:
             # The fence joins pre-existing descendant spawns and excludes new
             # ones, making this a complete authority snapshot. Persist the
@@ -1598,8 +1684,14 @@ class SpawnedAgentLifecycle:
             )
             settled = registry.get(child_did)
             return settled is None or settled.retired
+        except BaseException as error:
+            originals.append(error)
+            raise
         finally:
-            end_fence(self._agent_manager, fence)
+            try:
+                end_fence(self._agent_manager, fence)
+            except BaseException as error:
+                raise execution_observation_error(*originals, error)
 
     async def _terminate_and_cleanup(
         self,
@@ -1623,343 +1715,378 @@ class SpawnedAgentLifecycle:
         if tracked is None:
             return False
 
-        terminal_retirement = status in {
-            SpawnStatus.COMPLETED,
-            SpawnStatus.FAILED,
-            SpawnStatus.TIMED_OUT,
-        }
-        if terminal_retirement and not _terminal_descendant_fence_active:
-            begin_fence = vars(self._agent_manager).get(
-                "begin_terminal_descendant_spawn_fence"
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        originals: list[BaseException] = []
+        reconciliation_withdrawals: list[BaseException] = []
+        try:
+            terminal_retirement = status in {
+                SpawnStatus.COMPLETED,
+                SpawnStatus.FAILED,
+                SpawnStatus.TIMED_OUT,
+            }
+            if terminal_retirement and not _terminal_descendant_fence_active:
+                begin_fence = vars(self._agent_manager).get(
+                    "begin_terminal_descendant_spawn_fence"
+                )
+                class_begin_fence = (
+                    getattr(
+                        type(self._agent_manager),
+                        "begin_terminal_descendant_spawn_fence",
+                        None,
+                    )
+                    if not callable(begin_fence)
+                    else None
+                )
+                if callable(begin_fence) or callable(class_begin_fence):
+                    fence = (
+                        await begin_fence(tracked.child_did)
+                        if callable(begin_fence)
+                        else await class_begin_fence(self._agent_manager, tracked.child_did)
+                    )
+                    try:
+                        return await self._terminate_and_cleanup(
+                            child_name,
+                            status,
+                            reason,
+                            offboard_runtime=offboard_runtime,
+                            result=result,
+                            _terminal_descendant_fence_active=True,
+                        )
+                    except BaseException as fenced_error:
+                        originals.append(fenced_error)
+                        raise
+                    finally:
+                        end_fence = vars(self._agent_manager).get(
+                            "end_terminal_descendant_spawn_fence"
+                        )
+                        if callable(end_fence):
+                            end_fence(fence)
+                        else:
+                            class_end_fence = getattr(
+                                type(self._agent_manager),
+                                "end_terminal_descendant_spawn_fence",
+                                None,
+                            )
+                            if callable(class_end_fence):
+                                class_end_fence(self._agent_manager, fence)
+            retirement_targets = (
+                _terminal_retirement_tree(
+                    self._agent_manager,
+                    child_name=child_name,
+                    child_did=tracked.child_did,
+                    parent_did=tracked.parent_did,
+                )
+                if terminal_retirement
+                else ()
             )
-            class_begin_fence = (
-                getattr(
+            retirement_intents: dict[tuple[str, str], bool] = {}
+            reopen_live_intents = status is not SpawnStatus.TIMED_OUT
+            begin_retirements = getattr(
+                type(self._agent_manager),
+                "begin_terminal_spawn_retirements",
+                None,
+            )
+            begin_retirement = getattr(
+                type(self._agent_manager),
+                "begin_terminal_spawn_retirement",
+                None,
+            )
+            if terminal_retirement and callable(begin_retirements):
+                try:
+                    retirement_intents.update(
+                        begin_retirements(
+                            self._agent_manager,
+                            tuple(
+                                (target.child_name, target.child_did)
+                                for target in retirement_targets
+                            ),
+                        )
+                    )
+                except BaseException as opening_error:
+                    originals.append(opening_error)
+                    await _settle_terminal_retirement_tree(
+                        self._agent_manager,
+                        retirement_targets,
+                        retirement_intents,
+                        reopen_live_intents=reopen_live_intents,
+                    )
+                    raise
+            elif terminal_retirement and callable(begin_retirement):
+                try:
+                    for target in retirement_targets:
+                        target_key = (target.child_name, target.child_did)
+                        retirement_intents[target_key] = bool(
+                            begin_retirement(
+                                self._agent_manager,
+                                target.child_name,
+                                expected_child_did=target.child_did,
+                            )
+                        )
+                except BaseException as opening_error:
+                    originals.append(opening_error)
+                    await _settle_terminal_retirement_tree(
+                        self._agent_manager,
+                        retirement_targets,
+                        retirement_intents,
+                        reopen_live_intents=reopen_live_intents,
+                    )
+                    raise
+
+            if status is SpawnStatus.TIMED_OUT:
+                fence_expired = getattr(
                     type(self._agent_manager),
-                    "begin_terminal_descendant_spawn_fence",
+                    "fence_expired_spawn_routes",
                     None,
                 )
-                if not callable(begin_fence)
-                else None
-            )
-            if callable(begin_fence) or callable(class_begin_fence):
-                fence = (
-                    await begin_fence(tracked.child_did)
-                    if callable(begin_fence)
-                    else await class_begin_fence(self._agent_manager, tracked.child_did)
-                )
-                try:
-                    return await self._terminate_and_cleanup(
-                        child_name,
-                        status,
-                        reason,
-                        offboard_runtime=offboard_runtime,
-                        result=result,
-                        _terminal_descendant_fence_active=True,
-                    )
-                finally:
-                    end_fence = vars(self._agent_manager).get(
-                        "end_terminal_descendant_spawn_fence"
-                    )
-                    if callable(end_fence):
-                        end_fence(fence)
-                    else:
-                        class_end_fence = getattr(
-                            type(self._agent_manager),
-                            "end_terminal_descendant_spawn_fence",
-                            None,
-                        )
-                        if callable(class_end_fence):
-                            class_end_fence(self._agent_manager, fence)
-        retirement_targets = (
-            _terminal_retirement_tree(
-                self._agent_manager,
-                child_name=child_name,
-                child_did=tracked.child_did,
-                parent_did=tracked.parent_did,
-            )
-            if terminal_retirement
-            else ()
-        )
-        retirement_intents: dict[tuple[str, str], bool] = {}
-        reopen_live_intents = status is not SpawnStatus.TIMED_OUT
-        begin_retirements = getattr(
-            type(self._agent_manager),
-            "begin_terminal_spawn_retirements",
-            None,
-        )
-        begin_retirement = getattr(
-            type(self._agent_manager),
-            "begin_terminal_spawn_retirement",
-            None,
-        )
-        if terminal_retirement and callable(begin_retirements):
-            try:
-                retirement_intents.update(
-                    begin_retirements(
+                if callable(fence_expired):
+                    fence_expired(
                         self._agent_manager,
                         tuple(
                             (target.child_name, target.child_did)
                             for target in retirement_targets
                         ),
                     )
-                )
-            except BaseException:
-                await _settle_terminal_retirement_tree(
-                    self._agent_manager,
-                    retirement_targets,
-                    retirement_intents,
-                    reopen_live_intents=reopen_live_intents,
-                )
-                raise
-        elif terminal_retirement and callable(begin_retirement):
+
+            # Terminate via AgentManager (handles cascading grandchildren). The
+            # calling entry point already marked the exact child as the owner that
+            # still needs this record after manager-side relationship pruning.
+            termination_failure: BaseException | None = None
+            reconciliation_cancelled = False
+            reconciliation_observations_supported = False
+            terminated = False
+            finalized_from_absence = False
             try:
-                for target in retirement_targets:
-                    target_key = (target.child_name, target.child_did)
-                    retirement_intents[target_key] = bool(
-                        begin_retirement(
-                            self._agent_manager,
-                            target.child_name,
-                            expected_child_did=target.child_did,
-                        )
+                if offboard_runtime:
+                    terminated = await self._agent_manager.terminate_child(
+                        tracked.parent_did,
+                        child_name,
+                        offboard_runtime=True,
                     )
-            except BaseException:
-                await _settle_terminal_retirement_tree(
-                    self._agent_manager,
-                    retirement_targets,
-                    retirement_intents,
-                    reopen_live_intents=reopen_live_intents,
-                )
-                raise
-
-        if status is SpawnStatus.TIMED_OUT:
-            fence_expired = getattr(
-                type(self._agent_manager),
-                "fence_expired_spawn_routes",
-                None,
-            )
-            if callable(fence_expired):
-                fence_expired(
-                    self._agent_manager,
-                    tuple(
-                        (target.child_name, target.child_did)
-                        for target in retirement_targets
-                    ),
-                )
-
-        # Terminate via AgentManager (handles cascading grandchildren). The
-        # calling entry point already marked the exact child as the owner that
-        # still needs this record after manager-side relationship pruning.
-        termination_failure: BaseException | None = None
-        reconciliation_cancelled = False
-        terminated = False
-        finalized_from_absence = False
-        try:
-            if offboard_runtime:
-                terminated = await self._agent_manager.terminate_child(
-                    tracked.parent_did,
-                    child_name,
-                    offboard_runtime=True,
-                )
-            else:
-                terminated = await self._agent_manager.terminate_child(
-                    tracked.parent_did,
-                    child_name,
-                )
-        except BaseException as exc:
-            if not _is_expected_termination_outcome(exc):
-                raise
-            if not _typed_termination_proves_removal(
-                self._agent_manager,
-                child_name,
-                exc,
-            ):
-                await _settle_terminal_retirement_tree(
-                    self._agent_manager,
-                    retirement_targets,
-                    retirement_intents,
-                    reopen_live_intents=reopen_live_intents,
-                )
-                raise
-            termination_failure = exc
-            logger.error(
-                "Failed to terminate child '%s' via AgentManager: %s",
-                child_name,
-                exc,
-            )
-
-        if status is SpawnStatus.TIMED_OUT and (
-            terminated or termination_failure is not None
-        ):
-            await_reconciliation = vars(self._agent_manager).get(
-                "await_child_termination_reconciliation",
-            )
-            if callable(await_reconciliation):
-                reconciliation_result = await await_reconciliation(
-                    tracked.parent_did, child_name
-                )
-            else:
-                class_reconciliation = getattr(
-                    type(self._agent_manager),
-                    "await_child_termination_reconciliation",
-                    None,
-                )
-                reconciliation_result = (
-                    await class_reconciliation(
-                        self._agent_manager,
+                else:
+                    terminated = await self._agent_manager.terminate_child(
                         tracked.parent_did,
                         child_name,
                     )
-                    if callable(class_reconciliation)
-                    else None
-                )
-            if reconciliation_result is not None:
-                terminated, reconciliation_cancelled = reconciliation_result
-                if not terminated and termination_failure is not None:
-                    raise termination_failure
-
-        if not terminated and termination_failure is None:
-            if _manager_proves_child_absent(
-                self._agent_manager,
-                parent_did=tracked.parent_did,
-                child_name=child_name,
-            ):
-                # A concurrent removal may already have shut down and
-                # unpublished the child and pruned its parent edge. Finalize
-                # local lifecycle custody exactly once. Routing absence alone
-                # does not prove that destructive runtime offboarding ran.
-                terminated = True
-                finalized_from_absence = True
-                logger.warning(
-                    "Finalizing child %r from routing absence; "
-                    "offboard_runtime=%s and runtime custody is unknown",
+            except BaseException as exc:
+                originals.append(exc)
+                if not _is_expected_termination_outcome(exc):
+                    raise
+                if not _typed_termination_proves_removal(
+                    self._agent_manager,
                     child_name,
-                    offboard_runtime,
+                    exc,
+                ):
+                    await _settle_terminal_retirement_tree(
+                        self._agent_manager,
+                        retirement_targets,
+                        retirement_intents,
+                        reopen_live_intents=reopen_live_intents,
+                    )
+                    raise
+                termination_failure = exc
+                logger.error(
+                    "Failed to terminate child '%s' via AgentManager: %s",
+                    child_name,
+                    exc,
                 )
-                if offboard_runtime:
-                    from kestrel_sovereign.multi_agent.agent_manager import (
-                        RuntimeOffboardingNotPerformedError,
-                    )
 
-                    termination_failure = RuntimeOffboardingNotPerformedError(
-                        agent_name=child_name,
-                        agent_id=tracked.child_did,
-                        cleanup_state="custody_unknown",
+            if status is SpawnStatus.TIMED_OUT and (
+                terminated or termination_failure is not None
+            ):
+                await_reconciliation = vars(self._agent_manager).get(
+                    "await_child_termination_reconciliation",
+                )
+                if callable(await_reconciliation):
+                    try:
+                        # Core's reader exposes actual observations; legacy host
+                        # protocol implementations can retain their two-argument
+                        # tuple contract without receiving an unexpected keyword.
+                        observation_kwargs = ({"withdrawals": reconciliation_withdrawals}
+                            if "withdrawals" in inspect.signature(await_reconciliation).parameters else {})
+                        reconciliation_observations_supported = bool(observation_kwargs)
+                        reconciliation_result = await await_reconciliation(
+                            tracked.parent_did, child_name, **observation_kwargs,
+                        )
+                    except BaseException as reconciliation_error:
+                        from kestrel_sovereign.execution_custody import execution_observation_error
+                        raise execution_observation_error(termination_failure, reconciliation_error, *reconciliation_withdrawals)
+                else:
+                    class_reconciliation = getattr(
+                        type(self._agent_manager),
+                        "await_child_termination_reconciliation",
+                        None,
                     )
-            else:
+                    try:
+                        observation_kwargs = ({"withdrawals": reconciliation_withdrawals}
+                            if callable(class_reconciliation)
+                            and "withdrawals" in inspect.signature(class_reconciliation).parameters else {})
+                        reconciliation_observations_supported = bool(observation_kwargs)
+                        reconciliation_result = (
+                            await class_reconciliation(
+                                self._agent_manager,
+                                tracked.parent_did,
+                                child_name,
+                                **observation_kwargs,
+                            )
+                            if callable(class_reconciliation)
+                            else None
+                        )
+                    except BaseException as reconciliation_error:
+                        from kestrel_sovereign.execution_custody import execution_observation_error
+                        raise execution_observation_error(termination_failure, reconciliation_error, *reconciliation_withdrawals)
+                if reconciliation_result is not None:
+                    terminated, reconciliation_cancelled = reconciliation_result
+                    if not terminated and termination_failure is not None:
+                        from kestrel_sovereign.execution_custody import execution_observation_error
+                        raise execution_observation_error(termination_failure, *reconciliation_withdrawals)
+
+            if not terminated and termination_failure is None:
+                if _manager_proves_child_absent(
+                    self._agent_manager,
+                    parent_did=tracked.parent_did,
+                    child_name=child_name,
+                ):
+                    # A concurrent removal may already have shut down and
+                    # unpublished the child and pruned its parent edge. Finalize
+                    # local lifecycle custody exactly once. Routing absence alone
+                    # does not prove that destructive runtime offboarding ran.
+                    terminated = True
+                    finalized_from_absence = True
+                    logger.warning(
+                        "Finalizing child %r from routing absence; "
+                        "offboard_runtime=%s and runtime custody is unknown",
+                        child_name,
+                        offboard_runtime,
+                    )
+                    if offboard_runtime:
+                        from kestrel_sovereign.multi_agent.agent_manager import (
+                            RuntimeOffboardingNotPerformedError,
+                        )
+
+                        termination_failure = RuntimeOffboardingNotPerformedError(
+                            agent_name=child_name,
+                            agent_id=tracked.child_did,
+                            cleanup_state="custody_unknown",
+                        )
+                else:
+                    await _settle_terminal_retirement_tree(
+                        self._agent_manager,
+                        retirement_targets,
+                        retirement_intents,
+                        reopen_live_intents=reopen_live_intents,
+                    )
+                    # A TTL attempt is itself the timer task and is about to
+                    # finish. Bound automatic retries so a genuine refusal cannot
+                    # leak one task and one warning per TTL forever. Explicit
+                    # retries remain available while the live child stays tracked.
+                    if tracked.ttl_task is asyncio.current_task():
+                        tracked.automatic_termination_attempts += 1
+                        attempts = tracked.automatic_termination_attempts
+                        if attempts < _MAX_AUTOMATIC_TERMINATION_ATTEMPTS:
+                            tracked.ttl_task = asyncio.create_task(
+                                self._ttl_monitor(
+                                    child_name,
+                                tracked.child_did,
+                                    tracked.ttl_seconds,
+                                )
+                            )
+                        else:
+                            tracked.termination_refusal = TerminationRefusalState(
+                                automatic_termination_attempts=attempts,
+                                requested_status=status,
+                            )
+                            logger.error(
+                                "Automatic termination was refused %d times for "
+                                "child %r; automatic retries stopped and explicit "
+                                "operator termination remains available",
+                                attempts,
+                                child_name,
+                            )
+                    if reconciliation_withdrawals:
+                        raise execution_observation_error(*originals, *reconciliation_withdrawals)
+                    return False
+
+            if terminal_retirement:
                 await _settle_terminal_retirement_tree(
                     self._agent_manager,
                     retirement_targets,
                     retirement_intents,
                     reopen_live_intents=reopen_live_intents,
                 )
-                # A TTL attempt is itself the timer task and is about to
-                # finish. Bound automatic retries so a genuine refusal cannot
-                # leak one task and one warning per TTL forever. Explicit
-                # retries remain available while the live child stays tracked.
-                if tracked.ttl_task is asyncio.current_task():
-                    tracked.automatic_termination_attempts += 1
-                    attempts = tracked.automatic_termination_attempts
-                    if attempts < _MAX_AUTOMATIC_TERMINATION_ATTEMPTS:
-                        tracked.ttl_task = asyncio.create_task(
-                            self._ttl_monitor(
-                                child_name,
-                                tracked.child_did,
-                                tracked.ttl_seconds,
-                            )
-                        )
-                    else:
-                        tracked.termination_refusal = TerminationRefusalState(
-                            automatic_termination_attempts=attempts,
-                            requested_status=status,
-                        )
-                        logger.error(
-                            "Automatic termination was refused %d times for "
-                            "child %r; automatic retries stopped and explicit "
-                            "operator termination remains available",
-                            attempts,
-                            child_name,
-                        )
-                return False
 
-        if terminal_retirement:
-            await _settle_terminal_retirement_tree(
-                self._agent_manager,
-                retirement_targets,
-                retirement_intents,
-                reopen_live_intents=reopen_live_intents,
-            )
+            # Only an authoritative manager success (or its typed terminal
+            # exception path, which is surfaced below) may disarm TTL and publish
+            # lifecycle completion. A bare False retains every retry handle.
+            if result is None:
+                result = SpawnResult(
+                    child_name=child_name,
+                    child_did=tracked.child_did,
+                    status=status,
+                    started_at=tracked.started_at,
+                    parent_did=tracked.parent_did,
+                )
+            result.finalized_from_absence = finalized_from_absence
+            tracked.termination_refusal = None
+            tracked.result = result
+            self._results[child_name] = result
+            if (
+                (status is not SpawnStatus.TERMINATED or offboard_runtime)
+                and tracked.ttl_task
+                and tracked.ttl_task is not asyncio.current_task()
+                and not tracked.ttl_task.done()
+            ):
+                tracked.ttl_task.cancel()
 
-        # Only an authoritative manager success (or its typed terminal
-        # exception path, which is surfaced below) may disarm TTL and publish
-        # lifecycle completion. A bare False retains every retry handle.
-        if result is None:
-            result = SpawnResult(
-                child_name=child_name,
-                child_did=tracked.child_did,
-                status=status,
-                started_at=tracked.started_at,
+            # Clean up ephemeral temp directory
+            if tracked.mode == SpawnMode.EPHEMERAL and tracked.temp_dir:
+                try:
+                    shutil.rmtree(tracked.temp_dir, ignore_errors=True)
+                    logger.info(
+                        "Cleaned up ephemeral dir for '%s': %s",
+                        child_name,
+                        tracked.temp_dir,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to clean up temp dir for '%s': %s",
+                        child_name,
+                        e,
+                    )
+
+            # Fire AGENT_TERMINATE hook
+            termination_reason = reason or status.value
+            await self._fire_hook(
+                HookEvent.AGENT_TERMINATE,
                 parent_did=tracked.parent_did,
+                child_did=tracked.child_did,
+                child_name=child_name,
+                termination_reason=termination_reason,
             )
-        result.finalized_from_absence = finalized_from_absence
-        tracked.termination_refusal = None
-        tracked.result = result
-        self._results[child_name] = result
-        if (
-            (status is not SpawnStatus.TERMINATED or offboard_runtime)
-            and tracked.ttl_task
-            and tracked.ttl_task is not asyncio.current_task()
-            and not tracked.ttl_task.done()
-        ):
-            tracked.ttl_task.cancel()
 
-        # Clean up ephemeral temp directory
-        if tracked.mode == SpawnMode.EPHEMERAL and tracked.temp_dir:
-            try:
-                shutil.rmtree(tracked.temp_dir, ignore_errors=True)
-                logger.info(
-                    "Cleaned up ephemeral dir for '%s': %s",
-                    child_name,
-                    tracked.temp_dir,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to clean up temp dir for '%s': %s",
-                    child_name,
-                    e,
-                )
+            # Remove from tracking
+            self._tracked.pop(child_name, None)
 
-        # Fire AGENT_TERMINATE hook
-        termination_reason = reason or status.value
-        await self._fire_hook(
-            HookEvent.AGENT_TERMINATE,
-            parent_did=tracked.parent_did,
-            child_did=tracked.child_did,
-            child_name=child_name,
-            termination_reason=termination_reason,
-        )
-
-        # Remove from tracking
-        self._tracked.pop(child_name, None)
-
-        logger.info(
-            "Child '%s' lifecycle ended: status=%s, reason=%s",
-            child_name,
-            status.value,
-            termination_reason,
-        )
-        terminal_outcomes: list[BaseException] = []
-        if reconciliation_cancelled:
-            terminal_outcomes.append(asyncio.CancelledError())
-        if termination_failure is not None:
-            terminal_outcomes.append(termination_failure)
-        if len(terminal_outcomes) == 1:
-            raise terminal_outcomes[0]
-        if terminal_outcomes:
-            raise BaseExceptionGroup(
-                "Child termination finalized with terminal outcomes",
-                terminal_outcomes,
+            logger.info(
+                "Child '%s' lifecycle ended: status=%s, reason=%s",
+                child_name,
+                status.value,
+                termination_reason,
             )
-        return terminated
+            from kestrel_sovereign.execution_custody import execution_observation_error, is_execution_control_error
+            terminal_outcomes: list[BaseException] = list(reconciliation_withdrawals)
+            if (reconciliation_cancelled and not reconciliation_withdrawals
+                and not reconciliation_observations_supported
+                and not is_execution_control_error(termination_failure)):
+                # Preserve the legacy ordinary tuple-only protocol. Core native
+                # outcomes never manufacture an observation from a boolean.
+                terminal_outcomes.append(asyncio.CancelledError())
+            if termination_failure is not None:
+                terminal_outcomes.append(termination_failure)
+            if terminal_outcomes:
+                raise execution_observation_error(*terminal_outcomes, message="Child termination finalized with terminal outcomes")
+            return terminated
+        except BaseException as error:
+            raise execution_observation_error(*originals, error, *reconciliation_withdrawals)
 
     async def _fire_hook(
         self,
@@ -1987,4 +2114,6 @@ class SpawnedAgentLifecycle:
         try:
             await self._hooks_manager.execute_hooks(event, hook_input)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Hook execution failed for %s: %s", event.value, e)

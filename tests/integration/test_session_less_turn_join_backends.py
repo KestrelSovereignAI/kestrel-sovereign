@@ -28,6 +28,30 @@ LEGACY = {"sent_form": True}
 NOTICE = {"sent_form": True, "operator_signal": True}
 
 
+@pytest.fixture
+async def unexpected_model_services(monkeypatch):
+    """Session provenance needs only the native store, not default LLM owners."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    # These tests verify row/session semantics. Embeddings have their own
+    # native-service fixtures; never start an ambient provider here.
+    monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
+    original = LLMService.__init__
+    services = []
+
+    def observe(service, *args, **kwargs):
+        original(service, *args, **kwargs)
+        services.append(service)
+
+    monkeypatch.setattr(LLMService, "__init__", observe)
+    try:
+        yield services
+    finally:
+        for service in services:
+            await service.close()
+            await service.wait_for_close_completion()
+
+
 def _minutes_ago(minutes: int) -> datetime:
     now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
     return now - timedelta(minutes=minutes)
@@ -82,7 +106,7 @@ async def test_a_session_less_turn_skips_the_chain_and_joins_a_person(db_backend
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("raw", ["{not json", "[]", '"human-H"', "42"])
-async def test_an_unreadable_newest_row_files_the_next_turn_whole(db_backend, raw):
+async def test_an_unreadable_newest_row_files_the_next_turn_whole(db_backend, raw, unexpected_model_services):
     """The newest row's metadata names no session: a fresh one, never none.
 
     The session-less turn that follows (its opening row and the reply) lands
@@ -120,5 +144,8 @@ async def test_an_unreadable_newest_row_files_the_next_turn_whole(db_backend, ra
         assert len(rows) == 2 and len(sessions) == 1
         [session] = sessions
         assert session != "human-H" and is_stampable_session_id(session)
+        assert not unexpected_model_services, (
+            "session provenance created unrelated default LLM services/native writers"
+        )
     finally:
         await storage.close()

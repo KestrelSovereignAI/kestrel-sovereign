@@ -26,6 +26,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_agent_privacy_config,
@@ -69,6 +70,7 @@ _TELEGRAM_TERMINAL_DISPOSITIONS = frozenset(
         "unsupported_update",
         "senderless_update",
         "unauthorized_sender",
+        "care_acknowledgement",
     }
 )
 
@@ -743,6 +745,8 @@ class ChannelFeature(Feature):
                 ),
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error("Failed to log channel message: %s", exc)
 
     async def _log_outbound(
@@ -995,6 +999,19 @@ class ChannelFeature(Feature):
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         if metadata.get("dedupe_key") != message.id:
             return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        if disposition == "care_acknowledgement":
+            # Valid care replies retain their sanitized content for durable
+            # workflow observers, but never create a cognition delivery.
+            adapter = self.registry.get(message.channel_type)
+            config = getattr(adapter, "config", None)
+            if (
+                canonical_telegram_user_id(message.sender) is None
+                or config is None
+                or not config.enabled
+                or not getattr(config, "allowed_senders", None)
+                or not config.is_sender_allowed(message.sender)
+            ):
+                return InboundAdmission(InboundAdmissionDisposition.REJECTED)
         if (
             self._durable_cognition_registration_failed
             or not self._durable_terminal_ready
@@ -1016,7 +1033,9 @@ class ChannelFeature(Feature):
                 consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
             )
             receipt = await handle.wait_for_durable_admission()
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.exception(
                 "Failed to durably record terminal Telegram update id=%s", message.id
             )
@@ -1167,6 +1186,17 @@ class ChannelFeature(Feature):
                             )
                         else:
                             terminal_result = await wait_for_terminal()
+                            receipt = await wait_for_durable_admission()
+                            if getattr(receipt, "disposition", None) is DurableAdmissionDisposition.TERMINAL:
+                                # A verified retry can name an existing
+                                # terminal-only ledger row with no cognition
+                                # delivery by design. The dispatcher proved
+                                # its original envelope before this receipt.
+                                durable_admission = getattr(receipt, "acknowledged", False) is True
+                                if durable_admission:
+                                    return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
+                            if getattr(receipt, "disposition", None) is DurableAdmissionDisposition.NOT_ADMITTED:
+                                return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
                             if (
                                 getattr(terminal_result, "status", None)
                                 is Status.COALESCED
@@ -1206,7 +1236,9 @@ class ChannelFeature(Feature):
                         durable_admission = (
                             getattr(receipt, "acknowledged", False) is True
                         )
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception(
                     "Failed to durably admit channel.message signal for message id=%s",
                     message.id,

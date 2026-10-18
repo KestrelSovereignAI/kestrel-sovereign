@@ -51,7 +51,14 @@ from .output_ceiling import (
 from contextlib import asynccontextmanager
 
 from .retry import with_retry
+import sys
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
+from kestrel_sovereign.execution_custody import (
+    owned_native_http_client,
+    native_execution_response_owner, native_sdk_operation,
+    retain_native_execution_http_client_close,
+    is_execution_control_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +89,7 @@ def anthropic_model_info(model_data: Any) -> ModelInfo:
 
 
 @asynccontextmanager
-async def _anthropic_stream_with_retry(client, api_params):
+async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
     """Open an Anthropic streaming response, retrying the OPEN on transient
     errors — especially a 429 throttle on the plan/OAuth route.
 
@@ -95,15 +102,64 @@ async def _anthropic_stream_with_retry(client, api_params):
     Mid-stream failures are not retried — partial text has already shipped.
     """
     async def _enter():
-        cm = client.messages.stream(**api_params)
-        return cm, await cm.__aenter__()
+        from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
 
-    stream_cm, stream = await with_retry(_enter)
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
+        async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
+            cm = client.messages.stream(**api_params)
+            stream = await cm.__aenter__()
+            retain_native_execution_stream_close(stream)
+            responses.handles.clear()
+            return cm, stream
+
+    async def close_acquired(pair):
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+
+        original = sys.exc_info()[1]
+
+        async def owned_close():
+            with bind_execution_cleanup(None):
+                await pair[0].__aexit__(None, None, None)
+        admission = OwnedTaskAdmission()
+        opening = None
+        try:
+            task = create_owned_task(
+                owned_close(), retirement_resource=pair[1], retain_originals=True,
+                admission=admission,
+            )
+        except BaseException as admission_error:
+            opening = admission_error
+            task = admission.task
+            if task is None:
+                raise execution_terminal_error(
+                    original, opening,
+                    retain_originals=True, isolate_control_originals=True,
+                )
+        outcome = await await_owned_task(task)
+        retirement = None
+        if outcome.error is not None:
+            retirement = RuntimeError("original Anthropic context retirement failed")
+            retirement._kestrel_native_retirement_debts = ((pair[1], task),)
+        if opening is not None or outcome.error is not None or outcome.cancellation is not None:
+            raise execution_terminal_error(
+                original, opening, outcome.error, retirement, outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
+
+    if retry_open:
+        stream_cm, stream = await with_retry(_enter, acquired_result_cleanup=close_acquired)
+    else:
+        from kestrel_sovereign.execution_custody import await_execution_work
+        stream_cm, stream = await await_execution_work(
+            None, _enter, acquired_result_cleanup=close_acquired,
+        )
     try:
         _report_body_progress(stream)
         yield stream
     finally:
-        await stream_cm.__aexit__(None, None, None)
+        await close_acquired((stream_cm, stream))
 
 
 class _ProgressReportingBody(httpx2.AsyncByteStream):
@@ -189,7 +245,9 @@ async def _anthropic_final_message(client, api_params):
     measures provider silence, not the length of the answer.
     """
     async def _once():
-        async with client.messages.stream(**api_params) as stream:
+        # The outer retry still owns this whole non-incremental request; do
+        # not multiply its retry budget with a second open retry policy.
+        async with _anthropic_stream_with_retry(client, api_params, retry_open=False) as stream:
             _report_body_progress(stream)
             async for _event in stream:
                 report_call_progress()
@@ -559,6 +617,7 @@ class AnthropicAdapter(LLMAdapter):
         """Remember the output ceiling each discovered model reports."""
         self._output_ceilings.learn(models)
 
+    @native_sdk_operation
     async def _model_output_ceiling(
         self,
         client: Any,
@@ -578,6 +637,7 @@ class AnthropicAdapter(LLMAdapter):
         known = self._output_ceilings.get(wire_model)
         if known is not None:
             return known
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         record = await await_or_cancelled(
             with_retry(client.models.retrieve, wire_model),
             cancel_token,
@@ -716,6 +776,7 @@ class AnthropicAdapter(LLMAdapter):
             features |= {"token_counting", "raw_passthrough"}
         return frozenset(features)
 
+    @native_sdk_operation
     async def count_tokens(
         self,
         client: Any,
@@ -738,6 +799,7 @@ class AnthropicAdapter(LLMAdapter):
             params["system"] = combined_system
         if tools:
             params["tools"] = self._convert_tools_to_anthropic_format(tools)
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         result = await client.messages.count_tokens(**params)
         input_tokens = getattr(result, "input_tokens", None)
         return TokenCount(input_tokens=input_tokens, raw=result)
@@ -765,6 +827,7 @@ class AnthropicAdapter(LLMAdapter):
                 out[key] = value
         return out
 
+    @native_sdk_operation
     async def raw_request(
         self,
         client: Any,
@@ -790,6 +853,7 @@ class AnthropicAdapter(LLMAdapter):
                 "unsupported because it would bypass SDK authentication"
             )
         target: Any = client
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         for part in operation.split("."):
             target = getattr(target, part)
         # Support both the dict-payload form and the SDK-style keyword form
@@ -1323,6 +1387,7 @@ class AnthropicAdapter(LLMAdapter):
                 })
         return anthropic_tools
 
+    @native_sdk_operation
     async def get_response(
         self,
         client: Any,
@@ -2003,6 +2068,7 @@ class AnthropicAdapter(LLMAdapter):
             **kwargs
         )
 
+    @native_sdk_operation
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from Anthropic API.
 
@@ -2026,7 +2092,8 @@ class AnthropicAdapter(LLMAdapter):
                 logger.warning("ANTHROPIC_API_KEY not set, returning empty model list")
                 return []
 
-            async with httpx2.AsyncClient() as client:
+            async with owned_native_http_client(httpx2.AsyncClient()) as client:
+                retain_native_execution_http_client_close(client)
                 response = await client.get(
                     "https://api.anthropic.com/v1/models",
                     headers={
@@ -2050,12 +2117,18 @@ class AnthropicAdapter(LLMAdapter):
 
         except httpx2.HTTPStatusError as e:
             logger.error(f"Anthropic API HTTP error: {e.response.status_code} - {e.response.text}")
+            if is_execution_control_error(e):
+                raise
             return []
         except httpx2.RequestError as e:
             logger.error(f"Anthropic API connection error: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except Exception as e:
             logger.error(f"Failed to list Anthropic models: {e}", exc_info=True)
+            if is_execution_control_error(e):
+                raise
             return []
 
     # ---- Provider metadata (SDK 0.6.0) -------------------------------------

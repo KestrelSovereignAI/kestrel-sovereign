@@ -386,7 +386,10 @@ def _wrap_builtin_action_handler(
     async def checked_handler(payload: dict) -> Any:
         try:
             result = await handler(payload)
-        except Exception:
+        except Exception as error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                raise
             # Keep the actionable traceback in the trusted local log while the
             # dispatcher/audit boundary receives fixed, content-free text.
             logger.exception("Scheduled built-in task %s raised", task_name)
@@ -411,7 +414,10 @@ def _make_action_handler(
     async def handler(payload: dict) -> Any:
         try:
             result = await lookup(task_name, payload)
-        except Exception:
+        except Exception as error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                raise
             logger.exception("Scheduled tool %s raised", task_name)
             raise RuntimeError(
                 f"scheduled tool {task_name} raised"
@@ -432,7 +438,10 @@ def _make_artifact_handler(
     async def handler(signal: Signal) -> Any:
         try:
             result = await lookup(task_name, signal.payload)
-        except Exception:
+        except Exception as error:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(error):
+                raise
             logger.exception("Scheduled tool %s raised", task_name)
             raise RuntimeError(
                 f"scheduled tool {task_name} raised"

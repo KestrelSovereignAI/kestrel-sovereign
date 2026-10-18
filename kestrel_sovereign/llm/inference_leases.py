@@ -32,6 +32,12 @@ from kestrel_sdk.llm import (
     InferencePrivacy,
 )
 
+from kestrel_sovereign.execution_custody import (
+    bind_execution_runtime,
+    is_execution_control_error,
+    require_execution_work,
+)
+
 logger = logging.getLogger(__name__)
 
 PersistLeaseState = Callable[[Mapping[str, Any] | None], Awaitable[None]]
@@ -244,6 +250,8 @@ def discover_inference_lease_providers() -> dict[str, InferenceLeaseProvider]:
             if inspect.isclass(candidate):
                 candidate = candidate()
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseProviderDiscoveryError(
                 f"inference provider entry point {entry_point.name!r} could not load"
             ) from exc
@@ -355,6 +363,8 @@ class InferenceLeaseCoordinator:
         except InferenceLeaseProvisioningError:
             raise
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             raise InferenceLeaseProvisioningError(
                 "durable inference lease state could not be saved"
             ) from exc
@@ -422,7 +432,12 @@ class InferenceLeaseCoordinator:
 
         if payload is None:
             return None
+        with bind_execution_runtime(self._llm_service):
+            return await self._restore_under_runtime(payload)
+
+    async def _restore_under_runtime(self, payload: Mapping[str, Any]) -> InferenceLease | None:
         async with self._lock:
+            require_execution_work()
             record = InferenceLeaseRecord.from_persisted_dict(
                 payload,
                 owner_id=self._owner_id,
@@ -433,6 +448,7 @@ class InferenceLeaseCoordinator:
             provider = self._provider(record.provider_name)
             try:
                 if record.lease is None:
+                    require_execution_work()
                     lease = await provider.acquire(record.request, record.quote)
                 else:
                     lease = await provider.status(
@@ -440,6 +456,8 @@ class InferenceLeaseCoordinator:
                         record.lease.lease_id,
                     )
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 raise InferenceLeaseProvisioningError(
                     f"inference provider {record.provider_name!r} could not "
                     "reconcile persisted state"
@@ -458,6 +476,7 @@ class InferenceLeaseCoordinator:
                 capability.satisfies(request) for capability in provider.capabilities()
             ):
                 return None
+            require_execution_work(self._llm_service)
             quote = await provider.quote(request)
             quote.validate_for(request)
             if quote.provider_name != provider.provider_name.strip().lower():
@@ -465,11 +484,15 @@ class InferenceLeaseCoordinator:
                     "quote provider does not match selected provider"
                 )
             return quote
-        except (InferenceLeaseConstraintError, InferenceLeaseProviderUnavailableError):
+        except (InferenceLeaseConstraintError, InferenceLeaseProviderUnavailableError) as exc:
+            if is_execution_control_error(exc):
+                raise
             return None
         # Third-party provider adapters may raise arbitrary client-library
         # exceptions. A bad quote is isolated so another provider can win.
         except Exception as exc:  # noqa: BLE001
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Inference provider %s could not produce a valid quote (%s)",
                 provider.provider_name,
@@ -485,7 +508,12 @@ class InferenceLeaseCoordinator:
             raise InferenceLeaseConstraintError(
                 "inference request owner does not match this agent"
             )
+        with bind_execution_runtime(self._llm_service):
+            return await self._acquire_under_runtime(request)
+
+    async def _acquire_under_runtime(self, request: InferenceLeaseRequest) -> InferenceLease:
         async with self._lock:
+            require_execution_work()
             if self._record is not None:
                 previous = self._record
                 if previous.lease is None:
@@ -495,8 +523,11 @@ class InferenceLeaseCoordinator:
                         )
                     provider = self._provider(previous.provider_name)
                     try:
+                        require_execution_work()
                         lease = await provider.acquire(previous.request, previous.quote)
                     except Exception as exc:
+                        if is_execution_control_error(exc):
+                            raise
                         raise InferenceLeaseProvisioningError(
                             f"inference provider {previous.provider_name!r} could not "
                             "resume acquisition"
@@ -507,12 +538,8 @@ class InferenceLeaseCoordinator:
                         "release the current inference lease before acquiring another"
                     )
 
-            quotes = await asyncio.gather(
-                *(
-                    self._quote_provider(provider, request)
-                    for _name, provider in sorted(self._providers.items())
-                )
-            )
+            from kestrel_sovereign._async_ownership import gather_owned
+            quotes = await gather_owned(self._quote_provider(provider, request) for _name, provider in sorted(self._providers.items()))
             valid_quotes = [quote for quote in quotes if quote is not None]
             if not valid_quotes:
                 raise InferenceLeaseProviderUnavailableError(
@@ -540,8 +567,11 @@ class InferenceLeaseCoordinator:
             await self._persist()
             provider = self._provider(quote.provider_name)
             try:
+                require_execution_work()
                 lease = await provider.acquire(request, quote)
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 raise InferenceLeaseProvisioningError(
                     f"inference provider {quote.provider_name!r} could not acquire "
                     "capacity; retry with the same request_id"
@@ -558,15 +588,23 @@ class InferenceLeaseCoordinator:
         return record
 
     async def status(self, lease_id: str) -> InferenceLease:
+        with bind_execution_runtime(self._llm_service):
+            return await self._status_under_runtime(lease_id)
+
+    async def _status_under_runtime(self, lease_id: str) -> InferenceLease:
         async with self._lock:
+            require_execution_work()
             record = self._record_for_lease(lease_id)
             assert record.lease is not None
             if record.lease.is_terminal:
                 return record.lease
             provider = self._provider(record.provider_name)
             try:
+                require_execution_work()
                 lease = await provider.status(self._owner_id, lease_id)
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 raise InferenceLeaseProvisioningError(
                     f"inference provider {record.provider_name!r} could not report "
                     "lease status"
@@ -581,36 +619,40 @@ class InferenceLeaseCoordinator:
         durable state is updated before the caller sends inference traffic.
         """
 
-        async with self._lock:
-            record = self._record_for_lease(lease_id)
-            previous = record.lease
-            assert previous is not None
-            if previous.state is not InferenceLeaseState.READY:
-                raise InferenceLeaseProvisioningError(
-                    "only a ready inference lease can be renewed"
-                )
-            provider = self._provider(record.provider_name)
-            try:
-                lease = await provider.touch(self._owner_id, lease_id)
-            except Exception as exc:
-                raise InferenceLeaseProvisioningError(
-                    f"inference provider {record.provider_name!r} could not "
-                    "renew the lease idle deadline"
-                ) from exc
-            # A shortened expiry is accepted, deliberately. Nothing in the SDK
-            # contract makes expires_at monotonic across touch, and a provider
-            # that models its idle deadline as
-            # min(now + idle_ttl, authorized_cap) legitimately returns a nearer
-            # expiry on its first renewal. Shortening TIGHTENS the authorization
-            # envelope; the direction that threatens it - extension - is already
-            # rejected by validate_for's absolute ceiling in
-            # _apply_provider_lease. Rejecting the safe direction here also
-            # discarded the safer value, leaving the coordinator advertising an
-            # expiry the provider no longer honours while every subsequent call
-            # on that route failed, with no way for the agent to take a turn and
-            # release it. status has no equivalent guard, so this also keeps the
-            # two reconciliation paths agreeing on what is legal.
-            return await self._apply_provider_lease(record, lease)
+        with bind_execution_runtime(self._llm_service):
+            async with self._lock:
+                record = self._record_for_lease(lease_id)
+                previous = record.lease
+                assert previous is not None
+                if previous.state is not InferenceLeaseState.READY:
+                    raise InferenceLeaseProvisioningError(
+                        "only a ready inference lease can be renewed"
+                    )
+                provider = self._provider(record.provider_name)
+                require_execution_work(self._llm_service)
+                try:
+                    lease = await provider.touch(self._owner_id, lease_id)
+                except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
+                    raise InferenceLeaseProvisioningError(
+                        f"inference provider {record.provider_name!r} could not "
+                        "renew the lease idle deadline"
+                    ) from exc
+                # A shortened expiry is accepted, deliberately. Nothing in the SDK
+                # contract makes expires_at monotonic across touch, and a provider
+                # that models its idle deadline as
+                # min(now + idle_ttl, authorized_cap) legitimately returns a nearer
+                # expiry on its first renewal. Shortening TIGHTENS the authorization
+                # envelope; the direction that threatens it - extension - is already
+                # rejected by validate_for's absolute ceiling in
+                # _apply_provider_lease. Rejecting the safe direction here also
+                # discarded the safer value, leaving the coordinator advertising an
+                # expiry the provider no longer honours while every subsequent call
+                # on that route failed, with no way for the agent to take a turn and
+                # release it. status has no equivalent guard, so this also keeps the
+                # two reconciliation paths agreeing on what is legal.
+                return await self._apply_provider_lease(record, lease)
 
     async def release(self, lease_id: str) -> InferenceLease:
         """Remove routing, drain calls, then request idempotent provider release."""
@@ -641,6 +683,8 @@ class InferenceLeaseCoordinator:
             try:
                 lease = await provider.release(self._owner_id, lease_id)
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 raise InferenceLeaseProvisioningError(
                     f"inference provider {record.provider_name!r} could not release "
                     "capacity; retry release with the same lease_id"

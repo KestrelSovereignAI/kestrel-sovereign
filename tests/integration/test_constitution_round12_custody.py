@@ -17,6 +17,51 @@ from tests.integration.test_constitution_turn_admission import _ready_turn
 from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
 
 
+@pytest.fixture(params=["sqlite", "postgres"])
+async def db_backend(request, tmp_path):
+    """Own the whole encrypted-file namespace, including offline reconnects."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    import asyncpg
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    from tests.conftest import postgres_test_url
+
+    if request.param == "sqlite":
+        backend = SQLiteBackend(str(tmp_path / "test.db"))
+        await backend.connect()
+        try:
+            yield backend
+        finally:
+            await backend.close()
+        return
+
+    dsn = postgres_test_url()
+    if not dsn:
+        pytest.skip("TEST_POSTGRES_URL required for native PostgreSQL proofs")
+    schema = "constitution_custody_" + uuid4().hex
+    control = await asyncpg.connect(dsn)
+    backend = None
+    try:
+        await control.execute(f'CREATE SCHEMA "{schema}"')
+        parts = urlsplit(dsn)
+        query = [(key, value) for key, value in parse_qsl(parts.query)
+                 if key != "search_path"]
+        query.append(("search_path", schema))
+        isolated_dsn = urlunsplit(parts._replace(query=urlencode(query)))
+        backend = PostgresBackend(isolated_dsn)
+        await backend.connect()
+        yield backend
+    finally:
+        try:
+            if backend is not None:
+                await backend.close()
+        finally:
+            try:
+                await control.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            finally:
+                await control.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("deleted_root", [False, True])
@@ -483,22 +528,26 @@ async def test_owned_failure_retirement_uncertainty_never_erases_database(tmp_pa
     from kestrel_sovereign.storage.db.interface import TransactionError
     from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
     from kestrel_sovereign.constitution import anchored_bytes
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
 
     monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
     monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
     directory = tmp_path / "failed-retirement"
     opened = []
     native_close = SQLiteBackend.close
+    prepare_error = RuntimeError("synthetic prepare failure")
+    publication_error = RuntimeError("synthetic native publication failure")
+    cleanup_error = RuntimeError("synthetic retirement acknowledgement unavailable")
 
     async def fail_audit(prompt):
-        raise RuntimeError("synthetic prepare failure")
+        raise prepare_error
 
     async def fail_publication(*args, **kwargs):
-        raise RuntimeError("synthetic native publication failure")
+        raise publication_error
 
     async def uncertain_close(backend):
         opened.append(backend)
-        raise RuntimeError("synthetic retirement acknowledgement unavailable")
+        raise cleanup_error
 
     monkeypatch.setattr(SQLiteBackend, "close", uncertain_close)
     if stage == "publication":
@@ -512,14 +561,12 @@ async def test_owned_failure_retirement_uncertainty_never_erases_database(tmp_pa
             )
         assert len(opened) == 1, "uncertain retirement must retain its original owner, not retry blindly"
         assert failure.value.retirement_owner._backend is opened[0]
-        assert isinstance(failure.value.cleanup_error, RuntimeError)
-        assert str(failure.value.cleanup_error) == "synthetic retirement acknowledgement unavailable"
-        assert failure.value.__cause__ is failure.value.cleanup_error
+        assert failure.value.cleanup_error is cleanup_error
+        chain = tuple(_explicit_control_chain(failure.value))
+        assert cleanup_error in chain and failure.value.operation_error in chain
         operation_type = GenesisAuditPendingError if stage == "prepare" else TransactionError
         assert isinstance(failure.value.operation_error, operation_type)
-        expected_operation = "synthetic prepare failure" if stage == "prepare" else "synthetic native publication failure"
-        assert isinstance(failure.value.operation_error.__cause__, RuntimeError)
-        assert str(failure.value.operation_error.__cause__) == expected_operation
+        assert (prepare_error if stage == "prepare" else publication_error) in chain
         assert (directory / "kestrel_prime.db").is_file(), "failed retirement erased a still-owned database"
         assert opened and opened[-1]._connection is not None
         assert not list(directory.glob("retired-init_*"))

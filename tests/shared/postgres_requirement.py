@@ -15,6 +15,9 @@ Then:
   or argument parametrized with the value ``"postgres"``) is reported as
   failed if it skips, carrying the skip reason. A connection failure that a
   fixture turns into a skip is thereby a failure too.
+* native PostgreSQL consumers (including indirect dependencies on
+  ``native_pg``) are marked before marker deselection and obey the same
+  mandatory skip gate (#3675).
 
 Only the PostgreSQL case is covered. A SQLite case that skips because its
 claim needs PostgreSQL is left alone: that skip is the test's design, and
@@ -31,6 +34,15 @@ import pytest
 REQUIRE_ENV = "KESTREL_REQUIRE_POSTGRES_TESTS"
 URL_ENV = "TEST_POSTGRES_URL"
 POSTGRES_PARAM = "postgres"
+NATIVE_MARKER = "native_postgres"
+
+
+def mark_native_postgres_cases(items: list[pytest.Item]) -> None:
+    """Use pytest's resolved fixture graph, not filenames, to select native CI."""
+
+    for item in items:
+        if "native_pg" in item.fixturenames:
+            item.add_marker(NATIVE_MARKER)
 
 
 def postgres_required(environ: dict | None = None) -> bool:
@@ -59,7 +71,10 @@ def check_session(environ: dict | None = None) -> None:
 
 
 def is_postgres_case(item: Any) -> bool:
-    """Whether *item* is the PostgreSQL case of a parametrized test."""
+    """Whether *item* actually depends on PostgreSQL, parametrized or native."""
+
+    if "native_pg" in getattr(item, "fixturenames", ()):
+        return True
 
     callspec = getattr(item, "callspec", None)
     if callspec is None:

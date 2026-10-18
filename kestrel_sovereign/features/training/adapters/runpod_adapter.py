@@ -20,6 +20,8 @@ from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
 from typing import Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 import httpx
 
 from ._session_training_lifecycle import (
@@ -83,6 +85,8 @@ async def _pod_action(action: Awaitable[object], pod_id: str) -> None:
     try:
         await action
     except Exception as error:
+        if is_execution_control_error(error):
+            raise
         if not _is_pod_not_found(error):
             raise
         logger.info(f"RunPod pod {pod_id} no longer exists")
@@ -105,6 +109,8 @@ async def _read_pod_status(
     try:
         observed = await asyncio.to_thread(get_status, pod_id)
     except Exception as error:
+        if is_execution_control_error(error):
+            raise
         if _is_pod_not_found(error):
             return None, _POD_GONE
         raise
@@ -201,11 +207,15 @@ class RunPodTrainingAdapter:
                 from kestrel_cloud_runpod.manager import RunPodManager
                 self._manager = RunPodManager()
             except ImportError as e:
+                if is_execution_control_error(e):
+                    raise
                 raise ProviderNotAvailableError(
                     f"RunPod manager not available — install kestrel-cloud-runpod "
                     f"to enable RunPod-as-training-provider: {e}"
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 raise ProviderNotAvailableError(
                     f"Failed to initialize RunPod manager: {e}"
                 )
@@ -226,9 +236,13 @@ class RunPodTrainingAdapter:
             # Try to get manager (validates configuration)
             manager = self._get_manager()
             return manager is not None
-        except (ProviderNotAvailableError, ImportError):
+        except (ProviderNotAvailableError, ImportError) as error:
+            if is_execution_control_error(error):
+                raise
             return False
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.debug("RunPod availability check failed", exc_info=True)
             return False
 
@@ -271,12 +285,18 @@ class RunPodTrainingAdapter:
         except TrainingProviderError:
             raise
         except httpx.HTTPError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod training HTTP error: {e}")
             raise TrainingSubmissionError(f"Failed to start RunPod training: {e}")
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod training connection error: {e}")
             raise TrainingSubmissionError(f"Failed to start RunPod training: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start RunPod training: {e}")
 
@@ -489,12 +509,18 @@ class RunPodTrainingAdapter:
         except TrainingProviderError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod training status network error: {e}")
             raise TrainingStatusError(f"Status check failed: {e}")
         except (KeyError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod training status parse error: {e}")
             raise TrainingStatusError(f"Status check failed: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to get RunPod training status: {e}", exc_info=True)
             raise TrainingStatusError(f"Status check failed: {e}")
 
@@ -533,9 +559,13 @@ class RunPodTrainingAdapter:
         except TrainingProviderError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod LoRA download network error: {e}")
             raise DownloadError(f"Download failed: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to download RunPod LoRA weights: {e}", exc_info=True)
             raise DownloadError(f"Download failed: {e}")
 
@@ -732,12 +762,18 @@ class RunPodTrainingAdapter:
         except GenerationError:
             raise
         except httpx.HTTPError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod generation HTTP error: {e}")
             raise GenerationError(f"Generation failed: {e}")
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod generation connection error: {e}")
             raise GenerationError(f"Generation failed: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"RunPod generation failed: {e}", exc_info=True)
             raise GenerationError(f"Generation failed: {e}")
 
@@ -764,9 +800,13 @@ class RunPodTrainingAdapter:
 
             return await manager.get_current_job(session)
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to check training status: {e}")
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to check training status: {e}", exc_info=True)
             return None
 

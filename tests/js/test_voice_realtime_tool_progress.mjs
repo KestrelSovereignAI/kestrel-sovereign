@@ -10,10 +10,25 @@ import {
   bytesToBase64,
   createUserTranscriptTracker,
   normalizeToolBatchResults,
+  readToolBatchResponse,
   responseAllowsToolDispatch,
   resolveRealtimeSDPEndpoint,
   waitForPlaybackIdle,
 } from '../../kestrel_sovereign/static/js/voice/realtime.js';
+
+test('native HTTP acknowledgement controls cannot become function-error outputs', async () => {
+  const calls = [{ call_id: 'one' }, { call_id: 'two' }];
+  for (const response of [
+    new Response(JSON.stringify({ error: { code: 'execution_control', message: 'Reconcile' } }), { status: 500 }),
+    new Response('unreadable', { status: 200 }),
+    new Response(JSON.stringify({ results: [{ call_id: 'one', result: {} }] })),
+    new Response(JSON.stringify({ results: [{ call_id: 'one', result: {} }, { call_id: 'one', result: {} }] })),
+  ]) {
+    await assert.rejects(readToolBatchResponse(response, calls));
+  }
+  const results = [{ call_id: 'one', result: { error: 'acknowledged application failure' } }, { call_id: 'two', result: {} }];
+  assert.deepEqual(await readToolBatchResponse(new Response(JSON.stringify({ results })), calls), results);
+});
 
 test('realtime tool disclosure update uses session.update tools payload', () => {
   const tools = [{ type: 'function', name: 'memory_feature', parameters: { type: 'object' } }];
@@ -123,7 +138,7 @@ test('playback idle wait has a bounded continuation timeout', async () => {
 
 test('cancelled and failed responses never dispatch collected tools', () => {
   assert.equal(responseAllowsToolDispatch({ response: { status: 'completed' } }), true);
-  assert.equal(responseAllowsToolDispatch({}), true); // xAI-compatible absent status
+  assert.equal(responseAllowsToolDispatch({}), false); // absent status is not a completed receipt
   assert.equal(responseAllowsToolDispatch({ response: { status: 'cancelled' } }), false);
   assert.equal(responseAllowsToolDispatch({ response: { status: 'failed' } }), false);
   assert.equal(responseAllowsToolDispatch({ response: { status: 'incomplete' } }), false);

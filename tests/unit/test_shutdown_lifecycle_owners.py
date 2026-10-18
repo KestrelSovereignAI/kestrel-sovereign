@@ -361,7 +361,7 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
         phases.append("agents")
         raise RuntimeError("agent failure")
 
-    async def finish_phoenix(_app) -> bool:
+    async def finish_phoenix(_app, **_finite_collectors) -> bool:
         phases.append("phoenix")
         return False
 
@@ -413,7 +413,7 @@ async def test_lifespan_consumer_preserves_grouped_cancellation_and_failure(
                 ],
             )
 
-    async def noop(_app) -> None:
+    async def noop(_app, **_finite_collectors) -> None:
         return None
 
     manager = _GroupedManager()
@@ -588,10 +588,15 @@ async def test_phoenix_cleanup_stops_child_when_proxy_close_fails() -> None:
     app.state.phoenix = supervisor
     app.state.phoenix_task = None
 
-    assert await server._shutdown_phoenix(app) is False
+    with pytest.raises(BaseException) as caught:
+        await server._shutdown_phoenix(app)
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    assert any(isinstance(error, RuntimeError) and str(error) == "proxy close failed"
+               for error in _explicit_control_chain(caught.value))
     assert supervisor.close_entered.is_set()
     assert supervisor.stopped is True
-    assert app.state.phoenix is None
+    assert app.state.phoenix is supervisor
+    assert app.state.phoenix_proxy_close_error is caught.value
 
 
 @pytest.mark.asyncio
@@ -716,6 +721,7 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
     monkeypatch, tmp_path,
 ) -> None:
     """Agent cancellation cannot bypass the server's Phoenix teardown owner."""
+    monkeypatch.setenv("KESTREL_API_KEY", "provider-free-local-host-authority-test")
     from kestrel_sovereign import host_features as hf
     from kestrel_sovereign.a2a import did_registry
     from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
@@ -859,7 +865,10 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
     monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
 
     app = FastAPI()
-    async with server._lifespan_startup(app):
+    # Startup intentionally leaves the failed host's diagnostic stores alive
+    # until its outer server lifetime retires. Use that SAME production owner
+    # so the fixture cannot leave SQLite callbacks targeting a closed loop.
+    async with server.lifespan(app):
         pass
 
     assert manager.shutdown_calls == 1
@@ -868,6 +877,7 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
     assert app.state.agent_manager is None
     assert app.state.agent is None
     assert "scheduler boot failed" in app.state.startup_error
+    assert app.state.stop_receipt_db is None and app.state.host_context is None
 
 
 @pytest.mark.asyncio
@@ -978,7 +988,9 @@ async def test_host_scheduler_start_failure_closes_storage_even_when_runner_stop
     assert runner_instances[0].stop_calls == 1
     assert storage_instances[0].closed is True
     assert app.state.host_scheduler_storage is None
-    assert app.state.host_scheduler_runner is None
+    # Failed stop is not positive retirement, even when independent storage
+    # closes successfully. Preserve the original runner for reconciliation.
+    assert app.state.host_scheduler_runner is runner_instances[0]
 
 
 @pytest.mark.asyncio
@@ -1347,34 +1359,39 @@ async def test_quarantined_removal_fences_blocked_wallet_transfer_then_refunds_o
         child_wallet,
         BudgetAllocation(child_did=agent.agent_id, parent_did="did:parent", amount=Decimal("10")),
     )
-    manager._child_budgets["hostile"] = (delegated, parent_wallet)
+    entry = (delegated, parent_wallet)
+    manager._child_budgets["hostile"] = entry
 
     spending = asyncio.create_task(delegated.spend(Decimal("3"), "blocked debit", "FIL"))
     await asyncio.wait_for(child_wallet.transfer_entered.wait(), timeout=30.0)
     removal = asyncio.create_task(manager.remove_agent("hostile"))
     await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
 
-    assert await asyncio.wait_for(removal, timeout=0.2) is True
-    assert manager.get_agent("hostile") is None
-    assert "hostile" not in manager._child_budgets
-    assert delegated.can_spend(Decimal("1")) is False
-    assert parent_wallet.deposits == []
+    try:
+        assert await asyncio.wait_for(removal, timeout=0.2) is True
+        assert manager.get_agent("hostile") is None
+        # Spend fencing and ownership are distinct: the exact hold remains
+        # until the accepted refund physically acknowledges its one credit.
+        assert manager._child_budgets["hostile"] is entry
+        assert delegated.can_spend(Decimal("1")) is False
+        assert parent_wallet.deposits == []
 
-    child_wallet.allow_transfer.set()
-    assert await asyncio.wait_for(spending, timeout=30.0) is True
-    for _ in range(100):
-        if parent_wallet.deposits:
-            break
-        await asyncio.sleep(0)
-    assert parent_wallet.deposits == [Decimal("7")]
-    with pytest.raises(BudgetExceededError):
-        await delegated.spend(Decimal("1"), "post-refund", "FIL")
-
-    agent.allow_shutdown_finish.set()
-    for _ in range(100):
-        if all(not item["pending"] for item in manager.quarantined_shutdowns().values()):
-            break
-        await asyncio.sleep(0)
+        child_wallet.allow_transfer.set()
+        assert await asyncio.wait_for(spending, timeout=30.0) is True
+        for _ in range(100):
+            if parent_wallet.deposits:
+                break
+            await asyncio.sleep(0)
+        assert parent_wallet.deposits == [Decimal("7")]
+        assert "hostile" not in manager._child_budgets
+        with pytest.raises(BudgetExceededError):
+            await delegated.spend(Decimal("1"), "post-refund", "FIL")
+    finally:
+        child_wallet.allow_transfer.set()
+        agent.allow_shutdown_finish.set()
+        await asyncio.gather(spending, removal, return_exceptions=True)
+        for record in tuple(manager._quarantined_shutdown_reapers.values()):
+            await asyncio.gather(record.task, return_exceptions=True)
     assert all(not item["pending"] for item in manager.quarantined_shutdowns().values())
 
 
@@ -1621,8 +1638,8 @@ async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
     allow_drain_scan = asyncio.Event()
     real_set_seal = manager._set_quarantined_shutdown_handoffs_sealed
 
-    async def expose_empty_seal(sealed: bool) -> bool:
-        cancelled = await real_set_seal(sealed)
+    async def expose_empty_seal(sealed: bool, *, withdrawals=None) -> bool:
+        cancelled = await real_set_seal(sealed, withdrawals=withdrawals)
         if sealed:
             seal_visible.set()
             await allow_drain_scan.wait()
@@ -1869,10 +1886,10 @@ async def test_terminal_drain_sanitizes_cancelled_worker_with_prior_failure(
     real_join = manager_module.await_lifecycle_task_completion
     cleanup_join_started = asyncio.Event()
 
-    async def observe_join(task):
+    async def observe_join(task, *, withdrawals=None):
         if task is cleanup_task:
             cleanup_join_started.set()
-        return await real_join(task)
+        return await real_join(task, withdrawals=withdrawals)
 
     monkeypatch.setattr(
         manager_module,
@@ -2246,7 +2263,7 @@ async def test_explicit_offboarding_intent_survives_quarantined_reaper_handoff(
         if not removal.done():
             await asyncio.wait_for(removal, timeout=30.0)
 
-    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent, withdrawals=[])
 
 
 @pytest.mark.asyncio
@@ -2296,7 +2313,7 @@ async def test_handed_off_offboarding_failure_is_owned_once_and_remains_visible(
             with pytest.raises(RuntimeOffboardingRetainedError):
                 await asyncio.wait_for(removal, timeout=30.0)
 
-    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent, withdrawals=[])
     assert manager.get_agent("hostile") is None
 
 
@@ -2462,7 +2479,7 @@ async def test_delete_endpoint_maps_real_shutdown_handoff_to_pending_custody(
     finally:
         agent.allow_shutdown_finish.set()
 
-    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent, withdrawals=[])
 
 
 @pytest.mark.asyncio
@@ -3529,18 +3546,23 @@ async def test_quarantined_refund_failure_restores_exact_hold_for_retry(monkeypa
     assert manager._handoff_child_budget_release_to_quarantined_reaper(
         "quarantined", agent_id="did:test:quarantined-refund"
     )
-    # The reaper owns this withdrawn name while the hold is temporarily out of
-    # the normal map.  A new identity cannot slip into that restoration gap.
-    await asyncio.wait_for(release_started.wait(), timeout=30.0)
-    with pytest.raises(RuntimeError, match="unresolved quarantined cleanup"):
-        await manager.load_agent(
-            "quarantined", LocalAgentConfig(data_dir="new", port=8801)
-        )
-    reaper = next(iter(manager._quarantined_shutdown_reapers.values())).task
-    allow_first_failure.set()
-    with pytest.raises(RuntimeError, match="provider refund failed"):
-        await reaper
-    await asyncio.sleep(0)
+    # The reaper owns this withdrawn name while the exact fenced hold stays
+    # tracked until refund acknowledgement. A new identity cannot replace it.
+    try:
+        await asyncio.wait_for(release_started.wait(), timeout=30.0)
+        with pytest.raises(RuntimeError, match="unresolved delegated budget cleanup"):
+            await manager.load_agent(
+                "quarantined", LocalAgentConfig(data_dir="new", port=8801)
+            )
+        reaper = next(iter(manager._quarantined_shutdown_reapers.values())).task
+        allow_first_failure.set()
+        with pytest.raises(RuntimeError, match="provider refund failed"):
+            await reaper
+        await asyncio.sleep(0)
+    finally:
+        allow_first_failure.set()
+        for record in tuple(manager._quarantined_shutdown_reapers.values()):
+            await asyncio.gather(record.task, return_exceptions=True)
 
     assert delegated.fence_calls == 1
     assert manager._child_budgets["quarantined"] is entry
@@ -3778,26 +3800,38 @@ async def test_batch_claims_failed_onboarding_result_before_cleanup_failure(tmp_
     agent = SimpleNamespace(agent_id="did:test:batch-cleanup-once")
     config = LocalAgentConfig(data_dir="batch-once", port=8801)
     cleanup_calls = 0
+    opening = RuntimeError("host onboarding failed")
+    cleanup = RuntimeError("owned cleanup failed")
 
     async def initialize(*_args, **_kwargs):
         return agent
 
     async def reject_onboarding(*_args, **_kwargs):
-        raise RuntimeError("host onboarding failed")
+        raise opening
 
     async def fail_shutdown(_name, _agent):
         nonlocal cleanup_calls
         cleanup_calls += 1
-        raise RuntimeError("owned cleanup failed")
+        raise cleanup
 
     manager._initialize_agent = initialize
     manager._shutdown_unregistered_agent = fail_shutdown
     manager.set_agent_registration_hook(reject_onboarding)
 
-    with pytest.raises(ExceptionGroup, match="claimed cleanup failed"):
+    with pytest.raises(ExceptionGroup) as caught:
         await manager.load_from_config(MultiAgentConfig(agents={"B": config}))
+    from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+    chain = tuple(_explicit_control_chain(caught.value))
+    assert opening in chain and cleanup in chain
     assert cleanup_calls == 1
-    assert manager._agent_operations == {}
+    admission = manager._agent_operations["b"]
+    assert admission.child is agent, "failed original cleanup lost the private candidate"
+    assert any(resource is agent and task is not None and task.done()
+               for resource, task in execution_cleanup_debts(caught.value))
+    with pytest.raises(BaseException) as repeated:
+        await manager._release_agent_operations([admission])
+    assert cleanup in tuple(_explicit_control_chain(repeated.value))
+    assert manager._agent_operations.get("b") is admission and cleanup_calls == 1
 
 
 @pytest.mark.asyncio
@@ -3854,6 +3888,16 @@ async def test_main_and_cli_do_not_swallow_terminal_cleanup_failure(
     tmp_path, monkeypatch,
 ) -> None:
     """Interactive entry points must not let a live backend disappear on error."""
+    from kestrel_sovereign import hold
+    from kestrel_sovereign._async_ownership import gather_owned
+    original_initialize = hold.initialize_with_bound_hold_context
+    contexts = []
+    original_threads = set(threading.enumerate())
+    async def initialize(*args, **kwargs):
+        context = await original_initialize(*args, **kwargs)
+        contexts.append(context)
+        return context
+    monkeypatch.setattr(hold, "initialize_with_bound_hold_context", initialize)
     main_agent = _TerminalFailureShutdownAgent()
     monkeypatch.setattr(main, "KestrelAgent", lambda **_kwargs: main_agent)
     monkeypatch.setattr(main, "LLMService", MagicMock())
@@ -3862,22 +3906,62 @@ async def test_main_and_cli_do_not_swallow_terminal_cleanup_failure(
     monkeypatch.setattr(sys, "argv", ["kestrel-main", str(tmp_path)])
     monkeypatch.setattr("builtins.input", lambda _prompt: "!quit")
 
-    with pytest.raises(RuntimeError, match="durable cleanup failed"):
-        await main.main()
+    try:
+        with pytest.raises(RuntimeError, match="durable cleanup failed"):
+            await main.main()
 
-    cli_agent = _TerminalFailureShutdownAgent()
-    storage = MagicMock()
-    storage.initialize = AsyncMock()
-    storage.close = AsyncMock()
-    storage.get_nodes_by_type = AsyncMock(
-        return_value=[SimpleNamespace(node_id=cli_agent.agent_id)]
-    )
-    monkeypatch.setattr("kestrel_sovereign.storage.AsyncStorage", lambda _path: storage)
-    monkeypatch.setattr(
-        "kestrel_sovereign.kestrel_agent.KestrelAgent", lambda **_kwargs: cli_agent
-    )
-    monkeypatch.setattr("kestrel_sovereign.llm.service.LLMService", MagicMock())
-    monkeypatch.setattr("kestrel_sovereign.kestrel_config.constants.SHUTDOWN_TIMEOUT", 0.01)
+        cli_agent = _TerminalFailureShutdownAgent()
+        storage = MagicMock()
+        storage.initialize = AsyncMock()
+        storage.close = AsyncMock()
+        storage.get_nodes_by_type = AsyncMock(
+            return_value=[SimpleNamespace(node_id=cli_agent.agent_id)]
+        )
+        monkeypatch.setattr("kestrel_sovereign.storage.AsyncStorage", lambda _path: storage)
+        monkeypatch.setattr(
+            "kestrel_sovereign.kestrel_agent.KestrelAgent", lambda **_kwargs: cli_agent
+        )
+        monkeypatch.setattr("kestrel_sovereign.llm.service.LLMService", MagicMock())
+        monkeypatch.setattr("kestrel_sovereign.kestrel_config.constants.SHUTDOWN_TIMEOUT", 0.01)
 
-    with pytest.raises(RuntimeError, match="durable cleanup failed"):
-        await cli._run_shell(Path(tmp_path), SimpleNamespace(app=None))
+        with pytest.raises(RuntimeError, match="durable cleanup failed"):
+            await cli._run_shell(Path(tmp_path), SimpleNamespace(app=None))
+        assert len(contexts) == 2
+    finally:
+        # The deliberately failed Agent shutdown cannot acknowledge release
+        # of its real Hold database. Retire our fixture-owned contexts only
+        # after both production failures have been observed, even on assertion.
+        await gather_owned(
+            (hold.close_bound_host_context(context) for context in contexts),
+            cancel_siblings_on_error=False, retain_originals=True,
+            isolate_control_originals=True,
+        )
+    assert not [worker for worker in threading.enumerate()
+                if worker not in original_threads
+                and getattr(getattr(worker, "_target", None), "__module__", "") == "aiosqlite.core"], "entry-point fixture abandoned a native SQLite worker"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_later", [False, True])
+async def test_bound_shutdown_keeps_logged_ordinary_prior_compatibility(monkeypatch, native_later):
+    """Finite selection policy only; native physical ownership is tested separately."""
+    from kestrel_sovereign.hold import enforcement
+    from tests.unit.test_execution_custody_review32 import receipt
+    from tests.utils.original_failure import OriginalFailure
+
+    prior = OriginalFailure.capture(OSError("already logged bounded shutdown failure"))
+    native = OriginalFailure.capture(receipt("unknown"))
+    context = object()
+    close = AsyncMock()
+    completion = AsyncMock(side_effect=native.error if native_later else None)
+    agent = SimpleNamespace(wait_for_shutdown_completion=completion)
+    monkeypatch.setattr(enforcement, "close_bound_host_context", close)
+    if native_later:
+        with pytest.raises(BaseException) as caught:
+            await enforcement.complete_bound_agent_shutdown(agent, context, prior_errors=[prior.error])
+        native.assert_retained(caught.value)
+        prior.assert_retained(caught.value)
+    else:
+        await enforcement.complete_bound_agent_shutdown(agent, context, prior_errors=[prior.error])
+        prior.assert_retained(prior.error)
+    close.assert_awaited_once_with(context)

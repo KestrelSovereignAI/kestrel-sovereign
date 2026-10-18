@@ -33,6 +33,7 @@ Server→client requests come in two flavors:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -40,7 +41,21 @@ import re
 import shutil
 import tomllib
 from pathlib import Path
+from functools import wraps
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple
+
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    owned_task_error,
+    raise_owned_outcome,
+)
+from kestrel_sovereign.execution_custody import (
+    current_execution_custody,
+    execution_terminal_error,
+    is_execution_control_error,
+    is_scope_local_execution_control,
+    owned_native_http_client,
+)
 
 from .cancellation import (
     AuthCancellationToken,
@@ -308,6 +323,15 @@ class CodexAppServerClient:
         self._start_lock = asyncio.Lock()
         self._initialized = False
         self._auth_cancellation_token: Optional[AuthCancellationToken] = None
+        # Connection ownership includes defaults (notably OAuth refresh), not
+        # only tasks registered with a turn's dynamic-tool handler.
+        self._server_request_tasks: set[asyncio.Task] = set()
+        self._server_request_failure: BaseException | None = None
+        self._closing = False
+        self._retiring = False
+        self._close_task: asyncio.Task | None = None
+        self._explicitly_closed = False
+        self._startup_retryable = False
 
     # ---------------------------------------------------------------- lifecycle
     def _auth_cancelled(self) -> CodexAppServerCancelled:
@@ -318,19 +342,44 @@ class CodexAppServerClient:
         *,
         cancellation_token: Optional[AuthCancellationToken] = None,
     ) -> None:
+        self._require_connection_open()
         if self._initialized:
             return
-        async with self._start_lock:
-            if self._initialized:
-                return
-            previous_token = self._auth_cancellation_token
-            self._auth_cancellation_token = cancellation_token
+        owns_startup = False
+        try:
+            async with self._start_lock:
+                self._require_connection_open()
+                if self._initialized:
+                    return
+                previous_token = self._auth_cancellation_token
+                self._auth_cancellation_token = cancellation_token
+                try:
+                    owns_startup = True
+                    await self._spawn()
+                    self._require_connection_open()
+                    await self._handshake(cancellation_token=cancellation_token)
+                    self._require_connection_open()
+                    self._initialized = True
+                finally:
+                    self._auth_cancellation_token = previous_token
+        except BaseException as startup_error:
+            if not owns_startup:
+                # A cancelled lock waiter never owned this connection birth.
+                # It may not retire another caller's still-live startup.
+                raise
+            # The retained retirement owner acquires the startup lock. Join it
+            # only AFTER releasing that lock, for every failed native birth,
+            # not just version rejection. Cancellation cannot orphan the child.
             try:
-                await self._spawn()
-                await self._handshake(cancellation_token=cancellation_token)
-                self._initialized = True
-            finally:
-                self._auth_cancellation_token = previous_token
+                await self._retire_connection()
+            except BaseException as retirement_error:
+                raise execution_terminal_error(startup_error, retirement_error)
+            self._startup_retryable = (
+                isinstance(startup_error, asyncio.CancelledError)
+                and not is_execution_control_error(startup_error)
+                and not self._explicitly_closed
+            )
+            raise
 
     async def _spawn(self) -> None:
         # Isolate ``CODEX_HOME`` to a kestrel-managed directory so codex
@@ -502,8 +551,11 @@ class CodexAppServerClient:
         # kestrel.
         self._closed_error = None
         self._stderr_tail = []
-        self._reader_task = asyncio.create_task(self._read_loop())
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        # The transport outlives individual occurrences. Per-turn handlers
+        # rebind their captured turn; the reader must not inherit the first
+        # occurrence's eventually retired authority/caller/lock contexts.
+        self._reader_task = asyncio.create_task(self._read_loop(), context=contextvars.Context())
+        self._stderr_task = asyncio.create_task(self._drain_stderr(), context=contextvars.Context())
 
     async def _handshake(
         self,
@@ -524,11 +576,7 @@ class CodexAppServerClient:
             cancellation_token=cancellation_token,
         )
         ua = (result or {}).get("userAgent", "")
-        try:
-            _validated_codex_version(ua)
-        except CodexAppServerError:
-            await self.aclose()
-            raise
+        _validated_codex_version(ua)
         self.notify("initialized")
         # Match kestrel-claw's auth-bridge.ts: after initialize +
         # initialized notification, explicitly drive
@@ -660,6 +708,7 @@ class CodexAppServerClient:
         disk or the refresh exchange fails — the caller should error
         out cleanly in that case rather than send an empty token.
         """
+        self._require_connection_open()
         if cancellation_token is not None:
             cancellation_token.raise_if_cancelled(self._auth_cancelled)
         user_codex_home_env = os.environ.get("CODEX_HOME", "").strip()
@@ -690,7 +739,8 @@ class CodexAppServerClient:
         client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=20) as client:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=20)) as client:
+                self._require_connection_open()
                 if cancellation_token is not None:
                     cancellation_token.raise_if_cancelled(self._auth_cancelled)
                 # OAuth token endpoints (including OpenAI's) require
@@ -718,6 +768,8 @@ class CodexAppServerClient:
                     return None
                 body = resp.json()
         except (httpx.HTTPError, ValueError, OSError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning("codex token refresh exception: %s", e)
             return None
         new_access = (body.get("access_token") or "").strip()
@@ -742,8 +794,13 @@ class CodexAppServerClient:
             ).isoformat()
         )
         try:
+            # A cancellation-resistant HTTP/transport close can finish after
+            # shutdown began. It must not publish rotated credentials then.
+            self._require_connection_open()
             auth_path.write_text(json.dumps(data))
         except OSError as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "codex token refresh: wrote new token in-memory but "
                 "failed to persist to %s: %s — next host restart will "
@@ -786,28 +843,115 @@ class CodexAppServerClient:
             out["chatgptPlanType"] = plan_type
         return out
 
+    def _require_connection_open(self) -> None:
+        failure = getattr(self, "_server_request_failure", None)
+        if failure is not None:
+            raise failure
+        if getattr(self, "_closing", False) or getattr(self, "_retiring", False):
+            raise CodexAppServerConnectionClosed("codex app-server is retiring")
+
+    def _retain_request_failure(self, error: BaseException, *, caller_scopes: tuple = ()) -> None:
+        if is_execution_control_error(error):
+            if is_scope_local_execution_control(error, caller_scopes):
+                # Original typed callback refusal stays on its owning turn's
+                # bridge receipt. It does not authorize that turn to continue
+                # or imply failure of the shared native connection. Reader,
+                # lifecycle, unscoped, commit and native-close failures remain
+                # connection-wide control, never inferred from a thread ID.
+                return
+            self._server_request_failure = execution_terminal_error(
+                getattr(self, "_server_request_failure", None), error,
+            )
+            self._fail_all(self._server_request_failure)
+
+    def _server_request_done(self, task: asyncio.Task) -> None:
+        error = owned_task_error(task)
+        if error is not None:
+            self._retain_request_failure(error,
+                caller_scopes=getattr(task, "_kestrel_codex_caller_scopes", ()))
+        self._server_request_tasks.discard(task)
+
+    async def _join_server_requests(self) -> None:
+        tasks = tuple(getattr(self, "_server_request_tasks", ()))
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            outcome = await await_owned_task(task)
+            if outcome.error is not None:
+                self._retain_request_failure(outcome.error,
+                    caller_scopes=getattr(task, "_kestrel_codex_caller_scopes", ()))
+        failure = getattr(self, "_server_request_failure", None)
+        if failure is not None:
+            raise failure
+
     async def aclose(self) -> None:
-        proc = self._proc
-        if proc is None:
-            return
-        try:
-            if proc.stdin and not proc.stdin.is_closing():
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except (asyncio.TimeoutError, Exception):
+        self._explicitly_closed = True
+        self._startup_retryable = False
+        await self._retire_connection()
+
+    @property
+    def replaceable_after_failed_startup(self) -> bool:
+        """Only cleanly retired, ordinarily cancelled startup may be replaced."""
+        task = self._close_task
+        return (
+            self._startup_retryable
+            and not self._explicitly_closed
+            and self._proc is None
+            and task is not None
+            and task.done()
+            and not task.cancelled()
+            and task.exception() is None
+        )
+
+    async def _retire_connection(self) -> None:
+        # Fence admissions before scheduling the one retained retirement owner.
+        self._closing = True
+        if getattr(self, "_close_task", None) is None:
+            self._close_task = asyncio.create_task(self._close_connection())
+        outcome = await await_owned_task(self._close_task)
+        raise_owned_outcome(outcome, operation="codex app-server retirement")
+
+    async def _close_connection(self) -> None:
+        error: BaseException | None = None
+        async with self._start_lock:
             try:
-                proc.kill()
-            except Exception:
-                pass
-        for t in (self._reader_task, self._stderr_task):
-            if t:
-                t.cancel()
-        self._fail_all(CodexAppServerConnectionClosed("codex app-server closed"))
-        self._initialized = False
-        self._proc = None
+                await self._join_server_requests()
+            except BaseException as exc:
+                error = execution_terminal_error(error, exc)
+            proc = self._proc
+            if proc is not None:
+                try:
+                    if proc.stdin and not proc.stdin.is_closing():
+                        proc.stdin.close()
+                except BaseException as exc:
+                    error = execution_terminal_error(error, exc)
+                try:
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        await proc.wait()
+                except BaseException as exc:
+                    error = execution_terminal_error(error, exc)
+            for task in (self._reader_task, self._stderr_task):
+                if task is not None:
+                    if not task.done():
+                        task.cancel()
+                    outcome = await await_owned_task(task)
+                    if outcome.error is not None and (
+                        not isinstance(outcome.error, asyncio.CancelledError)
+                        or is_execution_control_error(outcome.error)
+                    ):
+                        error = execution_terminal_error(error, outcome.error)
+            self._fail_all(error or CodexAppServerConnectionClosed("codex app-server closed"))
+            self._initialized = False
+            self._proc = None
+        if error is not None:
+            raise error
 
     # ----------------------------------------------------------------- io loops
     async def _drain_stderr(self) -> None:
@@ -819,10 +963,14 @@ class CodexAppServerClient:
                     self._stderr_tail.append(line)
                     del self._stderr_tail[:-40]
                     logger.debug("codex app-server stderr: %s", line[:500])
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+        except asyncio.CancelledError as exc:
+            if is_execution_control_error(exc):
+                self._retain_request_failure(exc)
+                raise
+        except Exception as exc:
+            if is_execution_control_error(exc):
+                self._retain_request_failure(exc)
+                raise
 
     def _fail_active_bridge_work(self, exc: BaseException) -> None:
         """Fail in-flight RPCs/turns without declaring the process dead.
@@ -899,6 +1047,7 @@ class CodexAppServerClient:
 
     async def _read_loop(self) -> None:
         assert self._proc and self._proc.stdout
+        proc = self._proc
         try:
             async for raw in self._iter_stdout_frames():
                 line = raw.decode("utf-8", "replace").strip()
@@ -912,9 +1061,14 @@ class CodexAppServerClient:
                     logger.warning("codex app-server: non-JSON line: %s", line[:200])
                     continue
                 self._dispatch(msg)
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError as exc:
+            if is_execution_control_error(exc):
+                self._retain_request_failure(exc)
+                raise
         except ValueError as e:
+            if is_execution_control_error(e):
+                self._retain_request_failure(e)
+                raise
             # ``read()`` does not impose a delimiter-length limit. This is
             # retained as a diagnostic for a future reader implementation so
             # an accidental return to ``readline()`` does not masquerade as
@@ -931,6 +1085,9 @@ class CodexAppServerClient:
                 "(%s): %s", detail, e,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                self._retain_request_failure(e)
+                raise
             # Don't let an unexpected reader exception look like a clean
             # exit — log the actual error so it survives the
             # ``CodexAppServerConnectionClosed`` thrown in the finally
@@ -943,6 +1100,14 @@ class CodexAppServerClient:
                 exc_info=True,
             )
         finally:
+            # No old default/turn handler may survive into a replacement
+            # process. Keep restart fenced until physical request retirement.
+            self._retiring = True
+            request_error: BaseException | None = None
+            try:
+                await self._join_server_requests()
+            except BaseException as exc:
+                request_error = exc
             # Wait briefly for the OS to report the real returncode.
             # Without this, ``returncode`` would be None when stdout
             # closes BEFORE the process is reaped — the error message
@@ -950,13 +1115,21 @@ class CodexAppServerClient:
             # normally vs crashed. Critical for diagnosing
             # CodexAppServerConnectionClosed reports (#1399).
             rc_value: Any = "?"
-            if self._proc is not None:
+            if proc is not None:
                 try:
                     rc_value = await asyncio.wait_for(
-                        self._proc.wait(), timeout=1.0
+                        proc.wait(), timeout=1.0
                     )
-                except (asyncio.TimeoutError, ProcessLookupError):
-                    rc_value = self._proc.returncode
+                except asyncio.TimeoutError:
+                    # EOF is not proof the native process is retired. A peer
+                    # can close stdout while still owning a live stdin worker.
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    rc_value = await proc.wait()
+                except ProcessLookupError:
+                    rc_value = proc.returncode
             # Diagnostic tail goes to server logs only (#1412). Mirrors
             # the leak boundary established for the idle-timeout path in
             # #1410: ``CodexAppServerConnectionClosed`` propagates to
@@ -972,7 +1145,7 @@ class CodexAppServerClient:
                     rc_value, tail,
                 )
             self._fail_all(
-                CodexAppServerConnectionClosed(
+                request_error or CodexAppServerConnectionClosed(
                     f"codex app-server exited (rc={rc_value})"
                 )
             )
@@ -987,6 +1160,9 @@ class CodexAppServerClient:
             # the involuntary-exit path.
             self._initialized = False
             self._proc = None
+            self._retiring = False
+            if request_error is not None:
+                raise request_error
 
     def _dispatch(self, msg: dict) -> None:
         mid = msg.get("id")
@@ -1007,6 +1183,12 @@ class CodexAppServerClient:
                     fut.set_result(msg.get("result"))
             return
         if mid is not None and method is not None:
+            if (
+                getattr(self, "_closing", False)
+                or getattr(self, "_retiring", False)
+                or getattr(self, "_server_request_failure", None) is not None
+            ):
+                return
             # Server→client request. Dispatch in a task so the read loop
             # keeps pumping concurrent notifications/requests while a
             # long-running tool handler is running.
@@ -1024,6 +1206,11 @@ class CodexAppServerClient:
                     handler_selected=True,
                 )
             )
+            task._kestrel_codex_caller_scopes = getattr(handler, "_codex_caller_scopes", ())
+            if not hasattr(self, "_server_request_tasks"):
+                self._server_request_tasks = set()
+            self._server_request_tasks.add(task)
+            task.add_done_callback(self._server_request_done)
             active_tasks = getattr(handler, "_codex_active_tasks", None)
             if isinstance(active_tasks, set):
                 # Admission is synchronous with task creation. A cooperative
@@ -1154,6 +1341,13 @@ class CodexAppServerClient:
         except CodexAppServerCancelled:
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                sink = self._turn_sinks.get(tid)
+                if sink is not None:
+                    sink.put_nowait({"__bridge_error__": e})
+                self._retain_request_failure(e, caller_scopes=getattr(handler, "_codex_caller_scopes", ()))
+                self._send({"id": mid, "error": {"message": "execution requires authority/commit reconciliation"}})
+                return
             logger.warning("codex server-request %s failed: %s", method, e)
             try:
                 self._send({"id": mid, "error": {"message": str(e)}})
@@ -1214,7 +1408,8 @@ class CodexAppServerClient:
             if db is None:
                 return
             from kestrel_sovereign.llm.codex_decline_events import (
-                ensure_codex_decline_events_table, record_decline,
+                ensure_codex_decline_events_table,
+                record_decline,
             )
             await ensure_codex_decline_events_table(db)
             agent_id = (
@@ -1234,6 +1429,8 @@ class CodexAppServerClient:
                 reason="auto_default",
             )
         except Exception as exc:  # noqa: BLE001
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "codex_decline_events: default-decline record failed "
                 "(%s) — %s", method, exc,
@@ -1255,10 +1452,20 @@ class CodexAppServerClient:
         Returns an ``unregister`` callable; safe to call once.
         """
         key = (method, thread_id)
-        self._server_request_handlers[key] = handler
+        # This is a classification snapshot, not a new work admission. Reader
+        # Tasks inherit the shared reader's context, which cannot establish
+        # ownership of a callback's later denial. Keep each registration's
+        # actual typed scopes; neither a thread ID nor "handler exists" proves
+        # that foreign/mixed native control is local to this turn.
+        @wraps(handler)
+        async def registered(params):
+            return await handler(params)
+
+        registered._codex_caller_scopes = current_execution_custody()
+        self._server_request_handlers[key] = registered
 
         def _unregister() -> None:
-            if self._server_request_handlers.get(key) is handler:
+            if self._server_request_handlers.get(key) is registered:
                 self._server_request_handlers.pop(key, None)
 
         return _unregister
@@ -1305,6 +1512,9 @@ class CodexAppServerClient:
         """
         if cancellation_token is not None:
             cancellation_token.raise_if_cancelled(self._auth_cancelled)
+        if method in {"turn/start", "thread/start"}:
+            from kestrel_sovereign.execution_custody import require_execution_work
+            require_execution_work()
         mid = self._next_id
         self._next_id += 1
         fut: asyncio.Future = asyncio.get_event_loop().create_future()

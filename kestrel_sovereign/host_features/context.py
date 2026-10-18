@@ -22,11 +22,19 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from kestrel_sovereign.host_features.storage import HostDatabaseLaunchContext
 
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
+from kestrel_sovereign.execution_custody import (
+    execution_cleanup_debts,
+    execution_native_source_error,
+    execution_terminal_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.lifecycle_checks import (
     is_isolated_nonproduction_kite_environment,
 )
@@ -151,6 +159,7 @@ class SovereignHostContext:
         self._hold_evidence_db = hold_evidence_db
         self._hold_boot_state = tuple(hold_boot_state)
         self._backend_error = str(backend_error or "")
+        self._native_close_owners: dict[object, _HostCloseOwner] = {}
 
     @property
     def db(self) -> Any:
@@ -214,52 +223,126 @@ class SovereignHostContext:
         return FLEET_TENANT_ID
 
 
+@dataclass
+class _HostCloseOwner:
+    """One original resource and its close operation, never a proxy ACK."""
+
+    resource: Any
+    task: asyncio.Task | None = None
+    error: BaseException | None = None
+    closed: bool = False
+
+
+def _host_close_owners(context: Any) -> dict[object, _HostCloseOwner]:
+    """One context-owned inventory for original resource retirement failures."""
+    owners = getattr(context, "_native_close_owners", None)
+    if owners is None:
+        owners = context._native_close_owners = {}
+    return owners
+
+
+def _retain_host_cleanup_failure(
+    context: Any, resource: Any, error: BaseException, *, operation: str,
+) -> None:
+    # A feature may also be a database resource. Operation-qualified keys must
+    # not confuse its failed stop hook with the independent resource.close.
+    record = _host_close_owners(context).setdefault(
+        (operation, id(resource)), _HostCloseOwner(resource)
+    )
+    record.error = execution_terminal_error(
+        record.error, execution_native_source_error(error) or error,
+        retain_originals=True, isolate_control_originals=True,
+    )
+
+
+def _retained_host_cleanup_error(context: Any) -> BaseException | None:
+    return execution_terminal_error(
+        *(record.error for record in _host_close_owners(context).values()),
+        retain_originals=True, isolate_control_originals=True,
+    )
+
+
 async def _close_partial_host_resources(
     session_factory: Optional[FleetSessionFactory],
     hold_evidence_db: Any,
     hold_db: Any,
     db: Any,
+    *,
+    owners: dict[object, _HostCloseOwner],
+    prior_error: BaseException | None = None,
 ) -> None:
-    """Close every resource acquired before host bootstrap completed."""
+    """Retire each ORIGINAL resource independently, retaining native failures.
 
-    cancelled = False
-    if session_factory is not None:
-        try:
-            await session_factory.close()
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception as close_exc:  # noqa: BLE001 - finish later resources
-            logger.warning("Could not close partial host session factory: %s", close_exc)
-    if (
-        hold_evidence_db is not None
-        and hold_evidence_db is not hold_db
-        and hold_evidence_db is not db
-        and hasattr(hold_evidence_db, "close")
-    ):
-        try:
-            await hold_evidence_db.close()
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception as close_exc:  # noqa: BLE001 - finish later resources
-            logger.warning(
-                "Could not close partial Hold evidence backend: %s", close_exc
+    The caller already owns this cleanup. No all-resource collector Task is
+    needed. Register each actual resource BEFORE close-Task admission, join
+    every accepted close, and keep failed/unaccepted owners for reconciliation.
+    Session factories still retire before their borrowed databases.
+    """
+    resources = []
+    for resource in (session_factory, hold_evidence_db, hold_db, db):
+        if resource is not None and callable(getattr(resource, "close", None)):
+            if not any(resource is previous for previous in resources):
+                resources.append(resource)
+    errors = []
+    for resource in resources:
+        record = owners.setdefault(id(resource), _HostCloseOwner(resource))
+        if record.closed:
+            continue
+        if record.task is None and record.error is None:
+            admission = OwnedTaskAdmission()
+            try:
+                record.task = create_owned_task(
+                    resource.close(),
+                    retirement_resource=resource,
+                    retain_originals=True,
+                    admission=admission,
+                    name="host-original-resource-close",
+                )
+            except BaseException as error:
+                # Canonical admission closes refused coroutines and attaches
+                # the ACTUAL resource's unstarted retirement debt.
+                record.error = error
+                record.task = admission.task
+                debt = RuntimeError("original host closer admission failed")
+                debt.__cause__ = execution_native_source_error(error) or error
+                debt._kestrel_native_retirement_debts = ((resource, record.task),)
+                record.error = execution_terminal_error(
+                    error, debt, retain_originals=True, isolate_control_originals=True,
+                )
+        if record.task is not None:
+            outcome = await await_owned_task(record.task)
+            from kestrel_sovereign._async_ownership import owned_task_error
+            physical = owned_task_error(record.task)
+            record.error = execution_terminal_error(
+                record.error, execution_native_source_error(physical) or physical,
+                retain_originals=True,
+                isolate_control_originals=True,
             )
-    if hold_db is not None and hold_db is not db and hasattr(hold_db, "close"):
-        try:
-            await hold_db.close()
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception as close_exc:  # noqa: BLE001 - finish later resources
-            logger.warning("Could not close partial Hold backend: %s", close_exc)
-    if db is not None and hasattr(db, "close"):
-        try:
-            await db.close()
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception as close_exc:  # noqa: BLE001 - finish later resources
-            logger.warning("Could not close partial host backend: %s", close_exc)
-    if cancelled:
-        raise asyncio.CancelledError()
+            # Join publication/removal failures belong to this finite
+            # observation, not the physical closer's sticky disposition.
+            errors.extend((outcome.error, outcome.cancellation))
+            if record.error is None:
+                record.closed = True
+                record.task = None
+        if record.error is not None:
+            if not execution_cleanup_debts(record.error):
+                # An unsuccessful close is not physical retirement. Retain its
+                # ORIGINAL resource/operation rather than a successful holder.
+                debt = RuntimeError("original host close retirement failed")
+                debt.__cause__ = execution_native_source_error(record.error) or record.error
+                debt._kestrel_native_retirement_debts = ((resource, record.task),)
+                record.error = execution_terminal_error(
+                    record.error, debt, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+    # Feature stop and declarative rollback share this SAME inventory. Closing
+    # their independent databases cannot acknowledge an earlier failed hook.
+    errors.extend(record.error for record in owners.values())
+    if any(error is not None for error in errors):
+        raise execution_terminal_error(
+            prior_error, *errors, retain_originals=True, prefer_cancellation=True,
+            isolate_control_originals=True,
+        )
 
 
 async def _finish_partial_host_cleanup(
@@ -267,30 +350,19 @@ async def _finish_partial_host_cleanup(
     hold_evidence_db: Any,
     hold_db: Any,
     db: Any,
+    *,
+    owners: dict[object, _HostCloseOwner] | None = None,
+    prior_error: BaseException | None = None,
 ) -> None:
-    """Own partial bootstrap cleanup through repeated caller cancellation."""
-
-    cleanup = asyncio.create_task(
-        _close_partial_host_resources(
-            session_factory,
-            hold_evidence_db,
-            hold_db,
-            db,
-        ),
-        name="partial-host-bootstrap-cleanup",
+    """The original caller joins each resource, including repeated Stop."""
+    await _close_partial_host_resources(
+        session_factory,
+        hold_evidence_db,
+        hold_db,
+        db,
+        owners=owners if owners is not None else {},
+        prior_error=prior_error,
     )
-    cancelled = False
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            # A supervisor may cancel shutdown more than once. The resource
-            # owner is independent, so every acquired backend still closes.
-            cancelled = True
-            continue
-    await cleanup
-    if cancelled:
-        raise asyncio.CancelledError()
 
 
 async def close_host_context_resources(context: Any) -> None:
@@ -298,11 +370,13 @@ async def close_host_context_resources(context: Any) -> None:
 
     if context is None:
         return
+    owners = _host_close_owners(context)
     await _finish_partial_host_cleanup(
         getattr(context, "session_factory", None),
         getattr(context, "hold_evidence_db", None),
         getattr(context, "hold_db", None),
         getattr(context, "db", None),
+        owners=owners,
     )
 
 
@@ -323,8 +397,10 @@ async def build_host_context(
     ``KESTREL_HOLD_BACKEND=sqlite``. ``db_path`` overrides the host SQLite
     location (``$KESTREL_HOST_DB_PATH``, otherwise
     ``$KESTREL_DB_PATH/host-data``, otherwise the private host-data root).
-    Failure to secure or open either backend degrades gracefully to a context
-    with no store; production Hold enforcement then fails closed at boot.
+    Ordinary capability failures can return a degraded context with no store;
+    production Hold enforcement then fails closed at boot. Original execution
+    authority, commit-outcome and native retirement controls instead propagate
+    after the original acquired resources have had their cleanup attempts.
     """
     db = None
     session_factory: Optional[FleetSessionFactory] = None
@@ -375,9 +451,7 @@ async def build_host_context(
         evidence_dsn = None
         external_pair_id = None
         if configured_hold_backend is None:
-            hold_backend = (
-                "postgres" if backend == "postgres" and dsn else "sqlite"
-            )
+            hold_backend = "postgres" if backend == "postgres" and dsn else "sqlite"
         else:
             hold_backend = configured_hold_backend.lower()
             if hold_backend not in {"postgres", "sqlite"}:
@@ -413,9 +487,7 @@ async def build_host_context(
             external_pair_id = configured_postgres_hold_pair_id(
                 launch_env,
                 required=(
-                    launch_env.get("KESTREL_DEPLOYMENT_PERSISTENCE", "")
-                    .strip()
-                    .lower()
+                    launch_env.get("KESTREL_DEPLOYMENT_PERSISTENCE", "").strip().lower()
                     == "durable_sovereign"
                 ),
             )
@@ -462,9 +534,7 @@ async def build_host_context(
             claim_hold_backend_custody(resolved, hold_backend)
             hold_db = db
             hold_location = str(resolved)
-            initialization_witness_path = hold_initialization_witness_path(
-                resolved
-            )
+            initialization_witness_path = hold_initialization_witness_path(resolved)
             history_anchor_path = hold_history_anchor_path(resolved)
         hold_store = HoldStore(
             hold_db,
@@ -485,24 +555,19 @@ async def build_host_context(
             FLEET_TENANT_ID,
             hold_location,
         )
-    except asyncio.CancelledError as cancellation:
-        await _finish_partial_host_cleanup(
-            session_factory,
-            hold_evidence_db,
-            hold_db,
-            db,
-        )
-        raise cancellation
-    except Exception as exc:  # noqa: BLE001 - host must start even without a store
-        # Cleanup owns its task independently so cancellation arriving after
-        # the opening failure closes every acquired backend and then
+    except BaseException as exc:
+        # Cleanup owns each original resource independently so cancellation
+        # arriving after the opening failure closes every acquired backend and
         # propagates instead of returning a degraded context during shutdown.
         await _finish_partial_host_cleanup(
             session_factory,
             hold_evidence_db,
             hold_db,
             db,
+            prior_error=exc,
         )
+        if not isinstance(exc, Exception) or is_execution_control_error(exc):
+            raise
         session_factory = None
         hold_store = None
         hold_evidence_db = None

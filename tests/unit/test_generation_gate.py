@@ -612,14 +612,31 @@ def _route(agent, name: str, daemon: _Daemon) -> dict:
     return provider
 
 
-def _booted_agent(tmp_path):
+@asynccontextmanager
+async def _booted_agent(tmp_path):
     """A real agent on real storage; only the daemons are scripted. Beyond
     the mandatory features it loads only the one whose tool the turns call,
     so an installed optional package adds no model call of its own."""
-    return booted_agent(
+    async with booted_agent(
         tmp_path, name="Gate", provenance="test:generation_gate",
         features={"StateOfMindFeature"},
-    )
+    ) as agent:
+        # This table tests generation/Stop outcomes, not cold database startup.
+        # Initialize the actual owned usage DB before a one-second watchdog can
+        # interrupt its native schema COMMIT on a loaded unit-test worker.
+        await agent.llm_service._ensure_db_initialized()
+        yield agent
+
+
+@pytest.mark.asyncio
+async def test_generation_fixture_opens_usage_database_before_timed_calls(tmp_path):
+    """The generation watchdog must not race unrelated usage-DB migrations."""
+    async with _booted_agent(tmp_path) as agent:
+        service = agent.llm_service
+        assert service._db_initialized and service._usage_db is not None, (
+            "generation fixture handed a cold usage database to a timed call"
+        )
+        assert await service._usage_db.fetchval("SELECT COUNT(*) FROM model_usage") == 0
 
 
 @asynccontextmanager
@@ -752,8 +769,13 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
     # a provider timeout fails its attempt at once.
     from kestrel_sovereign.llm import ollama_adapter
 
-    async def no_retry(func, *args, **kwargs):
-        return await func(*args, **kwargs)
+    async def no_retry(func, *args, acquired_result_cleanup=None, **kwargs):
+        from kestrel_sovereign.execution_custody import await_execution_work
+
+        return await await_execution_work(
+            None, lambda: func(*args, **kwargs),
+            acquired_result_cleanup=acquired_result_cleanup,
+        )
 
     monkeypatch.setattr(ollama_adapter, "with_retry", no_retry)
 
@@ -860,6 +882,26 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("isolated_process_rate_limiter")
+async def test_repair_watchdog_does_not_bound_the_successful_fixture_prelude(
+    tmp_path, monkeypatch,
+):
+    original_handle = _Daemon.handle
+
+    async def slow_initial_reply(daemon, request):
+        if request.url.path == "/api/chat" and not _is_repair(json.loads(request.content)):
+            # A finite IO delay, not CPU stress. The generation under test is
+            # the subsequent silent repair, not this successful setup reply.
+            await asyncio.sleep(TURN_BOUND + 0.1)
+        return await original_handle(daemon, request)
+
+    monkeypatch.setattr(_Daemon, "handle", slow_initial_reply)
+    await test_only_a_natural_end_becomes_the_answer(
+        tmp_path, monkeypatch, "invoke_repair", "watchdog",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_process_rate_limiter")
 async def test_a_route_that_fails_before_sending_anything_still_falls_back(
     tmp_path, monkeypatch,
 ):
@@ -904,8 +946,13 @@ async def test_a_discovery_reply_becomes_the_answer_only_when_it_finished(
     from kestrel_sovereign.bootstrap import BootstrapState
     from kestrel_sovereign.llm import ollama_adapter
 
-    async def no_retry(func, *args, **kwargs):
-        return await func(*args, **kwargs)
+    async def no_retry(func, *args, acquired_result_cleanup=None, **kwargs):
+        from kestrel_sovereign.execution_custody import await_execution_work
+
+        return await await_execution_work(
+            None, lambda: func(*args, **kwargs),
+            acquired_result_cleanup=acquired_result_cleanup,
+        )
 
     monkeypatch.setattr(ollama_adapter, "with_retry", no_retry)
     monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", UNREACHED_BOUND)

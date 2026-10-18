@@ -30,6 +30,13 @@ from kestrel_sovereign.host_features.context import (
 )
 from kestrel_sovereign.security import csrf
 
+
+@pytest.fixture
+def _local_host_auth(monkeypatch):
+    # Local Sovereign host authentication, not a paid-provider API key. These
+    # structural lifespan tests must not depend on another module's key state.
+    monkeypatch.setenv("KESTREL_API_KEY", "local-host-feature-lifecycle-test")
+
 # ---------------------------------------------------------------------------
 # A minimal host feature used across the tests.
 # ---------------------------------------------------------------------------
@@ -334,6 +341,7 @@ async def test_one_feature_start_failure_does_not_abort_others():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reject_context", [False, True])
+@pytest.mark.usefixtures("_local_host_auth")
 async def test_server_lifespan_wires_and_closes_host_features(
     monkeypatch, tmp_path: Path, reject_context: bool,
 ):
@@ -555,6 +563,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_local_host_auth")
 async def test_server_retains_control_context_after_optional_mount_failure(
     monkeypatch,
     tmp_path: Path,
@@ -1010,9 +1019,11 @@ async def test_host_shutdown_closes_later_databases_after_close_cancellation():
 
     from kestrel_sovereign import server
 
-    evidence_db = SimpleNamespace(
-        close=AsyncMock(side_effect=asyncio.CancelledError())
-    )
+    from tests.utils.original_failure import OriginalFailure
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+    original = asyncio.CancelledError("original resource close cancellation")
+    snapshot = OriginalFailure.capture(original)
+    evidence_db = SimpleNamespace(close=AsyncMock(side_effect=original))
     hold_db = SimpleNamespace(close=AsyncMock())
     host_db = SimpleNamespace(close=AsyncMock())
     session_factory = SimpleNamespace(close=AsyncMock())
@@ -1025,8 +1036,11 @@ async def test_host_shutdown_closes_later_databases_after_close_cancellation():
         hold_evidence_db=evidence_db,
     )
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(BaseException) as caught:
         await server._shutdown_host_features(app)
+    snapshot.assert_retained(caught.value)
+    assert any(resource is evidence_db and owner is not None and owner.done()
+               for resource, owner in execution_cleanup_debts(caught.value))
 
     session_factory.close.assert_awaited_once()
     evidence_db.close.assert_awaited_once()

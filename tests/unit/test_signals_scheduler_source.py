@@ -339,6 +339,30 @@ async def test_artifact_task_dispatches_through_artifact_handler(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["action", "artifact", "builtin"])
+async def test_scheduler_source_dispatcher_preserves_commit_uncertainty(dispatcher_components, route):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, execution_commit_outcome
+    agent, registry, dispatcher, _ = dispatcher_components
+    async def effect(*args):
+        try:
+            raise ExecutionCommitOutcomeError("unknown")
+        except ExecutionCommitOutcomeError as error:
+            raise RuntimeError("storage wrapped an uncertain commit") from error
+    task = "morning_signal" if route == "artifact" else "backup_snapshot" if route == "builtin" else "signal_dispatch"
+    for registration in build_cron_registrations(
+        tool_lookup=effect, reason_codes_lookup=_NO_REASON_CODES,
+        builtin_handlers={task: effect} if route == "builtin" else None,
+    ):
+        registry.register(registration)
+    with pytest.raises(RuntimeError) as caught:
+        await dispatcher.dispatch_signal(Signal(
+            source=cron_source_name(task), kind="run", payload={}, target_agent=agent.did,
+            mode=SignalMode.ARTIFACT if route == "artifact" else SignalMode.ACTION,
+        ))
+    assert execution_commit_outcome(caught.value) == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_json_shaped_string_artifact_is_not_a_scheduler_envelope(
     dispatcher_components,
 ):

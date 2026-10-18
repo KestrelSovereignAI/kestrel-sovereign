@@ -747,7 +747,7 @@ jobs:
         # thresholds are the least trustworthy thing to assert on a shared
         # runner. It still runs weekly via weekly-analysis.yml, which
         # invokes run_tests.py with no marker filter.
-        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 --session-timeout=2700 -m "not docker_mcp and not cloud_resource and not bench"
+        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 --session-timeout=2700 -m "not native_postgres and not docker_mcp and not cloud_resource and not bench"
         # 20 was too tight, then 30 was too tight, each for the same reason
         # 10 was too tight on the unit tier above: they started killing
         # PASSING runs. #3212 is the third instance, and the repetition is
@@ -816,6 +816,84 @@ jobs:
           RUNPOD_API_KEY: ""
           XAI_API_KEY: ""
           GITHUB_PAT: ${{ secrets.GH_PAT }}
+
+  # Native fixture consumers own disposable schemas and must not silently skip
+  # when the generic integration job provides DATABASE_URL but not the explicit
+  # TEST_POSTGRES_URL they read (#3675). Separate parallel lane: no duplicate
+  # execution and no extension of the existing integration timeout. This is a
+  # required reusable release-CI job as well as a PR job. The shared failed-unit
+  # run cancellation above also reaches this lane.
+  native-postgres-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    if: >-
+      (github.event_name != 'push' || github.ref != 'refs/heads/main')
+      && needs.lint-and-imports.outputs.run_expensive != 'false'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run required native PostgreSQL tests
+        # Initial bounded lane, not a fabricated runner-speed measurement.
+        # Reuses integration's 45-minute pytest deadline and 50-minute step
+        # backstop (180s maximum marked case + epilogue). Exact-head CI must
+        # establish the new lane's actual timing; no historical skip counts
+        # are represented as passes. Collection uses the canonical native_pg
+        # dependency marker before pytest's -m deselection.
+        run: uv run pytest tests/integration/ -p pytest_asyncio.plugin -p pytest_timeout -o addopts='' -v --tb=short -x --timeout=120 --session-timeout=2700 -m "native_postgres and not docker_mcp and not cloud_resource and not bench"
+        timeout-minutes: 50
+        env:
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          EMAIL_DRY_RUN: "true"
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          TAVILY_API_KEY: ""
+          REPLICATE_API_TOKEN: ""
+          RUNPOD_API_KEY: ""
+          XAI_API_KEY: ""
 
   # Offline LLM adapter tests (live credential-gated cases intentionally skip).
   #
@@ -956,6 +1034,10 @@ jobs:
       - name: Install the Chromium browser
         run: npx playwright install --with-deps chromium
         timeout-minutes: 5
+
+      - name: Verify offline native voice transport custody
+        run: node --test tests/js/test_voice_native_custody.cjs
+        timeout-minutes: 3
 
       - name: Run the Console smoke against a fresh isolated instance
         run: uv run kestrel demo smoke --home "$RUNNER_TEMP/kestrel-console-smoke" --port "$SMOKE_PORT"

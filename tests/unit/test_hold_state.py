@@ -149,6 +149,18 @@ async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(
             self.executed = []
             self.terminated = False
 
+        def get_server_pid(self):
+            return 3569
+
+        def is_closed(self):
+            return self.terminated
+
+        def add_termination_listener(self, callback):
+            self.listener = callback
+
+        def remove_termination_listener(self, callback):
+            assert callback == self.listener
+
         async def fetchval(self, query, *_params):
             assert "pg_control_system" in query
             return "cluster-selected-by-load-balancer"
@@ -157,6 +169,9 @@ async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(
             self.executed.append((query, params))
 
         def terminate(self):
+            self.terminated = True
+
+        async def close(self):
             self.terminated = True
 
     connection = _Connection()
@@ -1890,6 +1905,10 @@ async def test_database_factory_preserves_both_errors_and_marks_uncertain_cleanu
     from kestrel_sovereign.storage import async_database as database_module
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+
+    primary = RuntimeError("primary schema failure")
+    cleanup = RuntimeError("cleanup failed")
 
     class _Backend:
         backend_type = "postgres"
@@ -1898,24 +1917,31 @@ async def test_database_factory_preserves_both_errors_and_marks_uncertain_cleanu
             return None
 
         async def close(self):
-            raise RuntimeError("cleanup failed")
+            raise cleanup
 
     async def _fail_schema(_self):
-        raise RuntimeError("primary schema failure")
+        raise primary
 
+    backend = _Backend()
     monkeypatch.setattr(
         postgres_module,
         "PostgresBackend",
-        lambda **_kwargs: _Backend(),
+        lambda **_kwargs: backend,
     )
     monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
 
     with pytest.raises(database_module.DatabaseInitializationCleanupError) as failure:
         await database_module.AsyncDatabase.postgres("postgresql://durable/host")
 
-    assert str(failure.value.initialization_error) == "primary schema failure"
-    assert str(failure.value.cleanup_error) == "cleanup failed"
-    assert failure.value.__cause__ is failure.value.cleanup_error
+    assert failure.value.initialization_error is primary
+    assert failure.value.cleanup_error is cleanup
+    # Retirement now retains its SAME recovery owner and the full finite
+    # carrier, not just the last cleanup exception as the public cause.
+    assert isinstance(failure.value.__cause__, database_module.DatabaseRetirementError)
+    assert failure.value.__cause__.retirement_owner is failure.value.retirement_owner
+    assert failure.value.retirement_owner.backend is backend
+    chain = tuple(_explicit_control_chain(failure.value))
+    assert primary in chain and cleanup in chain
 
 
 @pytest.mark.asyncio

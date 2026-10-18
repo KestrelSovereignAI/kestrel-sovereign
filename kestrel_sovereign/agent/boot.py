@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, List, Optional
 
 from kestrel_sovereign.agent.custody import ReleaseOutcome, ResourceCustody
+from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import execution_terminal_error
 
 logger = logging.getLogger(__name__)
 
@@ -123,16 +125,19 @@ class BootContext:
         self,
         logger_: Optional[logging.Logger] = None,
         custody: Optional[ResourceCustody] = None,
+        before_rollback: Optional[Callable[[], None]] = None,
     ) -> None:
         self.logger = logger_ or logger
         #: The tracker of held resources. An agent passes its own, so what a
         #: rollback could not release stays held for its shutdown.
         self.custody = custody if custody is not None else ResourceCustody()
         self._undo: List[_Undo] = []
+        self._before_rollback = before_rollback
         #: Phases that fully committed, in order (the journal).
         self.committed_phases: List[str] = []
         #: Resources deliberately retained across a failure (audit trail).
         self.retained_resources: List[str] = []
+        self.rollback_errors: List[BaseException] = []
         # ---- cross-phase carry -------------------------------------------
         #: The agent identity graph node loaded in the storage phase and read
         #: again by the providers/sync phase (constitution-anchor gate).
@@ -179,17 +184,8 @@ class BootContext:
             undo = self._undo.pop()
             try:
                 outcome = await self.custody.release(undo.label, undo.action)
-            except asyncio.CancelledError:
-                # Teardown must complete even under cancellation — record and
-                # keep going rather than abandoning the remaining resources.
-                self.logger.warning(
-                    "boot rollback step '%s' was cancelled; continuing teardown",
-                    undo.label,
-                )
-                self.note_retained(undo.label)
-                released.append(f"{undo.label} (cancelled)")
-                continue
-            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+            except BaseException as exc:  # every independent inverse must run
+                self.rollback_errors.append(exc)
                 self.logger.warning(
                     "boot rollback step '%s' failed: %s",
                     undo.label,
@@ -197,7 +193,8 @@ class BootContext:
                     exc_info=True,
                 )
                 self.note_retained(undo.label)
-                released.append(f"{undo.label} (error)")
+                disposition = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+                released.append(f"{undo.label} ({disposition})")
                 continue
             if outcome is ReleaseOutcome.RELEASED:
                 released.append(undo.label)
@@ -209,25 +206,26 @@ class BootContext:
     async def run_rollback(self) -> List[str]:
         """Unwind the rollback stack to completion, even under cancellation.
 
-        The unwind runs as a separate task awaited via :func:`asyncio.wait`,
-        which — unlike :func:`asyncio.wait_for` — does NOT cancel its inner
-        task when *our own* await is cancelled. So a boot cancelled mid-phase
-        still releases every acquired resource before the ``CancelledError``
-        propagates out of :func:`run_boot_sequence`.
+        The unwind has one separate, shielded owner. Repeated caller
+        cancellation cannot abandon that task or skip independent inverses.
+        Original cleanup receipts are retained until all inverses finish and
+        :func:`run_boot_sequence` publishes FAILED and selects its terminal
+        receipt; uncertain releases remain in resource custody.
         """
-        task = asyncio.ensure_future(self._unwind())
-        while True:
+        # Failure retires ordinary work before even the first teardown await.
+        # The owner supplies only its local process lifetime; borrowed tenant
+        # generations must not be revoked by this agent-agnostic coordinator.
+        if self._before_rollback is not None:
             try:
-                done, _pending = await asyncio.wait({task})
-                return task.result() if task in done else []
-            except asyncio.CancelledError:
-                if task.done():
-                    # Unwind already finished; swallow so the orchestrator can
-                    # re-raise the ORIGINAL boot exception (which may itself be
-                    # the CancelledError) after a complete teardown.
-                    return task.result()
-                # Otherwise keep waiting for the shielded unwind to finish.
-                continue
+                self._before_rollback()
+            except BaseException as error:
+                self.rollback_errors.append(error)
+        task = asyncio.ensure_future(self._unwind())
+        outcome = await await_owned_task(task)
+        for error in (outcome.error, outcome.cancellation):
+            if error is not None:
+                self.rollback_errors.append(error)
+        return outcome.result or []
 
 
 async def run_boot_sequence(
@@ -254,10 +252,16 @@ async def run_boot_sequence(
             for resource in phase.retained:
                 ctx.note_retained(resource)
             ctx.logger.debug("boot: committed phase '%s'", phase.name)
+        set_state(BootPhaseState.READY)
     except BaseException as exc:  # noqa: BLE001 - includes CancelledError
         failed_after = ctx.committed_phases[-1] if ctx.committed_phases else "<none>"
-        released = await ctx.run_rollback()
-        set_state(BootPhaseState.FAILED)
+        released = []
+        try:
+            released = await ctx.run_rollback()
+        except BaseException as error:
+            ctx.rollback_errors.append(error)
+        finally:
+            set_state(BootPhaseState.FAILED)
         ctx.logger.warning(
             "agent boot FAILED (last committed phase: %s; %r). "
             "Rolled back %d resource(s): %s. Retained: %s.",
@@ -267,5 +271,8 @@ async def run_boot_sequence(
             released,
             ctx.retained_resources or "none",
         )
-        raise
-    set_state(BootPhaseState.READY)
+        terminal = execution_terminal_error(exc, *ctx.rollback_errors)
+        if terminal is exc:
+            raise
+        assert terminal is not None
+        raise terminal

@@ -347,13 +347,9 @@ async def test_spawn_snapshots_mutable_mandate_before_admission_await(tmp_path):
         "restricted_tool_args": {"fetch": {"host": ["example.test"]}}
     }
     assert captured.purpose == "validated proposal"
-    await manager._release_agent_operations(
-        [
-            manager._agent_operations[
-                manager._canonical_agent_name("SnapshotChild")
-            ]
-        ]
-    )
+    # The mock body has no retirement finally. The public entry now owns
+    # that final name release too; proposal assertions above are unchanged.
+    assert manager._agent_operations == {}
 
 
 @pytest.mark.asyncio
@@ -2141,10 +2137,10 @@ async def test_final_publication_verification_cannot_finish_after_deadline(
 
     original_join = manager_module.await_lifecycle_task_completion
 
-    async def _delay_final_publication_join(task):
+    async def _delay_final_publication_join(task, *, withdrawals=None):
         if task.get_name().startswith("agent_readiness_publication_check:"):
             await asyncio.sleep(0.03)
-        return await original_join(task)
+        return await original_join(task, withdrawals=withdrawals)
 
     monkeypatch.setattr(
         manager_module,
@@ -2368,10 +2364,13 @@ async def test_expired_private_candidate_cancels_admission_owner_and_shuts_down(
         )
         await asyncio.wait_for(initialized.wait(), timeout=0.2)
         try:
-            await asyncio.sleep(0.08)
-            assert load.done(), "signed expiry must cancel the admission owner"
+            # The signed deadline revokes admission at 30ms; physical owned
+            # rollback may require several more event-loop turns. Do not
+            # confuse an actively cancelling owner with missed expiry under
+            # xdist load. Shield preserves the deadline as the sole source of
+            # cancellation; a missing expiry still fails this bounded wait.
             with pytest.raises(asyncio.CancelledError):
-                await load
+                await asyncio.wait_for(asyncio.shield(load), timeout=1.0)
         finally:
             if not load.done():
                 load.cancel()
@@ -2954,9 +2953,12 @@ async def test_spawn_join_tracks_operation_not_callers_later_work(tmp_path):
     await asyncio.sleep(0)
     release_spawn.set()
     await asyncio.wait_for(spawn_returned.wait(), timeout=1)
-    await asyncio.sleep(0)
 
     try:
+        # Completion-only lifecycle joins intentionally take their own callback
+        # turn. Assert the actual operation boundary, not a fixed tick count:
+        # the enclosing caller is still blocked on release_caller throughout.
+        await asyncio.wait_for(asyncio.shield(join), timeout=1)
         assert join.done(), "spawn join followed the enclosing caller task"
         assert join.result() == (False, [])
         assert not caller.done()
@@ -7919,6 +7921,7 @@ class TestAgentManagerBasics:
     async def test_load_from_config_cancellation_releases_every_batch_admission(
         self,
         tmp_path,
+        monkeypatch,
     ) -> None:
         """Cancellation during the first final release cannot strand its peers."""
 
@@ -7932,6 +7935,16 @@ class TestAgentManagerBasics:
             "Beta": _make_mock_agent("did:test:batch-release-beta"),
         }
         final_publication_holds_state_lock = asyncio.Event()
+        from kestrel_sovereign.multi_agent import agent_manager as manager_module
+        actual_join, withdrawals = manager_module.await_lifecycle_task_completion, []
+        async def join(task, *args, **kwargs):
+            observed = kwargs.pop("withdrawals", None)
+            observed = observed if observed is not None else []
+            previous_count = len(observed)
+            result = await actual_join(task, *args, withdrawals=observed, **kwargs)
+            withdrawals.extend(observed[previous_count:])
+            return result
+        monkeypatch.setattr(manager_module, "await_lifecycle_task_completion", join)
 
         async def initialize(name, *_args, **_kwargs):
             return agents[name]
@@ -7950,13 +7963,14 @@ class TestAgentManagerBasics:
         try:
             # The batch has committed both agents and is blocked retiring its
             # first admission. Its cancellation must join both release tasks.
-            batch.cancel()
+            batch.cancel("actual batch readiness observer withdrew")
             await asyncio.sleep(0)
         finally:
             manager._lock.release()
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as cancelled:
             await asyncio.wait_for(batch, timeout=1.0)
+        assert withdrawals and any(cancelled.value is error for error in withdrawals)
 
         assert manager.list_agents() == agents
         assert manager._agent_operations == {}
@@ -10565,8 +10579,15 @@ class TestAgentManagerBasics:
             runtime_path=Path("operator/runtime/tenant"),
             cause=IsolatedRuntimeNamespaceError("foreign owner"),
         )
+        async def actual_withdrawal():
+            asyncio.current_task().cancel("actual administrative observer withdrew")
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError as original:
+                return original
+        withdrawal = await asyncio.create_task(actual_withdrawal())
         manager._finish_agent_runtime_offboarding = AsyncMock(
-            return_value=(True, retained)
+            return_value=(True, BaseExceptionGroup("original administrative outcome", [withdrawal, retained]))
         )
 
         with pytest.raises(BaseExceptionGroup) as raised:
@@ -10576,6 +10597,7 @@ class TestAgentManagerBasics:
             isinstance(error, asyncio.CancelledError)
             for error in raised.value.exceptions
         )
+        assert [error for error in raised.value.exceptions if isinstance(error, asyncio.CancelledError)] == [withdrawal]
         assert any(
             isinstance(error, RuntimeOffboardingRetainedError)
             for error in raised.value.exceptions
@@ -13715,6 +13737,7 @@ class TestLoadFromConfig:
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    @pytest.mark.parametrize("custody_bound", [False, True])
     async def test_postgres_host_factory_wires_one_shared_pool_into_every_agent(
         self,
         mock_llm_cls,
@@ -13722,8 +13745,11 @@ class TestLoadFromConfig:
         mock_get_did,
         monkeypatch,
         tmp_path,
+        custody_bound,
     ):
         from kestrel_sovereign.storage.db.postgres import PostgresBackend
+        from kestrel_sovereign.execution_custody import ExecutionCustody
+        from tests.unit.test_execution_custody import Authority
 
         class _Pool:
             def get_max_size(self):
@@ -13734,6 +13760,7 @@ class TestLoadFromConfig:
             pool,
             advisory_dsn="postgresql://host/kestrel",
             advisory_max_pool_size=6,
+            execution_custody=ExecutionCustody(Authority()) if custody_bound else None,
         )
         mock_agent_cls.side_effect = [
             _make_mock_agent("did:tenant-a"),
@@ -13755,6 +13782,8 @@ class TestLoadFromConfig:
         assert second["pg_pool"] is pool
         assert first["shared_postgres_advisory_backend"] is host_backend
         assert second["shared_postgres_advisory_backend"] is host_backend
+        assert first["execution_custody"] is host_backend._execution_custody
+        assert second["execution_custody"] is host_backend._execution_custody
         assert host_backend._advisory_max_pool_size == 6
 
     @pytest.mark.asyncio

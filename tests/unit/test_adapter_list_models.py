@@ -135,7 +135,7 @@ class TestAnthropicAdapterListModels:
             ]
         }
 
-        with patch("httpx.AsyncClient") as mock_client:
+        with patch("kestrel_sovereign.llm.anthropic_adapter.httpx2.AsyncClient") as mock_client:
             mock_instance = AsyncMock()
             mock_instance.__aenter__.return_value.get.return_value = mock_response
             mock_client.return_value = mock_instance
@@ -160,7 +160,7 @@ class TestAnthropicAdapterListModels:
             ]
         }
 
-        with patch("httpx.AsyncClient") as mock_client:
+        with patch("kestrel_sovereign.llm.anthropic_adapter.httpx2.AsyncClient") as mock_client:
             mock_instance = AsyncMock()
             mock_instance.__aenter__.return_value.get.return_value = mock_response
             mock_client.return_value = mock_instance

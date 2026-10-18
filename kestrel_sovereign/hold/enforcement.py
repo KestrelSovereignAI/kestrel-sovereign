@@ -276,6 +276,55 @@ async def close_bound_host_context(context: Any) -> None:
     await close_host_context(context)
 
 
+async def complete_bound_agent_shutdown(
+    agent: Any, context: Any, *, prior_errors=(), withdrawals=None,
+) -> None:
+    """Retire both standalone owners before reporting their finite outcome.
+
+    A settled Agent failure is not ownership of its caller's Hold context.
+    A genuinely pending original Agent Task, however, still depends on it.
+    Neither case authorizes a replacement Agent or native closer.
+    """
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_finite_error, is_execution_control_error
+    from kestrel_sovereign.kestrel_agent import await_agent_shutdown_completion
+
+    prior, errors = list(prior_errors), []
+    observed = [] if withdrawals is None else withdrawals
+    try:
+        await await_agent_shutdown_completion(agent, withdrawals=observed, finite_errors=errors)
+    except BaseException as error:
+        # Completion observation cannot own an independently acquired context.
+        # Actual pending dependencies below still forbid early retirement.
+        errors.append(error)
+    pending = []
+    for error in (*prior, *errors):
+        for _, task in execution_cleanup_debts(error):
+            if isinstance(task, asyncio.Future) and not task.done() and task not in pending:
+                pending.append(task)
+    continuation = vars(agent).get("_durable_shutdown_continuation")
+    if isinstance(continuation, asyncio.Future) and not continuation.done() and continuation not in pending:
+        pending.append(continuation)
+    if pending:
+        debt = RuntimeError("standalone Hold context remains owned by original pending Agent cleanup")
+        debt._kestrel_native_retirement_debts = tuple((context, task) for task in pending)
+        errors.append(debt)
+    else:
+        try:
+            await close_bound_host_context(context)
+        except BaseException as error:
+            errors.append(error)
+    originals = [*prior, *errors, *observed]
+    if not any(is_execution_control_error(error) for error in originals):
+        # Initial ordinary shutdown errors were already logged by CLI/main.
+        # Keep that compatibility when later physical completion succeeds;
+        # a later native outcome instead needs ALL of the finite originals.
+        originals = [*(error for error in prior if not isinstance(error, Exception)), *errors, *observed]
+    terminal = execution_finite_error(*originals, retain_originals=True,
+                                       prefer_cancellation=True, isolate_control_originals=True)
+    if terminal is not None:
+        raise terminal
+
+
 async def _close_context_after_startup_failure(
     context: Any,
     startup_failure: BaseException,
@@ -284,16 +333,14 @@ async def _close_context_after_startup_failure(
 ) -> None:
     """Join context cleanup before propagating a failed startup phase."""
 
-    from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
+    from kestrel_sovereign.execution_custody import execution_finite_error
 
-    close_task = asyncio.create_task(
-        close_bound_host_context(context),
-        name=f"hold_context:{phase}:close",
-    )
-    cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
-        close_task
-    )
-    if cleanup_failure is not None:
+    # The shared context drain already registers and physically joins every
+    # original native closer through withdrawal. An extra collector Task here
+    # would add a new refusal boundary before that actual resource inventory.
+    try:
+        await close_bound_host_context(context)
+    except BaseException as cleanup_failure:
         logger.warning(
             "Hold context cleanup failed after %s: %s",
             phase,
@@ -304,8 +351,10 @@ async def _close_context_after_startup_failure(
                 cleanup_failure.__traceback__,
             ),
         )
-    if cleanup_cancelled and not isinstance(startup_failure, asyncio.CancelledError):
-        raise asyncio.CancelledError() from startup_failure
+        raise execution_finite_error(
+            startup_failure, cleanup_failure,
+            retain_originals=True, prefer_cancellation=True, isolate_control_originals=True,
+        )
 
 
 async def initialize_with_bound_hold_context(

@@ -16,6 +16,8 @@ import importlib.metadata
 import logging
 from typing import Callable, Dict, List, Tuple, Type
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +54,8 @@ def discover_entry_point_callables(group: str) -> List[Tuple[str, Callable]]:
     try:
         eps = importlib.metadata.entry_points()
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.warning("Failed to read entry_points: %s", e)
         return callables
 
@@ -76,6 +80,8 @@ def discover_entry_point_callables(group: str) -> List[Tuple[str, Callable]]:
                 group, ep.name, ep.value,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning("Failed to load entry_point '%s' from group '%s': %s", ep.name, group, e)
 
     return callables
@@ -104,6 +110,8 @@ def discover_entry_point_classes(
     try:
         eps = importlib.metadata.entry_points()
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.warning("Failed to read entry_points: %s", e)
         return classes
 
@@ -128,6 +136,8 @@ def discover_entry_point_classes(
                 group, ep.name, ep.value,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning("Failed to load entry_point '%s' from group '%s': %s", ep.name, group, e)
 
     return classes

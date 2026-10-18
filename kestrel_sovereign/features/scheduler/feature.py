@@ -57,6 +57,7 @@ Tools:
 """
 
 import json
+from kestrel_sovereign.execution_custody import is_execution_control_error
 import logging
 import time
 import uuid
@@ -356,6 +357,16 @@ class SchedulerFeature(Feature):
             misfire_grace_seconds=self._load_misfire_grace_seconds(),
             max_concurrent_tasks=self._load_max_concurrent_tasks(),
             lease_seconds=self._load_lease_seconds(),
+            runtime_task_factory=(
+                self.agent._track_runtime_task
+                if callable(getattr(type(self.agent), "_track_runtime_task", None))
+                else None
+            ),
+            occurrence_task_factory=(
+                self.agent._track_background_task
+                if callable(getattr(type(self.agent), "_track_background_task", None))
+                else None
+            ),
             failure_alert_threshold=self._load_failure_alert_threshold(),
         )
         await self._runner.start(polling=False)
@@ -863,6 +874,8 @@ class SchedulerFeature(Feature):
                         },
                     )
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.error(
                 "Failed to ensure built-in schedule %s: %s",
                 task_name,
@@ -1378,6 +1391,8 @@ class SchedulerFeature(Feature):
                 ),
             )
         except Exception as error:  # noqa: BLE001 - fail closed at the data boundary
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "Scheduler: semantic maintenance readiness failed for training_cycle: %s",
                 type(error).__name__,
@@ -1438,7 +1453,9 @@ class SchedulerFeature(Feature):
                 continue
             try:
                 owned = {getattr(t, "name", None) for t in feature.get_tools()}
-            except Exception:  # noqa: BLE001 - a broken feature can't block others
+            except Exception as control_error:  # noqa: BLE001 - a broken feature can't block others
+                if is_execution_control_error(control_error):
+                    raise
                 continue
             if task_name in owned:
                 return declared[task_name]
@@ -1552,7 +1569,9 @@ class SchedulerFeature(Feature):
                 continue
             try:
                 disabled_tools = feature.get_tools()
-            except Exception:  # noqa: BLE001 - a broken feature can't block others
+            except Exception as control_error:  # noqa: BLE001 - a broken feature can't block others
+                if is_execution_control_error(control_error):
+                    raise
                 continue
             if any(getattr(t, "name", None) == task_name for t in disabled_tools):
                 return (
@@ -1684,7 +1703,9 @@ class SchedulerFeature(Feature):
             try:
                 for agent_tool in feature.get_tools():
                     names.add(agent_tool.name)
-            except Exception:
+            except Exception as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 # A misbehaving feature must not block validation of
                 # everything else; skip it -- but log it, because a
                 # silent skip drops that feature's task names from the
@@ -1747,7 +1768,9 @@ class SchedulerFeature(Feature):
                 continue
             try:
                 tools = feature.get_tools()
-            except Exception:
+            except Exception as control_error:
+                if is_execution_control_error(control_error):
+                    raise
                 # A misbehaving feature must not block creation validation.
                 continue
             for agent_tool in tools:
@@ -1756,7 +1779,9 @@ class SchedulerFeature(Feature):
                         level = await store.get_permission(
                             feature_name, agent_tool.name
                         )
-                    except Exception:
+                    except Exception as control_error:
+                        if is_execution_control_error(control_error):
+                            raise
                         return False
                     return level == PermissionLevel.DENY
         return False
@@ -1869,7 +1894,9 @@ class SchedulerFeature(Feature):
                 skip_consolidation=skip_consolidation,
                 skip_reflection=skip_reflection,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as control_error:  # noqa: BLE001
+            if is_execution_control_error(control_error):
+                raise
             # The local feature log is the trusted diagnostic boundary. The
             # scheduled result crosses into signal/task audit stores, where it
             # must remain content-free and bounded.
@@ -1966,6 +1993,8 @@ class SchedulerFeature(Feature):
             # New message since the last episode (or no episode yet) → active.
             return last_ep is None or last_msg > last_ep
         except Exception as e:  # noqa: BLE001 - never wrongly skip on error
+            if is_execution_control_error(e):
+                raise
             logger.debug("[sleep] activity check failed (assuming active): %s", e)
             return True
 
@@ -2026,6 +2055,8 @@ class SchedulerFeature(Feature):
                 try:
                     durable_purged = await purge_durable()
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     logger.warning(
                         "[retention] durable signal cleanup failed for agent=%s: %s",
                         self._agent_id,
@@ -2083,6 +2114,8 @@ class SchedulerFeature(Feature):
                 cutoff_iso, max_rows=max_rows, reason="retention-janitor",
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "[retention] agent=%s sweep failed: %s", self._agent_id, e,
             )
@@ -2138,6 +2171,8 @@ class SchedulerFeature(Feature):
             store = OperatorNoticeAuditStore(db, agent_did)
             return await store.purge_expired()
         except Exception as exc:  # noqa: BLE001 - never block the sweep
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "[retention] operator notice audit cleanup failed for "
                 "agent=%s: %s",
@@ -2360,6 +2395,8 @@ class SchedulerFeature(Feature):
             enq = dispatcher.enqueue_signal(signal)
             handle = await enq if hasattr(enq, "__await__") else enq
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning("%s: enqueue_signal raised: %s", label, e)
             return {
                 "blocked": "dispatch_error",
@@ -2379,6 +2416,8 @@ class SchedulerFeature(Feature):
                 ),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # No supervisor means nothing will ever advance the checkpoint,
             # and leaving the in-flight guard set would wedge this watch for
             # the process lifetime. Release it and report honestly.
@@ -2467,6 +2506,8 @@ class SchedulerFeature(Feature):
         try:
             raw_result = await self._lookup_and_run_tool(tool_name, tool_args)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             return json.dumps({
                 "signaled": False,
                 "blocked": "tool_error",
@@ -2753,6 +2794,8 @@ class SchedulerFeature(Feature):
                 (self._agent_id,),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to list scheduled tasks: %s", e)
             return ToolResult.failed(str(e))
 
@@ -2844,6 +2887,8 @@ class SchedulerFeature(Feature):
                 **scheduler_status_parameters(self),
             )
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "Failed to inspect scheduler runtime status: %s",
                 type(error).__name__,
@@ -3557,6 +3602,8 @@ class SchedulerFeature(Feature):
                     # schedule exists when persistence did not happen.
                     return ToolResult.failed("Failed to persist scheduled task")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to add scheduled task: %s", e)
             return ToolResult.failed(str(e))
 
@@ -3647,6 +3694,8 @@ class SchedulerFeature(Feature):
                     task_id, "schedule removed before outcome commit"
                 )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to remove task %s: %s", task_id, e)
             return ToolResult.failed(str(e))
 
@@ -3711,6 +3760,7 @@ class SchedulerFeature(Feature):
 
                 claim_fenced = bool(row[2]) if len(row) > 2 else False
                 rollout_fenced = bool(row[3]) if len(row) > 3 else False
+                unresolved = await self._has_unresolved_execution(task_id)
                 if not row[1] and not claim_fenced and not rollout_fenced:
                     return ToolResult.ok(
                         confirmation=f"Task {task_id} was already paused (no-op)",
@@ -3721,13 +3771,16 @@ class SchedulerFeature(Feature):
                     """
                     UPDATE scheduled_tasks
                     SET enabled = 0, lease_owner = NULL, lease_expires_at = NULL,
-                        claim_token = NULL, claim_execution_id = NULL,
-                        claim_scheduled_for = NULL, scheduler_claim_fenced = 0,
+                        claim_token = NULL,
+                        claim_execution_id = CASE WHEN ? = 1 THEN claim_execution_id ELSE NULL END,
+                        claim_scheduled_for = CASE WHEN ? = 1 THEN claim_scheduled_for ELSE NULL END,
+                        terminal_status = CASE WHEN ? = 1 THEN 'unresolved_effect' ELSE terminal_status END,
+                        scheduler_claim_fenced = 0,
                         scheduler_rollout_fenced = 0,
                         scheduler_rollout_fenced_at = NULL
                     WHERE id = ? AND agent_id = ?
                     """,
-                    (task_id, self._agent_id),
+                    (int(unresolved), int(unresolved), int(unresolved), task_id, self._agent_id),
                 )
                 if not self._scheduler_mutation_wrote(paused):
                     return ToolResult.failed("Failed to pause scheduled task")
@@ -3735,6 +3788,8 @@ class SchedulerFeature(Feature):
                     task_id, "schedule paused before outcome commit"
                 )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to pause task %s: %s", task_id, e)
             return ToolResult.failed(str(e))
 
@@ -3809,6 +3864,11 @@ class SchedulerFeature(Feature):
                 run_at = row[4] if len(row) > 4 else None
                 timezone_name = row[5] if len(row) > 5 and row[5] else "UTC"
                 terminal_status = row[6] if len(row) > 6 else None
+                if terminal_status == "unresolved_effect" or await self._has_unresolved_execution(task_id):
+                    return ToolResult.failed(
+                        f"Task {task_id} has an unresolved dispatched effect; reconcile its execution log before resuming",
+                        data={"task_id": task_id, "disabled_reason": "unresolved_effect", "recoverable": False},
+                    )
                 if terminal_status == "invalid_idempotency_key":
                     return ToolResult.failed(
                         f"Task {task_id} has an invalid persisted idempotency key; "
@@ -3910,6 +3970,8 @@ class SchedulerFeature(Feature):
                 if not self._scheduler_mutation_wrote(resumed):
                     return ToolResult.failed("Failed to resume scheduled task")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to resume task %s: %s", task_id, e)
             return ToolResult.failed(str(e))
 
@@ -4008,6 +4070,11 @@ class SchedulerFeature(Feature):
                     )
 
                 old_cron = row[0]
+                if await self._has_unresolved_execution(task_id):
+                    return ToolResult.failed(
+                        f"Task {task_id} has an unresolved dispatched effect; reconcile it before changing its occurrence",
+                        data={"task_id": task_id, "disabled_reason": "unresolved_effect"},
+                    )
                 claim_fenced = bool(row[4]) if len(row) > 4 else False
                 rollout_fenced = bool(row[5]) if len(row) > 5 else False
                 if rollout_fenced:
@@ -4075,6 +4142,8 @@ class SchedulerFeature(Feature):
                     status="superseded",
                 )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to update task %s: %s", task_id, e)
             return ToolResult.failed(str(e))
 
@@ -4097,6 +4166,14 @@ class SchedulerFeature(Feature):
                 "next_run_at": next_run_at,
             },
         )
+
+    async def _has_unresolved_execution(self, task_id: str) -> bool:
+        if self._database_backend_type() not in {"postgres", "sqlite"}:
+            return False
+        return bool(await self._db.fetchone(
+            "SELECT id FROM task_execution_log WHERE task_id = ? AND agent_id = ? AND status = 'executing' LIMIT 1",
+            (task_id, self._agent_id),
+        ))
 
     async def _cancel_claimed_executions(
         self,
@@ -4494,6 +4571,8 @@ class SchedulerFeature(Feature):
                 if not self._scheduler_mutation_wrote(updated):
                     return ToolResult.failed("Failed to record scheduler outcome")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to record outcome for %s: %s", execution_id, e)
             return ToolResult.failed(str(e))
 
@@ -4575,6 +4654,8 @@ class SchedulerFeature(Feature):
                 (since, self._agent_id),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to aggregate engagement: %s", e)
             return ToolResult.failed(str(e))
 
@@ -4626,6 +4707,8 @@ class SchedulerFeature(Feature):
                 (self._agent_id, limit),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to get execution history: %s", e)
             return ToolResult.failed(str(e))
 
@@ -4694,6 +4777,8 @@ class SchedulerFeature(Feature):
                 (self._agent_id, SELF_FOLLOWUP_TASK_NAME, limit),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("Failed to list self-followup schedules: %s", e)
             return ToolResult.failed(str(e))
 
@@ -4744,6 +4829,8 @@ class SchedulerFeature(Feature):
                     (task_id, self._agent_id),
                 )
             except Exception as e:  # noqa: BLE001 - one bad row must not hide the rest
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Failed to read execution log for follow-up %s: %s",
                     task_id, e,

@@ -25,6 +25,17 @@ import threading
 from types import MappingProxyType
 from typing import Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
+from kestrel_sovereign._async_ownership import create_owned_task, owned_task_error
+from kestrel_sovereign.execution_custody import (
+    await_execution_work,
+    current_execution_custody,
+    execution_terminal_error,
+    is_execution_control_error,
+    is_scope_local_execution_control,
+    require_execution_work,
+    retained_execution_error,
+)
+
 from .model_metadata import ModelInfo
 
 logger = logging.getLogger(__name__)
@@ -180,11 +191,29 @@ class SharedModelCache:
         self._lock = threading.Lock()
         self._refresh_task: Optional[asyncio.Task] = None
         self._refresh_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._refresh_error: Optional[BaseException] = None
+
+    def _observe_refresh_control_locked(self, task=None) -> Optional[BaseException]:
+        """Retain one strongest original receipt; the caller holds the lock."""
+        task = self._refresh_task if task is None else task
+        if task is not None and task.done():
+            error = owned_task_error(task)
+            if (is_execution_control_error(error) and not is_scope_local_execution_control(
+                error, getattr(task, "_kestrel_model_refresh_scopes", ()),
+            )):
+                self._refresh_error = execution_terminal_error(self._refresh_error, error)
+        return self._refresh_error
+
+    def _raise_refresh_control_locked(self) -> None:
+        error = self._observe_refresh_control_locked()
+        if error is not None:
+            raise retained_execution_error(error)
 
     def snapshot(self) -> Optional[ModelCatalogSnapshot]:
         """Return the current snapshot regardless of freshness, or None if
         nothing has been published."""
         with self._lock:
+            self._raise_refresh_control_locked()
             return self._snapshot
 
     def fresh_snapshot(self) -> Optional[ModelCatalogSnapshot]:
@@ -224,7 +253,9 @@ class SharedModelCache:
         observed. Omitted, the catalog was not produced by a refresh, and the
         snapshot carries the previous one's failures.
         """
+        require_execution_work()
         with self._lock:
+            self._raise_refresh_control_locked()
             self._publish(models, outcomes, time.time())
             logger.debug(
                 "Shared model cache updated: %d models (snapshot %d)",
@@ -239,7 +270,9 @@ class SharedModelCache:
         cache holds no discovery outcomes, so this snapshot carries the
         previous one's failures.
         """
+        require_execution_work()
         with self._lock:
+            self._raise_refresh_control_locked()
             if self._snapshot is not None and self._snapshot.models is not None:
                 return  # Don't overwrite fresh data with stale
             self._publish(models, None, 0.0)
@@ -276,6 +309,7 @@ class SharedModelCache:
         Returns whether the snapshot reports ``failures``: ``False`` only when
         the catalog has been replaced.
         """
+        require_execution_work()
         for vendor, outcome in failures.items():
             if outcome.status is not DiscoveryStatus.FAILED:
                 raise ValueError(
@@ -283,6 +317,7 @@ class SharedModelCache:
                     f"got {outcome.status.value}"
                 )
         with self._lock:
+            self._raise_refresh_control_locked()
             current = self._snapshot
             if current is None or current.catalog_version != catalog_version:
                 return False
@@ -342,7 +377,10 @@ class SharedModelCache:
         an already-running refresh without awaiting provider network calls.
         """
         loop = asyncio.get_running_loop()
+        require_execution_work()
+        captured_scopes = current_execution_custody()
         with self._lock:
+            self._raise_refresh_control_locked()
             if self._refresh_task is not None and not self._refresh_task.done():
                 owner_loop = self._refresh_loop
                 # Test harnesses and embedded hosts can replace their event
@@ -357,24 +395,23 @@ class SharedModelCache:
                 # Let the latency-sensitive response serialize before provider
                 # discovery starts doing synchronous SDK/catalog setup.
                 await asyncio.sleep(0.05)
-                return await refresh_factory()
+                return await await_execution_work(self, refresh_factory)
 
-            task = loop.create_task(_deferred_refresh())
+            task = create_owned_task(_deferred_refresh(), loop=loop, retain_originals=True)
+            task._kestrel_model_refresh_scopes = captured_scopes
             self._refresh_task = task
             self._refresh_loop = loop
 
         def _finished(done: asyncio.Task) -> None:
-            try:
-                done.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.warning("Background model discovery refresh failed", exc_info=True)
-            finally:
-                with self._lock:
-                    if self._refresh_task is done:
-                        self._refresh_task = None
-                        self._refresh_loop = None
+            error = owned_task_error(done)
+            with self._lock:
+                self._observe_refresh_control_locked(done)
+                if self._refresh_task is done:
+                    self._refresh_task = None
+                    self._refresh_loop = None
+            if error is not None and not isinstance(error, asyncio.CancelledError):
+                logger.warning("Background model discovery refresh failed",
+                               exc_info=(type(error), error, error.__traceback__))
 
         task.add_done_callback(_finished)
         return True
@@ -391,6 +428,7 @@ class SharedModelCache:
         """
         loop = asyncio.get_running_loop()
         with self._lock:
+            self._raise_refresh_control_locked()
             task = self._refresh_task
             owner_loop = self._refresh_loop
             if task is None or task.done() or owner_loop is not loop:
@@ -398,17 +436,24 @@ class SharedModelCache:
 
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
+        except BaseException as error:
+            source_error = owned_task_error(task) if task.done() else None
+            if is_execution_control_error(source_error) or is_execution_control_error(error):
+                # The shared source latch keeps only the original owner, not
+                # each waiter's finite withdrawal/error projection.
+                with self._lock:
+                    self._observe_refresh_control_locked(task if task.done() else None)
+                raise execution_terminal_error(source_error, error, retain_originals=True,
+                                               isolate_control_originals=True)
             # Explicit cache invalidation may cancel the shared refresh. Do not
             # turn that internal cancellation into cancellation of the caller;
             # cancellation of the caller itself must still propagate.
-            if task.cancelled():
+            if isinstance(error, asyncio.CancelledError) and task.cancelled():
+                return False
+            if isinstance(error, Exception):
+                # Only ordinary availability may become a foreground miss.
                 return False
             raise
-        except Exception:
-            # The refresh callback logs the provider failure. The caller can
-            # now perform its normal foreground discovery/fallback.
-            return False
         return True
 
     def clear(self) -> None:

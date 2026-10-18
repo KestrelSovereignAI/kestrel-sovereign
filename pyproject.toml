@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.53.27"
+version = "0.53.28"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -407,6 +407,7 @@ testpaths = ["tests"]
 norecursedirs = ["scripts", ".venv", "*.egg-info", ".git", "node_modules"]
 addopts = "-x --tb=short"
 markers = [
+    "native_postgres: Resolved native_pg fixture consumers; mandatory isolated PostgreSQL CI lane",
     "e2e: marks tests as end-to-end (slow)",
     "integration: marks tests as integration tests",
     "load: Load/stress tests (opt-in with --run-load)",

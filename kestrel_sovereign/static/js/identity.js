@@ -1307,6 +1307,8 @@ async function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view, nex
     // this fires on.
     const generation = autoTargetPane.generation;
     const stillOwned = () => walk === autoLoadWalkSeq
+        && conversationsHandle?.view === 'active'
+        && API.hasCapability('conversations')
         && currentAgentMatches(autoTargetAgent)
         && state.chatPanes.get(autoTargetAgent) === autoTargetPane
         && autoTargetPane.generation === generation
@@ -1347,6 +1349,7 @@ async function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view, nex
         auto: true,
         expectedAgent: autoTargetAgent,
         expectedGeneration: generation,
+        isCurrentAutoLoad: stillOwned,
     });
 }
 
@@ -1458,6 +1461,11 @@ function ensureConversationsMount() {
         onNewConversation: () => startNewConversationForPane(),
         onSelect: (conv, ctx) => {
             window.loadConversation(conv.session_id, { expectedAgent: ctx.agentName });
+        },
+        onLoadStart: () => {
+            // Replacement data may be slow or fail. Retire an old pagination
+            // walk at request START, not only when onLoaded later fires.
+            autoLoadWalkSeq += 1;
         },
         onLoaded: (conversations, ctx) => {
             maybeAutoLoadMostRecent(conversations, ctx.agentName, ctx.view, ctx.nextCursor);
@@ -1709,6 +1717,14 @@ function legacyToolEventsFromText(content) {
 }
 
 window.loadConversation = async function(sessionId, options = {}) {
+    // Preserve the original list/walk owner through this function's own
+    // awaits. Agent and pane generation alone do not observe a replacement
+    // list, view switch or capability retirement. Explicit row clicks keep
+    // their existing semantics; legacy auto callers retain pane guards below.
+    const ownsAutoSource = () => !options.auto
+        || !Object.prototype.hasOwnProperty.call(options, 'isCurrentAutoLoad')
+        || (typeof options.isCurrentAutoLoad === 'function' && options.isCurrentAutoLoad());
+    if (!ownsAutoSource()) return;
     // Stale-load guard: when a row load was queued for one agent and the
     // operator has since selectAgent'd to a different host, the queued
     // session_id is no longer addressable on the new agent — running this
@@ -1795,12 +1811,11 @@ window.loadConversation = async function(sessionId, options = {}) {
     }
 
     // Load conversation messages into chat panel
+    let didCommit = false;
     try {
         const data = await API.getConversation(sessionId, state.showDecrypted);
+        if (!ownsAutoSource()) return;
         const messages = data.messages || [];
-        if (data.encrypted_at_rest !== undefined) {
-            state.encryptedAtRest = data.encrypted_at_rest;
-        }
 
         // Post-await stale-agent re-check: the operator may have
         // switched host agents while ``getConversation`` was in flight.
@@ -1830,6 +1845,7 @@ window.loadConversation = async function(sessionId, options = {}) {
         } catch (e) {
             restartEvents = [];
         }
+        if (!ownsAutoSource()) return;
 
         // Superseded-load check: if the operator selected ANOTHER conversation
         // while this one's fetches were in flight, the later call holds the
@@ -1878,6 +1894,7 @@ window.loadConversation = async function(sessionId, options = {}) {
         // explicit clicks (no `auto` flag) skip this guard: the user's
         // intent to switch conversations is overriding.
         if (options.auto) {
+            if (!ownsAutoSource()) return;
             const pane = state.chatPanes.get(currentAgent);
             // `awaitingNewSession` catches the claim that arrives DURING these
             // awaits without a wipe to bump the generation — the fallback
@@ -1909,6 +1926,10 @@ window.loadConversation = async function(sessionId, options = {}) {
         // synchronous, so the selection, the highlight (#2222), and the pane
         // switch land atomically — the sidebar can never show a session the
         // composer isn't anchored to (#2380 codex round 8 P1).
+        didCommit = true;
+        if (data.encrypted_at_rest !== undefined) {
+            state.encryptedAtRest = data.encrypted_at_rest;
+        }
         activeConversationId = sessionId;
         activeConversationIdsByAgent.set(host, sessionId);
         applyHighlight(sessionId);
@@ -2154,6 +2175,7 @@ window.loadConversation = async function(sessionId, options = {}) {
         // session's utilization until an unrelated refresh fires (#2380).
         updateContextStatus();
     } catch (e) {
+        if (!didCommit && !ownsAutoSource()) return;
         console.error('Failed to load conversation:', e);
         // Roll the selection back to the session the pane actually renders —
         // the clicked row never loaded, so leaving it highlighted would let
