@@ -332,6 +332,13 @@ real database-clock expiry, subsequent takeover and stale-owner fencing. They
 do not promise two-second response/renewal performance under arbitrary load or
 retroactively establish the ordering of an earlier uninstrumented CI failure.
 
+Native HTTP sends capture their original custody and validator inventory before
+request observers execute. Mutable request extensions are descriptive transport
+metadata, never dispatch authority. The final native dispatch and response-body
+owner use the privately retained send admission, including concurrent/nested
+sends and redirects on a shared client. Clearing or replacing extensions cannot
+authorize a request after the original policy retires.
+
 Private host ingress has a caller-local Core admission rooted before task
 publication. Backend observation follows actual joined task lineage, not mere
 ContextVar inheritance into resident readers or supervisors. Native failure

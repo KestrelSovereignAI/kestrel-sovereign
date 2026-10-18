@@ -1173,8 +1173,19 @@ def retain_native_execution_http_client_close(client: Any) -> None:
     if getattr(client, "_kestrel_native_close_hook", None) is not None:
         return
 
+    # Transport extensions are observer-mutable descriptive metadata. Capture
+    # each original send's authority privately, including across redirects and
+    # nested/concurrent calls on this same shared native client.
+    send_admission = ContextVar("kestrel_original_native_http_send", default=None)
+
+    def original_admission():
+        admission = send_admission.get()
+        if admission is None:
+            raise ExecutionAuthorityError("native HTTP dispatch has no original send admission")
+        return admission
+
     async def retain_response(response):
-        captured = response.request.extensions.get("kestrel.execution_custody", current_execution_custody())
+        captured, _validators = original_admission()
         if not isinstance(response.stream, _CustodyHTTPBody):
             response.stream = _CustodyHTTPBody(response, captured)
         retain_native_execution_stream_close(response)
@@ -1189,8 +1200,9 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         # A native SDK must not spend an already-revoked admission, even if
         # a caller enabled internal retry or automatic function-call dispatch.
         # Check THAT request's active scope, never the client's first caller.
-        request.extensions["kestrel.execution_custody"] = current_execution_custody()
-        request.extensions["kestrel.native_admission"] = _NATIVE_ADMISSION_VALIDATORS.get()
+        captured, validators = original_admission()
+        request.extensions["kestrel.execution_custody"] = captured
+        request.extensions["kestrel.native_admission"] = validators
         require_original_native_work()
 
     native_dispatch = client._send_single_request
@@ -1200,20 +1212,25 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         # The SDK's retry/normalization boundary surrounds HTTPX.send, not
         # only the socket dispatch. Async response observers and eager body
         # reads can fail AFTER a real effect, before an SDK sees the result.
+        token = send_admission.set((current_execution_custody(), _NATIVE_ADMISSION_VALIDATORS.get()))
         try:
-            return await native_send(*args, **kwargs)
-        except BaseException as original:
-            sink = _NATIVE_RESPONSE_SINK.get()
-            if sink is not None:
-                sink.retain_control(original)
-            raise
+            try:
+                return await native_send(*args, **kwargs)
+            except BaseException as original:
+                sink = _NATIVE_RESPONSE_SINK.get()
+                if sink is not None:
+                    sink.retain_control(original)
+                raise
+        finally:
+            send_admission.reset(token)
 
     async def dispatch_after_observers(request):
         # HTTPX runs every request observer before this native boundary. A
         # check at the beginning of that list cannot admit the final dispatch.
-        with bind_execution_custody_snapshot(request.extensions.get("kestrel.execution_custody", ())):
+        captured, validators = original_admission()
+        with bind_execution_custody_snapshot(captured):
             require_original_native_work()
-            for validator in request.extensions.get("kestrel.native_admission", ()):
+            for validator in validators:
                 await validator()
             require_original_native_work()
             return await native_dispatch(request)
