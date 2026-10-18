@@ -1663,13 +1663,13 @@ class _ExecutionForwarder:
                 with self._turn_scope.bind():
                     await require_native_execution_admission(self._runtime_owner)
                 if self._iterator is None:
-                    from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+                    from kestrel_sovereign._async_ownership import create_owned_iterator
                     from kestrel_sovereign.llm.call_progress import (
                         inherit_call_progress,
                     )
                     inherit_call_progress(self._owner_context)
                     with self._turn_scope.bind():
-                        self._iterator = OwnedAsyncIterator(
+                        self._iterator = await create_owned_iterator(
                             self._produce, operation="execution-stream-forward",
                             owner_context=self._owner_context,
                             owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
@@ -1684,12 +1684,6 @@ class _ExecutionForwarder:
         except BaseException as error:
             # Admission can fail while ENTERING the original binding, before
             # the next native pull. The suspended producer still has to retire.
-            failed_iterator = getattr(error, "_kestrel_failed_owned_iterator", None)
-            if self._iterator is None and failed_iterator is not None:
-                try:
-                    await failed_iterator.aclose()
-                except BaseException as cleanup_error:
-                    error = execution_terminal_error(error, cleanup_error, retain_originals=True)
             try:
                 await self.aclose()
             except BaseException as cleanup_error:

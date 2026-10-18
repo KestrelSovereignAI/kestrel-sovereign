@@ -24,7 +24,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
-from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign._async_ownership import create_owned_iterator
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
@@ -1014,7 +1014,7 @@ async def stream_agent_response(request: Request):
                     stop_notice_emitted = True
                     return
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
-                agent_stream = OwnedAsyncIterator(
+                agent_stream = await create_owned_iterator(
                     lambda: agent.process_input_streaming(
                         user_input,
                         model_override=model_override,

@@ -52,7 +52,7 @@ from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
     bind_request_operation_if_supported,
 )
-from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign._async_ownership import create_owned_iterator
 from kestrel_sovereign.endpoints.closing_streaming_response import (
     ClosingStreamingResponse,
 )
@@ -426,7 +426,7 @@ def get_router() -> APIRouter:
                 # strip it before serializing each chunk into the
                 # bridge SSE event payload.
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
-                agent_stream = OwnedAsyncIterator(
+                agent_stream = await create_owned_iterator(
                     lambda: agent.process_input_streaming(
                         user_input,
                         model_override=body.model_override,
