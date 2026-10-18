@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
+
 
 def _prepare_app(agent):
     from server import app
@@ -118,10 +120,17 @@ def test_constitution_endpoint_returns_text_hash_and_metadata():
     "https://" + "a" * 64 + ".example/avatar.png",
     "https://.example/avatar.png",
     "https://bad\ud800.example/avatar.png",
+    "https://01.2.3.4/avatar.png",
+    "https://1。2。3。04/avatar.png",
+    "https://public.example/avatar\ud800.png",
 ])
 def test_avatar_url_rejection_uses_shared_policy_before_transport_creation(url, monkeypatch):
     from kestrel_sdk.security import outbound
 
+    def unexpected_dns(*args, **kwargs):
+        pytest.fail("malformed or literal private avatar URL reached DNS")
+
+    monkeypatch.setattr("socket.getaddrinfo", unexpected_dns)
     store_avatar = AsyncMock()
     agent = SimpleNamespace(agent_id="did:test:avatar", storage=SimpleNamespace(files=SimpleNamespace(store_avatar=store_avatar)))
     factory = MagicMock(side_effect=AssertionError("unsafe URL reached HTTP transport"))

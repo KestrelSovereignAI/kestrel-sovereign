@@ -96,6 +96,7 @@ def test_did_fetch_enforces_the_real_peer_certificate(outbound_tls):
     assert peer.requests == []
 
 
+@pytest.mark.usefixtures("isolated_process_rate_limiter")
 @pytest.mark.parametrize("path,status", [("/avatar.png", 200), ("/redirect", 400)])
 def test_avatar_uses_real_tls_and_refuses_http_redirects(outbound_tls, path, status):
     peer = outbound_tls
