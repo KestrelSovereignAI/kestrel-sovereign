@@ -314,6 +314,16 @@ closer) before observer publication. A live worker with no admitted closer is
 unresolved retirement, not a completed close; later probes cannot retry it or
 discard its original control while that worker remains live.
 
+SQLite diagnostic success tests control the before-deadline schedule with the
+existing pinned loop clock, while joining the real native worker under an
+independent thread-based hang guard. Only physical retirement permits advancing
+the worker poll; snapshot, backup-destination and primary closes share this test
+driver without replacing the original close Task or deadline. Deliberate expiry
+tests cross the captured production deadline while the original worker is held
+and require the overrun diagnostic and retained owner before releasing it. These
+tests do not promise real-time disk performance under arbitrary CI load or change
+the production shutdown budget; the broader operational #3460 remains separate.
+
 Private host ingress has a caller-local Core admission rooted before task
 publication. Backend observation follows actual joined task lineage, not mere
 ContextVar inheritance into resident readers or supervisors. Native failure

@@ -10,6 +10,7 @@ import asyncio
 import logging
 import re
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -17,13 +18,69 @@ import pytest
 import kestrel_sovereign.storage.db.sqlite as sqlite_backend_module
 from kestrel_sovereign.storage.db import ConnectionError, SQLiteBackend
 from tests.utils.aiosqlite_workers import (
+    CloseStage,
     aiosqlite_worker,
     delay_aiosqlite_worker_exit,
+    observe_bounded_close_stages,
+)
+from tests.utils.virtual_clock import (
+    HANG_GUARD_SECONDS as _HANG_GUARD_SECONDS,
+    await_within_hang_guard,
+    pinned_loop_clock,
+    wait_for_thread_event,
 )
 
-# Bound for awaits that must finish promptly. Generous, so a GC pause on a
-# loaded xdist worker cannot fail a passing test.
-_HANG_GUARD_SECONDS = 30.0
+
+@asynccontextmanager
+async def _normal_close_schedule():
+    """Exercise real closes before their deadlines, not a disk-speed claim.
+
+    Pin before the enclosing operation captures its deadline. Each original
+    close and worker must actually finish; only then wake its worker poll.
+    Thread-based guards bound real hangs independently of the pinned clock.
+    """
+    owners = []
+    workers = []
+    try:
+        with observe_bounded_close_stages() as stages, pinned_loop_clock() as clock:
+            async def finish(connection, operation):
+                worker = aiosqlite_worker(connection)
+                workers.append(worker)
+                close_task = asyncio.create_task(operation)
+                owners.append(close_task)
+                await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
+                deadline = stages.deadlines[connection]
+                join_task = asyncio.create_task(
+                    asyncio.to_thread(worker.join, _HANG_GUARD_SECONDS)
+                )
+                owners.append(join_task)
+                await await_within_hang_guard(
+                    join_task, step="the original SQLite worker retiring"
+                )
+                assert not worker.is_alive()
+                clock.advance(sqlite_backend_module._AIOSQLITE_WORKER_SHUTDOWN_POLL_S * 1.1)
+                assert clock.time() < deadline
+                return await await_within_hang_guard(
+                    close_task, step="the original SQLite close completing"
+                )
+
+            yield finish
+    finally:
+        # Restore the real clock before settling existing owners on failure.
+        # Never start another native close or cancel its cleanup to get out.
+        if owners:
+            await await_within_hang_guard(
+                asyncio.gather(*owners, return_exceptions=True),
+                step="settling the original SQLite close/join owners",
+            )
+        for worker in workers:
+            assert not worker.is_alive(), "original SQLite worker did not retire"
+
+
+async def _normal_backend_close(backend):
+    connection = backend._ensure_connected()
+    async with _normal_close_schedule() as finish:
+        await finish(connection, backend.close())
 
 # The patched worker-shutdown window. Close budgets add one 10ms poll to it.
 _SHORT_WINDOW_S = 0.05
@@ -124,16 +181,31 @@ async def test_slow_close_reports_elapsed_budget_and_wal_size(
     page_size = await _page_size(backend)
     wal_bytes = Path(f"{db_path}-wal").stat().st_size
     assert wal_bytes > 0
-    connection, _entered, release = _block_close(backend)
+    connection, entered, release = _block_close(backend)
     worker = aiosqlite_worker(connection)
+    close_task = None
     try:
-        with caplog.at_level(logging.WARNING, logger=sqlite_backend_module.__name__):
-            with pytest.raises(
-                ConnectionError, match="connection close did not complete"
-            ) as raised:
-                await backend.close()
+        with observe_bounded_close_stages() as stages, pinned_loop_clock() as clock:
+            close_task = asyncio.create_task(backend.close())
+            await wait_for_thread_event(entered, step="native SQLite close entry")
+            await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
+            assert worker.is_alive() and not close_task.done()
+            deadline = stages.deadlines[connection]
+            clock.advance(deadline - clock.time() + _SHORT_WINDOW_S)
+            with caplog.at_level(logging.WARNING, logger=sqlite_backend_module.__name__):
+                with pytest.raises(
+                    ConnectionError, match="connection close did not complete"
+                ) as raised:
+                    await await_within_hang_guard(close_task, step="close deadline expiry")
+            assert not release.is_set() and worker.is_alive()
+            assert backend.connection_retirement_pending
+            retained = backend._retired_connection_closes[connection]
+            assert retained.close_task is stages.close_tasks[connection]
+            assert retained.retirement_task is not None
     finally:
         await _retire(backend, release, worker)
+        if close_task is not None:
+            await asyncio.gather(close_task, return_exceptions=True)
 
     message = str(raised.value)
     assert _SHORT_BUDGET in message
@@ -191,7 +263,7 @@ async def test_normal_close_logs_nothing_and_checkpoints(tmp_path, caplog):
     worker = aiosqlite_worker(backend._ensure_connected())
 
     with caplog.at_level(logging.DEBUG, logger=sqlite_backend_module.__name__):
-        await backend.close()
+        await _normal_backend_close(backend)
 
     assert _overrun_warnings(caplog) == []
     assert not backend.is_connected
@@ -267,7 +339,7 @@ async def test_non_wal_database_closes_normally(caplog):
     assert backend._journal_mode == "memory"
 
     with caplog.at_level(logging.DEBUG, logger=sqlite_backend_module.__name__):
-        await backend.close()
+        await _normal_backend_close(backend)
 
     assert _overrun_warnings(caplog) == []
     assert not backend.is_connected
@@ -300,13 +372,28 @@ async def test_worker_termination_overrun_reports_wal_read_before_close(
         backend = await _connected_wal_backend(db_path)
         page_size = await _page_size(backend)
         wal_bytes = Path(f"{db_path}-wal").stat().st_size
-        worker = aiosqlite_worker(backend._ensure_connected())
+        connection = backend._ensure_connected()
+        worker = aiosqlite_worker(connection)
         retirement_tasks = []
+        close_task = None
         try:
-            with pytest.raises(
-                ConnectionError, match="worker did not terminate"
-            ) as raised:
-                await backend.close()
+            with observe_bounded_close_stages() as stages, pinned_loop_clock() as clock:
+                close_task = asyncio.create_task(backend.close())
+                await wait_for_thread_event(worker_exit_delayed, step="native worker exit gate")
+                await stages.reached(connection, CloseStage.WORKER_EXIT)
+                assert worker.is_alive() and not close_task.done()
+                deadline = stages.deadlines[connection]
+                clock.advance(deadline - clock.time() + _SHORT_WINDOW_S)
+                with pytest.raises(
+                    ConnectionError, match="worker did not terminate"
+                ) as raised:
+                    await await_within_hang_guard(close_task, step="worker-exit deadline expiry")
+                assert not release_worker.is_set() and worker.is_alive()
+                assert backend.connection_retirement_pending
+                assert (
+                    backend._retired_connection_closes[connection].close_task
+                    is stages.close_tasks[connection]
+                )
             retirement_tasks = [
                 retained.retirement_task
                 for retained in backend._retired_connection_closes.values()
@@ -316,6 +403,10 @@ async def test_worker_termination_overrun_reports_wal_read_before_close(
             async with asyncio.timeout(_HANG_GUARD_SECONDS):
                 await asyncio.gather(*retirement_tasks, return_exceptions=True)
             worker.join(timeout=_HANG_GUARD_SECONDS)
+            assert not worker.is_alive()
+            if close_task is not None:
+                await asyncio.gather(close_task, return_exceptions=True)
+            assert not backend.connection_retirement_pending
 
     assert not Path(f"{db_path}-wal").exists()
     message = str(raised.value)
@@ -400,7 +491,7 @@ async def test_snapshot_close_reports_primary_journal_mode(
                 )
     finally:
         await _retire(backend, release, worker)
-        await backend.close()
+        await _normal_backend_close(backend)
 
     message = str(raised.value)
     assert "database=snapshot.db" in message
@@ -418,13 +509,6 @@ async def test_every_backend_close_names_the_database_it_closes(
     reported = []
     real_close = sqlite_backend_module._close_aiosqlite_connection
 
-    async def record_diagnostics(connection, **kwargs):
-        reported.append(kwargs.get("diagnostics"))
-        await real_close(connection, **kwargs)
-
-    monkeypatch.setattr(
-        sqlite_backend_module, "_close_aiosqlite_connection", record_diagnostics
-    )
     holding = asyncio.Event()
     release = asyncio.Event()
 
@@ -434,18 +518,29 @@ async def test_every_backend_close_names_the_database_it_closes(
             holding.set()
             await release.wait()
 
-    holder = asyncio.create_task(hold_transaction())
-    try:
-        async with asyncio.timeout(_HANG_GUARD_SECONDS):
-            await holding.wait()
+    async with _normal_close_schedule() as finish:
+        async def record_diagnostics(connection, **kwargs):
+            reported.append(kwargs.get("diagnostics"))
+            await finish(connection, real_close(connection, **kwargs))
+
+        monkeypatch.setattr(
+            sqlite_backend_module, "_close_aiosqlite_connection", record_diagnostics
+        )
+        holder = asyncio.create_task(hold_transaction())
+        try:
+            await await_within_hang_guard(holding.wait(), step="the other transaction starting")
             # Another task's open transaction routes this read to a snapshot
             # connection, which is closed when the read finishes.
-            assert await backend.fetch_one("SELECT count(*) FROM payload") == (20,)
-    finally:
-        release.set()
-        await holder
-    await backend.backup_to(str(tmp_path / "copy.db"))
-    await backend.close()
+            assert await await_within_hang_guard(
+                backend.fetch_one("SELECT count(*) FROM payload"), step="snapshot read and close"
+            ) == (20,)
+        finally:
+            release.set()
+            await await_within_hang_guard(holder, step="the other transaction releasing")
+        await await_within_hang_guard(
+            backend.backup_to(str(tmp_path / "copy.db")), step="backup and destination close"
+        )
+        await await_within_hang_guard(backend.close(), step="the primary close")
 
     assert [
         (diagnostics.database, diagnostics.journal_mode)

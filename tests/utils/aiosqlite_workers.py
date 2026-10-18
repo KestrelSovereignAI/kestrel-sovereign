@@ -45,6 +45,8 @@ class BoundedCloseStages:
         ] = {}
         #: The absolute deadline each connection's close was given.
         self.deadlines: dict[aiosqlite.Connection, float] = {}
+        #: The original native close Task, including caller-supplied owners.
+        self.close_tasks: dict[aiosqlite.Connection, asyncio.Task[None]] = {}
 
     def _event(
         self, stage: CloseStage, connection: aiosqlite.Connection
@@ -81,6 +83,7 @@ def observe_bounded_close_stages() -> Iterator[BoundedCloseStages]:
 
     async def observed_finish_close(connection, **kwargs):
         stages.deadlines[connection] = kwargs["deadline"]
+        stages.close_tasks[connection] = kwargs["close_task"]
         stages._enter(CloseStage.CONNECTION_CLOSE, connection)
         return await finish_close(connection, **kwargs)
 
