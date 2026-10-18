@@ -7,10 +7,12 @@ import pytest
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
-from tests.integration.test_execution_authority_postgres import native_pg as work_pg
+from tests.integration.test_execution_authority_postgres import native_pg as _work_pg
 from tests.integration.test_host_onboarding_original_admission import onboarding_owner as onboarding_owner
 from tests.integration.test_maintenance_original_retirement import _original_control
 from tests.utils.original_failure import OriginalFailure
+
+work_pg = _work_pg
 
 
 @pytest.mark.asyncio
