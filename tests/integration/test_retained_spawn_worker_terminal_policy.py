@@ -119,13 +119,15 @@ async def test_retained_worker_native_failure_is_not_a_successful_retry(
     result = await ownership.await_owned_task(worker)
     assert len(sources) == 1
     sources[0].assert_retained(result.error)
-    assert calls == [phase], "native uncertainty was retried as ordinary availability"
+    assert calls == [phase] * (1 if source_cancel else 2)
     await asyncio.sleep(0)
     sources[0].assert_retained(manager._quarantined_shutdown_control)
     assert worker.done() and not manager._quarantined_shutdown_reapers
     assert manager._quarantined_cleanup_name_is_reserved("retainedchild")
-    assert manager._pending_spawns == 1 and not admission.spawn_slot_terminal.done()
-    assert await db.fetchval("SELECT count(*) FROM host_rollback_effects") == 1
+    incomplete = source_cancel or later_outcome == "would-fail"
+    assert manager._pending_spawns == int(incomplete)
+    assert admission.spawn_slot_terminal.done() is (not incomplete)
+    assert await db.fetchval("SELECT count(*) FROM host_rollback_effects") == len(calls)
 
 
 @pytest.mark.asyncio
@@ -269,7 +271,47 @@ async def test_retained_worker_returned_native_carrier_is_not_retirement_success
     result = await ownership.await_owned_task(worker)
     assert len(sources) == 1
     sources[0].assert_retained(result.error)
-    assert manager._pending_spawns == 1 and not admission.spawn_slot_terminal.done()
+    assert manager._pending_spawns == 0 and admission.spawn_slot_terminal.done()
     await asyncio.sleep(0)
     sources[0].assert_retained(manager._quarantined_shutdown_control)
+    assert await db.fetchval("SELECT count(*) FROM host_rollback_effects") == 1
+
+
+@pytest.mark.asyncio
+async def test_retained_worker_native_prefix_survives_actual_retry_withdrawal(
+    native_pg, onboarding_owner, retained_worker, monkeypatch,
+):
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    manager, child, db = onboarding_owner
+    admission = admission_for(manager, child)
+    entered, sources, observations = asyncio.Event(), [], []
+    worker = None
+    async def runtime(*args):
+        await db.execute("INSERT INTO host_rollback_effects VALUES (461)")
+        source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch, False))
+        sources.append(source)
+        raise source.error
+    actual_sleep = asyncio.sleep
+    async def sleep(delay, *args, **kwargs):
+        selected = asyncio.current_task() is worker and delay == 1.0
+        if selected:
+            entered.set()
+        try:
+            return await actual_sleep(delay, *args, **kwargs)
+        except asyncio.CancelledError as error:
+            if selected:
+                observations.append(OriginalFailure.capture(error))
+            raise
+    monkeypatch.setattr(manager, "_rollback_uncommitted_spawn_runtime", runtime)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    worker = await retained_worker(admission)
+    await asyncio.wait_for(entered.wait(), 5)
+    worker.cancel("actual retained restrictive retry observer withdrew")
+    result = await ownership.await_owned_task(worker)
+    assert len(sources) == len(observations) == 1
+    sources[0].assert_retained(result.error)
+    observations[0].assert_retained(result.error)
+    sources[0].assert_retained(manager._quarantined_shutdown_control)
+    assert observations[0].error not in tuple(_explicit_control_chain(manager._quarantined_shutdown_control))
+    assert manager._pending_spawns == 1 and not admission.spawn_slot_terminal.done()
     assert await db.fetchval("SELECT count(*) FROM host_rollback_effects") == 1

@@ -13056,17 +13056,22 @@ class AgentManager:
 
         async def revoke_then_shutdown() -> None:
             outcomes: list[BaseException] = []
+            control: BaseException | None = None
 
-            async def retry_ordinary_phase(operation, description):
+            async def retry_restrictive_phase(operation, description):
+                nonlocal control
                 while True:
                     try:
                         return await operation()
                     except Exception as error:
-                        # Ordinary availability may retry restrictive cleanup.
-                        # Native uncertainty is a terminal source, never an
-                        # acknowledgement supplied by a later successful retry.
+                        # Keep the existing restrictive retry, but retain native
+                        # evidence before it can be erased by later success.
+                        # Reuse the bounded reducer, never a raw retry history.
                         if is_execution_control_error(error):
-                            raise
+                            control = _merge_manager_cleanup_control(control, error)
+                            self._quarantined_shutdown_control = _merge_manager_cleanup_control(
+                                vars(self).get("_quarantined_shutdown_control"), error,
+                            )
                         logger.exception(
                             "Failed spawn %s remains pending for %r",
                             description,
@@ -13076,7 +13081,7 @@ class AgentManager:
 
             try:
                 while admission.spawn_receipt_graph is not None:
-                    await retry_ordinary_phase(
+                    await retry_restrictive_phase(
                         lambda: self._downgrade_uncommitted_spawn_receipt(admission, child),
                         "receipt revocation",
                     )
@@ -13084,23 +13089,21 @@ class AgentManager:
                     admission.spawn_startup_config is not None
                     or admission.spawn_startup_config_path is not None
                 ):
-                    await retry_ordinary_phase(
+                    await retry_restrictive_phase(
                         lambda: self._withdraw_uncommitted_spawn_startup_registration(admission),
                         "startup-roster withdrawal",
                     )
-                retirement = await retry_ordinary_phase(
+                retirement = await retry_restrictive_phase(
                     lambda: self._rollback_uncommitted_spawn_runtime(admission, child),
                     "runtime cleanup",
                 )
                 if isinstance(retirement, BaseException):
-                    if is_execution_control_error(retirement):
-                        raise retirement
                     outcomes.append(retirement)
                 while (
                     admission.spawn_authority_witness_did is not None
                     or admission.spawn_authority_witness_mandate is not None
                 ):
-                    await retry_ordinary_phase(
+                    await retry_restrictive_phase(
                         lambda: self._withdraw_uncommitted_spawn_authority_witness(admission),
                         "authority-witness settlement",
                     )
@@ -13114,9 +13117,9 @@ class AgentManager:
                         self._pending_spawns -= 1
                         self._resolve_spawn_slot_terminal(admission)
             except BaseException as error:
-                raise execution_observation_error(*outcomes, error)
-            if outcomes:
-                raise execution_observation_error(*outcomes)
+                raise execution_observation_error(control, *outcomes, error)
+            if control is not None or outcomes:
+                raise execution_observation_error(control, *outcomes)
 
         observed = withdrawals if withdrawals is not None else []
         cleanup: asyncio.Task[None] | None = None
