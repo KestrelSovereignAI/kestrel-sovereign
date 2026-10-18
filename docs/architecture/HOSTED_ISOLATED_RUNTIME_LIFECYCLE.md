@@ -413,3 +413,13 @@ bookkeeping failures; unresolved settlement never publishes completion. Native
 groups remain whole during the lifecycle's own child sweep. Independent drain
 joins finish before an unexpected process-control original is surfaced without
 demoting it into ordinary availability diagnostics.
+
+Retained child control is part of the reader's complete exit policy, including
+ordinary cleanup refusal and callback-observation failure; it is not checked
+only after an empty snapshot. Diagnostic wrapping shares one classification
+rule across manager-lock admission, drain/reconciliation and failed-spawn
+handoff phases: native or unexpected terminal control remains original, while
+ordinary availability keeps its diagnostic envelope. A descendant fence owns
+every actual withdrawal collected across its original spawn joins, including
+when releasing the same token fails. A previously handled cancellation count
+alone does not create a new observation or force a new cancellation result.

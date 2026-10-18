@@ -474,6 +474,16 @@ def _raise_lifecycle_outcomes(message: str, outcomes: list[BaseException]) -> No
         raise terminal
 
 
+def _lifecycle_boundary_error(message: str, failure: BaseException) -> BaseException:
+    """Add ordinary diagnostics without demoting original terminal control."""
+
+    if is_execution_control_error(failure) or not _is_lifecycle_terminal_outcome(failure):
+        return failure
+    diagnostic = RuntimeError(message)
+    diagnostic.__cause__ = failure
+    return diagnostic
+
+
 async def _collect_lifecycle_task_completion(
     task: "asyncio.Future[object]", *, withdrawals: list[BaseException],
 ) -> tuple[bool, BaseException | None]:
@@ -9743,7 +9753,7 @@ class AgentManager:
                 cancelled, failure = await await_lifecycle_task_completion(task, withdrawals=observed)
             terminal = execution_observation_error(opening, failure, *(observed if opening is not None or failure is not None else ()))
             if terminal is not None:
-                raise RuntimeError(message) from terminal
+                raise _lifecycle_boundary_error(message, terminal)
             if not acquired():
                 raise RuntimeError(message)
             transferred = True
@@ -10050,9 +10060,9 @@ class AgentManager:
                 )
                 cancelled = cancelled or yield_cancelled
                 if yield_failure is not None:
-                    raise RuntimeError(
-                        "Unable to retire completed quarantined shutdown metadata"
-                    ) from yield_failure
+                    raise _lifecycle_boundary_error(
+                        "Unable to retire completed quarantined shutdown metadata", yield_failure,
+                    )
 
             # A task can finish (and its callback can collapse it to unsafe
             # metadata) before this drain gets its first registry snapshot.  That
@@ -10097,9 +10107,9 @@ class AgentManager:
             )
             cancelled = cancelled or reconciliation_cancelled
             if reconciliation_failure is not None:
-                raise RuntimeError(
-                    "Unable to reconcile completed child terminations"
-                ) from reconciliation_failure
+                raise _lifecycle_boundary_error(
+                    "Unable to reconcile completed child terminations", reconciliation_failure,
+                )
 
             # Eviction never acknowledges an unsafe result.  The retained
             # metadata is intentionally bounded, so preserve the loss as an
@@ -13129,9 +13139,9 @@ class AgentManager:
                     admission=admission, withdrawals=observed,
                 )
                 if acquire_failure is not None:
-                    raise RuntimeError(
-                        "Unable to admit failed spawn cleanup"
-                    ) from acquire_failure
+                    raise _lifecycle_boundary_error(
+                        "Unable to admit failed spawn cleanup", acquire_failure,
+                    )
                 if self._quarantined_shutdown_handoffs_sealed:
                     wait_for_open = self._quarantined_shutdown_handoffs_open
                 else:
@@ -13178,9 +13188,9 @@ class AgentManager:
                 admission=admission, withdrawals=observed,
             )
             if wait_failure is not None:
-                raise RuntimeError(
-                    "Unable to wait for failed spawn cleanup admission"
-                ) from wait_failure
+                raise _lifecycle_boundary_error(
+                    "Unable to wait for failed spawn cleanup admission", wait_failure,
+                )
 
         if admission_failure is not None:
             cleanup_failure = None
@@ -13617,74 +13627,84 @@ class AgentManager:
         originals = []
         withdrawals = [] if withdrawals is None else withdrawals
 
-        while True:
-            records = tuple(
-                record
-                for record in self._quarantined_shutdown_reapers.values()
-                if record.canonical_agent_name == retained_name
-            )
-            if not records:
-                break
-            for record in records:
-                join_cancelled, failure = await _collect_lifecycle_task_completion(
-                    record.task, withdrawals=withdrawals,
+        try:
+            while True:
+                records = tuple(
+                    record
+                    for record in self._quarantined_shutdown_reapers.values()
+                    if record.canonical_agent_name == retained_name
                 )
-                if record.publication_error is not None:
-                    originals.append(record.publication_error)
-                self._observe_quarantined_cleanup_completion(record, record.task)
-                cancelled = cancelled or join_cancelled
-                if failure is not None:
-                    cleanup_failed = True
-                    originals.append(failure)
+                if not records:
+                    break
+                for record in records:
+                    join_cancelled, failure = await _collect_lifecycle_task_completion(
+                        record.task, withdrawals=withdrawals,
+                    )
+                    if record.publication_error is not None:
+                        originals.append(record.publication_error)
+                    self._observe_quarantined_cleanup_completion(record, record.task)
+                    cancelled = cancelled or join_cancelled
+                    if failure is not None:
+                        cleanup_failed = True
+                        originals.append(failure)
 
-            # Completion callbacks collapse live tasks into bounded history or
-            # unsafe evidence. Yield through the cancellation-safe join so the
-            # next ownership snapshot cannot spin on a completed live record.
-            callback_yield = asyncio.create_task(asyncio.sleep(0))
-            yield_cancelled, yield_failure = await _collect_lifecycle_task_completion(
-                callback_yield, withdrawals=withdrawals,
-            )
-            cancelled = cancelled or yield_cancelled
-            if yield_failure is not None:
-                originals.append(yield_failure)
-            if any(is_execution_control_error(error) or not _is_lifecycle_terminal_outcome(error)
-                   for error in originals):
-                raise execution_observation_error(*originals, *withdrawals)
-            if yield_failure is not None:
-                raise RuntimeError(
-                    "Unable to observe quarantined child cleanup completion"
-                ) from yield_failure
-            if cleanup_failed:
-                logger.error(
-                    "Deferred cleanup failed for child %r; TTL retirement "
-                    "remains reserved for operator reconciliation",
-                    child_name,
+                # Completion callbacks collapse live tasks into bounded history or
+                # unsafe evidence. Yield through the cancellation-safe join so the
+                # next ownership snapshot cannot spin on a completed live record.
+                callback_yield = asyncio.create_task(asyncio.sleep(0))
+                yield_cancelled, yield_failure = await _collect_lifecycle_task_completion(
+                    callback_yield, withdrawals=withdrawals,
                 )
-                return False, cancelled
+                cancelled = cancelled or yield_cancelled
+                if yield_failure is not None:
+                    originals.append(yield_failure)
+                if any(is_execution_control_error(error) or not _is_lifecycle_terminal_outcome(error)
+                       for error in originals):
+                    raise execution_observation_error(*originals, *withdrawals)
+                if yield_failure is not None:
+                    raise _lifecycle_boundary_error(
+                        "Unable to observe quarantined child cleanup completion", yield_failure,
+                    )
+                if cleanup_failed:
+                    logger.error(
+                        "Deferred cleanup failed for child %r; TTL retirement "
+                        "remains reserved for operator reconciliation",
+                        child_name,
+                    )
+                    return False, cancelled
 
-        control = vars(self).get("_quarantined_shutdown_control")
-        if (is_execution_control_error(control)
-            and self._quarantined_cleanup_name_is_reserved(retained_name)):
-            # Completed sources may predate this reader's first snapshot.
-            # Preserve the existing bounded private conservative witness;
-            # do not reconstruct completed Task/traceback history.
-            raise execution_observation_error(control, *originals, *withdrawals)
-        reconciliation = asyncio.create_task(
-            self._prune_child_tracking_if_fully_removed(parent_did, child_name),
-            name=f"ttl_termination_reconcile:{child_name}",
-        )
-        reconciliation_cancelled, reconciliation_failure = (
-            await _collect_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
-        )
-        cancelled = cancelled or reconciliation_cancelled
-        if reconciliation_failure is not None:
-            originals.append(reconciliation_failure)
-            if any(is_execution_control_error(error) for error in originals):
-                raise execution_observation_error(*originals, *withdrawals)
-            raise RuntimeError(
-                "Unable to reconcile deferred child cleanup"
-            ) from reconciliation_failure
-        return bool(reconciliation.result()), cancelled
+            reconciliation = asyncio.create_task(
+                self._prune_child_tracking_if_fully_removed(parent_did, child_name),
+                name=f"ttl_termination_reconcile:{child_name}",
+            )
+            reconciliation_cancelled, reconciliation_failure = (
+                await _collect_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
+            )
+            cancelled = cancelled or reconciliation_cancelled
+            if reconciliation_failure is not None:
+                originals.append(reconciliation_failure)
+                if any(is_execution_control_error(error) for error in originals):
+                    raise execution_observation_error(*originals, *withdrawals)
+                raise _lifecycle_boundary_error(
+                    "Unable to reconcile deferred child cleanup", reconciliation_failure,
+                )
+            return bool(reconciliation.result()), cancelled
+        except BaseException as error:
+            originals.append(error)
+            raise
+        finally:
+            # Every exit, including ordinary refusal/observation failure,
+            # consults the existing bounded conservative private witness.
+            control = vars(self).get("_quarantined_shutdown_control")
+            retained_control = (
+                control if is_execution_control_error(control)
+                and self._quarantined_cleanup_name_is_reserved(retained_name) else None
+            )
+            if retained_control is not None or any(
+                is_execution_control_error(error) or not _is_lifecycle_terminal_outcome(error)
+                for error in originals
+            ):
+                raise execution_observation_error(retained_control, *originals, *withdrawals)
 
     async def _prune_all_fully_removed_child_tracking(self) -> None:
         """Reconcile completed child removals at a serialized lifecycle boundary.
@@ -13840,7 +13860,6 @@ class AgentManager:
             )
             self._terminal_descendant_spawn_fence_members[token.nonce] = set()
 
-        cancelled = False
         joined_spawns: set[asyncio.Future[object]] = set()
         failures, withdrawals = [], []
         try:
@@ -13961,14 +13980,13 @@ class AgentManager:
                     break
                 for spawn_task in earlier_spawns:
                     joined_spawns.add(spawn_task)
-                    task_cancelled, failure = await _collect_lifecycle_task_completion(
+                    _cancelled, failure = await _collect_lifecycle_task_completion(
                         spawn_task, withdrawals=withdrawals,
                     )
-                    cancelled = cancelled or task_cancelled
                     if failure is not None and (is_execution_control_error(failure)
                                                 or not _is_lifecycle_terminal_outcome(failure)):
                         failures.append(failure)
-            if failures:
+            if failures or withdrawals:
                 raise execution_observation_error(*failures, *withdrawals)
         except BaseException as error:
             failures.append(error)
@@ -13977,9 +13995,6 @@ class AgentManager:
             except BaseException as unwind_error:
                 failures.append(unwind_error)
             raise execution_observation_error(*failures, *withdrawals)
-        if cancelled:
-            self.end_terminal_descendant_spawn_fence(token)
-            raise withdrawals[-1] if withdrawals else asyncio.CancelledError()
         return token
 
     def end_terminal_descendant_spawn_fence(
