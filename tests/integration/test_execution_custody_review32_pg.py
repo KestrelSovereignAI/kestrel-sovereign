@@ -81,6 +81,7 @@ async def test_native_commit_writer_must_settle_before_agent_storage_close(
         assert not writer.done() and not closed.is_set()
         assert service.has_pending_close_owners()
         assert service._llm_close_tasks["preference-writers"]._kestrel_llm_close_cancel_sent
+        finite_close = service._llm_close_tasks["preference-writers"]
         assert agent._durable_shutdown_continuation is not None
         waiter = asyncio.create_task(agent.wait_for_shutdown_completion())
         await asyncio.sleep(0.01)
@@ -96,7 +97,10 @@ async def test_native_commit_writer_must_settle_before_agent_storage_close(
         assert original in chain and original in retained
         assert execution_commit_outcome(caught.value) == "unknown"
         assert execution_commit_outcome(agent._shutdown_control) == "unknown"
-        assert all(error in chain and error in retained for error in withdrawals)
+        finite_chain = tuple(_explicit_control_chain(owned_task_error(finite_close)))
+        assert withdrawals and all(error in finite_chain for error in withdrawals)
+        assert all(error not in chain for error in withdrawals)
+        assert all(error not in retained for error in withdrawals)
         # The finite shutdown receipt retains its own cancellations; the
         # shared strongest-writer latch must not become caller history.
         assert service._preference_persistence_control is original

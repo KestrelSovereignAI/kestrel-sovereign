@@ -2056,3 +2056,21 @@ private carrier even when physical close raises the very same original source.
 Core diagnostic and commit-classification wrappers forward authenticated source
 provenance: current observer withdrawal remains finite, while shared SafeMode and
 shutdown latches keep source-only evidence without editing genuine originals.
+
+A refused native closer's fresh debt receipt explicitly owns its original
+admission error even when no Task was accepted. Raising that receipt must not
+clear the explicit cause. Published-ready rollback likewise carries actual
+observer withdrawals in its finite canonical composition, without reconstructing
+cancellation or promoting it into shared native-source evidence. A later,
+uncancelled shutdown reader reports source control, not an earlier close caller's
+withdrawal; the original finite close Task retains that exact withdrawal.
+
+All four spawn rollback phases use original admission receipts and a finite
+withdrawal collection, in receipt/roster/runtime/witness order. Failed rollback
+keeps its restrictive handoff and live-resource inspection; a refused phase
+cannot authorize another spawn or claim that the child/hold has retired.
+Background shutdown keeps one strongest source through private metadata carriers,
+not completed-worker exception history or writes onto another operation's source.
+Advisory cleanup records and joins the accepted original closer even if its
+callback publication fails. Whole-agent shutdown separately retains its current
+caller's finite evidence without publishing that caller history into shared state.

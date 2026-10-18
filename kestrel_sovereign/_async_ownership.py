@@ -148,11 +148,15 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         if retirement_resource is not None:
             from kestrel_sovereign.execution_custody import execution_terminal_error
             debt = RuntimeError("original native closer admission refused")
+            # This private native receipt owns the actual admission failure,
+            # including a genuine source C. Source-only shared projections
+            # must retain it even though no accepted Task exists to harvest.
+            debt.__cause__ = error
             debt._kestrel_native_retirement_debts = ((retirement_resource, None),)
             raise execution_terminal_error(
                 error, debt, retain_originals=True,
                 isolate_control_originals=True,
-            ) from None
+            )
         raise
     def close_unstarted(_task):
         if not started:

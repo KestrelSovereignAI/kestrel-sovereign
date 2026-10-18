@@ -312,27 +312,33 @@ async def test_revocation_inside_transaction_rolls_back_and_sql_cannot_escape(na
 @pytest.mark.parametrize("explicit", [False, True])
 async def test_postcommit_revocation_does_not_claim_rollback(native_pg, explicit):
     backend, _, _ = native_pg
+    denials = []
 
     class LossAfterCommit(GenerationFence):
         connection = None
 
         def require_work(self):
             if self.connection is not None and not self.connection.is_in_transaction():
-                raise ExecutionAuthorityError("authority notification raced commit")
+                denial = ExecutionAuthorityError("authority notification raced commit")
+                denials.append(denial)
+                raise denial
 
         async def lock_and_validate(self, connection):
             await super().lock_and_validate(connection)
             self.connection = connection
 
     with bind_execution_custody(LossAfterCommit()):
-        with pytest.raises(Exception, match="may have committed") as caught:
+        with pytest.raises(Exception) as caught:
             if explicit:
                 async with backend.transaction():
                     await backend.execute("INSERT INTO effects VALUES (1, 'committed')")
             else:
                 await backend.execute("INSERT INTO effects VALUES (1, 'committed')")
-        from kestrel_sovereign.execution_custody import execution_commit_outcome
+        from kestrel_sovereign.execution_custody import execution_commit_outcome, _explicit_control_chain
 
+        chain = tuple(_explicit_control_chain(caught.value))
+        assert any("may have committed" in str(error) for error in chain)
+        assert denials and any(error in chain for error in denials)
         assert execution_commit_outcome(caught.value) == "committed"
     assert await backend.fetch_val("SELECT value FROM effects") == "committed"
 

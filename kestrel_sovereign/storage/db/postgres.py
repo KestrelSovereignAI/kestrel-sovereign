@@ -1710,14 +1710,22 @@ class PostgresBackend(DatabaseBackend):
             return original
         scopes = current_execution_custody(self)
         resource = _NativePostgresRetirement(connection, connection, native)
+        admission = OwnedTaskAdmission()
         try:
             closer = create_owned_task(
                 connection.close(), name="postgres-original-advisory-retirement",
-                retirement_resource=resource, retain_originals=True,
+                retirement_resource=resource, retain_originals=True, admission=admission,
             )
         except BaseException as refusal:
+            accepted = admission.task
+            if accepted is not None:
+                joined = await await_owned_task(accepted)
+                refusal = execution_terminal_error(
+                    refusal, joined.error, joined.cancellation,
+                    retain_originals=True, isolate_control_originals=True,
+                )
             return self._refused_native_owner(
-                connection, connection, refusal, scopes, original, native,
+                connection, connection, refusal, scopes, original, native, owner=accepted,
             )
         outcome = await await_owned_task(closer)
         debt = None

@@ -77,6 +77,11 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 
 class HostFeatureConfigError(RuntimeError):
     """The host could not read the feature configuration it was asked to apply."""
+
+
+class _BackgroundShutdownControl(RuntimeError):
+    """Private strongest-source/fact inventory, not completed-worker history."""
+
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 
 from kestrel_sovereign.a2a.stores import (
@@ -9709,8 +9714,21 @@ Expected Duration: {expected_duration}
             # Ordinary finite observer C is not a native source. Explicit
             # shutdown-owned cancellation keeps its separate opt-in contract.
             error = execution_native_source_error(error)
+        previous = vars(self).get(channel)
+        if not retain_originals:
+            # Strongest selection merges native metadata. Only PRIVATE
+            # carriers may be selected for those writes; their explicit cause
+            # retains one strongest source, not every completed worker.
+            def private_source(source):
+                if source is None or type(source) is _BackgroundShutdownControl:
+                    return source
+                carrier = _BackgroundShutdownControl("background native control")
+                carrier.__cause__ = source
+                return carrier
+
+            previous, error = private_source(previous), private_source(error)
         setattr(self, channel, execution_terminal_error(
-            vars(self).get(channel), error, retain_originals=retain_originals,
+            previous, error, retain_originals=retain_originals,
             isolate_control_originals=retain_originals,
         ))
         lifecycle = vars(self).get("_shutdown_lifecycle_control")
@@ -10109,6 +10127,18 @@ Expected Duration: {expected_duration}
         goes on, and its resource stays held. The serving record is removed
         only once custody holds nothing.
         """
+        finite_outcomes: list[BaseException] = []
+
+        def remember_finite(error):
+            # Shared agent state owns source-only facts. This invocation still
+            # owes its finite caller every actual delivered withdrawal.
+            if error is not None and (
+                is_execution_control_error(error)
+                or isinstance(error, asyncio.CancelledError)
+            ) and all(error is not prior for prior in finite_outcomes):
+                finite_outcomes.append(error)
+            self._remember_shutdown_control(error)
+
         loop = asyncio.get_running_loop()
         dispatcher = getattr(self, "dispatcher", None)
         inherited_durable_admission = getattr(
@@ -10331,7 +10361,7 @@ Expected Duration: {expected_duration}
                 await custody.release(resource, step)
             except asyncio.CancelledError as cancellation:
                 if is_execution_control_error(cancellation):
-                    self._remember_shutdown_control(cancellation)
+                    remember_finite(cancellation)
                     return reported
                 # Whole-agent shutdown is being cancelled. Stop the sweep and
                 # propagate to the durable tail via ``finally``.
@@ -10343,20 +10373,20 @@ Expected Duration: {expected_duration}
                 raise
             except BaseExceptionGroup as failure:
                 if is_execution_control_error(failure):
-                    self._remember_shutdown_control(failure)
+                    remember_finite(failure)
                 elif isinstance(failure, Exception):
                     logging.warning("Error during %s shutdown: %s", label, failure, exc_info=True)
                 else:
                     raise
             except asyncio.TimeoutError as timeout:
-                self._remember_shutdown_control(timeout)
+                remember_finite(timeout)
                 logging.warning(
                     "%s shutdown exceeded %.2fs; abandoning and continuing sweep",
                     label,
                     budget,
                 )
             except Exception as e:
-                self._remember_shutdown_control(e)
+                remember_finite(e)
                 logging.warning(
                     "Error during %s shutdown: %s", label, e, exc_info=True
                 )
@@ -10518,7 +10548,7 @@ Expected Duration: {expected_duration}
                     _step_budget(),
                 )
         except asyncio.CancelledError as cancellation:
-            self._remember_shutdown_control(cancellation)
+            remember_finite(cancellation)
             shutdown_cancelled = True
         finally:
             # Re-read the actual cache at the tail boundary.  The original
@@ -10560,10 +10590,10 @@ Expected Duration: {expected_duration}
             try:
                 await self.wait_for_shutdown_completion()
             except asyncio.CancelledError as cancellation:
-                self._remember_shutdown_control(cancellation)
+                remember_finite(cancellation)
                 shutdown_cancelled = True
             except (Exception, BaseExceptionGroup) as failure:
-                self._remember_shutdown_control(failure)
+                remember_finite(failure)
                 if not is_execution_control_error(failure):
                     raise
                 tail_degraded = True
@@ -10584,7 +10614,7 @@ Expected Duration: {expected_duration}
         context_cancelled, context_failure = await self._close_standalone_hold_context()
         shutdown_cancelled = shutdown_cancelled or context_cancelled
         if context_failure is not None:
-            self._remember_shutdown_control(context_failure)
+            remember_finite(context_failure)
             tail_degraded = True
             logging.warning(
                 "Standalone Hold context shutdown failed: %s",
@@ -10598,7 +10628,12 @@ Expected Duration: {expected_duration}
 
         # Physical retirement still runs for every owner. Its completion does
         # not turn an unresolved COMMIT/authority receipt into successful Stop.
-        self._raise_shutdown_control()
+        finite_terminal = execution_terminal_error(
+            vars(self).get("_shutdown_control"), *finite_outcomes,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        if finite_terminal is not None:
+            raise finite_terminal
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer
             # asyncio.wait_for surfaces the timeout/cancellation. Report the

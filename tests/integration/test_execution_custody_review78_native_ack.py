@@ -811,6 +811,9 @@ async def test_caller_cancel_joins_original_native_ack_without_poisoning_runtime
     explicit,
     retire_scope,
 ):
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    from kestrel_sovereign.storage.db import postgres
+
     backend, observer, schema = native_pg
     scope = ExecutionCustody(ProcessRuntimeExecutionFence("original-native-ack"))
     parent = ExecutionCustody(ProcessRuntimeExecutionFence("healthy-native-ack-parent"))
@@ -818,6 +821,16 @@ async def test_caller_cancel_joins_original_native_ack_without_poisoning_runtime
     original_commit = asyncpg.transaction.Transaction.__aexit__
     original_release = asyncpg.pool.PoolAcquireContext.__aexit__
     acknowledgments = []
+    withdrawals = []
+    actual_join = postgres.await_owned_task
+
+    async def join(*args, **kwargs):
+        result = await actual_join(*args, **kwargs)
+        if result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+
+    monkeypatch.setattr(postgres, "await_owned_task", join)
 
     async def held_commit(transaction, error_type, error, traceback):
         result = await original_commit(transaction, error_type, error, traceback)
@@ -864,8 +877,9 @@ async def test_caller_cancel_joins_original_native_ack_without_poisoning_runtime
         assert not owner.done(), "caller cancellation abandoned the original native ACK"
         release.set()
         outcome = await asyncio.wait_for(await_owned_task(owner), 3)
-        assert isinstance(outcome.error, asyncio.CancelledError)
-        assert outcome.error.args == ("original caller stopped observing",)
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert withdrawals and all(error in chain for error in withdrawals)
+        assert withdrawals[0].args == ("original caller stopped observing",)
         assert execution_commit_outcome(outcome.error) == "committed"
         assert execution_denial_scopes(outcome.error) == (
             (scope,) if retire_scope else ()

@@ -7,7 +7,7 @@ import pytest
 from tests.utils.original_failure import OriginalFailure
 from tests.utils.receipt_delivery import ReceiptDelivery
 
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCommitOutcomeError, ExecutionCustody,
     bind_execution_runtime, require_execution_work, _explicit_control_chain, execution_commit_outcome,
@@ -103,6 +103,7 @@ async def test_actual_agent_retains_storage_until_native_preference_writer_settl
         assert not storage_closed.is_set()
         assert not writer.done()
         assert agent._durable_shutdown_continuation is not None
+        finite_close = service._llm_close_tasks["preference-writers"]
         waiter = asyncio.create_task(agent.wait_for_shutdown_completion())
         await asyncio.sleep(0.01)
         assert not waiter.done()
@@ -117,7 +118,9 @@ async def test_actual_agent_retains_storage_until_native_preference_writer_settl
             assert error in chain and error in retained
             assert execution_commit_outcome(caught.value) == "unknown"
             assert execution_commit_outcome(agent._shutdown_control) == "unknown"
-            assert all(item in chain and item in retained for item in withdrawals)
+            finite_chain = tuple(_explicit_control_chain(owned_task_error(finite_close)))
+            assert withdrawals and all(item in finite_chain for item in withdrawals)
+            assert all(item not in chain and item not in retained for item in withdrawals)
             assert service._preference_persistence_control is error
             assert all(item not in tuple(_explicit_control_chain(error)) for item in withdrawals)
             for _ in range(3):
