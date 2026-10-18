@@ -26,7 +26,7 @@ from tests.utils.original_failure import OriginalFailure
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suppress", [False, True])
 @pytest.mark.parametrize("withdraw", [False, True])
-@pytest.mark.parametrize("producer", ["same", "owned", "direct", "gather", "taskgroup", "nested", "groupbody", "groupdirect", "groupgather"])
+@pytest.mark.parametrize("producer", ["same", "owned", "direct", "gather", "taskgroup", "nested", "groupbody", "groupdirect", "groupgather", "eager", "eagernested"])
 async def test_ingress_hands_off_actual_native_failure_before_foreign_redaction(
     native_pg, tmp_path, monkeypatch, suppress, withdraw, producer,
 ):
@@ -52,6 +52,20 @@ async def test_ingress_hands_off_actual_native_failure_before_foreign_redaction(
                     await asyncio.create_task(work)
                 elif producer == "gather":
                     await asyncio.gather(work)
+                elif producer in ("eager", "eagernested"):
+                    def eager_child(group, operation):
+                        loop = asyncio.get_running_loop()
+                        previous = loop.get_task_factory()
+                        loop.set_task_factory(asyncio.eager_task_factory)
+                        try:
+                            return group.create_task(operation)
+                        finally:
+                            loop.set_task_factory(previous)
+                    async def nested_eager():
+                        async with asyncio.TaskGroup() as inner:
+                            eager_child(inner, work)
+                    async with asyncio.TaskGroup() as outer:
+                        eager_child(outer, nested_eager() if producer == "eagernested" else work)
                 elif producer == "nested":
                     async def nested():
                         async with asyncio.TaskGroup() as inner:

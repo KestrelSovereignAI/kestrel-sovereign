@@ -6261,7 +6261,7 @@ class AgentManager:
         admission: AgentOperationAdmission,
         *,
         spawn_slot_admitted: bool,
-    ) -> bool:
+    ) -> BaseException | None:
         """Retire a spawn's cap slot and name admission as one terminal tail."""
 
         async def retire_spawn_slot() -> None:
@@ -6273,7 +6273,7 @@ class AgentManager:
                     admission.spawn_slot_active = False
                     self._resolve_spawn_slot_terminal(admission)
 
-        cancelled, failures = False, []
+        failures = []
         if spawn_slot_admitted:
             owner = vars(admission).get("_spawn_slot_retirement_owner")
             if owner is None:
@@ -6281,7 +6281,7 @@ class AgentManager:
                     retire_spawn_slot, phase="spawn_slot_retirement", resource=admission,
                 )
                 admission._spawn_slot_retirement_owner = owner
-            cancelled, failure = await owner.join(admission.canonical_name)
+            _cancelled, failure = await owner.join(admission.canonical_name)
             failures.append(failure)
         # Release the name only AFTER its exact cap slot retired. A failed
         # slot remains on the admission; this same canonical release refuses
@@ -6289,7 +6289,6 @@ class AgentManager:
         try:
             await self._release_agent_operation(admission)
         except asyncio.CancelledError as error:
-            cancelled = True
             failures.append(error)
         except BaseException as error:
             failures.append(error)
@@ -6299,7 +6298,7 @@ class AgentManager:
         if terminal is not None and (is_execution_control_error(terminal)
                 or not isinstance(terminal, asyncio.CancelledError)):
             raise terminal
-        return cancelled
+        return terminal
 
     def _resolve_spawn_slot_terminal(
         self,
@@ -11416,21 +11415,26 @@ class AgentManager:
                     mandate.max_child_depth = max(allowed, 0)
             return await self._do_spawn(name, parent_agent, mandate, admission)
         finally:
-            release_cancelled = await self._retire_spawn_slot_and_admission(
-                admission,
-                spawn_slot_admitted=spawn_slot_admitted,
-            )
-            # The spawn body can be propagating a BaseExceptionGroup which
-            # preserves both cancellation and a rollback failure.  Retirement
-            # observes the same pending cancellation, but must not replace
-            # that already-terminal evidence with a bare CancelledError.
-            if (
-                release_cancelled
-                and sys.exception() is None
-                and not admission.committed
-                and not admission.rollback_incomplete
+            # Save the body before awaiting the terminal tail: release may
+            # independently raise, or finish while observing actual caller C.
+            body_failure = sys.exception()
+            try:
+                release_failure = await self._retire_spawn_slot_and_admission(
+                    admission, spawn_slot_admitted=spawn_slot_admitted,
+                )
+            except BaseException as error:
+                release_failure = error
+            if release_failure is not None and (
+                body_failure is not None
+                or is_execution_control_error(release_failure)
+                or not isinstance(release_failure, asyncio.CancelledError)
+                or (not admission.committed and not admission.rollback_incomplete)
             ):
-                raise asyncio.CancelledError()
+                raise execution_terminal_error(
+                    body_failure, release_failure, retain_originals=True,
+                    prefer_cancellation=isinstance(body_failure, asyncio.CancelledError),
+                    isolate_control_originals=True,
+                )
 
     async def _do_spawn(
         self,
@@ -11456,14 +11460,17 @@ class AgentManager:
                         name, parent_agent, mandate, admission
                     )
                 finally:
-                    release_cancelled = await self._release_agent_operations(
-                        [admission]
-                    )
-                    if (
-                        release_cancelled
-                        and (sys.exception() is not None or not admission.committed)
+                    body_failure = sys.exception()
+                    try:
+                        release_failure = await self._release_agent_operations([admission])
+                    except BaseException as error:
+                        release_failure = error
+                    if release_failure is not None and (
+                        body_failure is not None or not admission.committed
+                        or is_execution_control_error(release_failure)
+                        or not isinstance(release_failure, asyncio.CancelledError)
                     ):
-                        raise execution_terminal_error(sys.exception(), release_cancelled,
+                        raise execution_terminal_error(body_failure, release_failure,
                             retain_originals=True, prefer_cancellation=True,
                             isolate_control_originals=True)
 

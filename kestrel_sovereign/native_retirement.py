@@ -311,6 +311,22 @@ def _native_observation_requested():
     return any(observer._belongs_to_owner() for observer in _NATIVE_OBSERVERS.get())
 
 
+async def _settle_native_observer_enrollment():
+    """Let an eager constructor publish its REAL join edge before acquisition.
+
+    TaskGroup membership, direct await/gather waiters and canonical owned-task
+    joins appear only after eager Task construction returns. At most one
+    cancellable scheduling turn precedes admission; copied context by itself
+    still grants nothing. The backend then samples the same authenticated
+    relationships and original live scopes, BEFORE selecting any native path.
+    No foreign frame, global task scan, task factory patch or new owner exists.
+    """
+    if any(observer._trusted_phases_only
+           and observer._owner_task is not None and not observer._owner_task.done()
+           and not observer._belongs_to_owner() for observer in _NATIVE_OBSERVERS.get()):
+        await asyncio.sleep(0)
+
+
 def _require_native_observation_for_connection(connection):
     """Never attach an empty inventory to a borrowed, pre-existing lease.
 

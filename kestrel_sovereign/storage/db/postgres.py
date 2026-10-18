@@ -34,6 +34,7 @@ from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
 from kestrel_sovereign.native_retirement import (
     _begin_native_resource, _native_observation_requested,
+    _settle_native_observer_enrollment,
     _require_native_observation_for_connection,
 )
 from kestrel_sovereign.execution_custody import (
@@ -852,6 +853,7 @@ class PostgresBackend(DatabaseBackend):
         disclose old-owner data. Never classify authority from a SQL verb.
         """
 
+        await _settle_native_observer_enrollment()
         scopes = self._remember_transaction_custody()
         if _native_observation_requested() and executor is not self._pool:
             _require_native_observation_for_connection(executor)
@@ -935,6 +937,7 @@ class PostgresBackend(DatabaseBackend):
 
     @asynccontextmanager
     async def _tracked_pool_checkout(self, pool: Any, *, admit_work: bool) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
+        await _settle_native_observer_enrollment()
         state = _ExecutionCommitState()
         state.remember(current_execution_custody(self))
         if isinstance(pool, PostgresPoolAdapter):
@@ -1244,17 +1247,27 @@ class PostgresBackend(DatabaseBackend):
                 if phase is not None:
                     phase.record_native_failure(completed.error, commit_outcome="unknown" if committing else None, cancellation=completed.cancellation)
                 if committing:
-                    terminal = execution_terminal_error(completed.error, completed.cancellation, retain_originals=True)
-                    outcome = execution_commit_outcome(terminal) or "unknown"
+                    physical = completed.error
+                    outcome = execution_commit_outcome(physical) or "unknown"
+                    if execution_commit_outcome(physical) is None:
+                        classified = ExecutionCommitOutcomeError(outcome)
+                        classified.__cause__ = physical
+                        physical = classified
+                    terminal = execution_terminal_error(
+                        physical, completed.cancellation, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                     for scope in scopes:
                         scope.preserve_commit_uncertainty(outcome)
-                    if execution_commit_outcome(terminal) is not None:
-                        raise terminal
-                    raise ExecutionCommitOutcomeError(outcome) from terminal
-                terminal = execution_terminal_error(body_failure, completed.error, completed.cancellation, retain_originals=True)
-                terminal._kestrel_native_retirement_debts = (
-                    *getattr(terminal, "_kestrel_native_retirement_debts", ()),
+                    raise terminal
+                debt = RuntimeError("original native rollback acknowledgement failed")
+                debt.__cause__ = completed.error
+                debt._kestrel_native_retirement_debts = (
                     (_NativePostgresRetirement(transaction, connection, native_connection), completion),
+                )
+                terminal = execution_terminal_error(
+                    body_failure, debt, completed.cancellation, retain_originals=True,
+                    isolate_control_originals=True,
                 )
                 for scope in scopes:
                     scope.revoke("original native rollback acknowledgement failed")
@@ -1270,7 +1283,10 @@ class PostgresBackend(DatabaseBackend):
                 commit_state.acknowledgments[:] = [receipt] if receipt is not None else []
                 if observation is not None:
                     observation.acknowledgments = tuple(commit_state.acknowledgments)
-            terminal = execution_terminal_error(body_failure, completed.cancellation, retain_originals=True)
+            terminal = execution_terminal_error(
+                body_failure, completed.cancellation, retain_originals=True,
+                isolate_control_originals=True,
+            )
             if receipt is not None and completed.cancellation is not None and phase is not None:
                 phase.record_acknowledged_withdrawal(completed.cancellation, receipt)
             if terminal is not None:
@@ -1329,6 +1345,7 @@ class PostgresBackend(DatabaseBackend):
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
+        await _settle_native_observer_enrollment()
         record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
@@ -1369,6 +1386,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""
+        await _settle_native_observer_enrollment()
         if not params_list:
             return 0
         record_write_query(query)
@@ -1397,6 +1415,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
         """Fetch a single row."""
+        await _settle_native_observer_enrollment()
         record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
@@ -1421,6 +1440,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
         """Fetch all rows."""
+        await _settle_native_observer_enrollment()
         record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
@@ -1443,6 +1463,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def fetch_val(self, query: str, params: Params = ()) -> Optional[Any]:
         """Fetch a single value."""
+        await _settle_native_observer_enrollment()
         record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
@@ -1462,6 +1483,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
+        await _settle_native_observer_enrollment()
         if self._current_txn_conn() is not None or current_execution_custody(self) or _native_observation_requested():
             reject_transaction_control(script, dialect="postgres")
         record_write_script(script)
@@ -1529,6 +1551,7 @@ class PostgresBackend(DatabaseBackend):
         connection for the owning task for the lifetime of this context.
         """
 
+        await _settle_native_observer_enrollment()
         existing = self._current_txn_conn()
         if existing is not None:
             _require_native_observation_for_connection(existing)

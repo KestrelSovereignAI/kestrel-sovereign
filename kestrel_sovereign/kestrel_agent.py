@@ -147,6 +147,7 @@ from kestrel_sovereign.command_policy import (
 )
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
+    execution_native_source_error,
     execution_terminal_error,
     execution_work_operation,
     is_execution_control_error,
@@ -514,10 +515,8 @@ def _retain_feature_lifecycle_safe_mode(agent: object, reason: str, *errors) -> 
     agent._safe_mode = True
     agent._safe_mode_reason = reason
     agent._safe_mode_cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
-    agent._feature_lifecycle_control = execution_terminal_error(
-        vars(agent).get("_feature_lifecycle_control"),
-        *(error for error in errors if is_execution_control_error(error)),
-        retain_originals=True, isolate_control_originals=True,
+    agent._feature_lifecycle_control = execution_native_source_error(
+        vars(agent).get("_feature_lifecycle_control"), *errors,
     )
 
 
@@ -561,6 +560,12 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             _raise_unexpected_lifecycle_exception_group(error)
     finally:
         _retain_feature_lifecycle_safe_mode(agent, reason, *controls)
+    withdrawals.extend(
+        error for control in controls for error in _explicit_control_chain(control)
+        if isinstance(error, asyncio.CancelledError)
+        and not is_execution_control_error(error)
+        and all(error is not prior for prior in withdrawals)
+    )
     terminal = execution_terminal_error(
         agent._feature_lifecycle_control, *withdrawals, retain_originals=True,
         isolate_control_originals=True,

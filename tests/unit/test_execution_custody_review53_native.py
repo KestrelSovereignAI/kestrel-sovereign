@@ -12,7 +12,8 @@ from kestrel_sovereign.agent.invocation import (
     mark_current_invocation_effect_completed,
 )
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_cleanup_debts
+from tests.utils.original_failure import OriginalFailure
 from kestrel_sovereign.llm.model_discovery import ModelDiscoveryMixin
 from kestrel_sovereign.storage.db import sqlite as sqlite_module
 from tests.unit.test_execution_custody_review29 import native_owner, retire
@@ -77,6 +78,7 @@ async def test_benign_interrupt_text_does_not_erase_explicit_native_receipt(tmp_
     release, retained = asyncio.Event(), {}
     original = ValueError("no active connection")
     original.__cause__ = terminal(kind)
+    source = OriginalFailure.capture(original)
 
     async def delayed_close():
         await await_owned_task(create_owned_task(release.wait()))
@@ -93,7 +95,13 @@ async def test_benign_interrupt_text_does_not_erase_explicit_native_receipt(tmp_
             connection, retained_closes=retained,
             deadline=asyncio.get_running_loop().time() + 0.02,
         )))
-        assert outcome.error is original
+        source.assert_retained(outcome.error)
+        record = retained[connection]
+        # Admission may be cancelled before its first turn on a busy runner;
+        # a done Python Task still cannot certify retirement of a live worker.
+        assert record.close_task is not None
+        assert sqlite_module._aiosqlite_worker_is_alive(connection)
+        assert (connection, record.close_task) in execution_cleanup_debts(outcome.error)
     finally:
         release.set()
         for record in list(retained.values()):
@@ -102,6 +110,7 @@ async def test_benign_interrupt_text_does_not_erase_explicit_native_receipt(tmp_
                 await join(record.retirement_task)
         monkeypatch.undo()
         await native_close()
+        await sqlite_module._wait_for_aiosqlite_worker_shutdown(connection, timeout_s=1)
 
 
 @pytest.mark.asyncio

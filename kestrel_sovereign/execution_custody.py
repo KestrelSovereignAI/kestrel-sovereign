@@ -300,6 +300,39 @@ def is_scope_local_execution_control(error: BaseException | None, captured_scope
                 and execution_commit_outcome(error) is None)
 
 
+_FINITE_NATIVE_SOURCES = object()
+
+
+def _native_source_originals(error: BaseException | None) -> tuple[BaseException, ...]:
+    """Flatten only canonical finite carriers, never genuine source groups."""
+    if error is None:
+        return ()
+    provenance = vars(error).get("_kestrel_finite_native_sources")
+    if (type(provenance) is tuple and len(provenance) == 2
+            and provenance[0] is _FINITE_NATIVE_SOURCES):
+        return provenance[1]
+    return (error,) if is_execution_control_error(error) else ()
+
+
+def execution_native_source_error(*errors: BaseException | None) -> BaseException | None:
+    """Project canonical native SOURCES, never a finite observer's withdrawal.
+
+    Only our freshly allocated composition carries this provenance. An
+    unmarked original source (including native cancellation/group) stays exact;
+    arbitrary exception attributes or cancellation-shaped foreign leaves do
+    not authorize rewriting its explicit graph. Flatten canonical compositions
+    before merging a shared latch, so repeated projections of the SAME sources
+    cannot accumulate wrappers or previous observers.
+    """
+    sources = []
+    for error in errors:
+        for source in _native_source_originals(error):
+            if all(source is not prior for prior in sources):
+                sources.append(source)
+    return execution_terminal_error(*sources, retain_originals=True,
+                                    isolate_control_originals=True)
+
+
 def execution_terminal_error(*errors: BaseException | None, retain_originals: bool = False,
                              prefer_cancellation: bool = False,
                              isolate_control_originals: bool = False) -> BaseException | None:
@@ -334,8 +367,34 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
             # A pre-existing explicit cycle cannot justify dropping its
             # originals; one enclosing original already traverses that cycle.
             enclosing = enclosing or unique[:1]
-            present = ((BaseExceptionGroup("original execution terminal evidence", enclosing),)
-                       if len(enclosing) > 1 else tuple(enclosing))
+            if len(enclosing) > 1:
+                terminal = BaseExceptionGroup("original execution terminal evidence", enclosing)
+                sources = []
+                for error in enclosing:
+                    for source in _native_source_originals(error):
+                        if all(source is not prior for prior in sources):
+                            sources.append(source)
+                # Ordinary physical errors can be native only by association
+                # with an actual retained owner. Preserve that exact original,
+                # not an unrelated observer C in the same finite aggregate.
+                from kestrel_sovereign._async_ownership import owned_task_error
+                for error in enclosing:
+                    for _resource, owner in execution_cleanup_debts(error):
+                        if isinstance(owner, asyncio.Future) and owner.done():
+                            physical = owned_task_error(owner)
+                            if (physical is not None
+                                and any(physical is member for member in _explicit_control_chain(terminal))
+                            ):
+                                # A physical owner can itself have returned a
+                                # canonical finite observation. Its observer C
+                                # is still not a shared native source.
+                                for source in _native_source_originals(physical) or (physical,):
+                                    if all(source is not prior for prior in sources):
+                                        sources.append(source)
+                terminal._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, tuple(sources))
+                present = (terminal,)
+            else:
+                present = tuple(enclosing)
     def retain(selected):
         if retain_originals:
             # A selected cause cannot point back to its enclosing original

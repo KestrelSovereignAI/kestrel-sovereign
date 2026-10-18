@@ -19,6 +19,7 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
 from tests.integration.test_execution_authority_postgres import native_pg as _native_pg
+from tests.utils.original_failure import OriginalFailure
 
 native_pg = _native_pg
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -394,6 +395,8 @@ async def test_asyncpg_internal_reset_task_refusal_keeps_actual_debt(
     original_abort = asyncpg.Connection.terminate
     refusal = RuntimeError("asyncpg internal reset task refused")
     abort_error = OSError("original connection termination refused")
+    refusal_source = OriginalFailure.capture(refusal)
+    abort_source = OriginalFailure.capture(abort_error)
     checkouts = []
     scope = ExecutionCustody(ProcessRuntimeExecutionFence("inner-factory-original"))
 
@@ -431,6 +434,7 @@ async def test_asyncpg_internal_reset_task_refusal_keeps_actual_debt(
     try:
         outcome = await await_owned_task(owner)
         assert execution_commit_outcome(outcome.error) == "committed"
+        refusal_source.assert_retained(outcome.error)
         assert execution_denial_scopes(outcome.error) is None
         ((resource, closer),) = execution_cleanup_debts(outcome.error)
         assert resource.context_manager is checkouts[0][0]
@@ -445,7 +449,7 @@ async def test_asyncpg_internal_reset_task_refusal_keeps_actual_debt(
             == 1
         )
         if abort_fails:
-            assert abort_error is refusal.__cause__
+            abort_source.assert_retained(outcome.error)
             assert not checkouts[0][1].is_closed()
         else:
             assert backend._pool.get_idle_size() == backend._pool.get_size()

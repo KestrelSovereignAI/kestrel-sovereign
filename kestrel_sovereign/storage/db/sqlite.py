@@ -646,9 +646,10 @@ async def _finish_aiosqlite_connection_close(
             diagnostics,
             overrun_at,
         )
-        if interrupt_error is not None:
-            raise error from interrupt_error
-        raise error
+        raise execution_terminal_error(
+            pending_cancellation, error, interrupt_error, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
 
     from kestrel_sovereign._async_ownership import owned_task_error
     close_error = owned_task_error(close_task)
@@ -1351,7 +1352,7 @@ class SQLiteBackend(DatabaseBackend):
                 raise failure
             return
 
-        pending_cancellation: Optional[asyncio.CancelledError] = None
+        pending_cancellation: Optional[BaseException] = None
         loop = asyncio.get_running_loop()
         diagnostics = self._close_diagnostics()
         close_deadline = loop.time() + self.minimum_close_timeout_s
@@ -1379,7 +1380,10 @@ class SQLiteBackend(DatabaseBackend):
                     # Cancellation cannot transfer ownership of the primary
                     # non-daemon worker. Preserve it for delivery only after
                     # the connection has completed its bounded retirement.
-                    pending_cancellation = exc
+                    pending_cancellation = execution_terminal_error(
+                        pending_cancellation, exc, retain_originals=True,
+                        prefer_cancellation=True, isolate_control_originals=True,
+                    )
                 except ValueError as exc:
                     if is_execution_control_error(exc):
                         failure = execution_terminal_error(failure, exc, retain_originals=True, isolate_control_originals=True)
@@ -1417,7 +1421,10 @@ class SQLiteBackend(DatabaseBackend):
                     # SQLite work.  Retire the Python task so loop teardown
                     # cannot strand a backend-owned cleanup task.
                     if isinstance(exc, asyncio.CancelledError):
-                        pending_cancellation = exc
+                        pending_cancellation = execution_terminal_error(
+                            pending_cancellation, exc, retain_originals=True,
+                            prefer_cancellation=True, isolate_control_originals=True,
+                        )
                     drain.cancel()
                     # Retire the Python drain separately from observing its
                     # original result. A new caller cancellation can interrupt
@@ -1434,7 +1441,10 @@ class SQLiteBackend(DatabaseBackend):
                         failure, observation, retain_originals=True,
                         isolate_control_originals=True,
                     )
-                    pending_cancellation = pending_cancellation or outcome.cancellation
+                    pending_cancellation = execution_terminal_error(
+                        pending_cancellation, outcome.cancellation, retain_originals=True,
+                        prefer_cancellation=True, isolate_control_originals=True,
+                    )
                 # Harvest the original terminal error only after completion;
                 # ordinary drain cancellation is not caller cancellation.
                 error = owned_task_error(drain)

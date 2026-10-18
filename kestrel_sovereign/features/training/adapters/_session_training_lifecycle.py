@@ -212,6 +212,8 @@ class SessionTrainingRecord(Generic[SessionT]):
     compensation_task: asyncio.Task[None] | None = field(default=None, repr=False)
     release_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     native_release_control: BaseException | None = field(default=None, repr=False)
+    release_body_started: bool = field(default=False, repr=False)
+    physical_release_error: BaseException | None = field(default=None, repr=False)
     task_opening_errors: dict[str, BaseException] = field(default_factory=dict, repr=False)
 
     def transition(self, target: SessionJobPhase, *, error: str | None = None) -> None:
@@ -481,10 +483,17 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         if record.phase is SessionJobPhase.RELEASING:
             record.transition(SessionJobPhase.RELEASE_FAILED,
                               error="original release owner failed")
-        if is_execution_control_error(error) and record.native_release_control is None:
+        # The outer owner also carries operational submission/compensation E.
+        # Only admission or PHYSICAL release uncertainty may fence retries.
+        native_release = (
+            record.task_opening_errors.get("release_task")
+            if is_execution_control_error(record.task_opening_errors.get("release_task"))
+            else record.physical_release_error if record.release_body_started else error
+        )
+        if is_execution_control_error(native_release) and record.native_release_control is None:
             debt = RuntimeError("original accepted release remains unresolved")
             debt._kestrel_native_retirement_debts = ((record.session, task),)
-            record.native_release_control = execution_terminal_error(error, debt,
+            record.native_release_control = execution_terminal_error(native_release, debt,
                 retain_originals=True, isolate_control_originals=True)
 
     def local_status(
@@ -1086,6 +1095,8 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         if task is not None and not task.done():
             return task
         record.transition(SessionJobPhase.RELEASING)
+        record.release_body_started = False
+        record.physical_release_error = None
         record.release_intent = intent
         # Cancel in the same step as the request, so no submission step can
         # run between cancel() being called and the release task starting.
@@ -1111,6 +1122,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         return task
 
     async def _run_release(self, record: SessionTrainingRecord[SessionT]) -> bool:
+        record.release_body_started = True
         name = self._hooks.display_name
         try:
             drained = await self._drain_submission(record)
@@ -1128,6 +1140,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                         admission=physical, retirement_resource=record.session,
                     )
                 except BaseException as error:
+                    record.physical_release_error = error
                     record.transition(
                         SessionJobPhase.RELEASE_FAILED,
                         error=f"session release failed: {error}",

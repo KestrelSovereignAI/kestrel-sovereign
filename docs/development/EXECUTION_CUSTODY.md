@@ -2010,3 +2010,32 @@ types share the same original physical close owner and guarded body protocol.
 A transport major-version change must not silently bypass request admission,
 response acquisition or physical pool retirement. SDK fixtures use their actual
 required transport, while the older-family coverage remains independently live.
+
+Spawn's final cap/name retirement returns actual finite withdrawal evidence,
+not a boolean or a manufactured cancellation. The public and direct-test tails
+save their body outcome before awaiting release and compose independent release
+errors without altering the original source. Successful publication semantics
+and the existing physical slot/name owners are unchanged.
+
+Canonical isolated compositions privately record their native source projection.
+SafeMode latches retain only that source projection; current observer withdrawal
+remains in the finite caller result. Unmarked genuine source cancellations and
+source groups stay intact, including their native cause. An arbitrary similarly
+named exception attribute cannot grant this provenance. This is evidence
+projection, not an authority grant, replacement closer or reconciliation ACK.
+
+Before selecting/acquiring a PostgreSQL native path, a trusted observer whose
+eager child has not yet published a join relationship yields at most one
+cancellable scheduling turn. Actual TaskGroup membership or direct/gather join
+edges then authorize observation; inherited context alone still does not. No
+global task factory, foreign frame inspection or task scan is installed.
+
+Training distinguishes the current physical release attempt from an operational
+submission/compensation failure. Native physical/admission uncertainty retains
+its exact owner; an ordinary physical release failure remains retryable even
+when the finite result also reports an operational native source. SQLite close
+deadline/drain paths retain distinct delivered withdrawals without extending the
+original deadline. PostgreSQL COMMIT/rollback exits classify and compose private
+evidence without appending caller cancellation or rollback debt to a prior source.
+The native tests use real local PG/SQLite effects and declared training/spawn
+seams, not authenticated provider billing, signed genesis or deployed acceptance.
