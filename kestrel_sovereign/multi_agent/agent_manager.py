@@ -459,6 +459,8 @@ def _uncommitted_spawn_not_hosted_cancellation(
 def _is_lifecycle_terminal_outcome(error: BaseException) -> bool:
     """Whether a lifecycle owner may aggregate this outcome and keep sweeping."""
 
+    if is_execution_control_error(error):
+        return True
     if isinstance(error, (Exception, asyncio.CancelledError)):
         return True
     if isinstance(error, BaseExceptionGroup):
@@ -470,6 +472,30 @@ def _raise_lifecycle_outcomes(message: str, outcomes: list[BaseException]) -> No
     terminal = execution_observation_error(*outcomes, message=message)
     if terminal is not None:
         raise terminal
+
+
+async def _collect_lifecycle_task_completion(
+    task: "asyncio.Future[object]", *, withdrawals: list[BaseException],
+) -> tuple[bool, BaseException | None]:
+    """Collect raised join outcomes before independent owned cleanup proceeds.
+
+    The lifecycle helper intentionally raises unexpected source groups. That
+    is a terminal result, not permission for an enclosing owner to abandon
+    other original Tasks. If observation itself failed before settlement,
+    join the SAME Task through the canonical completion-only owner first.
+    """
+    try:
+        return await await_lifecycle_task_completion(task, withdrawals=withdrawals)
+    except BaseException as error:
+        later = None
+        if not task.done():
+            outcome = await await_owned_task(task)
+            later = outcome.error
+            if outcome.cancellation is not None and all(
+                prior is not outcome.cancellation for prior in withdrawals
+            ):
+                withdrawals.append(outcome.cancellation)
+        return bool(withdrawals), execution_observation_error(error, later, *withdrawals)
 
 
 @dataclass(frozen=True)
@@ -575,6 +601,7 @@ class QuarantinedShutdownReaper:
     runtime_outcome_required: bool = False
     completed_monotonic: Optional[float] = None
     failure: Optional[str] = None
+    publication_error: Optional[BaseException] = None
 
 
 @dataclass(frozen=True)
@@ -9316,6 +9343,8 @@ class AgentManager:
             # of the terminal drain's join set. Registering a second owner
             # after the seal would instead race the drain's empty snapshot.
             return
+        if any(existing.task is record.task for existing in self._quarantined_shutdown_reapers.values()):
+            return
         self._retain_quarantined_cleanup(
             name=record.agent_name,
             agent_id=record.agent_id,
@@ -9459,78 +9488,94 @@ class AgentManager:
         self._quarantined_shutdown_reapers[reaper_id] = record
 
         def observe_reaper_completion(task: "asyncio.Future[object]") -> None:
-            record.completed_monotonic = time.monotonic()
-            failure = owned_task_error(task)
-            # The offboarding-specific observer may have failed publication.
-            # This SAME worker is physically complete; retire its duplicate
-            # inflight reference before collapsing quarantine to bounded state.
-            self._inflight_runtime_offboardings.pop(id(task), None)
-            if failure is not None and is_execution_control_error(failure):
-                self._quarantined_shutdown_control = _merge_manager_cleanup_control(
-                    self._quarantined_shutdown_control, failure,
-                )
-            if task.cancelled():
-                record.failure = "shutdown reaper was cancelled"
-            else:
-                if failure is None and record.runtime_outcome_required:
-                    failure = _runtime_offboarding_outcome_error(
-                        agent_name=record.agent_name,
-                        agent_id=record.agent_id,
-                        result=task.result(),
-                    )
-                if failure is not None:
-                    record.failure = _bounded_shutdown_metadata(
-                        f"{public_exception_type_name(failure)}: {failure}"
-                    )
-            # Do not keep a completed Task: it retains coroutine locals and,
-            # on failure, the full traceback. Operators still receive a
-            # bounded history entry with the safety outcome.
-            self._quarantined_shutdown_reapers.pop(record.reaper_id, None)
-            history = QuarantinedShutdownHistory(
-                reaper_id=record.reaper_id,
-                agent_name=record.agent_name,
-                canonical_agent_name=record.canonical_agent_name,
-                agent_id=record.agent_id,
-                started_monotonic=record.started_monotonic,
-                completed_monotonic=record.completed_monotonic or time.monotonic(),
-                failure=record.failure,
-            )
-            if history.failure is None:
-                self._quarantined_shutdown_history.append(history)
-            else:
-                self._unsafe_quarantined_shutdown_failures[history.reaper_id] = history
-                while (
-                    len(self._unsafe_quarantined_shutdown_failures)
-                    > _UNSAFE_QUARANTINED_FAILURE_LIMIT
-                ):
-                    self._unsafe_quarantined_shutdown_failures.pop(
-                        next(iter(self._unsafe_quarantined_shutdown_failures))
-                    )
-                    # The individual record is intentionally discarded to
-                    # preserve the hard metadata bound.  Keep one aggregate
-                    # reservation instead of an unbounded set of evicted
-                    # names; acknowledgement below is the explicit boundary
-                    # for reopening admission.
-                    self._unsafe_quarantined_shutdown_failure_overflow_reserved = (
-                        True
-                    )
-                    self._unsafe_quarantined_shutdown_failure_evictions += 1
-            if record.failure is None:
-                logger.info(
-                    "Quarantined shutdown reaper %s completed for agent %r",
-                    record.reaper_id,
-                    record.agent_name,
-                )
-            else:
-                logger.error(
-                    "Quarantined shutdown reaper %s remains unsafe for agent %r: %s",
-                    record.reaper_id,
-                    record.agent_name,
-                    record.failure,
-                )
+            self._observe_quarantined_cleanup_completion(record, task)
 
-        task.add_done_callback(observe_reaper_completion)
+        try:
+            task.add_done_callback(observe_reaper_completion)
+        except BaseException as error:
+            record.publication_error = error
+            raise
+        finally:
+            if task.done():
+                self._observe_quarantined_cleanup_completion(record, task)
         return reaper_id
+
+    def _observe_quarantined_cleanup_completion(
+        self, record: QuarantinedShutdownReaper, task: "asyncio.Future[object]",
+    ) -> None:
+        """Harvest the same completed record once, with or without callbacks."""
+        if (task is not record.task or not task.done()
+            or self._quarantined_shutdown_reapers.get(record.reaper_id) is not record):
+            return
+        record.completed_monotonic = time.monotonic()
+        failure = execution_observation_error(record.publication_error, owned_task_error(task))
+        # The offboarding-specific observer may have failed publication.
+        # This SAME worker is physically complete; retire its duplicate
+        # inflight reference before collapsing quarantine to bounded state.
+        self._inflight_runtime_offboardings.pop(id(task), None)
+        if failure is not None and is_execution_control_error(failure):
+            self._quarantined_shutdown_control = _merge_manager_cleanup_control(
+                self._quarantined_shutdown_control, failure,
+            )
+        if task.cancelled():
+            record.failure = "shutdown reaper was cancelled"
+        else:
+            if failure is None and record.runtime_outcome_required:
+                failure = _runtime_offboarding_outcome_error(
+                    agent_name=record.agent_name,
+                    agent_id=record.agent_id,
+                    result=task.result(),
+                )
+            if failure is not None:
+                record.failure = _bounded_shutdown_metadata(
+                    f"{public_exception_type_name(failure)}: {failure}"
+                )
+        # Do not keep a completed Task: it retains coroutine locals and,
+        # on failure, the full traceback. Operators still receive a
+        # bounded history entry with the safety outcome.
+        self._quarantined_shutdown_reapers.pop(record.reaper_id, None)
+        history = QuarantinedShutdownHistory(
+            reaper_id=record.reaper_id,
+            agent_name=record.agent_name,
+            canonical_agent_name=record.canonical_agent_name,
+            agent_id=record.agent_id,
+            started_monotonic=record.started_monotonic,
+            completed_monotonic=record.completed_monotonic or time.monotonic(),
+            failure=record.failure,
+        )
+        if history.failure is None:
+            self._quarantined_shutdown_history.append(history)
+        else:
+            self._unsafe_quarantined_shutdown_failures[history.reaper_id] = history
+            while (
+                len(self._unsafe_quarantined_shutdown_failures)
+                > _UNSAFE_QUARANTINED_FAILURE_LIMIT
+            ):
+                self._unsafe_quarantined_shutdown_failures.pop(
+                    next(iter(self._unsafe_quarantined_shutdown_failures))
+                )
+                # The individual record is intentionally discarded to
+                # preserve the hard metadata bound.  Keep one aggregate
+                # reservation instead of an unbounded set of evicted
+                # names; acknowledgement below is the explicit boundary
+                # for reopening admission.
+                self._unsafe_quarantined_shutdown_failure_overflow_reserved = (
+                    True
+                )
+                self._unsafe_quarantined_shutdown_failure_evictions += 1
+        if record.failure is None:
+            logger.info(
+                "Quarantined shutdown reaper %s completed for agent %r",
+                record.reaper_id,
+                record.agent_name,
+            )
+        else:
+            logger.error(
+                "Quarantined shutdown reaper %s remains unsafe for agent %r: %s",
+                record.reaper_id,
+                record.agent_name,
+                record.failure,
+            )
 
     def quarantined_shutdowns(self) -> dict[str, dict[str, object]]:
         """Return operational status for cleanup retained after removal.
@@ -9898,9 +9943,12 @@ class AgentManager:
                         continue
                     observed_reapers.add(record.reaper_id)
                     observed_cleanup_tasks.add(id(record.task))
-                    join_cancelled, failure = await await_lifecycle_task_completion(
+                    join_cancelled, failure = await _collect_lifecycle_task_completion(
                         record.task, withdrawals=refund_withdrawals,
                     )
+                    if record.publication_error is not None:
+                        join_originals.append(record.publication_error)
+                    self._observe_quarantined_cleanup_completion(record, record.task)
                     cancelled = cancelled or join_cancelled
                     classified_outcome = False
                     if failure is not None:
@@ -9931,7 +9979,7 @@ class AgentManager:
                     (
                         join_cancelled,
                         offboarding_failure,
-                    ) = await await_lifecycle_task_completion(runtime_offboarding.task, withdrawals=refund_withdrawals)
+                    ) = await _collect_lifecycle_task_completion(runtime_offboarding.task, withdrawals=refund_withdrawals)
                     cancelled = cancelled or join_cancelled
                     classified_outcome = False
                     if runtime_offboarding.task.done():
@@ -9973,9 +10021,10 @@ class AgentManager:
                     if budget_release.release_id in observed_budget_releases:
                         continue
                     observed_budget_releases.add(budget_release.release_id)
-                    join_cancelled, release_failure = await await_lifecycle_task_completion(
+                    join_cancelled, release_failure = await _collect_lifecycle_task_completion(
                         budget_release.task, withdrawals=refund_withdrawals,
                     )
+                    self._observe_budget_release_completion(budget_release, budget_release.task)
                     cancelled = cancelled or join_cancelled
                     if release_failure is not None:
                         join_originals.append(release_failure)
@@ -9996,7 +10045,7 @@ class AgentManager:
                 # a second cancellation must not interrupt this manager between
                 # observing a reaper and its callback retiring the live task.
                 callback_yield = asyncio.create_task(asyncio.sleep(0))
-                yield_cancelled, yield_failure = await await_lifecycle_task_completion(
+                yield_cancelled, yield_failure = await _collect_lifecycle_task_completion(
                     callback_yield, withdrawals=refund_withdrawals,
                 )
                 cancelled = cancelled or yield_cancelled
@@ -10044,7 +10093,7 @@ class AgentManager:
                 name="agent_manager:reconcile_completed_child_terminations",
             )
             reconciliation_cancelled, reconciliation_failure = (
-                await await_lifecycle_task_completion(reconciliation, withdrawals=refund_withdrawals)
+                await _collect_lifecycle_task_completion(reconciliation, withdrawals=refund_withdrawals)
             )
             cancelled = cancelled or reconciliation_cancelled
             if reconciliation_failure is not None:
@@ -11476,23 +11525,7 @@ class AgentManager:
         def observe_budget_release_completion(
             task: "asyncio.Future[object]",
         ) -> None:
-            if self._inflight_removal_budget_releases.get(record.release_id) is not record:
-                # The SAME Task was transferred to an accepted quarantine
-                # reaper. That owner's callback retains its terminal evidence.
-                return
-            # A completed task retains its traceback-bearing frame. Remove it
-            # immediately, but never discard an unsafe terminal outcome: this
-            # callback can run while a terminal drain is still waiting to
-            # acquire ``_lock`` and therefore has not yet observed the task.
-            self._inflight_removal_budget_releases.pop(record.release_id, None)
-            if (
-                self._inflight_removal_budget_releases_by_child.get(child_name)
-                is record
-            ):
-                self._inflight_removal_budget_releases_by_child.pop(child_name, None)
-            failure = owned_task_error(task)
-            if failure is not None:
-                self._record_unsafe_removal_budget_release_failure(record, failure)
+            self._observe_budget_release_completion(record, task)
 
         # ``Future.add_done_callback`` schedules callbacks for a later loop
         # turn when the override returned an already-completed Future. Retire
@@ -11512,6 +11545,21 @@ class AgentManager:
                 )
         return record
 
+    def _observe_budget_release_completion(
+        self, record: InflightRemovalBudgetRelease, task: "asyncio.Future[object]",
+    ) -> None:
+        """Retire only this completed record, whether callback or join harvests."""
+        if (task is not record.task or not task.done()
+            or self._inflight_removal_budget_releases.get(record.release_id) is not record):
+            # A transferred Task belongs to its accepted quarantine record.
+            return
+        self._inflight_removal_budget_releases.pop(record.release_id, None)
+        if self._inflight_removal_budget_releases_by_child.get(record.child_name) is record:
+            self._inflight_removal_budget_releases_by_child.pop(record.child_name, None)
+        failure = owned_task_error(task)
+        if failure is not None:
+            self._record_unsafe_removal_budget_release_failure(record, failure)
+
     async def _await_child_budget_release_cancellation_safe(
         self, budget_release: "asyncio.Future[object]", *,
         withdrawals: Optional[list[BaseException]] = None,
@@ -11520,7 +11568,13 @@ class AgentManager:
 
         caller = asyncio.current_task()
         release_cancelled = bool(caller is not None and caller.cancelling())
-        outcome = await await_owned_task(budget_release)
+        try:
+            outcome = await await_owned_task(budget_release)
+        finally:
+            if budget_release.done():
+                for record in tuple(self._inflight_removal_budget_releases.values()):
+                    if record.task is budget_release:
+                        self._observe_budget_release_completion(record, budget_release)
         if withdrawals is not None and outcome.cancellation is not None:
             if all(prior is not outcome.cancellation for prior in withdrawals):
                 withdrawals.append(outcome.cancellation)
@@ -13551,6 +13605,7 @@ class AgentManager:
         )
         cancelled = False
         cleanup_failed = False
+        originals, withdrawals = [], []
 
         while True:
             records = tuple(
@@ -13561,21 +13616,30 @@ class AgentManager:
             if not records:
                 break
             for record in records:
-                join_cancelled, failure = await await_lifecycle_task_completion(
-                    record.task
+                join_cancelled, failure = await _collect_lifecycle_task_completion(
+                    record.task, withdrawals=withdrawals,
                 )
+                if record.publication_error is not None:
+                    originals.append(record.publication_error)
+                self._observe_quarantined_cleanup_completion(record, record.task)
                 cancelled = cancelled or join_cancelled
                 if failure is not None:
                     cleanup_failed = True
+                    originals.append(failure)
 
             # Completion callbacks collapse live tasks into bounded history or
             # unsafe evidence. Yield through the cancellation-safe join so the
             # next ownership snapshot cannot spin on a completed live record.
             callback_yield = asyncio.create_task(asyncio.sleep(0))
-            yield_cancelled, yield_failure = await await_lifecycle_task_completion(
-                callback_yield
+            yield_cancelled, yield_failure = await _collect_lifecycle_task_completion(
+                callback_yield, withdrawals=withdrawals,
             )
             cancelled = cancelled or yield_cancelled
+            if yield_failure is not None:
+                originals.append(yield_failure)
+            if any(is_execution_control_error(error) or not _is_lifecycle_terminal_outcome(error)
+                   for error in originals):
+                raise execution_observation_error(*originals, *withdrawals)
             if yield_failure is not None:
                 raise RuntimeError(
                     "Unable to observe quarantined child cleanup completion"
@@ -13593,10 +13657,13 @@ class AgentManager:
             name=f"ttl_termination_reconcile:{child_name}",
         )
         reconciliation_cancelled, reconciliation_failure = (
-            await await_lifecycle_task_completion(reconciliation)
+            await _collect_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
         )
         cancelled = cancelled or reconciliation_cancelled
         if reconciliation_failure is not None:
+            originals.append(reconciliation_failure)
+            if any(is_execution_control_error(error) for error in originals):
+                raise execution_observation_error(*originals, *withdrawals)
             raise RuntimeError(
                 "Unable to reconcile deferred child cleanup"
             ) from reconciliation_failure
@@ -13877,14 +13944,15 @@ class AgentManager:
                     break
                 for spawn_task in earlier_spawns:
                     joined_spawns.add(spawn_task)
-                    task_cancelled, failure = await await_lifecycle_task_completion(
+                    task_cancelled, failure = await _collect_lifecycle_task_completion(
                         spawn_task, withdrawals=withdrawals,
                     )
                     cancelled = cancelled or task_cancelled
-                    if failure is not None and is_execution_control_error(failure):
+                    if failure is not None and (is_execution_control_error(failure)
+                                                or not _is_lifecycle_terminal_outcome(failure)):
                         failures.append(failure)
             if failures:
-                raise execution_finite_error(*failures, *withdrawals)
+                raise execution_observation_error(*failures, *withdrawals)
         except BaseException as error:
             failures.append(error)
             try:
@@ -14804,7 +14872,7 @@ class AgentManager:
                     name=f"terminate_child_setup_retirement_settle:{child_name}",
                 )
                 settlement_cancelled, settlement_failure = (
-                    await await_lifecycle_task_completion(settlement, withdrawals=withdrawals)
+                    await _collect_lifecycle_task_completion(settlement, withdrawals=withdrawals)
                 )
                 if settlement_failure is not None:
                     setup_outcomes.append(settlement_failure)
@@ -14909,7 +14977,7 @@ class AgentManager:
                 (
                     retirement_cancelled,
                     retirement_failure,
-                ) = await await_lifecycle_task_completion(retirement_settlement, withdrawals=withdrawals)
+                ) = await _collect_lifecycle_task_completion(retirement_settlement, withdrawals=withdrawals)
                 if retirement_failure is not None:
                     terminal_outcomes.append(retirement_failure)
                 reconciliation = asyncio.create_task(
@@ -14919,7 +14987,7 @@ class AgentManager:
                 (
                     reconciliation_cancelled,
                     reconciliation_failure,
-                ) = await await_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
+                ) = await _collect_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
                 if reconciliation_failure is not None:
                     if not _is_lifecycle_terminal_outcome(reconciliation_failure):
                         raise reconciliation_failure
@@ -15289,7 +15357,7 @@ class AgentManager:
                 )
                 if unexpected is not None and not is_execution_control_error(exc):
                     raise unexpected
-                assert expected is not None
+                assert expected is not None or is_execution_control_error(exc)
                 removed = fully_removed(name)
                 record_failure(name, exc if is_execution_control_error(exc) else expected)
                 failure_recorded = True

@@ -41,6 +41,9 @@ _COLD_TTL_RETIREMENT_RETRY_SECONDS = 30.0
 def _is_expected_termination_outcome(error: BaseException) -> bool:
     """Accept lifecycle failures/cancellation, never process-control signals."""
 
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    if is_execution_control_error(error):
+        return True
     if isinstance(error, (Exception, asyncio.CancelledError)):
         return True
     if isinstance(error, BaseExceptionGroup):
@@ -1794,24 +1797,32 @@ class SpawnedAgentLifecycle:
                 "await_child_termination_reconciliation",
             )
             if callable(await_reconciliation):
-                reconciliation_result = await await_reconciliation(
-                    tracked.parent_did, child_name
-                )
+                try:
+                    reconciliation_result = await await_reconciliation(
+                        tracked.parent_did, child_name
+                    )
+                except BaseException as reconciliation_error:
+                    from kestrel_sovereign.execution_custody import execution_observation_error
+                    raise execution_observation_error(termination_failure, reconciliation_error)
             else:
                 class_reconciliation = getattr(
                     type(self._agent_manager),
                     "await_child_termination_reconciliation",
                     None,
                 )
-                reconciliation_result = (
-                    await class_reconciliation(
-                        self._agent_manager,
-                        tracked.parent_did,
-                        child_name,
+                try:
+                    reconciliation_result = (
+                        await class_reconciliation(
+                            self._agent_manager,
+                            tracked.parent_did,
+                            child_name,
+                        )
+                        if callable(class_reconciliation)
+                        else None
                     )
-                    if callable(class_reconciliation)
-                    else None
-                )
+                except BaseException as reconciliation_error:
+                    from kestrel_sovereign.execution_custody import execution_observation_error
+                    raise execution_observation_error(termination_failure, reconciliation_error)
             if reconciliation_result is not None:
                 terminated, reconciliation_cancelled = reconciliation_result
                 if not terminated and termination_failure is not None:

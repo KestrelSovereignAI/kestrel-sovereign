@@ -188,6 +188,27 @@ def _explicit_control_chain(error: BaseException | None) -> Iterator[BaseExcepti
             pending.extend(current.exceptions)
 
 
+def _enclosing_original_errors(errors: list[BaseException]) -> list[BaseException]:
+    """Keep representatives covering every explicit component, including cycles.
+
+    An error enclosed by a retained representative is redundant. A later
+    enclosing error can replace that representative because its whole graph
+    remains reachable. Unlike removing every node with an incoming edge,
+    this also retains a representative of a cyclic component beside unrelated
+    originals. No original graph is changed.
+    """
+    enclosing: list[BaseException] = []
+    chains: dict[int, set[int]] = {}
+    for error in errors:
+        if any(id(error) in chains[id(prior)] for prior in enclosing):
+            continue
+        chain = {id(member) for member in _explicit_control_chain(error)}
+        chains[id(error)] = chain
+        enclosing = [prior for prior in enclosing if id(prior) not in chain]
+        enclosing.append(error)
+    return enclosing
+
+
 def execution_commit_outcome(error: BaseException | None) -> str | None:
     """Preserve the strongest commit distinction through explicit carriers."""
     outcome = None
@@ -383,11 +404,7 @@ def execution_observation_error(*errors: BaseException | None,
     # Re-observing an already enclosing carrier is not another independent
     # failure. Keep that exact original envelope rather than growing wrapper
     # history or converting a sole typed outcome into a duplicate group.
-    enclosing = [error for error in present if not any(
-        parent is not error and any(error is member for member in _explicit_control_chain(parent))
-        for parent in present
-    )]
-    present = enclosing or present[:1]
+    present = _enclosing_original_errors(present)
     if len(present) < 2:
         return present[0] if present else None
     terminal = BaseExceptionGroup(message, present)
@@ -438,14 +455,7 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
             for error in present:
                 if all(error is not prior for prior in unique):
                     unique.append(error)
-            enclosing = [error for error in unique if not any(
-                parent is not error
-                and any(error is member for member in _explicit_control_chain(parent))
-                for parent in unique
-            )]
-            # A pre-existing explicit cycle cannot justify dropping its
-            # originals; one enclosing original already traverses that cycle.
-            enclosing = enclosing or unique[:1]
+            enclosing = _enclosing_original_errors(unique)
             if len(enclosing) > 1:
                 terminal = BaseExceptionGroup("original execution terminal evidence", enclosing)
                 sources = []

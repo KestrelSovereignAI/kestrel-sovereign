@@ -1,6 +1,7 @@
 """Native finite callers and manager retention have different lifetimes."""
 import ast
 import asyncio
+from itertools import permutations
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,28 @@ def test_observation_of_already_enclosing_original_does_not_add_envelope_history
     assert execution_observation_error(enclosing, original.error, sibling.error) is enclosing
     original.assert_retained(enclosing)
     sibling.assert_retained(enclosing)
+
+
+@pytest.mark.parametrize("composer", ["observation", "finite"])
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+@pytest.mark.parametrize("kind", ["denied", "committed", "unknown", "source-cancel", "source-group"])
+def test_finite_composition_keeps_cyclic_component_beside_independent_original(composer, order, kind):
+    # Pure explicit-graph contract, not native I/O/authority acceptance.
+    native = OriginalFailure.capture(source(kind))
+    first = RuntimeError("original cyclic outer carrier")
+    second = BaseExceptionGroup("original cyclic source carrier", [native.error])
+    first.__cause__ = second
+    second.__cause__ = first
+    originals = [OriginalFailure.capture(error) for error in
+                 (first, second, OSError("independent original outside the cycle"))]
+    errors = [originals[index].error for index in order]
+    terminal = (execution_observation_error(*errors) if composer == "observation" else
+                execution_finite_error(*errors, retain_originals=True, isolate_control_originals=True))
+    for original in (*originals, native):
+        original.assert_retained(terminal)
+    assert execution_commit_outcome(terminal) == execution_commit_outcome(native.error)
+    # Re-observation must remain bounded even when one component is cyclic.
+    assert execution_observation_error(terminal, *errors) is terminal
 
 
 def test_all_three_lifecycle_consumers_use_explicit_finite_policy():

@@ -383,3 +383,18 @@ The protected lifetime begins immediately after successful acquisition: extensio
 setup, banner output and shutdown diagnostics cannot bypass mandatory completion
 and context retirement. Failed fallback observation retains its original waiter
 admission error and whole native group while independent safe cleanup still runs.
+
+Quarantine and ordinary-budget completion use an idempotent physical harvester
+from both callbacks and direct joins. Failed callback publication does not
+create another cleanup Task or leave a completed record in the live registry;
+bounded unsafe metadata and native source retention are published once. A
+raised completion outcome is collected before independent original joins,
+registration compensation or reconciliation continue. Native groups remain
+whole even when their leaves include unexpected control, without turning that
+control into a successful lifecycle result. Child-specific TTL readers surface
+native uncertainty and actual withdrawals rather than reducing them to a
+boolean refusal. Their outer lifecycle caller preserves earlier terminal
+evidence beside the later reader failure and does not finalize the child.
+Finite composition keeps a representative of every explicit graph component,
+including mutually enclosing cycles beside independent errors; it does not
+rewrite originals or grow a repeated-observation history.

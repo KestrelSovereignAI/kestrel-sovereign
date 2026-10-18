@@ -454,7 +454,8 @@ async def test_completion_join_keeps_prior_native_receipt_and_original_close_fai
 async def test_bounded_native_offboarding_preserves_its_actual_observer(tmp_path, monkeypatch):
     import threading
     from kestrel_sovereign.features.isolated_runtime import RuntimeNamespaceCleanupOutcome
-    from kestrel_sovereign.multi_agent.agent_manager import InflightRuntimeOffboarding
+    from kestrel_sovereign.multi_agent.agent_manager import InflightRuntimeOffboarding, RuntimeOffboardingRetainedError
+    from kestrel_sovereign.endpoints.models import _grouped_runtime_retained_detail
 
     manager = AgentManager(base_data_dir=tmp_path)
     artifact = tmp_path / "fixture-owned-offboarding"
@@ -462,6 +463,7 @@ async def test_bounded_native_offboarding_preserves_its_actual_observer(tmp_path
     entered, release = threading.Event(), threading.Event()
     actual_wait = asyncio.wait
     withdrawals = []
+    withdrawal_graphs = []
     observing = asyncio.Event()
     owner = None
 
@@ -479,6 +481,7 @@ async def test_bounded_native_offboarding_preserves_its_actual_observer(tmp_path
         except asyncio.CancelledError as cancellation:
             if asyncio.current_task() is owner:
                 withdrawals.append(cancellation)
+                withdrawal_graphs.append(tuple(_explicit_control_chain(cancellation)))
             raise
 
     worker = create_owned_task(asyncio.to_thread(remove), retain_originals=True)
@@ -494,8 +497,15 @@ async def test_bounded_native_offboarding_preserves_its_actual_observer(tmp_path
         outcome = await await_owned_task(owner)
         assert outcome.error is None
         cancelled, failure = outcome.result
-        assert cancelled and failure.cleanup_pending and not worker.done() and artifact.exists()
-        assert len(withdrawals) == 1 and withdrawals[0] in tuple(_explicit_control_chain(failure)), "offboarding metadata discarded actual observer withdrawal"
+        chain = tuple(_explicit_control_chain(failure))
+        pending = [error for error in chain if isinstance(error, RuntimeOffboardingRetainedError)]
+        assert cancelled and len(pending) == 1 and pending[0].cleanup_pending
+        assert not worker.done() and artifact.exists()
+        assert len(withdrawals) == 1 and withdrawals[0] in chain, "offboarding metadata discarded actual observer withdrawal"
+        assert tuple(_explicit_control_chain(withdrawals[0])) == withdrawal_graphs[0], "composition mutated the actual observer"
+        detail = _grouped_runtime_retained_detail(failure)
+        assert detail["runtime_cleanup_pending"] is True and detail["runtime_cleanup_state"] == "pending"
+        assert detail["retained_outcome_count"] == 1 and detail["additional_outcome_count"] == 1
     finally:
         release.set()
         if owner is not None:
