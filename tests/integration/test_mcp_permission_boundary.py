@@ -52,6 +52,11 @@ class MCPBoundary:
         assert result.exit_code == 0, result.output
         return result.output.decode().splitlines()
 
+    async def result_with_witness(self, call, expected_witness):
+        result = await call
+        assert await self.witness() == expected_witness
+        return result
+
 
 @pytest_asyncio.fixture
 async def mcp_boundary(tmp_path):
@@ -114,8 +119,7 @@ async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary):
     await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.DENY)
     for generic in ('mcp_call_tool', 'mcp_gateway_call'):
         await peer.store.set_permission('MCPAgent', generic, PermissionLevel.ALLOW)
-    result = await peer.invoke('direct-denied')
-    assert await peer.witness() == []
+    result = await peer.result_with_witness(peer.invoke('direct-denied'), [])
     assert result['success'] is False and 'Permission denied' in result['error']
     for generic, arguments in [
         ('mcp_call_tool', {'container_name': peer.container, 'tool_name': 'record_marker',
@@ -139,16 +143,16 @@ async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_bou
     assert request.tool_args == {'marker': 'approved-once'}
     assert await peer.witness() == []
     assert await peer.queue.submit_decision(request.id, True, scope='once')
-    assert (await asyncio.wait_for(first, 5))['status'] == 'ok'
-    assert await peer.witness() == ['approved-once']
+    result = await peer.result_with_witness(asyncio.wait_for(first, 5), ['approved-once'])
+    assert result['status'] == 'ok'
     assert not await peer.queue.submit_decision(request.id, True, scope='once')
     second = peer.invoke('not-approved-again')
     following = await asyncio.wait_for(peer.requests.get(), 5)
     assert following.id != request.id and not second.done()
     assert await peer.witness() == ['approved-once']
     assert await peer.queue.submit_decision(following.id, False)
-    assert (await asyncio.wait_for(second, 5))['success'] is False
-    assert await peer.witness() == ['approved-once']
+    result = await peer.result_with_witness(asyncio.wait_for(second, 5), ['approved-once'])
+    assert result['success'] is False
     decisions = [row['decision'] for row in await peer.store.get_audit_log()
                  if row['feature'] == peer.owner and row['tool'] == peer.handle]
     assert decisions.count('user_approved') == 1
@@ -166,12 +170,11 @@ async def test_pending_approval_cannot_execute_against_a_replacement_connection(
     current = peer.feature.manager.owned_containers[peer.container]['connection']
     assert current is not original and not original.is_connected
     assert await peer.queue.submit_decision(request.id, True, scope='once')
-    result = await asyncio.wait_for(pending, 5)
+    result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
     assert result['status'] == 'error', result
     assert 'changed; rediscover' in result['error']
-    assert await peer.witness() == []
     fresh = peer.invoke('approved-for-new-connection')
     following = await asyncio.wait_for(peer.requests.get(), 5)
     assert await peer.queue.submit_decision(following.id, True, scope='once')
-    assert (await asyncio.wait_for(fresh, 5))['status'] == 'ok'
-    assert await peer.witness() == ['approved-for-new-connection']
+    result = await peer.result_with_witness(asyncio.wait_for(fresh, 5), ['approved-for-new-connection'])
+    assert result['status'] == 'ok'

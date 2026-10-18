@@ -2608,6 +2608,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/02/06/a8d6a8f90d11b76d9086242b6bb0ee4b503473bfc8be34c2d5b067275c22/httpcore2-2.14.0-py3-none-any.whl", hash = "sha256:4c4f64f4b544afeb778c42c0ffb5941b29e671157e90ed3f6dc787c4bca90cd1", size = 84291, upload-time = "2026-10-18T16:29:19.743Z" },
 ]
 
+[package.optional-dependencies]
+asyncio = [
+    { name = "anyio" },
+]
+
 [[package]]
 name = "httplib2"
 version = "0.32.0"
@@ -2978,20 +2983,20 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.5.0"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "docker" },
-    { name = "httpx2" },
-    { name = "kestrel-sovereign-sdk" },
+    { name = "jsonschema" },
+    { name = "kestrel-sovereign-sdk", extra = ["httpx2"] },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/83/68/9ba0ce1c75086f363ec2e8bb0522c23566a7a8c2fe7d651e2e7df2468699/kestrel_feature_mcp-0.5.0.tar.gz", hash = "sha256:d8d514792249168eb73e48d5dc688d67a5233638dc6d64a56e558c9d2a6ce15c", size = 163562, upload-time = "2026-10-18T15:58:51.553Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/48/31/8e2dabbb2cd5c2f2f5fd7a968247bc732cbdc6c92b7e2adf0affc48ae8d9/kestrel_feature_mcp-0.6.0.tar.gz", hash = "sha256:b42689d73e553637616c07dbecc63e1f9bf78225ce81eaae0091f1dc963dcf3a", size = 195062, upload-time = "2026-10-18T22:49:16.016Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ed/bc/5f2d03c7f6827c551870ef86ff0585c1ff9be84cb234ad2aa01bb5f53e8a/kestrel_feature_mcp-0.5.0-py3-none-any.whl", hash = "sha256:db5ea77d9bf649059923d284cc24b0256897ac96e1ce62efd1a0018c24bcc76f", size = 47264, upload-time = "2026-10-18T15:58:50.153Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/7c/522b94650083537602fd08d509c467126d914723a018a4fb251a8963746c/kestrel_feature_mcp-0.6.0-py3-none-any.whl", hash = "sha256:9f3606d11fdafcd49c8ff71f50a80f616429d5b5258b9915f6ce1ca510afc9ee", size = 68866, upload-time = "2026-10-18T22:49:14.6Z" },
 ]
 
 [[package]]
@@ -3449,6 +3454,10 @@ wheels = [
 httpx = [
     { name = "httpcore", extra = ["asyncio"] },
     { name = "httpx" },
+]
+httpx2 = [
+    { name = "httpcore2", extra = ["asyncio"] },
+    { name = "httpx2" },
 ]
 metrics = [
     { name = "prometheus-client" },
