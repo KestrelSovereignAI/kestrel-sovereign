@@ -179,3 +179,25 @@ def test_avatar_fetch_passes_the_shared_validation_result_into_native_transport(
         )
     finally:
         _restore_app(app, original)
+
+
+def test_avatar_transport_origin_refusal_is_a_client_error_without_storage(monkeypatch):
+    from kestrel_sdk.security import outbound
+
+    store = AsyncMock()
+    agent = SimpleNamespace(agent_id="did:test:avatar", storage=SimpleNamespace(files=SimpleNamespace(store_avatar=store)))
+
+    def refuse(request):
+        raise outbound.SSRFError("pinned transport refused unexpected origin")
+
+    monkeypatch.setattr(outbound, "pinned_httpx_async_transport", lambda validated: httpx.MockTransport(refuse))
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post("/api/identity/avatar", json={"url": "https://8.8.8.8/avatar.png"}, headers={"X-API-Key": "test-key"})
+        assert response.status_code == 400
+        assert "unexpected origin" in response.json()["detail"]
+        store.assert_not_awaited()
+    finally:
+        _restore_app(app, original)

@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-18
-**Scope:** 3131 tracked files (2325 `.py`, 357 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3133 tracked files (2327 `.py`, 357 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -4246,7 +4246,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_identity_command_parsing.py** — F187 command-form regression: the encrypted-export restore instruction must be parseable by the real (positional) command parser.
   - `def test_import_positional_form_binds_key_hash()`; `def test_verify_positional_form_binds_key_hash()`; `def test_old_kwarg_form_misbinds_and_would_be_rejected()`; `async def test_import_rejects_non_boolean_verify_signature()`
 - **tests/unit/test_identity_constitution_endpoint_contracts.py** — Focused contract tests for identity and constitution endpoints.
-  - `def test_identity_endpoint_returns_avatar_and_constitution_fields()`; `def test_constitution_endpoint_returns_text_hash_and_metadata()`; `def test_avatar_url_rejection_uses_shared_policy_before_transport_creation(url, monkeypatch)`; `def test_avatar_fetch_passes_the_shared_validation_result_into_native_transport(monkeypatch)`
+  - `def test_identity_endpoint_returns_avatar_and_constitution_fields()`; `def test_constitution_endpoint_returns_text_hash_and_metadata()`; `def test_avatar_url_rejection_uses_shared_policy_before_transport_creation(url, monkeypatch)`; `def test_avatar_fetch_passes_the_shared_validation_result_into_native_transport(monkeypatch)`; `def test_avatar_transport_origin_refusal_is_a_client_error_without_storage(monkeypatch)`
 - **tests/unit/test_identity_custody_bundle.py** — Durable Cloud Run identity custody bundle tests (#2472).
   - `async def test_encrypted_bundle_round_trip_and_fail_closed(tmp_path, monkeypatch)`; `def test_bundle_writer_does_not_depend_on_process_umask(tmp_path)`
 - **tests/unit/test_identity_endpoints.py** — Unit tests for the identity profile endpoints.
@@ -4547,6 +4547,8 @@ Repo entry points and standard project files.
   - `async def store()`; `async def test_orphan_marker_session_lists_but_now_deletes(store)`; `async def test_delete_only_touches_tagged_rows(store)`; `async def test_delete_restore_round_trip_includes_marker(store)`; `async def test_purge_destroys_marker_too(store)`; `async def test_healthy_session_delete_unchanged(store)`
 - **tests/unit/test_otel_export_isolation.py** — Regression guard for #2704: the test suite must never ship real OTLP spans.
   - `def network_export_sentinel(monkeypatch)`; `def test_autouse_fixture_disables_llm_tracing_by_default()`; `def test_llm_span_cycle_never_exports_over_network(network_export_sentinel)`; `def test_endpoint_set_run_uses_in_memory_exporter_not_network(monkeypatch, network_export_sentinel)`
+- **tests/unit/test_outbound_fetch_tls.py** — Exercise Core's production fetch callers over real verified TLS and HTTP.
+  - `def outbound_tls(tmp_path, monkeypatch, request)`; `def test_did_fetch_preserves_idna2008_host_sni_and_proxy_isolation(outbound_tls)`; `def test_did_fetch_enforces_the_real_peer_certificate(outbound_tls)`; `def test_avatar_uses_real_tls_and_refuses_http_redirects(outbound_tls, path, status)`; `def test_extracted_tls_fixture_still_supports_the_load_test_memory_bio(tmp_path)`
 - **tests/unit/test_owned_gather_first_completion.py** — Pure Task-owner policy checks; native ingress proof is an integration test.
   - `async def test_invalid_race_policy_does_not_consume_operations(policy)`; `async def test_empty_owned_gather_has_no_waiter(policy)`; `async def test_owned_gather_default_waits_but_race_retires_peer(policy)`
 - **tests/unit/test_owned_join_ancestry.py** — Actual join dependencies are distinct from creation/context ancestry.
@@ -5018,7 +5020,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_sse_connection_limits.py** — Unit tests for SSE connection limits (issue #145).
   - `def clean_sse_connections()`; `def app_with_mock_agent()`; `class TestSSEConnectionLimits`; `class TestSSEConnectionTrackerModule`
 - **tests/unit/test_ssrf_guard.py** — DID and stdlib HTTPS callers use the shared SDK outbound policy.
-  - `class TestPinnedUrllibConnections`; `class TestDidWebSSRF`
+  - `class TestPinnedUrllibConnections`; `class TestDidWebSSRF`; `def test_did_fetch_network_failures_have_the_resolver_error_type(monkeypatch, failure)`; `def test_did_fetch_does_not_hide_programming_errors(monkeypatch)`; `def test_pinned_connection_refuses_proxy_tunnels_before_dialing()`; `def test_did_http_errors_close_the_response_before_becoming_resolver_errors(monkeypatch, status)`
 - **tests/unit/test_standalone_context_shutdown_admission.py** — Original Agent-owned Hold resources close without an extra collector Task.
   - `async def test_agent_shutdown_retains_original_standalone_context(tmp_path, monkeypatch, refusal)`; `async def test_agent_original_context_close_joins_actual_ack_through_withdrawal(tmp_path, monkeypatch)`
 - **tests/unit/test_standalone_original_cleanup.py** — Original standalone resources and caller withdrawal survive failed startup.
@@ -5304,6 +5306,8 @@ Repo entry points and standard project files.
   - `async def settle_occurrences(runner)`; `async def tick_and_settle(runner)`
 - **tests/utils/test_result_analyzer.py** — Test Result Analyzer for Agent Reflection.
   - `class InsightType`; `class TestInsight`; `class TestPattern`; `class TestResultAnalyzer`
+- **tests/utils/tls.py** — Shared real TLS certificate and isolated HTTP server fixtures.
+  - `def make_tls_contexts(directory, hostname)`; `def tls_http_server(context, handler)`
 - **tests/utils/virtual_clock.py** — Event-loop clocks that only move when a test advances them.
   - `class VirtualClock`; `class VirtualClockLoop`; `def pinned_loop_clock()`; `class AdvanceableClock`; `def advanceable_loop_clock()`; `async def await_within_hang_guard(awaitable)`; `async def wait_for_thread_event(event)`
 

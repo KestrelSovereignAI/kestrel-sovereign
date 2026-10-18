@@ -2,14 +2,102 @@
 from __future__ import annotations
 
 import ipaddress
+from http.client import RemoteDisconnected
+import socket
+import ssl
 import pytest
 from unittest.mock import MagicMock
+from urllib.error import URLError
 
 from kestrel_sdk.security.outbound import SSRFError, ValidatedOutboundURL
 from kestrel_sovereign.security.pinned_urllib import _PinnedHTTPSConnection
 
 
 class TestPinnedUrllibConnections:
+    def test_certificate_failure_does_not_retry_a_second_address(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")),
+        )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=10)
+        first, second = MagicMock(spec=socket.socket), MagicMock(spec=socket.socket)
+        conn._create_connection = MagicMock(side_effect=[first, second])
+        conn._context = MagicMock()
+        conn._context.wrap_socket.side_effect = [ssl.SSLCertVerificationError("bad certificate"), second]
+        with pytest.raises(ssl.SSLCertVerificationError, match="certificate"):
+            conn.connect()
+        conn._create_connection.assert_called_once()
+        first.close.assert_called_once()
+        second.close.assert_not_called()
+        assert conn.sock is None
+
+    def test_all_addresses_share_one_connection_deadline(self, monkeypatch):
+        clock = [0.0]
+        monkeypatch.setattr("time.monotonic", lambda: clock[0])
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")),
+        )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=0.5)
+        dials = []
+
+        def stalled(address, timeout, source_address):
+            dials.append((address, timeout))
+            clock[0] += timeout
+            raise TimeoutError("address stalled")
+
+        conn._create_connection = stalled
+        with pytest.raises(TimeoutError) as error:
+            conn.connect()
+        assert len(dials) == 1
+        assert "deadline" in str(error.value)
+        assert conn.sock is None
+
+    def test_tls_uses_remaining_budget_then_restores_the_read_timeout(self, monkeypatch):
+        clock = [0.0]
+        monkeypatch.setattr("time.monotonic", lambda: clock[0])
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"),),
+        )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=10)
+        raw, wrapped = MagicMock(spec=socket.socket), MagicMock(spec=socket.socket)
+
+        def dial(address, timeout, source_address):
+            assert timeout == 10
+            clock[0] += 3
+            return raw
+
+        def tls(sock, server_hostname):
+            assert sock is raw and server_hostname == validated.host
+            raw.settimeout.assert_called_once_with(7)
+            clock[0] += 2
+            return wrapped
+
+        conn._create_connection = dial
+        conn._context = MagicMock()
+        conn._context.wrap_socket.side_effect = tls
+        conn.connect()
+        assert conn.sock is wrapped
+        wrapped.settimeout.assert_called_once_with(10)
+        raw.close.assert_not_called()
+        wrapped.close.assert_not_called()
+
+    def test_reconnect_cannot_discard_an_existing_socket(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"),),
+        )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated)
+        original = MagicMock(spec=socket.socket)
+        conn.sock = original
+        conn._create_connection = MagicMock(side_effect=AssertionError("reconnect guard allowed a new dial"))
+        with pytest.raises(RuntimeError, match="connected"):
+            conn.connect()
+        conn._create_connection.assert_not_called()
+        original.close.assert_not_called()
+        assert conn.sock is original
+
     def test_unexpected_tls_error_is_not_retried_and_releases_the_socket(self):
         validated = ValidatedOutboundURL(
             url="https://example.test/did.json", scheme="https", host="example.test", port=443,
@@ -26,21 +114,18 @@ class TestPinnedUrllibConnections:
         sock.close.assert_called_once()
         assert conn.sock is None
 
-    def test_all_network_failures_close_sockets_and_report_the_last_failure(self):
+    def test_all_tcp_failures_report_the_last_failure_without_tls(self):
         validated = ValidatedOutboundURL(
             url="https://example.test/did.json", scheme="https", host="example.test", port=443,
             ip_addresses=(ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")),
         )
         conn = _PinnedHTTPSConnection(validated.host, validated=validated)
-        sockets = [MagicMock(), MagicMock()]
-        conn._create_connection = MagicMock(side_effect=sockets)
+        conn._create_connection = MagicMock(side_effect=[OSError("first unavailable"), OSError("second unavailable")])
         conn._context = MagicMock()
-        conn._context.wrap_socket.side_effect = [OSError("first unavailable"), OSError("second unavailable")]
         with pytest.raises(OSError, match="second unavailable"):
             conn.connect()
         assert conn._create_connection.call_count == 2
-        for sock in sockets:
-            sock.close.assert_called_once()
+        conn._context.wrap_socket.assert_not_called()
         assert conn.sock is None
 
     def test_changed_origin_is_refused_before_socket_creation(self):
@@ -66,13 +151,6 @@ class TestPinnedUrllibConnections:
         dialed = []
         wrapped = []
 
-        class FakeSocket:
-            def setsockopt(self, *args):
-                pass
-
-            def close(self):
-                pass
-
         class FakeContext:
             def wrap_socket(self, sock, server_hostname=None):
                 wrapped.append(server_hostname)
@@ -80,7 +158,7 @@ class TestPinnedUrllibConnections:
 
         def fake_create_connection(address, timeout, source_address):
             dialed.append(address)
-            return FakeSocket()
+            return MagicMock(spec=socket.socket)
 
         conn._create_connection = fake_create_connection
         conn._context = FakeContext()
@@ -102,13 +180,6 @@ class TestPinnedUrllibConnections:
         dialed = []
         wrapped = []
 
-        class FakeSocket:
-            def setsockopt(self, *args):
-                pass
-
-            def close(self):
-                pass
-
         class FakeContext:
             def wrap_socket(self, sock, server_hostname=None):
                 wrapped.append(server_hostname)
@@ -116,7 +187,7 @@ class TestPinnedUrllibConnections:
 
         def fake_create_connection(address, timeout, source_address):
             dialed.append(address)
-            return FakeSocket()
+            return MagicMock(spec=socket.socket)
 
         conn._create_connection = fake_create_connection
         conn._context = FakeContext()
@@ -141,13 +212,6 @@ class TestPinnedUrllibConnections:
         dialed = []
         wrapped = []
 
-        class FakeSocket:
-            def setsockopt(self, *args):
-                pass
-
-            def close(self):
-                pass
-
         class FakeContext:
             def wrap_socket(self, sock, server_hostname=None):
                 wrapped.append(server_hostname)
@@ -157,7 +221,7 @@ class TestPinnedUrllibConnections:
             dialed.append(address)
             if address[0] == "2001:4860:4860::8888":
                 raise OSError("IPv6 route unavailable")
-            return FakeSocket()
+            return MagicMock(spec=socket.socket)
 
         conn._create_connection = fake_create_connection
         conn._context = FakeContext()
@@ -207,3 +271,54 @@ class TestDidWebSSRF:
         with pytest.raises(did_web.DidWebError, match="redirect"):
             did_web._default_fetcher("https://93.184.216.34/.well-known/did.json")
         assert requests == ["https://93.184.216.34/.well-known/did.json"]
+
+
+@pytest.mark.parametrize("failure", [
+    SSRFError("origin changed"),
+    URLError("connection refused"),
+    RemoteDisconnected("peer disconnected"),
+    TimeoutError("body stalled"),
+    ConnectionResetError("body disconnected"),
+])
+def test_did_fetch_network_failures_have_the_resolver_error_type(monkeypatch, failure):
+    from kestrel_sovereign.identity import did_web
+    opener = MagicMock()
+    opener.open.side_effect = failure
+    monkeypatch.setattr("kestrel_sovereign.security.pinned_urllib.pinned_urllib_https_opener", lambda *args: opener)
+    with pytest.raises(did_web.DidWebError, match="failed"):
+        did_web._default_fetcher("https://8.8.8.8/did.json")
+
+
+def test_did_fetch_does_not_hide_programming_errors(monkeypatch):
+    from kestrel_sovereign.identity import did_web
+    opener = MagicMock()
+    opener.open.side_effect = TypeError("invalid TLS configuration")
+    monkeypatch.setattr("kestrel_sovereign.security.pinned_urllib.pinned_urllib_https_opener", lambda *args: opener)
+    with pytest.raises(TypeError, match="configuration"):
+        did_web._default_fetcher("https://8.8.8.8/did.json")
+
+
+def test_pinned_connection_refuses_proxy_tunnels_before_dialing():
+    validated = ValidatedOutboundURL(url="https://8.8.8.8/did.json", scheme="https", host="8.8.8.8", port=443,
+                                     ip_addresses=(ipaddress.ip_address("8.8.8.8"),))
+    conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=1)
+    conn.set_tunnel(validated.host)
+    conn._create_connection = MagicMock(side_effect=AssertionError("proxy tunnel guard allowed a dial"))
+    with pytest.raises(SSRFError, match="tunnel"):
+        conn.connect()
+    conn._create_connection.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [302, 404])
+def test_did_http_errors_close_the_response_before_becoming_resolver_errors(monkeypatch, status):
+    import io
+    from urllib.error import HTTPError
+    from kestrel_sovereign.identity import did_web
+
+    body = io.BytesIO(b"remote error body")
+    opener = MagicMock()
+    opener.open.side_effect = HTTPError("https://8.8.8.8/did.json", status, "refused", {}, body)
+    monkeypatch.setattr("kestrel_sovereign.security.pinned_urllib.pinned_urllib_https_opener", lambda *args: opener)
+    with pytest.raises(did_web.DidWebError):
+        did_web._default_fetcher("https://8.8.8.8/did.json")
+    assert body.closed

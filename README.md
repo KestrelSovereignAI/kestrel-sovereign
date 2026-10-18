@@ -330,7 +330,14 @@ Core requires `kestrel-sovereign-sdk[httpx,tracing]>=0.39.1,<0.40`; the
 `observability` extra adds `metrics` under that same base constraint. 0.39.1
 owns the canonical outbound URL/IP policy and native pinned HTTP transport;
 avatar downloads and DID resolution use it. Core retains only its stdlib HTTPS
-I/O implementation for DID documents. 0.39.0 adds
+I/O implementation for DID documents. That binding shares one TCP/TLS deadline
+across approved addresses, retries TCP connection failures only, and keeps
+certificate verification and environment-proxy isolation. Callers use the
+validated canonical URL; avatar downloads refuse redirects and map transport
+origin refusals to HTTP 400. DID resolution uses a 10-second connection budget
+and socket read timeout; DNS and complete response download still need separate
+liveness bounds, tracked in [#3695](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3695).
+0.39.0 adds
 the decisions contract (LLM contract v7, epic #3424) that `LLMService.decide`
 is built on, on top of the runtime contracts of the 0.37–0.38 line: durable
 isolated execution, provider-neutral private inference leases (including

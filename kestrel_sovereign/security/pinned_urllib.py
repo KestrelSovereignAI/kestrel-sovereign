@@ -5,10 +5,11 @@ import errno
 from contextlib import ExitStack
 import http.client
 import socket
+import time
 from typing import Any
 import urllib.request
 
-from kestrel_sdk.security.outbound import ValidatedOutboundURL
+from kestrel_sdk.security.outbound import SSRFError, ValidatedOutboundURL
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -25,47 +26,57 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         super().__init__(host, *args, **kwargs)
 
     def connect(self) -> None:
+        if self.sock is not None:
+            raise RuntimeError("pinned HTTPS connection is already connected")
         self._validated.assert_origin(self.host, self.port)
-
         if self._tunnel_host:
-            server_hostname = self._tunnel_host
-        else:
-            server_hostname = self.host
+            raise SSRFError("pinned HTTPS connection does not allow proxy tunnels")
+
+        timeout = socket.getdefaulttimeout() if self.timeout is socket._GLOBAL_DEFAULT_TIMEOUT else self.timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        def remaining() -> float | None:
+            if deadline is None:
+                return None
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("approved-address connection deadline exceeded")
+            return budget
 
         last_error: OSError | None = None
         for ip in self._validated.ip_addresses:
-            connected = False
+            dial_timeout = remaining()
             try:
-                with ExitStack() as pending:
-                    sock = self._create_connection(
-                        (str(ip), self.port),
-                        self.timeout,
-                        self.source_address,
-                    )
-                    pending.callback(sock.close)
-                    try:
-                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    except OSError as e:
-                        if e.errno != errno.ENOPROTOOPT:
-                            raise
-
-                    self.sock = sock
-                    if self._tunnel_host:
-                        self._tunnel()
-                    self.sock = self._context.wrap_socket(
-                        self.sock, server_hostname=server_hostname
-                    )
-                    pending.pop_all()
-                    connected = True
-                    return
+                sock = self._create_connection(
+                    (str(ip), self.port), dial_timeout, self.source_address,
+                )
             except OSError as e:
                 last_error = e
-            finally:
-                if not connected:
-                    self.sock = None
-        if last_error is not None:
-            raise last_error
-        raise OSError("pinned opener has no validated addresses")
+                continue
+            break
+        else:
+            remaining()
+            if last_error is not None:
+                raise last_error
+            raise OSError("pinned opener has no validated addresses")
+
+        # Only TCP connection errors may try another approved address. TLS,
+        # certificate and configuration errors must fail on the first peer.
+        with ExitStack() as pending:
+            pending.callback(sock.close)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError as e:
+                if e.errno != errno.ENOPROTOOPT:
+                    raise
+            sock.settimeout(remaining())
+            wrapped = self._context.wrap_socket(sock, server_hostname=self._validated.host)
+            if wrapped is not sock:
+                pending.callback(wrapped.close)
+            remaining()
+            wrapped.settimeout(timeout)
+            self.sock = wrapped
+            pending.pop_all()
 
 
 class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
