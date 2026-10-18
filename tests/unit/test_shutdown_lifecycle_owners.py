@@ -862,7 +862,10 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
     monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
 
     app = FastAPI()
-    async with server._lifespan_startup(app):
+    # Startup intentionally leaves the failed host's diagnostic stores alive
+    # until its outer server lifetime retires. Use that SAME production owner
+    # so the fixture cannot leave SQLite callbacks targeting a closed loop.
+    async with server.lifespan(app):
         pass
 
     assert manager.shutdown_calls == 1
@@ -871,6 +874,7 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
     assert app.state.agent_manager is None
     assert app.state.agent is None
     assert "scheduler boot failed" in app.state.startup_error
+    assert app.state.stop_receipt_db is None and app.state.host_context is None
 
 
 @pytest.mark.asyncio

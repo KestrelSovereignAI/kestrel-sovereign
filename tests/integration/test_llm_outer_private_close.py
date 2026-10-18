@@ -15,6 +15,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 from kestrel_sdk.llm import (
     InferenceLease,
     InferenceLeaseState,
@@ -107,6 +108,7 @@ async def test_refused_outer_private_close_keeps_original_sdk_and_service(
         {},
     )
     client, rotated_client, rotation = None, None, None
+    source = OriginalFailure.capture(refusal)
 
     def refuse_outer(loop, coroutine, **kwargs):
         if _operation_name(coroutine).endswith(".close_remote_route"):
@@ -194,7 +196,9 @@ async def test_refused_outer_private_close_keeps_original_sdk_and_service(
             assert (
                 service._remote_client is client and rotated_client._client.is_closed
             ), "late private rotation replaced the original client after shutdown won"
-        assert caught is refusal and refused
+        source.assert_retained(caught)
+        assert refused and any(resource is service and task is None
+                               for resource, task in execution_cleanup_debts(caught))
         assert all(
             inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused
         )

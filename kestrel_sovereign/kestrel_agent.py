@@ -6688,7 +6688,8 @@ class KestrelAgent(
         controls = tuple(error for error in (opening, cleanup)
                          if is_execution_control_error(error))
         if controls:
-            withdrawals = tuple(error for error in (opening, cleanup)
+            withdrawals = tuple(error for result in (opening, cleanup)
+                                for error in _explicit_control_chain(result)
                                 if isinstance(error, asyncio.CancelledError)
                                 and not is_execution_control_error(error))
             await enter_feature_lifecycle_safe_mode(
@@ -7246,14 +7247,16 @@ class KestrelAgent(
             # disabled feature can keep contributing prompt bytes.
             quarantine_error = None
             controls = [activation_error] if is_execution_control_error(activation_error) else []
-            withdrawals = [activation_error] if isinstance(activation_error, asyncio.CancelledError) else []
+            withdrawals = [error for error in _explicit_control_chain(activation_error)
+                           if isinstance(error, asyncio.CancelledError)]
             try:
                 await self._unregister_feature_runtime(feature, unload=False)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as cleanup_exc:
                 if is_execution_control_error(cleanup_exc):
                     controls.append(cleanup_exc)
-                elif isinstance(cleanup_exc, asyncio.CancelledError):
-                    withdrawals.append(cleanup_exc)
+                withdrawals.extend(error for error in _explicit_control_chain(cleanup_exc)
+                                   if isinstance(error, asyncio.CancelledError)
+                                   and all(error is not prior for prior in withdrawals))
                 logging.warning(
                     "Cleanup after failed activation of feature '%s' reported %s; "
                     "quarantining surviving contributions",
@@ -7265,8 +7268,9 @@ class KestrelAgent(
                 except (Exception, asyncio.CancelledError, BaseExceptionGroup) as quarantine_exc:
                     if is_execution_control_error(quarantine_exc):
                         controls.append(quarantine_exc)
-                    elif isinstance(quarantine_exc, asyncio.CancelledError):
-                        withdrawals.append(quarantine_exc)
+                    withdrawals.extend(error for error in _explicit_control_chain(quarantine_exc)
+                                       if isinstance(error, asyncio.CancelledError)
+                                       and all(error is not prior for prior in withdrawals))
                     quarantine_error = RuntimeError(
                         "failed activation contributions could not be quarantined"
                     )

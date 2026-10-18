@@ -6,6 +6,7 @@ import inspect
 import httpx2 as httpx
 import openai
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -194,6 +195,7 @@ async def test_public_usage_close_retains_original_database_after_native_refusal
         [],
     )
     failure = RuntimeError("actual owned usage database closer refused")
+    source = OriginalFailure.capture(failure)
 
     def factory(loop, coroutine, **kwargs):
         operation = _actual_operation(coroutine)
@@ -220,12 +222,14 @@ async def test_public_usage_close_retains_original_database_after_native_refusal
         with pytest.raises(BaseException) as caught:
             await service.close_usage_db()
         loop.set_task_factory(previous)
-        assert caught.value is failure and is_execution_control_error(failure)
+        source.assert_retained(caught.value)
+        assert is_execution_control_error(caught.value)
         assert service._usage_db is db and service._db_initialized, (
             "failed physical usage close discarded its original database"
         )
         assert worker.is_alive() and db.backend._connection is connection
-        assert execution_cleanup_debts(failure)
+        assert any(resource is db and task is None
+                   for resource, task in execution_cleanup_debts(caught.value))
         assert all(
             inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
             for pair in refused

@@ -5,6 +5,7 @@ import inspect
 
 import httpx
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -12,6 +13,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionStreamLifecycle,
     NativeExecutionStreamOwner,
     ProcessRuntimeExecutionFence,
+    _explicit_control_chain,
     bind_execution_custody_snapshot,
     execution_cleanup_debts,
     execution_stream,
@@ -58,6 +60,7 @@ async def test_refused_native_http_close_keeps_actual_handle_and_debt():
     loop, refused = asyncio.get_running_loop(), []
     factory = loop.get_task_factory()
     refusal = RuntimeError("original native close Task refused")
+    source = OriginalFailure.capture(refusal)
 
     def refuse_once(loop, coroutine, **kwargs):
         if not refused and _operation_name(coroutine).endswith(".owned_close"):
@@ -81,24 +84,27 @@ async def test_refused_native_http_close_keeps_actual_handle_and_debt():
             inventory.retain(response)
         other, held = responses
         loop.set_task_factory(refuse_once)
-        with pytest.raises(RuntimeError) as caught:
+        with pytest.raises(BaseException) as caught:
             await inventory.close()
         loop.set_task_factory(factory)
-        assert caught.value is refusal and refused
+        source.assert_retained(caught.value)
+        assert refused and any(resource is held and task is None
+                               for resource, task in execution_cleanup_debts(caught.value))
         assert inventory.handles == [held], (
             "unclosed actual response disappeared from native inventory"
         )
-        assert is_execution_control_error(refusal)
-        assert (held, None) in execution_cleanup_debts(refusal)
+        assert is_execution_control_error(caught.value)
+        assert (held, None) in execution_cleanup_debts(caught.value)
         assert not held.is_closed and not peer_closed["/held"].is_set()
         await asyncio.wait_for(peer_closed["/other"].wait(), 2)
         assert other.is_closed, "independent native handle was not physically retired"
         assert all(
             inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused
         )
-        with pytest.raises(RuntimeError) as repeated:
+        with pytest.raises(BaseException) as repeated:
             await inventory.close()
-        assert repeated.value is refusal and len(refused) == 1
+        source.assert_retained(repeated.value)
+        assert repeated.value is caught.value and len(refused) == 1
     finally:
         loop.set_task_factory(factory)
         for coroutine in refused:
@@ -196,6 +202,7 @@ async def test_refused_optional_disposal_still_physically_closes_primary_sqlite(
         [],
     )
     refusal = RuntimeError("optional engine disposal Task refused")
+    source = OriginalFailure.capture(refusal)
 
     def refuse_disposal(loop, coroutine, **kwargs):
         if _operation_name(coroutine) == "AsyncDatabase.dispose_cached_sqla_factory":
@@ -207,10 +214,11 @@ async def test_refused_optional_disposal_still_physically_closes_primary_sqlite(
 
     try:
         loop.set_task_factory(refuse_disposal)
-        with pytest.raises(RuntimeError) as caught:
+        with pytest.raises(BaseException) as caught:
             await db.close()
         loop.set_task_factory(factory)
-        assert caught.value is refusal and refused
+        source.assert_retained(caught.value)
+        assert refused and any(task is None for _, task in execution_cleanup_debts(caught.value))
         assert db._backend._connection is None, (
             "optional disposal allocation skipped the actual primary close"
         )
@@ -405,6 +413,14 @@ async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel
     from kestrel_sovereign.multi_agent import agent_manager as manager_module
     from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 
+    actual_join, withdrawals = manager_module.await_owned_task, []
+    async def observed_join(*args, **kwargs):
+        result = await actual_join(*args, **kwargs)
+        if result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+    monkeypatch.setattr(manager_module, "await_owned_task", observed_join)
+
     agent, db = await _partial_native_agent(tmp_path, monkeypatch)
     connection = db._backend._connection
     worker = getattr(connection, "_thread", connection)
@@ -471,7 +487,7 @@ async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel
     batch = None
     try:
         loop.set_task_factory(refuse_collector)
-        batch = create_owned_task(manager.load_from_config(config))
+        batch = create_owned_task(manager.load_from_config(config), retain_originals=True)
         await asyncio.wait_for(beta_entered.wait(), 3)
         await asyncio.wait_for(alpha_done.wait(), 3)
         batch.cancel()
@@ -491,9 +507,8 @@ async def assert_cancelled_batch_native_cleanup(tmp_path, monkeypatch, *, cancel
         assert not worker.is_alive()
         assert not manager._initializing_agents and not manager.list_agents()
         assert not manager._agent_operations
-        assert isinstance(
-            outcome.error, asyncio.CancelledError
-        ) or is_execution_control_error(outcome.error)
+        assert withdrawals and all(error in tuple(_explicit_control_chain(outcome.error))
+                                   for error in withdrawals)
         assert not agent._runtime_publication_ready.is_set()
         assert all(
             inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused

@@ -12,7 +12,7 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from types import MethodType
+from types import BuiltinMethodType, FunctionType, MethodType
 from typing import Any
 
 from kestrel_sovereign._async_ownership import OwnedTaskOutcome, await_owned_task, owned_task_join_ancestors
@@ -164,18 +164,46 @@ class NativeExecutionObserver:
         # TaskGroup waits on a classification Future rather than directly on
         # each child. Verify the ACTUAL stdlib group's child and parent wait,
         # not a copied context or similarly named foreign attribute.
-        for child in (current, *ancestors):
+        pending, group_seen = [current, *ancestors], set()
+        while pending:
+            child = pending.pop()
+            if child in group_seen:
+                continue
+            group_seen.add(child)
+            if child in seen:
+                return True
             for callback, _context in getattr(child, "_callbacks", None) or ():
+                if type(callback) is BuiltinMethodType and callback.__name__ == "task_wakeup":
+                    parent = callback.__self__
+                    if (isinstance(parent, asyncio.Task) and not parent.done()
+                        and getattr(parent, "_fut_waiter", None) is child):
+                        pending.append(parent)
+                elif (type(callback) is FunctionType
+                      and callback.__code__.co_name == "_done_callback"
+                      and any(callback.__code__ is code for code in asyncio.tasks.gather.__code__.co_consts)):
+                    # Only the actual stdlib gather callback can introduce
+                    # its outer Future; no foreign attribute or closure is
+                    # inspected. The Future's real waiter then joins this
+                    # child through the same reverse graph as a direct Task.
+                    cells = dict(zip(callback.__code__.co_freevars, callback.__closure__ or ()))
+                    cell = cells.get("outer")
+                    outer = cell.cell_contents if cell is not None else None
+                    if type(outer) is asyncio.tasks._GatheringFuture and child in outer._children:
+                        pending.append(outer)
                 if type(callback) is not MethodType:
                     continue
                 group = callback.__self__
                 if type(group) is not asyncio.TaskGroup:
                     continue
                 parent = group._parent_task
-                if (parent in seen and child in group._tasks
-                    and group._on_completed_fut is not None
-                    and group._on_completed_fut is getattr(parent, "_fut_waiter", None)):
-                    return True
+                if (callback.__func__ is asyncio.TaskGroup._on_task_done
+                    and group._entered and child in group._tasks
+                    and parent is not None and not parent.done()):
+                    # Entering the stdlib group already obliges this exact
+                    # parent to join its child, including before __aexit__
+                    # creates the completion Future. Follow nested groups
+                    # transitively; copied context alone contributes no edge.
+                    pending.extend((parent, *owned_task_join_ancestors(parent)))
         return False
 
     def _record_native_failure(self, resource, owner, error, commit_outcome, cancellation=None):

@@ -6237,7 +6237,7 @@ class AgentManager:
 
     async def _release_agent_operations(
         self, admissions: list[AgentOperationAdmission]
-    ) -> bool:
+    ) -> BaseException | None:
         """Retire every admission before returning any observed cancellation."""
 
         # Each operation already has one retained release owner. Admitting a
@@ -6254,7 +6254,7 @@ class AgentManager:
         )
         if terminal is not None and (failures or is_execution_control_error(terminal)):
             raise terminal
-        return bool(withdrawals)
+        return terminal
 
     async def _retire_spawn_slot_and_admission(
         self,
@@ -6647,7 +6647,9 @@ class AgentManager:
                 # handoff that the caller may never persist. The admission is
                 # now terminal, so retain the successful return instead.
                 if release_cancelled and not admission.published:
-                    raise execution_terminal_error(original_failure, asyncio.CancelledError())
+                    raise execution_terminal_error(original_failure, release_cancelled,
+                        retain_originals=True, prefer_cancellation=True,
+                        isolate_control_originals=True)
 
     def _reconcile_spawn_authority_restart_roster(
         self,
@@ -7516,21 +7518,13 @@ class AgentManager:
                         initial_failure, *(
                             result for result in settled if isinstance(result, BaseException)
                         ), cleanup_failure,
-                        retain_originals=True, isolate_control_originals=True,
+                        retain_originals=True, prefer_cancellation=True, isolate_control_originals=True,
                     )
-                    if terminal is not None and is_execution_control_error(terminal):
-                        raise terminal
-                    if isinstance(initial_failure, asyncio.CancelledError):
-                        raise asyncio.CancelledError()
-                    raise
+                    raise terminal
                 terminal = execution_terminal_error(initial_failure, *(
                     result for result in settled if isinstance(result, BaseException)
-                ), retain_originals=True, isolate_control_originals=True)
-                if terminal is not None and is_execution_control_error(terminal):
-                    raise terminal
-                if isinstance(initial_failure, asyncio.CancelledError) or cleanup_cancelled:
-                    raise asyncio.CancelledError()
-                raise initial_failure
+                ), retain_originals=True, prefer_cancellation=True, isolate_control_originals=True)
+                raise terminal
 
             fatal = next(
                 (
@@ -7554,20 +7548,12 @@ class AgentManager:
                 except BaseException as cleanup_failure:
                     terminal = execution_terminal_error(fatal, *(
                         result for result in results if isinstance(result, BaseException)
-                    ), cleanup_failure, retain_originals=True, isolate_control_originals=True)
-                    if terminal is not None and is_execution_control_error(terminal):
-                        raise terminal
-                    if isinstance(fatal, asyncio.CancelledError):
-                        raise asyncio.CancelledError()
-                    raise
+                    ), cleanup_failure, retain_originals=True, prefer_cancellation=True, isolate_control_originals=True)
+                    raise terminal
                 terminal = execution_terminal_error(fatal, *(
                     result for result in results if isinstance(result, BaseException)
-                ), retain_originals=True, isolate_control_originals=True)
-                if terminal is not None and is_execution_control_error(terminal):
-                    raise terminal
-                if isinstance(fatal, asyncio.CancelledError) or cleanup_cancelled:
-                    raise asyncio.CancelledError()
-                raise fatal
+                ), retain_originals=True, prefer_cancellation=True, isolate_control_originals=True)
+                raise terminal
 
             unpublished = {
                 name: result
@@ -7712,7 +7698,7 @@ class AgentManager:
                                 cleanup_failure = error
                         terminal = execution_terminal_error(
                             onboarding_failure, cleanup_failure, retain_originals=True,
-                            isolate_control_originals=True,
+                            prefer_cancellation=True, isolate_control_originals=True,
                         )
                         if terminal is not None and is_execution_control_error(terminal):
                             raise terminal
@@ -7721,7 +7707,9 @@ class AgentManager:
                             or cleanup_cancelled
                             or isinstance(cleanup_failure, asyncio.CancelledError)
                         ):
-                            raise asyncio.CancelledError()
+                            raise execution_terminal_error(onboarding_failure, cleanup_failure,
+                                retain_originals=True, prefer_cancellation=True,
+                                isolate_control_originals=True)
                         if cleanup_failure is not None:
                             if isinstance(onboarding_failure, Exception) and isinstance(
                                 cleanup_failure, Exception
@@ -7773,7 +7761,7 @@ class AgentManager:
                         cleanup_failure = error
                 terminal = execution_terminal_error(
                     publication_failure, cleanup_failure, retain_originals=True,
-                    isolate_control_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
                 )
                 if terminal is not None and is_execution_control_error(terminal):
                     raise terminal
@@ -7782,7 +7770,9 @@ class AgentManager:
                     or cleanup_cancelled
                     or isinstance(cleanup_failure, asyncio.CancelledError)
                 ):
-                    raise asyncio.CancelledError()
+                    raise execution_terminal_error(publication_failure, cleanup_failure,
+                        retain_originals=True, prefer_cancellation=True,
+                        isolate_control_originals=True)
                 if cleanup_failure is not None:
                     if isinstance(publication_failure, Exception) and isinstance(
                         cleanup_failure, Exception
@@ -7809,15 +7799,15 @@ class AgentManager:
             except BaseException as error:
                 release_failure = error
             terminal = execution_terminal_error(
-                batch_failure, release_failure, retain_originals=True,
+                batch_failure, release_failure, release_cancelled or None, retain_originals=True,
                 isolate_control_originals=True,
             )
             if terminal is not None and is_execution_control_error(terminal):
                 raise terminal
             if release_failure is not None:
-                raise release_failure
+                raise terminal
             if release_cancelled:
-                raise asyncio.CancelledError()
+                raise terminal
 
     @property
     def init_failures(self) -> list[tuple[str, Exception]]:
@@ -10586,16 +10576,17 @@ class AgentManager:
                 try:
                     release_cancelled = await self._release_agent_operations([admission])
                 except BaseException as release_failure:
-                    terminal = execution_terminal_error(creation_failure, release_failure)
+                    terminal = execution_terminal_error(creation_failure, release_failure,
+                        retain_originals=True, isolate_control_originals=True)
                     raise terminal
                 # ``load_agent`` records publication on this outer admission,
                 # even when create owns it through the nested call. Do not
                 # turn that committed create into a false cancellation while
                 # merely retiring its now-terminal admission.
-                if release_cancelled and not admission.published and not (
-                    creation_failure is not None and is_execution_control_error(creation_failure)
-                ):
-                    raise asyncio.CancelledError()
+                if release_cancelled and not admission.published:
+                    raise execution_terminal_error(creation_failure, release_cancelled,
+                        retain_originals=True, prefer_cancellation=True,
+                        isolate_control_originals=True)
 
     def _parent_feature_names(self, parent_agent: KestrelAgent) -> set[str]:
         """Feature class names available to the parent — the ceiling a child's
@@ -11470,10 +11461,11 @@ class AgentManager:
                     )
                     if (
                         release_cancelled
-                        and sys.exception() is None
-                        and not admission.committed
+                        and (sys.exception() is not None or not admission.committed)
                     ):
-                        raise asyncio.CancelledError()
+                        raise execution_terminal_error(sys.exception(), release_cancelled,
+                            retain_originals=True, prefer_cancellation=True,
+                            isolate_control_originals=True)
 
             spawn_operation = asyncio.create_task(
                 run_direct_spawn(),

@@ -121,6 +121,10 @@ async def test_actual_asgi_peer_envelope_preserves_control_without_private_prose
     assert is_execution_control_error(caught.value)
     assert execution_commit_outcome(caught.value) == outcome
     redacted = _redacted_host_ingress_error(carrier)
+    assert redacted.status == "generic-failure" and redacted.commit_outcome is None
+    # A foreign exception graph is no native provenance. The independently
+    # decoded canonical ASGI control is an explicit trusted input instead.
+    redacted = _redacted_host_ingress_error(caught.value, trusted=True)
     assert redacted.status == "execution-control" and redacted.commit_outcome == outcome
 
 

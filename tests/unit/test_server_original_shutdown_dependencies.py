@@ -5,6 +5,7 @@ import inspect
 from contextlib import asynccontextmanager
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 from fastapi import FastAPI
 
 from kestrel_sovereign._async_ownership import await_owned_task
@@ -201,6 +202,7 @@ async def test_refused_inner_phoenix_close_keeps_actual_proxy_and_debt(tmp_path)
         [],
     )
     refusal = RuntimeError("original Phoenix proxy closer admission refused")
+    source = OriginalFailure.capture(refusal)
 
     def factory(loop, coroutine, **kwargs):
         operation = _actual_operation(coroutine)
@@ -231,8 +233,9 @@ async def test_refused_inner_phoenix_close_keeps_actual_proxy_and_debt(tmp_path)
                 caught = error
             loop.set_task_factory(previous)
             assert (
-                refused and caught is refusal and is_execution_control_error(caught)
+                refused and is_execution_control_error(caught)
             ), "inner proxy Task refusal was only logged"
+            source.assert_retained(caught)
             assert app.state.phoenix is supervisor and supervisor._client is client
             assert not client.is_closed and not closed.is_set()
             assert any(

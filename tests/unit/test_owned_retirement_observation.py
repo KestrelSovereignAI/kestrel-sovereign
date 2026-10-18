@@ -4,6 +4,7 @@ import asyncio
 import inspect
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
@@ -78,6 +79,7 @@ async def test_independent_fanout_attempts_later_owner_and_joins_accepted_childr
     release = asyncio.Event()
     accepted, refused = [], []
     refusal = RuntimeError("middle original retirement admission refused")
+    source = OriginalFailure.capture(refusal)
     resource = object()
     collector = None
 
@@ -123,7 +125,7 @@ async def test_independent_fanout_attempts_later_owner_and_joins_accepted_childr
         assert all(task.cancelling() == 0 for task in accepted)
         release.set()
         outcome = await await_owned_task(collector)
-        assert outcome.error is refusal
+        source.assert_retained(outcome.error)
         assert (resource, None) in execution_cleanup_debts(outcome.error)
         assert all(task.done() for task in accepted)
         assert all(

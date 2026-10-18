@@ -60,7 +60,8 @@ async def test_reserved_lifecycle_rpc_keeps_actual_original_native_handoff(nativ
 
 
 @pytest.mark.asyncio
-async def test_known_ack_with_actual_private_caller_withdrawal_does_not_poison_next_call(native_pg, tmp_path, monkeypatch):
+@pytest.mark.parametrize("phase", ["transaction", "reset"])
+async def test_known_ack_with_actual_private_caller_withdrawal_does_not_poison_next_call(native_pg, tmp_path, monkeypatch, phase):
     backend, observer, schema = native_pg
     records, withdrawals = [], []
     feature = await lifecycle_component(monkeypatch, tmp_path, backend, records)
@@ -80,7 +81,18 @@ async def test_known_ack_with_actual_private_caller_withdrawal_does_not_poison_n
         if result.cancellation is not None:
             withdrawals.append(result.cancellation)
         return result
-    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", exit)
+    if phase == "transaction":
+        monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", exit)
+    else:
+        actual_reset = asyncpg.pool.PoolAcquireContext.__aexit__
+        async def reset(checkout, *args):
+            result = await actual_reset(checkout, *args)
+            if checkout.pool is backend._pool and not held:
+                held.append(checkout)
+                entered.set()
+                await release.wait()
+            return result
+        monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", reset)
     monkeypatch.setattr(postgres_module, "await_owned_task", join)
     async def invoke():
         with bind_execution_custody_snapshot((ExecutionCustody(GenerationFence()),)):

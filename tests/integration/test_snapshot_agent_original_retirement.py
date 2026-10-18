@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
 from kestrel_sovereign.execution_custody import (
@@ -321,6 +322,7 @@ async def test_refused_snapshot_owner_preserves_unstarted_service_debt(
         asyncio.get_running_loop().get_task_factory(),
     )
     refusal = RuntimeError("actual final snapshot Task admission refused")
+    source = OriginalFailure.capture(refusal)
     refused = []
 
     def refuse_snapshot(loop, coroutine, **kwargs):
@@ -335,16 +337,18 @@ async def test_refused_snapshot_owner_preserves_unstarted_service_debt(
 
     loop.set_task_factory(refuse_snapshot)
     try:
-        with pytest.raises(RuntimeError) as result:
+        with pytest.raises(BaseException) as result:
             await agent._run_durable_shutdown_tail(0.2)
-        assert result.value is refusal and refused
+        source.assert_retained(result.value)
+        assert refused
         assert all(getcoroutinestate(coro) == CORO_CLOSED for coro in refused)
         assert not clients and not entered.is_set()
-        assert execution_cleanup_debts(refusal) == ((service, None),)
-        assert vars(agent).get("_shutdown_control") is refusal
-        with pytest.raises(RuntimeError) as completion:
+        assert (service, None) in execution_cleanup_debts(result.value)
+        assert vars(agent).get("_shutdown_control") is result.value
+        with pytest.raises(BaseException) as completion:
             await agent.wait_for_shutdown_completion()
-        assert completion.value is refusal, (
+        source.assert_retained(completion.value)
+        assert completion.value is result.value, (
             "unstarted native debt was replaced or acknowledged"
         )
     finally:

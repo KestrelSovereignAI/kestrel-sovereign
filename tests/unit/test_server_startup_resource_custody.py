@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from tests.utils.original_failure import OriginalFailure
 import pytest_asyncio
 from fastapi import FastAPI
 
@@ -242,6 +243,7 @@ async def test_failed_original_stop_database_close_remains_owned(original_server
         [],
     )
     original = RuntimeError("original Stop evidence database closer refused")
+    source = OriginalFailure.capture(original)
 
     def factory(loop, coroutine, **kwargs):
         operation = _actual_operation(coroutine)
@@ -265,10 +267,13 @@ async def test_failed_original_stop_database_close_remains_owned(original_server
 
     try:
         loop.set_task_factory(factory)
-        with pytest.raises(RuntimeError) as caught:
+        with pytest.raises(BaseException) as caught:
             await server._shutdown_stop_receipts(app)
         loop.set_task_factory(previous)
-        assert caught.value is original and is_execution_control_error(original)
+        source.assert_retained(caught.value)
+        assert is_execution_control_error(caught.value)
+        assert any(resource is receipts and task is None
+                   for resource, task in execution_cleanup_debts(caught.value))
         assert app.state.stop_receipt_db is receipts and worker.is_alive()
         with pytest.raises(RuntimeError, match="retire"):
             server._require_retired_server_resources(app)

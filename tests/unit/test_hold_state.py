@@ -171,6 +171,9 @@ async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(
         def terminate(self):
             self.terminated = True
 
+        async def close(self):
+            self.terminated = True
+
     connection = _Connection()
 
     class _Acquire:

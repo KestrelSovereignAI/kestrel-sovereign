@@ -240,9 +240,23 @@ provider release failures retain their existing bounded retry behavior. Local
 component tests do not prove authenticated provider termination or billing
 acceptance; those remain separate provider verification boundaries.
 
+Submission, compensation and release publish their original Task on the job
+before registering fallible completion observers. A refused/unpublished owner
+does not advance the physical release phase underneath an accepted task. Native
+submission or compensation control is not a business failure string and cannot
+skip the first independent session release; the finite result retains both
+outcomes. Public training adapters preserve that control. The SQLite backend
+likewise roots the exact connection and accepted closer (or an explicit absent
+closer) before observer publication. A live worker with no admitted closer is
+unresolved retirement, not a completed close; later probes cannot retry it or
+discard its original control while that worker remains live.
+
 Private host ingress has a caller-local Core admission rooted before task
 publication. Backend observation follows actual joined task lineage, not mere
 ContextVar inheritance into resident readers or supervisors. Native failure
+observation follows nested TaskGroups and their actual direct/gather waiters,
+including a group child running before its parent's exit wait begins. This
+membership is a physical join obligation, not copied-context authority. Native
 classification comes from the actual backend phase: a foreign exception's
 attributes, type, cause, or group membership do not prove that this ingress
 attempted COMMIT. Healthy rolled-back foreign failures release their observation.

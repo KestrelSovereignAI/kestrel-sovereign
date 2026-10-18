@@ -1067,18 +1067,22 @@ class PostgresBackend(DatabaseBackend):
                 phase.owner = retirement
             state.retirement.owner = retirement
             retired = await await_owned_task(retirement)
-            terminal = execution_terminal_error(body_failure, retired.error, retired.cancellation, retain_originals=True)
             if retired.error is not None:
                 if phase is not None:
                     phase.record_native_failure(retired.error, commit_outcome=state.outcome, cancellation=retired.cancellation)
+                debt = RuntimeError("original native pool retirement remains unresolved")
+                debt._kestrel_native_retirement_debts = (
+                    (_NativePostgresRetirement(checkout, connection, native_connection), retirement),
+                )
+                # Establish private retirement evidence BEFORE either abort or
+                # finite composition can decorate an earlier shared receipt.
+                terminal = execution_terminal_error(body_failure, retired.error,
+                    retired.cancellation, debt, retain_originals=True,
+                    isolate_control_originals=True)
                 assert terminal is not None
                 self._abort_native_connection(connection, terminal)
                 for scope in state.scopes:
                     scope.revoke("original native pool retirement failed")
-                terminal._kestrel_native_retirement_debts = (
-                    *getattr(terminal, "_kestrel_native_retirement_debts", ()),
-                    (_NativePostgresRetirement(checkout, connection, native_connection), retirement),
-                )
                 outcome = execution_commit_outcome(terminal) or state.outcome
                 if outcome is not None:
                     for scope in state.scopes:
@@ -1086,8 +1090,14 @@ class PostgresBackend(DatabaseBackend):
                     if execution_commit_outcome(terminal) is None:
                         raise ExecutionCommitOutcomeError(outcome) from terminal
                 raise terminal
+            terminal = execution_terminal_error(body_failure, retired.cancellation,
+                retain_originals=True, isolate_control_originals=True)
             if terminal is not None:
                 terminal = state.retain_acknowledgments(terminal)
+                if (phase is not None and retired.cancellation is not None
+                    and state.acknowledgments):
+                    phase.record_acknowledged_withdrawal(retired.cancellation,
+                                                        state.acknowledgments[-1])
                 if admit_work and state.acknowledgments:
                     terminal = self._retain_after_commit_denial(terminal, state.scopes, state.acknowledgments)
                 raise terminal

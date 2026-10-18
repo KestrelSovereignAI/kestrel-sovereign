@@ -26,7 +26,7 @@ from tests.utils.original_failure import OriginalFailure
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suppress", [False, True])
 @pytest.mark.parametrize("withdraw", [False, True])
-@pytest.mark.parametrize("producer", ["same", "owned", "direct", "gather", "taskgroup"])
+@pytest.mark.parametrize("producer", ["same", "owned", "direct", "gather", "taskgroup", "nested", "groupbody", "groupdirect", "groupgather"])
 async def test_ingress_hands_off_actual_native_failure_before_foreign_redaction(
     native_pg, tmp_path, monkeypatch, suppress, withdraw, producer,
 ):
@@ -52,6 +52,27 @@ async def test_ingress_hands_off_actual_native_failure_before_foreign_redaction(
                     await asyncio.create_task(work)
                 elif producer == "gather":
                     await asyncio.gather(work)
+                elif producer == "nested":
+                    async def nested():
+                        async with asyncio.TaskGroup() as inner:
+                            inner.create_task(work)
+                    async with asyncio.TaskGroup() as outer:
+                        outer.create_task(nested())
+                elif producer in ("groupdirect", "groupgather"):
+                    async def mixed():
+                        if producer == "groupdirect":
+                            await asyncio.create_task(work)
+                        else:
+                            await asyncio.gather(work)
+                    async with asyncio.TaskGroup() as group:
+                        group.create_task(mixed())
+                elif producer == "groupbody":
+                    async with asyncio.TaskGroup() as group:
+                        group.create_task(work)
+                        # The child reaches its native phase BEFORE the
+                        # parent starts TaskGroup.__aexit__ or owns its join
+                        # Future. Membership is already a physical obligation.
+                        await entered.wait()
                 else:
                     async with asyncio.TaskGroup() as group:
                         group.create_task(work)

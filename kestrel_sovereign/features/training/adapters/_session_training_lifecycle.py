@@ -212,6 +212,7 @@ class SessionTrainingRecord(Generic[SessionT]):
     compensation_task: asyncio.Task[None] | None = field(default=None, repr=False)
     release_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     native_release_control: BaseException | None = field(default=None, repr=False)
+    task_opening_errors: dict[str, BaseException] = field(default_factory=dict, repr=False)
 
     def transition(self, target: SessionJobPhase, *, error: str | None = None) -> None:
         if target not in _LEGAL_TRANSITIONS[self.phase]:
@@ -431,6 +432,61 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             provider_session_id=self._hooks.session_id(record.session),
         )
 
+    def _admit_record_task(self, record, field, operation, *, name, resource=None):
+        """Publish the original owner before fallible observer registration.
+
+        A publication failure is an observation of this SAME accepted Task,
+        not permission to retry it or to advance its physical release phase.
+        """
+        receipt = OwnedTaskAdmission()
+        try:
+            task = create_owned_task(operation, name=name, retain_originals=True,
+                admission=receipt, retirement_resource=resource)
+            setattr(record, field, task)
+            task.add_done_callback(_observe_outcome)
+        except BaseException as error:
+            setattr(record, field, receipt.task)
+            record.task_opening_errors[field] = error
+            if receipt.task is None:
+                raise
+            return receipt.task
+        record.task_opening_errors.pop(field, None)
+        return task
+
+    @staticmethod
+    def _task_error(record, field):
+        task = getattr(record, field)
+        return execution_terminal_error(
+            record.task_opening_errors.get(field),
+            owned_task_error(task) if task is not None and task.done() else None,
+            retain_originals=True, isolate_control_originals=True,
+        )
+
+    def _work_control(self, record):
+        errors = [self._task_error(record, field) for field in
+                  ("submission_task", "compensation_task")]
+        if not any(is_execution_control_error(error) for error in errors):
+            return None
+        return execution_terminal_error(*errors, retain_originals=True,
+                                        isolate_control_originals=True)
+
+    def _capture_release(self, record):
+        """Harvest an accepted owner even if its admission gate never ran it."""
+        task = record.release_task
+        if task is None or not task.done() or record.session_released:
+            return
+        error = self._task_error(record, "release_task")
+        if error is None:
+            return
+        if record.phase is SessionJobPhase.RELEASING:
+            record.transition(SessionJobPhase.RELEASE_FAILED,
+                              error="original release owner failed")
+        if is_execution_control_error(error) and record.native_release_control is None:
+            debt = RuntimeError("original accepted release remains unresolved")
+            debt._kestrel_native_retirement_debts = ((record.session, task),)
+            record.native_release_control = execution_terminal_error(error, debt,
+                retain_originals=True, isolate_control_originals=True)
+
     def local_status(
         self, job_id: str, *, preparing_message: str
     ) -> StatusLookup[SessionT]:
@@ -446,6 +502,12 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             raise TrainingStatusError(
                 f"Unknown job: {job_id}", provider=self._hooks.provider_name
             )
+        self._capture_release(record)
+        native = execution_terminal_error(self._work_control(record),
+            record.native_release_control, self._task_error(record, "release_task"),
+            retain_originals=True, isolate_control_originals=True)
+        if is_execution_control_error(native):
+            raise native
         status = phase_status(
             record,
             provider_name=self._hooks.provider_name,
@@ -551,7 +613,8 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 try:
                     release = self._ensure_release(record, ReleaseIntent.CANCEL)
                     released = await await_owned_task(release, outcome.cancellation)
-                    observations.append(released.error)
+                    observations.extend((released.error, released.cancellation,
+                                         self._task_error(record, "release_task")))
                 except BaseException as cleanup:
                     observations.append(cleanup)
                 if record.job_id in self._records:
@@ -622,12 +685,27 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             started_at=now,
         )
         self._records[job_id] = record
-        submission = asyncio.create_task(
-            self._run_submission(record, avatar_data),
-            name=f"{self._hooks.provider_name}-training-submit:{job_id}",
-        )
-        submission.add_done_callback(_observe_outcome)
-        record.submission_task = submission
+        try:
+            self._admit_record_task(record, "submission_task",
+                self._run_submission(record, avatar_data),
+                name=f"{self._hooks.provider_name}-training-submit:{job_id}")
+            opening = record.task_opening_errors.get("submission_task")
+            if opening is not None:
+                raise opening
+        except BaseException as opening:
+            observations = [opening]
+            cancellation = None
+            try:
+                task = self._ensure_release(record, ReleaseIntent.CANCEL)
+                released = await await_owned_task(task)
+                observations.extend((released.error, self._task_error(record, "release_task"),
+                                     self._work_control(record)))
+                cancellation = released.cancellation
+            except BaseException as cleanup:
+                observations.append(cleanup)
+            raise_owned_outcome(OwnedTaskOutcome(None, execution_terminal_error(
+                *observations, retain_originals=True, isolate_control_originals=True),
+                cancellation), operation="rejected submission publication", retain_originals=True)
         return record
 
     async def _release_unregistered(
@@ -757,6 +835,8 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             self._settle_stopping(record)
             raise
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.error(
                 "[%s] %s background submission failed: %s",
                 record.job_id,
@@ -889,13 +969,22 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             raise TrainingStatusError(
                 f"Unknown job: {job_id}", provider=self._hooks.provider_name
             )
-        stop = asyncio.create_task(
-            self._stop_submission(record, reason),
-            name=f"{self._hooks.provider_name}-training-stop:{job_id}",
-        )
+        receipt, opening = OwnedTaskAdmission(), None
+        try:
+            stop = create_owned_task(self._stop_submission(record, reason),
+                name=f"{self._hooks.provider_name}-training-stop:{job_id}",
+                retain_originals=True, admission=receipt)
+        except BaseException as error:
+            if receipt.task is None:
+                raise
+            opening, stop = error, receipt.task
         outcome = await await_owned_task(stop)
+        outcome = OwnedTaskOutcome(outcome.result, execution_terminal_error(
+            opening, outcome.error, retain_originals=True, isolate_control_originals=True),
+            outcome.cancellation)
         return raise_owned_outcome(
-            outcome, operation=f"{self._hooks.display_name} submission stop of {job_id}"
+            outcome, operation=f"{self._hooks.display_name} submission stop of {job_id}",
+            retain_originals=True,
         )
 
     async def _stop_submission(
@@ -915,6 +1004,9 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 provider=self._hooks.provider_name,
             )
         await self._await_compensation(record)
+        native = self._work_control(record)
+        if native is not None:
+            raise native
         self._settle_stopping(record)
         if (
             record.provider_job_id is not None
@@ -944,12 +1036,21 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         (:data:`RELEASED_JOB_HISTORY_LIMIT`), reports ``False``.
         """
 
-        record = self._records.get(job_id)
+        record = self._records.get(job_id) or self._released.get(job_id)
         if record is None:
-            return job_id in self._released
+            return False
+        if record.session_released and record.phase is SessionJobPhase.RELEASED:
+            native = execution_terminal_error(self._work_control(record),
+                self._task_error(record, "release_task"), retain_originals=True,
+                isolate_control_originals=True)
+            if is_execution_control_error(native):
+                raise native
+            return True
         outcome = await await_owned_task(self._ensure_release(record, intent))
+        self._capture_release(record)
         outcome = OwnedTaskOutcome(outcome.result, execution_terminal_error(
-            record.native_release_control, outcome.error, retain_originals=True,
+            record.native_release_control, self._task_error(record, "release_task"),
+            self._work_control(record), outcome.error, retain_originals=True,
             isolate_control_originals=True,
         ), outcome.cancellation)
         return self._release_result(outcome, job_id)
@@ -976,6 +1077,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
     ) -> asyncio.Task[bool]:
         """Return the job's in-flight release task, starting one if needed."""
 
+        self._capture_release(record)
         task = record.release_task
         if record.native_release_control is not None:
             if task is not None:
@@ -990,21 +1092,16 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         submission = record.submission_task
         if submission is not None and not submission.done():
             submission.cancel()
-        admission = OwnedTaskAdmission()
         try:
-            task = create_owned_task(
+            task = self._admit_record_task(record, "release_task",
                 self._run_release(record),
                 name=f"{self._hooks.provider_name}-training-release:{record.job_id}",
-                retain_originals=True, admission=admission,
-                retirement_resource=record.session,
+                resource=record.session,
             )
-            record.release_task = task
-            task.add_done_callback(_observe_outcome)
         except BaseException as error:
-            record.release_task = admission.task
             if is_execution_control_error(error):
                 debt = RuntimeError("original session release admission failed")
-                debt._kestrel_native_retirement_debts = ((record.session, admission.task),)
+                debt._kestrel_native_retirement_debts = ((record.session, record.release_task),)
                 record.native_release_control = execution_terminal_error(
                     error, debt, retain_originals=True,
                     isolate_control_originals=True,
@@ -1017,7 +1114,12 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         name = self._hooks.display_name
         try:
             drained = await self._drain_submission(record)
-            await self._await_compensation(record)
+            operational = self._work_control(record)
+            try:
+                await self._await_compensation(record)
+            except BaseException as error:
+                operational = execution_terminal_error(operational, error,
+                    retain_originals=True, isolate_control_originals=True)
             if not record.session_released:
                 physical = OwnedTaskAdmission()
                 try:
@@ -1035,13 +1137,16 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                             debt = RuntimeError("original session release is unresolved")
                             debt._kestrel_native_retirement_debts = ((record.session, physical.task),)
                             record.native_release_control = execution_terminal_error(
-                                error, debt, retain_originals=True,
+                                error, debt, operational, retain_originals=True,
                                 isolate_control_originals=True,
                             )
                             raise record.native_release_control
                         raise
                     if not isinstance(error, Exception):
                         raise
+                    if is_execution_control_error(operational):
+                        raise execution_terminal_error(error, operational,
+                            retain_originals=True, isolate_control_originals=True)
                     logger.error(
                         "[%s] %s session %s could not be released (it may still "
                         "be billing): %s",
@@ -1070,6 +1175,11 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 self._hooks.session_id(record.session),
                 record.release_intent.value if record.release_intent else "release",
             )
+            terminal = execution_terminal_error(operational, self._work_control(record),
+                self._task_error(record, "release_task"), retain_originals=True,
+                isolate_control_originals=True)
+            if is_execution_control_error(terminal):
+                raise terminal
             return True
         except BaseException as error:
             # Never leave a job stranded in RELEASING: a retry must be able to
@@ -1099,7 +1209,12 @@ class SessionTrainingLifecycle(Generic[SessionT]):
 
         task = self._ensure_compensation(record)
         if task is not None:
-            await asyncio.shield(task)
+            outcome = await await_owned_task(task)
+            outcome = OwnedTaskOutcome(outcome.result, execution_terminal_error(
+                self._task_error(record, "compensation_task"), outcome.error,
+                retain_originals=True, isolate_control_originals=True), outcome.cancellation)
+            raise_owned_outcome(outcome, operation="original provider compensation",
+                                retain_originals=True)
 
     def _ensure_compensation(
         self, record: SessionTrainingRecord[SessionT]
@@ -1109,6 +1224,11 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         task = record.compensation_task
         if task is not None and not task.done():
             return task
+        prior = self._task_error(record, "compensation_task")
+        if is_execution_control_error(prior):
+            if task is not None:
+                return task
+            raise prior
         if (
             self._hooks.cancel_provider_job is None
             or record.provider_job_id is None
@@ -1116,15 +1236,13 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             or record.session_released  # terminating it already stopped the job
         ):
             return None
-        task = asyncio.create_task(
+        return self._admit_record_task(record, "compensation_task",
             self._run_compensation(
                 record, self._hooks.cancel_provider_job, record.provider_job_id
             ),
             name=f"{self._hooks.provider_name}-training-job-cancel:{record.job_id}",
+            resource=record,
         )
-        task.add_done_callback(_observe_outcome)
-        record.compensation_task = task
-        return task
 
     async def _run_compensation(
         self,
@@ -1135,6 +1253,8 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         try:
             result = await self._bounded(cancel(record, provider_job_id))
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             record.compensation_error = str(error)
             logger.warning(
                 "[%s] %s could not cancel provider job %s: %s",
@@ -1246,9 +1366,13 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 self._timeouts.close,
                 len(pending),
             )
-        for record in self._records.values():
+        for record in (*self._records.values(), *self._released.values()):
+            self._capture_release(record)
             if record.native_release_control is not None:
                 native_failures.append(record.native_release_control)
+            for candidate in (self._work_control(record), self._task_error(record, "release_task")):
+                if is_execution_control_error(candidate):
+                    native_failures.append(candidate)
         for task in set(openings) | {record.release_task for record in self._records.values() if record.release_task is not None}:
             if task.done():
                 original = owned_task_error(task)
