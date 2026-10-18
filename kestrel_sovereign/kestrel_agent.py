@@ -9761,6 +9761,17 @@ Expected Duration: {expected_duration}
         are likewise joined before their terminal control is reported.
         """
         retried_failure = False
+        finite_outcomes: list[BaseException] = []
+
+        def raise_finite_control(*, control_only=False):
+            terminal = execution_terminal_error(
+                vars(self).get("_shutdown_control"), *finite_outcomes,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if terminal is not None and (
+                not control_only or is_execution_control_error(terminal)
+            ):
+                raise terminal
         while True:
             # A finite tail guard may stop observing an original native close,
             # but cannot destroy that owner's coroutine/join. Explicit shutdown
@@ -9784,22 +9795,22 @@ Expected Duration: {expected_duration}
             if pending:
                 for owner in pending:
                     outcome = await await_owned_task(owner)
-                    self._remember_shutdown_control(execution_terminal_error(
-                        vars(self).get("_shutdown_control"),
-                        outcome.error, outcome.cancellation, retain_originals=True,
-                    ))
+                    if outcome.cancellation is not None:
+                        finite_outcomes.append(outcome.cancellation)
+                    self._remember_shutdown_control(outcome.error)
                 continue  # Harvest any native child debt published by that owner.
             continuation = self._durable_shutdown_continuation
             if continuation is None:
-                self._raise_shutdown_control()
+                raise_finite_control()
                 return
             try:
                 await asyncio.shield(continuation)
-                self._raise_shutdown_control()
+                raise_finite_control()
                 return
             except asyncio.CancelledError as cancellation:
+                finite_outcomes.append(cancellation)
                 self._remember_shutdown_control(cancellation)
-                self._raise_shutdown_control(control_only=True)
+                raise_finite_control(control_only=True)
                 # A continuation can itself be cancelled (for example while
                 # releasing the runtime owner).  That is a retryable cleanup
                 # failure.  A cancellation of *this* waiter, on the other
@@ -9809,8 +9820,9 @@ Expected Duration: {expected_duration}
                     raise
                 failure: BaseException = asyncio.CancelledError()
             except Exception as exc:
+                finite_outcomes.append(exc)
                 self._remember_shutdown_control(exc)
-                self._raise_shutdown_control(control_only=True)
+                raise_finite_control(control_only=True)
                 failure = exc
 
             if retried_failure:
@@ -10056,6 +10068,7 @@ Expected Duration: {expected_duration}
 
     async def _close_standalone_hold_context(
         self,
+        *, withdrawals: list[BaseException] | None = None,
     ) -> tuple[bool, BaseException | None]:
         """Join closure of a standalone helper's agent-owned Hold context."""
 
@@ -10078,12 +10091,16 @@ Expected Duration: {expected_duration}
             except BaseException as error:
                 if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
                     cancelled = True
+                    if withdrawals is not None:
+                        withdrawals.append(error)
                 else:
                     failure = execution_terminal_error(error, retain_originals=True)
         else:
             # Join an already accepted owner from a previous lifecycle call;
             # never replace it with a fresh observer or cancel its native work.
-            cancelled, failure = await await_lifecycle_task_completion(task)
+            cancelled, failure = await await_lifecycle_task_completion(
+                task, withdrawals=withdrawals,
+            )
         if failure is None:
             self._standalone_hold_context = None
         # A failed close remains retryable on a later shutdown call; a terminal
@@ -10567,11 +10584,17 @@ Expected Duration: {expected_duration}
             # cancellation cannot make the outer wait_for / CLI "forcing exit"
             # branch unreachable. Returns whether cancellation was observed
             # and whether any step degraded (abandoned/errored).
-            tail_cancelled, tail_degraded = await self._run_durable_shutdown_tail(
-                tail_reserve,
-                storage_close_timeout=storage_close_timeout,
-                storage_preclose_timeout=storage_preclose_timeout,
-            )
+            try:
+                tail_cancelled, tail_degraded = await self._run_durable_shutdown_tail(
+                    tail_reserve,
+                    storage_close_timeout=storage_close_timeout,
+                    storage_preclose_timeout=storage_preclose_timeout,
+                )
+            except BaseException as tail_failure:
+                if not is_execution_control_error(tail_failure):
+                    raise
+                remember_finite(tail_failure)
+                tail_cancelled, tail_degraded = False, True
             if tail_cancelled:
                 shutdown_cancelled = True
 
@@ -10611,7 +10634,11 @@ Expected Duration: {expected_duration}
             # is still running.
             tail_degraded = True
 
-        context_cancelled, context_failure = await self._close_standalone_hold_context()
+        context_withdrawals: list[BaseException] = []
+        context_cancelled, context_failure = await self._close_standalone_hold_context(
+            withdrawals=context_withdrawals,
+        )
+        finite_outcomes.extend(context_withdrawals)
         shutdown_cancelled = shutdown_cancelled or context_cancelled
         if context_failure is not None:
             remember_finite(context_failure)
@@ -10748,6 +10775,18 @@ Expected Duration: {expected_duration}
         loop = asyncio.get_running_loop()
 
         state = {"cancelled": False, "degraded": False}
+        admission_failures: list[BaseException] = []
+
+        def tail_result(degraded=None):
+            # Independent tail steps get their attempt before an admission
+            # fault is surfaced. Early ownership-transfer returns still report
+            # that same failure, never silently convert it into degraded success.
+            if admission_failures:
+                raise execution_terminal_error(
+                    vars(self).get("_shutdown_control"), *admission_failures,
+                    retain_originals=True, isolate_control_originals=True,
+                )
+            return state["cancelled"], state["degraded"] if degraded is None else degraded
 
         # Count the tail steps that will actually run so each fair-divides the
         # live remaining tail budget (with a nonzero floor per step).
@@ -10943,17 +10982,31 @@ Expected Duration: {expected_duration}
             if retirement_resource is None:
                 task = asyncio.ensure_future(coro)
             else:
-                from kestrel_sovereign._async_ownership import create_owned_task
+                from kestrel_sovereign._async_ownership import (
+                    OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
+                )
 
+                admission = OwnedTaskAdmission()
                 try:
                     task = create_owned_task(
                         coro, retirement_resource=retirement_resource,
-                        retain_originals=True,
+                        retain_originals=True, admission=admission,
                     )
                 except BaseException as failure:
-                    self._remember_shutdown_control(failure)
-                    self._raise_shutdown_control()
-                    raise
+                    accepted = admission.task
+                    outcome = await await_owned_task(accepted) if accepted is not None else None
+                    terminal = execution_terminal_error(
+                        owned_task_admission_error(retirement_resource, admission, failure),
+                        outcome.error if outcome is not None else None,
+                        outcome.cancellation if outcome is not None else None,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    if outcome is not None and outcome.cancellation is not None:
+                        state["cancelled"] = True
+                    self._remember_shutdown_control(terminal)
+                    admission_failures.append(terminal)
+                    state["degraded"] = True
+                    return "error"
             try:
                 done, _pending = await asyncio.wait({task}, timeout=guard)
             except asyncio.CancelledError as withdrawal:
@@ -11125,7 +11178,7 @@ Expected Duration: {expected_duration}
                 continuation = await self._ensure_durable_shutdown_continuation(
                     dispatcher
                 )
-            return state["cancelled"], state["degraded"]
+            return tail_result()
 
         if run_dispatcher and not dispatcher_shutdown_complete:
             await self._ensure_durable_shutdown_continuation(dispatcher)
@@ -11134,13 +11187,13 @@ Expected Duration: {expected_duration}
                 "tail guard; an agent-owned continuation will close storage "
                 "after owner release."
             )
-            return state["cancelled"], state["degraded"]
+            return tail_result()
 
         if self._has_pending_llm_storage_dependents():
             await self._ensure_durable_shutdown_continuation(dispatcher)
             # The finite shutdown boundary hands off to an explicit lifecycle
             # join. Neither SQLAlchemy nor primary storage may close early.
-            return state["cancelled"], True
+            return tail_result(True)
         await self._join_llm_storage_dependents()
 
         # Dispose an optional cached SQLAlchemy engine as its own bounded
@@ -11203,4 +11256,4 @@ Expected Duration: {expected_duration}
             )
             state["degraded"] = True
 
-        return state["cancelled"], state["degraded"]
+        return tail_result()

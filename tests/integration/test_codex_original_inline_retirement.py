@@ -52,10 +52,10 @@ for line in sys.stdin:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", ["collector", "collector-native", "checkpoint", "checkpoint-observer", "native-tool", "tool-observer", "deferred-completion", "image", "image-native"]
+    ("mode", "eager"), [(mode, False) for mode in ["collector", "collector-native", "checkpoint", "checkpoint-observer", "native-tool", "tool-observer", "deferred-completion", "image", "image-native", "checkpoint-publish-before", "checkpoint-publish-after"]] + [(mode, True) for mode in ["checkpoint-publish-before", "checkpoint-publish-after"]]
 )
 async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
-    native_pg, monkeypatch, tmp_path, mode
+    native_pg, monkeypatch, tmp_path, mode, eager
 ):
     backend, observer, schema = native_pg
     await observer.execute(f'CREATE TABLE "{schema}".inline_checkpoints (id INTEGER PRIMARY KEY)')
@@ -112,6 +112,7 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
         monkeypatch.setattr(adapter_module, "_materialize_app_server_data_images", materialize_then_replace)
         monkeypatch.setattr(Path, "unlink", observe_native_unlink)
     refusal = RuntimeError("original inline retirement Task allocation refused")
+    publication_tasks, checkpoint_operations = [], []
     loop, factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     actual_register, actual_events = app.register_server_request_handler, app.iter_turn_events
     actual_terminal = execution_custody.execution_terminal_error
@@ -141,6 +142,10 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
 
     monkeypatch.setattr(execution_custody, "execution_terminal_error", terminal)
     monkeypatch.setattr(adapter_module, "await_owned_task", retirement_join)
+    # Checkpoint admission now joins through the shared admission-safe helper;
+    # observe that same real join as well as the direct handler-join alias.
+    from kestrel_sovereign import _async_ownership as ownership_module
+    monkeypatch.setattr(ownership_module, "await_owned_task", retirement_join)
 
     def register(method, handler, **kwargs):
         marked = getattr(handler, "_codex_active_tasks", None)
@@ -200,8 +205,26 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
 
     execute.persist_completed_effects = checkpoint
 
+    class PublicationTask(asyncio.Task):
+        failed = False
+
+        def add_done_callback(self, callback, *args, **kwargs):
+            if not self.failed and getattr(callback, "__name__", "") == "close_unstarted":
+                self.failed = True
+                if mode == "checkpoint-publish-after":
+                    super().add_done_callback(callback, *args, **kwargs)
+                allocation_attempted.set()
+                raise refusal
+            return super().add_done_callback(callback, *args, **kwargs)
+
     def refuse(loop, coroutine, **kwargs):
         name = _operation_name(coroutine)
+        if mode.startswith("checkpoint-publish-") and name.endswith(".checkpoint"):
+            from tests.unit.test_host_context_native_cleanup import _actual_operation
+            checkpoint_operations.append(_actual_operation(coroutine))
+            task = PublicationTask(coroutine, loop=loop, eager_start=eager, **kwargs)
+            publication_tasks.append(task)
+            return task
         selected = (
             mode in {"collector", "collector-native"} and name.endswith(".settle_inline_tools")
         ) or (mode == "checkpoint" and name.endswith(".checkpoint"))
@@ -251,7 +274,7 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
             observers[0].cancel("actual later inline tool observer withdrawal")
             await asyncio.sleep(0)
         release_tool.set()
-        if mode == "checkpoint":
+        if mode == "checkpoint" or mode.startswith("checkpoint-publish-"):
             await asyncio.wait_for(allocation_attempted.wait(), 5)
         elif mode not in {"collector-native", "native-tool", "tool-observer", "image-native"}:
             try:
@@ -288,9 +311,13 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
                 resource is image_paths[0] and attempt is image_owners[0]
                 for resource, attempt in execution_cleanup_debts(outcome.error)
             ), "failed image unlink lost its actual artifact/original turn owner"
-        if mode == "checkpoint":
+        if mode == "checkpoint" or mode.startswith("checkpoint-publish-"):
             assert refusal in chain and all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused)
-            assert (execute, None) in execution_cleanup_debts(outcome.error)
+            expected = publication_tasks[0] if publication_tasks else None
+            assert (execute, expected) in execution_cleanup_debts(outcome.error)
+            assert all(task.done() for task in publication_tasks)
+            assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in checkpoint_operations)
+            assert not checkpoints, "failed start gate admitted the native checkpoint body"
             assert is_execution_control_error(outcome.error)
             assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".inline_checkpoints') == 0
         elif mode in {"collector-native", "native-tool", "tool-observer", "image-native"}:
@@ -307,6 +334,8 @@ async def test_original_inline_tool_and_checkpoint_retire_before_thread_release(
             owner.cancel()
         await await_owned_task(owner)
         for task in tools:
+            await await_owned_task(task)
+        for task in publication_tasks:
             await await_owned_task(task)
         for coroutine in refused:
             coroutine.close()

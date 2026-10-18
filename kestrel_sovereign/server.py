@@ -2266,7 +2266,10 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             raise terminal
         return cancelled
 
-    from kestrel_sovereign._async_ownership import create_owned_task
+    from kestrel_sovereign._async_ownership import (
+        OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
+    )
+    from kestrel_sovereign.execution_custody import execution_native_source_error
 
     close_task = getattr(app.state, "phoenix_proxy_close_task", None)
     close_failure = getattr(app.state, "phoenix_proxy_close_error", None)
@@ -2287,22 +2290,33 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             if resource is None:
                 resource = phoenix
             app.state.phoenix_proxy_close_resource = resource
+            admission = OwnedTaskAdmission()
             try:
                 close_task = create_owned_task(
                     phoenix.aclose(), name="server_phoenix:original_proxy_close",
                     retain_originals=True, retirement_resource=resource,
+                    admission=admission,
                 )
                 app.state.phoenix_proxy_close_task = close_task
             except BaseException as error:
-                close_failure = error
+                close_task = admission.task
+                app.state.phoenix_proxy_close_task = close_task
+                close_failure = owned_task_admission_error(resource, admission, error)
         if close_task is not None:
-            close_cancelled, failure = await await_lifecycle_task_completion(close_task)
-            cancelled = cancelled or close_cancelled
-            close_failure = execution_terminal_error(close_failure, failure, retain_originals=True)
+            outcome = await await_owned_task(close_task)
+            cancelled = cancelled or outcome.cancellation is not None
+            if outcome.cancellation is not None:
+                failures.append(outcome.cancellation)
+            close_failure = execution_terminal_error(
+                close_failure, outcome.error, retain_originals=True,
+                isolate_control_originals=True,
+            )
         if close_failure is not None:
-            close_failure._kestrel_native_retirement_debts = (
-                *getattr(close_failure, "_kestrel_native_retirement_debts", ()),
-                (resource, close_task),
+            debt = RuntimeError("original Phoenix proxy retirement failed")
+            debt.__cause__ = execution_native_source_error(close_failure) or close_failure
+            debt._kestrel_native_retirement_debts = ((resource, close_task),)
+            close_failure = execution_terminal_error(
+                close_failure, debt, retain_originals=True, isolate_control_originals=True,
             )
             app.state.phoenix_proxy_close_error = close_failure
             failures.append(close_failure)
@@ -2312,11 +2326,12 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
         except BaseException as error:
             # stop() runs synchronously in this ORIGINAL owner, so this Task
             # (not an unaccepted replacement) witnessed the failed retirement.
-            error._kestrel_native_retirement_debts = (
-                *getattr(error, "_kestrel_native_retirement_debts", ()),
-                (phoenix, asyncio.current_task()),
+            debt = RuntimeError("original Phoenix process stop failed")
+            debt.__cause__ = execution_native_source_error(error) or error
+            debt._kestrel_native_retirement_debts = ((phoenix, asyncio.current_task()),)
+            stop_failure = execution_terminal_error(
+                error, debt, retain_originals=True, isolate_control_originals=True,
             )
-            stop_failure = error
             failures.append(stop_failure)
         if close_failure is None and stop_failure is None:
             app.state.phoenix = None
@@ -2324,7 +2339,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             app.state.phoenix_proxy_close_resource = None
             app.state.phoenix_proxy_close_supervisor = None
 
-    terminal = execution_terminal_error(*failures, retain_originals=True)
+    terminal = execution_terminal_error(*failures, retain_originals=True, isolate_control_originals=True)
     if terminal is not None:
         raise terminal
     return cancelled

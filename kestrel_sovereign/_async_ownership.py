@@ -250,15 +250,31 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     first_observed = False
     try:
         for index, operation in enumerate(operations):
+            admission = OwnedTaskAdmission()
             try:
                 children.append(create_owned_task(
                     operation, retirement_resource=retirement_resource,
                     retain_originals=retain_originals,
                     name=f"{name_prefix}:{index}" if name_prefix is not None else None,
+                    admission=admission,
                 ))
             except BaseException as error:
+                if admission.task is not None:
+                    # Publication failed, not acceptance. This exact gated
+                    # child must be harvested without cancelling away its
+                    # original opening failure.
+                    children.append(admission.task)
+                    outcome = await await_owned_task(admission.task)
+                    error = execution_terminal_error(
+                        error, outcome.error, outcome.cancellation,
+                        retain_originals=retain_originals,
+                        isolate_control_originals=isolate_control_originals,
+                    )
+                error = owned_task_admission_error(
+                    retirement_resource, admission, error,
+                )
                 if cancel_siblings_on_error:
-                    raise
+                    raise error
                 primary = execution_terminal_error(
                     primary, error, retain_originals=retain_originals,
                     isolate_control_originals=isolate_control_originals,
@@ -378,6 +394,63 @@ class OwnedTaskOutcome(Generic[_T]):
     result: _T | None
     error: BaseException | None
     cancellation: asyncio.CancelledError | None
+
+
+def owned_task_admission_error(resource, admission, failure):
+    """Private debt for one failed admission; never decorate the source.
+
+    An accepted gated Task is distinct from a true allocation refusal. Neither
+    is a physical retirement ACK. The caller still owns joining the receipt.
+    """
+    from kestrel_sovereign.execution_custody import (
+        execution_native_source_error, execution_terminal_error,
+    )
+    debt = None
+    if resource is not None:
+        debt = RuntimeError("original native operation admission failed")
+        debt.__cause__ = execution_native_source_error(failure) or failure
+        debt._kestrel_native_retirement_debts = ((resource, admission.task),)
+    return execution_terminal_error(
+        failure, debt, retain_originals=True, isolate_control_originals=True,
+    )
+
+
+async def await_owned_operation(operation, *, retirement_resource=None,
+                                retain_originals=False, name=None, context=None,
+                                **observation):
+    """Admit and physically join one operation, including publication failure.
+
+    This is only for an existing asynchronous join boundary. Bounded or
+    synchronous handoffs must instead inventory their explicit receipt in the
+    existing lifecycle owner. No registry, replacement Task, retry or new
+    observation deadline is introduced here.
+    """
+    from kestrel_sovereign.execution_custody import execution_terminal_error
+    admission = OwnedTaskAdmission()
+    opening = None
+    try:
+        task = create_owned_task(
+            operation, retirement_resource=retirement_resource,
+            retain_originals=retain_originals, name=name, context=context,
+            admission=admission,
+        )
+    except BaseException as failure:
+        opening = owned_task_admission_error(retirement_resource, admission, failure)
+        task = admission.task
+        if task is None:
+            return OwnedTaskOutcome(None, opening, observation.get("pending_cancellation"))
+    if opening is None:
+        return await await_owned_task(task, **observation)
+    # Do not cancel the failed start gate into a substitute CancelledError.
+    outcome = await await_owned_task(
+        task, pending_cancellation=observation.get("pending_cancellation"),
+    )
+    return OwnedTaskOutcome(
+        outcome.result,
+        execution_terminal_error(opening, outcome.error, retain_originals=True,
+                                 isolate_control_originals=True),
+        outcome.cancellation,
+    )
 
 
 def owned_task_observation_control(outcome):

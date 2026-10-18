@@ -13,6 +13,7 @@ from kestrel_sovereign.features.base import Feature
 from tests.unit.test_execution_custody_proxy_ingress import owner
 from tests.unit.test_execution_custody_review29 import native_owner, retire
 from tests.unit.test_execution_custody_review30 import carrier, service_owner
+from tests.utils.original_failure import OriginalFailure
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completion", ["ack", "retry"])
@@ -96,7 +97,7 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
 
     feature = Native(agent)
     manager = TaskManager(None, None, None)
-    payloads, strongest = [], None
+    payloads, strongest, strongest_source = [], None, None
     try:
         for index in range(40):
             error = ExecutionCommitOutcomeError("unknown") if index >= 20 else carrier("error")
@@ -104,6 +105,7 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
             payloads.append(weakref.ref(error.retained_payload))
             if index == 20:
                 strongest = error
+                strongest_source = OriginalFailure.capture(error)
 
             async def effect(index=index, error=error):
                 await db.execute("INSERT INTO effects VALUES (?)", (index,))
@@ -152,7 +154,8 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
             if finite:
                 assert lifecycle in chain
             else:
-                assert agent._shutdown_control is strongest
+                strongest_source.assert_retained(agent._shutdown_control)
+                assert execution_commit_outcome(agent._shutdown_control) == "unknown"
             with pytest.raises(BaseException) as caught:
                 agent._raise_shutdown_control()
         assert strongest in tuple(_explicit_control_chain(caught.value))

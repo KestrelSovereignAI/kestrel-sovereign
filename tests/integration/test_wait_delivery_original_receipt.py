@@ -38,6 +38,7 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
 from tests.integration.test_wait_consumers_original_control import (
     wait_native_runtime as wait_native_runtime,
 )
+from tests.utils.original_failure import OriginalFailure
 
 
 @dataclass
@@ -46,6 +47,7 @@ class NativeDispatchInput:
     native_read: object
     ordinary_failure: bool = False
     originals: list = field(default_factory=list)
+    source_snapshots: list = field(default_factory=list)
     tasks: list = field(default_factory=list)
     _background_tasks: set = field(default_factory=set)
     _durable_persistence_gate: object = field(default_factory=DurablePersistenceGate)
@@ -65,6 +67,7 @@ class NativeDispatchInput:
         try:
             row = await self.native_read()
         except BaseException as error:
+            self.source_snapshots.append(OriginalFailure.capture(error))
             self.originals.append(error)
             raise
         if self.ordinary_failure:
@@ -147,7 +150,9 @@ async def test_actual_agent_completion_receipt_survives_wait_harvest(
         original = owner.originals[0]
         assert execution_commit_outcome(original) == "committed"
         assert getattr(handle.task, "_kestrel_owned_terminal_error", None) is original
-        assert vars(owner).get("_shutdown_control") is original
+        shared = vars(owner).get("_shutdown_control")
+        owner.source_snapshots[0].assert_retained(shared)
+        assert execution_commit_outcome(shared) == "committed"
         failure = None
         try:
             await reconciler.reconcile()

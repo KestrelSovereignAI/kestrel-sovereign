@@ -758,6 +758,8 @@ class PostgresBackend(DatabaseBackend):
         Borrowed primary pools are only detached; their caller retains custody.
         """
         errors: list[BaseException] = []
+        from kestrel_sovereign._async_ownership import owned_task_admission_error
+        owners = vars(self).setdefault("_pool_close_owners", {})
         for attribute in ("_advisory_pool", "_pool"):
             pool = getattr(self, attribute)
             if pool is None:
@@ -766,17 +768,28 @@ class PostgresBackend(DatabaseBackend):
                 if self._pool is pool:
                     self._pool = None
                 continue
-            try:
-                task = create_owned_task(
-                    pool.close(), retirement_resource=pool, retain_originals=True,
-                )
-            except BaseException as error:
-                errors.append(error)
+            record = owners.get(attribute)
+            if record is None or record[0] is not pool:
+                admission = OwnedTaskAdmission()
+                record = [pool, None, None]
+                owners[attribute] = record
+                try:
+                    record[1] = create_owned_task(
+                        pool.close(), retirement_resource=pool, retain_originals=True,
+                        admission=admission,
+                    )
+                except BaseException as error:
+                    record[1] = admission.task
+                    record[2] = owned_task_admission_error(pool, admission, error)
+            task, opening = record[1:]
+            if task is None:
+                errors.append(opening)
                 continue
             outcome = await await_owned_task(task)
-            errors.extend((outcome.error, outcome.cancellation))
-            if outcome.error is None and getattr(self, attribute) is pool:
+            errors.extend((opening, outcome.error, outcome.cancellation))
+            if opening is None and outcome.error is None and getattr(self, attribute) is pool:
                 setattr(self, attribute, None)
+                owners.pop(attribute, None)
         terminal = execution_terminal_error(
             *errors, retain_originals=True, prefer_cancellation=True,
             isolate_control_originals=True,

@@ -233,6 +233,20 @@ configuration body-error precedence does not suppress native finalizer control.
 An accepted SDK response/context close remains the same close task even when
 publishing its completion callback fails.
 
+Every explicit native `create_owned_task` admission supplies a fresh
+`OwnedTaskAdmission`. Its start gate keeps the operation unentered until
+canonical callback publication succeeds, including under eager execution.
+Synchronous refund/drain handoffs publish `admission.task` into their existing
+record even when creation raises; their asynchronous consumers join that exact
+Task. Existing unbounded asynchronous join boundaries can use
+`await_owned_operation` for the same receipt-and-join protocol. Bounded tail
+owners keep their original absolute deadline and explicit handoff instead.
+An accepted but unstarted closer retains `(resource, original_task)` debt;
+only genuine no-Task refusal uses `(resource, None)`. Debt belongs on a private
+carrier, not the original native exception. Independent cleanup phases still
+get their attempt before the finite terminal failure is raised. Shared source
+latches never acquire another shutdown observer's actual cancellation.
+
 Session-training acquisition and rejected-session release retain the actual
 physical hook task and session when native retirement is unresolved. A later
 close reports that evidence without issuing a replacement release. Ordinary

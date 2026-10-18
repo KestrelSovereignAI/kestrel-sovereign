@@ -2933,22 +2933,29 @@ class SignalDispatcher:
             self._discard_transient_durable_handoff(reservation.delivery_id)
 
         from kestrel_sovereign._async_ownership import (
-            await_owned_task, create_owned_task, owned_task_error,
+            OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error,
+            owned_task_admission_error,
         )
 
         def completed(task):
             self._post_commit_reservation_repairs.discard(task)
             self._retain_durable_writer_control(owned_task_error(task))
 
+        admission = OwnedTaskAdmission()
+        opening = None
         try:
             repair_task = create_owned_task(
                 self._requeue_committed_initial_reservations(persisted),
                 name=f"durable_signal_post_commit_repair:{self._agent.did}",
                 retain_originals=True, retirement_resource=self,
+                admission=admission,
             )
         except BaseException as error:
-            self._retain_durable_writer_control(error)
-            raise
+            repair_task = admission.task
+            opening = owned_task_admission_error(self, admission, error)
+            self._retain_durable_writer_control(opening)
+            if repair_task is None:
+                raise opening
         try:
             self._post_commit_reservation_repairs.add(repair_task)
             repair_task.add_done_callback(completed)
@@ -2966,7 +2973,7 @@ class SignalDispatcher:
             raise terminal
         outcome = await await_owned_task(repair_task)
         error = execution_terminal_error(
-            outcome.error, outcome.cancellation, retain_originals=True,
+            opening, outcome.error, outcome.cancellation, retain_originals=True,
             prefer_cancellation=True, isolate_control_originals=True,
         )
         if error is not None:
@@ -5375,7 +5382,10 @@ class SignalDispatcher:
         self, delivery: DurableDelivery, error: BaseException,
     ) -> None:
         """Keep irreversible control evidence non-retryable and non-ACKable."""
-        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error,
+            owned_task_admission_error,
+        )
         from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_terminal_error
 
         prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
@@ -5391,21 +5401,28 @@ class SignalDispatcher:
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
             return
         task = owners.get(key)
+        opening = None
         if task is None or (task.done() and owned_task_error(task) is not None):
             # Concurrent retention callbacks and shutdown join the SAME native
             # terminalizer. Its successful original-token receipt survives a
             # later callback; the cleared CAS cannot manufacture new debt.
             # A failed metadata attempt keeps the existing bounded exact-token
             # reconciliation policy, never a replacement owner or work grant.
+            admission = OwnedTaskAdmission()
             try:
                 task = create_owned_task(
                     self._apply_cognition_control_terminal(delivery, error),
                     name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
                     retirement_resource=delivery, retain_originals=True,
+                    admission=admission,
                 )
             except BaseException as admission_error:
+                task = admission.task
+                if task is not None:
+                    owners[key] = task
+                opening = owned_task_admission_error(delivery, admission, admission_error)
                 terminal = execution_terminal_error(
-                    error, admission_error, retain_originals=True,
+                    error, opening, retain_originals=True,
                     isolate_control_originals=True,
                 )
                 # One bounded source latch owns the exact delivery. A later
@@ -5418,13 +5435,14 @@ class SignalDispatcher:
                 retained = (execution_terminal_error(retained_error, admission_error)
                             if already_unadmitted else terminal)
                 self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
-                raise terminal
+                if task is None:
+                    raise terminal
             owners[key] = task
         outcome = await await_owned_task(task)
         # Caller cancellation is not a failed receipt. The owned child has
         # been joined, so clear confirmed settlement before propagating it;
         # otherwise every retry loses the now-cleared original-token CAS.
-        if outcome.error is None:
+        if opening is None and outcome.error is None:
             # Keep only the successful original-token receipt while an
             # original delivery callback still owns its immutable snapshot.
             # Neither completed tasks nor their signal/ContextVar graph may
@@ -5436,8 +5454,11 @@ class SignalDispatcher:
             if owners.get(key) is task:
                 owners.pop(key, None)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
-        if outcome.error is not None or outcome.cancellation is not None:
-            terminal = execution_terminal_error(error, outcome.error, outcome.cancellation)
+        if opening is not None or outcome.error is not None or outcome.cancellation is not None:
+            terminal = execution_terminal_error(
+                error, opening, outcome.error, outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
             if outcome.error is not None:
                 self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, terminal)
                 self._rearm_cleanup_runtime_owner_heartbeat()

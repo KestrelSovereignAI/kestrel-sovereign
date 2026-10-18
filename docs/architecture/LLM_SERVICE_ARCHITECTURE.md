@@ -114,6 +114,10 @@ shutdown observers join the same original SDK/session/pool Task, including
 when callback publication fails. Refused or unstarted retirement retains the
 actual resource and original Task rather than reporting physical success.
 Private close debt is carried separately from shared source control errors.
+Asynchronous abandoned-result cleanup and inline Codex Stop checkpoints use
+the same receipt-and-join boundary before releasing their original stream,
+turn sink or mutex. A failed canonical callback cannot hide an accepted Task
+behind a replacement Future or allow its unstarted body to run eagerly.
 
 Offline embedding resolution establishes the same unpublished-service owner
 immediately after constructing a private `LLMService`, before awaiting persisted

@@ -28,9 +28,10 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     from kestrel_sovereign.host_features.storage import HostDatabaseLaunchContext
 
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
     execution_cleanup_debts,
+    execution_native_source_error,
     execution_terminal_error,
     is_execution_control_error,
 )
@@ -249,14 +250,14 @@ def _retain_host_cleanup_failure(
         (operation, id(resource)), _HostCloseOwner(resource)
     )
     record.error = execution_terminal_error(
-        record.error, error, retain_originals=True
+        record.error, error, retain_originals=True, isolate_control_originals=True,
     )
 
 
 def _retained_host_cleanup_error(context: Any) -> BaseException | None:
     return execution_terminal_error(
         *(record.error for record in _host_close_owners(context).values()),
-        retain_originals=True,
+        retain_originals=True, isolate_control_originals=True,
     )
 
 
@@ -287,39 +288,54 @@ async def _close_partial_host_resources(
         if record.closed:
             continue
         if record.task is None and record.error is None:
+            admission = OwnedTaskAdmission()
             try:
                 record.task = create_owned_task(
                     resource.close(),
                     retirement_resource=resource,
                     retain_originals=True,
+                    admission=admission,
                     name="host-original-resource-close",
                 )
             except BaseException as error:
                 # Canonical admission closes refused coroutines and attaches
                 # the ACTUAL resource's unstarted retirement debt.
                 record.error = error
-                if not execution_cleanup_debts(error):
-                    error._kestrel_native_retirement_debts = ((resource, None),)
+                record.task = admission.task
+                debt = RuntimeError("original host closer admission failed")
+                debt.__cause__ = execution_native_source_error(error) or error
+                debt._kestrel_native_retirement_debts = ((resource, record.task),)
+                record.error = execution_terminal_error(
+                    error, debt, retain_originals=True, isolate_control_originals=True,
+                )
         if record.task is not None:
             outcome = await await_owned_task(record.task)
-            record.error = outcome.error
+            record.error = execution_terminal_error(
+                record.error, outcome.error, retain_originals=True,
+                isolate_control_originals=True,
+            )
             errors.append(outcome.cancellation)
-            if outcome.error is None:
+            if record.error is None:
                 record.closed = True
                 record.task = None
         if record.error is not None:
             if not execution_cleanup_debts(record.error):
                 # An unsuccessful close is not physical retirement. Retain its
                 # ORIGINAL resource/operation rather than a successful holder.
-                record.error._kestrel_native_retirement_debts = (
-                    (resource, record.task),
+                debt = RuntimeError("original host close retirement failed")
+                debt.__cause__ = execution_native_source_error(record.error) or record.error
+                debt._kestrel_native_retirement_debts = ((resource, record.task),)
+                record.error = execution_terminal_error(
+                    record.error, debt, retain_originals=True,
+                    isolate_control_originals=True,
                 )
     # Feature stop and declarative rollback share this SAME inventory. Closing
     # their independent databases cannot acknowledge an earlier failed hook.
     errors.extend(record.error for record in owners.values())
     if any(error is not None for error in errors):
         raise execution_terminal_error(
-            prior_error, *errors, retain_originals=True, prefer_cancellation=True
+            prior_error, *errors, retain_originals=True, prefer_cancellation=True,
+            isolate_control_originals=True,
         )
 
 

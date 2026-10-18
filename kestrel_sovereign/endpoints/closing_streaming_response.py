@@ -10,8 +10,6 @@ from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskOutcome,
-    await_owned_task,
-    create_owned_task,
     raise_owned_outcome,
 )
 from kestrel_sovereign.execution_custody import (
@@ -104,19 +102,10 @@ class ClosingStreamingResponse(StreamingResponse):
             primary if isinstance(primary, asyncio.CancelledError) else None,
         )
         if callable(close):
-            try:
-                close_task = create_owned_task(
-                    close(),
-                    name="closing_streaming_response:body",
-                    retirement_resource=self.body_iterator,
-                    retain_originals=True,
-                )
-            except BaseException as error:
-                self._raise_terminal(execution_terminal_error(
-                    primary, error, retain_originals=True,
-                ))
-            outcome = await await_owned_task(
-                close_task,
+            from kestrel_sovereign._async_ownership import await_owned_operation
+            outcome = await await_owned_operation(
+                close(), name="closing_streaming_response:body",
+                retirement_resource=self.body_iterator, retain_originals=True,
                 pending_cancellation=(
                     primary if isinstance(primary, asyncio.CancelledError) else None
                 ),
@@ -128,6 +117,7 @@ class ClosingStreamingResponse(StreamingResponse):
         ):
             self._raise_terminal(execution_terminal_error(
                 primary, outcome.error, outcome.cancellation, retain_originals=True,
+                isolate_control_originals=True,
             ))
 
         if primary is not None and not isinstance(

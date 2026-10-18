@@ -69,7 +69,7 @@ from kestrel_sdk.llm import (
 )
 from pydantic import BaseModel
 
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     owned_execution_stream,
@@ -3403,31 +3403,22 @@ class CodexAdapter(LLMAdapter):
                         None,
                     )
                     if callable(checkpoint):
-                        try:
-                            checkpoint_owner = create_owned_task(
-                                checkpoint(list(executed_log)),
-                                name="codex-inline-tool-stop-checkpoint",
-                                retirement_resource=tool_executor,
-                                retain_originals=True,
-                            )
-                        except BaseException as admission_error:
-                            checkpoint_error = admission_error
+                        from kestrel_sovereign._async_ownership import await_owned_operation
+                        checkpoint_outcome = await await_owned_operation(
+                            checkpoint(list(executed_log)),
+                            name="codex-inline-tool-stop-checkpoint",
+                            retirement_resource=tool_executor, retain_originals=True,
+                        )
+                        if checkpoint_outcome.cancellation is not None:
+                            inline_terminal_errors.append(checkpoint_outcome.cancellation)
+                        if checkpoint_outcome.error is not None:
+                            checkpoint_error = checkpoint_outcome.error
                         else:
-                            checkpoint_outcome = await await_owned_task(checkpoint_owner)
-                            if checkpoint_outcome.cancellation is not None:
-                                inline_terminal_errors.append(checkpoint_outcome.cancellation)
-                            if checkpoint_outcome.error is not None:
-                                checkpoint_outcome.error.add_note(
-                                    "caller cancellation remained pending after an "
-                                    "inline tool effect completed"
-                                )
-                                checkpoint_error = checkpoint_outcome.error
-                            else:
-                                setattr(
-                                    pending_cleanup_cancellation,
-                                    "_kestrel_completed_effect_checkpointed",
-                                    True,
-                                )
+                            setattr(
+                                pending_cleanup_cancellation,
+                                "_kestrel_completed_effect_checkpointed",
+                                True,
+                            )
             finally:
                 try:
                     app.close_turn_sink(thread_id)

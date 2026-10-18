@@ -1828,7 +1828,7 @@ class TestSpawnFeatureWithManager:
         finally:
             child.allow_shutdown_finish.set()
 
-        manager._offboard_agent_runtime_namespace.assert_awaited_once_with(child)
+        manager._offboard_agent_runtime_namespace.assert_awaited_once_with(child, withdrawals=[])
 
     @pytest.mark.asyncio
     async def test_terminate_child_flattens_grouped_retained_agents(self):

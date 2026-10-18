@@ -1810,21 +1810,26 @@ class SQLiteBackend(DatabaseBackend):
         started_at = time.monotonic()
         self._cancelled_write_drain_error = None
         self._cancelled_write_drain_started_at = started_at
-        from kestrel_sovereign._async_ownership import create_owned_task
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskAdmission, create_owned_task, owned_task_admission_error,
+        )
 
+        admission = OwnedTaskAdmission()
         try:
             self._cancelled_write_drain = create_owned_task(
                 self._drain_cancelled_write(conn, started_at=started_at),
                 name=f"sqlite-cancelled-write-drain:{self.db_path}",
                 retirement_resource=conn, retain_originals=True,
+                admission=admission,
             )
         except BaseException as admission_error:
+            self._cancelled_write_drain = admission.task
             terminal = execution_terminal_error(
-                error, admission_error, retain_originals=True,
+                error, owned_task_admission_error(conn, admission, admission_error), retain_originals=True,
                 isolate_control_originals=True,
             )
-            # No drain was admitted. Retain the original connection debt and
-            # fence subsequent writes instead of clearing the safety latch.
+            # Accepted original or actual no-Task refusal stays fenced. Close
+            # and cleanup observers join the SAME stored drain if accepted.
             self._cancelled_write_drain_error = terminal
             raise terminal
 

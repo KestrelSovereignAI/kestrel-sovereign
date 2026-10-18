@@ -80,22 +80,12 @@ class DatabaseInitializationCleanupError(ConnectionError):
 async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseException | None = None) -> None:
     """Settle the one owned close through repeated cancellation on every exit."""
 
-    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign._async_ownership import await_owned_operation
 
-    try:
-        cleanup = create_owned_task(
-            db.close(), name="owned-database-retirement",
-            retain_originals=True, retirement_resource=db,
-        )
-    except BaseException as error:
-        # A refused closer never entered native retirement. Keep the SAME
-        # database and operation receipt on the public recovery contract.
-        cause = execution_terminal_error(
-            operation_error, error, retain_originals=True,
-            isolate_control_originals=True,
-        )
-        raise DatabaseRetirementError(db, operation_error, error) from cause
-    outcome = await await_owned_task(cleanup)
+    outcome = await await_owned_operation(
+        db.close(), name="owned-database-retirement",
+        retain_originals=True, retirement_resource=db,
+    )
     close_exc = outcome.error
     if close_exc is not None:
         # Keep the resource-retirement wrapper/owner AND the original control
@@ -4103,22 +4093,14 @@ class AsyncDatabase:
         chance to complete.
         """
         from kestrel_sovereign._async_ownership import (
-            await_owned_task,
-            create_owned_task,
+            await_owned_operation,
         )
         errors = []
         # Independent resource retirement must finish even if an earlier owner
         # reports grouped control or the caller is cancelled during a join.
         for index, operation in enumerate((self.dispose_cached_sqla_factory, self._backend.close)):
-            try:
-                task = create_owned_task(operation(), retirement_resource=self)
-            except BaseException as error:
-                # An unaccepted optional closer cannot skip the independent
-                # primary owner. Keep the original resource/debt and continue.
-                errors.append(error)
-                continue
-            outcome = await await_owned_task(
-                task,
+            outcome = await await_owned_operation(
+                operation(), retirement_resource=self, retain_originals=True,
                 cancel_on_caller_cancellation=index == 0,
             )
             errors.extend((outcome.error, outcome.cancellation))
@@ -4135,14 +4117,14 @@ class AsyncDatabase:
                         "pending after the primary database connection closed"
                     ))
             else:
+                # This finalizer has no suspension and native retirement has
+                # already settled. Harvest its reporting inline, never in an
+                # unreturned Task that could consume unseen terminal evidence.
                 try:
-                    task = create_owned_task(self.finalize_retired_sqla_factory(), retirement_resource=self)
+                    await self.finalize_retired_sqla_factory()
                 except BaseException as error:
                     errors.append(error)
-                else:
-                    outcome = await await_owned_task(task)
-                    errors.extend((outcome.error, outcome.cancellation))
-        terminal = execution_terminal_error(*errors, retain_originals=True)
+        terminal = execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
         if terminal is not None:
             raise terminal
 

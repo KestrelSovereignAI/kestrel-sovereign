@@ -1670,19 +1670,15 @@ class SpawnFeature(Feature):
 
         failure = None
         if manager is not None:
-            try:
-                descendant_shutdown = create_owned_task(
-                    manager.shutdown_spawn_authority_tree(self.agent),
-                    name="standalone_spawn_descendant_shutdown",
-                    retain_originals=True, retirement_resource=manager,
-                )
-            except BaseException as error:
-                failure = error
-            else:
-                outcome = await await_owned_task(descendant_shutdown)
-                failure = outcome.error
-                if outcome.cancellation is not None:
-                    outcomes.append(outcome.cancellation)
+            from kestrel_sovereign._async_ownership import await_owned_operation
+            outcome = await await_owned_operation(
+                manager.shutdown_spawn_authority_tree(self.agent),
+                name="standalone_spawn_descendant_shutdown",
+                retain_originals=True, retirement_resource=manager,
+            )
+            failure = outcome.error
+            if outcome.cancellation is not None:
+                outcomes.append(outcome.cancellation)
             if failure is not None:
                 outcomes.append(failure)
 

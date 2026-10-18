@@ -8835,25 +8835,31 @@ class AgentManager:
             )
 
         async def finish_shutdown_and_optional_offboarding() -> object:
-            cancelled, failure = await await_lifecycle_task_completion(shutdown_reaper)
+            withdrawals: list[BaseException] = []
+            _cancelled, failure = await await_lifecycle_task_completion(
+                shutdown_reaper, withdrawals=withdrawals,
+            )
             if failure is not None:
-                raise failure
-            if cancelled:
-                raise asyncio.CancelledError()
+                raise execution_terminal_error(
+                    failure, *withdrawals, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            if withdrawals:
+                raise execution_terminal_error(*withdrawals, retain_originals=True)
             if offboard_runtime:
                 (
                     cleanup_cancelled,
                     cleanup_failure,
-                ) = await self._offboard_agent_runtime_namespace(agent)
+                ) = await self._offboard_agent_runtime_namespace(
+                    agent, withdrawals=withdrawals,
+                )
                 if cleanup_failure is not None:
-                    if cleanup_cancelled:
-                        raise BaseExceptionGroup(
-                            "Runtime offboarding had multiple terminal outcomes",
-                            [asyncio.CancelledError(), cleanup_failure],
-                        )
-                    raise cleanup_failure
-                if cleanup_cancelled:
-                    raise asyncio.CancelledError()
+                    raise execution_terminal_error(
+                        cleanup_failure, *withdrawals, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
+                if withdrawals:
+                    raise execution_terminal_error(*withdrawals, retain_originals=True)
                 if retire_persistent_registration:
                     agent_id = _loaded_agent_did(agent)
                     if isinstance(agent_id, str) and agent_id:
@@ -11162,6 +11168,8 @@ class AgentManager:
         self._next_removal_budget_release_id += 1
         release_id = f"ordinary-budget-release:{self._next_removal_budget_release_id}"
         started_monotonic = time.monotonic()
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_task_admission_error
+        admission = OwnedTaskAdmission()
         try:
             release_awaitable = (
                 release_operation() if release_operation is not None else
@@ -11175,6 +11183,7 @@ class AgentManager:
                 budget_release = create_owned_task(
                     release_awaitable, retain_originals=True,
                     retirement_resource=self._child_budgets.get(child_name),
+                    admission=admission,
                 )
             else:
                 raise TypeError("An asyncio.Future, a coroutine or an awaitable is required")
@@ -11182,16 +11191,20 @@ class AgentManager:
             # A failed Future gives the caller the same await/cancellation
             # contract as an asynchronously failed release, while ensuring the
             # just-reserved record can retain its evidence synchronously.
-            budget_release = asyncio.get_running_loop().create_future()
+            budget_release = admission.task
+            if budget_release is not None:
+                budget_release._kestrel_owned_terminal_error = owned_task_admission_error(
+                    self._child_budgets.get(child_name), admission, failure,
+                )
             # Keep the SAME admission carrier before projecting the legacy
             # cancelled-Future state. A fresh Future cancellation has no cause.
-            budget_release._kestrel_owned_terminal_error = failure
-            if isinstance(failure, asyncio.CancelledError):
-                budget_release.cancel()
-            else:
-                budget_release.set_exception(failure)
-        if isinstance(budget_release, asyncio.Task):
-            budget_release.set_name(f"agent_budget_release:{child_name}")
+            if budget_release is None:
+                budget_release = asyncio.get_running_loop().create_future()
+                budget_release._kestrel_owned_terminal_error = failure
+                if isinstance(failure, asyncio.CancelledError):
+                    budget_release.cancel()
+                else:
+                    budget_release.set_exception(failure)
         record = InflightRemovalBudgetRelease(
             release_id=release_id,
             child_name=child_name,
@@ -11200,6 +11213,15 @@ class AgentManager:
         )
         self._inflight_removal_budget_releases[release_id] = record
         self._inflight_removal_budget_releases_by_child[child_name] = record
+        # Inventory acceptance BEFORE diagnostic naming or later callbacks.
+        if isinstance(budget_release, asyncio.Task):
+            try:
+                budget_release.set_name(f"agent_budget_release:{child_name}")
+            except BaseException as failure:
+                budget_release._kestrel_owned_terminal_error = execution_terminal_error(
+                    owned_task_error(budget_release) if budget_release.done() else None,
+                    failure, retain_originals=True, isolate_control_originals=True,
+                )
 
         def observe_budget_release_completion(
             task: "asyncio.Future[object]",
@@ -11229,7 +11251,15 @@ class AgentManager:
         if budget_release.done():
             observe_budget_release_completion(budget_release)
         else:
-            budget_release.add_done_callback(observe_budget_release_completion)
+            try:
+                budget_release.add_done_callback(observe_budget_release_completion)
+            except BaseException as failure:
+                # Existing asynchronous release/drain consumers still own and
+                # join the exact record even without the observer callback.
+                budget_release._kestrel_owned_terminal_error = execution_terminal_error(
+                    getattr(budget_release, "_kestrel_owned_terminal_error", None),
+                    failure, retain_originals=True, isolate_control_originals=True,
+                )
         return record
 
     async def _await_child_budget_release_cancellation_safe(
@@ -11273,12 +11303,24 @@ class AgentManager:
     async def _release_child_budget_cancellation_safe(self, child_name: str) -> bool:
         """Release one removed child's hold before reporting caller cancellation."""
 
-        budget_release = create_owned_task(
-            self._release_child_budget(child_name),
-            name=f"agent_budget_release:{child_name}",
-            retain_originals=True,
-            retirement_resource=self._child_budgets.get(child_name),
-        )
+        admission = OwnedTaskAdmission()
+        resource = self._child_budgets.get(child_name)
+        try:
+            budget_release = create_owned_task(
+                self._release_child_budget(child_name),
+                name=f"agent_budget_release:{child_name}",
+                retain_originals=True, admission=admission,
+                retirement_resource=resource,
+            )
+        except BaseException as opening:
+            from kestrel_sovereign._async_ownership import owned_task_admission_error
+            accepted = admission.task
+            outcome = await await_owned_task(accepted) if accepted is not None else None
+            raise execution_terminal_error(
+                owned_task_admission_error(resource, admission, opening), outcome.error if outcome is not None else None,
+                outcome.cancellation if outcome is not None else None,
+                retain_originals=True, isolate_control_originals=True,
+            )
         return await self._await_child_budget_release_cancellation_safe(budget_release)
 
     async def spawn_agent(
@@ -12762,16 +12804,23 @@ class AgentManager:
         cleanup: asyncio.Task[None] | None = None
         admission_failure: BaseException | None = None
         while True:
-            _result, acquire_failure = await self._join_spawn_rollback_phase(
-                self._lock.acquire(), phase="failed_spawn_cleanup_admission",
-                admission=admission, withdrawals=observed,
-            )
-            if acquire_failure is not None:
-                raise RuntimeError(
-                    "Unable to admit failed spawn cleanup"
-                ) from acquire_failure
+            acquired = False
+
+            async def acquire_manager_lock():
+                nonlocal acquired
+                await self._lock.acquire()
+                acquired = True
+
             wait_for_open: asyncio.Event | None = None
             try:
+                _result, acquire_failure = await self._join_spawn_rollback_phase(
+                    acquire_manager_lock(), phase="failed_spawn_cleanup_admission",
+                    admission=admission, withdrawals=observed,
+                )
+                if acquire_failure is not None:
+                    raise RuntimeError(
+                        "Unable to admit failed spawn cleanup"
+                    ) from acquire_failure
                 if self._quarantined_shutdown_handoffs_sealed:
                     wait_for_open = self._quarantined_shutdown_handoffs_open
                 else:
@@ -12809,7 +12858,8 @@ class AgentManager:
                             self._pending_spawns += 1
                             slot_transferred = True
             finally:
-                self._lock.release()
+                if acquired:
+                    self._lock.release()
             if wait_for_open is None:
                 break
             _result, wait_failure = await self._join_spawn_rollback_phase(

@@ -1665,12 +1665,12 @@ async def close_execution_stream(
     owner: Any, stream: Any, captured: tuple[ExecutionCustody, ...] = (),
 ) -> None:
     """Join an owned source's close despite repeated caller cancellation."""
-    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign._async_ownership import await_owned_operation
 
     close = getattr(stream, "aclose", None)
     if callable(close):
         with bind_execution_cleanup(owner, captured):
-            outcome = await await_owned_task(create_owned_task(close(), retirement_resource=stream, retain_originals=True))
+            outcome = await await_owned_operation(close(), retirement_resource=stream, retain_originals=True)
             error = execution_terminal_error(outcome.error, outcome.cancellation, retain_originals=True, isolate_control_originals=True)
             if error is not None:
                 raise error

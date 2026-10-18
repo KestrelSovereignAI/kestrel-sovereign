@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from typing import AsyncIterator, Awaitable, Callable, Optional, TypeVar
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import execution_terminal_error
 
 CancelToken = Callable[[], bool]
@@ -98,21 +98,24 @@ async def await_or_cancelled(
             task.cancel()
         outcome = await await_owned_task(task)
         if outcome.error is None and abandoned_result_cleanup is not None:
+            from kestrel_sovereign._async_ownership import await_owned_operation
             try:
                 operation = abandoned_result_cleanup(outcome.result)
                 # A synchronous resource release (notably Lock.release) must
                 # happen before any additional cleanup allocation can fail.
-                if operation is not None:
-                    cleanup = create_owned_task(operation, retirement_resource=outcome.result)
             except BaseException as cleanup_error:
                 raise execution_terminal_error(
-                    original, outcome.cancellation, cleanup_error, retain_originals=True
+                    original, outcome.cancellation, cleanup_error, retain_originals=True,
+                    isolate_control_originals=True,
                 )
             if operation is None:
                 raise execution_terminal_error(original, outcome.cancellation)
-            closed = await await_owned_task(cleanup)
+            closed = await await_owned_operation(
+                operation, retirement_resource=outcome.result, retain_originals=True,
+            )
             raise execution_terminal_error(
-                original, outcome.cancellation, closed.error, closed.cancellation
+                original, outcome.cancellation, closed.error, closed.cancellation,
+                retain_originals=True, isolate_control_originals=True,
             )
         raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
