@@ -115,7 +115,7 @@ from kestrel_sdk.signals import (
 )
 
 from kestrel_sovereign.execution_custody import (
-    execution_terminal_error,
+    execution_finite_error,
     is_execution_control_error,
 )
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
@@ -1017,7 +1017,7 @@ class SignalDispatcher:
         point remains valid and shutdown waits for it to finish.
         """
         if self._outcome_log_control_error is not None:
-            raise execution_terminal_error(self._outcome_log_control_error)
+            raise execution_finite_error(self._outcome_log_control_error)
         current_task = asyncio.current_task()
         if current_task is None:  # pragma: no cover - async APIs run in Tasks
             raise RuntimeError("Durable signal delivery requires an asyncio task")
@@ -1458,7 +1458,7 @@ class SignalDispatcher:
             if operation is not None:
                 operation.cancel()
                 outcome = await await_owned_task(operation)
-                opening = execution_terminal_error(
+                opening = execution_finite_error(
                     opening,
                     outcome.error if is_execution_control_error(outcome.error) else None,
                     outcome.cancellation, retain_originals=True,
@@ -1903,7 +1903,7 @@ class SignalDispatcher:
                         lease_token=delivery.lease_token,
                     )
                 except BaseException as cleanup:
-                    raise execution_terminal_error(
+                    raise execution_finite_error(
                         opening, cleanup, retain_originals=True,
                         prefer_cancellation=True, isolate_control_originals=True,
                     )
@@ -2108,7 +2108,7 @@ class SignalDispatcher:
                         event_id=event_id,
                     )
                 except BaseException as cleanup:
-                    raise execution_terminal_error(
+                    raise execution_finite_error(
                         opening, cleanup, retain_originals=True,
                         prefer_cancellation=True, isolate_control_originals=True,
                     )
@@ -2567,7 +2567,7 @@ class SignalDispatcher:
             from kestrel_sovereign._async_ownership import owned_task_error
             debt = tuple(original for _, original in self._retained_cognition_control_debt.values())
             completed_error = owned_task_error(completion) if completion.done() else None
-            raise execution_terminal_error(
+            raise execution_finite_error(
                 *debt, self._outcome_log_control_error, completed_error, error,
                 retain_originals=True, prefer_cancellation=True,
                 isolate_control_originals=True,
@@ -2644,7 +2644,7 @@ class SignalDispatcher:
             try:
                 await drain()
             except BaseException as error:
-                cleanup_error = execution_terminal_error(cleanup_error, error)
+                cleanup_error = execution_finite_error(cleanup_error, error)
         if cleanup_error is not None:
             # Still join every accepted writer/repair, but uncertain storage
             # control is not permission to publish an ordinary owner release.
@@ -2788,22 +2788,22 @@ class SignalDispatcher:
             tasks = tuple(self._outcome_log_tasks)
             await self._join_outcome_log_tasks(tasks)
         if self._outcome_log_control_error is not None:
-            raise execution_terminal_error(self._outcome_log_control_error)
+            raise execution_finite_error(self._outcome_log_control_error)
 
     async def _drain_outcome_logs_for_signal(self, signal_id: str) -> None:
         """Join this dispatch's outcome writers before returning its result."""
         while tasks := self._outcome_log_tasks_by_signal.get(signal_id):
             await self._join_outcome_log_tasks(tuple(tasks))
         if self._outcome_log_control_error is not None:
-            raise execution_terminal_error(self._outcome_log_control_error)
+            raise execution_finite_error(self._outcome_log_control_error)
 
     async def _join_outcome_log_tasks(self, tasks) -> None:
         from kestrel_sovereign._async_ownership import await_owned_task
         error = None
         for task in tasks:
             outcome = await await_owned_task(task)
-            error = execution_terminal_error(error, outcome.error, outcome.cancellation)
-        error = execution_terminal_error(self._outcome_log_control_error, error)
+            error = execution_finite_error(error, outcome.error, outcome.cancellation)
+        error = execution_finite_error(self._outcome_log_control_error, error)
         if error is not None:
             raise error
 
@@ -2910,7 +2910,7 @@ class SignalDispatcher:
                         )
                     break
         except BaseException as error:
-            terminal = execution_terminal_error(
+            terminal = execution_finite_error(
                 error, withdrawal, retain_originals=True,
                 prefer_cancellation=True, isolate_control_originals=True,
             )
@@ -2964,7 +2964,7 @@ class SignalDispatcher:
             # async owner can physically join it before propagating failure.
             outcome = await await_owned_task(repair_task)
             self._post_commit_reservation_repairs.discard(repair_task)
-            terminal = execution_terminal_error(
+            terminal = execution_finite_error(
                 error, outcome.error, outcome.cancellation,
                 retain_originals=True, prefer_cancellation=True,
                 isolate_control_originals=True,
@@ -2972,7 +2972,7 @@ class SignalDispatcher:
             self._retain_durable_writer_control(terminal)
             raise terminal
         outcome = await await_owned_task(repair_task)
-        error = execution_terminal_error(
+        error = execution_finite_error(
             opening, outcome.error, outcome.cancellation, retain_originals=True,
             prefer_cancellation=True, isolate_control_originals=True,
         )
@@ -2993,7 +2993,7 @@ class SignalDispatcher:
             error = None
             for repair in repairs:
                 outcome = await await_owned_task(repair)
-                error = execution_terminal_error(
+                error = execution_finite_error(
                     error, outcome.error, outcome.cancellation,
                     retain_originals=True, prefer_cancellation=True,
                     isolate_control_originals=True,
@@ -3001,7 +3001,7 @@ class SignalDispatcher:
             if error is not None:
                 raise error
         if self._outcome_log_control_error is not None:
-            raise execution_terminal_error(self._outcome_log_control_error)
+            raise execution_finite_error(self._outcome_log_control_error)
 
     def _retain_durable_writer_control(self, error: BaseException | None) -> None:
         """One existing bounded safety latch for this runtime's native writers."""
@@ -3150,8 +3150,8 @@ class SignalDispatcher:
                 # A zero-row CAS is lost protection, not a healthy heartbeat.
                 # Keep the original debt and expose its terminal evidence; a
                 # timer retry cannot manufacture another owner's authority.
-                from kestrel_sovereign.execution_custody import execution_terminal_error
-                raise execution_terminal_error(*(
+                from kestrel_sovereign.execution_custody import execution_finite_error
+                raise execution_finite_error(*(
                     error for _, error in self._retained_cognition_control_debt.values()
                 ))
             if not retained and any(
@@ -3890,7 +3890,7 @@ class SignalDispatcher:
             if isinstance(child_error, asyncio.CancelledError) and not is_execution_control_error(child_error):
                 child_error = None  # Our requested cancellation of the renewer.
             renewal_error = lost.result() if lost.done() else None
-            terminal = execution_terminal_error(
+            terminal = execution_finite_error(
                 body_error,
                 renewal_error if isinstance(renewal_error, BaseException) else None,
                 child_error,
@@ -4213,7 +4213,7 @@ class SignalDispatcher:
                                         "failure: %s",
                                         cleanup_exc,
                                     )
-                                    raise execution_terminal_error(
+                                    raise execution_finite_error(
                                         exc, cleanup_exc, retain_originals=True,
                                         isolate_control_originals=True,
                                     )
@@ -4241,7 +4241,7 @@ class SignalDispatcher:
                                         "failure: %s",
                                         cleanup_exc,
                                     )
-                                    raise execution_terminal_error(
+                                    raise execution_finite_error(
                                         exc, cleanup_exc, retain_originals=True,
                                         isolate_control_originals=True,
                                     )
@@ -4987,10 +4987,10 @@ class SignalDispatcher:
             # an in-flight commit. Its owned join can publish control after
             # that wait; never proceed to ACK/NACK before harvesting it.
             if lease_lost.done() and isinstance(lease_lost.result(), BaseException):
-                lease_loss_error = execution_terminal_error(lease_loss_error, lease_lost.result())
+                lease_loss_error = execution_finite_error(lease_loss_error, lease_lost.result())
                 raise lease_loss_error
         except asyncio.CancelledError as error:
-            error = execution_terminal_error(lease_loss_error, error)
+            error = execution_finite_error(lease_loss_error, error)
             if is_execution_control_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
                 raise error
@@ -5004,7 +5004,7 @@ class SignalDispatcher:
             raise
 
         except BaseException as error:
-            error = execution_terminal_error(lease_loss_error, error)
+            error = execution_finite_error(lease_loss_error, error)
             if is_execution_control_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
             raise error
@@ -5372,8 +5372,8 @@ class SignalDispatcher:
         else:
             if routing_task is not None:
                 from kestrel_sovereign._async_ownership import owned_task_error
-                from kestrel_sovereign.execution_custody import execution_terminal_error
-                error = execution_terminal_error(
+                from kestrel_sovereign.execution_custody import execution_finite_error
+                error = execution_finite_error(
                     error, owned_task_error(routing_task), retain_originals=True,
                     isolate_control_originals=True,
                 )
@@ -5408,7 +5408,7 @@ class SignalDispatcher:
             owned_task_admission_error,
         )
         from kestrel_sovereign.execution_custody import (
-            execution_cleanup_debts, execution_native_source_error, execution_terminal_error,
+            execution_cleanup_debts, execution_native_source_error, execution_finite_error,
         )
 
         retained_error = self._retain_cognition_native_control(delivery, error)
@@ -5442,7 +5442,7 @@ class SignalDispatcher:
                 if task is not None:
                     owners[key] = task
                 opening = owned_task_admission_error(delivery, admission, admission_error)
-                terminal = execution_terminal_error(
+                terminal = execution_finite_error(
                     error, opening, retain_originals=True,
                     isolate_control_originals=True,
                 )
@@ -5476,7 +5476,7 @@ class SignalDispatcher:
                 owners.pop(key, None)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
         if opening is not None or outcome.error is not None or outcome.cancellation is not None:
-            terminal = execution_terminal_error(
+            terminal = execution_finite_error(
                 error, opening, outcome.error, outcome.cancellation,
                 retain_originals=True, isolate_control_originals=True,
             )
@@ -6192,7 +6192,7 @@ class SignalDispatcher:
                 # the worker carries no stronger native control receipt.
                 if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
                     error = None
-                return execution_terminal_error(error, outcome.cancellation)
+                return execution_finite_error(error, outcome.cancellation)
 
             async def execute_with_tracking():
                 from kestrel_sovereign.hold import source_owns_hold_disposition
@@ -6307,7 +6307,7 @@ class SignalDispatcher:
                     if not task.done():
                         task.cancel()
                 for task in tasks:
-                    error = execution_terminal_error(error, await join_sibling(task))
+                    error = execution_finite_error(error, await join_sibling(task))
                 finish_execution = getattr(
                     self._agent,
                     "finish_cognition_signal_execution",
@@ -6319,9 +6319,9 @@ class SignalDispatcher:
                         if inspect.isawaitable(finished):
                             finished_task = asyncio.ensure_future(finished)
                             outcome = await await_owned_task(finished_task)
-                            error = execution_terminal_error(error, outcome.error, outcome.cancellation)
+                            error = execution_finite_error(error, outcome.error, outcome.cancellation)
                     except BaseException as finish_error:
-                        error = execution_terminal_error(error, finish_error)
+                        error = execution_finite_error(error, finish_error)
                 if error is not None:
                     raise error
 
@@ -6589,7 +6589,7 @@ class SignalDispatcher:
                 if callable(clear_receipt):
                     clear_receipt()
             except BaseException as cleanup_error:
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     error, cleanup_error, retain_originals=True,
                     prefer_cancellation=True, isolate_control_originals=True,
                 )
@@ -7285,9 +7285,9 @@ class SignalDispatcher:
                          exc_info=(type(exc), exc, exc.__traceback__))
             if is_execution_control_error(exc):
                 self._retain_durable_writer_control(exc)
-                raise execution_terminal_error(exc, outcome.cancellation)
+                raise execution_finite_error(exc, outcome.cancellation)
             if not isinstance(exc, Exception):
-                raise execution_terminal_error(exc, outcome.cancellation)
+                raise execution_finite_error(exc, outcome.cancellation)
         if outcome.cancellation is not None:
             raise outcome.cancellation
 

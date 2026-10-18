@@ -260,6 +260,23 @@ debt writers use the same bounded source-only retention boundary, including
 late route and cleanup completion callbacks. PostgreSQL and Phoenix close
 accounting uses the original Task's physical result, not its joiner's aggregate.
 
+Manager, server and dispatcher finite lifecycle owners use an explicit native
+composition policy: every original source and actual current join withdrawal
+remains in the finite result without decorating any original source graph.
+This does not change the generic non-native caused-cancellation defaults.
+The manager's two completed-cleanup writers have a different lifetime: their
+shared summary keeps one strongest genuine original (UNKNOWN before COMMITTED
+before other denial), fixed irreversible classification, and exact unresolved
+retirement ownership. It does not keep every completed source after the bounded
+128-record display history is evicted or acknowledged. Compacted independent
+scope evidence fails closed at this manager's aggregate reader rather than
+attributing all sources to the selected original's tenant. Exact per-operation
+scopes remain unchanged. Display acknowledgement is not physical retirement:
+generic debts stay conservative, and unretired typed ACK receipts keep their
+mutable original retirement record, including an owner not yet published.
+Only that receipt's actual retirement permits its redundant ownership record
+to be compacted; a successful unrelated Task or Future is not a retirement ACK.
+
 Session-training acquisition and rejected-session release retain the actual
 physical hook task and session when native retirement is unresolved. A later
 close reports that evidence without issuing a replacement release. Ordinary

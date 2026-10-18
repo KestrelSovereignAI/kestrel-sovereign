@@ -386,6 +386,23 @@ def execution_observation_error(*errors: BaseException | None) -> BaseException 
     return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
 
 
+def execution_finite_error(*errors: BaseException | None, retain_originals: bool = False,
+                           prefer_cancellation: bool = False,
+                           isolate_control_originals: bool = False) -> BaseException | None:
+    """Finite lifecycle composition isolates native sources, not generic defaults.
+
+    A native receipt cannot erase this caller's actual withdrawal or acquire
+    independent failures in its original graph. Ordinary no-control callers
+    retain their existing selection and caused-cancellation policy.
+    """
+    native = any(is_execution_control_error(error) for error in errors)
+    return execution_terminal_error(
+        *errors, retain_originals=retain_originals or native,
+        prefer_cancellation=prefer_cancellation,
+        isolate_control_originals=isolate_control_originals or native,
+    )
+
+
 def execution_terminal_error(*errors: BaseException | None, retain_originals: bool = False,
                              prefer_cancellation: bool = False,
                              isolate_control_originals: bool = False) -> BaseException | None:

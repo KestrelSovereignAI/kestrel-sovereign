@@ -30,7 +30,7 @@ from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
-from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_terminal_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, _explicit_control_chain, execution_finite_error, is_execution_control_error
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did,
@@ -100,6 +100,76 @@ _QUARANTINED_METADATA_TEXT_LIMIT = 256
 _RUNTIME_OFFBOARD_TIMEOUT_ENV = "KESTREL_RUNTIME_OFFBOARD_TIMEOUT_S"
 _DEFAULT_RUNTIME_OFFBOARD_TIMEOUT_S = 30.0
 StartupAuthorityChain = tuple[tuple[str, str], ...]
+
+
+class _ManagerCleanupControl(ExecutionAuthorityError):
+    """One strongest original plus necessary ownership, never source history."""
+
+
+def _merge_manager_cleanup_control(previous, error):
+    """Reduce only this manager's terminal latch; never rewrite its sources.
+
+    Display acknowledgement cannot settle native custody. Keep exact generic
+    retirement debts conservatively: an arbitrary successful Task is not proof
+    of its resource's retirement. Typed ACK receipts have their own precise
+    reset contract, so only those confirmed retired receipts can be compacted.
+    """
+    from kestrel_sovereign.execution_custody import (
+        AcknowledgedExecutionCommit, _native_source_originals,
+        execution_cleanup_debts, execution_commit_outcome,
+        execution_denial_scopes,
+    )
+    root = previous.__cause__ if isinstance(previous, _ManagerCleanupControl) else None
+    compacted = bool(getattr(previous, "_manager_sources_compacted", False))
+    unscoped = bool(getattr(previous, "_kestrel_unscoped_execution_denial", False))
+    priority = {None: 0, "committed": 1, "unknown": 2}
+    for value in (previous, error):
+        for source in _native_source_originals(value):
+            if isinstance(source, _ManagerCleanupControl):
+                source = source.__cause__
+            if source is None:
+                continue
+            if root is not None and source is not root:
+                compacted = True
+            if root is None or priority[execution_commit_outcome(source)] > priority[execution_commit_outcome(root)]:
+                root = source
+    summary = _ManagerCleanupControl("manager cleanup retains original native control")
+    summary.__cause__ = root
+    summary._manager_sources_compacted = compacted
+    outcomes = (execution_commit_outcome(previous), execution_commit_outcome(error))
+    if "unknown" in outcomes:
+        summary._kestrel_unresolved_commit_outcome = "unknown"
+    elif "committed" in outcomes:
+        summary._kestrel_unresolved_commit_outcome = "committed"
+    scopes = execution_denial_scopes(root)
+    if scopes:
+        summary._kestrel_denied_execution_scopes = scopes
+    if compacted or unscoped or not scopes:
+        # Compaction is not evidence that other sources belonged to the
+        # selected root's tenant. This aggregate reader grants no work.
+        summary._kestrel_unscoped_execution_denial = True
+    debts, receipts = [], []
+    for value in (previous, error):
+        for resource, owner in execution_cleanup_debts(value):
+            if not any(resource is old and owner is old_owner for old, old_owner in debts):
+                debts.append((resource, owner))
+        for carrier in _explicit_control_chain(value):
+            for receipt in vars(carrier).get("_kestrel_acknowledged_commits", ()):
+                if not isinstance(receipt, AcknowledgedExecutionCommit):
+                    continue
+                try:
+                    retired = receipt.retired
+                except BaseException:
+                    retired = False  # Failed observation is never a reset ACK.
+                if not retired and all(receipt is not old for old in receipts):
+                    # Preserve the mutable retirement record itself, including
+                    # an original reset owner that has not yet been published.
+                    receipts.append(receipt)
+    if debts:
+        summary._kestrel_native_retirement_debts = tuple(debts)
+    if receipts:
+        summary._kestrel_acknowledged_commits = tuple(receipts)
+    return summary
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +463,8 @@ def _raise_lifecycle_outcomes(message: str, outcomes: list[BaseException]) -> No
         return
     if len(outcomes) == 1:
         raise outcomes[0]
+    if any(is_execution_control_error(error) for error in outcomes):
+        raise execution_finite_error(*outcomes)
     raise BaseExceptionGroup(message, outcomes)
 
 
@@ -680,7 +752,7 @@ class _OwnedLifecycleOperation:
         task = self.admission.task
         outcome = await await_owned_task(task) if task is not None else None
         if not self.harvested:
-            physical = execution_terminal_error(
+            physical = execution_finite_error(
                 self.opening, owned_task_error(task) if task is not None else None,
                 retain_originals=True, isolate_control_originals=True,
             )
@@ -689,13 +761,13 @@ class _OwnedLifecycleOperation:
                 from kestrel_sovereign.execution_custody import execution_native_source_error
                 debt.__cause__ = execution_native_source_error(physical) or physical
                 debt._kestrel_native_retirement_debts = ((self.resource if self.resource is not None else self, task),)
-                self.failure = execution_terminal_error(
+                self.failure = execution_finite_error(
                     physical, debt, retain_originals=True,
                     isolate_control_originals=True,
                 )
             self.harvested = True
         if outcome is not None and is_execution_control_error(outcome.error):
-            self.failure = execution_terminal_error(
+            self.failure = execution_finite_error(
                 self.failure, outcome.error, retain_originals=True,
                 isolate_control_originals=True,
             )
@@ -705,7 +777,7 @@ class _OwnedLifecycleOperation:
         # A pending cancellation count may already have been handled by the
         # body. Only an actual newly delivered withdrawal is a join outcome.
         cancelled = withdrawal is not None
-        return cancelled, execution_terminal_error(
+        return cancelled, execution_finite_error(
             self.failure, outcome.error if outcome is not None else None, withdrawal, retain_originals=True,
             isolate_control_originals=True,
         )
@@ -2595,7 +2667,7 @@ class AgentManager:
             )
             cancelled, failure = await await_lifecycle_task_completion(task)
             if failure is not None and is_execution_control_error(failure):
-                raise execution_terminal_error(failure)
+                raise execution_finite_error(failure)
             if isinstance(failure, asyncio.CancelledError):
                 # ``on_agent_ready`` is a best-effort post-publication phase.
                 # Real agents consume a hook-owned child cancellation inside
@@ -3068,7 +3140,7 @@ class AgentManager:
                     active_boot_semaphore.release()
                     active_boot_slot_held = False
         except BaseException as initialization_failure:
-            from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+            from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
             if agent is not None:
                 # The constructed candidate owns the initialization receipt as
                 # well as its native resources. Rollback cannot replace that
@@ -3078,7 +3150,7 @@ class AgentManager:
                 try:
                     await self._discard_unpublished_initialized_agents([(name, agent)])
                 except BaseException as cleanup_failure:
-                    terminal = execution_terminal_error(
+                    terminal = execution_finite_error(
                         initialization_failure, cleanup_failure, retain_originals=True,
                         isolate_control_originals=True,
                     )
@@ -3122,8 +3194,8 @@ class AgentManager:
                             self._unpublished_llm_owners, name, llm_service, captured,
                         )
                     except BaseException as error:
-                        from kestrel_sovereign.execution_custody import execution_terminal_error
-                        cleanup_failure = execution_terminal_error(
+                        from kestrel_sovereign.execution_custody import execution_finite_error
+                        cleanup_failure = execution_finite_error(
                             cleanup_failure, error, retain_originals=True,
                             isolate_control_originals=True,
                         )
@@ -3133,8 +3205,8 @@ class AgentManager:
                             exc_info=True,
                         )
                 if cleanup_failure is not None:
-                    from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-                    terminal = execution_terminal_error(
+                    from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
+                    terminal = execution_finite_error(
                         initialization_failure, cleanup_failure, retain_originals=True,
                         isolate_control_originals=True,
                     )
@@ -3169,7 +3241,7 @@ class AgentManager:
         if isinstance(rollback, _OwnedLifecycleOperation) and rollback.attempted:
             pending = RuntimeError("cannot commit host onboarding after rollback began")
             pending._kestrel_native_retirement_debts = ((rollback, rollback.admission.task),)
-            raise execution_terminal_error(
+            raise execution_finite_error(
                 rollback.failure, pending, retain_originals=True,
                 isolate_control_originals=True,
             )
@@ -3451,7 +3523,7 @@ class AgentManager:
                 withdrawals.extend(error for error in _explicit_control_chain(cleanup_failure)
                                    if isinstance(error, asyncio.CancelledError)
                                    and all(error is not prior for prior in withdrawals))
-            control = execution_terminal_error(
+            control = execution_finite_error(
                 control, cleanup_failure, retain_originals=True,
                 isolate_control_originals=True,
             )
@@ -3470,7 +3542,7 @@ class AgentManager:
             raise control
         if cancelled:
             if withdrawals:
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     *withdrawals, control, retain_originals=True,
                     prefer_cancellation=True, isolate_control_originals=True,
                 )
@@ -5058,7 +5130,7 @@ class AgentManager:
                 task, withdrawals=withdrawals,
             )
             if failure is not None and is_execution_control_error(failure):
-                raise execution_terminal_error(failure)
+                raise execution_finite_error(failure)
             if isinstance(failure, asyncio.CancelledError):
                 # Ready hooks are best-effort after publication. A compatible
                 # agent can surface a hook-owned cancellation instead of
@@ -5179,7 +5251,7 @@ class AgentManager:
             withdrawals=observed,
         )
         if failure is not None:
-            raise execution_terminal_error(
+            raise execution_finite_error(
                 failure, *observed, retain_originals=True,
                 isolate_control_originals=True,
             )
@@ -5261,7 +5333,7 @@ class AgentManager:
             if cleanup_failure is not None:
                 outcomes.append(cleanup_failure)
             if any(is_execution_control_error(error) for error in outcomes):
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     *outcomes, retain_originals=True,
                     isolate_control_originals=True,
                 )
@@ -6239,7 +6311,7 @@ class AgentManager:
             except BaseException as error:
                 task_cancelled, failure = False, error
             cancelled = cancelled or task_cancelled
-            control = execution_terminal_error(control, failure)
+            control = execution_finite_error(control, failure)
             if failure is None:
                 continue
             if isinstance(failure, asyncio.CancelledError):
@@ -6267,7 +6339,7 @@ class AgentManager:
                 await self._release_agent_operation(admission)
             except BaseException as error:
                 (withdrawals if isinstance(error, asyncio.CancelledError) else failures).append(error)
-        terminal = execution_terminal_error(
+        terminal = execution_finite_error(
             *failures, *withdrawals, retain_originals=True,
             isolate_control_originals=True,
         )
@@ -6311,7 +6383,7 @@ class AgentManager:
             failures.append(error)
         except BaseException as error:
             failures.append(error)
-        terminal = execution_terminal_error(
+        terminal = execution_finite_error(
             *failures, retain_originals=True, isolate_control_originals=True,
         )
         if terminal is not None and (is_execution_control_error(terminal)
@@ -6548,7 +6620,7 @@ class AgentManager:
                                 [registration_failure, rollback_failure],
                             )
                         if rollback_cancelled:
-                            raise execution_terminal_error(registration_failure, asyncio.CancelledError())
+                            raise execution_finite_error(registration_failure, asyncio.CancelledError())
                         raise
                     committed = True
                     admission.published = True
@@ -6618,12 +6690,12 @@ class AgentManager:
                                     )
                                 )
                             except BaseException as cleanup_failure:
-                                raise execution_terminal_error(
+                                raise execution_finite_error(
                                     onboarding_failure, cleanup_failure,
                                     retain_originals=True, isolate_control_originals=True,
                                 )
                             if cleanup_cancelled or rollback_cancelled:
-                                raise execution_terminal_error(
+                                raise execution_finite_error(
                                     onboarding_failure, asyncio.CancelledError(),
                                     retain_originals=True, isolate_control_originals=True,
                                 )
@@ -6656,7 +6728,7 @@ class AgentManager:
                     # Name-release refusal is independent terminal evidence;
                     # it cannot replace the opening/rollback originals which
                     # made that exact candidate unsafe to release.
-                    raise execution_terminal_error(
+                    raise execution_finite_error(
                         original_failure, release_failure, retain_originals=True,
                         isolate_control_originals=True,
                     )
@@ -6665,7 +6737,7 @@ class AgentManager:
                 # handoff that the caller may never persist. The admission is
                 # now terminal, so retain the successful return instead.
                 if release_cancelled and not admission.published:
-                    raise execution_terminal_error(original_failure, release_cancelled,
+                    raise execution_finite_error(original_failure, release_cancelled,
                         retain_originals=True, prefer_cancellation=True,
                         isolate_control_originals=True)
 
@@ -7447,7 +7519,7 @@ class AgentManager:
                         try:
                             await self._discard_unpublished_initialized_agents([(name, initialized)])
                         except BaseException as cleanup_failure:
-                            raise execution_terminal_error(
+                            raise execution_finite_error(
                                 staging_failure, cleanup_failure, retain_originals=True,
                                 isolate_control_originals=True,
                             )
@@ -7475,7 +7547,7 @@ class AgentManager:
                     )
                     physical = owned_task_error(initializer)
                     if outcome.cancellation is not None or outcome.error is not physical:
-                        raise execution_terminal_error(
+                        raise execution_finite_error(
                             outcome.error, outcome.cancellation, retain_originals=True,
                             isolate_control_originals=True,
                         )
@@ -7521,7 +7593,7 @@ class AgentManager:
                 settled = []
                 for initializer in init_tasks:
                     outcome = await await_owned_task(initializer)
-                    initial_failure = execution_terminal_error(
+                    initial_failure = execution_finite_error(
                         initial_failure, outcome.error, outcome.cancellation, retain_originals=True,
                         isolate_control_originals=True)
                     physical = owned_task_error(initializer)
@@ -7536,14 +7608,14 @@ class AgentManager:
                         await self._discard_unpublished_initialized_agents(initialized)
                     )
                 except BaseException as cleanup_failure:
-                    terminal = execution_terminal_error(
+                    terminal = execution_finite_error(
                         initial_failure, *(
                             result for result in settled if isinstance(result, BaseException)
                         ), cleanup_failure,
                         retain_originals=True, prefer_cancellation=True, isolate_control_originals=True,
                     )
                     raise terminal
-                terminal = execution_terminal_error(initial_failure, *(
+                terminal = execution_finite_error(initial_failure, *(
                     result for result in settled if isinstance(result, BaseException)
                 ), retain_originals=True, prefer_cancellation=True, isolate_control_originals=True)
                 raise terminal
@@ -7568,11 +7640,11 @@ class AgentManager:
                         await self._discard_unpublished_initialized_agents(initialized)
                     )
                 except BaseException as cleanup_failure:
-                    terminal = execution_terminal_error(fatal, *(
+                    terminal = execution_finite_error(fatal, *(
                         result for result in results if isinstance(result, BaseException)
                     ), cleanup_failure, retain_originals=True, prefer_cancellation=True, isolate_control_originals=True)
                     raise terminal
-                terminal = execution_terminal_error(fatal, *(
+                terminal = execution_finite_error(fatal, *(
                     result for result in results if isinstance(result, BaseException)
                 ), retain_originals=True, prefer_cancellation=True, isolate_control_originals=True)
                 raise terminal
@@ -7677,7 +7749,7 @@ class AgentManager:
                                 )
                                 self._withdraw_initialized_agent(name, result)
                                 withdrawn_after_onboarding_failure = True
-                                terminal = execution_terminal_error(registration_failure, rollback_failure)
+                                terminal = execution_finite_error(registration_failure, rollback_failure)
                                 if terminal is not None and is_execution_control_error(terminal):
                                     raise terminal
                                 if rollback_failure is not None:
@@ -7719,7 +7791,7 @@ class AgentManager:
                                 )
                             except BaseException as error:
                                 cleanup_failure = error
-                        terminal = execution_terminal_error(
+                        terminal = execution_finite_error(
                             onboarding_failure, cleanup_failure, retain_originals=True,
                             prefer_cancellation=True, isolate_control_originals=True,
                         )
@@ -7730,7 +7802,7 @@ class AgentManager:
                             or cleanup_cancelled
                             or isinstance(cleanup_failure, asyncio.CancelledError)
                         ):
-                            raise execution_terminal_error(onboarding_failure, cleanup_failure,
+                            raise execution_finite_error(onboarding_failure, cleanup_failure,
                                 retain_originals=True, prefer_cancellation=True,
                                 isolate_control_originals=True)
                         if cleanup_failure is not None:
@@ -7782,7 +7854,7 @@ class AgentManager:
                         )
                     except BaseException as error:
                         cleanup_failure = error
-                terminal = execution_terminal_error(
+                terminal = execution_finite_error(
                     publication_failure, cleanup_failure, retain_originals=True,
                     prefer_cancellation=True, isolate_control_originals=True,
                 )
@@ -7793,7 +7865,7 @@ class AgentManager:
                     or cleanup_cancelled
                     or isinstance(cleanup_failure, asyncio.CancelledError)
                 ):
-                    raise execution_terminal_error(publication_failure, cleanup_failure,
+                    raise execution_finite_error(publication_failure, cleanup_failure,
                         retain_originals=True, prefer_cancellation=True,
                         isolate_control_originals=True)
                 if cleanup_failure is not None:
@@ -7821,7 +7893,7 @@ class AgentManager:
                 )
             except BaseException as error:
                 release_failure = error
-            terminal = execution_terminal_error(
+            terminal = execution_finite_error(
                 batch_failure, release_failure, release_cancelled or None,
                 *batch_withdrawals, retain_originals=True,
                 prefer_cancellation=True, isolate_control_originals=True,
@@ -8416,6 +8488,8 @@ class AgentManager:
         if len(outcomes) == 1:
             raise outcomes[0]
         if outcomes:
+            if any(is_execution_control_error(error) for error in outcomes):
+                raise execution_finite_error(*outcomes)
             raise BaseExceptionGroup(
                 "Agent removal had multiple terminal outcomes", outcomes
             )
@@ -8637,7 +8711,7 @@ class AgentManager:
                                     withdrawals=withdrawals,
                                 )
                             )
-                            terminal = execution_terminal_error(
+                            terminal = execution_finite_error(
                                 *withdrawals, retain_originals=True,
                                 isolate_control_originals=True,
                             )
@@ -8794,7 +8868,7 @@ class AgentManager:
                 withdrawals=withdrawals,
             )
         )
-        terminal = execution_terminal_error(
+        terminal = execution_finite_error(
             *withdrawals, retain_originals=True, isolate_control_originals=True,
         )
         if terminal is not None:
@@ -8840,12 +8914,12 @@ class AgentManager:
                 shutdown_reaper, withdrawals=withdrawals,
             )
             if failure is not None:
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     failure, *withdrawals, retain_originals=True,
                     isolate_control_originals=True,
                 )
             if withdrawals:
-                raise execution_terminal_error(*withdrawals, retain_originals=True)
+                raise execution_finite_error(*withdrawals, retain_originals=True)
             if offboard_runtime:
                 (
                     cleanup_cancelled,
@@ -8854,12 +8928,12 @@ class AgentManager:
                     agent, withdrawals=withdrawals,
                 )
                 if cleanup_failure is not None:
-                    raise execution_terminal_error(
+                    raise execution_finite_error(
                         cleanup_failure, *withdrawals, retain_originals=True,
                         isolate_control_originals=True,
                     )
                 if withdrawals:
-                    raise execution_terminal_error(*withdrawals, retain_originals=True)
+                    raise execution_finite_error(*withdrawals, retain_originals=True)
                 if retire_persistent_registration:
                     agent_id = _loaded_agent_did(agent)
                     if isinstance(agent_id, str) and agent_id:
@@ -9181,7 +9255,7 @@ class AgentManager:
                 RuntimeError("runtime offboarding continues after cancellation"),
                 cleanup_pending=True,
             )
-            return True, execution_terminal_error(
+            return True, execution_finite_error(
                 pending, withdrawal,
                 retain_originals=True, isolate_control_originals=True,
             )
@@ -9258,8 +9332,7 @@ class AgentManager:
             record.completed_monotonic = time.monotonic()
             failure = owned_task_error(task)
             if failure is not None and is_execution_control_error(failure):
-                from kestrel_sovereign.execution_custody import execution_native_source_error
-                self._quarantined_shutdown_control = execution_native_source_error(
+                self._quarantined_shutdown_control = _merge_manager_cleanup_control(
                     self._quarantined_shutdown_control, failure,
                 )
             if task.cancelled():
@@ -9569,7 +9642,7 @@ class AgentManager:
         except BaseException as error:
             control = vars(self).get("_quarantined_shutdown_control")
             if control is not None or is_execution_control_error(error):
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     control, error, *withdrawals, retain_originals=True,
                     isolate_control_originals=True,
                 )
@@ -9850,7 +9923,7 @@ class AgentManager:
         # value so callers can choose when to re-raise cancellation themselves.
         control = vars(self).get("_quarantined_shutdown_control")
         if control is not None:
-            raise execution_terminal_error(
+            raise execution_finite_error(
                 control, *refund_withdrawals, *failures,
                 retain_originals=bool(refund_withdrawals),
                 isolate_control_originals=bool(refund_withdrawals),
@@ -10002,7 +10075,7 @@ class AgentManager:
                     if not _is_lifecycle_terminal_outcome(error):
                         raise
                     reconciliation_failure = error
-                terminal = execution_terminal_error(
+                terminal = execution_finite_error(
                     release_failure, reconciliation_failure,
                     unpublished_offboarding_failure, *reconciliation_withdrawals,
                     retain_originals=True,
@@ -10155,7 +10228,7 @@ class AgentManager:
                         if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
                             raise
                         if removal_withdrawals:
-                            raise execution_terminal_error(
+                            raise execution_finite_error(
                                 terminal, *removal_withdrawals, retain_originals=True,
                                 prefer_cancellation=True, isolate_control_originals=True,
                             )
@@ -10178,7 +10251,7 @@ class AgentManager:
                         if is_execution_control_error(terminal) or not isinstance(terminal, Exception):
                             raise
                         if removal_withdrawals:
-                            raise execution_terminal_error(
+                            raise execution_finite_error(
                                 terminal, *removal_withdrawals, retain_originals=True,
                                 prefer_cancellation=True, isolate_control_originals=True,
                             )
@@ -10327,7 +10400,7 @@ class AgentManager:
             if handoff_offboarding_pending is not None:
                 terminal_outcomes.append(handoff_offboarding_pending)
             if reconciliation_withdrawals:
-                terminal = execution_terminal_error(
+                terminal = execution_finite_error(
                     *terminal_outcomes, retain_originals=True,
                     prefer_cancellation=True, isolate_control_originals=True,
                 )
@@ -10343,7 +10416,7 @@ class AgentManager:
             # SAME finite removal observer, including later admission refusal.
             # Never attach caller-private cancellation to the shared latch.
             if removal_withdrawals:
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     error, *removal_withdrawals, retain_originals=True,
                     prefer_cancellation=True, isolate_control_originals=True,
                 )
@@ -10610,7 +10683,7 @@ class AgentManager:
                 try:
                     release_cancelled = await self._release_agent_operations([admission])
                 except BaseException as release_failure:
-                    terminal = execution_terminal_error(creation_failure, release_failure,
+                    terminal = execution_finite_error(creation_failure, release_failure,
                         retain_originals=True, isolate_control_originals=True)
                     raise terminal
                 # ``load_agent`` records publication on this outer admission,
@@ -10618,7 +10691,7 @@ class AgentManager:
                 # turn that committed create into a false cancellation while
                 # merely retiring its now-terminal admission.
                 if release_cancelled and not admission.published:
-                    raise execution_terminal_error(creation_failure, release_cancelled,
+                    raise execution_finite_error(creation_failure, release_cancelled,
                         retain_originals=True, prefer_cancellation=True,
                         isolate_control_originals=True)
 
@@ -11117,8 +11190,7 @@ class AgentManager:
             # The existing terminal custody latch outlives public metadata
             # acknowledgement/eviction. A display record cannot settle an
             # original uncertain refund or retire its native evidence.
-            from kestrel_sovereign.execution_custody import execution_native_source_error
-            self._quarantined_shutdown_control = execution_native_source_error(
+            self._quarantined_shutdown_control = _merge_manager_cleanup_control(
                 self._quarantined_shutdown_control, failure,
             )
         unsafe = UnsafeRemovalBudgetReleaseFailure(
@@ -11222,11 +11294,11 @@ class AgentManager:
             except BaseException as failure:
                 cached = getattr(budget_release, "_kestrel_owned_terminal_error", None)
                 if budget_release.done():
-                    cached = execution_terminal_error(
+                    cached = execution_finite_error(
                         cached, owned_task_error(budget_release),
                         retain_originals=True, isolate_control_originals=True,
                     )
-                budget_release._kestrel_owned_terminal_error = execution_terminal_error(
+                budget_release._kestrel_owned_terminal_error = execution_finite_error(
                     cached,
                     failure, retain_originals=True, isolate_control_originals=True,
                 )
@@ -11264,7 +11336,7 @@ class AgentManager:
             except BaseException as failure:
                 # Existing asynchronous release/drain consumers still own and
                 # join the exact record even without the observer callback.
-                budget_release._kestrel_owned_terminal_error = execution_terminal_error(
+                budget_release._kestrel_owned_terminal_error = execution_finite_error(
                     getattr(budget_release, "_kestrel_owned_terminal_error", None),
                     failure, retain_originals=True, isolate_control_originals=True,
                 )
@@ -11283,7 +11355,7 @@ class AgentManager:
             if all(prior is not outcome.cancellation for prior in withdrawals):
                 withdrawals.append(outcome.cancellation)
         release_cancelled = release_cancelled or outcome.cancellation is not None
-        terminal = execution_terminal_error(
+        terminal = execution_finite_error(
             outcome.error, outcome.cancellation,
             self._quarantined_shutdown_control,
             *(withdrawals or ()),
@@ -11324,7 +11396,7 @@ class AgentManager:
             from kestrel_sovereign._async_ownership import owned_task_admission_error
             accepted = admission.task
             outcome = await await_owned_task(accepted) if accepted is not None else None
-            raise execution_terminal_error(
+            raise execution_finite_error(
                 owned_task_admission_error(resource, admission, opening), outcome.error if outcome is not None else None,
                 outcome.cancellation if outcome is not None else None,
                 retain_originals=True, isolate_control_originals=True,
@@ -11446,7 +11518,7 @@ class AgentManager:
             if release_failure is None or isinstance(release_failure, asyncio.CancelledError):
                 return outcome.result
         errors = (withdrawal, body_failure) if isinstance(body_failure, asyncio.CancelledError) else (body_failure, withdrawal)
-        terminal = execution_terminal_error(
+        terminal = execution_finite_error(
             opening, *errors, release_failure, retain_originals=True,
             prefer_cancellation=body_failure is None or isinstance(body_failure, asyncio.CancelledError),
             isolate_control_originals=True,
@@ -11545,7 +11617,7 @@ class AgentManager:
                 or not isinstance(release_failure, asyncio.CancelledError)
                 or (not admission.committed and not admission.rollback_incomplete)
             ):
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     body_failure, release_failure, retain_originals=True,
                     prefer_cancellation=isinstance(body_failure, asyncio.CancelledError),
                     isolate_control_originals=True,
@@ -11585,7 +11657,7 @@ class AgentManager:
                         or is_execution_control_error(release_failure)
                         or not isinstance(release_failure, asyncio.CancelledError)
                     ):
-                        raise execution_terminal_error(body_failure, release_failure,
+                        raise execution_finite_error(body_failure, release_failure,
                             retain_originals=True, prefer_cancellation=True,
                             isolate_control_originals=True)
 
@@ -12046,7 +12118,7 @@ class AgentManager:
                     if len(outcomes) == 1:
                         raise expiry_failure from spawn_failure
                     if any(is_execution_control_error(error) for error in outcomes):
-                        raise execution_terminal_error(
+                        raise execution_finite_error(
                             *outcomes, retain_originals=True,
                             isolate_control_originals=True,
                         )
@@ -12057,7 +12129,7 @@ class AgentManager:
                 if cleanup_withdrawal is not None or is_execution_control_error(
                     spawn_failure
                 ) or is_execution_control_error(cleanup_failure):
-                    raise execution_terminal_error(
+                    raise execution_finite_error(
                         spawn_failure, cleanup_withdrawal, cleanup_failure,
                         retain_originals=True, prefer_cancellation=True,
                         isolate_control_originals=True,
@@ -12267,7 +12339,7 @@ class AgentManager:
             debt = RuntimeError("original spawn rollback phase admission failed")
             debt.__cause__ = opening
             debt._kestrel_native_retirement_debts = ((admission, task),)
-        failure = execution_terminal_error(
+        failure = execution_finite_error(
             opening, outcome.error if outcome is not None else None, debt,
             retain_originals=True, isolate_control_originals=True,
         )
@@ -12312,11 +12384,11 @@ class AgentManager:
                         withdrawals.append(handoff)
                 except BaseException as error:
                     handoff_failure = error
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     failure, handoff_failure, *withdrawals, retain_originals=True,
                     isolate_control_originals=True,
                 )
-        return execution_terminal_error(
+        return execution_finite_error(
             *withdrawals, retain_originals=True, prefer_cancellation=True,
             isolate_control_originals=True,
         ) or False
@@ -12611,7 +12683,7 @@ class AgentManager:
             )
 
         def raise_failures(*failures):
-            terminal = execution_terminal_error(
+            terminal = execution_finite_error(
                 *failures, *withdrawals, retain_originals=True,
                 isolate_control_originals=True,
             )
@@ -12707,7 +12779,7 @@ class AgentManager:
             )
             if descendant_failure is not None:
                 raise_failures(descendant_failure)
-        return execution_terminal_error(
+        return execution_finite_error(
             *withdrawals, retain_originals=True, prefer_cancellation=True,
             isolate_control_originals=True,
         ) or False
@@ -12890,11 +12962,11 @@ class AgentManager:
                 debt = RuntimeError("original spawn cleanup publication failed")
                 debt.__cause__ = admission_failure
                 debt._kestrel_native_retirement_debts = ((admission, cleanup),)
-            raise execution_terminal_error(
+            raise execution_finite_error(
                 admission_failure, cleanup_failure, debt, *observed,
                 retain_originals=True, isolate_control_originals=True,
             )
-        return execution_terminal_error(
+        return execution_finite_error(
             *observed, retain_originals=True, prefer_cancellation=True,
             isolate_control_originals=True,
         ) or False
@@ -13412,7 +13484,7 @@ class AgentManager:
         )
         if failure is not None:
             if withdrawals:
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     failure, *withdrawals, retain_originals=True,
                     isolate_control_originals=True,
                 )
@@ -14875,7 +14947,7 @@ class AgentManager:
         except BaseException as error:
             control = vars(self).get("_quarantined_shutdown_control")
             if control is not None or is_execution_control_error(error):
-                raise execution_terminal_error(
+                raise execution_finite_error(
                     control, error, *withdrawals, retain_originals=True,
                     isolate_control_originals=True,
                 )
@@ -15251,10 +15323,10 @@ class AgentManager:
         else:
             logger.info("All agents shut down")
 
-        terminal = execution_terminal_error(*failures)
+        terminal = execution_finite_error(*failures, *(withdrawals or ()))
         if terminal is not None and is_execution_control_error(terminal):
             # Aggregate only after the complete fleet sweep, but preserve the
-            # original strongest native receipt rather than a new wrapper.
+            # original receipts without making one their metadata destination.
             raise terminal
         if cancelled and failures:
             raise BaseExceptionGroup(

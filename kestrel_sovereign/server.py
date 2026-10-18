@@ -35,7 +35,7 @@ from kestrel_sovereign.kestrel_agent import (
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners, retire_unpublished_llm
-from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
 from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
@@ -1993,10 +1993,10 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
         )
     except asyncio.CancelledError as error:
         cancelled = True
-        failure = execution_terminal_error(failure, error)
+        failure = execution_finite_error(failure, error)
         logger.debug("Agent shutdown cancelled")
     except BaseException as error:
-        failure = execution_terminal_error(failure, error)
+        failure = execution_finite_error(failure, error)
         logger.warning("Error during agent shutdown (%s)", type(error).__name__)
     cancelled = await await_agent_shutdown_completion(agent, prior_error=failure) or cancelled
     if cancelled:
@@ -2125,7 +2125,7 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
                 "Durable Stop startup cleanup also failed: "
                 f"{type(failure).__name__}: {failure}"
             )
-        terminal = execution_terminal_error(error, *cleanup_failures)
+        terminal = execution_finite_error(error, *cleanup_failures)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
         if not isinstance(error, (Exception, asyncio.CancelledError)):
@@ -2262,7 +2262,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
 
     phoenix = getattr(app.state, "phoenix", None)
     if phoenix is None:
-        terminal = execution_terminal_error(*failures, retain_originals=True)
+        terminal = execution_finite_error(*failures, retain_originals=True)
         if terminal is not None:
             raise terminal
         return cancelled
@@ -2284,7 +2284,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
                 RuntimeError("previous Phoenix supervisor must retire before replacement"),
                 tuple(original for original in (previous_supervisor or resource, phoenix) if original is not None),
             )
-            close_failure = execution_terminal_error(
+            close_failure = execution_finite_error(
                 close_failure, mismatch, retain_originals=True, isolate_control_originals=True,
             )
             raise close_failure
@@ -2314,7 +2314,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             if outcome.error is not None:
                 failures.append(outcome.error)
             physical = owned_task_error(close_task)
-            close_failure = execution_terminal_error(
+            close_failure = execution_finite_error(
                 close_failure, execution_native_source_error(physical) or physical,
                 retain_originals=True,
                 isolate_control_originals=True,
@@ -2326,7 +2326,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
                 debt = RuntimeError("original Phoenix proxy retirement failed")
                 debt.__cause__ = execution_native_source_error(close_failure) or close_failure
                 debt._kestrel_native_retirement_debts = ((resource, close_task),)
-                close_failure = execution_terminal_error(
+                close_failure = execution_finite_error(
                     close_failure, debt, retain_originals=True, isolate_control_originals=True,
                 )
             app.state.phoenix_proxy_close_error = close_failure
@@ -2340,7 +2340,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             debt = RuntimeError("original Phoenix process stop failed")
             debt.__cause__ = execution_native_source_error(error) or error
             debt._kestrel_native_retirement_debts = ((phoenix, asyncio.current_task()),)
-            stop_failure = execution_terminal_error(
+            stop_failure = execution_finite_error(
                 error, debt, retain_originals=True, isolate_control_originals=True,
             )
             failures.append(stop_failure)
@@ -2350,7 +2350,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             app.state.phoenix_proxy_close_resource = None
             app.state.phoenix_proxy_close_supervisor = None
 
-    terminal = execution_terminal_error(
+    terminal = execution_finite_error(
         *failures, *(withdrawals if failures else ()),
         retain_originals=True, isolate_control_originals=True,
     )
@@ -2380,12 +2380,12 @@ async def _shutdown_host_features(app: FastAPI) -> None:
         try:
             unmount(app)
         except BaseException as exc:
-            failure = execution_terminal_error(failure, exc, retain_originals=True)
+            failure = execution_finite_error(failure, exc, retain_originals=True)
     if host_context is not None:
         try:
             await _hf.close_host_context(host_context)
         except BaseException as exc:
-            failure = execution_terminal_error(failure, exc, retain_originals=True)
+            failure = execution_finite_error(failure, exc, retain_originals=True)
     if failure is not None:
         raise failure
     if getattr(app.state, "host_context", None) is host_context:
@@ -2469,7 +2469,7 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
                 "Shared PostgreSQL startup cleanup also failed: "
                 f"{type(cleanup_failure).__name__}"
             )
-        terminal = execution_terminal_error(startup_failure, cleanup_failure, cleanup_withdrawal,
+        terminal = execution_finite_error(startup_failure, cleanup_failure, cleanup_withdrawal,
                                            retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
@@ -2601,7 +2601,7 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
             "host_scheduler_protocol_preflight_close", storage.close,
             resources=(storage,),
         )
-        terminal = execution_terminal_error(preflight_failure, close_failure, close_withdrawal,
+        terminal = execution_finite_error(preflight_failure, close_failure, close_withdrawal,
                                            retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
@@ -2789,7 +2789,7 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
                     cleanup_failure.__traceback__,
                 ),
             )
-        terminal = execution_terminal_error(startup_failure, cleanup_failure, cleanup_withdrawal,
+        terminal = execution_finite_error(startup_failure, cleanup_failure, cleanup_withdrawal,
                                            retain_originals=True, isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
@@ -2836,7 +2836,7 @@ async def _shutdown_host_scheduler(app: FastAPI) -> None:
         else:
             if getattr(app.state, attribute, None) is resource:
                 setattr(app.state, attribute, None)
-    terminal = execution_terminal_error(
+    terminal = execution_finite_error(
         *failures, retain_originals=True, prefer_cancellation=True,
     )
     if terminal is not None:
@@ -2878,7 +2878,7 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
             else:
                 if getattr(app.state, attribute, None) is agent:
                     setattr(app.state, attribute, None)
-    terminal = execution_terminal_error(*failures)
+    terminal = execution_finite_error(*failures)
     if terminal is not None:
         raise terminal
 
@@ -2914,7 +2914,7 @@ async def _rollback_startup_agent_manager(
     )
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
-    terminal = execution_terminal_error(
+    terminal = execution_finite_error(
         original_failure, failure, withdrawal, retain_originals=True,
         prefer_cancellation=True, isolate_control_originals=True,
     )
@@ -2976,7 +2976,7 @@ async def _run_lifespan_shutdown_phase(
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
     if failure_cancelled:
-        withdrawal = execution_terminal_error(
+        withdrawal = execution_finite_error(
             withdrawal, original_phase_failure, retain_originals=True,
             prefer_cancellation=True, isolate_control_originals=True,
         )
@@ -3045,7 +3045,7 @@ def _lifespan_shutdown_phase_resources(app: FastAPI, name: str | None = None) ->
 
 def _require_retired_server_resources(app: FastAPI) -> None:
     """Reject a new lifespan BEFORE any old ownership field can be reset."""
-    previous = execution_terminal_error(
+    previous = execution_finite_error(
         getattr(app.state, "_lifespan_teardown_error", None),
         getattr(app.state, "phoenix_proxy_close_error", None), retain_originals=True,
     )
@@ -3059,7 +3059,7 @@ async def _shutdown_server_resources(
     app: FastAPI, *, original_failure: BaseException | None = None,
 ) -> tuple[bool, BaseException | None]:
     """Drain every server-owned teardown phase before reporting an outcome."""
-    from kestrel_sovereign.execution_custody import execution_terminal_error
+    from kestrel_sovereign.execution_custody import execution_finite_error
     logger.info("Server shutting down...")
     cancelled = False
     first_failure: BaseException | None = None
@@ -3131,11 +3131,11 @@ async def _shutdown_server_resources(
             cancelled = True
         if failure is not None:
             failed_phases.add(name)
-            first_failure = execution_terminal_error(first_failure, failure, retain_originals=True,
+            first_failure = execution_finite_error(first_failure, failure, retain_originals=True,
                                                      isolate_control_originals=True)
 
     if any(is_execution_control_error(error) for error in (original_failure, first_failure)):
-        first_failure = execution_terminal_error(
+        first_failure = execution_finite_error(
             first_failure, *withdrawals, retain_originals=True,
             isolate_control_originals=True,
         )
@@ -3154,8 +3154,8 @@ async def _lifespan_teardown_owner(app: FastAPI):
         raise
     finally:
         cancelled, teardown_failure = await _shutdown_server_resources(app, original_failure=body_failure)
-        from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
-        terminal = execution_terminal_error(body_failure, teardown_failure, retain_originals=True,
+        from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
+        terminal = execution_finite_error(body_failure, teardown_failure, retain_originals=True,
                                            isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
             raise terminal
@@ -3717,7 +3717,7 @@ async def _lifespan_startup(app: FastAPI):
                 except BaseException as error:
                     rollback_failure = error
                 rollback_complete = not manager.list_agents()
-            terminal = execution_terminal_error(
+            terminal = execution_finite_error(
                 e, rollback_failure, retain_originals=True,
                 isolate_control_originals=True,
             )
@@ -3856,7 +3856,7 @@ async def _lifespan_startup(app: FastAPI):
                 except BaseException as error:
                     close_error = error
                 if close_error is not None:
-                    terminal = execution_terminal_error(e, close_error)
+                    terminal = execution_finite_error(e, close_error)
                     if terminal is not None and is_execution_control_error(terminal):
                         raise terminal
                     if isinstance(close_error, asyncio.CancelledError):
@@ -4048,7 +4048,7 @@ async def _lifespan_startup(app: FastAPI):
         if fatal or len(failures) > 1:
             # Complete prospective-set rejection is a startup failure, not an
             # optional-feature warning. Prior valid state remains visible.
-            raise execution_terminal_error(*failures, retain_originals=True)
+            raise execution_finite_error(*failures, retain_originals=True)
 
     # No cognition turn may cross startup with the agent-only clause view.
     # This includes overdue standalone schedules armed from on_agent_ready and

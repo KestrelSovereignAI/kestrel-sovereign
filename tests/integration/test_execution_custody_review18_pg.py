@@ -16,6 +16,7 @@ from tests.integration.test_execution_authority_postgres import GenerationFence,
 from tests.integration.test_execution_custody_review13_pg import _seed_owned_deliveries
 from tests.unit.test_durable_signal_delivery import _Agent, _channel_signal, _registration
 from tests.unit.test_execution_custody_review15 import control_error
+from tests.utils.original_failure import OriginalFailure
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg
@@ -69,6 +70,7 @@ async def test_native_failure_receipt_control_settles_or_retains_exact_delivery(
     agent, dispatcher, delivery, signal = await setup_delivery(native_pg)
     foreign_before = await controller.fetchrow("SELECT * FROM durable_signal_deliveries WHERE delivery_id='delivery2'")
     error = control_error(control, carrier)
+    source = OriginalFailure.capture(error)
     dispatcher._route_after_durable_persistence = AsyncMock(return_value=SignalResult(
         signal_id=signal.id, status=Status.FAILED, mode=signal.mode, duration_ms=0, error="ordinary failed cognition",
     ))
@@ -90,7 +92,7 @@ async def test_native_failure_receipt_control_settles_or_retains_exact_delivery(
     try:
         with pytest.raises(BaseException) as caught:
             await route(dispatcher, delivery, signal)
-        assert caught.value is error
+        source.assert_retained(caught.value)
         state = await controller.fetchval("SELECT status FROM durable_signal_deliveries WHERE delivery_id='delivery1'")
         # The exact original retry capability now survives a committed NACK,
         # so fixed cleanup can settle it without granting ordinary authority.
@@ -115,6 +117,7 @@ async def test_native_renewal_control_survives_cooperative_or_retained_cognition
     agent, dispatcher, delivery, signal = await setup_delivery(native_pg)
     delivery = replace(delivery, lease_expires_at=datetime.now(timezone.utc)+timedelta(seconds=0.03))
     error = control_error(control, carrier)
+    source = OriginalFailure.capture(error)
     entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     renewing = asyncio.Event()
     scope = ExecutionCustody(GenerationFence())
@@ -154,7 +157,7 @@ async def test_native_renewal_control_survives_cooperative_or_retained_cognition
             # The external test watchdog bounds the whole case without
             # injecting a new cancellation into the owner under observation.
             await route(dispatcher, delivery, signal)
-        assert caught.value is error
+        source.assert_retained(caught.value)
         assert cancelled.is_set() is (not late_commit)
         if stubborn and not late_commit:
             assert dispatcher._retained_cognition_control_debt == {delivery.delivery_id: (delivery, error)}

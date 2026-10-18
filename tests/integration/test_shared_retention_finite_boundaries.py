@@ -77,7 +77,7 @@ async def test_manager_independent_completion_sources_do_not_mutate_each_other(
     admission = OwnedTaskAdmission()
     refused = OSError("actual native closer factory refused")
     fault = NativeAdmissionFault(lambda op: getattr(op, "cr_code", None) is SQLiteBackend.close.__code__, refused, "refuse")
-    tasks = []
+    tasks, finite = [], []
     try:
         with fault:
             try:
@@ -97,11 +97,13 @@ async def test_manager_independent_completion_sources_do_not_mutate_each_other(
                 task = create_owned_task(cleanup(), retain_originals=True)
                 manager._retain_quarantined_cleanup(name="source-completion-" + str(index), agent_id="component-native", task=task)
             tasks.append(task)
-            await await_owned_task(task)
+            finite.append((await await_owned_task(task)).error)
             await asyncio.sleep(0)
         shared = manager._quarantined_shutdown_control
         source.assert_retained(shared)
-        debt_snapshot.assert_retained(shared)
+        debt_snapshot.assert_retained(finite[-1])
+        from kestrel_sovereign.execution_custody import execution_cleanup_debts
+        assert any(value is resource and task is None for value, task in execution_cleanup_debts(shared))
         source.assert_retained(source.error)
         debt_snapshot.assert_retained(debt_snapshot.error)
         assert admission.task is None and resource._connection is not None and worker.is_alive()

@@ -178,9 +178,11 @@ async def test_native_outcome_writer_control_is_not_discarded(
 @pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group"])
 @pytest.mark.parametrize("cancel_parent", [False, True])
 async def test_monitor_withdrawal_physically_joins_native_worker_receipt(
-    dispatcher_components, tmp_path, kind, cancel_parent,
+    dispatcher_components, tmp_path, monkeypatch, kind, cancel_parent,
 ):
     from kestrel_sdk.signals import SignalMode
+    from kestrel_sovereign import _async_ownership as ownership
+    from tests.utils.original_failure import OriginalFailure
     c = dispatcher_components
     template = tmp_path / "monitor.md"
     template.write_text("payload: {payload}")
@@ -188,6 +190,15 @@ async def test_monitor_withdrawal_physically_joins_native_worker_receipt(
     await c.backend.execute("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
     entered, cancellation_seen, release = (asyncio.Event() for _ in range(3))
     original = receipt(kind)
+    source = OriginalFailure.capture(original)
+    withdrawals, task = [], None
+    actual_join = ownership.await_owned_task
+    async def observe(owner, *args, **kwargs):
+        result = await actual_join(owner, *args, **kwargs)
+        if asyncio.current_task() is task and result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+    monkeypatch.setattr(ownership, "await_owned_task", observe)
     async def execute(_prompt):
         entered.set()
         try:
@@ -217,7 +228,11 @@ async def test_monitor_withdrawal_physically_joins_native_worker_receipt(
         assert not task.done(), "withdrawal released a live native worker"
         release.set()
         outcome = await await_owned_task(task)
-        assert outcome.error is original, "withdrawal replaced the native commit receipt"
+        source.assert_retained(outcome.error)
+        if cancel_parent:
+            assert withdrawals and all(value in tuple(_explicit_control_chain(outcome.error)) for value in withdrawals)
+        else:
+            assert outcome.error is original
         rows = await c.backend.fetch_all("SELECT COUNT(*) AS n FROM effects")
         assert rows[0][0] == 1
     finally:
