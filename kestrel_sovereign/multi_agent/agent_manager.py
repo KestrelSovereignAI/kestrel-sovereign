@@ -10142,6 +10142,13 @@ class AgentManager:
         # collected. A successful join retains the established ``True`` return
         # value so callers can choose when to re-raise cancellation themselves.
         control = vars(self).get("_quarantined_shutdown_control")
+        if any(not _is_lifecycle_terminal_outcome(error)
+               for error in (*join_originals, *boundary_errors)):
+            # Independent joins finish before process-control propagation, but
+            # sanitizing diagnostics must not demote the original control.
+            raise execution_observation_error(
+                control, *join_originals, *boundary_errors, *refund_withdrawals, *failures,
+            )
         if any(is_execution_control_error(error) for error in (control, *join_originals, *boundary_errors)):
             raise execution_finite_error(
                 control, *join_originals, *boundary_errors, *refund_withdrawals, *failures,
@@ -13655,6 +13662,13 @@ class AgentManager:
                 )
                 return False, cancelled
 
+        control = vars(self).get("_quarantined_shutdown_control")
+        if (is_execution_control_error(control)
+            and self._quarantined_cleanup_name_is_reserved(retained_name)):
+            # Completed sources may predate this reader's first snapshot.
+            # Preserve the existing bounded private conservative witness;
+            # do not reconstruct completed Task/traceback history.
+            raise execution_observation_error(control, *originals, *withdrawals)
         reconciliation = asyncio.create_task(
             self._prune_child_tracking_if_fully_removed(parent_did, child_name),
             name=f"ttl_termination_reconcile:{child_name}",

@@ -398,3 +398,18 @@ evidence beside the later reader failure and does not finalize the child.
 Finite composition keeps a representative of every explicit graph component,
 including mutually enclosing cycles beside independent errors; it does not
 rewrite originals or grow a repeated-observation history.
+
+The same guarantee reaches the actual live and cold TTL Task, not only its
+inner termination helper. Native uncertainty escapes that exact timer without
+starting an ambiguous replacement retry, and its original terminal carrier is
+available to both callback and direct readers. Ordinary availability retries
+remain separate. Cold retirement uses receipt-backed admission and joins the
+accepted original before reporting a failed publication or actual withdrawal.
+An already-harvested child reader consults the existing bounded private native
+summary rather than rebuilding completed Task history. A successful manager
+call followed by an unsafe reader refusal still reports actual caller
+withdrawal. Finalization keeps earlier originals through settlement, hook and
+bookkeeping failures; unresolved settlement never publishes completion. Native
+groups remain whole during the lifecycle's own child sweep. Independent drain
+joins finish before an unexpected process-control original is surfaced without
+demoting it into ordinary availability diagnostics.
