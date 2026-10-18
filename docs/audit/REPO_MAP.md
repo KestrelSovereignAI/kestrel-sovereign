@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-18
-**Scope:** 3133 tracked files (2327 `.py`, 357 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3135 tracked files (2328 `.py`, 358 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2153,6 +2153,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.47.0.md** — v0.47.0 — Fail-Closed Constitution Integrity — > **⚠️ Read this BEFORE upgrading a deployment from ≤ 0.46.2.** This release ships fail-closed constitution integrity enforcement.
 - **docs/releases/v0.53.27.md** — Core 0.53.27 — Named `kestrel start <name>` launches now direct child output to the agent's append-only log file.
 - **docs/releases/v0.53.28.md** — Core 0.53.28 — Hosted execution custody — Status: unreleased; review and full release gates remain required.
+- **docs/releases/v0.53.31.md** — Core 0.53.31 — Private native HTTP admission — Status: candidate; publication and artifact verification remain required.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
@@ -2725,6 +2726,8 @@ Repo entry points and standard project files.
   - `async def test_original_scheduler_stop_and_failed_storage_close_preserve_both_owners(native_pg, tmp_path, monkeypatch, refuse_storage)`
 - **tests/integration/test_host_startup_rollback_publication.py** — Actual empty-host startup must not publish after unsafe contribution rollback.
   - `async def test_actual_host_startup_rejects_retained_declarative_failure(tmp_path, monkeypatch)`
+- **tests/integration/test_http_private_request_admission.py** — Request extensions describe transport state; they never grant authority.
+  - `async def test_request_observer_cannot_replace_private_native_admission(tmp_path, http, mutation)`
 - **tests/integration/test_identity_export_import.py** — Integration tests for Identity Export/Import functionality.
   - `async def test_db()`; `async def populated_db(test_db)`; `class TestIdentityExporter`; `class TestIdentityImporter`; `class TestExportImportRoundTrip`
 - **tests/integration/test_identity_import_atomicity.py** — Atomic, exact identity replace contracts for SQLite and PostgreSQL.
