@@ -362,7 +362,8 @@ def execution_native_source_error(*errors: BaseException | None) -> BaseExceptio
                                     isolate_control_originals=True)
 
 
-def execution_observation_error(*errors: BaseException | None) -> BaseException | None:
+def execution_observation_error(*errors: BaseException | None,
+                                message: str = "original completion observation evidence") -> BaseException | None:
     """Compose a Core-owned join without making observers genuine sources.
 
     A fresh group preserves even ordinary physical errors without decorating
@@ -379,9 +380,17 @@ def execution_observation_error(*errors: BaseException | None) -> BaseException 
         for source in _native_source_originals(error):
             if all(source is not prior for prior in sources):
                 sources.append(source)
+    # Re-observing an already enclosing carrier is not another independent
+    # failure. Keep that exact original envelope rather than growing wrapper
+    # history or converting a sole typed outcome into a duplicate group.
+    enclosing = [error for error in present if not any(
+        parent is not error and any(error is member for member in _explicit_control_chain(parent))
+        for parent in present
+    )]
+    present = enclosing or present[:1]
     if len(present) < 2:
         return present[0] if present else None
-    terminal = BaseExceptionGroup("original completion observation evidence", present)
+    terminal = BaseExceptionGroup(message, present)
     terminal._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, tuple(sources))
     return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
 

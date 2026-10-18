@@ -647,10 +647,16 @@ async def await_agent_shutdown_completion(
     observed = withdrawals if withdrawals is not None else []
     async def join_original(task):
         nonlocal cancelled
-        join_cancelled, failure = await await_lifecycle_task_completion(task, withdrawals=observed)
-        cancelled = cancelled or join_cancelled
-        if failure is not None:
-            errors.append(failure)
+        try:
+            join_cancelled, failure = await await_lifecycle_task_completion(task, withdrawals=observed)
+        except BaseException as error:
+            # An unexpected control leaf is terminal evidence, not permission
+            # to skip independent owners or discard an earlier admission error.
+            errors.append(error)
+        else:
+            cancelled = cancelled or join_cancelled
+            if failure is not None:
+                errors.append(failure)
     waiter = getattr(agent, "wait_for_shutdown_completion", None)
     if callable(waiter):
         admission, task, creation_failed = OwnedTaskAdmission(), None, False

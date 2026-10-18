@@ -9,6 +9,7 @@ from kestrel_sovereign.execution_custody import (
     AcknowledgedExecutionCommit, ExecutionAuthorityError, ExecutionCommitOutcomeError,
     _explicit_control_chain, execution_cleanup_debts, execution_commit_outcome,
     execution_denial_scopes, execution_finite_error, execution_native_source_error,
+    execution_observation_error,
 )
 from kestrel_sovereign.multi_agent.agent_manager import _merge_manager_cleanup_control
 from tests.utils.original_failure import OriginalFailure
@@ -58,6 +59,16 @@ def test_finite_nonnative_caused_cancellation_keeps_generic_default(retain):
     error, ordinary = asyncio.CancelledError("ordinary source"), ValueError("ordinary source cause")
     error.__cause__ = ordinary
     assert execution_finite_error(error, retain_originals=retain) is (error if retain else ordinary)
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "denied", "unknown", "source-cancel", "source-group"])
+def test_observation_of_already_enclosing_original_does_not_add_envelope_history(kind):
+    original = OriginalFailure.capture(OSError("original ordinary error") if kind == "ordinary" else source(kind))
+    sibling = OriginalFailure.capture(ValueError("independent original sibling"))
+    enclosing = execution_observation_error(original.error, sibling.error)
+    assert execution_observation_error(enclosing, original.error, sibling.error) is enclosing
+    original.assert_retained(enclosing)
+    sibling.assert_retained(enclosing)
 
 
 def test_all_three_lifecycle_consumers_use_explicit_finite_policy():

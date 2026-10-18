@@ -10579,8 +10579,15 @@ class TestAgentManagerBasics:
             runtime_path=Path("operator/runtime/tenant"),
             cause=IsolatedRuntimeNamespaceError("foreign owner"),
         )
+        async def actual_withdrawal():
+            asyncio.current_task().cancel("actual administrative observer withdrew")
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError as original:
+                return original
+        withdrawal = await asyncio.create_task(actual_withdrawal())
         manager._finish_agent_runtime_offboarding = AsyncMock(
-            return_value=(True, retained)
+            return_value=(True, BaseExceptionGroup("original administrative outcome", [withdrawal, retained]))
         )
 
         with pytest.raises(BaseExceptionGroup) as raised:
@@ -10590,6 +10597,7 @@ class TestAgentManagerBasics:
             isinstance(error, asyncio.CancelledError)
             for error in raised.value.exceptions
         )
+        assert [error for error in raised.value.exceptions if isinstance(error, asyncio.CancelledError)] == [withdrawal]
         assert any(
             isinstance(error, RuntimeOffboardingRetainedError)
             for error in raised.value.exceptions

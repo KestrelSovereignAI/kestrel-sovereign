@@ -10,6 +10,8 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.unit.test_execution_custody_review29 import native_owner
 from tests.unit.test_execution_custody_review32 import receipt
+from tests.utils.original_failure import OriginalFailure
+from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -28,6 +30,8 @@ async def test_native_postgres_lifecycle_consumers_join_before_original_receipt(
     agent.storage = agent._raw_storage = storage
     release, closed = asyncio.Event(), asyncio.Event()
     failure = receipt(kind)
+    original = OriginalFailure.capture(failure)
+    original_outcome = execution_commit_outcome(failure)
     continuation = waiter = shutdown = None
 
     async def tail():
@@ -62,7 +66,9 @@ async def test_native_postgres_lifecycle_consumers_join_before_original_receipt(
         assert not closed.is_set()
         release.set()
         outcome = await await_owned_task(waiter)
-        assert outcome.error is failure
+        original.assert_retained(outcome.error)
+        assert is_execution_control_error(outcome.error)
+        assert execution_commit_outcome(outcome.error) == original_outcome
         assert closed.is_set()
         assert await observer.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects WHERE id=34') == 1
     finally:

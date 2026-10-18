@@ -353,6 +353,25 @@ Bookkeeping-observer or expiry-fence failures still join the original hook;
 they cannot return while it retains native work. An unexpected observation in
 a finite group must not filter away an independent original native source.
 
+These finite collectors span enclosing server phases and descendant setup,
+not just an individual join. Ordinary phase errors and actual Phoenix
+withdrawals stay unreduced until the complete lifespan has finished, including
+an external native lifespan failure. Core-owned observation composition reuses
+an already enclosing original carrier instead of wrapping it again or turning
+a sole typed result into duplicate error groups. Generic terminal-selection
+and non-native caused-cancellation defaults remain unchanged.
+
+Dynamic scheduler preparation harvests the actual successful Task result even
+when completion observation fails. Its exact nonce-bearing rollback owner
+compensates before that finite error escapes. Both loaded and cold runtime
+offboarding use one receipt-backed admission boundary: a failed completion
+observer cannot restore authority over an accepted deletion or lose its record.
+The original administrative/terminal/quarantine owners manually harvest a
+completed record when necessary. Observation failure never changes a proven
+REMOVED result into pending deletion, and no cancellation count or boolean may
+invent a caller exception. These are component ownership guarantees, not a new
+filesystem deletion policy or a grant of destructive authority.
+
 Standalone CLI and main callers own their Hold context separately from the
 Agent. They complete both safe retirements before reporting a settled Agent
 failure. A genuinely pending original Agent Task instead retains that exact
@@ -360,3 +379,7 @@ context/Task dependency; it is neither a successful context close nor permission
 to allocate a replacement cleanup attempt. Component native tests establish
 these ownership boundaries, not whole-Agent genesis, provider billing or deployed
 production acceptance.
+The protected lifetime begins immediately after successful acquisition: extension
+setup, banner output and shutdown diagnostics cannot bypass mandatory completion
+and context retirement. Failed fallback observation retains its original waiter
+admission error and whole native group while independent safe cleanup still runs.

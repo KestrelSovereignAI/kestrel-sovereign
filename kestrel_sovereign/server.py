@@ -35,7 +35,7 @@ from kestrel_sovereign.kestrel_agent import (
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners, retire_unpublished_llm
-from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import execution_finite_error, execution_observation_error, is_execution_control_error
 from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
@@ -2207,7 +2207,7 @@ async def _shutdown_stop_cleanup(app: FastAPI) -> None:
         app.state.stop_cleanup_registry = None
 
 
-async def _shutdown_phoenix(app: FastAPI) -> bool:
+async def _shutdown_phoenix(app: FastAPI, *, withdrawals=None, finite_errors=None) -> bool:
     """Release all server-owned Phoenix work before lifespan teardown returns.
 
     The supervisor task and its proxy client are server-owned resources.  A
@@ -2218,31 +2218,35 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
     """
     cancelled = False
     failures = []
-    withdrawals = []
-    join_originals = []
+    withdrawals = [] if withdrawals is None else withdrawals
+    join_originals = [] if finite_errors is None else finite_errors
+
+    async def observe_original(task, label):
+        nonlocal cancelled
+        try:
+            join_cancelled, failure = await await_lifecycle_task_completion(
+                task, withdrawals=withdrawals,
+            )
+        except BaseException as error:
+            join_cancelled, failure = False, error
+        cancelled = cancelled or join_cancelled
+        if failure is not None:
+            join_originals.append(failure)
+            if (is_execution_control_error(failure)
+                    or not isinstance(failure, (Exception, asyncio.CancelledError))):
+                failures.append(failure)
+            if not isinstance(failure, asyncio.CancelledError):
+                logger.warning(
+                    "Phoenix %s failed during shutdown: %s", label, failure,
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                )
 
     phoenix_task = getattr(app.state, "phoenix_task", None)
     if phoenix_task is not None:
         if not phoenix_task.done():
             phoenix_task.cancel()
-        try:
-            join_cancelled, failure = await await_lifecycle_task_completion(
-                phoenix_task, withdrawals=withdrawals,
-            )
-            if failure is not None:
-                join_originals.append(failure)
-            cancelled = cancelled or join_cancelled
-            if failure is not None and is_execution_control_error(failure):
-                failures.append(failure)
-            if failure is not None and not isinstance(
-                failure, asyncio.CancelledError
-            ):
-                logger.warning(
-                    "Phoenix supervision task failed during shutdown: %s",
-                    failure,
-                    exc_info=(type(failure), failure, failure.__traceback__),
-                )
-        finally:
+        await observe_original(phoenix_task, "supervision task")
+        if phoenix_task.done():
             app.state.phoenix_task = None
 
     # ``phoenix_task`` can finish immediately when it is cancelled while its
@@ -2252,30 +2256,13 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
     # after teardown has returned.
     phoenix_start_task = getattr(app.state, "phoenix_start_task", None)
     if phoenix_start_task is not None:
-        try:
-            join_cancelled, failure = await await_lifecycle_task_completion(
-                phoenix_start_task, withdrawals=withdrawals,
-            )
-            if failure is not None:
-                join_originals.append(failure)
-            cancelled = cancelled or join_cancelled
-            if failure is not None and is_execution_control_error(failure):
-                failures.append(failure)
-            if failure is not None and not isinstance(
-                failure, asyncio.CancelledError
-            ):
-                logger.warning(
-                    "Phoenix startup worker failed during shutdown: %s",
-                    failure,
-                    exc_info=(type(failure), failure, failure.__traceback__),
-                )
-        finally:
-            if getattr(app.state, "phoenix_start_task", None) is phoenix_start_task:
-                app.state.phoenix_start_task = None
+        await observe_original(phoenix_start_task, "startup worker")
+        if phoenix_start_task.done() and getattr(app.state, "phoenix_start_task", None) is phoenix_start_task:
+            app.state.phoenix_start_task = None
 
     phoenix = getattr(app.state, "phoenix", None)
     if phoenix is None:
-        terminal = execution_finite_error(*failures, *withdrawals, retain_originals=True) if failures else None
+        terminal = execution_observation_error(*failures, *join_originals, *withdrawals) if failures else None
         if terminal is not None:
             raise terminal
         return cancelled
@@ -2363,11 +2350,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
             app.state.phoenix_proxy_close_resource = None
             app.state.phoenix_proxy_close_supervisor = None
 
-    terminal = execution_finite_error(
-        *failures, *(join_originals if any(is_execution_control_error(error) for error in failures) else ()),
-        *(withdrawals if failures else ()),
-        retain_originals=True, isolate_control_originals=True,
-    )
+    terminal = execution_observation_error(*failures, *join_originals, *withdrawals) if failures else None
     if terminal is not None:
         raise terminal
     return cancelled
@@ -2400,7 +2383,7 @@ async def _shutdown_host_features(app: FastAPI) -> None:
             await _hf.close_host_context(host_context)
         except BaseException as exc:
             failures.append(exc)
-    failure = execution_finite_error(*failures, retain_originals=True)
+    failure = execution_observation_error(*failures)
     if failure is not None:
         raise failure
     if getattr(app.state, "host_context", None) is host_context:
@@ -2851,9 +2834,7 @@ async def _shutdown_host_scheduler(app: FastAPI) -> None:
         else:
             if getattr(app.state, attribute, None) is resource:
                 setattr(app.state, attribute, None)
-    terminal = execution_finite_error(
-        *failures, retain_originals=True, prefer_cancellation=True,
-    )
+    terminal = execution_observation_error(*failures)
     if terminal is not None:
         raise terminal
 
@@ -2893,7 +2874,7 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
             else:
                 if completed and getattr(app.state, attribute, None) is agent:
                     setattr(app.state, attribute, None)
-    terminal = execution_finite_error(*failures)
+    terminal = execution_observation_error(*failures)
     if terminal is not None:
         raise terminal
 
@@ -2997,10 +2978,7 @@ async def _run_lifespan_shutdown_phase(
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
     if failure_cancelled:
-        withdrawal = execution_finite_error(
-            withdrawal, original_phase_failure, retain_originals=True,
-            prefer_cancellation=True, isolate_control_originals=True,
-        )
+        withdrawal = execution_observation_error(withdrawal, original_phase_failure)
     if failure is not None:
         logger.warning(
             "Server shutdown phase %r failed: %s",
@@ -3102,7 +3080,7 @@ async def _shutdown_server_resources(
         "phoenix": (),
     }
 
-    withdrawals = []
+    withdrawals, finite_originals = [], []
     for name, operation in (
         ("host-scheduler", lambda: _shutdown_host_scheduler(app)),
         # The scheduler is now drained, so no cold wake can remount host
@@ -3128,7 +3106,7 @@ async def _shutdown_server_resources(
             "shared-agent-postgres",
             lambda: _shutdown_shared_agent_postgres_backend(app),
         ),
-        ("phoenix", lambda: _shutdown_phoenix(app)),
+        ("phoenix", lambda: _shutdown_phoenix(app, withdrawals=withdrawals, finite_errors=finite_originals)),
     ):
         resources = _lifespan_shutdown_phase_resources(app, name)
         blocked_by = tuple(prerequisite for prerequisite in prerequisites[name]
@@ -3156,9 +3134,9 @@ async def _shutdown_server_resources(
             failed_phases.add(name)
             failures.append(failure)
 
-    if any(is_execution_control_error(error) for error in (original_failure, *failures)):
+    if any(is_execution_control_error(error) for error in (original_failure, *failures, *finite_originals)):
         first_failure = execution_finite_error(
-            original_failure, *failures, *withdrawals, retain_originals=True,
+            original_failure, *failures, *finite_originals, *withdrawals, retain_originals=True,
             isolate_control_originals=True,
         )
     else:

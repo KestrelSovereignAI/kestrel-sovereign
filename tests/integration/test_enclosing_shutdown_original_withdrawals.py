@@ -108,8 +108,9 @@ async def test_enclosing_shutdown_keeps_actual_join_withdrawal_before_native_fai
 @pytest.mark.parametrize("entrypoint", ["cli", "main"])
 @pytest.mark.parametrize("source_cancel", [False, True])
 @pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("failure_phase", [None, "setup", "report"])
 async def test_standalone_entrypoint_closes_real_caller_owned_hold_after_settled_native_agent_failure(
-    native_pg, monkeypatch, tmp_path, entrypoint, source_cancel, pending,
+    native_pg, monkeypatch, tmp_path, entrypoint, source_cancel, pending, failure_phase,
 ):
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch, source_cancel))
     contexts = []
@@ -146,6 +147,15 @@ async def test_standalone_entrypoint_closes_real_caller_owned_hold_after_settled
     monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
     monkeypatch.setattr(hold, "initialize_with_bound_hold_context", initialize)
     monkeypatch.setattr("builtins.input", lambda prompt: "!quit")
+    reporting = OriginalFailure.capture(BrokenPipeError("original standalone output owner failed"))
+    actual_print = print
+    def output(*args, **kwargs):
+        value = " ".join(str(arg) for arg in args)
+        if (failure_phase == "setup" and "Kestrel Agent Initialized" in value
+                or failure_phase == "report" and "Agent deactivated" in value):
+            raise reporting.error
+        return actual_print(*args, **kwargs)
+    monkeypatch.setattr("builtins.print", output)
     if entrypoint == "main":
         monkeypatch.setattr(main, "KestrelAgent", lambda **kwargs: agent)
         monkeypatch.setattr(main, "LLMService", MagicMock())
@@ -162,6 +172,8 @@ async def test_standalone_entrypoint_closes_real_caller_owned_hold_after_settled
     try:
         result = await await_owned_task(create_owned_task(op, retain_originals=True))
         source.assert_retained(result.error)
+        if failure_phase is not None:
+            reporting.assert_retained(result.error)
         assert len(contexts) == 1
         context = contexts[0]
         if pending:

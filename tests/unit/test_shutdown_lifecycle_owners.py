@@ -361,7 +361,7 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
         phases.append("agents")
         raise RuntimeError("agent failure")
 
-    async def finish_phoenix(_app) -> bool:
+    async def finish_phoenix(_app, **_finite_collectors) -> bool:
         phases.append("phoenix")
         return False
 
@@ -413,7 +413,7 @@ async def test_lifespan_consumer_preserves_grouped_cancellation_and_failure(
                 ],
             )
 
-    async def noop(_app) -> None:
+    async def noop(_app, **_finite_collectors) -> None:
         return None
 
     manager = _GroupedManager()

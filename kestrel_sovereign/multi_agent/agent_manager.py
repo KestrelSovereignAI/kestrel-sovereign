@@ -30,7 +30,7 @@ from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, _explicit_control_chain, execution_finite_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, _explicit_control_chain, execution_finite_error, execution_observation_error, is_execution_control_error
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did,
@@ -247,6 +247,8 @@ class RuntimeOffboardingRetainedError(RuntimeError):
         self.runtime_path = runtime_path
         self.cause = cause
         self.cleanup_pending = cleanup_pending
+        if is_execution_control_error(cause):
+            self.__cause__ = cause
         self.metadata = {
             "code": "runtime_offboarding_retained",
             "agent": agent_name,
@@ -465,13 +467,9 @@ def _is_lifecycle_terminal_outcome(error: BaseException) -> bool:
 
 
 def _raise_lifecycle_outcomes(message: str, outcomes: list[BaseException]) -> None:
-    if not outcomes:
-        return
-    if len(outcomes) == 1:
-        raise outcomes[0]
-    if any(is_execution_control_error(error) for error in outcomes):
-        raise execution_finite_error(*outcomes)
-    raise BaseExceptionGroup(message, outcomes)
+    terminal = execution_observation_error(*outcomes, message=message)
+    if terminal is not None:
+        raise terminal
 
 
 @dataclass(frozen=True)
@@ -482,6 +480,7 @@ class InflightRuntimeOffboarding:
     agent_id: str
     runtime_path: Optional[Path]
     task: "asyncio.Task[object]"
+    publication_error: Optional[BaseException] = None
 
 
 @dataclass
@@ -2557,15 +2556,27 @@ class AgentManager:
                 self._scheduler_authority_by_name[name] = agent_id
                 authority_added = True
 
-            registration_task = asyncio.create_task(
-                hook(name, agent_id, config),
-                name=f"scheduler_tenant_registration:{name}",
-            )
-            cancelled, failure = await await_lifecycle_task_completion(
-                registration_task, withdrawals=withdrawals,
-            )
-            if failure is not None:
-                raise failure
+            admission, opening = OwnedTaskAdmission(), None
+            try:
+                registration_task = create_owned_task(
+                    hook(name, agent_id, config), retain_originals=True,
+                    name=f"scheduler_tenant_registration:{name}", admission=admission,
+                )
+            except BaseException as error:
+                opening, registration_task = error, admission.task
+                if registration_task is None:
+                    raise
+            try:
+                cancelled, failure = await await_lifecycle_task_completion(
+                    registration_task, withdrawals=withdrawals,
+                )
+            except BaseException as error:
+                cancelled, failure = bool(withdrawals), error
+            physical = owned_task_error(registration_task)
+            if physical is not None:
+                raise execution_observation_error(opening, failure, physical, *withdrawals)
+            # Observation failure is not failure of physical registration.
+            # Harvest its exact nonce-bearing result before any compensation.
             rollback_protocol = registration_task.result()
             registration = _DynamicSchedulerTenantRegistration(
                 self,
@@ -2575,19 +2586,17 @@ class AgentManager:
                 lifecycle_lock,
                 rollback_protocol,
             )
-            if cancelled:
-                rollback_task = asyncio.create_task(
-                    registration.rollback(),
-                    name=f"scheduler_tenant_registration_cancel:{name}",
-                )
-                _, rollback_failure = await await_lifecycle_task_completion(
-                    rollback_task, withdrawals=withdrawals,
-                )
+            if cancelled or opening is not None or failure is not None:
+                compensation = []
+                # This exact registration owns the lock until its original
+                # rollback settles; refused admission retains that debt.
                 lock_owned = False
-                if rollback_failure is not None:
-                    raise execution_finite_error(rollback_failure, *withdrawals)
-                if withdrawals:
-                    raise withdrawals[-1]
+                await registration._rollback_owner.join(
+                    name, withdrawals=withdrawals, finite_errors=compensation,
+                )
+                terminal = execution_observation_error(opening, failure, *compensation, *withdrawals)
+                if terminal is not None:
+                    raise terminal
                 raise asyncio.CancelledError()
             return registration
         except BaseException:
@@ -4952,13 +4961,32 @@ class AgentManager:
                 done, _pending = await asyncio.wait(
                     {task}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
                 )
-            except asyncio.CancelledError as cancellation:
+            except BaseException as observation:
+                # asyncio.wait itself publishes/removes completion observers.
+                # Failure there cannot abandon the already accepted hook.
                 task.cancel()
-                withdrawals = [cancellation]
-                _, failure = await await_lifecycle_task_completion(task, withdrawals=withdrawals)
-                if publications or failure is not None and is_execution_control_error(failure):
-                    raise execution_observation_error(*publications, failure, *withdrawals)
-                raise
+                originals, withdrawals = [*publications, observation], []
+                if asyncio.get_running_loop().time() >= deadline:
+                    expiry = PersistedSpawnMandateExpiredError(
+                        f"Persisted spawn mandate expired during {phase}"
+                    )
+                    originals.append(expiry)
+                    if on_expiry is not None:
+                        try:
+                            on_expiry()
+                        except BaseException as error:
+                            originals.append(error)
+                try:
+                    _, failure = await await_lifecycle_task_completion(task, withdrawals=withdrawals)
+                except BaseException as error:
+                    failure = error
+                if (isinstance(observation, asyncio.CancelledError)
+                        and not publications
+                        and not any(is_execution_control_error(error) for error in (observation, failure))):
+                    # Preserve the established plain-caller cancellation policy.
+                    # A genuine native source cancellation is not that policy.
+                    raise observation
+                raise execution_observation_error(*originals, failure, *withdrawals)
             if task not in done:
                 task.cancel()
                 try:
@@ -8523,13 +8551,12 @@ class AgentManager:
         if pending_offboarding and offboarding_admission is not None:
             offboarding_admission.started = True
 
-        offboarding_cancelled = False
         offboarding_failure: BaseException | None = None
         if pending_offboarding:
             if len(pending_offboarding) != 1:
                 raise RuntimeError("one agent removal admitted multiple offboardings")
             (
-                offboarding_cancelled,
+                _offboarding_cancelled,
                 offboarding_failure,
             ) = await self._finish_agent_runtime_offboarding(
                 pending_offboarding[0],
@@ -8549,10 +8576,9 @@ class AgentManager:
         outcomes: list[BaseException] = []
         if primary_failure is not None:
             outcomes.append(primary_failure)
-        if offboarding_cancelled and not _contains_lifecycle_cancellation(
-            primary_failure
-        ):
-            outcomes.append(asyncio.CancelledError())
+        # Every actual withdrawal from the administrative wait is already in
+        # primary_failure or offboarding_failure. A boolean (including genuine
+        # source cancellation) cannot manufacture another caller exception.
         if offboarding_failure is not None:
             outcomes.append(offboarding_failure)
         if retirement_failure is not None:
@@ -9091,6 +9117,37 @@ class AgentManager:
             result=result,
         )
 
+    def _register_runtime_offboarding(
+        self, operation, *, name: str, agent_id: str, runtime_path,
+    ) -> InflightRuntimeOffboarding:
+        """Root accepted deletion before publishing its completion observer."""
+        admission, opening = OwnedTaskAdmission(), None
+        try:
+            task = create_owned_task(
+                operation(), name=f"isolated_runtime_namespace_offboard:{name}",
+                retain_originals=True, admission=admission,
+            )
+        except BaseException as error:
+            task, opening = admission.task, error
+            if task is None:
+                raise
+        record = InflightRuntimeOffboarding(
+            agent_name=name, agent_id=agent_id, runtime_path=runtime_path,
+            task=task, publication_error=opening,
+        )
+        key = id(task)
+        self._inflight_runtime_offboardings[key] = record
+        def retire_inflight(completed):
+            self._inflight_runtime_offboardings.pop(key, None)
+        try:
+            task.add_done_callback(retire_inflight)
+        except BaseException as error:
+            # The caller receives the SAME accepted record even when observer
+            # publication fails. That failure cannot restore deleted authority.
+            record = replace(record, publication_error=execution_observation_error(opening, error))
+            self._inflight_runtime_offboardings[key] = record
+        return record
+
     def _start_agent_runtime_offboarding(
         self,
         *,
@@ -9118,24 +9175,10 @@ class AgentManager:
                         self._retire_persistent_spawn_registration(name, agent_id)
             return result
 
-        cleanup_task = asyncio.create_task(
-            cleanup_and_retire(),
-            name=f"isolated_runtime_namespace_offboard:{name}",
-        )
-        record = InflightRuntimeOffboarding(
-            agent_name=name,
-            agent_id=agent_id,
+        return self._register_runtime_offboarding(
+            cleanup_and_retire, name=name, agent_id=agent_id,
             runtime_path=_agent_runtime_path(agent),
-            task=cleanup_task,
         )
-        record_key = id(cleanup_task)
-        self._inflight_runtime_offboardings[record_key] = record
-
-        def retire_inflight(_task: "asyncio.Future[object]") -> None:
-            self._inflight_runtime_offboardings.pop(record_key, None)
-
-        cleanup_task.add_done_callback(retire_inflight)
-        return record
 
     async def _admit_agent_runtime_offboarding_identity(
         self,
@@ -9258,24 +9301,10 @@ class AgentManager:
                         self._retire_persistent_spawn_registration(name, agent_id)
             return result
 
-        cleanup_task = asyncio.create_task(
-            cleanup_and_retire(),
-            name=f"isolated_runtime_namespace_offboard:{name}",
-        )
-        record = InflightRuntimeOffboarding(
-            agent_name=name,
-            agent_id=agent_id,
+        return self._register_runtime_offboarding(
+            cleanup_and_retire, name=name, agent_id=agent_id,
             runtime_path=scope.path if scope is not None else None,
-            task=cleanup_task,
         )
-        record_key = id(cleanup_task)
-        self._inflight_runtime_offboardings[record_key] = record
-
-        def retire_inflight(_task: "asyncio.Future[object]") -> None:
-            self._inflight_runtime_offboardings.pop(record_key, None)
-
-        cleanup_task.add_done_callback(retire_inflight)
-        return record
 
     def _retain_timed_out_runtime_offboarding(
         self, record: InflightRuntimeOffboarding
@@ -9315,56 +9344,80 @@ class AgentManager:
                 cleanup_pending=cleanup_pending,
             )
 
-        if cancellation_already_observed and not record.task.done():
-            self._retain_timed_out_runtime_offboarding(record)
-            return False, retained(
-                RuntimeError("runtime offboarding continues after cancellation"),
-                cleanup_pending=True,
-            )
+        observations = []
+        async def finish():
+            if cancellation_already_observed and not record.task.done():
+                self._retain_timed_out_runtime_offboarding(record)
+                return False, retained(
+                    RuntimeError("runtime offboarding continues after cancellation"),
+                    cleanup_pending=True,
+                )
 
+            try:
+                done, _ = await asyncio.wait(
+                    {record.task}, timeout=RUNTIME_OFFBOARD_TIMEOUT_S
+                )
+            except BaseException as observation:
+                observations.append(observation)
+                if not record.task.done():
+                    self._retain_timed_out_runtime_offboarding(record)
+                    return _contains_lifecycle_cancellation(observation), retained(
+                        RuntimeError("runtime offboarding continues after observation failure"),
+                        cleanup_pending=True,
+                    )
+                # Failed observation cannot change the physically completed
+                # worker's actual REMOVED/retained outcome below.
+                done = {record.task}
+
+            if not done:
+                self._retain_timed_out_runtime_offboarding(record)
+                return False, retained(
+                    TimeoutError(
+                        "secure runtime offboarding exceeded its administrative wait bound"
+                    ),
+                    cleanup_pending=True,
+                )
+            failure = owned_task_error(record.task)
+            if record.task.cancelled() and not is_execution_control_error(failure):
+                return cancellation_already_observed, retained(
+                    RuntimeError("secure runtime offboarding task was cancelled")
+                )
+            if failure is None:
+                result = record.task.result()
+                outcome_error = _runtime_offboarding_outcome_error(
+                    agent_name=record.agent_name,
+                    agent_id=record.agent_id,
+                    result=result,
+                )
+                if outcome_error is None:
+                    return cancellation_already_observed, None
+                if isinstance(outcome_error, RuntimeOffboardingNotPerformedError):
+                    return cancellation_already_observed, outcome_error
+                return cancellation_already_observed, retained(outcome_error)
+            if not isinstance(failure, Exception):
+                raise failure
+            return cancellation_already_observed, retained(failure)
         try:
-            done, _ = await asyncio.wait(
-                {record.task}, timeout=RUNTIME_OFFBOARD_TIMEOUT_S
-            )
-        except asyncio.CancelledError as withdrawal:
-            self._retain_timed_out_runtime_offboarding(record)
-            pending = retained(
-                RuntimeError("runtime offboarding continues after cancellation"),
-                cleanup_pending=True,
-            )
-            return True, execution_finite_error(
-                pending, withdrawal,
-                retain_originals=True, isolate_control_originals=True,
-            )
-
-        if not done:
-            self._retain_timed_out_runtime_offboarding(record)
-            return False, retained(
-                TimeoutError(
-                    "secure runtime offboarding exceeded its administrative wait bound"
-                ),
-                cleanup_pending=True,
-            )
-        if record.task.cancelled():
-            return cancellation_already_observed, retained(
-                RuntimeError("secure runtime offboarding task was cancelled")
-            )
-        failure = record.task.exception()
-        if failure is None:
-            result = record.task.result()
-            outcome_error = _runtime_offboarding_outcome_error(
-                agent_name=record.agent_name,
-                agent_id=record.agent_id,
-                result=result,
-            )
-            if outcome_error is None:
-                return cancellation_already_observed, None
-            if isinstance(outcome_error, RuntimeOffboardingNotPerformedError):
-                return cancellation_already_observed, outcome_error
-            return cancellation_already_observed, retained(outcome_error)
-        if not isinstance(failure, Exception):
-            raise failure
-        return cancellation_already_observed, retained(failure)
+            cancelled, failure = await finish()
+        except BaseException as error:
+            # A refused wait observer is not refusal of the admitted deletion.
+            # Keep the exact worker in the existing registry/quarantine owner.
+            outcomes = [error]
+            if not record.task.done():
+                try:
+                    self._retain_timed_out_runtime_offboarding(record)
+                except BaseException as retention:
+                    outcomes.append(retention)
+                outcomes.append(retained(
+                    RuntimeError("runtime offboarding continues after observation failure"),
+                    cleanup_pending=True,
+                ))
+            cancelled, failure = _contains_lifecycle_cancellation(error), execution_observation_error(*outcomes)
+        finally:
+            if record.task.done():
+                # Completion callback publication itself may have failed.
+                self._inflight_runtime_offboardings.pop(id(record.task), None)
+        return cancelled, execution_observation_error(record.publication_error, *observations, failure)
 
     def _retain_quarantined_cleanup(
         self,
@@ -9408,6 +9461,10 @@ class AgentManager:
         def observe_reaper_completion(task: "asyncio.Future[object]") -> None:
             record.completed_monotonic = time.monotonic()
             failure = owned_task_error(task)
+            # The offboarding-specific observer may have failed publication.
+            # This SAME worker is physically complete; retire its duplicate
+            # inflight reference before collapsing quarantine to bounded state.
+            self._inflight_runtime_offboardings.pop(id(task), None)
             if failure is not None and is_execution_control_error(failure):
                 self._quarantined_shutdown_control = _merge_manager_cleanup_control(
                     self._quarantined_shutdown_control, failure,
@@ -9723,6 +9780,7 @@ class AgentManager:
         # retained must remain retryable by a later startup/server shutdown.
         withdrawals = [] if withdrawals is None else withdrawals
         acquired = False
+        spawn_failures = []
         try:
             cancelled = await self._acquire_quarantined_shutdown_drain(withdrawals=withdrawals)
             acquired = True
@@ -9743,12 +9801,7 @@ class AgentManager:
             return result
         except BaseException as error:
             control = vars(self).get("_quarantined_shutdown_control")
-            if control is not None or is_execution_control_error(error):
-                raise execution_finite_error(
-                    control, error, *withdrawals, retain_originals=True,
-                    isolate_control_originals=True,
-                )
-            raise
+            raise execution_observation_error(control, *spawn_failures, error, *withdrawals)
         finally:
             if acquired:
                 self._reopen_agent_registration_after_shutdown_all()
@@ -9881,6 +9934,10 @@ class AgentManager:
                     ) = await await_lifecycle_task_completion(runtime_offboarding.task, withdrawals=refund_withdrawals)
                     cancelled = cancelled or join_cancelled
                     classified_outcome = False
+                    if runtime_offboarding.task.done():
+                        self._inflight_runtime_offboardings.pop(record_key, None)
+                    if runtime_offboarding.publication_error is not None:
+                        join_originals.append(runtime_offboarding.publication_error)
                     if offboarding_failure is not None:
                         join_originals.append(offboarding_failure)
                     if offboarding_failure is None:
@@ -13645,9 +13702,14 @@ class AgentManager:
                 observed.add(operation.canonical_name)
                 task = operation.spawn_task
                 assert task is not None
-                join_cancelled, failure = await await_lifecycle_task_completion(
-                    task, withdrawals=withdrawals,
-                )
+                try:
+                    join_cancelled, failure = await await_lifecycle_task_completion(
+                        task, withdrawals=withdrawals,
+                    )
+                except BaseException as error:
+                    if not is_execution_control_error(error):
+                        raise
+                    join_cancelled, failure = False, error
                 cancelled = cancelled or join_cancelled
                 # A spawn owns its rollback until this join.  Ordinary spawn
                 # failures are represented by the authoritative state swept
@@ -13655,7 +13717,7 @@ class AgentManager:
                 # a rollback failure and cannot be allowed to abort that
                 # sweep.  Defer it so the terminal report retains both facts
                 # after every live agent has received cleanup.
-                if failure is not None and is_execution_control_error(failure) and _is_lifecycle_terminal_outcome(failure):
+                if failure is not None and is_execution_control_error(failure):
                     failures.append(failure)
                 elif isinstance(failure, BaseExceptionGroup) and not isinstance(
                     failure, Exception
@@ -13823,9 +13885,13 @@ class AgentManager:
                         failures.append(failure)
             if failures:
                 raise execution_finite_error(*failures, *withdrawals)
-        except BaseException:
-            self.end_terminal_descendant_spawn_fence(token)
-            raise
+        except BaseException as error:
+            failures.append(error)
+            try:
+                self.end_terminal_descendant_spawn_fence(token)
+            except BaseException as unwind_error:
+                failures.append(unwind_error)
+            raise execution_observation_error(*failures, *withdrawals)
         if cancelled:
             self.end_terminal_descendant_spawn_fence(token)
             raise withdrawals[-1] if withdrawals else asyncio.CancelledError()
@@ -14564,285 +14630,372 @@ class AgentManager:
                     raise
                 terminal_outcomes.append(exc)
 
-        if (
-            persistent_cleanup_child_did is not None
-            and child_agent is None
-            and not offboard_runtime
-        ):
-            # The durable child is already stopped and intentionally retained.
-            # Its descendants were handled above; a repeated non-destructive
-            # cascade must not enter the destructive-only cold identity seam.
-            _raise_lifecycle_outcomes(
-                f"Child {child_name!r} descendant termination failed",
-                terminal_outcomes,
-            )
-            return True
-
-        registration_rollback: Optional[Callable[[], Awaitable[None]]] = None
-        offboarding_admission: Optional[RuntimeOffboardingAdmission] = None
-        offboard_child_did: Optional[str] = None
-        persistent_offboarding_key: Optional[tuple[str, str]] = None
-        persistent_registration_already_removed = False
-        removal_hook = None
-        mandate = self._child_mandates.get(child_name)
-        if mandate is None and cleanup_child_did is not None:
-            mandate = self._persistent_spawn_mandates.get(
-                self._canonical_agent_name(child_name)
-            )
-        if mandate is None and registry_cleanup_witness is not None:
-            mandate = registry_cleanup_witness.mandate
-        persistent_spawn = (
-            isinstance(mandate, SpawnMandate) and mandate.ttl_seconds <= 0
-        )
-        unregistered_persistent_rollback = (
-            _unregistered_persistent_spawn_expected_agent_id is not None
-        )
-        if unregistered_persistent_rollback and (
-            not offboard_runtime or not persistent_spawn
-        ):
-            raise RuntimeError(
-                "Unregistered spawn rollback requires an exact persistent child "
-                "and destructive offboarding"
-            )
-        if offboard_runtime and persistent_spawn and not unregistered_persistent_rollback:
-            removal_hook = self._created_agent_registration_removal_hook
-            offboard_child_did = expected_child_did
-            if offboard_child_did is None and child_agent is not None:
-                offboard_child_did = _loaded_agent_did(child_agent)
-            if not offboard_child_did:
-                offboard_child_did = mandate.child_did
-            if not isinstance(offboard_child_did, str) or not offboard_child_did:
-                raise RuntimeError(
-                    "Persistent spawned child identity is unavailable; "
-                    "destructive offboarding was refused"
-                )
-            persistent_offboarding_key = (
-                self._canonical_agent_name(child_name),
-                offboard_child_did,
-            )
-            persistent_registration_already_removed = (
-                persistent_offboarding_key in self._persistent_spawn_offboarding
-            )
-            if (
-                removal_hook is None
-                and self._startup_config_path is not None
-                and not persistent_registration_already_removed
-            ):
-                raise RuntimeError(
-                    "Destructive offboarding of a config-registered persistent "
-                    "spawned child requires a startup-registration removal hook"
-                )
-
-        async def compensate_registration_if_not_admitted() -> tuple[
-            bool, Optional[BaseException]
-        ]:
-            if (
-                registration_rollback is None
-                or offboarding_admission is None
-                or offboarding_admission.started
-            ):
-                return False, None
-            rollback_task = asyncio.create_task(
-                registration_rollback(),
-                name=f"restore_persistent_child_registration:{child_name}",
-            )
-            return await await_lifecycle_task_completion(rollback_task, withdrawals=withdrawals)
-
-        # NB: the child's own budget hold is released inside remove_agent below
-        # (stop-then-release), after the cascade above has already stopped and
-        # released every descendant — so refunds flow up leaf-first (#2113).
-
-        # Shutdown the child before mutating retry bookkeeping.  A false
-        # removal result or a failed/cancelled refund leaves either routing or
-        # its exact delegated hold live; keeping the relationship and mandate
-        # lets the ordinary terminate_child path retry safely.  ``remove_agent``
-        # can also re-raise cancellation only after its owned shutdown/refund
-        # tail settled.  In that terminal case reconcile the authoritative
-        # state before propagating cancellation, or the removed child keeps a
-        # stale mandate that consumes a spawn-cap slot forever.
-        startup_registration = None
-        destructive_spawn_retirement = None
+        # One finite prefix spans every subsequent setup/removal/reporting
+        # exit. A later independent refusal cannot replace descendant evidence.
         try:
-            if offboard_runtime:
+            if (
+                persistent_cleanup_child_did is not None
+                and child_agent is None
+                and not offboard_runtime
+            ):
+                # The durable child is already stopped and intentionally retained.
+                # Its descendants were handled above; a repeated non-destructive
+                # cascade must not enter the destructive-only cold identity seam.
+                _raise_lifecycle_outcomes(
+                    f"Child {child_name!r} descendant termination failed",
+                    terminal_outcomes,
+                )
+                return True
+
+            registration_rollback: Optional[Callable[[], Awaitable[None]]] = None
+            offboarding_admission: Optional[RuntimeOffboardingAdmission] = None
+            offboard_child_did: Optional[str] = None
+            persistent_offboarding_key: Optional[tuple[str, str]] = None
+            persistent_registration_already_removed = False
+            removal_hook = None
+            mandate = self._child_mandates.get(child_name)
+            if mandate is None and cleanup_child_did is not None:
+                mandate = self._persistent_spawn_mandates.get(
+                    self._canonical_agent_name(child_name)
+                )
+            if mandate is None and registry_cleanup_witness is not None:
+                mandate = registry_cleanup_witness.mandate
+            persistent_spawn = (
+                isinstance(mandate, SpawnMandate) and mandate.ttl_seconds <= 0
+            )
+            unregistered_persistent_rollback = (
+                _unregistered_persistent_spawn_expected_agent_id is not None
+            )
+            if unregistered_persistent_rollback and (
+                not offboard_runtime or not persistent_spawn
+            ):
+                raise RuntimeError(
+                    "Unregistered spawn rollback requires an exact persistent child "
+                    "and destructive offboarding"
+                )
+            if offboard_runtime and persistent_spawn and not unregistered_persistent_rollback:
+                removal_hook = self._created_agent_registration_removal_hook
+                offboard_child_did = expected_child_did
+                if offboard_child_did is None and child_agent is not None:
+                    offboard_child_did = _loaded_agent_did(child_agent)
+                if not offboard_child_did:
+                    offboard_child_did = mandate.child_did
+                if not isinstance(offboard_child_did, str) or not offboard_child_did:
+                    raise RuntimeError(
+                        "Persistent spawned child identity is unavailable; "
+                        "destructive offboarding was refused"
+                    )
+                persistent_offboarding_key = (
+                    self._canonical_agent_name(child_name),
+                    offboard_child_did,
+                )
+                persistent_registration_already_removed = (
+                    persistent_offboarding_key in self._persistent_spawn_offboarding
+                )
                 if (
-                    self._startup_config_path is not None
-                    and (not isinstance(child_id, str) or not child_id)
+                    removal_hook is None
+                    and self._startup_config_path is not None
+                    and not persistent_registration_already_removed
                 ):
                     raise RuntimeError(
-                        "Cannot destructively terminate a child without a stable identity"
+                        "Destructive offboarding of a config-registered persistent "
+                        "spawned child requires a startup-registration removal hook"
                     )
-                if isinstance(child_id, str) and child_id:
-                    destructive_spawn_retirement = (
-                        await self._begin_destructive_spawn_retirement(
-                            child_name,
-                            known_agent_id=child_id,
-                        )
-                    )
-                    # Close durable restart authority before removing either
-                    # startup-registration rail. A process death in the hook
-                    # must leave a terminal witness, not an active child whose
-                    # desired-state row has disappeared.
-                    if (
-                        removal_hook is not None
-                        and not persistent_registration_already_removed
-                    ):
-                        assert isinstance(offboard_child_did, str)
-                        assert persistent_offboarding_key is not None
-                        registration_rollback = await removal_hook(
-                            child_name,
-                            offboard_child_did,
-                        )
-                        if not callable(registration_rollback):
-                            raise RuntimeError(
-                                "Persistent startup registration removal did not "
-                                "provide a compensation callback"
-                            )
-                        self._persistent_spawn_offboarding.add(
-                            persistent_offboarding_key
-                        )
-                        raw_registration_rollback = registration_rollback
 
-                        async def registration_rollback() -> None:
-                            await raw_registration_rollback()
-                            self._persistent_spawn_offboarding.discard(
+            async def compensate_registration_if_not_admitted() -> tuple[
+                bool, Optional[BaseException]
+            ]:
+                if (
+                    registration_rollback is None
+                    or offboarding_admission is None
+                    or offboarding_admission.started
+                ):
+                    return False, None
+                rollback_task = asyncio.create_task(
+                    registration_rollback(),
+                    name=f"restore_persistent_child_registration:{child_name}",
+                )
+                return await await_lifecycle_task_completion(rollback_task, withdrawals=withdrawals)
+
+            # NB: the child's own budget hold is released inside remove_agent below
+            # (stop-then-release), after the cascade above has already stopped and
+            # released every descendant — so refunds flow up leaf-first (#2113).
+
+            # Shutdown the child before mutating retry bookkeeping.  A false
+            # removal result or a failed/cancelled refund leaves either routing or
+            # its exact delegated hold live; keeping the relationship and mandate
+            # lets the ordinary terminate_child path retry safely.  ``remove_agent``
+            # can also re-raise cancellation only after its owned shutdown/refund
+            # tail settled.  In that terminal case reconcile the authoritative
+            # state before propagating cancellation, or the removed child keeps a
+            # stale mandate that consumes a spawn-cap slot forever.
+            startup_registration = None
+            destructive_spawn_retirement = None
+            try:
+                if offboard_runtime:
+                    if (
+                        self._startup_config_path is not None
+                        and (not isinstance(child_id, str) or not child_id)
+                    ):
+                        raise RuntimeError(
+                            "Cannot destructively terminate a child without a stable identity"
+                        )
+                    if isinstance(child_id, str) and child_id:
+                        destructive_spawn_retirement = (
+                            await self._begin_destructive_spawn_retirement(
+                                child_name,
+                                known_agent_id=child_id,
+                            )
+                        )
+                        # Close durable restart authority before removing either
+                        # startup-registration rail. A process death in the hook
+                        # must leave a terminal witness, not an active child whose
+                        # desired-state row has disappeared.
+                        if (
+                            removal_hook is not None
+                            and not persistent_registration_already_removed
+                        ):
+                            assert isinstance(offboard_child_did, str)
+                            assert persistent_offboarding_key is not None
+                            registration_rollback = await removal_hook(
+                                child_name,
+                                offboard_child_did,
+                            )
+                            if not callable(registration_rollback):
+                                raise RuntimeError(
+                                    "Persistent startup registration removal did not "
+                                    "provide a compensation callback"
+                                )
+                            self._persistent_spawn_offboarding.add(
                                 persistent_offboarding_key
                             )
+                            raw_registration_rollback = registration_rollback
 
+                            async def registration_rollback() -> None:
+                                await raw_registration_rollback()
+                                self._persistent_spawn_offboarding.discard(
+                                    persistent_offboarding_key
+                                )
+
+                            offboarding_admission = RuntimeOffboardingAdmission()
+                        elif persistent_registration_already_removed:
+                            # The first attempt crossed the irreversible startup-row
+                            # boundary and then received a terminal cleanup outcome.
+                            # Retry the exact-DID runtime deletion without asking the
+                            # one-shot registration hook to remove the row again.
+                            offboarding_admission = RuntimeOffboardingAdmission()
+                        startup_registration = (
+                            self._withdraw_committed_spawn_startup_registration(
+                                child_name,
+                                expected_child_did=child_id,
+                            )
+                        )
+                    if startup_registration is not None and offboarding_admission is None:
                         offboarding_admission = RuntimeOffboardingAdmission()
-                    elif persistent_registration_already_removed:
-                        # The first attempt crossed the irreversible startup-row
-                        # boundary and then received a terminal cleanup outcome.
-                        # Retry the exact-DID runtime deletion without asking the
-                        # one-shot registration hook to remove the row again.
-                        offboarding_admission = RuntimeOffboardingAdmission()
-                    startup_registration = (
-                        self._withdraw_committed_spawn_startup_registration(
+            except BaseException as setup_error:
+                terminal_outcomes.append(setup_error)
+                if not _is_lifecycle_terminal_outcome(setup_error) and not any(is_execution_control_error(error) for error in terminal_outcomes):
+                    raise
+                setup_outcomes = terminal_outcomes
+                settlement = asyncio.create_task(
+                    self._settle_destructive_spawn_retirement(
+                        destructive_spawn_retirement
+                    ),
+                    name=f"terminate_child_setup_retirement_settle:{child_name}",
+                )
+                settlement_cancelled, settlement_failure = (
+                    await await_lifecycle_task_completion(settlement, withdrawals=withdrawals)
+                )
+                if settlement_failure is not None:
+                    setup_outcomes.append(settlement_failure)
+                rollback_cancelled, rollback_failure = (
+                    await compensate_registration_if_not_admitted()
+                )
+                if rollback_failure is not None:
+                    setup_outcomes.append(rollback_failure)
+                setup_outcomes.extend(withdrawals)
+                _raise_lifecycle_outcomes(
+                    f"Child {child_name!r} offboarding setup failed",
+                    setup_outcomes,
+                )
+
+            removed = False
+            try:
+                retirement_kwargs = (
+                    {}
+                    if destructive_spawn_retirement is None
+                    else {
+                        "_prestarted_spawn_retirement": destructive_spawn_retirement
+                    }
+                )
+                removal_kwargs: dict[str, object] = {
+                    "offboard_runtime": offboard_runtime,
+                    **retirement_kwargs,
+                }
+                if offboarding_admission is not None:
+                    removal_kwargs["offboarding_admission"] = offboarding_admission
+                exact_cleanup_child_did = expected_child_did
+                if (
+                    exact_cleanup_child_did is not None
+                    and child_agent is None
+                    and (
+                        persistent_cleanup_child_did == exact_cleanup_child_did
+                        or registry_cleanup_child_did == exact_cleanup_child_did
+                    )
+                ):
+                    # A stopped persistent child has no route to bind. Carry the
+                    # exact verified registry DID and its restart config into the
+                    # cold identity offboarding path instead.
+                    removal_kwargs["known_agent_id"] = exact_cleanup_child_did
+                    removal_kwargs["known_agent_config"] = (
+                        registry_cleanup_witness.config
+                        if registry_cleanup_witness is not None
+                        and registry_cleanup_witness.child_did
+                        == exact_cleanup_child_did
+                        else self._persistent_spawn_cleanup_config(
                             child_name,
-                            expected_child_did=child_id,
+                            exact_cleanup_child_did,
                         )
                     )
-                if startup_registration is not None and offboarding_admission is None:
-                    offboarding_admission = RuntimeOffboardingAdmission()
-        except BaseException as setup_error:
-            if not _is_lifecycle_terminal_outcome(setup_error):
-                raise
-            setup_outcomes: list[BaseException] = [setup_error]
-            settlement = asyncio.create_task(
-                self._settle_destructive_spawn_retirement(
-                    destructive_spawn_retirement
-                ),
-                name=f"terminate_child_setup_retirement_settle:{child_name}",
-            )
-            settlement_cancelled, settlement_failure = (
-                await await_lifecycle_task_completion(settlement, withdrawals=withdrawals)
-            )
-            if settlement_failure is not None:
-                setup_outcomes.append(settlement_failure)
-            rollback_cancelled, rollback_failure = (
-                await compensate_registration_if_not_admitted()
-            )
-            if rollback_failure is not None:
-                setup_outcomes.append(rollback_failure)
-            setup_outcomes.extend(withdrawals)
-            _raise_lifecycle_outcomes(
-                f"Child {child_name!r} offboarding setup failed",
-                setup_outcomes,
-            )
-
-        removed = False
-        try:
-            retirement_kwargs = (
-                {}
-                if destructive_spawn_retirement is None
-                else {
-                    "_prestarted_spawn_retirement": destructive_spawn_retirement
-                }
-            )
-            removal_kwargs: dict[str, object] = {
-                "offboard_runtime": offboard_runtime,
-                **retirement_kwargs,
-            }
-            if offboarding_admission is not None:
-                removal_kwargs["offboarding_admission"] = offboarding_admission
-            exact_cleanup_child_did = expected_child_did
-            if (
-                exact_cleanup_child_did is not None
-                and child_agent is None
-                and (
-                    persistent_cleanup_child_did == exact_cleanup_child_did
-                    or registry_cleanup_child_did == exact_cleanup_child_did
-                )
-            ):
-                # A stopped persistent child has no route to bind. Carry the
-                # exact verified registry DID and its restart config into the
-                # cold identity offboarding path instead.
-                removal_kwargs["known_agent_id"] = exact_cleanup_child_did
-                removal_kwargs["known_agent_config"] = (
-                    registry_cleanup_witness.config
-                    if registry_cleanup_witness is not None
-                    and registry_cleanup_witness.child_did
-                    == exact_cleanup_child_did
-                    else self._persistent_spawn_cleanup_config(
-                        child_name,
-                        exact_cleanup_child_did,
+                elif exact_cleanup_child_did is not None:
+                    # Bind every signed or cleanup-only authority snapshot to the
+                    # exact tracked child so a same-name replacement cannot be
+                    # removed after any await.
+                    removal_kwargs["_lifecycle_cleanup_expected_agent_id"] = (
+                        exact_cleanup_child_did
                     )
+                try:
+                    removed = await self.remove_agent(child_name, **removal_kwargs)
+                except BaseException as removal_error:
+                    terminal_outcomes.append(removal_error)
+                    rollback_cancelled, rollback_failure = (
+                        await compensate_registration_if_not_admitted()
+                    )
+                    rollback_outcomes: list[BaseException] = [removal_error]
+                    if rollback_failure is not None:
+                        rollback_outcomes.append(rollback_failure)
+                    rollback_outcomes.extend(withdrawals)
+                    _raise_lifecycle_outcomes(
+                        f"Child {child_name!r} removal and registration compensation failed",
+                        rollback_outcomes,
+                    )
+                if not removed:
+                    rollback_cancelled, rollback_failure = (
+                        await compensate_registration_if_not_admitted()
+                    )
+                    if rollback_failure is not None:
+                        raise execution_finite_error(rollback_failure, *withdrawals)
+                    if rollback_cancelled:
+                        _raise_lifecycle_outcomes("Child removal compensation observed withdrawal",
+                                                  [*terminal_outcomes, *withdrawals])
+            except BaseException as exc:
+                terminal_outcomes.append(exc)
+                if (
+                    startup_registration is not None
+                    and offboarding_admission is not None
+                    and not offboarding_admission.started
+                ):
+                    self._restore_committed_spawn_startup_registration(
+                        startup_registration
+                    )
+                if not _is_lifecycle_terminal_outcome(exc) and not any(is_execution_control_error(error) for error in terminal_outcomes):
+                    raise
+                retirement_settlement = asyncio.create_task(
+                    self._settle_destructive_spawn_retirement(
+                        destructive_spawn_retirement
+                    ),
+                    name=f"terminate_child_retirement_settle:{child_name}",
                 )
-            elif exact_cleanup_child_did is not None:
-                # Bind every signed or cleanup-only authority snapshot to the
-                # exact tracked child so a same-name replacement cannot be
-                # removed after any await.
-                removal_kwargs["_lifecycle_cleanup_expected_agent_id"] = (
-                    exact_cleanup_child_did
+                (
+                    retirement_cancelled,
+                    retirement_failure,
+                ) = await await_lifecycle_task_completion(retirement_settlement, withdrawals=withdrawals)
+                if retirement_failure is not None:
+                    terminal_outcomes.append(retirement_failure)
+                reconciliation = asyncio.create_task(
+                    self._prune_child_tracking_if_fully_removed(parent_did, child_name),
+                    name=f"terminate_child_terminal_reconcile:{child_name}",
                 )
-            try:
-                removed = await self.remove_agent(child_name, **removal_kwargs)
-            except BaseException as removal_error:
-                rollback_cancelled, rollback_failure = (
-                    await compensate_registration_if_not_admitted()
-                )
-                rollback_outcomes: list[BaseException] = [removal_error]
-                if rollback_failure is not None:
-                    rollback_outcomes.append(rollback_failure)
-                rollback_outcomes.extend(withdrawals)
+                (
+                    reconciliation_cancelled,
+                    reconciliation_failure,
+                ) = await await_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
+                if reconciliation_failure is not None:
+                    if not _is_lifecycle_terminal_outcome(reconciliation_failure):
+                        raise reconciliation_failure
+                    logger.error(
+                        "Unable to reconcile terminal termination of child %r",
+                        child_name,
+                        exc_info=(
+                            type(reconciliation_failure),
+                            reconciliation_failure,
+                            reconciliation_failure.__traceback__,
+                        ),
+                    )
+                    terminal_outcomes.append(
+                        ChildTerminationReconciliationError(
+                            child_name=child_name,
+                            cause=reconciliation_failure,
+                        ) if isinstance(reconciliation_failure, Exception) else reconciliation_failure
+                    )
+                if (
+                    offboard_runtime
+                    and reconciliation_failure is None
+                    and reconciliation.result()
+                ):
+                    try:
+                        self._record_destructive_child_retirement(
+                            child_name,
+                            child_id=child_id,
+                            startup_registration=startup_registration,
+                        )
+                    except Exception as retirement_failure:
+                        terminal_outcomes.append(retirement_failure)
+                terminal_outcomes.extend(withdrawals)
                 _raise_lifecycle_outcomes(
-                    f"Child {child_name!r} removal and registration compensation failed",
-                    rollback_outcomes,
+                    f"Child {child_name!r} termination had terminal failures",
+                    terminal_outcomes,
                 )
             if not removed:
-                rollback_cancelled, rollback_failure = (
-                    await compensate_registration_if_not_admitted()
+                if (
+                    startup_registration is not None
+                    and offboarding_admission is not None
+                    and not offboarding_admission.started
+                ):
+                    self._restore_committed_spawn_startup_registration(
+                        startup_registration
+                    )
+                if terminal_outcomes:
+                    terminal_outcomes.append(
+                        ChildTerminationNotPerformedError(child_name=child_name)
+                    )
+                _raise_lifecycle_outcomes(
+                    f"Child {child_name!r} descendant termination failed",
+                    terminal_outcomes,
                 )
-                if rollback_failure is not None:
-                    raise execution_finite_error(rollback_failure, *withdrawals)
-                if rollback_cancelled:
-                    _raise_lifecycle_outcomes("Child removal compensation observed withdrawal",
-                                              [*terminal_outcomes, *withdrawals])
-        except BaseException as exc:
-            if (
-                startup_registration is not None
-                and offboarding_admission is not None
-                and not offboarding_admission.started
-            ):
-                self._restore_committed_spawn_startup_registration(
-                    startup_registration
-                )
-            if not _is_lifecycle_terminal_outcome(exc):
-                raise
-            retirement_settlement = asyncio.create_task(
-                self._settle_destructive_spawn_retirement(
-                    destructive_spawn_retirement
-                ),
-                name=f"terminate_child_retirement_settle:{child_name}",
-            )
-            (
-                retirement_cancelled,
-                retirement_failure,
-            ) = await await_lifecycle_task_completion(retirement_settlement, withdrawals=withdrawals)
-            if retirement_failure is not None:
-                terminal_outcomes.append(retirement_failure)
+                return False
+
+            if offboard_child_did is not None:
+                # The startup row was removed before destructive admission, but the
+                # durable capacity/name reservation remains load-bearing until the
+                # exact runtime tree is proven gone by remove_agent's completed
+                # offboarding result.
+                async with self._lock:
+                    self._retire_persistent_spawn_registration(
+                        child_name,
+                        offboard_child_did,
+                    )
+
+            # ``True`` means routing has been withdrawn, not necessarily that a
+            # timeout/cancellation-resistant shutdown or fenced refund is done:
+            # remove_agent may have handed either to quarantine.  Keep the parent
+            # edge and mandate until the authoritative maps *and* the per-name
+            # reaper reservation prove the complete removal.  A terminal drain
+            # performs the same reconciliation after it joins the reaper, so a
+            # late failed refund that restores its hold cannot race this pruning.
             reconciliation = asyncio.create_task(
                 self._prune_child_tracking_if_fully_removed(parent_did, child_name),
-                name=f"terminate_child_terminal_reconcile:{child_name}",
+                name=f"terminate_child_reconcile:{child_name}",
             )
             (
                 reconciliation_cancelled,
@@ -14852,7 +15005,7 @@ class AgentManager:
                 if not _is_lifecycle_terminal_outcome(reconciliation_failure):
                     raise reconciliation_failure
                 logger.error(
-                    "Unable to reconcile terminal termination of child %r",
+                    "Unable to reconcile completed termination of child %r",
                     child_name,
                     exc_info=(
                         type(reconciliation_failure),
@@ -14871,108 +15024,31 @@ class AgentManager:
                 and reconciliation_failure is None
                 and reconciliation.result()
             ):
-                try:
-                    self._record_destructive_child_retirement(
-                        child_name,
-                        child_id=child_id,
-                        startup_registration=startup_registration,
-                    )
-                except Exception as retirement_failure:
-                    terminal_outcomes.append(retirement_failure)
-            terminal_outcomes.append(exc)
-            terminal_outcomes.extend(withdrawals)
-            _raise_lifecycle_outcomes(
-                f"Child {child_name!r} termination had terminal failures",
-                terminal_outcomes,
-            )
-        if not removed:
-            if (
-                startup_registration is not None
-                and offboarding_admission is not None
-                and not offboarding_admission.started
-            ):
-                self._restore_committed_spawn_startup_registration(
-                    startup_registration
+                self._record_destructive_child_retirement(
+                    child_name,
+                    child_id=child_id,
+                    startup_registration=startup_registration,
                 )
-            if terminal_outcomes:
-                terminal_outcomes.append(
-                    ChildTerminationNotPerformedError(child_name=child_name)
+            if reconciliation_failure is None and reconciliation.result():
+                logger.info(
+                    f"Terminated child '{child_name}' of parent '{parent_did[:30]}...'"
+                )
+            else:
+                logger.info(
+                    "Child %r routing was withdrawn, but its retry tracking remains "
+                    "owned by delegated cleanup.",
+                    child_name,
                 )
             _raise_lifecycle_outcomes(
                 f"Child {child_name!r} descendant termination failed",
-                terminal_outcomes,
+                [*terminal_outcomes, *withdrawals],
             )
-            return False
-
-        if offboard_child_did is not None:
-            # The startup row was removed before destructive admission, but the
-            # durable capacity/name reservation remains load-bearing until the
-            # exact runtime tree is proven gone by remove_agent's completed
-            # offboarding result.
-            async with self._lock:
-                self._retire_persistent_spawn_registration(
-                    child_name,
-                    offboard_child_did,
-                )
-
-        # ``True`` means routing has been withdrawn, not necessarily that a
-        # timeout/cancellation-resistant shutdown or fenced refund is done:
-        # remove_agent may have handed either to quarantine.  Keep the parent
-        # edge and mandate until the authoritative maps *and* the per-name
-        # reaper reservation prove the complete removal.  A terminal drain
-        # performs the same reconciliation after it joins the reaper, so a
-        # late failed refund that restores its hold cannot race this pruning.
-        reconciliation = asyncio.create_task(
-            self._prune_child_tracking_if_fully_removed(parent_did, child_name),
-            name=f"terminate_child_reconcile:{child_name}",
-        )
-        (
-            reconciliation_cancelled,
-            reconciliation_failure,
-        ) = await await_lifecycle_task_completion(reconciliation, withdrawals=withdrawals)
-        if reconciliation_failure is not None:
-            if not _is_lifecycle_terminal_outcome(reconciliation_failure):
-                raise reconciliation_failure
-            logger.error(
-                "Unable to reconcile completed termination of child %r",
-                child_name,
-                exc_info=(
-                    type(reconciliation_failure),
-                    reconciliation_failure,
-                    reconciliation_failure.__traceback__,
-                ),
+            return True
+        except BaseException as error:
+            _raise_lifecycle_outcomes(
+                f"Child {child_name!r} enclosing termination failed",
+                [*terminal_outcomes, error, *withdrawals],
             )
-            terminal_outcomes.append(
-                ChildTerminationReconciliationError(
-                    child_name=child_name,
-                    cause=reconciliation_failure,
-                ) if isinstance(reconciliation_failure, Exception) else reconciliation_failure
-            )
-        if (
-            offboard_runtime
-            and reconciliation_failure is None
-            and reconciliation.result()
-        ):
-            self._record_destructive_child_retirement(
-                child_name,
-                child_id=child_id,
-                startup_registration=startup_registration,
-            )
-        if reconciliation_failure is None and reconciliation.result():
-            logger.info(
-                f"Terminated child '{child_name}' of parent '{parent_did[:30]}...'"
-            )
-        else:
-            logger.info(
-                "Child %r routing was withdrawn, but its retry tracking remains "
-                "owned by delegated cleanup.",
-                child_name,
-            )
-        _raise_lifecycle_outcomes(
-            f"Child {child_name!r} descendant termination failed",
-            [*terminal_outcomes, *withdrawals],
-        )
-        return True
 
     async def terminate_children(
         self,
@@ -15211,7 +15287,7 @@ class AgentManager:
                 expected, unexpected = exc.split(
                     (asyncio.CancelledError, Exception)
                 )
-                if unexpected is not None:
+                if unexpected is not None and not is_execution_control_error(exc):
                     raise unexpected
                 assert expected is not None
                 removed = fully_removed(name)
@@ -15404,7 +15480,7 @@ class AgentManager:
                 cancellation_group, unexpected = non_failures.split(
                     asyncio.CancelledError
                 )
-                if unexpected is not None:
+                if unexpected is not None and not is_execution_control_error(exc):
                     raise unexpected
             cancelled = cancelled or cancellation_group is not None
             if drain_failures is not None and not is_execution_control_error(exc):

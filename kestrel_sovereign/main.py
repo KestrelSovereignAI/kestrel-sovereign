@@ -226,26 +226,26 @@ async def main():
         agent_data_root=storage_dir,
     )
 
-    if args.app:
-        extension_class = None
-        if args.app == 'elderly':
-            from kestrel_sovereign.extensions.elderly_extension import ElderlyExtension
-            extension_class = ElderlyExtension
-        
-        if extension_class:
-            agent.extension = extension_class(agent)
-            agent.app_context = args.app
-            print(f"   Extension Loaded: {args.app}")
-
-    print("✅ Kestrel Agent Initialized.")
-    print(f"   DID: {agent.agent_id}")
-    print(f"   Memory: {db_path}")
-
-    decryption_error_count = 0
-    MAX_DECRYPTION_ERRORS = 3
-
     body_failure = None
     try:
+        if args.app:
+            extension_class = None
+            if args.app == 'elderly':
+                from kestrel_sovereign.extensions.elderly_extension import ElderlyExtension
+                extension_class = ElderlyExtension
+
+            if extension_class:
+                agent.extension = extension_class(agent)
+                agent.app_context = args.app
+                print(f"   Extension Loaded: {args.app}")
+
+        print("✅ Kestrel Agent Initialized.")
+        print(f"   DID: {agent.agent_id}")
+        print(f"   Memory: {db_path}")
+
+        decryption_error_count = 0
+        MAX_DECRYPTION_ERRORS = 3
+
         while True:
             user_input = input("\n> ")
             if user_input.lower() == '!quit':
@@ -292,23 +292,27 @@ async def main():
         raise
     finally:
         failures = [body_failure] if body_failure is not None else []
-        # Graceful shutdown with timeout
         try:
-            await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
-            print("Agent deactivated.")
-        except asyncio.TimeoutError:
-            print(
-                f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
-                "waiting for durable cleanup."
-            )
-        except asyncio.CancelledError as error:
-            failures.append(error)
-            print("Agent shutdown cancelled.")
-        except BaseException as e:
-            failures.append(e)
-            logger.debug(f"Error during shutdown: {e}")
-            print("Agent deactivated (with errors).")
-        await complete_bound_agent_shutdown(agent, hold_context, prior_errors=failures)
+            try:
+                await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
+                print("Agent deactivated.")
+            except asyncio.TimeoutError:
+                print(
+                    f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
+                    "waiting for durable cleanup."
+                )
+            except asyncio.CancelledError as error:
+                failures.append(error)
+                print("Agent shutdown cancelled.")
+            except BaseException as e:
+                failures.append(e)
+                logger.debug(f"Error during shutdown: {e}")
+                print("Agent deactivated (with errors).")
+        except BaseException as reporting_failure:
+            failures.append(reporting_failure)
+            raise
+        finally:
+            await complete_bound_agent_shutdown(agent, hold_context, prior_errors=failures)
 
 
 if __name__ == "__main__":

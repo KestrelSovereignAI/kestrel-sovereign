@@ -290,7 +290,12 @@ async def complete_bound_agent_shutdown(
 
     prior, errors = list(prior_errors), []
     observed = [] if withdrawals is None else withdrawals
-    await await_agent_shutdown_completion(agent, withdrawals=observed, finite_errors=errors)
+    try:
+        await await_agent_shutdown_completion(agent, withdrawals=observed, finite_errors=errors)
+    except BaseException as error:
+        # Completion observation cannot own an independently acquired context.
+        # Actual pending dependencies below still forbid early retirement.
+        errors.append(error)
     pending = []
     for error in (*prior, *errors):
         for _, task in execution_cleanup_debts(error):
@@ -328,7 +333,7 @@ async def _close_context_after_startup_failure(
 ) -> None:
     """Join context cleanup before propagating a failed startup phase."""
 
-    from kestrel_sovereign.execution_custody import execution_terminal_error
+    from kestrel_sovereign.execution_custody import execution_finite_error
 
     # The shared context drain already registers and physically joins every
     # original native closer through withdrawal. An extra collector Task here
@@ -346,9 +351,9 @@ async def _close_context_after_startup_failure(
                 cleanup_failure.__traceback__,
             ),
         )
-        raise execution_terminal_error(
+        raise execution_finite_error(
             startup_failure, cleanup_failure,
-            retain_originals=True, prefer_cancellation=True,
+            retain_originals=True, prefer_cancellation=True, isolate_control_originals=True,
         )
 
 
