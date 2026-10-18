@@ -70,7 +70,7 @@ async def mcp_boundary(tmp_path):
         'COPY peer.py .\nCMD ["python", "peer.py"]\n'
     )
     identity = uuid.uuid4().hex
-    image = f'kestrel-permission-seam-{identity}:test'
+    image = f'mcp-{identity}:test'
     async with AsyncExitStack() as cleanup:
         client = await asyncio.to_thread(docker.from_env)
         cleanup.push_async_callback(asyncio.to_thread, client.close)
@@ -98,6 +98,8 @@ async def mcp_boundary(tmp_path):
         owner = 'mcp:container:' + container
         handles = [name for name, candidate in agent._tool_to_feature.items() if candidate == owner]
         assert len(handles) == 1
+        assert handles[0].endswith('__record_marker'), agent._direct_tool_defs
+        assert len(handles[0]) <= agent.MAX_TOOL_NAME_LEN
 
         async def drain_calls():
             queue.cancel_all()
