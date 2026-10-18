@@ -105,3 +105,37 @@ def test_core_classification_does_not_split_genuine_unmarked_source_cancellation
     projected = execution_native_source_error(wrapped)
     assert projected is wrapped and source in tuple(_explicit_control_chain(projected))
     assert tuple(_explicit_control_chain(source)) == before
+
+
+@pytest.mark.parametrize("shape", ["source-cancellation", "source-group", "forged-provenance"])
+def test_finite_observer_reader_never_splits_genuine_or_forged_sources(shape):
+    from kestrel_sovereign.execution_custody import execution_observer_cancellations
+    native = ExecutionAuthorityError("genuine source authority")
+    source = asyncio.CancelledError("genuine source cancellation")
+    source.__cause__ = native
+    if shape == "source-group":
+        source = BaseExceptionGroup("genuine unmarked source group", [native, source])
+    if shape == "forged-provenance":
+        source._kestrel_finite_native_sources = (object(), (native,))
+    before = tuple(_explicit_control_chain(source))
+    assert execution_observer_cancellations(source) == ()
+    assert tuple(_explicit_control_chain(source)) == before
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "committed"])
+@pytest.mark.parametrize("source_group", [False, True])
+def test_core_finite_observer_reader_keeps_exact_distinct_observations(outcome, source_group):
+    from kestrel_sovereign.execution_custody import execution_observer_cancellations
+    native = ExecutionAuthorityError("genuine original authority")
+    source_c = asyncio.CancelledError("genuine source cancellation")
+    source_c.__cause__ = native
+    source = BaseExceptionGroup("genuine whole source", [native, source_c]) if source_group else source_c
+    first, second = asyncio.CancelledError("actual first observation"), asyncio.CancelledError("actual second observation")
+    finite = execution_terminal_error(source, first, retain_originals=True, isolate_control_originals=True)
+    classified = execution_error_with_cause(ExecutionCommitOutcomeError(outcome), finite)
+    wrapped = execution_error_with_cause(RuntimeError("ordinary Core diagnostic"), classified)
+    final = execution_terminal_error(wrapped, second, retain_originals=True, isolate_control_originals=True)
+    observations = execution_observer_cancellations(final)
+    assert {id(error) for error in observations} == {id(first), id(second)}
+    assert source_c not in observations
+    assert all(error not in tuple(_explicit_control_chain(execution_native_source_error(final))) for error in observations)

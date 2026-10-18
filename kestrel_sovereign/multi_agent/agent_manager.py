@@ -13055,6 +13055,7 @@ class AgentManager:
         slot_transferred = False
 
         async def revoke_then_shutdown() -> None:
+            from kestrel_sovereign.execution_custody import execution_observer_cancellations
             outcomes: list[BaseException] = []
             control: BaseException | None = None
 
@@ -13068,6 +13069,9 @@ class AgentManager:
                         # evidence before it can be erased by later success.
                         # Reuse the bounded reducer, never a raw retry history.
                         if is_execution_control_error(error):
+                            for observation in execution_observer_cancellations(error):
+                                if all(observation is not previous for previous in outcomes):
+                                    outcomes.append(observation)
                             control = _merge_manager_cleanup_control(control, error)
                             self._quarantined_shutdown_control = _merge_manager_cleanup_control(
                                 vars(self).get("_quarantined_shutdown_control"), error,

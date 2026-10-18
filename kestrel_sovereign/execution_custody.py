@@ -345,6 +345,22 @@ def _native_source_originals(error: BaseException | None) -> tuple[BaseException
     return (error,) if is_execution_control_error(error) else ()
 
 
+def execution_observer_cancellations(error: BaseException | None) -> tuple[asyncio.CancelledError, ...]:
+    """Read actual finite C only from authenticated Core composition.
+
+    A genuine unmarked source/group cannot be split just because it contains
+    cancellation. Canonical provenance identifies the native source graph;
+    cancellation outside that graph belongs to this finite observation, not
+    a shared native latch. Return exact objects without rewriting carriers.
+    """
+    sources = _canonical_native_source_originals(error)
+    if sources is None:
+        return ()
+    source_ids = {id(member) for source in sources for member in _explicit_control_chain(source)}
+    return tuple(member for member in _explicit_control_chain(error)
+                 if isinstance(member, asyncio.CancelledError) and id(member) not in source_ids)
+
+
 def execution_error_with_cause(wrapper: BaseException, error: BaseException) -> BaseException:
     """Core-owned wrappers preserve a canonical finite source projection.
 

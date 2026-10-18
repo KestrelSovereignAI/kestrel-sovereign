@@ -433,3 +433,11 @@ withdrawal returned after runtime cleanup
 stays with the original worker through witness settlement and slot publication;
 later failures cannot replace it. Completed physical phases do not acquire new
 retirement debt, and current withdrawal is not stored as shared native history.
+
+When an ordinary-class Core commit or diagnostic wrapper carries both native
+control and actual observer cancellation, restrictive retry retains the exact
+finite cancellation before projecting its bounded native summary. Only Core's
+authenticated finite provenance can distinguish those observations from genuine
+source cancellation or a genuine source group. The original carrier stays
+unchanged; later phase success or failure cannot erase its finite observations,
+and shared manager history remains source-only.
