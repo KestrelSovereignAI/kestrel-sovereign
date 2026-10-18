@@ -1637,6 +1637,20 @@ wheels = [
 ]
 
 [[package]]
+name = "docker"
+version = "7.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
+    { name = "requests" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/88/7f/731ff914b0255d3d065f45fd4e626d4b8c95dbcbaada049f337a6ac16410/docker-7.2.0.tar.gz", hash = "sha256:cebb93773d334f778e023a7ee352a8d6e13ab1bd3b863a4d4a59dec897df43ac", size = 118731, upload-time = "2026-07-09T14:53:46.39Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/75/23/529140fe1aab80fc6992f93a706deec709140a6397439139a054e1515c45/docker-7.2.0-py3-none-any.whl", hash = "sha256:a3f45fdeb9165e2d25d9a1d02ddf3bc70fb572cf5ebbf9b58558c22caf29b71f", size = 148775, upload-time = "2026-07-09T14:53:45.224Z" },
+]
+
+[[package]]
 name = "docstring-parser"
 version = "0.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2963,6 +2977,24 @@ wheels = [
 ]
 
 [[package]]
+name = "kestrel-feature-mcp"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "docker" },
+    { name = "httpx2" },
+    { name = "kestrel-sovereign-sdk" },
+    { name = "mcp" },
+    { name = "pydantic" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/68/9ba0ce1c75086f363ec2e8bb0522c23566a7a8c2fe7d651e2e7df2468699/kestrel_feature_mcp-0.5.0.tar.gz", hash = "sha256:d8d514792249168eb73e48d5dc688d67a5233638dc6d64a56e558c9d2a6ce15c", size = 163562, upload-time = "2026-10-18T15:58:51.553Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ed/bc/5f2d03c7f6827c551870ef86ff0585c1ff9be84cb234ad2aa01bb5f53e8a/kestrel_feature_mcp-0.5.0-py3-none-any.whl", hash = "sha256:db5ea77d9bf649059923d284cc24b0256897ac96e1ce62efd1a0018c24bcc76f", size = 47264, upload-time = "2026-10-18T15:58:50.153Z" },
+]
+
+[[package]]
 name = "kestrel-llm-bedrock"
 version = "0.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3216,6 +3248,9 @@ local = [
     { name = "setuptools" },
     { name = "spacy" },
 ]
+mcp-integration = [
+    { name = "kestrel-feature-mcp" },
+]
 ml = [
     { name = "accelerate" },
     { name = "diffusers" },
@@ -3303,6 +3338,7 @@ requires-dist = [
     { name = "idna", specifier = ">=3.20,<4" },
     { name = "iniconfig", specifier = "==2.3.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
+    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.5,<1" },
     { name = "kestrel-llms", extras = ["all"], specifier = "==0.1.8" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },
@@ -3376,7 +3412,7 @@ requires-dist = [
     { name = "uvicorn", specifier = "==0.48.0" },
     { name = "web3", marker = "extra == 'wallet'", specifier = ">=7.15.0" },
 ]
-provides-extras = ["test", "ml", "local", "observability", "phoenix", "cloud", "wallet", "delivery", "search", "all-features", "full"]
+provides-extras = ["mcp-integration", "test", "ml", "local", "observability", "phoenix", "cloud", "wallet", "delivery", "search", "all-features", "full"]
 
 [package.metadata.requires-dev]
 dev = [
