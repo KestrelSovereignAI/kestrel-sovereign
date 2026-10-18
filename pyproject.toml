@@ -109,7 +109,7 @@ dependencies = [
     # Release cascade: Frinz and the observability fleet must publish/test
     # constraints that admit this line before Core is released. Do not weaken
     # Core's safety floor to make an older downstream resolver succeed.
-    "kestrel-sovereign-sdk[httpx,tracing]>=0.39.1,<0.40",
+    "kestrel-sovereign-sdk[httpx,tracing]>=0.39.2,<0.40",
     # Core web framework
     # Pre-1.0 router internals changed in a minor release. Advance this tested
     # current line with the native router/CSRF/frontend acceptance checks.

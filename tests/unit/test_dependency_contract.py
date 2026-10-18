@@ -54,14 +54,15 @@ SECURITY_FLOORS = {
 # context-clause contributions, 0.38.1 adds awaited preparation before
 # synchronous context rendering, and 0.39.0 adds the decisions contract (LLM
 # contract v7, #3424) that ``LLMService.decide`` is built on. Version 0.39.1
-# adds the shared outbound policy and native pinned transports used by Core's
-# avatar and did:web fetchers (#3679). This remains a Core-only
+# adds the shared outbound policy and native pinned transports; 0.39.2 fixes
+# their canonical host identity before DNS and native requests (#3679).
+# Core's avatar and did:web fetchers require that correction. This is a Core-only
 # release gate: sibling packages are released from their own repositories, but
 # Core must never
 # silently lower its declared/locked line to accommodate an older Frinz or
 # observability constraint. Their compatible releases remain a documented
 # release-cascade prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.39.1"), ("<", "0.40")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.39.2"), ("<", "0.40")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
@@ -277,7 +278,8 @@ def test_sdk_039_release_cascade_contract_is_declared():
     for specifier in (base.specifier, base.specifier & observability.specifier):
         assert Version("0.38.2") not in specifier
         assert Version("0.39.0") not in specifier
-        assert Version("0.39.1") in specifier
+        assert Version("0.39.1") not in specifier
+        assert Version("0.39.2") in specifier
         assert Version("0.40.0") not in specifier
 
     # The human release contract identifies downstream gates without probing
@@ -320,5 +322,5 @@ def test_sdk_039_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.39.1") <= version < Version("0.40.0") for version in sdk_versions
+        Version("0.39.2") <= version < Version("0.40.0") for version in sdk_versions
     )

@@ -326,9 +326,10 @@ use the scheduler host's own storage pool, not the agents' advisory pool.
 
 #### SDK 0.39 release cascade
 
-Core requires `kestrel-sovereign-sdk[httpx,tracing]>=0.39.1,<0.40`; the
-`observability` extra adds `metrics` under that same base constraint. 0.39.1
-owns the canonical outbound URL/IP policy and native pinned HTTP transport;
+Core requires `kestrel-sovereign-sdk[httpx,tracing]>=0.39.2,<0.40`; the
+`observability` extra adds `metrics` under that same base constraint. The SDK
+owns the canonical outbound URL/IP policy and native pinned HTTP transport.
+Version 0.39.2 aligns DNS, canonical URLs and native origin checks to IDNA 2008;
 avatar downloads and DID resolution use it. Core retains only its stdlib HTTPS
 I/O implementation for DID documents. That binding shares one TCP/TLS deadline
 across approved addresses, retries TCP connection failures only, and keeps

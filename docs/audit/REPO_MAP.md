@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-18
-**Scope:** 3135 tracked files (2328 `.py`, 358 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3137 tracked files (2329 `.py`, 359 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2154,6 +2154,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.53.27.md** — Core 0.53.27 — Named `kestrel start <name>` launches now direct child output to the agent's append-only log file.
 - **docs/releases/v0.53.28.md** — Core 0.53.28 — Hosted execution custody — Status: unreleased; review and full release gates remain required.
 - **docs/releases/v0.53.31.md** — Core 0.53.31 — Private native HTTP admission — Status: candidate; publication and artifact verification remain required.
+- **docs/releases/v0.53.32.md** — Core 0.53.32 — Atomic stream-owner construction — Status: candidate; publication and artifact verification remain required.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
@@ -5074,6 +5075,8 @@ Repo entry points and standard project files.
   - `class TestTheLedgerIsNotABootstrapFile`; `class TestRowsAreIndividuallyAddressable`; `class TestSupersession`; `class TestProjection`; `class TestQueryLayer`; `class TestBlockerReconciliation`; `class TestExistingReadersStillSeeBlockers`; `class TestUnreadableLedgerCannotDeleteTheIndex`; `…`
 - **tests/unit/test_strategy_ledger_external_edits.py** — STRATEGY_LEDGER.yaml edits made while the agent runs must survive its writes (#3636).
   - `class TestExternalEditsSurviveWrites`; `class TestUnchangedDiskWritesAsBefore`; `class TestRefusedWritesLeaveTheFileUntouched`; `class TestFailedWritesLeaveTheOriginalIntact`; `class TestReplacementKeepsTheFilesShape`; `class TestCommit`; `class TestAtomicFile`
+- **tests/unit/test_stream_constructor_admission.py** — Original native stream Tasks remain owned at every constructor publication.
+  - `async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, factory_kind, first_kind, phase, …)`; `async def test_public_http_constructor_failure_physically_joins_original(tmp_path, surface, join_failure)`; `async def test_actual_foreign_privacy_frame_retains_failed_native_handoff(tmp_path, publication, receipt)`; `async def test_lazy_genai_stream_retains_original_creation_authority(tmp_path, foreign)`
 - **tests/unit/test_stream_progress_watchdog.py** — #3357: provider progress that yields no stream item keeps a call alive.
   - `def test_a_tool_call_whose_arguments_outlast_the_bound_is_not_cut(kind, route)`; `def test_omitted_thinking_that_outlasts_the_bound_is_not_cut(route)`; `def test_hidden_thinking_deltas_that_outlast_the_bound_are_not_cut(kind, route)`; `def test_the_text_only_stream_counts_hidden_thinking_too(kind)`; `def test_omitted_thinking_does_not_cut_a_non_streaming_answer()`; `def test_a_stream_that_goes_silent_mid_tool_call_is_still_cut(kind, route)`; `def test_a_stream_that_never_sends_anything_is_still_cut(kind, route)`; `def test_a_stream_whose_pings_stop_is_cut_one_bound_after_the_last()`; `…`
 - **tests/unit/test_stream_tap.py** — Unit tests for the generic agent stream tap.
