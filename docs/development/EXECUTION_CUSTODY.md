@@ -2039,3 +2039,20 @@ original deadline. PostgreSQL COMMIT/rollback exits classify and compose private
 evidence without appending caller cancellation or rollback debt to a prior source.
 The native tests use real local PG/SQLite effects and declared training/spawn
 seams, not authenticated provider billing, signed genesis or deployed acceptance.
+
+Spawn admission covers the original Task's creation and publication as well as
+its body: a refused recipe is closed, an accepted Task is recorded before any
+await, and the exact cap/name admission is retired even if the body never starts.
+Release joins use actual delivered withdrawal objects, never a pending cancellation
+count. Batch readiness carries those objects in a finite per-call collection.
+Best-effort published readiness may consume an ordinary hook cancellation, but
+never one carrying native execution control.
+
+PostgreSQL transaction entry settles eager lineage before selecting even a borrowed
+operational connection; inherited context cannot start a native transaction on an
+unenrolled preexisting lease. Pool adapters and nested savepoints isolate their
+finite failure evidence just like top-level exits. Advisory retirement debt is a
+private carrier even when physical close raises the very same original source.
+Core diagnostic and commit-classification wrappers forward authenticated source
+provenance: current observer withdrawal remains finite, while shared SafeMode and
+shutdown latches keep source-only evidence without editing genuine originals.

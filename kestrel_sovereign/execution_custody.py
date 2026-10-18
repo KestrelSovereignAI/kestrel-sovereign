@@ -303,15 +303,44 @@ def is_scope_local_execution_control(error: BaseException | None, captured_scope
 _FINITE_NATIVE_SOURCES = object()
 
 
-def _native_source_originals(error: BaseException | None) -> tuple[BaseException, ...]:
-    """Flatten only canonical finite carriers, never genuine source groups."""
+def _canonical_native_source_originals(error: BaseException | None) -> tuple[BaseException, ...] | None:
+    """Only authenticated canonical finite provenance can split a source."""
     if error is None:
-        return ()
+        return None
     provenance = vars(error).get("_kestrel_finite_native_sources")
     if (type(provenance) is tuple and len(provenance) == 2
             and provenance[0] is _FINITE_NATIVE_SOURCES):
         return provenance[1]
+    return None
+
+
+def _native_source_originals(error: BaseException | None) -> tuple[BaseException, ...]:
+    """Flatten only canonical finite carriers, never genuine source groups."""
+    if error is None:
+        return ()
+    sources = _canonical_native_source_originals(error)
+    if sources is not None:
+        return sources
     return (error,) if is_execution_control_error(error) else ()
+
+
+def execution_error_with_cause(wrapper: BaseException, error: BaseException) -> BaseException:
+    """Core-owned wrappers preserve a canonical finite source projection.
+
+    Raising a new diagnostic/classification wrapper must not turn its finite
+    observer C into a genuine source. Unmarked originals, including source
+    cancellations/groups, remain intact. A commit classifier additionally
+    carries its NEW native outcome on a private source-only classifier.
+    """
+    wrapper.__cause__ = error
+    sources = _canonical_native_source_originals(error)
+    if sources is not None:
+        if isinstance(wrapper, ExecutionCommitOutcomeError):
+            classified_source = ExecutionCommitOutcomeError(wrapper.commit_outcome)
+            classified_source.__cause__ = execution_native_source_error(error)
+            sources = (classified_source,)
+        wrapper._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, sources)
+    return wrapper
 
 
 def execution_native_source_error(*errors: BaseException | None) -> BaseException | None:

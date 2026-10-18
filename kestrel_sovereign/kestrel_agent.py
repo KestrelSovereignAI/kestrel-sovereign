@@ -9705,8 +9705,13 @@ Expected Duration: {expected_duration}
         # project them without mutating either original carrier.
         channel = ("_shutdown_lifecycle_control" if retain_originals
                    else "_shutdown_background_control")
+        if not retain_cancellation:
+            # Ordinary finite observer C is not a native source. Explicit
+            # shutdown-owned cancellation keeps its separate opt-in contract.
+            error = execution_native_source_error(error)
         setattr(self, channel, execution_terminal_error(
             vars(self).get(channel), error, retain_originals=retain_originals,
+            isolate_control_originals=retain_originals,
         ))
         lifecycle = vars(self).get("_shutdown_lifecycle_control")
         background = vars(self).get("_shutdown_background_control")

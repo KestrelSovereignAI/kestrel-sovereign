@@ -347,13 +347,9 @@ async def test_spawn_snapshots_mutable_mandate_before_admission_await(tmp_path):
         "restricted_tool_args": {"fetch": {"host": ["example.test"]}}
     }
     assert captured.purpose == "validated proposal"
-    await manager._release_agent_operations(
-        [
-            manager._agent_operations[
-                manager._canonical_agent_name("SnapshotChild")
-            ]
-        ]
-    )
+    # The mock body has no retirement finally. The public entry now owns
+    # that final name release too; proposal assertions above are unchanged.
+    assert manager._agent_operations == {}
 
 
 @pytest.mark.asyncio
@@ -2141,10 +2137,10 @@ async def test_final_publication_verification_cannot_finish_after_deadline(
 
     original_join = manager_module.await_lifecycle_task_completion
 
-    async def _delay_final_publication_join(task):
+    async def _delay_final_publication_join(task, *, withdrawals=None):
         if task.get_name().startswith("agent_readiness_publication_check:"):
             await asyncio.sleep(0.03)
-        return await original_join(task)
+        return await original_join(task, withdrawals=withdrawals)
 
     monkeypatch.setattr(
         manager_module,
@@ -7925,6 +7921,7 @@ class TestAgentManagerBasics:
     async def test_load_from_config_cancellation_releases_every_batch_admission(
         self,
         tmp_path,
+        monkeypatch,
     ) -> None:
         """Cancellation during the first final release cannot strand its peers."""
 
@@ -7938,6 +7935,16 @@ class TestAgentManagerBasics:
             "Beta": _make_mock_agent("did:test:batch-release-beta"),
         }
         final_publication_holds_state_lock = asyncio.Event()
+        from kestrel_sovereign.multi_agent import agent_manager as manager_module
+        actual_join, withdrawals = manager_module.await_lifecycle_task_completion, []
+        async def join(task, *args, **kwargs):
+            observed = kwargs.pop("withdrawals", None)
+            observed = observed if observed is not None else []
+            previous_count = len(observed)
+            result = await actual_join(task, *args, withdrawals=observed, **kwargs)
+            withdrawals.extend(observed[previous_count:])
+            return result
+        monkeypatch.setattr(manager_module, "await_lifecycle_task_completion", join)
 
         async def initialize(name, *_args, **_kwargs):
             return agents[name]
@@ -7956,13 +7963,14 @@ class TestAgentManagerBasics:
         try:
             # The batch has committed both agents and is blocked retiring its
             # first admission. Its cancellation must join both release tasks.
-            batch.cancel()
+            batch.cancel("actual batch readiness observer withdrew")
             await asyncio.sleep(0)
         finally:
             manager._lock.release()
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as cancelled:
             await asyncio.wait_for(batch, timeout=1.0)
+        assert withdrawals and any(cancelled.value is error for error in withdrawals)
 
         assert manager.list_agents() == agents
         assert manager._agent_operations == {}

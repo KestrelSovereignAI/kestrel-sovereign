@@ -4,7 +4,8 @@ import asyncio
 import pytest
 
 from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError, _explicit_control_chain,
+    ExecutionAuthorityError, ExecutionCommitOutcomeError, _explicit_control_chain,
+    execution_commit_outcome, execution_error_with_cause,
     execution_native_source_error, execution_terminal_error,
 )
 
@@ -76,3 +77,31 @@ async def test_physical_task_harvest_projects_its_canonical_finite_source():
     projected = execution_native_source_error(joined)
     assert source in tuple(_explicit_control_chain(projected))
     assert withdrawal not in tuple(_explicit_control_chain(projected))
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "committed"])
+def test_core_classification_and_diagnostic_wrappers_forward_finite_sources(outcome):
+    source = ExecutionAuthorityError("declared original native source")
+    withdrawal = asyncio.CancelledError("independent finite observer")
+    finite = execution_terminal_error(source, withdrawal,
+        retain_originals=True, isolate_control_originals=True)
+    classified = execution_error_with_cause(ExecutionCommitOutcomeError(outcome), finite)
+    current = classified
+    for index in range(5):
+        current = execution_error_with_cause(RuntimeError(f"Core diagnostic wrapper {index}"), current)
+        projected = execution_native_source_error(current)
+        chain = tuple(_explicit_control_chain(projected))
+        assert source in chain and withdrawal not in chain and len(chain) == 2
+        assert execution_commit_outcome(projected) == outcome
+        assert withdrawal in tuple(_explicit_control_chain(current))
+    assert tuple(_explicit_control_chain(source)) == (source,)
+
+
+def test_core_classification_does_not_split_genuine_unmarked_source_cancellation():
+    source = asyncio.CancelledError("genuine source cancellation")
+    source.__cause__ = ExecutionAuthorityError("source native receipt")
+    before = tuple(_explicit_control_chain(source))
+    wrapped = execution_error_with_cause(ExecutionCommitOutcomeError("unknown"), source)
+    projected = execution_native_source_error(wrapped)
+    assert projected is wrapped and source in tuple(_explicit_control_chain(projected))
+    assert tuple(_explicit_control_chain(source)) == before

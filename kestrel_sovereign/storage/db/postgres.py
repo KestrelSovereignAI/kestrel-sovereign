@@ -45,6 +45,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionCommitOutcomeError,
     execution_commit_outcome,
     execution_denial_scopes,
+    execution_error_with_cause,
     execution_terminal_error,
     current_execution_custody,
     lock_execution_authority,
@@ -746,7 +747,7 @@ class PostgresBackend(DatabaseBackend):
             logger.debug(f"Connected to PostgreSQL pool (size: {self._min_pool_size}-{self._max_pool_size})")
             
         except Exception as e:
-            raise ConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
+            raise execution_error_with_cause(ConnectionError(f"Failed to connect to PostgreSQL: {e}"), e)
     
     async def close(self) -> None:
         """Join independent original pool closers, retaining refused owners.
@@ -831,9 +832,9 @@ class PostgresBackend(DatabaseBackend):
             except ConnectionError:
                 raise
             except Exception as exc:
-                raise ConnectionError(
+                raise execution_error_with_cause(ConnectionError(
                     f"Failed to create dedicated PostgreSQL advisory-lock pool: {exc}"
-                ) from exc
+                ), exc)
             self._advisory_pool = pool
             return pool
     
@@ -972,8 +973,10 @@ class PostgresBackend(DatabaseBackend):
                     await native.__aexit__(type(failure) if failure is not None else None,
                         failure, failure.__traceback__ if failure is not None else None)
                 except BaseException as cleanup:
-                    failure = execution_terminal_error(failure, cleanup, retain_originals=True)
-            failure = execution_terminal_error(state.body_failure, state.terminal, failure, retain_originals=True)
+                    failure = execution_terminal_error(failure, cleanup, retain_originals=True,
+                        isolate_control_originals=True)
+            failure = execution_terminal_error(state.body_failure, state.terminal, failure, retain_originals=True,
+                isolate_control_originals=True)
             if failure is not None:
                 # A new wrapper error AFTER successful reset is still an
                 # observer of this checkout's already-proven commit. Attach
@@ -982,7 +985,7 @@ class PostgresBackend(DatabaseBackend):
                 if state.outcome is not None and not is_execution_control_error(failure):
                     for scope in state.scopes:
                         scope.preserve_commit_uncertainty(state.outcome)
-                    raise ExecutionCommitOutcomeError(state.outcome) from failure
+                    raise execution_error_with_cause(ExecutionCommitOutcomeError(state.outcome), failure)
                 if admit_work and state.acknowledgments and execution_commit_outcome(failure) == "committed":
                     failure = self._retain_after_commit_denial(failure, state.scopes, state.acknowledgments)
                 raise failure
@@ -1091,7 +1094,7 @@ class PostgresBackend(DatabaseBackend):
                     for scope in state.scopes:
                         scope.preserve_commit_uncertainty(outcome)
                     if execution_commit_outcome(terminal) is None:
-                        raise ExecutionCommitOutcomeError(outcome) from terminal
+                        raise execution_error_with_cause(ExecutionCommitOutcomeError(outcome), terminal)
                 raise terminal
             terminal = execution_terminal_error(body_failure, retired.cancellation,
                 retain_originals=True, isolate_control_originals=True)
@@ -1153,9 +1156,10 @@ class PostgresBackend(DatabaseBackend):
                 for scope in scopes:
                     scope.preserve_commit_uncertainty("committed")
                 failure = ExecutionCommitOutcomeError("committed")
-                failure.__cause__ = denial
+                failure = execution_error_with_cause(failure, denial)
                 denial = failure
-            return execution_terminal_error(original, denial, retain_originals=True)
+            return execution_terminal_error(original, denial, retain_originals=True,
+                isolate_control_originals=True)
         return original
 
     @asynccontextmanager
@@ -1251,7 +1255,7 @@ class PostgresBackend(DatabaseBackend):
                     outcome = execution_commit_outcome(physical) or "unknown"
                     if execution_commit_outcome(physical) is None:
                         classified = ExecutionCommitOutcomeError(outcome)
-                        classified.__cause__ = physical
+                        classified = execution_error_with_cause(classified, physical)
                         physical = classified
                     terminal = execution_terminal_error(
                         physical, completed.cancellation, retain_originals=True,
@@ -1293,7 +1297,12 @@ class PostgresBackend(DatabaseBackend):
                 if receipt is not None:
                     retain_acknowledged_execution_commit(terminal, receipt)
                 elif committing:
-                    raise ExecutionCommitOutcomeError("unknown") from terminal
+                    # This is actual observer withdrawal after an unproven
+                    # successful exit, NOT a physical source cancellation.
+                    raise execution_terminal_error(
+                        ExecutionCommitOutcomeError("unknown"), terminal,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
                 raise terminal
 
     @staticmethod
@@ -1317,7 +1326,7 @@ class PostgresBackend(DatabaseBackend):
                 raise
             for scope in scopes:
                 scope.preserve_commit_uncertainty("committed")
-            raise ExecutionCommitOutcomeError("committed") from exc
+            raise execution_error_with_cause(ExecutionCommitOutcomeError("committed"), exc)
 
     @staticmethod
     def _strip_tz(params: Params) -> Tuple[Any, ...]:
@@ -1382,7 +1391,7 @@ class PostgresBackend(DatabaseBackend):
                     )
                     await asyncio.sleep(retry_delay)
                     continue
-                raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
+                raise execution_error_with_cause(QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}"), e)
     
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""
@@ -1411,7 +1420,7 @@ class PostgresBackend(DatabaseBackend):
             return len(params_list)  # asyncpg doesn't return affected count
             
         except Exception as e:
-            raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
+            raise execution_error_with_cause(QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}"), e)
     
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
         """Fetch a single row."""
@@ -1436,7 +1445,7 @@ class PostgresBackend(DatabaseBackend):
             return tuple(row.values())
             
         except Exception as e:
-            raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
+            raise execution_error_with_cause(QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}"), e)
     
     async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
         """Fetch all rows."""
@@ -1459,7 +1468,7 @@ class PostgresBackend(DatabaseBackend):
             return [tuple(row.values()) for row in rows]
             
         except Exception as e:
-            raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
+            raise execution_error_with_cause(QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}"), e)
     
     async def fetch_val(self, query: str, params: Params = ()) -> Optional[Any]:
         """Fetch a single value."""
@@ -1479,7 +1488,7 @@ class PostgresBackend(DatabaseBackend):
                     return await checked.fetchval(pg_query, *params)
             
         except Exception as e:
-            raise QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}") from e
+            raise execution_error_with_cause(QueryError(f"Query failed: {_failure_detail(e)}\nQuery: {pg_query}"), e)
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
@@ -1505,7 +1514,7 @@ class PostgresBackend(DatabaseBackend):
                                 await checked.execute(script)
                     
         except Exception as e:
-            raise QueryError(f"Script execution failed: {_failure_detail(e)}") from e
+            raise execution_error_with_cause(QueryError(f"Script execution failed: {_failure_detail(e)}"), e)
 
     @staticmethod
     async def _verify_operational_cluster_identity(
@@ -1522,10 +1531,10 @@ class PostgresBackend(DatabaseBackend):
                 "FROM pg_catalog.pg_control_system()"
             )
         except Exception as exc:
-            raise QueryError(
+            raise execution_error_with_cause(QueryError(
                 "PostgreSQL operational session cluster identity could not be "
                 "verified"
-            ) from exc
+            ), exc)
         if (
             not isinstance(actual_cluster_identity, str)
             or not actual_cluster_identity.strip()
@@ -1602,6 +1611,7 @@ class PostgresBackend(DatabaseBackend):
         no open connection (its ContextVar is the default) and acquires its own —
         so concurrent transactions no longer collide on a shared attribute.
         """
+        await _settle_native_observer_enrollment()
         pool = self._ensure_connected()
 
         existing = self._current_txn_conn()
@@ -1623,7 +1633,8 @@ class PostgresBackend(DatabaseBackend):
                         raise
             except BaseException as cleanup:
                 after_commit.roll_back_savepoint()
-                raise execution_terminal_error(body_failure, cleanup)
+                raise execution_terminal_error(body_failure, cleanup,
+                    retain_originals=True, isolate_control_originals=True)
             after_commit.release_savepoint()
             return
 
@@ -1649,7 +1660,7 @@ class PostgresBackend(DatabaseBackend):
                     except ExecutionCommitOutcomeError:
                         raise
                     except Exception as e:
-                        raise TransactionError(f"Transaction failed: {_failure_detail(e)}") from e
+                        raise execution_error_with_cause(TransactionError(f"Transaction failed: {_failure_detail(e)}"), e)
                     finally:
                         custody_var.reset(custody_token)
                         self._after_commit_context().reset(after_commit_token)
@@ -1674,7 +1685,7 @@ class PostgresBackend(DatabaseBackend):
             except ExecutionCommitOutcomeError:
                 raise
             except Exception as e:
-                raise TransactionError(f"Transaction failed: {_failure_detail(e)}") from e
+                raise execution_error_with_cause(TransactionError(f"Transaction failed: {_failure_detail(e)}"), e)
             finally:
                 custody_var.reset(custody_token)
                 self._after_commit_context().reset(after_commit_token)
@@ -1709,15 +1720,16 @@ class PostgresBackend(DatabaseBackend):
                 connection, connection, refusal, scopes, original, native,
             )
         outcome = await await_owned_task(closer)
+        debt = None
+        if outcome.error is not None:
+            debt = RuntimeError("original advisory session retirement failed")
+            debt.__cause__ = outcome.error
+            debt._kestrel_native_retirement_debts = ((resource, closer),)
         terminal = execution_terminal_error(
-            original, outcome.error, outcome.cancellation, retain_originals=True,
+            original, debt, outcome.error, outcome.cancellation, retain_originals=True,
             isolate_control_originals=True,
         )
         if outcome.error is not None:
-            terminal._kestrel_native_retirement_debts = (
-                *getattr(terminal, "_kestrel_native_retirement_debts", ()),
-                (resource, closer),
-            )
             for scope in scopes:
                 scope.revoke("original advisory session retirement failed")
         return terminal

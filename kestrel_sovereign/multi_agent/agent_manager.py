@@ -696,8 +696,9 @@ class _OwnedLifecycleOperation:
                 isolate_control_originals=True,
             )
         withdrawal = outcome.cancellation if outcome is not None else None
-        joiner = asyncio.current_task()
-        cancelled = withdrawal is not None or bool(joiner and joiner.cancelling())
+        # A pending cancellation count may already have been handled by the
+        # body. Only an actual newly delivered withdrawal is a join outcome.
+        cancelled = withdrawal is not None
         return cancelled, execution_terminal_error(
             self.failure, outcome.error if outcome is not None else None, withdrawal, retain_originals=True,
             isolate_control_originals=True,
@@ -5031,6 +5032,7 @@ class AgentManager:
         *,
         deadline: Optional[float],
         admission: AgentOperationAdmission,
+        withdrawals: list[BaseException] | None = None,
     ) -> None:
         """Keep wake-capable readiness inside a signed ephemeral lifetime.
 
@@ -5047,8 +5049,10 @@ class AgentManager:
                 name=f"agent_deferred_readiness:{name}",
             )
             caller_cancelled, failure = await await_lifecycle_task_completion(
-                task
+                task, withdrawals=withdrawals,
             )
+            if failure is not None and is_execution_control_error(failure):
+                raise execution_terminal_error(failure)
             if isinstance(failure, asyncio.CancelledError):
                 # Ready hooks are best-effort after publication. A compatible
                 # agent can surface a hook-owned cancellation instead of
@@ -5177,6 +5181,7 @@ class AgentManager:
         deadline: Optional[float],
         failure_description: str,
         scheduler_lifecycle_lock_held: bool = False,
+        withdrawals: list[BaseException] | None = None,
     ) -> None:
         """Run post-publication readiness or cascade its published effects."""
 
@@ -5186,6 +5191,7 @@ class AgentManager:
                 agent,
                 deadline=deadline,
                 admission=admission,
+                withdrawals=withdrawals,
             )
             # Ready hooks are wake-capable and may remove their own agent; a
             # concurrent DELETE/shutdown can do the same while the hook awaits.
@@ -5209,7 +5215,7 @@ class AgentManager:
             )
             _verification_cancelled, verification_failure = (
                 await self._await_before_spawn_admission_deadline(
-                    lambda: await_lifecycle_task_completion(verification),
+                    lambda: await_lifecycle_task_completion(verification, withdrawals=withdrawals),
                     deadline=deadline,
                     phase="agent readiness publication verification",
                     agent=agent,
@@ -6189,11 +6195,9 @@ class AgentManager:
                 release, phase="agent_operation_release", resource=admission,
             )
             admission._release_owner = owner
-        cancelled, failure = await owner.join(admission.canonical_name)
+        _cancelled, failure = await owner.join(admission.canonical_name)
         if failure is not None:
             raise failure
-        if cancelled:
-            raise asyncio.CancelledError()
 
     async def _settle_owned_lifecycle_tasks(
         self,
@@ -7350,6 +7354,10 @@ class AgentManager:
         # a concurrent dynamic create/load fail before duplicate initialization.
         admitted: list[tuple[str, LocalAgentConfig, AgentOperationAdmission]] = []
         batch_failure = None
+        # Finite batch caller evidence: committed per-agent loads may finish
+        # readiness successfully after withdrawal, but the aggregate must
+        # retain the ACTUAL C, not infer one later from cancelling() counts.
+        batch_withdrawals: list[BaseException] = []
         try:
             for name, agent_cfg in pending:
                 try:
@@ -7675,6 +7683,7 @@ class AgentManager:
                             failure_description=(
                                 "Batch agent readiness and its published rollback failed"
                             ),
+                            withdrawals=batch_withdrawals,
                         )
                         self._commit_host_onboarding(result)
                         loaded += 1
@@ -7798,14 +7807,15 @@ class AgentManager:
             except BaseException as error:
                 release_failure = error
             terminal = execution_terminal_error(
-                batch_failure, release_failure, release_cancelled or None, retain_originals=True,
-                isolate_control_originals=True,
+                batch_failure, release_failure, release_cancelled or None,
+                *batch_withdrawals, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
             )
             if terminal is not None and is_execution_control_error(terminal):
                 raise terminal
             if release_failure is not None:
                 raise terminal
-            if release_cancelled:
+            if release_cancelled or batch_withdrawals:
                 raise terminal
 
     @property
@@ -11323,22 +11333,59 @@ class AgentManager:
         # terminal descendant fence can now either join this exact task or
         # make its cap admission fail; there is no unclassified middle state.
         admission.spawn_parent = parent_agent
-        spawn_operation = asyncio.create_task(
-            self._run_admitted_spawn(
-                name,
-                parent_agent,
-                mandate,
-                admission,
-            ),
-            name=f"agent_spawn:{admission.canonical_name}",
+        return await self._run_spawn_operation(
+            self._run_admitted_spawn(name, parent_agent, mandate, admission),
+            admission, task_name=f"agent_spawn:{admission.canonical_name}",
         )
-        # Nested create -> load admission follows the operation task, not the
-        # request/cognition task that happens to call ``spawn_agent``. Terminal
-        # drains therefore join exactly through rollback/commit and cannot be
-        # held open by unrelated caller work after this method returns.
-        admission.owner_task = spawn_operation
-        admission.spawn_task = spawn_operation
-        return await spawn_operation
+
+    async def _run_spawn_operation(
+        self, operation: Awaitable[KestrelAgent], admission: AgentOperationAdmission,
+        *, task_name: str,
+    ) -> KestrelAgent:
+        """One entry boundary owns acceptance, unstarted work and name release.
+
+        The child body cannot retire its admission if Task creation, publication
+        or its first turn is refused. Inventory the exact accepted Task before
+        any await, join it, then retire any admission the body did not reach.
+        Neither refusal nor observer withdrawal can create a replacement spawn.
+        """
+        receipt = OwnedTaskAdmission()
+        opening = None
+        try:
+            task = create_owned_task(operation, name=task_name,
+                retain_originals=True, admission=receipt)
+        except BaseException as error:
+            opening, task = error, receipt.task
+        outcome = None
+        if task is not None:
+            admission.owner_task = admission.spawn_task = task
+            outcome = await await_owned_task(task, cancel_on_caller_cancellation=True)
+        release_failure = None
+        if (self._agent_operations.get(admission.canonical_name) is admission
+                or admission.spawn_slot_active):
+            try:
+                release_failure = await self._retire_spawn_slot_and_admission(
+                    admission, spawn_slot_admitted=admission.spawn_slot_active,
+                )
+            except BaseException as error:
+                release_failure = error
+        body_failure = outcome.error if outcome is not None else None
+        withdrawal = outcome.cancellation if outcome is not None else None
+        if (opening is None and body_failure is None and admission.committed
+                and not is_execution_control_error(release_failure)):
+            # A published child remains published after a successful tail;
+            # ordinary post-publication observer C cannot undo that commit.
+            if release_failure is None or isinstance(release_failure, asyncio.CancelledError):
+                return outcome.result
+        errors = (withdrawal, body_failure) if isinstance(body_failure, asyncio.CancelledError) else (body_failure, withdrawal)
+        terminal = execution_terminal_error(
+            opening, *errors, release_failure, retain_originals=True,
+            prefer_cancellation=body_failure is None or isinstance(body_failure, asyncio.CancelledError),
+            isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
+        return outcome.result
 
     async def _run_admitted_spawn(
         self,
@@ -11474,13 +11521,10 @@ class AgentManager:
                             retain_originals=True, prefer_cancellation=True,
                             isolate_control_originals=True)
 
-            spawn_operation = asyncio.create_task(
-                run_direct_spawn(),
-                name=f"agent_direct_spawn:{admission.canonical_name}",
+            return await self._run_spawn_operation(
+                run_direct_spawn(), admission,
+                task_name=f"agent_direct_spawn:{admission.canonical_name}",
             )
-            admission.owner_task = spawn_operation
-            admission.spawn_task = spawn_operation
-            return await spawn_operation
 
         assert admission is not None
         admission.spawn_parent = parent_agent
