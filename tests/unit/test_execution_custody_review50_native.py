@@ -153,6 +153,19 @@ async def test_sqlite_native_close_receipt_outweighs_caller_cancellation(tmp_pat
     await db.execute("CREATE TABLE effects(id INTEGER PRIMARY KEY)")
     await db.execute("INSERT INTO effects VALUES (1)")
     native_close, original = connection.close, terminal(kind)
+    from tests.utils.original_failure import OriginalFailure
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    from kestrel_sovereign import _async_ownership as ownership
+    snapshot = OriginalFailure.capture(original)
+    actual_join, withdrawals = ownership.await_owned_task, []
+
+    async def observed_join(*args, **kwargs):
+        result = await actual_join(*args, **kwargs)
+        if result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+
+    monkeypatch.setattr(ownership, "await_owned_task", observed_join)
     entered, finish = asyncio.Event(), asyncio.Event()
 
     async def close_then_receipt():
@@ -167,7 +180,9 @@ async def test_sqlite_native_close_receipt_outweighs_caller_cancellation(tmp_pat
         await asyncio.wait_for(entered.wait(), 2)
         owner.cancel()
         finish.set()
-        assert (await join(owner)).error is original
+        result = await join(owner)
+        snapshot.assert_retained(result.error)
+        assert withdrawals and all(error in tuple(_explicit_control_chain(result.error)) for error in withdrawals)
         assert not _aiosqlite_worker_is_alive(connection)
     finally:
         finish.set()

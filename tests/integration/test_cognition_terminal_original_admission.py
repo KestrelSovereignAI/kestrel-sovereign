@@ -20,6 +20,7 @@ from kestrel_sovereign.execution_custody import (
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
 from tests.integration.test_execution_custody_review18_pg import join_owned, setup_delivery
 from tests.unit.test_cleanup_task_admission import _operation_name
+from tests.utils.original_failure import OriginalFailure
 
 
 @pytest.mark.asyncio
@@ -93,7 +94,9 @@ async def test_native_cognition_terminal_admission_keeps_original_receipt_and_de
         assert refused and all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused)
         assert any(resource is delivery and task is None for resource, task in execution_cleanup_debts(caught.value))
         held_delivery, held_error = dispatcher._retained_cognition_control_debt[delivery.delivery_id]
-        assert held_delivery is delivery and caught.value in tuple(_explicit_control_chain(held_error))
+        assert held_delivery is delivery
+        for snapshot in OriginalFailure.capture_sources(caught.value):
+            snapshot.assert_retained(held_error)
         held_graph = tuple(_explicit_control_chain(held_error))
         for retry_index in range(refusal_rounds - 1):
             with pytest.raises(BaseException) as repeated:

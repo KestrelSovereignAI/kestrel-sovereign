@@ -274,6 +274,7 @@ async def test_actual_proxy_close_failure_keeps_original_resource_and_owner(
             if cancel
             else OSError("original native proxy close ACK lost")
         )
+        snapshot = OriginalFailure.capture(original)
 
         async def lose_ack():
             await native_close()
@@ -285,19 +286,21 @@ async def test_actual_proxy_close_failure_keeps_original_resource_and_owner(
             with pytest.raises(BaseException) as caught:
                 async with _lifespan_teardown_owner(app):
                     pass
-            assert caught.value is original and is_execution_control_error(original)
+            snapshot.assert_retained(caught.value)
+            assert is_execution_control_error(caught.value)
             await asyncio.wait_for(closed.wait(), 2)
             assert client.is_closed and supervisor._client is client
             assert app.state.phoenix is supervisor
             owner = app.state.phoenix_proxy_close_task
             assert owner.done() and any(
                 resource is client and task is owner
-                for resource, task in execution_cleanup_debts(original)
+                for resource, task in execution_cleanup_debts(caught.value)
             )
             with pytest.raises(BaseException) as repeated:
                 async with _lifespan_teardown_owner(app):
                     pass
-            assert repeated.value is original and calls == [True]
+            snapshot.assert_retained(repeated.value)
+            assert repeated.value is caught.value and calls == [True]
             assert app.state.phoenix_proxy_close_task is owner
 
 

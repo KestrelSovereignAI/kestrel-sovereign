@@ -285,7 +285,7 @@ async def test_published_source_callback_is_new_runtime_ingress_not_retired_boot
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_control_terminalizer_failure_or_cancel_retains_exact_cleanup_debt(cancel):
+async def test_control_terminalizer_failure_or_cancel_retains_exact_cleanup_debt(cancel, monkeypatch):
     from kestrel_sovereign.signals.dispatcher import SignalDispatcher
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
     dispatcher._retained_cognition_control_debt = {}
@@ -299,11 +299,25 @@ async def test_control_terminalizer_failure_or_cancel_retains_exact_cleanup_debt
     )
     entered, release = asyncio.Event(), asyncio.Event()
     error = control("unknown", True)
+    from tests.utils.original_failure import OriginalFailure
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    from kestrel_sovereign import _async_ownership as ownership
+    snapshot = OriginalFailure.capture(error)
+    physical = OSError("terminal receipt unavailable")
+    actual_join, withdrawals = ownership.await_owned_task, []
+
+    async def observed_join(*args, **kwargs):
+        result = await actual_join(*args, **kwargs)
+        if result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+
+    monkeypatch.setattr(ownership, "await_owned_task", observed_join)
 
     async def fail(**kwargs):
         entered.set()
         await release.wait()
-        raise OSError("terminal receipt unavailable")
+        raise physical
 
     backend = SimpleNamespace(backend_type="postgres", fail_cognition_delivery=AsyncMock(side_effect=fail))
     dispatcher._durable_store = SimpleNamespace(backend=backend, _failed_retry_release_receipts=set())
@@ -313,9 +327,12 @@ async def test_control_terminalizer_failure_or_cancel_retains_exact_cleanup_debt
         if cancel:
             task.cancel()
         release.set()
-        with pytest.raises(RuntimeError) as caught:
+        with pytest.raises(BaseException) as caught:
             await task
-        assert caught.value is error
+        snapshot.assert_retained(caught.value)
+        chain = tuple(_explicit_control_chain(caught.value))
+        assert physical in chain and all(withdrawal in chain for withdrawal in withdrawals)
+        assert bool(withdrawals) is cancel
         assert dispatcher._retained_cognition_control_debt == {"delivery": (delivery, error)}
         first_identity = backend.fail_cognition_delivery.await_args
         backend.fail_cognition_delivery = AsyncMock(return_value=True)
@@ -335,15 +352,20 @@ async def test_shutdown_cleanup_failure_keeps_owner_fenced_until_exact_retry(tmp
     backend, agent, dispatcher = await _dispatcher(tmp_path / "control-debt.db", "did:test:debt")
     delivery = ReceiptDelivery(delivery_id="original", consumer_id="original-consumer", lease_token="original-token")
     error = control("unknown", True)
+    from tests.utils.original_failure import OriginalFailure
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    snapshot = OriginalFailure.capture(error)
     dispatcher._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
     original_apply = dispatcher._apply_cognition_control_terminal
     original_release = dispatcher._release_runtime_owner_after_shutdown
-    dispatcher._apply_cognition_control_terminal = AsyncMock(side_effect=OSError("receipt unavailable"))
+    physical = OSError("receipt unavailable")
+    dispatcher._apply_cognition_control_terminal = AsyncMock(side_effect=physical)
     dispatcher._release_runtime_owner_after_shutdown = AsyncMock(wraps=original_release)
     try:
-        with pytest.raises(RuntimeError) as caught:
+        with pytest.raises(BaseException) as caught:
             await dispatcher.shutdown_durable_delivery()
-        assert caught.value is error
+        snapshot.assert_retained(caught.value)
+        assert physical in tuple(_explicit_control_chain(caught.value))
         assert dispatcher.durable_shutdown_owner_fenced
         assert dispatcher._runtime_owner_heartbeat_timer is not None
         dispatcher._release_runtime_owner_after_shutdown.assert_not_awaited()

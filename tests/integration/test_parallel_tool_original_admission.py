@@ -133,8 +133,11 @@ async def test_parallel_tool_admission_joins_original_children_and_closes_refusa
             assert (
                 (not bodies)
                 if stage == "batch"
-                else len(bodies) == (1 if hasattr(asyncio, "eager_task_factory") else 0)
+                else len(bodies) in ({0, 1} if hasattr(asyncio, "eager_task_factory") else {0})
             )
+            # Receipt-gated eager Tasks may still be queued behind canonical
+            # publication when the next allocation is refused. A pre-entered
+            # body is not required; every accepted original must still join.
             # Native cancellation may retract a query; no committed-ACK claim.
             assert await observer.fetchval(
                 f'SELECT count(*) FROM "{schema}".batch_effects'

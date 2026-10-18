@@ -11218,8 +11218,14 @@ class AgentManager:
             try:
                 budget_release.set_name(f"agent_budget_release:{child_name}")
             except BaseException as failure:
+                cached = getattr(budget_release, "_kestrel_owned_terminal_error", None)
+                if budget_release.done():
+                    cached = execution_terminal_error(
+                        cached, owned_task_error(budget_release),
+                        retain_originals=True, isolate_control_originals=True,
+                    )
                 budget_release._kestrel_owned_terminal_error = execution_terminal_error(
-                    owned_task_error(budget_release) if budget_release.done() else None,
+                    cached,
                     failure, retain_originals=True, isolate_control_originals=True,
                 )
 

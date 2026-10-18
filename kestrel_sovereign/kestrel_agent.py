@@ -9795,6 +9795,8 @@ Expected Duration: {expected_duration}
             if pending:
                 for owner in pending:
                     outcome = await await_owned_task(owner)
+                    if outcome.error is not None:
+                        finite_outcomes.append(outcome.error)
                     if outcome.cancellation is not None:
                         finite_outcomes.append(outcome.cancellation)
                     self._remember_shutdown_control(outcome.error)
@@ -9820,7 +9822,11 @@ Expected Duration: {expected_duration}
                     raise
                 failure: BaseException = asyncio.CancelledError()
             except Exception as exc:
-                finite_outcomes.append(exc)
+                # The one existing retry can resolve an ordinary observer
+                # failure. Do not turn that repaired availability error into
+                # a new terminal failure after storage physically closes.
+                if is_execution_control_error(exc):
+                    finite_outcomes.append(exc)
                 self._remember_shutdown_control(exc)
                 raise_finite_control(control_only=True)
                 failure = exc

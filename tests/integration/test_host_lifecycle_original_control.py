@@ -88,10 +88,14 @@ async def test_repeated_public_host_stop_keeps_original_native_receipt(
             # The protocol permits the feature itself to own the context's
             # backend lifetime. Its stop hook is not its independent close.
             ctx._db = second
+        from tests.utils.original_failure import OriginalFailure
+        from kestrel_sovereign.execution_custody import _explicit_control_chain
+        native_failure = OSError("original host stop COMMIT ACK lost")
+        native_snapshot = OriginalFailure.capture(native_failure)
         receipts = lose_native_ack(
             monkeypatch,
             boundary="commit",
-            original=OSError("original host stop COMMIT ACK lost"),
+            original=native_failure,
         )
         with pytest.raises(BaseException) as caught:
             if through_server:
@@ -105,6 +109,8 @@ async def test_repeated_public_host_stop_keeps_original_native_receipt(
                 await stop_host_features([first, second], ctx)
         assert receipts == [True]
         assert execution_commit_outcome(caught.value) == "unknown"
+        sources = OriginalFailure.capture_sources(caught.value)
+        native_snapshot.assert_retained(caught.value)
         assert entered == ["second-native", "first-native"], (
             "first control skipped an independent original peer"
         )
@@ -136,8 +142,10 @@ async def test_repeated_public_host_stop_keeps_original_native_receipt(
                 app.state.host_context = ctx
             for _ in range(2):
                 cancelled, failure = await _shutdown_server_resources(app)
-                assert not cancelled and failure is caught.value
-                assert app.state._lifespan_teardown_error is caught.value
+                assert not cancelled
+                for source in sources:
+                    source.assert_retained(failure)
+                    source.assert_retained(app.state._lifespan_teardown_error)
                 assert execution_commit_outcome(failure) == "unknown"
             assert app.state.host_context is ctx
             assert app.state.host_features == [first, second]
@@ -153,9 +161,9 @@ async def test_repeated_public_host_stop_keeps_original_native_receipt(
                     await _shutdown_host_features(app)
                 else:
                     await stop_host_features([first, second], ctx)
-            assert repeated.value is caught.value, (
-                "followup lost the original native COMMIT UNKNOWN"
-            )
+            for source in sources:
+                source.assert_retained(repeated.value)
+            native_snapshot.assert_retained(repeated.value)
             assert execution_commit_outcome(repeated.value) == "unknown"
         expected_starts = ["first-native", "second-native"]
         expected_stops = ["second-native", "first-native"]
@@ -181,7 +189,8 @@ async def test_repeated_public_host_stop_keeps_original_native_receipt(
             if record.resource is second
         ]
         assert retained and any(
-            record.error is caught.value and not record.closed for record in retained
+            native_failure in tuple(_explicit_control_chain(record.error)) and not record.closed
+            for record in retained
         ), "deactivation discarded the original failed feature/resource owner"
         if through_server:
             assert app.state.host_context is ctx

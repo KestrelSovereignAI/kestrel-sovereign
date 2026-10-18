@@ -193,7 +193,10 @@ async def test_actual_committed_release_lost_ack_cannot_be_reclaimed_by_fresh_ru
         assert await claim(store, agent, delivery, "dispatcher:successor", True) is None
         if cleanup_fails:
             assert await controller.fetchval("SELECT status FROM durable_signal_deliveries WHERE delivery_id='delivery1'") == "retry"
-            assert dispatcher._retained_cognition_control_debt[delivery.delivery_id][1] is caught.value
+            from tests.utils.original_failure import OriginalFailure
+            held = dispatcher._retained_cognition_control_debt[delivery.delivery_id][1]
+            for source in OriginalFailure.capture_sources(caught.value):
+                source.assert_retained(held)
             assert await backend.retain_cognition_cleanup_owner(agent_id=agent.did, owner_id="dispatcher:original")
             backend.fail_cognition_delivery = original_cleanup
             await dispatcher._drain_retained_durable_cognition_cleanup_tasks()
@@ -209,10 +212,23 @@ async def test_actual_committed_release_lost_ack_cannot_be_reclaimed_by_fresh_ru
 
 @pytest.mark.parametrize("carrier", ["direct", "wrapped", "cancel"])
 @pytest.mark.parametrize("repeat", [False, True])
-async def test_cancelled_successful_native_terminalizer_clears_confirmed_debt(native_pg, carrier, repeat):
+async def test_cancelled_successful_native_terminalizer_clears_confirmed_debt(native_pg, carrier, repeat, monkeypatch):
     backend, controller, _ = native_pg
     agent, dispatcher, delivery, _signal = await setup_delivery(native_pg)
     original = control_error("unknown", carrier)
+    from tests.utils.original_failure import OriginalFailure
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    from kestrel_sovereign import _async_ownership as ownership
+    snapshot = OriginalFailure.capture(original)
+    actual_join, withdrawals = ownership.await_owned_task, []
+
+    async def observed_join(*args, **kwargs):
+        result = await actual_join(*args, **kwargs)
+        if result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+
+    monkeypatch.setattr(ownership, "await_owned_task", observed_join)
     scope = ExecutionCustody(GenerationFence())
     agent._execution_custody = backend._execution_custody = scope
     scope.revoke("original runtime retired before terminal cleanup")
@@ -237,7 +253,8 @@ async def test_cancelled_successful_native_terminalizer_clears_confirmed_debt(na
         finish.set()
         with pytest.raises(BaseException) as caught:
             await task
-        assert caught.value is original
+        snapshot.assert_retained(caught.value)
+        assert withdrawals and all(error in tuple(_explicit_control_chain(caught.value)) for error in withdrawals)
         assert await controller.fetchval("SELECT status FROM durable_signal_deliveries WHERE delivery_id='delivery1'") == "failed"
         assert not dispatcher._retained_cognition_control_debt
         await dispatcher._drain_retained_durable_cognition_cleanup_tasks()

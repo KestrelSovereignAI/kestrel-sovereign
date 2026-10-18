@@ -170,6 +170,7 @@ async def test_cached_original_phoenix_close_cannot_retire_replacement(
         app.state.phoenix = original_supervisor
         original_close = type(original_client).aclose
         failure = OSError("original physical Phoenix close ACK lost")
+        snapshot = OriginalFailure.capture(failure)
 
         async def close_then_lose_original_ack(client):
             result = await original_close(client)
@@ -179,9 +180,9 @@ async def test_cached_original_phoenix_close_cannot_retire_replacement(
 
         with monkeypatch.context() as patch:
             patch.setattr(type(original_client), "aclose", close_then_lose_original_ack)
-            with pytest.raises(OSError) as first:
+            with pytest.raises(BaseException) as first:
                 await server._shutdown_phoenix(app)
-        assert first.value is failure
+        snapshot.assert_retained(first.value)
         await asyncio.wait_for(original_closed.wait(), 2)
         original_task = app.state.phoenix_proxy_close_task
         assert original_task.done() and original_client.is_closed

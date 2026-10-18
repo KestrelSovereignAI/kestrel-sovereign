@@ -3006,7 +3006,8 @@ class SignalDispatcher:
     def _retain_durable_writer_control(self, error: BaseException | None) -> None:
         """One existing bounded safety latch for this runtime's native writers."""
         if error is not None and is_execution_control_error(error):
-            self._outcome_log_control_error = execution_terminal_error(
+            from kestrel_sovereign.execution_custody import execution_native_source_error
+            self._outcome_log_control_error = execution_native_source_error(
                 self._outcome_log_control_error, error,
             )
 
@@ -5386,10 +5387,22 @@ class SignalDispatcher:
             OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error,
             owned_task_admission_error,
         )
-        from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_terminal_error
+        from kestrel_sovereign.execution_custody import (
+            _native_source_originals, execution_cleanup_debts, execution_native_source_error, execution_terminal_error,
+        )
 
         prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
-        retained_error = execution_terminal_error(None if prior is None else prior[1], error)
+        previous = None if prior is None else prior[1]
+        incoming_sources = _native_source_originals(error)
+        prior_sources = _native_source_originals(previous)
+        if previous is not None and incoming_sources and all(
+            any(source is old for old in prior_sources) for source in incoming_sources
+        ):
+            retained_error = previous
+        else:
+            retained_error = execution_native_source_error(previous, error) or execution_terminal_error(
+                previous, error, retain_originals=True, isolate_control_originals=True,
+            )
         self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained_error)
         self._rearm_cleanup_runtime_owner_heartbeat()
         key = (self._agent.did, delivery.consumer_id, delivery.delivery_id,
@@ -5432,8 +5445,8 @@ class SignalDispatcher:
                     resource is delivery and owner is None
                     for resource, owner in execution_cleanup_debts(retained_error)
                 )
-                retained = (execution_terminal_error(retained_error, admission_error)
-                            if already_unadmitted else terminal)
+                retained = (retained_error if already_unadmitted else
+                            execution_native_source_error(terminal) or retained_error)
                 self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
                 if task is None:
                     raise terminal
@@ -5460,7 +5473,11 @@ class SignalDispatcher:
                 retain_originals=True, isolate_control_originals=True,
             )
             if outcome.error is not None:
-                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, terminal)
+                # An observer's finite C and ordinary retryable metadata error
+                # are not new shared native source facts. Genuine native
+                # terminalizer uncertainty does remain with this delivery.
+                shared = execution_native_source_error(retained_error, opening, outcome.error)
+                self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, shared or retained_error)
                 self._rearm_cleanup_runtime_owner_heartbeat()
             raise terminal
 

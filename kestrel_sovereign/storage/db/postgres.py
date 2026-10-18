@@ -790,6 +790,13 @@ class PostgresBackend(DatabaseBackend):
             if opening is None and outcome.error is None and getattr(self, attribute) is pool:
                 setattr(self, attribute, None)
                 owners.pop(attribute, None)
+            elif opening is None and outcome.error is not None and not is_execution_control_error(outcome.error):
+                # An ordinary, physically joined availability failure keeps
+                # the pool handle and its legacy explicit-call retry contract.
+                # Refused/unpublished admission or native uncertainty never
+                # takes this branch, and no live original can be overlapped.
+                if owners.get(attribute) is record:
+                    owners.pop(attribute, None)
         terminal = execution_terminal_error(
             *errors, retain_originals=True, prefer_cancellation=True,
             isolate_control_originals=True,

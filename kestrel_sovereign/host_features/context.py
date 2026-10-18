@@ -250,7 +250,8 @@ def _retain_host_cleanup_failure(
         (operation, id(resource)), _HostCloseOwner(resource)
     )
     record.error = execution_terminal_error(
-        record.error, error, retain_originals=True, isolate_control_originals=True,
+        record.error, execution_native_source_error(error) or error,
+        retain_originals=True, isolate_control_originals=True,
     )
 
 
@@ -310,11 +311,16 @@ async def _close_partial_host_resources(
                 )
         if record.task is not None:
             outcome = await await_owned_task(record.task)
+            from kestrel_sovereign._async_ownership import owned_task_error
+            physical = owned_task_error(record.task)
             record.error = execution_terminal_error(
-                record.error, outcome.error, retain_originals=True,
+                record.error, execution_native_source_error(physical) or physical,
+                retain_originals=True,
                 isolate_control_originals=True,
             )
-            errors.append(outcome.cancellation)
+            # Join publication/removal failures belong to this finite
+            # observation, not the physical closer's sticky disposition.
+            errors.extend((outcome.error, outcome.cancellation))
             if record.error is None:
                 record.closed = True
                 record.task = None

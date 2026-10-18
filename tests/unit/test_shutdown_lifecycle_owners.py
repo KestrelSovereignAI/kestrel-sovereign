@@ -588,8 +588,11 @@ async def test_phoenix_cleanup_stops_child_when_proxy_close_fails() -> None:
     app.state.phoenix = supervisor
     app.state.phoenix_task = None
 
-    with pytest.raises(RuntimeError, match="proxy close failed") as caught:
+    with pytest.raises(BaseException) as caught:
         await server._shutdown_phoenix(app)
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    assert any(isinstance(error, RuntimeError) and str(error) == "proxy close failed"
+               for error in _explicit_control_chain(caught.value))
     assert supervisor.close_entered.is_set()
     assert supervisor.stopped is True
     assert app.state.phoenix is supervisor
@@ -2260,7 +2263,7 @@ async def test_explicit_offboarding_intent_survives_quarantined_reaper_handoff(
         if not removal.done():
             await asyncio.wait_for(removal, timeout=30.0)
 
-    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent, withdrawals=[])
 
 
 @pytest.mark.asyncio
@@ -2310,7 +2313,7 @@ async def test_handed_off_offboarding_failure_is_owned_once_and_remains_visible(
             with pytest.raises(RuntimeOffboardingRetainedError):
                 await asyncio.wait_for(removal, timeout=30.0)
 
-    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent, withdrawals=[])
     assert manager.get_agent("hostile") is None
 
 
@@ -2476,7 +2479,7 @@ async def test_delete_endpoint_maps_real_shutdown_handoff_to_pending_custody(
     finally:
         agent.allow_shutdown_finish.set()
 
-    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent, withdrawals=[])
 
 
 @pytest.mark.asyncio

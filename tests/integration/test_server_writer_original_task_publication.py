@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from kestrel_sdk.signals import Signal, SignalMode
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
-from kestrel_sovereign.execution_custody import execution_cleanup_debts
+from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
 from kestrel_sovereign.phoenix_supervisor import PhoenixSupervisor
 from kestrel_sovereign.server import _shutdown_phoenix
 from kestrel_sovereign.signals import DurableConsumerRegistration
@@ -71,6 +71,15 @@ async def test_phoenix_proxy_publication_keeps_original_http_client_and_stops_in
         assert any(resource is client and task is fault.task for resource, task in execution_cleanup_debts(result.error))
         assert supervisor._client is client and not client.is_closed and not peer_closed.is_set()
         assert not supervisor.pid_file.exists(), "independent actual stop did not run"
+        retained = app.state.phoenix_proxy_close_error
+        original_chain = tuple(_explicit_control_chain(retained))
+        for _ in range(20):
+            repeated = await await_owned_task(create_owned_task(_shutdown_phoenix(app), retain_originals=True))
+            source.assert_retained(repeated.error)
+            assert app.state.phoenix_proxy_close_task is fault.task
+            assert app.state.phoenix_proxy_close_error is retained
+            assert tuple(_explicit_control_chain(retained)) == original_chain
+        assert supervisor._client is client and not client.is_closed
     finally:
         if owner is not None:
             await await_owned_task(owner)

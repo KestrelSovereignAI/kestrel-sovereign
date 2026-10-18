@@ -250,7 +250,14 @@ async def test_accepted_startup_phase_retains_refused_native_pool_closer(
             for coroutine in pair:
                 coroutine.close()
         for owner in owners:
-            await owner.close()
+            # Production correctly retains the refused original close record;
+            # a healthy factory later is not permission to retry that owner.
+            # Explicit fixture recovery closes these SAME actual pools only
+            # after the retained handles/debt and independent ACK assertions.
+            native = owner.db.backend if isinstance(owner, AsyncStorage) else owner
+            for pool in (native._advisory_pool, native._pool):
+                if pool is not None and not pool._closed:
+                    await pool.close()
 
 
 @pytest.mark.asyncio

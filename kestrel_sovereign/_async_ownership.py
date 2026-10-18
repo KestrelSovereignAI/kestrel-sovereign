@@ -123,9 +123,11 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 retained_execution_error,
             )
             task = asyncio.current_task()
+            cached = getattr(task, "_kestrel_owned_terminal_error", None)
             task._kestrel_owned_terminal_error = retained_execution_error(
-                execution_terminal_error(getattr(task, "_kestrel_owned_terminal_error", None), error,
-                    retain_originals=retain_originals)
+                execution_terminal_error(cached, error,
+                    retain_originals=retain_originals,
+                    isolate_control_originals=cached is not None and cached is not error)
             )
             raise
     wrapper = run()

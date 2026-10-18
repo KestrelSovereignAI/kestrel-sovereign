@@ -246,6 +246,13 @@ only genuine no-Task refusal uses `(resource, None)`. Debt belongs on a private
 carrier, not the original native exception. Independent cleanup phases still
 get their attempt before the finite terminal failure is raised. Shared source
 latches never acquire another shutdown observer's actual cancellation.
+The physical result of an original closer is distinct from its completion
+observer's callback error: successful physical retirement closes that record,
+while the observer keeps its own failure finitely. A later healthy observation
+must not invent a replacement close or replay observer debt. Failed native
+attempts reuse their existing private error carrier instead of growing a new
+exception ancestry on every Stop. Cached publication diagnostics and subsequent
+native failures are composed in isolation from their original source graphs.
 
 Session-training acquisition and rejected-session release retain the actual
 physical hook task and session when native retirement is unresolved. A later
