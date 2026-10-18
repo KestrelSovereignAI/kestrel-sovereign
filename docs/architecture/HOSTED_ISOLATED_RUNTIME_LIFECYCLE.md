@@ -324,6 +324,14 @@ and require the overrun diagnostic and retained owner before releasing it. These
 tests do not promise real-time disk performance under arbitrary CI load or change
 the production shutdown budget; the broader operational #3460 remains separate.
 
+Stop-claim CAS races likewise require one live lease epoch. Their test-only lease
+is derived from the independent hang guard; actual database elapsed time and
+the stored heartbeat's cutoff are checked before interpreting winner counts.
+Separate native tests retain the production two-second lease and demonstrate
+real database-clock expiry, subsequent takeover and stale-owner fencing. They
+do not promise two-second response/renewal performance under arbitrary load or
+retroactively establish the ordering of an earlier uninstrumented CI failure.
+
 Private host ingress has a caller-local Core admission rooted before task
 publication. Backend observation follows actual joined task lineage, not mere
 ContextVar inheritance into resident readers or supervisors. Native failure
