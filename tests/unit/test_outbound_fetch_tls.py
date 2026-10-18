@@ -97,8 +97,12 @@ def test_did_fetch_enforces_the_real_peer_certificate(outbound_tls):
 
 
 @pytest.mark.usefixtures("isolated_process_rate_limiter")
-@pytest.mark.parametrize("path,status", [("/avatar.png", 200), ("/redirect", 400)])
-def test_avatar_uses_real_tls_and_refuses_http_redirects(outbound_tls, path, status):
+@pytest.mark.parametrize("outbound_tls,path,status,served", [
+    pytest.param("xn--strae-oqa.example", "/avatar.png", 200, True, id="verified-peer"),
+    pytest.param("xn--strae-oqa.example", "/redirect", 400, True, id="redirect-refused"),
+    pytest.param("wrong.example", "/avatar.png", 400, False, id="wrong-certificate"),
+], indirect=["outbound_tls"])
+def test_avatar_uses_real_tls_and_refuses_http_redirects(outbound_tls, path, status, served):
     peer = outbound_tls
     store = AsyncMock(return_value="avatar-hash")
     agent = SimpleNamespace(agent_id="did:test:avatar", storage=SimpleNamespace(files=SimpleNamespace(store_avatar=store)))
@@ -111,9 +115,9 @@ def test_avatar_uses_real_tls_and_refuses_http_redirects(outbound_tls, path, sta
         assert peer.dns == [peer.host]
         assert peer.dials == [("8.8.8.8", peer.port)]
         assert peer.sni == [peer.host]
-        assert peer.requests == [(path, f"{peer.host}:{peer.port}")]
+        assert peer.requests == ([(path, f"{peer.host}:{peer.port}")] if served else [])
         if status == 400:
-            assert "302" in response.json()["detail"]
+            assert ("302" if served else "CERTIFICATE_VERIFY_FAILED") in response.json()["detail"]
             store.assert_not_awaited()
         else:
             store.assert_awaited_once()

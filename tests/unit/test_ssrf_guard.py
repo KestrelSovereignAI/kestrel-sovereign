@@ -83,6 +83,34 @@ class TestPinnedUrllibConnections:
         raw.close.assert_not_called()
         wrapped.close.assert_not_called()
 
+    @pytest.mark.parametrize("handshake_elapsed", [10, 10.25])
+    def test_tls_finishing_at_the_deadline_closes_both_unpublished_sockets(self, monkeypatch, handshake_elapsed):
+        clock = [0.0]
+        monkeypatch.setattr("time.monotonic", lambda: clock[0])
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"),),
+        )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=10)
+        raw, wrapped = MagicMock(spec=socket.socket), MagicMock(spec=socket.socket)
+        conn._create_connection = MagicMock(return_value=raw)
+        conn._context = MagicMock()
+
+        def handshake(sock, server_hostname):
+            assert sock is raw and server_hostname == validated.host
+            raw.settimeout.assert_called_once_with(10)
+            clock[0] += handshake_elapsed
+            return wrapped
+
+        conn._context.wrap_socket.side_effect = handshake
+        with pytest.raises(TimeoutError, match="connection deadline exceeded"):
+            conn.connect()
+        conn._create_connection.assert_called_once()
+        raw.close.assert_called_once()
+        wrapped.close.assert_called_once()
+        wrapped.settimeout.assert_not_called()
+        assert conn.sock is None
+
     def test_reconnect_cannot_discard_an_existing_socket(self):
         validated = ValidatedOutboundURL(
             url="https://example.test/did.json", scheme="https", host="example.test", port=443,
