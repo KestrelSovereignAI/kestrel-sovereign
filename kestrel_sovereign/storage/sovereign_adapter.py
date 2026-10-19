@@ -1391,7 +1391,7 @@ class SovereignStorageAdapter:
         """
         try:
             await self._ensure_import_log()
-            await self.db.execute(
+            inserted = await self.db.execute(
                 f"""
                 INSERT INTO {self._import_log_sql}
                   (agent_did, source_did, host_agent_id, package_hash,
@@ -1403,6 +1403,10 @@ class SovereignStorageAdapter:
                  continuity_score, status, reject_reason, manifest_version,
                  messages_restored, shards_restored, source_cid, grant_id),
             )
+            if inserted != 1:
+                from kestrel_sovereign.storage.db import QueryError
+
+                raise QueryError("Sovereign import audit INSERT was not acknowledged as exactly one row")
         except BaseException as audit_error:
             if failure is None:
                 raise

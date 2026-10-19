@@ -42,6 +42,30 @@ class LegacyEnvelopeArchive(CapturedArchive):
 
 
 @pytest.mark.asyncio
+async def test_import_success_requires_an_acknowledged_audit_row(monkeypatch, tmp_path):
+    monkeypatch.setenv("KESTREL_DATA_KEY", "owned-ignored-audit-key-0123456789abcdef")
+    monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
+    did = "did:kestrel:owned-ignored-audit"
+    async with AsyncStorage(
+        backend="sqlite", db_path=str(tmp_path / "ignored-audit.db"), agent_id=did
+    ) as storage:
+        await storage.add_conversation("user", "owned ignored-audit fixture")
+        archive = CapturedArchive(
+            storage.db, "owned-ignored-audit-secret", object(), agent_id=did
+        )
+        await archive.export_agent(did)
+        await archive._ensure_import_log()
+        await storage.db.execute(
+            "CREATE TRIGGER owned_ignore_audit BEFORE INSERT ON agent_import_log BEGIN SELECT RAISE(IGNORE); END"
+        )
+        with pytest.raises(QueryError, match="not acknowledged"):
+            await archive.import_agent(archive.car)
+        assert await storage.db.fetchone("SELECT count(*) FROM agent_import_log") == (
+            0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_encrypted_conversations_are_readable_under_distinct_destination_key(
     monkeypatch, tmp_path
 ):
@@ -164,10 +188,11 @@ async def test_corrupt_source_at_rest_is_refused_before_upload(monkeypatch, tmp_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "same_target,refuse_audit", [(False, False), (True, False), (False, True)]
+    "same_target,audit_outcome",
+    [(False, "accepted"), (True, "accepted"), (False, "refused"), (False, "ignored")],
 )
 async def test_legacy_envelopes_require_the_actual_destination_key_before_replace(
-    monkeypatch, tmp_path, same_target, refuse_audit
+    monkeypatch, tmp_path, same_target, audit_outcome
 ):
     monkeypatch.setenv("KESTREL_DATA_KEY", "owned-legacy-key-0123456789abcdef")
     monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
@@ -206,14 +231,19 @@ async def test_legacy_envelopes_require_the_actual_destination_key_before_replac
                 "owned legacy archive message"
             ]
         else:
-            if refuse_audit:
+            if audit_outcome != "accepted":
                 await receiver._ensure_import_log()
+                action = (
+                    "SELECT RAISE(IGNORE)"
+                    if audit_outcome == "ignored"
+                    else "SELECT RAISE(ABORT,'owned audit refused')"
+                )
                 await target.db.execute(
-                    "CREATE TRIGGER owned_refuse_audit BEFORE INSERT ON agent_import_log BEGIN SELECT RAISE(ABORT,'owned audit refused'); END"
+                    f"CREATE TRIGGER owned_refuse_audit BEFORE INSERT ON agent_import_log BEGIN {action}; END"
                 )
             with pytest.raises(DecryptionError) as caught:
                 await receiver.import_agent(archive.car)
-            if refuse_audit:
+            if audit_outcome != "accepted":
                 assert isinstance(caught.value.__cause__, ExceptionGroup)
                 assert caught.value.__cause__.subgroup(QueryError) is not None
             assert (

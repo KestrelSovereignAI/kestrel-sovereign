@@ -113,7 +113,10 @@ async def test_configured_journal_preserves_host_schema_and_rows(backend, tmp_pa
 @pytest.mark.parametrize(
     "backend", ["sqlite", pytest.param("postgres", marks=pytest.mark.native_postgres)]
 )
-async def test_refused_journal_insert_propagates_actual_sql_error(backend, tmp_path):
+@pytest.mark.parametrize("ignored", [False, True])
+async def test_refused_journal_insert_propagates_actual_sql_error(
+    backend, tmp_path, ignored
+):
     async with _owned_database(backend, tmp_path) as db:
         adapter = SovereignStorageAdapter(
             db,
@@ -124,17 +127,27 @@ async def test_refused_journal_insert_propagates_actual_sql_error(backend, tmp_p
         )
         await adapter._ensure_import_log()
         if backend == "sqlite":
+            action = (
+                "SELECT RAISE(IGNORE)"
+                if ignored
+                else "SELECT RAISE(ABORT,'owned audit refused')"
+            )
             await db.execute(
-                "CREATE TRIGGER owned_refuse_import BEFORE INSERT ON sovereign_import_log BEGIN SELECT RAISE(ABORT,'owned audit refused'); END"
+                f"CREATE TRIGGER owned_refuse_import BEFORE INSERT ON sovereign_import_log BEGIN {action}; END"
             )
         else:
+            action = (
+                "RETURN NULL" if ignored else "RAISE EXCEPTION 'owned audit refused'"
+            )
             await db.execute(
-                "CREATE FUNCTION owned_refuse_import() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owned audit refused'; END $$"
+                f"CREATE FUNCTION owned_refuse_import() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN {action}; END $$"
             )
             await db.execute(
                 "CREATE TRIGGER owned_refuse_import BEFORE INSERT ON sovereign_import_log FOR EACH ROW EXECUTE FUNCTION owned_refuse_import()"
             )
-        with pytest.raises(QueryError, match="owned audit refused"):
+        with pytest.raises(
+            QueryError, match="not acknowledged" if ignored else "owned audit refused"
+        ):
             await _append(adapter)
         assert await db.fetchone("SELECT count(*) FROM sovereign_import_log") == (0,)
 
