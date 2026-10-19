@@ -1,13 +1,19 @@
-"""``kestrel update`` continues in a fresh interpreter after it pulls or installs (#3702).
+"""``kestrel update`` continues in a fresh interpreter after it installs (#3702).
 
 On 2026-10-19 a host's update ran ``uv sync`` and then ``feature sync`` in the
 same process. The sync had removed ``importlib_metadata``, which that process
 had already imported and whose finder stdlib ``importlib.metadata`` still
 dispatched to, so the sync died on its first version lookup with every feature
-package pruned. Pinned here: after a pull that moved ``HEAD``, and after the
-install, nothing more runs in the process that imported the replaced code; the
-continuation is the same update minus the steps already done, and its exit
-status is the update's.
+package pruned. Pinned here: nothing runs after the install in the process
+that imported the replaced code; the continuation is the same update minus the
+steps already done, and its exit status is the update's.
+
+The pull does NOT hand off. Until the install, the pulled code runs against the
+packages the old code was installed with, and it need not import against them:
+an end-to-end run across the same 2026-10-19 revisions died importing
+``fastapi.routing.iter_route_contexts`` in exactly that window. So the
+interpreter that imported the old code drives the install, and the manifest
+preflight runs before the pull, against the lock the pull will land.
 """
 
 from __future__ import annotations
@@ -20,6 +26,8 @@ import sys
 import pytest
 
 from kestrel_sovereign import cli, cli_lifecycle
+
+INCOMING = "c0ffee0000000000000000000000000000000000"
 
 
 @pytest.fixture
@@ -34,17 +42,27 @@ def checkout(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def steps(checkout, monkeypatch):
+def manifest(checkout):
+    path = checkout / ".kestrel-host-features.toml"
+    path.write_text('[[feature]]\nname = "arize-phoenix"\npypi = ""\n')
+    return path
+
+
+@pytest.fixture
+def steps(checkout, manifest, monkeypatch):
     """Record every step the PARENT runs, and the continuation it hands off to."""
     calls = []
-    manifest = checkout / ".kestrel-host-features.toml"
-    manifest.write_text("")
     monkeypatch.setattr(cli, "_host_manifest_path", lambda args: manifest)
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda _: calls.append("pull") or (0, "")
+        cli, "_run_git_fetch", lambda _: calls.append("fetch") or (0, "")
+    )
+    monkeypatch.setattr(cli, "_pull_target_revision", lambda _: INCOMING)
+    monkeypatch.setattr(
+        cli, "_run_sync_preflight",
+        lambda path, lock_revision=None: calls.append(("preflight", lock_revision)) or 0,
     )
     monkeypatch.setattr(
-        cli, "_run_sync_preflight", lambda _: calls.append("preflight") or 0
+        cli, "_run_git_pull", lambda _: calls.append("pull") or (0, "")
     )
     monkeypatch.setattr(
         cli, "_run_uv_sync", lambda _: calls.append("uv sync") or (0, "")
@@ -61,12 +79,6 @@ def steps(checkout, monkeypatch):
         cli, "cmd_restart", lambda args: calls.append("restart") or 0
     )
     return calls
-
-
-def _heads(monkeypatch, *heads):
-    """``_git_head`` answers *heads* in order: before the pull, then after."""
-    answers = iter(heads)
-    monkeypatch.setattr(cli, "_git_head", lambda _: next(answers))
 
 
 def _record_continuation(monkeypatch, calls, rc=0):
@@ -90,12 +102,13 @@ def _update(*argv):
 
 
 def test_after_the_install_nothing_more_runs_in_this_process(steps, monkeypatch):
-    _heads(monkeypatch, "a", "a")
     seen = _record_continuation(monkeypatch, steps, rc=0)
 
     assert _update() == 0
 
-    assert steps == ["pull", "preflight", "uv sync", "continue"]
+    assert steps == [
+        "fetch", ("preflight", INCOMING), "pull", "uv sync", "continue",
+    ]
     (argv,) = seen
     assert argv[-3:] == ["--no-pull", "--no-install", "--package-changed"]
     continued = _parse(argv)
@@ -103,66 +116,75 @@ def test_after_the_install_nothing_more_runs_in_this_process(steps, monkeypatch)
     assert continued.features and continued.restart and continued.package_changed
 
 
-def test_a_pull_that_moved_head_hands_off_before_installing(steps, monkeypatch):
-    _heads(monkeypatch, "a", "b")
-    seen = _record_continuation(monkeypatch, steps)
-
-    assert _update() == 0
-
-    assert steps == ["pull", "continue"]
-    continued = _parse(seen[0])
-    assert continued.pull is False
-    assert continued.install is True
-    assert continued.package_changed is True
-
-
-def test_a_head_git_cannot_name_counts_as_moved(steps, monkeypatch):
-    _heads(monkeypatch, None, None)
-    _record_continuation(monkeypatch, steps)
-
-    assert _update() == 0
-
-    assert steps == ["pull", "continue"]
-
-
 def test_the_continuation_exit_status_is_the_update_exit_status(steps, monkeypatch):
-    _heads(monkeypatch, "a", "a")
     _record_continuation(monkeypatch, steps, rc=7)
 
     assert _update() == 7
 
 
-def test_without_a_pull_or_install_nothing_hands_off(steps, monkeypatch):
+def test_without_an_install_nothing_hands_off(steps, monkeypatch):
+    """The pull alone does not: the code it lands may not import yet."""
     _record_continuation(monkeypatch, steps)
 
-    assert _update("--no-pull", "--no-install") == 0
+    assert _update("--no-install") == 0
 
-    assert steps == ["feature sync", "reconcile", "restart"]
+    assert steps == ["pull", "feature sync", "reconcile", "restart"]
 
 
-def test_a_dry_run_never_hands_off(steps, monkeypatch):
+def test_a_dry_run_never_hands_off_and_still_checks_the_incoming_lock(
+    steps, monkeypatch,
+):
     _record_continuation(monkeypatch, steps)
 
     assert _update("--dry-run") == 0
 
-    assert "continue" not in steps
+    # Read-only: the remote-tracking refs as last fetched, no fetch; the
+    # reconcile step previews its plan.
+    assert steps == [("preflight", INCOMING), "reconcile"]
 
 
-def test_the_phases_run_every_step_once_in_order(steps, monkeypatch):
+def test_a_refused_preflight_stops_the_update_before_the_pull(steps, monkeypatch):
+    _record_continuation(monkeypatch, steps)
+    monkeypatch.setattr(
+        cli, "_run_sync_preflight",
+        lambda path, lock_revision=None: steps.append(("preflight", lock_revision)) or 1,
+    )
+
+    assert _update() == 1
+
+    assert steps == ["fetch", ("preflight", INCOMING)]
+
+
+def test_without_a_pull_the_preflight_reads_the_lock_on_disk(steps, monkeypatch):
+    _record_continuation(monkeypatch, steps)
+
+    assert _update("--no-pull") == 0
+
+    assert steps[:2] == [("preflight", None), "uv sync"]
+
+
+def test_an_empty_manifest_has_nothing_to_preflight(steps, manifest, monkeypatch):
+    manifest.write_text("")
+    _record_continuation(monkeypatch, steps)
+
+    assert _update() == 0
+
+    assert steps == ["pull", "uv sync", "continue"]
+
+
+def test_the_phases_run_every_step_once_in_order(steps):
     """End to end through the real parser, with the continuation re-entered here."""
-    _heads(monkeypatch, "a", "b")
-
     assert _update("--allow-dirty", "--startup-timeout", "75.5") == 0
 
     assert steps == [
-        "pull", "preflight", "uv sync", "feature sync", "reconcile", "restart",
+        "fetch", ("preflight", INCOMING), "pull", "uv sync",
+        "feature sync", "reconcile", "restart",
     ]
 
 
-def test_a_continuation_still_judges_every_agent(steps, monkeypatch, checkout):
-    """With ``--no-features`` the last phase changes nothing itself, but the
-    phases before it did: the restart must still check every agent."""
-    _heads(monkeypatch, "a", "a")
+def test_a_continuation_still_judges_every_agent(steps, monkeypatch):
+    """With ``--no-features`` the continuation changes nothing itself, but the
+    install before it did: the restart must still check every agent."""
     restarts = []
     monkeypatch.setattr(cli, "cmd_restart", lambda args: restarts.append(args) or 0)
 
@@ -212,7 +234,7 @@ def test_every_update_flag_reaches_the_continuation(flags):
 def test_flags_combine_in_the_continuation():
     parsed = _parse([
         "update", "Kite", "--no-pull", "--prefer-pypi", "--no-uv-sync",
-        "--continue-on-error", "--manifest", "/m.toml", "--force",
+        "--continue-on-error", "--manifest", "/m m.toml", "--force",
         "--allow-constitution-safe-mode", "--startup-timeout", "9",
     ])
 

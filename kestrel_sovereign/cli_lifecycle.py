@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -978,21 +979,6 @@ def _run_git_pull(project_dir: Path) -> Tuple[int, str]:
     return result.returncode, out
 
 
-def _git_head(project_dir: Path) -> Optional[str]:
-    """The commit ``HEAD`` names in ``project_dir``, or None when git cannot say."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except (FileNotFoundError, OSError):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
-
-
 def _git_reattach_if_safely_detached(project_dir: Path) -> Optional[str]:
     """Reattach a detached-HEAD checkout to its default branch, but ONLY when
     doing so loses no commits. Returns the branch name if it reattached, else
@@ -1109,35 +1095,52 @@ def _pull_target_revision(project_dir: Path) -> Optional[str]:
         raise _GitFailedError(f"git not available: {exc}") from exc
 
 
-def _incoming_content(checkout: Path, *, fetch: bool):
+def _incoming_revision(checkout: Path, *, fetch: bool):
+    """The revision the update's pull will land on, resolved once when first asked.
+
+    Returns a function answering the commit, or None when the pull brings
+    nothing. Fetches first (unless ``fetch`` is False, for a dry run that
+    mutates nothing and so reads the remote-tracking refs as last fetched).
+    Shared by every check that judges the incoming revision before the pull,
+    so they judge one revision and the update fetches once. Raises
+    :class:`_GitFailedError` when git cannot fetch or answer.
+    """
+    resolved: list = []
+
+    def revision() -> Optional[str]:
+        if not resolved:
+            if fetch:
+                rc, out = cli._run_git_fetch(checkout)
+                if rc != 0:
+                    raise _GitFailedError(
+                        f"git fetch failed in {checkout}: {out.strip()}"
+                    )
+            resolved.append(cli._pull_target_revision(checkout))
+        return resolved[0]
+
+    return revision
+
+
+def _incoming_content(checkout: Path, revision):
     """What the update's pull will leave at each governing constitution path.
 
     The packaged constitution, and any descriptor-selected external file the
-    checkout tracks (#3522). Fetches first (unless ``fetch`` is False, for a
-    dry run that mutates nothing and so reads the remote-tracking refs as last
-    fetched), then asks git for the file at the revision the pull lands on.
-    The fetch and the revision are resolved once, on the first question, which
-    is only asked when an agent is actually compared, so a host with no agents
-    does no git work for this.
+    checkout tracks (#3522), asked of git at *revision* (from
+    :func:`_incoming_revision`). The revision is only resolved when an agent
+    is actually compared, so a host with no agents does no git work for this.
     """
     resolved: list = []
 
     def revision_content():
-        if fetch:
-            rc, out = cli._run_git_fetch(checkout)
-            if rc != 0:
-                raise ConstitutionAdoptionError(
-                    f"git fetch failed in {checkout}: {out.strip()}"
-                )
         try:
-            revision = cli._pull_target_revision(checkout)
+            revision_id = revision()
         except _GitFailedError as exc:
             raise ConstitutionAdoptionError(str(exc)) from exc
-        if revision is None:
+        if revision_id is None:
             print("• constitution: the pull brings no new revision")
             return None
-        print(f"• constitution: checking incoming revision {revision[:12]}")
-        return deployed_content_at(checkout, revision)
+        print(f"• constitution: checking incoming revision {revision_id[:12]}")
+        return deployed_content_at(checkout, revision_id)
 
     def load(path: Path) -> Optional[bytes]:
         if not resolved:
@@ -1589,11 +1592,11 @@ def _report_core_lock() -> None:
         print(f"    {line}", file=sys.stderr)
 
 
-def _run_sync_preflight(manifest: Path) -> int:
+def _run_sync_preflight(manifest: Path, *, lock_revision: Optional[str] = None) -> int:
     """``kestrel feature sync --preflight`` on *manifest*: 0 when the sync can be held."""
     from kestrel_sovereign.cli_features import run_sync_preflight
 
-    return run_sync_preflight(manifest)
+    return run_sync_preflight(manifest, lock_revision=lock_revision)
 
 
 def _update_argv(args) -> list:
@@ -1648,7 +1651,7 @@ def _run_update_continuation(argv: list) -> int:
     except OSError as exc:
         print(
             f"• continue: FAILED — could not start {sys.executable} ({exc}). "
-            f"Finish with `kestrel {' '.join(argv)}`.",
+            f"Finish with `kestrel {shlex.join(argv)}`.",
             file=sys.stderr,
         )
         return 1
@@ -1656,26 +1659,31 @@ def _run_update_continuation(argv: list) -> int:
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
-def _continue_update_in_fresh_interpreter(args, *, after: str) -> int:
-    """Hand the rest of this update to an interpreter that loads what is on disk (#3702).
+def _continue_update_in_fresh_interpreter(args) -> int:
+    """Hand the steps after the install to an interpreter that loads what is on disk (#3702).
 
-    A process keeps every module it has imported after ``git pull`` or
-    ``uv sync`` replaces it on disk. Run on in this one, the remaining steps
+    A process keeps every module it has imported after ``git pull`` and
+    ``uv sync`` replace them on disk. Run on in this one, the remaining steps
     mix pre-pull ``kestrel_sovereign`` modules with post-pull ones imported
     lazily, and call into third-party modules whose files the sync deleted:
     on 2026-10-19 the sync removed ``importlib_metadata``, which this process
     had imported and whose finder stdlib ``importlib.metadata`` still
     dispatched to, and ``feature sync`` died before restoring the packages the
-    sync had pruned. The continuation skips the steps already done and is told
-    the package changed, so it judges every agent as this process would have.
+    sync had pruned.
+
+    After the install and not after the pull: until the install, the pulled
+    code runs against the packages the old code was installed with, and it
+    need not even import against them (a new ``fastapi`` symbol is enough).
+    The interpreter that imported the old code is the one that can drive the
+    install. The continuation skips the steps already done and is told the
+    package changed, so it judges every agent as this process would have.
     """
-    skips = ["--no-pull"] if after == "pull" else ["--no-pull", "--no-install"]
-    argv = [*_update_argv(args), *skips, "--package-changed"]
+    argv = [*_update_argv(args), "--no-pull", "--no-install", "--package-changed"]
     print(
-        f"• continue: the {after} replaced code this process loaded; the "
+        "• continue: the install replaced code this process loaded; the "
         "remaining steps run in a fresh interpreter"
     )
-    print(f"    kestrel {' '.join(argv)}")
+    print(f"    kestrel {shlex.join(argv)}")
     print()
     # The child writes to the same descriptors; flush so nothing printed here
     # appears after its output when stdout is a pipe.
@@ -1715,15 +1723,15 @@ def cmd_update(args) -> int:
         the restart (not on ``--dry-run``) the venv is compared against it.
         Every mismatch is printed; nothing is repaired and the exit status
         does not change.
-      - Before the install, when features will sync, a host manifest window
-        that excludes the version the lock pins refuses the update: the sync
-        would refuse every install held to both, after ``uv sync`` had pruned
-        the packages it restores (#3702). ``--continue-on-error`` warns
-        instead, as it does for the sync failure this predicts.
-      - A pull that moved ``HEAD``, and the install, each hand the remaining
-        steps to a fresh interpreter (``--no-pull`` / ``--no-install`` plus
-        ``--package-changed``), so they run the code and packages now on
-        disk rather than the ones this process imported (#3702).
+      - Before the pull, when features will sync, a host manifest window
+        that excludes the version the incoming lock pins refuses the update:
+        the sync would refuse every install held to both, after ``uv sync``
+        had pruned the packages it restores (#3702). ``--continue-on-error``
+        warns instead, as it does for the sync failure this predicts.
+      - The install hands the remaining steps to a fresh interpreter
+        (``--no-pull --no-install --package-changed``), so they run the code
+        and packages now on disk rather than the ones this process imported
+        (#3702).
     """
     from kestrel_sovereign.cli_features import core_state_refusal
 
@@ -1795,10 +1803,11 @@ def cmd_update(args) -> int:
     )
     package_changing = package_changed or pull or install or features
     judged = None if package_changing or not target else [target]
+    incoming_revision = (
+        _incoming_revision(source_checkout, fetch=not dry_run) if pulling else None
+    )
     incoming = (
-        _incoming_content(source_checkout, fetch=not dry_run)
-        if pulling
-        else None
+        _incoming_content(source_checkout, incoming_revision) if pulling else None
     )
     code_label = (
         "the revision `git pull --ff-only` will land on"
@@ -1822,6 +1831,54 @@ def cmd_update(args) -> int:
     )
     if rc != 0:
         return rc
+
+    # Step 0.5: preflight (#3702). `uv sync` prunes every package its lock does
+    # not name and `feature sync` restores them, holding each install to the
+    # lock and to the manifest's windows. A window that excludes the locked
+    # version makes every one of those installs unsatisfiable, and finding that
+    # out after the prune leaves the venv without its features. Decided from
+    # the manifest and the lock the pull will land, read from git before the
+    # pull: the pulled code itself may not import until the install has run.
+    if install and features and source_checkout is not None:
+        preflight_manifest = cli._host_manifest_path(
+            argparse.Namespace(manifest=getattr(args, "manifest", None))
+        )
+        try:
+            # An empty manifest restores nothing, so it has nothing to check;
+            # one that will not read is the preflight's to report.
+            declares = preflight_manifest.exists() and bool(
+                cli._load_host_manifest(preflight_manifest)
+            )
+        except (ValueError, OSError):
+            declares = True
+        if declares:
+            try:
+                lock_revision = incoming_revision() if pulling else None
+            except _GitFailedError as exc:
+                print(
+                    f"• preflight: FAILED — {exc}. Nothing was pulled, "
+                    "installed or restarted.",
+                    file=sys.stderr,
+                )
+                return 1
+            rc = cli._run_sync_preflight(
+                preflight_manifest, lock_revision=lock_revision,
+            )
+            if rc != 0 and not continue_on_error:
+                print(
+                    "• preflight: REFUSED — nothing was pulled, installed or "
+                    f"restarted. Fix the entries above in {preflight_manifest}, "
+                    "then re-run `kestrel update`. (--continue-on-error "
+                    "installs anyway and lets the sync fail them.)",
+                    file=sys.stderr,
+                )
+                return rc
+            if rc != 0:
+                print(
+                    "• preflight: continuing (--continue-on-error); the sync "
+                    "will fail the entries above",
+                    file=sys.stderr,
+                )
 
     # Step 1: git pull --ff-only against the source checkout (NOT the
     # data root, which may be a non-git KESTREL_HOME).
@@ -1862,7 +1919,6 @@ def cmd_update(args) -> int:
                 )
             else:
                 print(f"• pull: git pull --ff-only ({source_checkout})")
-                head_before = cli._git_head(source_checkout)
                 rc, out = cli._run_git_pull(source_checkout)
                 if rc != 0:
                     # A sibling worktree's `gh pr merge --delete-branch` can flip
@@ -1887,49 +1943,8 @@ def cmd_update(args) -> int:
                 if out.strip():
                     for line in out.rstrip().splitlines():
                         print(f"    {line}")
-                # This process imported the code the pull just replaced. A HEAD
-                # git cannot name is treated as moved: a fresh interpreter is
-                # never the wrong place to continue, only a slower one.
-                head_after = cli._git_head(source_checkout)
-                if head_before is None or head_after != head_before:
-                    return _continue_update_in_fresh_interpreter(args, after="pull")
     else:
         print("• pull: skipped (--no-pull)")
-
-    # Step 1.5: preflight (#3702). `uv sync` prunes every package its lock does
-    # not name and `feature sync` restores them, holding each install to the
-    # lock and to the manifest's windows. A window that excludes the locked
-    # version makes every one of those installs unsatisfiable, and finding that
-    # out after the prune leaves the venv without its features. Decided from
-    # the manifest and the incoming lock alone, before anything is installed.
-    if install and features and source_checkout is not None:
-        preflight_manifest = cli._host_manifest_path(
-            argparse.Namespace(manifest=getattr(args, "manifest", None))
-        )
-        if preflight_manifest.exists():
-            if dry_run:
-                print(
-                    "• preflight: would check the host manifest against core's "
-                    "uv.lock before installing"
-                )
-            else:
-                rc = cli._run_sync_preflight(preflight_manifest)
-                if rc != 0 and not continue_on_error:
-                    print(
-                        "• preflight: REFUSED — nothing was installed or "
-                        "restarted. Fix the entries above in "
-                        f"{preflight_manifest}, then re-run `kestrel update`. "
-                        "(--continue-on-error installs anyway and lets the "
-                        "sync fail them.)",
-                        file=sys.stderr,
-                    )
-                    return rc
-                if rc != 0:
-                    print(
-                        "• preflight: continuing (--continue-on-error); the "
-                        "sync will fail the entries above",
-                        file=sys.stderr,
-                    )
 
     # Step 2: refresh the install from the source checkout.
     #
@@ -2030,7 +2045,7 @@ def cmd_update(args) -> int:
     # The install replaced packages this process imported, and every step
     # below imports more of them.
     if installed:
-        return _continue_update_in_fresh_interpreter(args, after="install")
+        return _continue_update_in_fresh_interpreter(args)
 
     # Step 2.5: kestrel feature sync — restore the host's out-of-tree feature
     # packages that `uv sync` just pruned (anything not in sovereign's lock).

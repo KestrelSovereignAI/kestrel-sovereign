@@ -54,10 +54,16 @@ def test_feature_sync_step_added_when_manifest_present(tmp_path):
     assert str(manifest.resolve()) in fs.argv
 
 
-def test_the_manifest_is_checked_against_the_landed_lock_before_the_prune(tmp_path):
+def test_the_manifest_is_checked_against_the_fetched_lock_before_anything_lands(
+    tmp_path,
+):
     """#3702: ``uv sync`` prunes what ``feature sync`` restores, so a manifest
-    window the landed lock contradicts must stop the update before the sync,
-    as it does ``kestrel update``, not leave the host without its features."""
+    window the fetched lock contradicts must stop the update before the sync,
+    as it does ``kestrel update``, not leave the host without its features.
+
+    Before the checkout, not merely before the install: the step runs the code
+    on disk, and once the checkout lands the fetched code, that code need not
+    import against the packages installed until ``uv sync`` has run."""
     import sys
 
     manifest = tmp_path / ".kestrel-host-features.toml"
@@ -68,13 +74,12 @@ def test_the_manifest_is_checked_against_the_landed_lock_before_the_prune(tmp_pa
     )
     names = _step_names(steps)
 
-    assert names.index("reattach_branch") < names.index("feature_preflight")
-    assert names.index("feature_preflight") < names.index("install")
+    assert names[:3] == ["fetch", "feature_preflight", "checkout"]
     preflight = next(s for s in steps if s.name == "feature_preflight")
-    # A fresh interpreter, so it is the landed code that judges the landed lock.
+    # The lock FETCH_HEAD records: what the checkout and `uv sync` will install.
     assert preflight.argv == [
         sys.executable, "-m", "kestrel_sovereign.cli", "feature", "sync",
-        "--manifest", str(manifest), "--preflight",
+        "--manifest", str(manifest), "--preflight", "--lock-revision", "FETCH_HEAD",
     ]
     assert preflight.cwd == "/repo"
     # Fatal on failure: a refusal must stop the update before the install.

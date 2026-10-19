@@ -2383,7 +2383,6 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _git_working_tree_dirty,
     _run_git_pull,
     _run_git_fetch,
-    _git_head,
     _pull_target_revision,
     _git_reattach_if_safely_detached,
     _run_uv_sync,

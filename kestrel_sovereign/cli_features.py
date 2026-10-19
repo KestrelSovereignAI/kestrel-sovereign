@@ -2931,17 +2931,24 @@ def _manifest_dist_name(package: str) -> str:
         return canonical_package(package)
 
 
-def sync_preflight(source_index) -> SyncPreflight:
+def sync_preflight(source_index, *, lock_revision: Optional[str] = None) -> SyncPreflight:
     """Check *source_index* against the lock a sync of it will be held to (#3702).
 
     The lock is the one the sync's installs keep: beside the checkout the
     manifest declares for core, none when it declares core from the index
     (an index wheel ships no lock), and otherwise the one beside the core
     installed now (:meth:`CoreInstallGuard.install_core` and
-    :meth:`CoreInstallGuard.refresh`). Installs nothing.
+    :meth:`CoreInstallGuard.refresh`). For that last one, *lock_revision* reads
+    it as the git revision about to be pulled or checked out records it, so
+    the check runs before the new code lands: that code may not even import
+    against the packages installed now. Installs nothing.
     """
     from kestrel_sovereign import feature_reconcile as fr
-    from kestrel_sovereign.core_lock import load_core_lock
+    from kestrel_sovereign.core_lock import (
+        core_lock_checkout,
+        load_core_lock,
+        read_core_lock_at,
+    )
 
     guard = CoreInstallGuard.snapshot(source_index)
     core = source_index.get(fr.CORE_DISTRIBUTION)
@@ -2951,6 +2958,13 @@ def sync_preflight(source_index) -> SyncPreflight:
         )
     elif core is not None and core.pypi is not None:
         return SyncPreflight()
+    elif lock_revision is not None:
+        def read_incoming():
+            checkout = core_lock_checkout(guard.before.provenance)
+            # An index-installed core ships no lock at any revision.
+            return None if checkout is None else read_core_lock_at(checkout, lock_revision)
+
+        lock, error, _ = guard._bind_lock(read_incoming)
     else:
         lock, error = guard._lock, guard._lock_error
     if error is not None:
@@ -3007,13 +3021,14 @@ def report_sync_preflight(result: SyncPreflight, manifest: Path, *, stream=None)
         )
 
 
-def run_sync_preflight(path: Path) -> int:
+def run_sync_preflight(path: Path, *, lock_revision: Optional[str] = None) -> int:
     """``kestrel feature sync --preflight`` for the manifest at *path* (#3702).
 
-    0 when a sync of it can be held to core's lock; 1, with every reason
-    printed, when the sync would certainly refuse: a window the lock
-    contradicts, a lock that cannot hold it, or a manifest that will not read.
-    Installs nothing.
+    0 when a sync of it can be held to core's lock (as *lock_revision* records
+    it, when given: see :func:`sync_preflight`); 1, with every reason printed,
+    when the sync would certainly refuse: a window the lock contradicts, a
+    lock that cannot hold it, or a manifest that will not read. Installs
+    nothing.
     """
     from kestrel_sovereign import feature_reconcile as fr
     from kestrel_sovereign.feature_registry import load_registry
@@ -3030,7 +3045,9 @@ def run_sync_preflight(path: Path) -> int:
     if not entries:
         print(f"• preflight: {path} declares no features; nothing to check")
         return 0
-    result = sync_preflight(fr.build_source_index(entries, load_registry()))
+    result = sync_preflight(
+        fr.build_source_index(entries, load_registry()), lock_revision=lock_revision,
+    )
     report_sync_preflight(
         result, path, stream=sys.stderr if result.refuses else sys.stdout,
     )
@@ -3223,7 +3240,9 @@ def cmd_feature_sync(args) -> int:
         return 1
 
     if getattr(args, "preflight", False):
-        return run_sync_preflight(path)
+        return run_sync_preflight(
+            path, lock_revision=getattr(args, "lock_revision", None),
+        )
 
     try:
         entries = _load_host_manifest(path)
@@ -4018,7 +4037,16 @@ def add_feature_subparser(subparsers) -> None:
         help=(
             "Install nothing; exit non-zero when the manifest contradicts "
             "core's uv.lock (a window excluding a locked version), which the "
-            "sync would refuse. `kestrel update` runs this before `uv sync`"
+            "sync would refuse. `kestrel update` runs this before its pull"
+        ),
+    )
+    feat_sync.add_argument(
+        "--lock-revision",
+        metavar="REV",
+        help=(
+            "With --preflight: read core's uv.lock as git revision REV of "
+            "core's checkout records it (what a pull or checkout to REV "
+            "installs), instead of the working tree"
         ),
     )
     feat_sync.add_argument(

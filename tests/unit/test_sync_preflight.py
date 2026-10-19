@@ -308,3 +308,125 @@ def test_update_without_features_has_no_sync_to_predict(update, tmp_path):
     assert _update("--no-features") == 0
 
     assert update == ["uv sync", "restart"]
+
+
+# --- the lock the pull will land, read before it lands -----------------------
+
+import subprocess as _subprocess
+
+from kestrel_sovereign.core_lock import CoreLockError, read_core_lock_at
+
+REAL_RUN = _subprocess.run
+
+
+def _git(cwd, *args):
+    return REAL_RUN(
+        ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _commit_lock(repo, lock, message):
+    (repo / "uv.lock").write_text(lock, encoding="utf-8")
+    _git(repo, "add", "uv.lock")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def incoming(tmp_path, monkeypatch):
+    """Core's checkout on a lock pinning phoenix 17.7.0; its upstream now pins 20.23.0.
+
+    The venv's metadata is the fake's; git is real, because the revision the
+    pull lands on is what this reads.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _commit_lock(origin, _lock_text(**{"arize-phoenix": "17.7.0"}), "old lock")
+    clone = tmp_path / "kestrel-sovereign"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    new = _commit_lock(origin, _lock_text(**{"arize-phoenix": "20.23.0"}), "new lock")
+    _git(clone, "fetch", "-q")
+    use_fake_uv(monkeypatch, FakeUv(
+        core_checkout=str(clone), feature="arize-phoenix",
+        feature_version="17.7.0", feature_requires=">=0.52",
+    ))
+    monkeypatch.setattr(_subprocess, "run", REAL_RUN)
+    return clone, new
+
+
+def test_the_preflight_reads_the_lock_the_revision_records(incoming, tmp_path):
+    clone, new = incoming
+    index = _index(_manifest(tmp_path, PHOENIX_STALE))
+
+    # On disk, the lock still agrees with the manifest...
+    assert not sync_preflight(index).refuses
+    # ...but the revision the pull lands on does not.
+    result = sync_preflight(index, lock_revision=new)
+
+    assert [(c.package, c.locked) for c in result.conflicts] == [
+        ("arize-phoenix", "20.23.0"),
+    ]
+    assert str(result.lock_path).endswith(f"uv.lock@{new}")
+
+
+def test_a_revision_without_a_lock_has_none(incoming):
+    clone, _ = incoming
+    _git(clone, "rm", "-q", "uv.lock")
+    _git(clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "no lock")
+
+    assert read_core_lock_at(clone, "HEAD") is None
+
+
+def test_a_revision_the_checkout_does_not_have_is_an_error(incoming):
+    clone, _ = incoming
+
+    with pytest.raises(CoreLockError, match="no revision"):
+        read_core_lock_at(clone, "f" * 40)
+
+
+@pytest.fixture
+def real_update(incoming, tmp_path, monkeypatch):
+    """``kestrel update`` on *incoming*'s clone: real git, recorded install steps."""
+    clone, new = incoming
+    project = tmp_path / "project"
+    project.mkdir()
+    steps = []
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
+    monkeypatch.setattr(cli, "_run_uv_sync", lambda _: steps.append("uv sync") or (0, ""))
+    monkeypatch.setattr(
+        cli, "cmd_feature_sync", lambda args: steps.append("feature sync") or 0,
+    )
+    monkeypatch.setattr(cli_lifecycle, "_run_feature_reconcile", lambda *a, **kw: 0)
+    monkeypatch.setattr(cli_lifecycle, "_report_core_lock", lambda: None)
+    monkeypatch.setattr(cli, "cmd_restart", lambda args: steps.append("restart") or 0)
+    return clone, new, project, steps
+
+
+def test_update_refuses_the_incoming_lock_before_pulling_anything(
+    real_update, capsys,
+):
+    clone, new, project, steps = real_update
+    _manifest(project, PHOENIX_STALE)
+    head = _git(clone, "rev-parse", "HEAD")
+
+    rc = cli.cmd_update(cli.build_parser().parse_args(["update"]))
+
+    assert rc == 1
+    assert steps == []
+    assert _git(clone, "rev-parse", "HEAD") == head
+    err = capsys.readouterr().err
+    assert "arize-phoenix==17.7.0, the lock pins 20.23.0" in err
+    assert "nothing was pulled, installed or restarted" in err
+
+
+def test_update_pulls_and_installs_when_the_incoming_lock_agrees(real_update):
+    clone, new, project, steps = real_update
+    _manifest(project, '[[feature]]\nname = "arize-phoenix"\npypi = ""\n')
+
+    rc = cli.cmd_update(cli.build_parser().parse_args(["update"]))
+
+    assert rc == 0
+    assert _git(clone, "rev-parse", "HEAD") == new
+    assert steps == ["uv sync", "feature sync", "restart"]
