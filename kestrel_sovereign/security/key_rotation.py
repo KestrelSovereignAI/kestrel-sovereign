@@ -216,14 +216,7 @@ class KeyRotationService:
             RuntimeError: If a rotation is already in progress
         """
         async with self._rotation_admission_lock:
-            # A failed attempt may already have durable rows under the new key.
-            # Its journal must be resumed, not replaced by a fresh rotation ID.
-            existing = await self._get_in_progress_rotation()
-            if existing:
-                raise RuntimeError(
-                    f"Rotation {existing.id} is unresolved. "
-                    "Resume with its original keys before starting a new rotation."
-                )
+            await self._require_rotation_admission()
 
             # Get new key
             if new_key_file:
@@ -270,6 +263,23 @@ class KeyRotationService:
 
             return rotation.id
 
+    async def _require_rotation_admission(self, resume_id: str | None = None) -> None:
+        """One admission rule for every start/resume, under the service lock.
+
+        A retiring task owns the database even after its status was saved.
+        A partially applied journal owns the key transition after task exit.
+        Only that same journal may resume; another historical failed attempt
+        cannot claim its remaining old-key rows.
+        """
+        if any(not task.done() for task in self._rotation_tasks):
+            raise RuntimeError("A rotation is already running; wait for its owner to finish")
+        existing = await self._get_in_progress_rotation(excluding_id=resume_id)
+        if existing:
+            raise RuntimeError(
+                f"Rotation {existing.id} is unresolved. "
+                "Resume with its original keys before starting a new rotation."
+            )
+
     async def get_status(self, rotation_id: str) -> Optional[RotationRecord]:
         """Get the status of a rotation operation."""
         row = await self.storage.database.fetchone(
@@ -302,15 +312,13 @@ class KeyRotationService:
             True if resumed successfully
         """
         async with self._rotation_admission_lock:
+            await self._require_rotation_admission(rotation_id)
             rotation = await self.get_status(rotation_id)
             if not rotation:
                 raise ValueError(f"Rotation {rotation_id} not found")
 
             if rotation.status not in {RotationStatus.IN_PROGRESS, RotationStatus.FAILED}:
                 raise ValueError(f"Rotation {rotation_id} is not resumable")
-            if any(not task.done() and task.get_name() == f"key-rotation-{rotation_id}"
-                   for task in self._rotation_tasks):
-                raise RuntimeError(f"Rotation {rotation_id} is already running")
 
             new_key = _read_key_from_file(key_file)
             if not new_key or _hash_key(new_key) != rotation.new_key_hash:
@@ -696,7 +704,7 @@ class KeyRotationService:
                 # A skipped encrypted row would remain under the old key even
                 # if the overall run reported success. Preserve partial progress
                 # and require an explicit resume with both original keys instead.
-                raise RuntimeError(f"Encrypted record in {table} could not be rotated") from e
+                raise RuntimeError(f"Encrypted record {record_id_str[:128]!r} in {table} could not be rotated") from e
 
     async def _count_encrypted_records(self) -> int:
         """Count total encrypted records across all registered tables.
@@ -774,14 +782,15 @@ class KeyRotationService:
             new_key = current
         return await self.start_rotation(new_key=new_key, new_key_file=new_key_file)
 
-    async def _get_in_progress_rotation(self) -> Optional[RotationRecord]:
-        """Find active work or a failed rotation with durable partial progress."""
-        row = await self.storage.database.fetchone(
-            "SELECT * FROM key_rotations k WHERE k.status = ? OR (k.status = ? "
-            "AND EXISTS (SELECT 1 FROM rotation_progress p WHERE p.rotation_id = k.id)) "
-            "ORDER BY started_at LIMIT 1",
-            (RotationStatus.IN_PROGRESS.value, RotationStatus.FAILED.value),
-        )
+    async def _get_in_progress_rotation(self, *, excluding_id: str | None = None) -> Optional[RotationRecord]:
+        """Find any unresolved journal other than the exact resume target."""
+        sql = ("SELECT * FROM key_rotations k WHERE (k.status = ? OR (k.status = ? "
+               "AND EXISTS (SELECT 1 FROM rotation_progress p WHERE p.rotation_id = k.id)))")
+        params = [RotationStatus.IN_PROGRESS.value, RotationStatus.FAILED.value]
+        if excluding_id is not None:
+            sql += " AND k.id != ?"
+            params.append(excluding_id)
+        row = await self.storage.database.fetchone(sql + " ORDER BY started_at LIMIT 1", tuple(params))
         if row:
             return RotationRecord(
                 id=row[0],

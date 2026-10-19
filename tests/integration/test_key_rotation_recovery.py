@@ -60,13 +60,13 @@ async def rotation_store(tmp_path, monkeypatch, request):
 
 
 async def reject_writes(db, table, failure):
-    assert table in {"artifact_keys", "files"}
+    assert table in {"artifact_keys", "files", "conversation_history"}
     if db.backend_type == "sqlite":
         action = "SELECT RAISE(ABORT, 'update denied');" if failure == "raise" else "SELECT RAISE(IGNORE);"
         await db.execute(f"CREATE TRIGGER rotation_unavailable BEFORE UPDATE ON {table} BEGIN {action} END")
     else:
         action = "RAISE EXCEPTION 'update denied';" if failure == "raise" else "RETURN NULL;"
-        await db.execute(f"CREATE FUNCTION rotation_unavailable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {action} END $$")
+        await db.execute(f"CREATE OR REPLACE FUNCTION rotation_unavailable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {action} END $$")
         await db.execute(f"CREATE TRIGGER rotation_unavailable BEFORE UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION rotation_unavailable()")
 
 
@@ -176,3 +176,64 @@ async def test_valid_journal_can_be_resumed_after_an_interruption(rotation_store
     assert completed.status == RotationStatus.COMPLETED
     assert completed.records_processed == 10
     await assert_rotated(store)
+
+
+async def allow_writes(db, table):
+    if db.backend_type == "sqlite":
+        await db.execute("DROP TRIGGER rotation_unavailable")
+    else:
+        await db.execute(f"DROP TRIGGER rotation_unavailable ON {table}")
+
+
+async def zero_progress_journal(store, tmp_path):
+    key = Fernet.generate_key().decode()
+    key_file = tmp_path / "earlier-key"
+    key_file.write_text(key)
+    key_file.chmod(0o600)
+    await reject_writes(store.db, "conversation_history", "raise")
+    rotation_id = await store.service.start_rotation(new_key=key)
+    await store.service.drain_rotations()
+    failed = await store.service.get_status(rotation_id)
+    assert failed.status == RotationStatus.FAILED and failed.records_processed == 0
+    await allow_writes(store.db, "conversation_history")
+    return rotation_id, key_file
+
+
+@pytest.mark.asyncio
+async def test_stale_zero_progress_journal_cannot_override_partial_rotation(rotation_store, tmp_path):
+    store = rotation_store
+    stale_id, stale_key_file = await zero_progress_journal(store, tmp_path)
+    await reject_writes(store.db, "artifact_keys", "raise")
+    current_id = await store.service.start_rotation(new_key=store.new_key)
+    await store.service.drain_rotations()
+    failed = await store.service.get_status(current_id)
+    assert failed.status == RotationStatus.FAILED and failed.records_processed == 9
+    await allow_writes(store.db, "artifact_keys")
+    with pytest.raises(RuntimeError, match="unresolved"):
+        await store.service.resume_rotation(stale_id, str(stale_key_file))
+    assert await store.service.resume_rotation(current_id, str(store.key_file))
+    await store.service.drain_rotations()
+    assert (await store.service.get_status(current_id)).status == RotationStatus.COMPLETED
+    assert (await store.service.get_status(stale_id)).records_processed == 0
+    await assert_rotated(store)
+
+
+@pytest.mark.asyncio
+async def test_running_owner_blocks_every_start_and_resume(rotation_store, tmp_path):
+    store = rotation_store
+    stale_id, stale_key_file = await zero_progress_journal(store, tmp_path)
+    # Native retirement can remain owned after the terminal status was saved.
+    # Even a task whose ID differs must block all new work until it joins.
+    retirement = asyncio.Event()
+    store.service._track_rotation_task(retirement.wait(), "different-retiring-owner")
+    with pytest.raises(RuntimeError, match="running"):
+        await store.service.start_rotation(new_key=store.new_key)
+    with pytest.raises(RuntimeError, match="running"):
+        await store.service.resume_rotation(stale_id, str(stale_key_file))
+    retirement.set()
+    await store.service.drain_rotations()
+    assert await store.service.resume_rotation(stale_id, str(stale_key_file))
+    await store.service.drain_rotations()
+    assert (await store.service.get_status(stale_id)).status == RotationStatus.COMPLETED
+    cipher = AEADCipher(_master_bytes_from_key(stale_key_file.read_text()))
+    assert cipher.decrypt(bytes((await store.db.fetchone("SELECT wrapped_key FROM artifact_keys"))[0])) == store.root
