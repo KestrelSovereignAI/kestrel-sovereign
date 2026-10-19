@@ -4834,7 +4834,9 @@
       "type": "User Guide"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/security/key_rotation.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
