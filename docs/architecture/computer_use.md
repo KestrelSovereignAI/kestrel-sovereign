@@ -21,6 +21,11 @@ privacy: public
 
 Optional capability that lets a sovereign agent read, list, write, and edit files on the user's machine and run shell commands. Disabled by default. Enabling it requires three independent actions — and even then, every tool call is gated.
 
+Provider-neutral visual sessions and saved outputs are specified in
+[Visual computer use and durable artifacts](VISUAL_COMPUTER_USE.md) (#3703).
+That work adds separate capabilities; the host filesystem/shell grants below
+do not authorize visual or native-desktop control.
+
 ## The gate sequence
 
 Every tool call runs through the same sequence. The audit log records every stage that passed and the stage that refused (if any) as a chain like `["privacy", "constitution", "path_safety", "policy", "input_validation", "approval:once:human"]`.
