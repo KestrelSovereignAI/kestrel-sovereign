@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-18
-**Scope:** 3139 tracked files (2331 `.py`, 359 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-19
+**Scope:** 3142 tracked files (2333 `.py`, 360 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2155,6 +2155,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.53.28.md** — Core 0.53.28 — Hosted execution custody — Status: unreleased; review and full release gates remain required.
 - **docs/releases/v0.53.31.md** — Core 0.53.31 — Private native HTTP admission — Status: candidate; publication and artifact verification remain required.
 - **docs/releases/v0.53.32.md** — Core 0.53.32 — Atomic stream-owner construction — Status: candidate; publication and artifact verification remain required.
+- **docs/releases/v0.53.33.md** — Core 0.53.33 — Wait-worker resident custody — Status: candidate; review, CI, publication and artifact verification are required.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
@@ -3133,6 +3134,8 @@ Repo entry points and standard project files.
   - `class NativeDispatchInput`; `async def real_dispatch(wait_native_runtime)`; `async def test_actual_agent_completion_receipt_survives_wait_harvest(real_dispatch, monkeypatch)`; `async def test_failed_wait_classification_cannot_become_restart_loss(real_dispatch, monkeypatch, route)`; `async def test_durable_resume_rejects_original_borrowed_native_callback(real_dispatch, monkeypatch, role, callback_kind, …)`; `async def test_durable_resume_accepts_plain_results_from_actual_stores(real_dispatch, monkeypatch, plain_callback)`
 - **tests/integration/test_wait_ownership_original_control.py** — Actual native lookup control must not grant durable watch admission.
   - `async def test_native_recipient_control_cannot_become_unverifiable_watch(native_pg, tmp_path, monkeypatch, route)`
+- **tests/integration/test_wait_resident_custody_pg.py** — Real wait-worker lifetime after hosted bootstrap admission retires (#3385).
+  - `async def test_wait_resident_outlives_boot_admission_but_not_original_generation(native_pg, tmp_path, monkeypatch, retirement)`
 - **tests/js/test_voice_capture_worklet.mjs** — (mjs asset)
 - **tests/js/test_voice_events.mjs** — (mjs asset)
 - **tests/js/test_voice_native_custody.cjs** — —
@@ -3511,6 +3514,8 @@ Repo entry points and standard project files.
   - `class TestSkipsOnlyTheDuplicate`; `class TestPrMustActuallyTriggerThisWorkflow`; `class TestEveryOtherTriggerRuns`; `class TestFailsOpen`; `class TestPrQueryFilter`; `class TestWiring`; `class TestTierConditions`; `class TestGateQueryInvocation`; `…`
 - **tests/unit/test_ci_gate_actions_fallback.py** — A credential that cannot read the Checks API must still produce a verdict.
   - `async def test_a_refused_checks_api_falls_back_to_the_actions_api(monkeypatch)`; `async def test_the_caveat_names_the_class_of_gate_that_stays_invisible(monkeypatch)`; `async def test_a_complete_rollup_has_no_caveat_at_all(monkeypatch)`; `async def test_a_network_failure_on_checks_does_not_take_the_fallback(monkeypatch)`; `async def test_both_check_endpoints_refused_is_a_hard_auth_failure(monkeypatch)`; `async def test_a_refused_status_propagates_instead_of_degrading(monkeypatch)`; `async def test_a_401_on_the_checks_read_does_not_degrade(monkeypatch)`; `async def test_a_401_on_the_actions_fallback_does_not_degrade_either(monkeypatch)`; `…`
+- **tests/unit/test_ci_minimum_python_custody.py** — The supported minimum interpreter must exercise actual native custody.
+  - `def minimum_job()`; `def test_minimum_lane_pins_interpreter_and_exact_release_ref()`; `def test_minimum_lane_cannot_silently_skip_native_or_omit_regressions()`
 - **tests/unit/test_ci_no_metered_provider_credentials.py** — Routine CI cannot enable metered tests through repo or inherited secrets.
   - `def test_provider_credentials_are_explicitly_blank_in_routine_test_steps(job)`
 - **tests/unit/test_ci_redefinition_gate.py** — The F811 gate in ``.github/workflows/ci.yml``.
