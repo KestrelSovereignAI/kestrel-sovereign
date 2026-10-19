@@ -8,7 +8,7 @@ tags:
 - architecture
 - architecture-spec
 timestamp: '2026-10-19T00:00:00Z'
-status: active
+status: design-of-record
 owner: architecture
 canonical: false
 generated: false
@@ -19,7 +19,9 @@ privacy: public
 
 Implementation decision record for [#3703](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3703), tracked by [#3707](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3707).
 
-Status: contracts under review; runtime and product integration in progress.
+Delivery snapshot (2026-10-19): SDK base contracts merged in SDK PR #87;
+workspace transfer extension tracked in SDK #86. Runtime and product integration
+remain in progress.
 This document specifies delivery boundaries, not capabilities already enabled.
 
 ## Four independent services

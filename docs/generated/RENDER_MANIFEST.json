@@ -724,7 +724,7 @@
       "path": "docs/architecture/VISUAL_COMPUTER_USE.md",
       "privacy": "public",
       "render": "public",
-      "status": "active",
+      "status": "design-of-record",
       "title": "Visual computer use and durable artifacts",
       "type": "Architecture Spec"
     },
