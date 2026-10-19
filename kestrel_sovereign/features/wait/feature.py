@@ -100,7 +100,11 @@ class WaitFeature(Feature):
         if agent is None or getattr(agent, "wait_registry", None) is None:
             # Standalone / no wait engine — nothing to reconcile.
             return
-        self._track_owned_background_task(
+        # This is the feature's resident service, not an effect child of the
+        # bootstrap request. Publish through Core's READY/runtime handoff so
+        # normal retirement of that request cannot poison the shared wait
+        # reconciler. The original runtime generation still governs every tick.
+        self._track_owned_runtime_task(
             self._fallback_reconcile_loop(agent),
             name="wait_fallback_reconcile",
         )
