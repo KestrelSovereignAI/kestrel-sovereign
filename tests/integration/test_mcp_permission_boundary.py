@@ -394,3 +394,54 @@ async def test_restore_database_read_failure_does_not_block_another_remote(mcp_b
     finally:
         peer.agent.get_enablement_deltas = original_reader
         await restored.shutdown()
+
+
+async def test_post_persistence_disable_reports_the_real_saved_connection_and_restore(mcp_boundary, monkeypatch):
+    peer = mcp_boundary
+    assert (await peer.feature.unload_tool(peer.selector)).status.value == "ok"
+    assert await peer.agent.get_enablement_deltas("mcp_server") == []
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_persist = peer.feature._persist_server
+
+    async def pause_after_committed_persistence(*args, **kwargs):
+        outcome = await original_persist(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        return outcome
+
+    monkeypatch.setattr(peer.feature, "_persist_server", pause_after_committed_persistence)
+    loading = asyncio.create_task(peer.feature.load_tool(peer.selector))
+    stopping = None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        saved = await peer.agent.get_enablement_deltas("mcp_server")
+        assert len(saved) == 1 and saved[0]["state"] == "enabled"
+        connection = peer.current_connection()
+        stopping = asyncio.create_task(peer.agent._unregister_feature_runtime(peer.feature, unload=False))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not stopping.done(), "Core released custody before the admitted persistence await settled"
+        release.set()
+        result = await loading
+        outcome = await stopping
+        assert outcome.name == "RELEASED"
+        assert not connection.is_connected and not peer.feature.enabled
+        assert peer.owner not in peer.agent._tool_to_feature.values()
+        assert await peer.agent.get_enablement_deltas("mcp_server") == saved
+        monkeypatch.setattr(peer.feature, "_persist_server", original_persist)
+        await peer.agent._activate_feature_runtime(peer.feature)
+        assert peer.current_connection().is_connected
+        assert peer.owner in peer.agent._tool_to_feature.values()
+        fresh = peer.invoke("saved-after-aborted-load")
+        approval = await asyncio.wait_for(peer.requests.get(), 5)
+        assert await peer.queue.submit_decision(approval.id, True, scope="once")
+        restored_result = await peer.result_with_witness(
+            asyncio.wait_for(fresh, 5), ["saved-after-aborted-load"],
+        )
+        assert restored_result["status"] == "ok"
+        assert result.status.value == "error"
+        assert "remains saved" in result.error, {"result": result.to_dict(), "saved": saved, "restored": restored_result}
+        assert "Unload" in result.error
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (loading, stopping) if task is not None), return_exceptions=True)
