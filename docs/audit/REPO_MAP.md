@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-19
-**Scope:** 3147 tracked files (2337 `.py`, 361 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3149 tracked files (2339 `.py`, 361 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1416,7 +1416,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/async_assertion_store.py** — Tenant-bound persistence for canonical semantic assertions.
   - `class AssertionStoreError`; `class SemanticRecallUnavailableError`; `class MaintenanceLeaseLostError`; `class TenantIsolationError`; `class AssertionConflictError`; `class AssertionOperationErasedError`; `class AssertionWriteResult`; `class SupersessionResult`; `…`
 - **kestrel_sovereign/storage/async_conversation_store.py** — Async Conversation Store for Kestrel Storage.
-  - `class ProjectionNotReady`; `class ConversationLexicalSchemaError`; `class ConversationSessionTimestampError`; `class DroppedConversationEmbedding`; `class EmbeddingColumnMismatch`; `class SearchTerms`; `def session_match_decoration(messages, name, terms)`; `def search_session_summaries(normalized_messages, query, names, limit)`; `…`
+  - `class ProjectionNotReady`; `class ConversationLexicalSchemaError`; `class ConversationSessionTimestampError`; `class DroppedConversationEmbedding`; `class EmbeddingColumnMismatch`; `class PreparedConversationFields`; `class SearchTerms`; `def session_match_decoration(messages, name, terms)`; `…`
 - **kestrel_sovereign/storage/async_database.py** — Async Database for Kestrel Storage.
   - `class DatabaseRetirementError`; `class DatabaseInitializationCleanupError`; `def graph_created_at_index_columns(backend_type)`; `def core_schema_sql(backend_type)`; `def validate_sqlite_core_schema_readiness(db_path)`; `class AsyncDatabase`
 - **kestrel_sovereign/storage/async_file_store.py** — Async File Store for Kestrel Storage.
@@ -3049,8 +3049,12 @@ Repo entry points and standard project files.
   - `async def test_conversations_are_actually_saved()`; `async def test_platform_shutdown_does_not_lose_data()`; `async def test_encryption_actually_works()`; `async def test_content_integrity_verification()`; `async def test_sovereignty_vs_simple_download()`; `async def test_inheritance_scenario()`; `async def test_performance_vs_cloud()`
 - **tests/integration/test_sovereignty_import.py** — Integration tests for V2 Import/Restore functionality.
   - `def temp_db()`; `async def llm_service()`; `async def test_restore_preserves_created_at_and_trash(temp_db)`; `async def test_restore_preserves_turn_order_for_same_second(temp_db)`; `async def test_export_import_roundtrip(temp_db)`; `async def test_import_rederives_the_session_id_column(temp_db)`; `async def test_import_with_wrong_key_fails(temp_db)`; `async def test_agent_command_import(temp_db, llm_service, skip_bootstrap)`; `…`
+- **tests/integration/test_sovereignty_import_journal_namespace.py** — Actual SQL journal namespace isolation; no cloud transport or model calls.
+  - `async def test_configured_journal_preserves_host_schema_and_rows(backend, tmp_path)`; `async def test_refused_journal_insert_propagates_actual_sql_error(backend, tmp_path, ignored)`; `def test_journal_namespace_refuses_unsafe_identifiers_before_any_io(name)`; `def test_journal_namespace_requires_text_before_any_io(name)`; `async def test_journal_preserves_original_native_control_before_ddl(native_pg, outcome, operation)`
 - **tests/integration/test_sovereignty_lighthouse_attribution.py** — Sovereignty exports on Lighthouse are attributed to their agent (#2874).
   - `def data_key(monkeypatch)`; `def kubo()`; `def lighthouse(monkeypatch)`; `def no_ambient_backup_tiers(monkeypatch)`; `def newest_only(monkeypatch)`; `async def test_export_is_found_by_the_health_check_and_attributed_to_its_agent(tmp_path, monkeypatch, kubo, lighthouse, …)`; `async def test_cleanup_for_one_agent_never_touches_another_agents_export(tmp_path, monkeypatch, kubo, lighthouse, …)`; `async def test_an_unattributable_legacy_upload_is_retained_by_cleanup(tmp_path, monkeypatch, kubo, lighthouse, …)`; `…`
+- **tests/integration/test_sovereignty_portable_conversations.py** — Actual encrypted SQLite -> CAR -> distinct destination, no model/cloud I/O.
+  - `class CapturedArchive`; `class LegacyEnvelopeArchive`; `async def test_import_success_requires_an_acknowledged_audit_row(monkeypatch, tmp_path)`; `async def test_encrypted_conversations_are_readable_under_distinct_destination_key(monkeypatch, tmp_path)`; `async def test_conflicting_host_audit_schema_cannot_be_a_logged_success(monkeypatch, tmp_path)`; `async def test_corrupt_source_at_rest_is_refused_before_upload(monkeypatch, tmp_path)`; `async def test_legacy_envelopes_require_the_actual_destination_key_before_replace(monkeypatch, tmp_path, same_target, audit_outcome)`
 - **tests/integration/test_sovereignty_v2.py** — —
   - `class MockStorageResult`; `class MockFilecoinAdapter`; `def temp_db()`; `async def test_sovereignty_export_v3_car(temp_db)`; `class MockLLMService`; `class MockWallet`; `async def test_agent_export_command(temp_db, skip_bootstrap)`
 - **tests/integration/test_spawn_enclosing_native_outcomes.py** — Exact native spawn/admission outcomes survive enclosing manager joins.
@@ -3264,7 +3268,7 @@ Repo entry points and standard project files.
 - **tests/unit/storage/test_session_id_write_paths.py** — #2958: every writer of ``conversation_history`` stamps the derived column.
   - `async def test_a_salvage_marker_is_filed_in_the_session_it_salvaged(tmp_path)`; `async def test_a_salvage_marker_outside_the_contract_stamps_null_not_garbage(tmp_path)`; `async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(tmp_path)`; `async def test_a_restore_rederives_the_column_from_the_backup_metadata(tmp_path)`
 - **tests/unit/storage/test_sovereign_import_destination.py** — #2525: ``target_db_path`` is refused before the bound database is touched.
-  - `async def test_non_none_target_db_path_is_refused_before_any_io(target)`; `async def test_omitted_keyword_does_not_warn(recwarn)`; `def test_unsupported_destination_is_a_value_error()`
+  - `async def test_non_none_target_db_path_is_refused_before_any_io(target)`; `async def test_omitted_keyword_does_not_warn(recwarn, tmp_path)`; `def test_unsupported_destination_is_a_value_error()`
 - **tests/unit/storage/test_sqlite_close_diagnostics.py** — What an SQLite close reports when it overruns its budget (#3460).
   - `def short_close_window(monkeypatch)`; `async def test_slow_close_reports_elapsed_budget_and_wal_size(tmp_path, short_close_window, caplog)`; `async def test_overrun_interrupts_before_it_logs(tmp_path, short_close_window, monkeypatch)`; `async def test_normal_close_logs_nothing_and_checkpoints(tmp_path, caplog)`; `async def test_failed_wal_read_reports_unknown_and_keeps_close_error(tmp_path, short_close_window, monkeypatch, caplog)`; `async def test_non_wal_database_reports_journal_mode_without_wal(short_close_window, caplog)`; `async def test_non_wal_database_closes_normally(caplog)`; `async def test_known_non_wal_journal_mode_never_reads_a_stray_wal(tmp_path)`; `…`
 - **tests/unit/storage/test_sqlite_close_drain_cancellation.py** — Native rollback-drain cancellation is not cancellation of its close observer.
