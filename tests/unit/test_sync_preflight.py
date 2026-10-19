@@ -500,3 +500,44 @@ def test_a_core_the_sync_will_pull_is_read_at_that_pulls_revision(
     # On disk the other checkout pins 17.7.0, which the window excludes; the
     # pull the sync will make lands 20.23.0, which it contains.
     assert run_sync_preflight(manifest) == 0, capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("extras", "refuses"), [('extras = ["observability"]\n', False), ("", True)],
+    ids=["with-extras-the-sync-pulls-it", "linked-as-declared-nothing-pulls-it"],
+)
+def test_core_on_the_installed_checkout_is_read_where_the_sync_leaves_it(
+    incoming, tmp_path, extras, refuses,
+):
+    """With no pull of its own (``--no-pull``), the update leaves the checkout
+    to the sync, which pulls a declared core it has to act on: one whose extras
+    it ensures. One linked exactly as declared it leaves alone."""
+    clone, new = incoming
+    index = _index(_manifest(
+        tmp_path,
+        f'[[feature]]\nname = "{CORE}"\neditable = "{clone}"\n{extras}'
+        '[[feature]]\nname = "arize-phoenix"\npypi = ">=20.23"\n',
+    ))
+
+    assert sync_preflight(index).refuses is refuses
+
+
+def test_a_dry_run_preflight_fetches_nothing(incoming, tmp_path, monkeypatch):
+    clone, new = incoming
+    other = tmp_path / "other-core"
+    _git(tmp_path, "clone", "-q", str(clone), str(other))
+    manifest = _manifest(
+        tmp_path,
+        f'[[feature]]\nname = "{CORE}"\neditable = "{other}"\n'
+        '[[feature]]\nname = "arize-phoenix"\npypi = ""\n',
+    )
+    fetches = []
+    monkeypatch.setattr(cli, "_run_git_fetch", lambda c: fetches.append(c) or (0, ""))
+
+    rc = cli.cmd_feature_sync(argparse.Namespace(
+        manifest=str(manifest), capture=False, dry_run=True, allow_dirty=False,
+        preflight=True,
+    ))
+
+    assert rc == 0
+    assert fetches == []

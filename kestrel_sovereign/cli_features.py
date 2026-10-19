@@ -2973,10 +2973,16 @@ def sync_preflight(
       same checkout, as ``feature sync --capture`` writes it) is the one a
       caller's pull or checkout moves: *lock_revision* is the revision it
       lands on, read before the new code lands, since that code may not even
-      import against the packages installed now. None reads it from disk.
-    * A core declared on another checkout is pulled by the sync itself before
-      it is linked, so it is read at that pull's revision
+      import against the packages installed now.
+    * Otherwise a declared core the sync acts on is pulled by the sync itself
+      before it is linked, so it is read at that pull's revision
       (:func:`_pending_core_pull`; *fetch* and *allow_dirty* as for the pull).
+      The sync acts on it when it switches source (another checkout) or
+      ensures declared extras: the editable half of
+      :func:`_resolve_manifest_action`. Its other half, a demotion to
+      ``ensure`` over unmet requirements, reads the venv as it is before
+      ``uv sync``, which is not the venv the sync will see.
+    * Anything else is read from disk: nothing moves it.
 
     Installs nothing.
     """
@@ -3003,20 +3009,20 @@ def sync_preflight(
             # Whether the declared checkout is the installed one cannot be
             # told; the sync will treat it as a source switch and pull it.
             installed = None
-        if declared is not None and not (
+        on_installed = declared is None or (
             installed is not None and fr._same_path(str(declared), str(installed))
-        ):
+        )
+        if on_installed and lock_revision is not None and installed is not None:
+            return read_core_lock_at(installed, lock_revision)
+        if declared is not None and (not on_installed or core.extras):
             revision = _pending_core_pull(declared, fetch=fetch, allow_dirty=allow_dirty)
             return (
                 read_core_lock_at(declared, revision) if revision
                 else load_core_lock(declared)
             )
-        # Core is the installed checkout, declared on it or not.
         if installed is None:
             # An index-installed core ships no lock at any revision.
             return None
-        if lock_revision is not None:
-            return read_core_lock_at(installed, lock_revision)
         return cli._core_lock(guard.before)
 
     lock, error, _ = guard._bind_lock(read_lock)
@@ -3303,6 +3309,8 @@ def cmd_feature_sync(args) -> int:
         return run_sync_preflight(
             path,
             lock_revision=getattr(args, "lock_revision", None),
+            # A dry run contacts nothing, as it installs nothing.
+            fetch=not getattr(args, "dry_run", False),
             allow_dirty=getattr(args, "allow_dirty", False),
         )
 
