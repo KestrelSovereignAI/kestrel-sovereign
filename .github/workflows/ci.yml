@@ -448,11 +448,12 @@ jobs:
       - name: Install the host and released MCP feature
         run: uv sync --python 3.14 --locked --extra mcp-integration
       - name: Exercise installed MCP permissions against real Docker and HTTPS peers
-        # budget-basis(mcp): slowest-pass=2.0 worst-runner-ratio=1.85 samples=10 longest-test=180
+        # budget-basis(mcp): slowest-pass=2.0 worst-runner-ratio=1.85 samples=11 longest-test=180
         # Eight historical three-case Docker passes include cold bytecode and
-        # public installs; slowest 114.60s, rounded up. Two expanded native
+        # public installs; slowest 114.60s, rounded up. Three expanded native
         # Docker/HTTPS campaigns passed in 46.73s (six cases) and 48.42s (eight
-        # cases) using private candidate wheels before public-floor promotion.
+        # cases), then 47.64s (nine cases) using private candidate wheels before
+        # public-floor promotion. These are at least eleven complete local runs.
         # The ratio is the integration tier's observed runner spread. Its
         # conftest also enforces the 180s per-test ceiling on these tests.
         run: >-

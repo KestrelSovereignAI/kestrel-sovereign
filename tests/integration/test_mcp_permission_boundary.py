@@ -177,6 +177,36 @@ async def test_pending_approval_cannot_execute_against_a_replacement_connection(
 
 
 @pytest.mark.parametrize("mcp_boundary", ["remote"], indirect=True)
+async def test_pending_approval_cannot_execute_while_remote_unload_waits_on_storage(mcp_boundary):
+    peer = mcp_boundary
+    await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.ASK)
+    pending = peer.invoke("approved-during-unload")
+    request = await asyncio.wait_for(peer.requests.get(), 5)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_clear = peer.agent.clear_feature_enablement
+
+    async def slow_clear(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        await original_clear(*args, **kwargs)
+
+    peer.agent.clear_feature_enablement = slow_clear
+    unloading = asyncio.create_task(peer.feature.unload_tool(peer.selector))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert await peer.queue.submit_decision(request.id, True, scope="once")
+        result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
+        assert result["status"] == "error" and "changed; rediscover" in result["error"]
+    finally:
+        release.set()
+        unloaded = await asyncio.wait_for(unloading, 5)
+        peer.agent.clear_feature_enablement = original_clear
+    assert unloaded.status.value == "ok"
+    assert await peer.agent.get_enablement_deltas("mcp_server") == []
+    assert not peer.feature._remote_connections
+
+
+@pytest.mark.parametrize("mcp_boundary", ["remote"], indirect=True)
 async def test_remote_reconnect_refuses_the_real_uninitialized_enablement_service(mcp_boundary):
     peer = mcp_boundary
     peer.agent._feature_enablement_store = None
