@@ -333,6 +333,71 @@ jobs:
         run: uv run python run_tests.py --kestrel --skip-check --validate-only
         timeout-minutes: 5
 
+  # Native custody must work on the declared minimum Python, not only 3.13's
+  # task-preserving wait_for implementation. No provider credentials or calls.
+  minimum-python-custody:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    if: needs.lint-and-imports.outputs.run_expensive != 'false'
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+      - name: Install the locked minimum-version host
+        run: uv sync --python 3.11 --locked
+      - name: Check native minimum-version custody
+        run: >-
+          uv run --python 3.11 --no-sync python -m pytest
+          -p pytest_asyncio.plugin -p pytest_timeout -p kestrel_sovereign.testing.fixtures
+          tests/integration/test_wait_resident_custody_pg.py
+          tests/unit/test_a2a_question_expiry_settlement.py
+          tests/unit/test_agent_manager.py tests/unit/test_audit_read_back_own_writes.py
+          tests/unit/test_execution_custody_production_routes.py
+          tests/unit/test_execution_custody_review49_native.py tests/unit/test_spawn_feature.py
+          -k "wait_resident_outlives or crash_while_the_late_wake_is_in_flight or spawn_receipt_wait_cannot_outlive or deeply_nested_value_never_raises or public_stream_rename_retains_privacy or native_fanout_physically_joins_stronger_late_sibling or terminate_child_preserves_active_cancellation_group"
+          -q --tb=short -o addopts='' --timeout=60 --session-timeout=600
+        env:
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          AWS_EC2_METADATA_DISABLED: "true"
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          OPENROUTER_MANAGEMENT_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          TAVILY_API_KEY: ""
+          REPLICATE_API_TOKEN: ""
+          RUNPOD_API_KEY: ""
+          XAI_API_KEY: ""
+
   # Keep the optional tracing stack compatible with the native MCP SDK.
   native-mcp-dependencies:
     runs-on: ubuntu-latest

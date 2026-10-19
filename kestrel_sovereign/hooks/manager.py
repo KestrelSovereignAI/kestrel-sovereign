@@ -381,10 +381,12 @@ class HooksManager:
                 if getattr(hook, "awaits_user_input", False):
                     output = await hook.execute(input)
                 else:
-                    output = await asyncio.wait_for(
-                        hook.execute(input),
-                        timeout=hook.timeout
-                    )
+                    # Keep the hook on its original owned task. On Python
+                    # 3.11 wait_for creates a hidden child and can replace a
+                    # cancellation-resistant child's stronger native receipt
+                    # with the wrapper's ordinary cancellation.
+                    async with asyncio.timeout(hook.timeout):
+                        output = await hook.execute(input)
 
                 logger.debug(
                     f"Hook '{hook.name}' returned: "
@@ -531,10 +533,8 @@ class HooksManager:
             try:
                 if getattr(hook, "awaits_user_input", False):
                     return await hook.execute(input)
-                return await asyncio.wait_for(
-                    hook.execute(input),
-                    timeout=hook.timeout
-                )
+                async with asyncio.timeout(hook.timeout):
+                    return await hook.execute(input)
             except asyncio.TimeoutError as error:
                 from kestrel_sovereign.execution_custody import (
                     is_execution_control_error,

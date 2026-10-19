@@ -736,7 +736,10 @@ async def test_public_stream_rename_retains_privacy_lock_reentry(monkeypatch, ho
     agent._process_input_streaming_traced_locked = body
     stream = agent.process_input_streaming("rename")
     try:
-        assert await asyncio.wait_for(anext(stream), timeout=5) == "renamed"
+        # Advance and close this lexical source on the same original task;
+        # wait_for silently introduces another task only on Python 3.11.
+        async with asyncio.timeout(5):
+            assert await anext(stream) == "renamed"
         assert agent._agent_name == "After"
     finally:
         await stream.aclose()

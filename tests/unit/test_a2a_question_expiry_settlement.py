@@ -1005,16 +1005,30 @@ async def test_late_answer_survives_a_crash_before_its_wake_is_enqueued(fleet):
 
 
 @pytest.mark.asyncio
-async def test_crash_while_the_late_wake_is_in_flight_is_relayed_again(fleet):
+async def test_crash_while_the_late_wake_is_in_flight_is_relayed_again(fleet, monkeypatch):
     """The late wake was enqueued but its turn never finished: the row is not
     confirmed, so the restarted process relays it again. A duplicate is the
     price of never losing it."""
     await _late_answer_after_unreached_expiry(fleet, "q-inflight")
     in_flight = _BlockedHandle()
     fleet.feature.agent.dispatcher.next_handles.append(in_flight)
+    renewed = asyncio.Event()
+    native_renew = fleet.store.renew_claim_lease
+
+    async def observed_renewal(*args, **kwargs):
+        result = await native_renew(*args, **kwargs)
+        if result:
+            renewed.set()
+        return result
+
+    monkeypatch.setattr(fleet.store, "renew_claim_lease", observed_renewal)
 
     first_pass = asyncio.create_task(fleet.settle())
-    await asyncio.wait_for(in_flight.waiting.wait(), timeout=30)
+    async with asyncio.timeout(30):
+        await in_flight.waiting.wait()
+        # Crash during the remote turn, not during the initial real SQLite
+        # COMMIT acknowledgement (which must retain UNKNOWN if interrupted).
+        await renewed.wait()
     first_pass.cancel()  # the process dies mid-turn
     with pytest.raises(asyncio.CancelledError):
         await first_pass

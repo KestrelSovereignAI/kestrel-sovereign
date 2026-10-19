@@ -72,7 +72,7 @@ async def test_owned_native_cancel_receipt_is_repeatably_harvestable(tmp_path, k
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["fanout", "hooks", "quotes"])
+@pytest.mark.parametrize("route", ["fanout", "hooks-timed", "hooks-human", "quotes"])
 @pytest.mark.parametrize("kind", KINDS)
 async def test_native_fanout_physically_joins_stronger_late_sibling(tmp_path, route, kind):
     agent, db = await native_owner(tmp_path)
@@ -95,11 +95,11 @@ async def test_native_fanout_physically_joins_stronger_late_sibling(tmp_path, ro
     try:
         if route == "fanout":
             coroutine = gather_owned((weak(), late()))
-        elif route == "hooks":
+        elif route.startswith("hooks-"):
             class NativeHook(Hook):
-                awaits_user_input = True
                 def __init__(self, name, callback):
-                    super().__init__(name=name, events=[HookEvent.POST_TOOL_USE])
+                    super().__init__(name=name, events=[HookEvent.POST_TOOL_USE],
+                                     awaits_user_input=route == "hooks-human")
                     self.callback = callback
                 async def execute(self, _input):
                     return await self.callback()

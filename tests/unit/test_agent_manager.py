@@ -519,13 +519,13 @@ async def test_spawn_receipt_wait_cannot_outlive_one_admission_deadline(tmp_path
     admission.before_publish = blocked_receipt
     try:
         with pytest.raises(RuntimeError, match="prepublication authority"):
-            await asyncio.wait_for(
-                manager.load_agent(
+            # Admission belongs to this exact task, not the hidden child
+            # created by wait_for on Python 3.11.
+            async with asyncio.timeout(1.0):
+                await manager.load_agent(
                     "DeadlineChild",
                     LocalAgentConfig(data_dir="unused", port=8801),
-                ),
-                timeout=1.0,
-            )
+                )
     finally:
         never_persisted.set()
         await manager._release_agent_operation(admission)
