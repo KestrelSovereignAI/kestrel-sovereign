@@ -103,3 +103,22 @@ test('running and working tasks both contribute to the working-task count', () =
     assert.equal(count.textContent, '2');
     assert.equal(count.style.display, 'inline-block');
 });
+
+test('artifact names render as text without creating executable HTML', async () => {
+    const target = document.createElement('div');
+    target.id = 'artifacts-title-test';
+    document.body.append(target);
+    const priorRequest = API.request;
+    const names = ['<img src=x onerror="alert(1)">', '<svg onload="alert(1)"></svg>', 'Report & <notes>', ''];
+    API.request = async () => ({ artifacts: names.map(name => ({ name, data: { text: 'saved content' } })) });
+    try {
+        await window.loadTaskArtifacts('title-test');
+        assert.equal(target.querySelector('img, svg, script, [onerror], [onload]'), null);
+        const labels = [...target.children].map(card => card.firstElementChild.textContent);
+        assert.deepEqual(labels, [...names.slice(0, 3), 'Artifact 4']);
+        assert.equal(target.querySelectorAll('pre').length, 4);
+    } finally {
+        API.request = priorRequest;
+        target.remove();
+    }
+});
