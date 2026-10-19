@@ -3892,7 +3892,9 @@ async def test_run_update_stops_at_first_failing_step(tmp_path):
     )
 
     async def _fake_step(self, step):
-        ok = step.name == "fetch"  # checkout fails
+        # The manifest preflight (present: the unit tier seeds a host
+        # manifest) passes; checkout fails.
+        ok = step.name in ("fetch", "feature_preflight")
         return {
             "step": step.name,
             "argv": list(step.argv),
@@ -3910,7 +3912,48 @@ async def test_run_update_stops_at_first_failing_step(tmp_path):
     assert update["ok"] is False
     assert update["failed_step"] == "checkout"
     # Stopped before install/resolve_ref ran.
-    assert {s["step"] for s in update["steps"]} == {"fetch", "checkout"}
+    assert [s["step"] for s in update["steps"]] == [
+        "fetch", "feature_preflight", "checkout",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_manifest_preflight_stops_the_update_before_the_checkout(
+    tmp_path,
+):
+    """#3702: the preflight runs before anything lands, so a manifest window the
+    fetched lock contradicts leaves the checkout and the venv as they were."""
+    feat, backend = await _make_feature(tmp_path)
+    profile = get_update_profile("sovereign_local_uv_sync")
+    row = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="update",
+    )
+    req = SimpleNamespace(
+        id=row.id,
+        update_repo_path=str(tmp_path),
+        update_target_ref="main",
+        update_allow_migrations=False,
+    )
+
+    async def _fake_step(self, step):
+        ok = step.name != "feature_preflight"
+        return {
+            "step": step.name,
+            "argv": list(step.argv),
+            "returncode": 0 if ok else 1,
+            "ok": ok,
+            "stdout_tail": "",
+            "stderr_tail": "" if ok else "contradicts core's uv.lock",
+        }
+
+    with patch.object(
+        RestartCoordinatorFeature, "_run_update_step", _fake_step,
+    ):
+        update = await feat._run_update(req, profile)
+
+    assert update["ok"] is False
+    assert update["failed_step"] == "feature_preflight"
+    assert [s["step"] for s in update["steps"]] == ["fetch", "feature_preflight"]
 
 
 @pytest.mark.asyncio

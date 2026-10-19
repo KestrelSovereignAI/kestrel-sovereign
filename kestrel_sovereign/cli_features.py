@@ -2870,6 +2870,262 @@ class CoreInstallGuard:
         return CORE_UNRESOLVED if outcome.unresolved else CORE_UNSAFE
 
 
+@dataclass(frozen=True)
+class WindowConflict:
+    """A manifest window that excludes the version core's lock pins (#3702)."""
+
+    package: str
+    window: str
+    locked: str
+
+    def describe(self) -> str:
+        return (
+            f"{self.package}: the manifest declares {self.package}{self.window}, "
+            f"the lock pins {self.locked}"
+        )
+
+
+@dataclass(frozen=True)
+class SyncPreflight:
+    """What a ``feature sync`` would certainly refuse, read before it runs (#3702).
+
+    Decided from the host manifest and core's ``uv.lock`` alone, so it can be
+    asked before ``uv sync`` prunes the packages the sync restores. Two answers
+    are certain, because every guarded install carries both lines the
+    contradiction is between (:attr:`CoreInstallGuard.install_constraints`):
+
+    * :attr:`conflicts` — a manifest window that excludes the version the lock
+      pins. Each install is held to ``name===<locked>`` and to the window, and
+      no version satisfies both.
+    * :attr:`error` — the lock cannot hold an install at all (it will not read,
+      or names no single version of a package here), which every guarded
+      install refuses without running (:meth:`CoreInstallGuard.run`).
+
+    What only a resolver can see, such as a feature whose own requirements
+    exclude a locked version, is not here: the sync still reports that.
+    """
+
+    lock_path: Optional[Path] = None
+    conflicts: tuple = ()
+    error: Optional[str] = None
+    #: Manifest windows compared against a locked version.
+    compared: int = 0
+
+    @property
+    def refuses(self) -> bool:
+        return bool(self.conflicts) or self.error is not None
+
+    def report_lines(self) -> list:
+        if self.error is not None:
+            return [f"core's uv.lock cannot hold the sync: {self.error}"]
+        return [conflict.describe() for conflict in self.conflicts]
+
+
+def _manifest_dist_name(package: str) -> str:
+    """*package* without extras: a manifest name may carry them inline."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    try:
+        return canonical_package(Requirement(package).name)
+    except InvalidRequirement:
+        return canonical_package(package)
+
+
+def _pending_core_pull(checkout: Path, *, fetch: bool, allow_dirty: bool) -> Optional[str]:
+    """The revision ``feature sync``'s pull of a declared core checkout lands on (#3702).
+
+    The sync pulls an editable core the manifest declares before it links it
+    (``cli_lifecycle._editable_git_pull``), so that pull decides the lock the
+    rest of the batch is held to. None wherever the pull leaves the checkout
+    as it is, which the sync then links: not a git checkout, a dirty tree it
+    refuses without ``--allow-dirty``, or a pull that fails or brings nothing.
+    """
+    if not cli._project_dir_is_git(checkout):
+        return None
+    try:
+        dirty, _ = cli._git_working_tree_dirty(checkout)
+        if dirty and not allow_dirty:
+            return None
+        if fetch and cli._run_git_fetch(checkout)[0] != 0:
+            return None
+        return cli._pull_target_revision(checkout)
+    except cli._GitFailedError:
+        return None
+
+
+def sync_preflight(
+    source_index,
+    *,
+    lock_revision: Optional[str] = None,
+    lock_checkout: Optional[Path] = None,
+    fetch: bool = True,
+    allow_dirty: bool = False,
+) -> SyncPreflight:
+    """Check *source_index* against the lock a sync of it will be held to (#3702).
+
+    The lock is the one the sync's installs keep: beside the checkout the
+    manifest declares for core, none when it declares core from the index
+    (an index wheel ships no lock), and otherwise the one beside the core
+    installed now (:meth:`CoreInstallGuard.install_core` and
+    :meth:`CoreInstallGuard.refresh`). It is read as it will be when the sync
+    uses it:
+
+    * *lock_revision* is the revision the caller's pull or checkout is about to
+      move *lock_checkout* to (default: the installed core's checkout). When
+      that is the checkout holding the sync, its lock is read as it lands
+      there, before the new code does: that code may not even import against
+      the packages installed now.
+    * Otherwise a declared core the sync acts on is pulled by the sync itself
+      before it is linked, so it is read where that pull lands
+      (:func:`_pending_core_pull`; *fetch* and *allow_dirty* as for the pull).
+      The sync acts on it when it switches source (another checkout) or
+      ensures declared extras: the editable half of
+      :func:`_resolve_manifest_action`. Its other half, a demotion to
+      ``ensure`` over unmet requirements, reads the venv as it is before
+      ``uv sync``, which is not the venv the sync will see.
+    * Anything else is read from disk: nothing moves it.
+
+    "As it lands" is :func:`~kestrel_sovereign.core_lock.read_core_lock_landing`:
+    local edits to ``uv.lock`` survive the move. Installs nothing.
+    """
+    from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.core_lock import (
+        CoreLockError,
+        core_lock_checkout,
+        load_core_lock,
+        read_core_lock_landing,
+    )
+
+    guard = CoreInstallGuard.snapshot(source_index)
+    core = source_index.get(fr.CORE_DISTRIBUTION)
+    if core is not None and not core.editable and core.pypi is not None:
+        return SyncPreflight()
+    declared = Path(core.editable).expanduser() if core is not None and core.editable else None
+
+    def read_lock():
+        try:
+            installed = core_lock_checkout(guard.before.provenance)
+        except CoreLockError:
+            if declared is None:
+                raise
+            # Whether the declared checkout is the installed one cannot be
+            # told; the sync will treat it as a source switch and pull it.
+            installed = None
+        holder = declared or installed
+        if holder is None:
+            # An index-installed core ships no lock at any revision.
+            return None
+        moving = Path(lock_checkout).expanduser() if lock_checkout else installed
+        if (
+            lock_revision is not None
+            and moving is not None
+            and fr._same_path(str(holder), str(moving))
+        ):
+            return read_core_lock_landing(holder, lock_revision)
+        on_installed = installed is not None and fr._same_path(str(holder), str(installed))
+        if declared is not None and (not on_installed or core.extras):
+            revision = _pending_core_pull(declared, fetch=fetch, allow_dirty=allow_dirty)
+            if revision is not None:
+                return read_core_lock_landing(declared, revision)
+        return load_core_lock(holder)
+
+    lock, error, _ = guard._bind_lock(read_lock)
+    if error is not None:
+        return SyncPreflight(error=error)
+    if lock is None:
+        return SyncPreflight()
+
+    pinned = lock.versions()
+    conflicts = []
+    compared = 0
+    for package, entry in source_index.items():
+        name = _manifest_dist_name(package)
+        # An editable entry is held on its checkout, not to a locked version,
+        # and a declared-but-empty window is "any version": neither can
+        # contradict the lock.
+        if name == fr.CORE_DISTRIBUTION or entry.editable or not entry.pypi:
+            continue
+        if name not in pinned:
+            continue
+        compared += 1
+        if not _version_satisfies(pinned[name], entry.pypi):
+            conflicts.append(
+                WindowConflict(package=name, window=entry.pypi, locked=pinned[name])
+            )
+    return SyncPreflight(
+        lock_path=lock.path, conflicts=tuple(conflicts), compared=compared,
+    )
+
+
+def report_sync_preflight(result: SyncPreflight, manifest: Path, *, stream=None) -> None:
+    """Print *result*: one line when the manifest agrees, every conflict when not."""
+    stream = stream or sys.stdout
+    where = f" ({result.lock_path})" if result.lock_path else ""
+    if not result.refuses:
+        print(
+            f"• preflight: the host manifest agrees with core's uv.lock{where}; "
+            f"{result.compared} declared window(s) contain their locked version",
+            file=stream,
+        )
+        return
+    print(
+        f"• preflight: the host manifest {manifest} contradicts core's "
+        f"uv.lock{where}. `feature sync` would refuse every install held to it:",
+        file=stream,
+    )
+    for line in result.report_lines():
+        print(f"    {line}", file=stream)
+    if result.conflicts:
+        print(
+            "    The lock decides these versions. Declare each entry "
+            "`pypi = \"\"` (any version, so the lock's), or a window that "
+            "contains the locked version.",
+            file=stream,
+        )
+
+
+def run_sync_preflight(
+    path: Path,
+    *,
+    lock_revision: Optional[str] = None,
+    lock_checkout: Optional[Path] = None,
+    fetch: bool = True,
+    allow_dirty: bool = False,
+) -> int:
+    """``kestrel feature sync --preflight`` for the manifest at *path* (#3702).
+
+    0 when a sync of it can be held to core's lock (read as
+    :func:`sync_preflight` describes, which the keyword arguments are for);
+    1, with every reason printed, when the sync would certainly refuse: a
+    window the lock contradicts, a lock that cannot hold it, or a manifest
+    that will not read. Installs nothing.
+    """
+    from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.feature_registry import load_registry
+
+    try:
+        entries = _load_host_manifest(path)
+    except (ValueError, OSError) as exc:
+        print(
+            f"• preflight: the host manifest {path} would not read ({exc}), so "
+            "`feature sync` would refuse it",
+            file=sys.stderr,
+        )
+        return 1
+    if not entries:
+        print(f"• preflight: {path} declares no features; nothing to check")
+        return 0
+    result = sync_preflight(
+        fr.build_source_index(entries, load_registry()),
+        lock_revision=lock_revision, lock_checkout=lock_checkout,
+        fetch=fetch, allow_dirty=allow_dirty,
+    )
+    report_sync_preflight(
+        result, path, stream=sys.stderr if result.refuses else sys.stdout,
+    )
+    return 1 if result.refuses else 0
+
+
 def _capture_host_manifest(path: Path) -> int:
     """Snapshot currently-installed extension packages into a manifest.
 
@@ -3054,6 +3310,16 @@ def cmd_feature_sync(args) -> int:
         print("Create one from your current install with:")
         print("  kestrel feature sync --capture")
         return 1
+
+    if getattr(args, "preflight", False):
+        return run_sync_preflight(
+            path,
+            lock_revision=getattr(args, "lock_revision", None),
+            lock_checkout=getattr(args, "lock_checkout", None),
+            # A dry run contacts nothing, as it installs nothing.
+            fetch=not getattr(args, "dry_run", False),
+            allow_dirty=getattr(args, "allow_dirty", False),
+        )
 
     try:
         entries = _load_host_manifest(path)
@@ -3841,6 +4107,32 @@ def add_feature_subparser(subparsers) -> None:
         "--dry-run",
         action="store_true",
         help="Show what would be installed/restored without changing anything",
+    )
+    feat_sync.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Install nothing; exit non-zero when the manifest contradicts "
+            "core's uv.lock (a window excluding a locked version), which the "
+            "sync would refuse. `kestrel update` runs this before its pull"
+        ),
+    )
+    feat_sync.add_argument(
+        "--lock-revision",
+        metavar="REV",
+        help=(
+            "With --preflight: the revision a pull or checkout is about to "
+            "move --lock-checkout to; when that checkout holds the sync's "
+            "lock, the lock is read as it will land there"
+        ),
+    )
+    feat_sync.add_argument(
+        "--lock-checkout",
+        metavar="PATH",
+        help=(
+            "With --lock-revision: the checkout REV belongs to (default: the "
+            "installed core's checkout)"
+        ),
     )
     feat_sync.add_argument(
         "--allow-dirty",
