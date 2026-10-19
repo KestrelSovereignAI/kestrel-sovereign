@@ -418,6 +418,7 @@ markers = [
     "cloud_resource: Tests that use cloud resources (RunPod, GPU, etc)",
     "docker: Tests that require Docker",
     "docker_mcp: Tests that require Docker MCP Toolkit (excluded in CI)",
+    "mcp_integration: Installed native MCP feature and real governed-dispatch peers",
     "live: Tests that call live external providers when credentials exist",
     "slow: Slow-running tests",
     "bench: Performance benchmarks (the integration tier excludes these in CI; see .github/workflows/ci.yml)",

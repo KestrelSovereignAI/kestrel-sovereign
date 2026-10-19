@@ -1,4 +1,4 @@
-"""Installed MCP package, real Docker peer, and the host's actual security rail.
+"""Installed MCP package, native peers, and the host's actual security rail.
 
 This proves governed dispatch, not full plugin-isolation bootstrap or vendor
 OAuth. The dedicated MCP CI job installs the optional feature explicitly.
@@ -8,11 +8,14 @@ import asyncio
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
 import uuid
 
 import pytest
 import pytest_asyncio
+
+from tests.integration.mcp_permission_peers import MCPTestPeer, docker_peer, https_peer
+from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
@@ -21,7 +24,7 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel, Per
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
-pytestmark = [pytest.mark.docker_mcp, pytest.mark.timeout(120)]
+pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(120)]
 
 
 @dataclass
@@ -35,7 +38,8 @@ class MCPBoundary:
     container: str
     owner: str
     handle: str
-    image: str
+    selector: str
+    peer: MCPTestPeer
 
     def invoke(self, marker):
         task = asyncio.create_task(self.agent.execute_named_tool(
@@ -45,12 +49,10 @@ class MCPBoundary:
         return task
 
     async def witness(self):
-        container = self.feature.manager.owned_containers[self.container]['container']
-        result = await asyncio.to_thread(container.exec_run, ['python', '-c',
-            'from pathlib import Path; p=Path("/tmp/permission-witness"); '
-            'print(p.read_text() if p.exists() else "", end="")'])
-        assert result.exit_code == 0, result.output
-        return result.output.decode().splitlines()
+        return await self.peer.witness(self.feature, self.container)
+
+    def current_connection(self):
+        return self.peer.connection(self.feature, self.container)
 
     async def result_with_witness(self, call, expected_witness):
         result = await call
@@ -58,31 +60,25 @@ class MCPBoundary:
         return result
 
 
-@pytest_asyncio.fixture
-async def mcp_boundary(tmp_path):
-    # No importorskip: the dedicated job must fail if its installed feature is
-    # absent. General integration CI deselects docker_mcp before fixture setup.
-    import docker
+@pytest_asyncio.fixture(params=[pytest.param("container", marks=pytest.mark.docker_mcp), "remote"])
+async def mcp_boundary(request, tmp_path, monkeypatch):
+    # No importorskip: the installed-feature job must fail on a missing package.
     import kestrel_feature_mcp
     from kestrel_feature_mcp.feature import MCPAgent
 
-    assert 'site-packages' in str(Path(kestrel_feature_mcp.__file__).resolve())
-    build = tmp_path / 'peer'
-    build.mkdir()
-    shutil.copyfile(Path(__file__).with_name('mcp_permission_peer.py'), build / 'peer.py')
-    (build / 'Dockerfile').write_text(
-        'FROM python:3.11-slim\nWORKDIR /app\nRUN pip install "mcp>=2.3,<3"\n'
-        'COPY peer.py .\nCMD ["python", "peer.py"]\n'
-    )
+    assert "site-packages" in str(Path(kestrel_feature_mcp.__file__).resolve())
     identity = uuid.uuid4().hex
-    image = f'mcp-{identity}:test'
     async with AsyncExitStack() as cleanup:
-        client = await asyncio.to_thread(docker.from_env)
-        cleanup.push_async_callback(asyncio.to_thread, client.close)
-        await asyncio.to_thread(client.images.build, path=str(build), tag=image, rm=True)
-        cleanup.push_async_callback(asyncio.to_thread, client.images.remove, image)
+        peer = await cleanup.enter_async_context(
+            docker_peer(tmp_path) if request.param == "container" else https_peer(tmp_path, monkeypatch))
         agent = KestrelAgent(did=f'did:test:mcp-seam-{identity}', storage_path=str(tmp_path / 'agent.db'))
         cleanup.push_async_callback(agent.llm_service.close)
+        backend = SQLiteBackend(str(tmp_path / "enablement.db"))
+        await backend.connect()
+        cleanup.push_async_callback(backend.close)
+        enablement = FeatureEnablementStore(backend)
+        await enablement.initialize()
+        agent._feature_enablement_store = enablement
         feature = MCPAgent(agent)
         calls = []
         requests = asyncio.Queue()
@@ -97,10 +93,10 @@ async def mcp_boundary(tmp_path):
         await feature.initialize()
         cleanup.push_async_callback(feature.shutdown)
         agent.features[feature.name] = feature
-        loaded = await feature.load_tool(image)
+        loaded = await feature.load_tool(peer.selector)
         assert loaded.status.value == 'ok', loaded.to_dict()
-        container = loaded.data['container']
-        owner = 'mcp:container:' + container
+        container = loaded.data['container' if peer.kind == 'container' else 'connection']
+        owner = f'mcp:{peer.kind}:' + container
         handles = [name for name, candidate in agent._tool_to_feature.items() if candidate == owner]
         assert len(handles) == 1
         assert handles[0].endswith('__record_marker'), agent._direct_tool_defs
@@ -111,7 +107,7 @@ async def mcp_boundary(tmp_path):
             await asyncio.gather(*calls, return_exceptions=True)
 
         cleanup.push_async_callback(drain_calls)
-        yield MCPBoundary(agent, feature, store, queue, requests, calls, container, owner, handles[0], image)
+        yield MCPBoundary(agent, feature, store, queue, requests, calls, container, owner, handles[0], peer.selector, peer)
 
 
 async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary):
@@ -164,10 +160,10 @@ async def test_pending_approval_cannot_execute_against_a_replacement_connection(
     await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.ASK)
     pending = peer.invoke('approved-for-old-connection')
     request = await asyncio.wait_for(peer.requests.get(), 5)
-    original = peer.feature.manager.owned_containers[peer.container]['connection']
-    reloaded = await peer.feature.load_tool(peer.image)
+    original = peer.current_connection()
+    reloaded = await peer.feature.load_tool(peer.selector)
     assert reloaded.status.value == 'ok', reloaded.to_dict()
-    current = peer.feature.manager.owned_containers[peer.container]['connection']
+    current = peer.current_connection()
     assert current is not original and not original.is_connected
     assert await peer.queue.submit_decision(request.id, True, scope='once')
     result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
@@ -178,3 +174,43 @@ async def test_pending_approval_cannot_execute_against_a_replacement_connection(
     assert await peer.queue.submit_decision(following.id, True, scope='once')
     result = await peer.result_with_witness(asyncio.wait_for(fresh, 5), ['approved-for-new-connection'])
     assert result['status'] == 'ok'
+
+
+@pytest.mark.parametrize("mcp_boundary", ["remote"], indirect=True)
+async def test_remote_reconnect_refuses_the_real_uninitialized_enablement_service(mcp_boundary):
+    peer = mcp_boundary
+    peer.agent._feature_enablement_store = None
+    result = await peer.feature.load_tool(peer.selector)
+    assert await peer.witness() == []
+    assert result.status.value == "error"
+    assert "did not retain" in result.error
+    assert peer.owner not in peer.agent._tool_to_feature.values()
+    assert not peer.feature._remote_connections
+
+
+@pytest.mark.parametrize("mcp_boundary", ["remote"], indirect=True)
+async def test_remote_feature_restore_reads_the_real_enablement_rows(mcp_boundary):
+    from kestrel_feature_mcp.feature import MCPAgent
+
+    peer = mcp_boundary
+    await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.DENY)
+    saved = await peer.agent.get_enablement_deltas("mcp_server")
+    assert len(saved) == 1 and saved[0]["metadata"] == {
+        "mode": "remote", "url": peer.selector, "auth": "none",
+    }
+    await peer.feature.shutdown()
+    restored = MCPAgent(peer.agent)
+    try:
+        await restored.initialize()
+        peer.agent.features[restored.name] = restored
+        await restored.post_all_features_loaded()
+        assert set(restored._remote_connections) == {peer.container}
+        assert restored.manager is None
+        result = await peer.result_with_witness(peer.invoke("denied-after-feature-restore"), [])
+        assert result["success"] is False and "Permission denied" in result["error"]
+        assert any(row["decision"] == "auto_denied" for row in await peer.store.get_audit_log())
+        result = await restored.unload_tool(peer.selector)
+        assert result.status.value == "ok"
+        assert await peer.agent.get_enablement_deltas("mcp_server") == []
+    finally:
+        await restored.shutdown()
