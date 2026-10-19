@@ -438,6 +438,27 @@ def _isolate_decision_check_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _update_continuation_in_process(monkeypatch):
+    """Run ``kestrel update``'s fresh-interpreter continuation in this process (#3702).
+
+    The real continuation starts ``kestrel update`` in a child, which no
+    monkeypatch reaches. On 2026-10-19 the first run of this change's unit
+    tests did exactly that: the child ran the real restart, and its orphan
+    reaping killed the operator's host on :8888. In-process, the continuation
+    keeps every seam a test patched and still round-trips its argv through the
+    real parser. A test of the spawn itself patches this attribute back.
+    """
+    from kestrel_sovereign import cli
+
+    def continue_in_process(argv):
+        args = cli.build_parser().parse_args(argv)
+        assert args.command == "update", argv
+        return cli.cmd_update(args)
+
+    monkeypatch.setattr(cli, "_run_update_continuation", continue_in_process)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_otel_export_env(monkeypatch):
     """Strip live OTLP export env from every test and reset the tracer cache.
 
