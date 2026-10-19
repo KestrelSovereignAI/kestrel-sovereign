@@ -222,6 +222,58 @@ async def test_same_instance_disable_enable_restores_the_governed_connection(mcp
     assert result["status"] == "ok"
 
 
+@pytest.mark.parametrize("mcp_boundary", ["container"], indirect=True)
+async def test_disable_cannot_release_custody_ahead_of_an_admitted_docker_acquisition(mcp_boundary, monkeypatch):
+    from kestrel_feature_mcp.manager import MCPToolManager
+
+    peer = mcp_boundary
+    # Real Core re-enable with no desired server leaves the active feature's
+    # lazy manager unacquired, matching a host's first container load.
+    unloaded = await peer.feature.unload_tool(peer.selector)
+    assert unloaded.status.value == "ok", unloaded.to_dict()
+    await peer.agent._unregister_feature_runtime(peer.feature, unload=False)
+    await peer.agent._activate_feature_runtime(peer.feature)
+    assert peer.feature.manager is None
+    assert not await peer.agent.get_enablement_deltas("mcp_server")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_create = MCPToolManager.create
+    managers = []
+
+    async def create(**kwargs):
+        entered.set()
+        await release.wait()
+        manager = await original_create(**kwargs)
+        managers.append(manager)
+        return manager
+
+    monkeypatch.setattr(MCPToolManager, "create", create)
+    loading = asyncio.create_task(peer.feature.load_tool(peer.selector))
+    stopping = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        stopping = asyncio.create_task(peer.agent._unregister_feature_runtime(peer.feature, unload=False))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not stopping.done(), "Core released feature custody while its Docker acquisition was in flight"
+        release.set()
+        result = await loading
+        await stopping
+        assert result.status.value == "error" and "shutting down" in result.error
+        assert not peer.feature.enabled
+        assert managers and all(not manager.owned_containers and manager.docker_client is None for manager in managers)
+        assert not await peer.agent.get_enablement_deltas("mcp_server")
+        assert not any(owner.startswith("mcp:") for owner in peer.agent._tool_to_feature.values())
+        with pytest.raises(ToolNotRegisteredError):
+            await peer.agent.execute_named_tool(peer.handle, {"marker": "after-disable"}, session_id="mcp-boundary")
+        refused = await peer.feature.load_tool(peer.selector)
+        assert refused.status.value == "error" and "shutting down" in refused.error
+        assert len(managers) == 1
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (loading, stopping) if task is not None), return_exceptions=True)
+        await peer.feature.shutdown()
+
+
 @pytest.mark.parametrize("mcp_boundary", ["remote"], indirect=True)
 async def test_pending_approval_cannot_execute_while_remote_unload_waits_on_storage(mcp_boundary):
     peer = mcp_boundary
