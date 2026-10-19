@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-19
-**Scope:** 3149 tracked files (2339 `.py`, 361 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3150 tracked files (2339 `.py`, 362 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2157,6 +2157,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.53.31.md** — Core 0.53.31 — Private native HTTP admission — Status: candidate; publication and artifact verification remain required.
 - **docs/releases/v0.53.32.md** — Core 0.53.32 — Atomic stream-owner construction — Status: candidate; publication and artifact verification remain required.
 - **docs/releases/v0.53.33.md** — Core 0.53.33 — Wait-worker resident custody — Status: candidate; review, CI, publication and artifact verification are required.
+- **docs/releases/v0.53.34.md** — Core 0.53.34 — Sovereignty retrieval and portable conversations — Status: candidate; release review, CI, publication and artifact verification are required.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
