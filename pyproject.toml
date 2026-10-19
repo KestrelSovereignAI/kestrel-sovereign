@@ -256,7 +256,7 @@ Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussio
 
 [project.optional-dependencies]
 # Installed native MCP seam tests remain separate from core-only boot tests.
-mcp-integration = ["kestrel-feature-mcp>=0.5,<1"]
+mcp-integration = ["kestrel-feature-mcp>=0.7,<1"]
 # Test dependencies (not needed in production)
 test = [
     # >=9.0.3 fixes unsafe temporary-file handling in pytest's debugger.
@@ -418,6 +418,7 @@ markers = [
     "cloud_resource: Tests that use cloud resources (RunPod, GPU, etc)",
     "docker: Tests that require Docker",
     "docker_mcp: Tests that require Docker MCP Toolkit (excluded in CI)",
+    "mcp_integration: Installed native MCP feature and real governed-dispatch peers",
     "live: Tests that call live external providers when credentials exist",
     "slow: Slow-running tests",
     "bench: Performance benchmarks (the integration tier excludes these in CI; see .github/workflows/ci.yml)",

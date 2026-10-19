@@ -193,7 +193,9 @@ advertised; track this in [#3684](https://github.com/KestrelSovereignAI/kestrel-
 Upgrade beyond the experimental candidate when needed; do not build an adapter
 or label the old core type a native extension result.
 
-The A2A candidate also has an independent signed-card gate. In `a2a-sdk==1.2.2`,
+The A2A candidate also has an independent signed-card gate. A fresh public-package
+probe on 2026-10-19 reproduced the failure in `a2a-sdk==1.2.3`; the 1.2.2
+candidate table above records the original experiment. In both releases,
 `AgentCard.documentation_url = ""` has protobuf presence and survives
 `MessageToDict`, but the signing helper removes it along with required empty
 capabilities. Separately, default `MessageToDict` serialization omits required
@@ -206,6 +208,15 @@ The normative presence rules must win: upgrade/fix the official SDK under
 [#3685](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3685),
 with canonical-byte vectors and independent verification before signed cards
 or the coordinated A2A cutover ship. No Kestrel canonicalization fork.
+The [contributed SDK repair](https://github.com/a2aproject/a2a-python/pull/1355)
+preserves required defaults, explicit optional defaults and JSON extension
+values before the SDK's JCS step. Full independent worktree review and separate
+signature oracles passed; upstream merge, publication and a new public-package
+probe remain required. This prerequisite does not replace Track B's native
+types, inbound/outbound cutover, TCK and cross-framework acceptance tests.
+The implementation target is the latest released A2A specification, 1.0.1 as
+checked on 2026-10-19. The signed-card prerequisite does not block development
+of the native task lifecycle, bindings or outbound client.
 
 ## Open release gates
 
