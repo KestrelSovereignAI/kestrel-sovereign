@@ -9,7 +9,6 @@ This adapter implements the "Convergent Sharding" protocol:
 """
 
 import abc
-import asyncio
 import contextlib
 import enum
 import functools
@@ -507,12 +506,12 @@ class SovereignStorageAdapter:
         return cid
 
     async def _download_content(self, cid: str) -> bytes:
-        """Download content by CID (handles local- fallback)."""
-        return await asyncio.to_thread(
+        """Join content retrieval before the original storage owner can retire."""
+        return await run_blocking_operation(functools.partial(
             self.adapter.retrieve_content,
-            content_hash=cid.replace("local-", ""),
+            content_hash=cid.removeprefix("local-"),
             ipfs_cid=cid if not cid.startswith("local-") else None,
-        )
+        ))
 
     def _encrypt_keyring(self, keyring: Dict[str, str]) -> bytes:
         """Encrypt the keyring dict and return nonce+ciphertext."""
@@ -769,6 +768,9 @@ class SovereignStorageAdapter:
                 source_cid = str(package)
                 car_bytes = await self._download_content(source_cid)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             await self._log_import_attempt(
                 agent_did="", source_did=source_did or "",
                 package_hash="", continuity_score=0.0, status="error",
@@ -1256,12 +1258,13 @@ class SovereignStorageAdapter:
             return None, f"external_ref_malformed_link: {e}"
 
         try:
-            payload = await asyncio.to_thread(
-                self.adapter.retrieve_content,
-                content_hash=cid_str,
-                ipfs_cid=cid_str,
-            )
+            # The same hook owns archive and linked-asset retrieval. A host's
+            # bounded/provenance-aware override must apply to both paths.
+            payload = await self._download_content(cid_str)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             return None, f"external_ref_fetch_failed: {e}"
 
         if not isinstance(payload, (bytes, bytearray)):
