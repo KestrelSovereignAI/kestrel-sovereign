@@ -25,7 +25,8 @@ and open gates are recorded in [the spike report](NATIVE_PROTOCOL_SPIKES.md).
 ## Protocol lock and ownership
 
 Use the published [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
-and [A2A 1.0 specification](https://a2a-protocol.org/v1.0.0/specification/).
+and [A2A 1.0.1 specification](https://a2a-protocol.org/v1.0.1/specification/),
+the latest released A2A revision checked on 2026-10-19.
 Use official Python SDKs at every network boundary. MCP was tested at 2.3.0;
 the A2A signed-card gate was rechecked at 1.2.3 on 2026-10-19, after the initial
 1.2.2 experiment. Exact versions belong in dependency locks,
@@ -407,7 +408,7 @@ The Agent Card has a separate standard JWS signature over the SDK card's JCS
 representation. Before JCS, apply A2A 1.0 section 5.7/8.4.1 presence rules:
 omit optional-and-unset fields and implicit defaults, retain required fields
 and explicitly set optional defaults, and exclude `signatures`. The normative
-[section 8.4.1](https://a2a-protocol.org/v1.0.0/specification/#841-canonicalization-requirements)
+[section 8.4.1](https://a2a-protocol.org/v1.0.1/specification/#841-canonicalization-requirements)
 is the canonical-byte oracle, not a same-helper signing round trip.
 
 **Signed-card release gate:** `a2a-sdk==1.2.3` still does not implement that oracle:

@@ -214,6 +214,9 @@ values before the SDK's JCS step. Full independent worktree review and separate
 signature oracles passed; upstream merge, publication and a new public-package
 probe remain required. This prerequisite does not replace Track B's native
 types, inbound/outbound cutover, TCK and cross-framework acceptance tests.
+The implementation target is the latest released A2A specification, 1.0.1 as
+checked on 2026-10-19. The signed-card prerequisite does not block development
+of the native task lifecycle, bindings or outbound client.
 
 ## Open release gates
 
