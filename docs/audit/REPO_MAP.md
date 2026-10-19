@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-18
-**Scope:** 3137 tracked files (2329 `.py`, 359 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3139 tracked files (2331 `.py`, 359 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2351,6 +2351,8 @@ Repo entry points and standard project files.
   - `def pytest_collection_modifyitems(config, items)`; `def pytest_timeout_set_timer(item, settings)`; `def live_call_budget(request)`; `async def complete_bootstrap(agent)`; `async def grant_permissions(agent)`; `def skip_bootstrap()`
 - **tests/integration/live_routes.py** — Deadlines and usable-route probes for tests that call live LLM routes (#3269).
   - `def record_backstop(item, timeout)`; `class LiveCallBudget`; `def describe_chat_routes(llm_service)`; `def describe_discovery_routes(llm_service)`; `def await_chain(task)`; `def parked_in(task)`; `async def bounded_live_call(awaitable)`; `def require_answering_ollama(deadline)`; `…`
+- **tests/integration/mcp_permission_peer.py** — Native external MCP peer that records actual tool side effects.
+  - `def main()`
 - **tests/integration/native_memory_original_control.py** — Owned local SDK/SQLite/PG fixtures; not Agent READY or paid-provider acceptance.
   - `class NativeMemoryOwners`; `async def native_memory_owners(native_pg, tmp_path, monkeypatch)`; `def native_vector_consumers(native_memory_owners)`; `def actual_native_loss(lease, observed)`
 - **tests/integration/test_a2a_cancel_authorization_backends.py** — SQLite/PostgreSQL parity for atomic A2A cancellation authority (#3134).
@@ -2793,6 +2795,8 @@ Repo entry points and standard project files.
   - `async def test_handoff_releases_physically_acquired_lock_after_join_observer_failure(native_pg, onboarding_owner, monkeypatch)`; `async def test_budget_release_inner_admission_joins_original_task(native_pg, onboarding_owner, monkeypatch, mode, …)`; `async def test_standalone_descendant_boundary_joins_original_before_releasing_manager(native_pg, onboarding_owner, monkeypatch, mode, …)`
 - **tests/integration/test_manager_terminal_harvest_originals.py** — Terminal consumers harvest original physical owners without callback ACKs.
   - `class UnexpectedControl`; `async def test_original_join_keeps_cyclic_native_component_beside_independent_observer(native_pg, onboarding_owner, monkeypatch, eager, …)`; `async def test_terminal_join_retires_completed_record_after_callback_publication_failure(native_pg, onboarding_owner, monkeypatch, surface, …)`; `async def test_whole_native_group_survives_sweep_filters_and_independent_attempts(native_pg, onboarding_owner, monkeypatch, surface, …)`; `async def test_child_settlement_raised_group_still_attempts_compensation_or_reconciliation(native_pg, onboarding_owner, monkeypatch, surface, …)`; `async def test_child_specific_reader_preserves_native_result_and_actual_withdrawal(native_pg, onboarding_owner, monkeypatch, source_cancel)`; `async def test_ttl_consumer_preserves_prior_terminal_and_late_native_reader_failure(native_pg, onboarding_owner, monkeypatch, entry, …)`; `async def test_ttl_successful_reader_never_reconstructs_actual_native_withdrawal(native_pg, onboarding_owner, monkeypatch, entry, …)`; `…`
+- **tests/integration/test_mcp_permission_boundary.py** — Installed MCP package, real Docker peer, and the host's actual security rail.
+  - `class MCPBoundary`; `async def mcp_boundary(tmp_path)`; `async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary)`; `async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary)`; `async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary)`
 - **tests/integration/test_memory_access_hot_retention.py** — Bounded actual memory work, declared retired-lease callbacks, repeated reads.
   - `async def test_original_memory_receipt_keeps_one_payload_and_bounded_reader_frames(native_memory_owners, monkeypatch, reader)`
 - **tests/integration/test_memory_access_native_publication.py** — Actual bound rehearsal SQL must settle before context publication.
@@ -2872,7 +2876,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_operator_notice_original_control.py** — Notice audit failure cannot replace an actual native COMMIT receipt.
   - `async def test_original_native_unknown_survives_guarded_notice_settlement(native_pg, tmp_path, monkeypatch, surface)`
 - **tests/integration/test_orchestration_e2e.py** — End-to-End Orchestration Tests for Kestrel Agent.
-  - `async def kestrel_agent(temp_db)`; `async def usable_model_list(kestrel_agent, live_call_budget)`; `async def usable_chat_route(kestrel_agent, live_call_budget)`; `async def test_orchestrator_model_management(kestrel_agent, usable_model_list, live_call_budget)`; `async def test_orchestrator_mcp_management(kestrel_agent, live_call_budget)`; `async def test_orchestrator_natural_language_tool_use(kestrel_agent, usable_chat_route, live_call_budget)`
+  - `async def kestrel_agent(temp_db)`; `async def usable_model_list(kestrel_agent, live_call_budget)`; `async def usable_chat_route(kestrel_agent, live_call_budget)`; `async def test_orchestrator_model_management(kestrel_agent, usable_model_list, live_call_budget)`; `async def test_orchestrator_natural_language_tool_use(kestrel_agent, usable_chat_route, live_call_budget)`
 - **tests/integration/test_orchestrator_permissions.py** — Integration tests for orchestrator permission enforcement.
   - `class MockAgent`; `def temp_db()`; `async def permission_store(temp_db)`; `def approval_queue(permission_store)`; `def security_hook(permission_store, approval_queue)`; `def hooks_manager(security_hook)`; `def mock_agent(hooks_manager)`; `class TestDenyBlocksTool`; `…`
 - **tests/integration/test_owned_database_original_admission.py** — Refused original database retirement keeps its native commit receipt.

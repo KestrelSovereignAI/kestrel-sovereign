@@ -367,6 +367,32 @@ jobs:
       - name: Verify live Phoenix UI assets through the host proxy
         run: uv run --no-sync python -m pytest tests/integration/test_phoenix_runtime.py -q
 
+  mcp-permission-seam:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Install the host and released MCP feature
+        run: uv sync --python 3.14 --locked --extra mcp-integration
+      - name: Exercise installed MCP permissions against a real Docker peer
+        # budget-basis(mcp): slowest-pass=2.0 worst-runner-ratio=1.85 samples=8 longest-test=180
+        # Eight local three-case passes across reviewed host revisions include
+        # cold bytecode and public installs; slowest 114.60s, rounded up.
+        # The ratio is the integration tier's observed runner spread. Its
+        # conftest also enforces the 180s per-test ceiling on these tests.
+        run: >-
+          uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
+          -q --timeout=120 --session-timeout=480
+        timeout-minutes: 12
+
   # Unit tests (no services needed)
   unit-tests:
     runs-on: ubuntu-latest

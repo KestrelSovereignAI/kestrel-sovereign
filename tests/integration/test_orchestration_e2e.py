@@ -2,7 +2,7 @@
 End-to-End Orchestration Tests for Kestrel Agent.
 
 This test suite verifies that the KestrelAgent correctly orchestrates its sub-agents
-(MCPAgent, ModelAgent) to perform complex tasks.
+(ModelAgent) to perform complex tasks.
 
 It uses a real LLMService (which may use local Ollama or cloud providers) but focuses
 on the agent's internal wiring and command delegation.
@@ -13,13 +13,9 @@ A test's probe and calls share its ``live_call_budget``, so the deadlines of
 its sequential calls together fit inside the test's timeout.
 """
 
-import os
 import pytest
 import pytest_asyncio
 import logging
-import asyncio
-import shutil
-from pathlib import Path
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.generation_gate import failure_summary
 from kestrel_sovereign.llm.output_ceiling import incomplete_generation
@@ -33,25 +29,15 @@ from tests.integration.live_routes import (
     require_answering_chat_route,
     require_answering_discovery,
 )
-from tests.shared import no_llm_credentials, no_docker
+from tests.shared import no_llm_credentials
 from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
 pytestmark = pytest.mark.timeout(TEST_TIMEOUT_SECONDS)
 
 
-def _mcp_available() -> bool:
-    try:
-        from kestrel_sovereign.features.mcp.feature import MCPAgent  # noqa: F401
-        return True
-    except (ImportError, ModuleNotFoundError):
-        return False
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Test constants
-TEST_MCP_IMAGE = "kestrel-mcp-test-server" # Custom image built in previous steps
 
 @pytest_asyncio.fixture
 async def kestrel_agent(temp_db):
@@ -149,57 +135,8 @@ async def test_orchestrator_model_management(kestrel_agent, usable_model_list, l
     )
     assert "Model not found" in response or "Error" in response or "not found" in response.lower()
 
-@pytest.mark.asyncio
-@pytest.mark.skipif(
-    no_docker() or no_llm_credentials() or not _mcp_available(),
-    reason="Docker/LLM credentials/kestrel-feature-mcp not available"
-)
-async def test_orchestrator_mcp_management(kestrel_agent, live_call_budget):
-    """
-    Test that the orchestrator correctly delegates MCP commands
-    to the MCPAgent.
-
-    Note: This test requires Docker to be available and running.
-    """
-    logger.info("Testing MCP Orchestration...")
-
-    # 1. Load Tool
-    # This requires the docker image to be available.
-    # We assume kestrel-mcp-test-server is built (from previous tests).
-    response = await _bounded_input(
-        kestrel_agent,
-        f"!mcp-load {TEST_MCP_IMAGE}",
-        f"Docker image {TEST_MCP_IMAGE}",
-        live_call_budget,
-    )
-    logger.info(f"MCP Load Response: {response}")
-    
-    assert "✅ Loaded" in response
-    assert "echo" in response # The test server exposes 'echo'
-    
-    # 2. List Tools
-    response = await _bounded_input(
-        kestrel_agent, "!mcp-list", f"Docker image {TEST_MCP_IMAGE}", live_call_budget
-    )
-    logger.info(f"MCP List Response: {response}")
-    assert "echo" in response
-    assert "add" in response
-    
-    # 3. Call Tool
-    # !mcp-call <container> <tool> <args_json>
-    # Container name is usually mcp-<image_name_sanitized>
-    container_name = f"mcp-{TEST_MCP_IMAGE.replace('/', '-').replace(':', '-')}"
-    
-    # We need to wait a bit for the server to be fully ready if it wasn't already
-    await asyncio.sleep(2)
-    
-    call_cmd = f"!mcp-call {container_name} echo {{\"message\": \"Hello Kestrel\"}}"
-    response = await _bounded_input(
-        kestrel_agent, call_cmd, f"MCP container {container_name}", live_call_budget
-    )
-    logger.info(f"MCP Call Response: {response}")
-    
-    assert "Hello Kestrel" in response
+# Native MCP dispatch and approval behavior is exercised without an LLM in
+# test_mcp_permission_boundary.py, using its own installed feature and peer.
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(no_llm_credentials(), reason="Requires LLM credentials for natural language tool use")
