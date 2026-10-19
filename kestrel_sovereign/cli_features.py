@@ -2938,13 +2938,20 @@ def sync_preflight(source_index, *, lock_revision: Optional[str] = None) -> Sync
     manifest declares for core, none when it declares core from the index
     (an index wheel ships no lock), and otherwise the one beside the core
     installed now (:meth:`CoreInstallGuard.install_core` and
-    :meth:`CoreInstallGuard.refresh`). For that last one, *lock_revision* reads
-    it as the git revision about to be pulled or checked out records it, so
-    the check runs before the new code lands: that code may not even import
-    against the packages installed now. Installs nothing.
+    :meth:`CoreInstallGuard.refresh`).
+
+    *lock_revision* is a revision of the installed core's checkout, the one a
+    pull or checkout is about to move. When that checkout is the one whose
+    lock holds the sync (core is not declared elsewhere, or is declared on that
+    same checkout, as ``feature sync --capture`` writes it), its lock is read
+    as that revision records it, so the check runs before the new code lands:
+    that code may not even import against the packages installed now. A core
+    declared on another checkout is not moved by that revision, so its lock is
+    read from disk. Installs nothing.
     """
     from kestrel_sovereign import feature_reconcile as fr
     from kestrel_sovereign.core_lock import (
+        CoreLockError,
         core_lock_checkout,
         load_core_lock,
         read_core_lock_at,
@@ -2952,21 +2959,30 @@ def sync_preflight(source_index, *, lock_revision: Optional[str] = None) -> Sync
 
     guard = CoreInstallGuard.snapshot(source_index)
     core = source_index.get(fr.CORE_DISTRIBUTION)
-    if core is not None and core.editable:
-        lock, error, _ = guard._bind_lock(
-            lambda: load_core_lock(Path(core.editable).expanduser())
-        )
-    elif core is not None and core.pypi is not None:
+    if core is not None and not core.editable and core.pypi is not None:
         return SyncPreflight()
-    elif lock_revision is not None:
-        def read_incoming():
-            checkout = core_lock_checkout(guard.before.provenance)
-            # An index-installed core ships no lock at any revision.
-            return None if checkout is None else read_core_lock_at(checkout, lock_revision)
+    declared = Path(core.editable).expanduser() if core is not None and core.editable else None
 
-        lock, error, _ = guard._bind_lock(read_incoming)
-    else:
-        lock, error = guard._lock, guard._lock_error
+    def read_lock():
+        if lock_revision is None:
+            return load_core_lock(declared) if declared else cli._core_lock(guard.before)
+        try:
+            moving = core_lock_checkout(guard.before.provenance)
+        except CoreLockError:
+            if declared is None:
+                raise
+            # Which checkout the revision belongs to cannot be told, so it
+            # cannot be said to move the declared one.
+            moving = None
+        checkout = declared or moving
+        if checkout is None:
+            # An index-installed core ships no lock at any revision.
+            return None
+        if moving is not None and fr._same_path(str(checkout), str(moving)):
+            return read_core_lock_at(checkout, lock_revision)
+        return load_core_lock(checkout)
+
+    lock, error, _ = guard._bind_lock(read_lock)
     if error is not None:
         return SyncPreflight(error=error)
     if lock is None:

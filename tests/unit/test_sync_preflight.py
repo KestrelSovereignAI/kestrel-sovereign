@@ -430,3 +430,41 @@ def test_update_pulls_and_installs_when_the_incoming_lock_agrees(real_update):
     assert rc == 0
     assert _git(clone, "rev-parse", "HEAD") == new
     assert steps == ["uv sync", "feature sync", "restart"]
+
+
+def test_core_declared_on_the_checkout_being_pulled_is_read_at_the_revision(
+    incoming, tmp_path,
+):
+    """``feature sync --capture`` declares an editable core on its own checkout:
+    that is the checkout the pull moves, so its incoming lock is the one."""
+    clone, new = incoming
+    index = _index(_manifest(
+        tmp_path,
+        f'[[feature]]\nname = "{CORE}"\neditable = "{clone}"\n' + PHOENIX_STALE,
+    ))
+
+    result = sync_preflight(index, lock_revision=new)
+
+    assert [(c.package, c.locked) for c in result.conflicts] == [
+        ("arize-phoenix", "20.23.0"),
+    ]
+
+
+def test_core_declared_on_another_checkout_keeps_that_checkouts_lock(
+    incoming, tmp_path,
+):
+    """The pull moves the installed core's checkout; a declared core elsewhere
+    is not that checkout, so the pulled revision says nothing about its lock."""
+    clone, new = incoming
+    other = _checkout(
+        tmp_path, _lock_text(**{"arize-phoenix": "17.7.0"}), name="other-core",
+    )
+    index = _index(_manifest(
+        tmp_path,
+        f'[[feature]]\nname = "{CORE}"\neditable = "{other}"\n' + PHOENIX_STALE,
+    ))
+
+    result = sync_preflight(index, lock_revision=new)
+
+    assert not result.refuses
+    assert str(result.lock_path).startswith(other)
