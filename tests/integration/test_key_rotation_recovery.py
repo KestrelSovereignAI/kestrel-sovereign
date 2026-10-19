@@ -44,17 +44,17 @@ async def rotation_store(tmp_path, monkeypatch, request):
         await service.initialize()
         cleanup.push_async_callback(service.shutdown)
         blob_type = "BYTEA" if db.backend_type == "postgres" else "BLOB"
-        await db.execute("CREATE TABLE conversation_history (id INTEGER PRIMARY KEY, content TEXT, rendered_content TEXT, agent_id TEXT)")
-        await db.execute(f"CREATE TABLE files (content_hash TEXT PRIMARY KEY, content {blob_type})")
+        await db.execute("CREATE TABLE conversation_history (id INTEGER PRIMARY KEY, content TEXT, rendered_content TEXT, agent_id TEXT, metadata TEXT)")
+        await db.execute(f"CREATE TABLE files (content_hash TEXT PRIMARY KEY, content {blob_type}, metadata TEXT)")
         await db.execute(f"CREATE TABLE artifact_keys (key_id TEXT PRIMARY KEY, wrapped_key {blob_type} NOT NULL)")
         old_cipher, new_cipher = (AEADCipher(_master_bytes_from_key(key)) for key in (old_key, new_key))
         root = bytes(range(32))
         assert len(root) == 32
         await db.execute("INSERT INTO artifact_keys VALUES (?, ?)", ("v1", old_cipher.encrypt(root)))
-        await db.execute("INSERT INTO conversation_history (id, content) VALUES (?, ?)", (1, old_cipher.encrypt(b"conversation").decode()))
+        await db.execute("INSERT INTO conversation_history (id, content, metadata) VALUES (?, ?, '{\"enc\": true}')", (1, old_cipher.encrypt(b"conversation").decode()))
         for index in range(8):
-            await db.execute("INSERT INTO files VALUES (?, ?)", (str(index), old_cipher.encrypt(b"file")))
-        await db.execute("INSERT INTO files VALUES (?, ?)", ("plain", b"legacy plaintext"))
+            await db.execute("INSERT INTO files (content_hash, content, metadata) VALUES (?, ?, ?)", (str(index), old_cipher.encrypt(b"file"), '{"enc": true}'))
+        await db.execute("INSERT INTO files (content_hash, content, metadata) VALUES (?, ?, ?)", ("plain", b"legacy plaintext", None))
         yield SimpleNamespace(db=db, service=service, old_key=old_key, new_key=new_key,
                               old_cipher=old_cipher, new_cipher=new_cipher, root=root, key_file=new_key_file)
 
@@ -71,9 +71,9 @@ async def reject_writes(db, table, failure):
 
 
 async def assert_rotated(store, *, has_root=True):
-    rows = await store.db.fetchall("SELECT content FROM files WHERE content_hash != 'plain'")
+    rows = await store.db.fetchall("SELECT content FROM files WHERE content_hash IN ('0', '1', '2', '3', '4', '5', '6', '7')")
     assert len(rows) == 8 and all(store.new_cipher.decrypt(bytes(row[0])) == b"file" for row in rows)
-    text = (await store.db.fetchone("SELECT content FROM conversation_history"))[0]
+    text = (await store.db.fetchone("SELECT content FROM conversation_history WHERE id = 1"))[0]
     assert store.new_cipher.decrypt(text.encode()) == b"conversation"
     assert (await store.db.fetchone("SELECT content FROM files WHERE content_hash = 'plain'"))[0] == b"legacy plaintext"
     if has_root:
@@ -237,3 +237,83 @@ async def test_running_owner_blocks_every_start_and_resume(rotation_store, tmp_p
     assert (await store.service.get_status(stale_id)).status == RotationStatus.COMPLETED
     cipher = AEADCipher(_master_bytes_from_key(stale_key_file.read_text()))
     assert cipher.decrypt(bytes((await store.db.fetchone("SELECT wrapped_key FROM artifact_keys"))[0])) == store.root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["KSAv2:", "gAAAAA"])
+@pytest.mark.parametrize("metadata", [None, '{"enc": false}'])
+async def test_encryption_metadata_preserves_prefixed_plaintext(rotation_store, prefix, metadata):
+    store = rotation_store
+    plaintext = prefix + " is a literal in this document"
+    await store.db.execute(
+        "INSERT INTO conversation_history (id, content, rendered_content, metadata) VALUES (?, ?, ?, ?)",
+        (2, plaintext, plaintext, metadata))
+    await store.db.execute("INSERT INTO files VALUES (?, ?, ?)", ("prefix-plain", plaintext.encode(), metadata))
+    rotation_id = await store.service.start_rotation(new_key=store.new_key)
+    await store.service.drain_rotations()
+    completed = await store.service.get_status(rotation_id)
+    assert completed.status == RotationStatus.COMPLETED
+    assert completed.records_total == completed.records_processed == 10
+    assert tuple(await store.db.fetchone("SELECT content, rendered_content FROM conversation_history WHERE id = 2")) == (plaintext, plaintext)
+    assert bytes((await store.db.fetchone("SELECT content FROM files WHERE content_hash = 'prefix-plain'"))[0]) == plaintext.encode()
+    await assert_rotated(store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["content", "rendered_content", "files"])
+@pytest.mark.parametrize("damaged", ["no-ciphertext-marker", "KSAv2:broken", "gAAAAAbroken"])
+async def test_flagged_encrypted_rows_cannot_hide_behind_prefix_filter(rotation_store, target, damaged):
+    store = rotation_store
+    if target == "files":
+        await store.db.execute("UPDATE files SET content = ? WHERE content_hash = '0'", (damaged.encode(),))
+    else:
+        assert target in {"content", "rendered_content"}
+        await store.db.execute(f"UPDATE conversation_history SET {target} = ? WHERE id = 1", (damaged,))
+    rotation_id = await store.service.start_rotation(new_key=store.new_key)
+    await store.service.drain_rotations()
+    failed = await store.service.get_status(rotation_id)
+    assert failed.status == RotationStatus.FAILED
+    assert failed.error_message
+
+
+@pytest.mark.asyncio
+async def test_metadata_selection_rotates_per_agent_content_and_rendered_bytes(rotation_store):
+    from kestrel_sovereign.security.key_rotation import _derive_agent_cipher
+    store = rotation_store
+    old = _derive_agent_cipher(_master_bytes_from_key(store.old_key), "alice")
+    new = _derive_agent_cipher(_master_bytes_from_key(store.new_key), "alice")
+    await store.db.execute(
+        "INSERT INTO conversation_history (id, content, rendered_content, agent_id, metadata) VALUES (?, ?, ?, ?, ?)",
+        (2, old.encrypt(b"raw").decode(), old.encrypt(b"rendered").decode(), "alice", '{"enc": true, "key_version": 1}'))
+    rotation_id = await store.service.start_rotation(new_key=store.new_key)
+    await store.service.drain_rotations()
+    completed = await store.service.get_status(rotation_id)
+    assert completed.status == RotationStatus.COMPLETED
+    assert completed.records_total == completed.records_processed == 12
+    row = await store.db.fetchone("SELECT content, rendered_content FROM conversation_history WHERE id = 2")
+    assert new.decrypt(row[0].encode()) == b"raw"
+    assert new.decrypt(row[1].encode()) == b"rendered"
+    await assert_rotated(store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", ["{", "[1]"])
+async def test_invalid_encryption_metadata_refuses_before_writes(rotation_store, metadata):
+    store = rotation_store
+    await store.db.execute("UPDATE conversation_history SET metadata = ? WHERE id = 1", (metadata,))
+    with pytest.raises(RuntimeError, match="Invalid encryption metadata"):
+        await store.service.start_rotation(new_key=store.new_key)
+    assert (await store.db.fetchone("SELECT COUNT(*) FROM key_rotations"))[0] == 0
+    content = (await store.db.fetchone("SELECT content FROM conversation_history WHERE id = 1"))[0]
+    assert store.old_cipher.decrypt(content.encode()) == b"conversation"
+    root = (await store.db.fetchone("SELECT wrapped_key FROM artifact_keys"))[0]
+    assert store.old_cipher.decrypt(bytes(root)) == store.root
+
+
+@pytest.mark.asyncio
+async def test_same_key_upgrade_checks_damaged_aead_instead_of_trusting_prefix(rotation_store):
+    store = rotation_store
+    await store.db.execute("UPDATE conversation_history SET content = ? WHERE id = 1", ("KSAv2:broken",))
+    rotation_id = await store.service.upgrade_to_aead()
+    await store.service.drain_rotations()
+    assert (await store.service.get_status(rotation_id)).status == RotationStatus.FAILED

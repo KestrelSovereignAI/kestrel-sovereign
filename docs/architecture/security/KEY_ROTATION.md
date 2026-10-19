@@ -67,6 +67,12 @@ stores are outside this service's coverage.
 journal records key fingerprints, status, counters and a failure message identifying the record. Each ciphertext update, exact write verification and progress
 receipt commit together. The entire database rotation is not one transaction.
 
+Both counting and rotation select conversation/file rows using the runtime
+`metadata.enc` flag. Ciphertext-like plaintext is left unchanged; flagged
+ciphertext with a damaged or missing prefix still fails closed. A NULL optional
+`rendered_content` has no ciphertext to rotate. Same-key AEAD upgrades verify
+and rewrite all flagged rows, including those already in AEAD format.
+
 Every selected encrypted row must succeed. A decrypt, malformed mandatory
 root, or write-verification failure stops the run and saves `FAILED`; the
 service does not silently skip failed encrypted records and report completion.

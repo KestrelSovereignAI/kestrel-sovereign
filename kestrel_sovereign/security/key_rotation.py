@@ -20,6 +20,7 @@ Usage:
 
 import asyncio
 import hashlib
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -153,9 +154,9 @@ class KeyRotationService:
     """
     Service for rotating encryption keys.
 
-    This allows changing KESTREL_DATA_KEY without losing access to
-    encrypted data. All encrypted records are re-encrypted with
-    the new key.
+    Re-encrypt registered encrypted records under a new master key.
+    The host owns maintenance isolation and key cutover; unregistered stores
+    and the known salted-passphrase limitation are outside this service.
     """
 
     def __init__(self, storage):
@@ -401,17 +402,15 @@ class KeyRotationService:
     #   ``HKDF(master, salt=agent_id, info=b"kestrel-agent-v1")``; rotation
     #   MUST derive the matching cipher per row, or the global cipher fails
     #   to decrypt and rows are silently skipped — corruption on key swap.
-    # - ``is_text_column``: TEXT (True) vs BLOB/BYTEA (False). SQL-side
-    #   ``LIKE 'gAAAAA%'`` works on TEXT and on SQLite's typeless BLOB but
-    #   does NOT compile against PostgreSQL BYTEA. BLOB tables therefore
-    #   route through a Python-side prefix filter instead of SQL LIKE.
+    # - ``optional_content``: a nullable companion column whose absent value
+    #   has no ciphertext even when the row-level metadata declares encryption.
+    # Selection follows the runtime's metadata.enc flag, never token prefixes.
     ENCRYPTED_TABLES: List[Dict[str, Any]] = [
         {
             "table": "conversation_history",
             "content_column": "content",
             "id_column": "id",
             "agent_id_column": "agent_id",
-            "is_text_column": True,
         },
         # rendered_content (#1402) holds the byte-stable transport form
         # encrypted under the same per-agent fernet as ``content``. It
@@ -423,15 +422,14 @@ class KeyRotationService:
             "content_column": "rendered_content",
             "id_column": "id",
             "agent_id_column": "agent_id",
-            "is_text_column": True,
             "progress_alias": "conversation_history.rendered_content",
+            "optional_content": True,
         },
         {
             "table": "files",
             "content_column": "content",
             "id_column": "content_hash",
             "agent_id_column": None,
-            "is_text_column": False,  # BLOB/BYTEA — Python-side filter
         },
         {
             # Saved artifacts use envelope encryption; rotating the wrapped
@@ -440,14 +438,10 @@ class KeyRotationService:
             "content_column": "wrapped_key",
             "id_column": "key_id",
             "agent_id_column": None,
-            "is_text_column": False,
             "optional": True,
             "require_all": True,
         },
     ]
-
-    # Prefixes that mark an encrypted row, used by the BLOB Python-side filter.
-    _ENCRYPTED_PREFIXES = (b"gAAAAA", b"KSAv2:")
 
     async def _entry_available(self, entry: Dict[str, Any]) -> bool:
         if not entry.get("optional"):
@@ -469,11 +463,9 @@ class KeyRotationService:
 
         Takes 44-byte URL-safe-base64 master keys for both sides so each
         per-agent row can have its HKDF-derived cipher built on demand.
-        Same-key (master-equal) runs short-circuit ``LIKE 'KSAv2:%'``
-        rows since they're already in v2 — useful for the
-        ``upgrade_to_aead`` path.
+        Same-key upgrade runs verify and rewrite all metadata-flagged rows,
+        including existing AEAD ciphertext, rather than trusting a prefix.
         """
-        same_key = old_master == new_master
         try:
             for entry in self.ENCRYPTED_TABLES:
                 if not await self._entry_available(entry):
@@ -484,8 +476,7 @@ class KeyRotationService:
                     content_column=entry["content_column"],
                     id_column=entry["id_column"],
                     agent_id_column=entry.get("agent_id_column"),
-                    is_text_column=entry.get("is_text_column", True),
-                    skip_v2=same_key,
+                    optional_content=entry.get("optional_content", False),
                     progress_alias=entry.get("progress_alias"),
                     require_all=entry.get("require_all", False),
                 )
@@ -516,8 +507,7 @@ class KeyRotationService:
         content_column: str,
         id_column: str,
         agent_id_column: Optional[str] = None,
-        is_text_column: bool = True,
-        skip_v2: bool = False,
+        optional_content: bool = False,
         progress_alias: Optional[str] = None,
         require_all: bool = False,
     ):
@@ -538,10 +528,6 @@ class KeyRotationService:
            transaction so a crash between them cannot leave the row
            rewritten under ``new_master`` with ``rotation_progress``
            silently missing it.
-
-        ``skip_v2=True`` (set by ``_execute_rotation`` when masters are
-        equal) narrows the SELECT to ``gAAAAA%`` only — same-key upgrade
-        runs do not need to revisit already-v2 rows.
 
         ``progress_alias`` (#1402) lets two passes over the same SQL
         table (one per encrypted column) record progress under distinct
@@ -565,51 +551,11 @@ class KeyRotationService:
         safe_content_col = safe_column_name(content_column)
         safe_agent_col = safe_column_name(agent_id_column) if agent_id_column else None
 
-        if safe_agent_col:
-            select_cols = f"{safe_id_col}, {safe_content_col}, {safe_agent_col}"
-        else:
-            select_cols = f"{safe_id_col}, {safe_content_col}"
-
-        # SQL-LIKE prefix filter only works for TEXT columns. PostgreSQL has
-        # no implicit text↔BYTEA cast, so a ``LIKE 'gAAAAA%'`` predicate
-        # against ``files.content`` (BLOB → BYTEA) does not compile. BLOB
-        # tables read all rows and apply the prefix check in Python below.
-        if is_text_column and not require_all:
-            if skip_v2:
-                where = f"{safe_content_col} LIKE 'gAAAAA%'"
-            else:
-                where = (
-                    f"{safe_content_col} LIKE 'gAAAAA%' "
-                    f"   OR {safe_content_col} LIKE 'KSAv2:%'"
-                )
-            rows = await self.storage.database.fetchall(
-                f"SELECT {select_cols} FROM {safe_tbl} WHERE {where}"
-            )
-        else:
-            all_rows = await self.storage.database.fetchall(
-                f"SELECT {select_cols} FROM {safe_tbl}"
-            )
-            rows = []
-            wanted_prefixes: tuple
-            if skip_v2:
-                wanted_prefixes = (b"gAAAAA",)
-            else:
-                wanted_prefixes = self._ENCRYPTED_PREFIXES
-            for row in all_rows:
-                content = row[1]
-                if isinstance(content, str):
-                    content_bytes = content.encode("ascii", errors="ignore")
-                elif isinstance(content, (bytes, bytearray, memoryview)):
-                    content_bytes = bytes(content)
-                else:
-                    if require_all:
-                        raise RuntimeError(f"Required encrypted record in {table} is invalid")
-                    continue
-                if require_all or any(content_bytes.startswith(p) for p in wanted_prefixes):
-                    rows.append(row)
-
-        if require_all and not rows:
-            raise RuntimeError(f"Required encrypted key table {table} is empty")
+        rows = await self._encrypted_rows(
+            table=table, content_column=content_column, id_column=id_column,
+            agent_id_column=agent_id_column, require_all=require_all,
+            optional_content=optional_content,
+        )
 
         # Pre-build the global cipher pair; per-agent ciphers are derived per row
         old_global = AEADCipher(old_master)
@@ -706,48 +652,57 @@ class KeyRotationService:
                 # and require an explicit resume with both original keys instead.
                 raise RuntimeError(f"Encrypted record {record_id_str[:128]!r} in {table} could not be rotated") from e
 
-    async def _count_encrypted_records(self) -> int:
-        """Count total encrypted records across all registered tables.
+    async def _encrypted_rows(
+        self, *, table: str, content_column: str, id_column: str,
+        agent_id_column: str | None = None, require_all: bool = False,
+        optional_content: bool = False,
+    ) -> list:
+        """Use the runtime's encryption marker for both counting and rotation.
 
-        TEXT columns use SQL ``LIKE``; BLOB columns (e.g. ``files.content`` →
-        BYTEA on PostgreSQL) cannot, because PostgreSQL has no implicit
-        text↔BYTEA cast. BLOB tables stream all rows and apply the prefix
-        check in Python.
+        A ciphertext-looking prefix is valid plaintext when metadata.enc is
+        absent/false. Conversely, a damaged flagged ciphertext remains required
+        even when its prefix is missing. Envelope tables have no plaintext rows.
         """
+        safe_tbl = safe_table_name(table)
+        safe_col = safe_column_name(content_column)
+        safe_id = safe_column_name(id_column)
+        agent = safe_column_name(agent_id_column) if agent_id_column else "NULL"
+        columns = f"{safe_id}, {safe_col}, {agent}"
+        if not require_all:
+            columns += ", metadata"
+        rows = await self.storage.database.fetchall(
+            f"SELECT {columns} FROM {safe_tbl} ORDER BY {safe_id}"
+        )
+        selected = []
+        for row in rows:
+            if not require_all:
+                try:
+                    metadata = json.loads(row[3]) if row[3] else None
+                    if not metadata or not metadata.get("enc"):
+                        continue
+                except (ValueError, TypeError, AttributeError) as exc:
+                    raise RuntimeError(
+                        f"Invalid encryption metadata for record {str(row[0])[:128]!r} in {table}"
+                    ) from exc
+                if optional_content and row[1] is None:
+                    continue
+            selected.append(row[:3])
+        if require_all and not selected:
+            raise RuntimeError(f"Required encrypted key table {table} is empty")
+        return selected
+
+    async def _count_encrypted_records(self) -> int:
+        """Count exactly the same metadata-selected records as the writer."""
         total = 0
         for entry in self.ENCRYPTED_TABLES:
             if not await self._entry_available(entry):
                 continue
-            table = entry["table"]
-            column = entry["content_column"]
-            is_text = entry.get("is_text_column", True)
-            try:
-                safe_tbl = safe_table_name(table)
-                safe_col = safe_column_name(column)
-                if is_text:
-                    value = await self.storage.database.fetchval(
-                        f"SELECT COUNT(*) FROM {safe_tbl} "
-                        f"WHERE {safe_col} LIKE 'gAAAAA%' "
-                        f"   OR {safe_col} LIKE 'KSAv2:%'"
-                    )
-                    total += value or 0
-                else:
-                    rows = await self.storage.database.fetchall(
-                        f"SELECT {safe_col} FROM {safe_tbl}"
-                    )
-                    for (content,) in rows:
-                        if isinstance(content, str):
-                            cb = content.encode("ascii", errors="ignore")
-                        elif isinstance(content, (bytes, bytearray, memoryview)):
-                            cb = bytes(content)
-                        else:
-                            continue
-                        if any(cb.startswith(p) for p in self._ENCRYPTED_PREFIXES):
-                            total += 1
-            except Exception as e:
-                # Table may not exist in this storage backend
-                logger.warning(f"Could not count encrypted data in {table}.{column}: {e}")
-                continue
+            total += len(await self._encrypted_rows(
+                table=entry["table"], content_column=entry["content_column"],
+                id_column=entry["id_column"], agent_id_column=entry.get("agent_id_column"),
+                require_all=entry.get("require_all", False),
+                optional_content=entry.get("optional_content", False),
+            ))
         return total
 
     # ------------------------------------------------------------------
