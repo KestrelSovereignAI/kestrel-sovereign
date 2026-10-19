@@ -166,6 +166,15 @@ class EmbeddingColumnMismatch:
     checked_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedConversationFields:
+    """Canonical at-rest fields, prepared without DB/provider/lexical effects."""
+
+    content: str
+    rendered_content: Optional[str]
+    metadata: Dict[str, Any]
+
+
 @dataclass(slots=True)
 class _PreparedConversationWrite:
     """Precomputed, not-yet-visible conversation row material.
@@ -1767,24 +1776,8 @@ class AsyncConversationStore:
         if session_id:
             meta['session_id'] = session_id
 
-        # Use per-agent key for new messages.
-        fernet_to_use = self._agent_fernet or self._global_fernet
-        to_store, was_encrypted = encrypt_string(content, fernet_to_use)
-        if was_encrypted:
-            meta['enc'] = True
-            meta['key_version'] = CURRENT_KEY_VERSION
-
-        rendered_to_store: Optional[str] = None
-        if rendered_content is not None:
-            rendered_to_store, rendered_was_encrypted = encrypt_string(
-                rendered_content, fernet_to_use
-            )
-            # rendered_content shares the same key/version as content; the
-            # ``enc`` flag covers both. If content was empty and skipped
-            # encryption but rendered_content didn't, surface that.
-            if rendered_was_encrypted and not was_encrypted:
-                meta['enc'] = True
-                meta['key_version'] = CURRENT_KEY_VERSION
+        fields = self.prepare_storage_fields(content, rendered_content, meta)
+        to_store, rendered_to_store, meta = fields.content, fields.rendered_content, fields.metadata
 
         # Compute the embedding from plaintext before the final INSERT so it
         # can still be co-written without an autoincrement-id round trip.
@@ -2266,6 +2259,29 @@ class AsyncConversationStore:
             "accepted only without embedding_profile_id (%s).",
             self.agent_id, error,
         )
+
+    def prepare_storage_fields(
+        self, content: str, rendered_content: Optional[str], metadata: Optional[Dict],
+    ) -> PreparedConversationFields:
+        """Encode logical fields under THIS store's existing encryption policy.
+
+        Importers can preserve original timestamps/session columns while using
+        the same message encryption as ordinary writes, without embeddings or
+        lexical-index I/O inside their atomic restore transaction.
+        """
+        meta = dict(metadata) if metadata else {}
+        fernet_to_use = self._agent_fernet or self._global_fernet
+        to_store, was_encrypted = encrypt_string(content, fernet_to_use)
+        if was_encrypted:
+            meta['enc'] = True
+            meta['key_version'] = CURRENT_KEY_VERSION
+        rendered_to_store = None
+        if rendered_content is not None:
+            rendered_to_store, rendered_was_encrypted = encrypt_string(rendered_content, fernet_to_use)
+            if rendered_was_encrypted and not was_encrypted:
+                meta['enc'] = True
+                meta['key_version'] = CURRENT_KEY_VERSION
+        return PreparedConversationFields(to_store, rendered_to_store, meta)
 
     def decrypt_stored_content(self, content: str, meta: Optional[Dict]) -> str:
         """Public: decrypt one stored row's content to plaintext.
