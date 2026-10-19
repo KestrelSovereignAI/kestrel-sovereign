@@ -436,18 +436,26 @@ def test_core_declared_on_the_checkout_being_pulled_is_read_at_the_revision(
     incoming, tmp_path,
 ):
     """``feature sync --capture`` declares an editable core on its own checkout:
-    that is the checkout the pull moves, so its incoming lock is the one."""
+    that is the checkout the caller's pull or checkout moves, so the revision
+    the caller names is the one, not the one a pull of its upstream would land
+    (the coordinator checks out ``FETCH_HEAD``, which may be a tag)."""
     clone, new = incoming
+    _git(clone, "checkout", "-q", "-b", "release")
+    tag = _commit_lock(clone, _lock_text(**{"arize-phoenix": "21.0.0"}), "release lock")
+    _git(clone, "checkout", "-q", "main")
     index = _index(_manifest(
         tmp_path,
         f'[[feature]]\nname = "{CORE}"\neditable = "{clone}"\n' + PHOENIX_STALE,
     ))
 
-    result = sync_preflight(index, lock_revision=new)
-
-    assert [(c.package, c.locked) for c in result.conflicts] == [
-        ("arize-phoenix", "20.23.0"),
+    assert [c.locked for c in sync_preflight(index, lock_revision=new).conflicts] == [
+        "20.23.0",
     ]
+    assert [c.locked for c in sync_preflight(index, lock_revision=tag).conflicts] == [
+        "21.0.0",
+    ]
+    # Nothing moves it: the lock on disk.
+    assert not sync_preflight(index).refuses
 
 
 def test_core_declared_on_another_checkout_keeps_that_checkouts_lock(
@@ -468,3 +476,27 @@ def test_core_declared_on_another_checkout_keeps_that_checkouts_lock(
 
     assert not result.refuses
     assert str(result.lock_path).startswith(other)
+
+
+def test_a_core_the_sync_will_pull_is_read_at_that_pulls_revision(
+    incoming, tmp_path, capsys,
+):
+    """A manifest moving core to another checkout: ``feature sync`` pulls that
+    checkout before linking it, so ITS pending pull decides the lock."""
+    clone, new = incoming
+    origin = tmp_path / "other-origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _commit_lock(origin, _lock_text(**{"arize-phoenix": "17.7.0"}), "old lock")
+    other = tmp_path / "other-core"
+    _git(tmp_path, "clone", "-q", str(origin), str(other))
+    _commit_lock(origin, _lock_text(**{"arize-phoenix": "20.23.0"}), "new lock")
+    manifest = _manifest(
+        tmp_path,
+        f'[[feature]]\nname = "{CORE}"\neditable = "{other}"\n'
+        '[[feature]]\nname = "arize-phoenix"\npypi = ">=20.23"\n',
+    )
+
+    # On disk the other checkout pins 17.7.0, which the window excludes; the
+    # pull the sync will make lands 20.23.0, which it contains.
+    assert run_sync_preflight(manifest) == 0, capsys.readouterr().err

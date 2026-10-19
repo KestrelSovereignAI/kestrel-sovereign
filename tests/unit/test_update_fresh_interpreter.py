@@ -59,7 +59,7 @@ def steps(checkout, manifest, monkeypatch):
     monkeypatch.setattr(cli, "_pull_target_revision", lambda _: INCOMING)
     monkeypatch.setattr(
         cli, "_run_sync_preflight",
-        lambda path, lock_revision=None: calls.append(("preflight", lock_revision)) or 0,
+        lambda path, lock_revision=None, **kw: calls.append(("preflight", lock_revision)) or 0,
     )
     monkeypatch.setattr(
         cli, "_run_git_pull", lambda _: calls.append("pull") or (0, "")
@@ -147,7 +147,7 @@ def test_a_refused_preflight_stops_the_update_before_the_pull(steps, monkeypatch
     _record_continuation(monkeypatch, steps)
     monkeypatch.setattr(
         cli, "_run_sync_preflight",
-        lambda path, lock_revision=None: steps.append(("preflight", lock_revision)) or 1,
+        lambda path, lock_revision=None, **kw: steps.append(("preflight", lock_revision)) or 1,
     )
 
     assert _update() == 1
@@ -274,7 +274,9 @@ def test_the_continuation_is_this_venvs_kestrel_with_inherited_stdio(monkeypatch
     assert cli._run_update_continuation(["--version"]) == 0
 
     ((command, kwargs),) = runs
-    assert command == [sys.executable, "-m", "kestrel_sovereign.cli", "--version"]
+    assert command == [
+        sys.executable, "-P", "-m", "kestrel_sovereign.cli", "--version",
+    ]
     # No capture, env, or cwd override: the child writes to the operator's
     # terminal and resolves the project exactly as this process did.
     assert set(kwargs) == {"check"}
@@ -297,3 +299,36 @@ def test_an_interpreter_that_will_not_start_says_how_to_finish(monkeypatch, caps
 
     assert cli_lifecycle._run_update_continuation(["update", "--no-pull"]) == 1
     assert "kestrel update --no-pull" in capsys.readouterr().err
+
+
+def test_the_continuation_ignores_a_checkout_in_the_working_directory(
+    monkeypatch, tmp_path,
+):
+    """Run from inside another checkout, ``python -m`` would import ITS
+    ``kestrel_sovereign`` ahead of the venv's; the console script never did."""
+    impostor = tmp_path / "kestrel_sovereign"
+    impostor.mkdir()
+    (impostor / "__init__.py").write_text("")
+    (impostor / "cli.py").write_text("import sys\nsys.exit(42)\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert cli_lifecycle._run_update_continuation(["--version"]) == 0
+
+
+@pytest.mark.parametrize(
+    ("flags", "fetch", "allow_dirty"),
+    [((), True, False), (("--dry-run",), False, False), (("--allow-dirty",), True, True)],
+)
+def test_the_preflight_pulls_as_the_update_would(steps, monkeypatch, flags, fetch, allow_dirty):
+    """A dry run fetches nothing; ``--allow-dirty`` reaches the pull the sync
+    makes of a declared core, as it reaches the sync itself."""
+    _record_continuation(monkeypatch, steps)
+    seen = []
+    monkeypatch.setattr(
+        cli, "_run_sync_preflight", lambda path, **kw: seen.append(kw) or 0,
+    )
+
+    assert _update(*flags) == 0
+
+    ((kw),) = seen
+    assert (kw["fetch"], kw["allow_dirty"]) == (fetch, allow_dirty)

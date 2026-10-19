@@ -1592,11 +1592,19 @@ def _report_core_lock() -> None:
         print(f"    {line}", file=sys.stderr)
 
 
-def _run_sync_preflight(manifest: Path, *, lock_revision: Optional[str] = None) -> int:
+def _run_sync_preflight(
+    manifest: Path,
+    *,
+    lock_revision: Optional[str] = None,
+    fetch: bool = True,
+    allow_dirty: bool = False,
+) -> int:
     """``kestrel feature sync --preflight`` on *manifest*: 0 when the sync can be held."""
     from kestrel_sovereign.cli_features import run_sync_preflight
 
-    return run_sync_preflight(manifest, lock_revision=lock_revision)
+    return run_sync_preflight(
+        manifest, lock_revision=lock_revision, fetch=fetch, allow_dirty=allow_dirty,
+    )
 
 
 def _update_argv(args) -> list:
@@ -1643,9 +1651,12 @@ def _run_update_continuation(argv: list) -> int:
 
     Inherits this process's stdio, environment and working directory, so the
     operator sees one continuous update and the child resolves the project the
-    same way this process did.
+    same way this process did. ``-P`` keeps that working directory off
+    ``sys.path``, as it is for the console script: ``-m`` would otherwise put
+    it first, and an update run from inside another checkout would continue
+    in that checkout's code.
     """
-    command = [sys.executable, "-m", "kestrel_sovereign.cli", *argv]
+    command = [sys.executable, "-P", "-m", "kestrel_sovereign.cli", *argv]
     try:
         result = subprocess.run(command, check=False)
     except OSError as exc:
@@ -1862,7 +1873,11 @@ def cmd_update(args) -> int:
                 )
                 return 1
             rc = cli._run_sync_preflight(
-                preflight_manifest, lock_revision=lock_revision,
+                preflight_manifest,
+                lock_revision=lock_revision,
+                # A dry run reads what was last fetched, as the gate does.
+                fetch=not dry_run,
+                allow_dirty=allow_dirty,
             )
             if rc != 0 and not continue_on_error:
                 print(
