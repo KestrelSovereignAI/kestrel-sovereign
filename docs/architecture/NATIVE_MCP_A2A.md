@@ -26,8 +26,9 @@ and open gates are recorded in [the spike report](NATIVE_PROTOCOL_SPIKES.md).
 
 Use the published [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
 and [A2A 1.0 specification](https://a2a-protocol.org/v1.0.0/specification/).
-Use official Python SDKs at every network boundary. The initial candidates are
-`mcp==2.3.0` and `a2a-sdk==1.2.2`; exact versions belong in dependency locks,
+Use official Python SDKs at every network boundary. MCP was tested at 2.3.0;
+the A2A signed-card gate was rechecked at 1.2.3 on 2026-10-19, after the initial
+1.2.2 experiment. Exact versions belong in dependency locks,
 and dependency ranges must admit the releases we actually test. Old dependency
 caps are subject to migration, not reasons to downgrade the protocol target.
 
@@ -409,7 +410,7 @@ and explicitly set optional defaults, and exclude `signatures`. The normative
 [section 8.4.1](https://a2a-protocol.org/v1.0.0/specification/#841-canonicalization-requirements)
 is the canonical-byte oracle, not a same-helper signing round trip.
 
-**Signed-card release gate:** `a2a-sdk==1.2.2` does not implement that oracle:
+**Signed-card release gate:** `a2a-sdk==1.2.3` still does not implement that oracle:
 its default `MessageToDict` serialization omits required no-presence fields
 at their defaults (including `description` and required repeated fields),
 then its recursive empty cleanup removes explicitly present empties such as
@@ -422,6 +423,10 @@ must respect each field's required annotation and presence. Resolve
 upgrading to a corrected official SDK release or contributing the repair to
 that SDK and consuming a tested release. Do not ship a Kestrel canonicalizer,
 relax verification, or remove valid empty fields just to evade the defect.
+The contributed [native SDK repair](https://github.com/a2aproject/a2a-python/pull/1355)
+has completed an independent full worktree review and independent signature
+probes. An open PR does not satisfy this release gate: consume a published
+corrected SDK and rerun the vectors before releasing the cutover.
 Check in normative canonical-byte/signature vectors for required empties,
 absent versus explicitly empty optional values, explicit false capabilities,
 and the implicit empty interface tenant. Require both official SDK helpers

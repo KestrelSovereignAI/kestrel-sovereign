@@ -90,11 +90,24 @@ async def mcp_boundary(request, tmp_path, monkeypatch):
         await store.initialize()
         queue = ApprovalQueue(on_request_added=approval_added, permission_store=store, agent=agent)
         agent.hooks_manager.register(SecurityHook(store, queue))
+        initial_manager = None
+
+        async def release_initial_manager():
+            # Keep test custody even if an adversarial lifecycle mutation loses
+            # the feature's reference to its original container manager.
+            if initial_manager is not None:
+                async with AsyncExitStack() as resources:
+                    resources.push_async_callback(initial_manager.aclose)
+                    for name in reversed(list(initial_manager.owned_containers)):
+                        resources.push_async_callback(initial_manager.stop_tool, name)
+
+        cleanup.push_async_callback(release_initial_manager)
         await feature.initialize()
         cleanup.push_async_callback(feature.shutdown)
         agent.features[feature.name] = feature
         loaded = await feature.load_tool(peer.selector)
         assert loaded.status.value == 'ok', loaded.to_dict()
+        initial_manager = feature.manager
         container = loaded.data['container' if peer.kind == 'container' else 'connection']
         owner = f'mcp:{peer.kind}:' + container
         handles = [name for name, candidate in agent._tool_to_feature.items() if candidate == owner]
@@ -176,6 +189,39 @@ async def test_pending_approval_cannot_execute_against_a_replacement_connection(
     assert result['status'] == 'ok'
 
 
+async def test_same_instance_disable_enable_restores_the_governed_connection(mcp_boundary):
+    peer = mcp_boundary
+    await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.ASK)
+    pending = peer.invoke("approved-before-disable")
+    request = await asyncio.wait_for(peer.requests.get(), 5)
+    original_connection = peer.current_connection()
+    original_manager = peer.feature.manager
+    await peer.feature.initialize()
+    assert peer.feature.manager is original_manager
+    assert peer.current_connection() is original_connection
+
+    await peer.agent._unregister_feature_runtime(peer.feature, unload=False)
+    assert peer.agent.features[peer.feature.name] is peer.feature
+    assert not peer.feature.enabled and not original_connection.is_connected
+    assert peer.owner not in peer.agent._tool_to_feature.values()
+    await peer.agent._activate_feature_runtime(peer.feature)
+    assert peer.agent.features[peer.feature.name] is peer.feature and peer.feature.enabled
+    if peer.peer.kind == "container":
+        assert peer.feature.manager is not original_manager
+    assert peer.current_connection() is not original_connection
+    assert await peer.queue.submit_decision(request.id, True, scope="once")
+    result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
+    assert result["status"] == "error" and "changed; rediscover" in result["error"]
+
+    fresh = peer.invoke("approved-after-reenable")
+    following = await asyncio.wait_for(peer.requests.get(), 5)
+    assert await peer.queue.submit_decision(following.id, True, scope="once")
+    result = await peer.result_with_witness(
+        asyncio.wait_for(fresh, 5), ["approved-after-reenable"],
+    )
+    assert result["status"] == "ok"
+
+
 @pytest.mark.parametrize("mcp_boundary", ["remote"], indirect=True)
 async def test_pending_approval_cannot_execute_while_remote_unload_waits_on_storage(mcp_boundary):
     peer = mcp_boundary
@@ -243,4 +289,56 @@ async def test_remote_feature_restore_reads_the_real_enablement_rows(mcp_boundar
         assert result.status.value == "ok"
         assert await peer.agent.get_enablement_deltas("mcp_server") == []
     finally:
+        await restored.shutdown()
+
+
+@pytest.mark.parametrize("mcp_boundary", ["remote"], indirect=True)
+async def test_restore_database_read_failure_does_not_block_another_remote(mcp_boundary, caplog):
+    from kestrel_feature_mcp.feature import MCPAgent
+
+    peer = mcp_boundary
+    second = await peer.feature.load_tool(peer.selector + "?connection=second")
+    assert second.status.value == "ok", second.to_dict()
+    rows = await peer.agent.get_enablement_deltas("mcp_server")
+    assert len(rows) == 2
+    failed_name, healthy_name = rows[0]["name"], rows[1]["name"]
+    await peer.feature.shutdown()
+    original_reader = peer.agent.get_enablement_deltas
+    backend = peer.agent._feature_enablement_store._backend
+    reads = 0
+
+    async def fail_one_read(kind):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            # The actual store executes its unchanged SELECT against a real
+            # temporarily unavailable table; the backend raises SDK QueryError.
+            await backend.execute("ALTER TABLE feature_enablement RENAME TO enablement_read_fault")
+            try:
+                return await original_reader(kind)
+            finally:
+                await backend.execute("ALTER TABLE enablement_read_fault RENAME TO feature_enablement")
+        return await original_reader(kind)
+
+    peer.agent.get_enablement_deltas = fail_one_read
+    restored = MCPAgent(peer.agent)
+    try:
+        await restored.initialize()
+        peer.agent.features[restored.name] = restored
+        await restored.post_all_features_loaded()
+        assert set(restored._remote_connections) == {healthy_name}
+        assert "Failed to restore remote MCP " + failed_name in caplog.text
+        assert "no such table: feature_enablement" in caplog.text
+        assert await original_reader("mcp_server") == rows
+        owner = "mcp:remote:" + healthy_name
+        handles = [name for name, candidate in peer.agent._tool_to_feature.items() if candidate == owner]
+        assert len(handles) == 1
+        await peer.store.set_permission(owner, handles[0], PermissionLevel.ALLOW)
+        result = await peer.agent.execute_named_tool(
+            handles[0], {"marker": "after-store-read-failure"}, session_id="mcp-boundary",
+        )
+        assert await peer.witness() == ["after-store-read-failure"]
+        assert result["status"] == "ok"
+    finally:
+        peer.agent.get_enablement_deltas = original_reader
         await restored.shutdown()
