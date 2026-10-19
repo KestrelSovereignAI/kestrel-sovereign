@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-19
-**Scope:** 3142 tracked files (2333 `.py`, 360 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3143 tracked files (2334 `.py`, 360 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2352,8 +2352,10 @@ Repo entry points and standard project files.
   - `def pytest_collection_modifyitems(config, items)`; `def pytest_timeout_set_timer(item, settings)`; `def live_call_budget(request)`; `async def complete_bootstrap(agent)`; `async def grant_permissions(agent)`; `def skip_bootstrap()`
 - **tests/integration/live_routes.py** — Deadlines and usable-route probes for tests that call live LLM routes (#3269).
   - `def record_backstop(item, timeout)`; `class LiveCallBudget`; `def describe_chat_routes(llm_service)`; `def describe_discovery_routes(llm_service)`; `def await_chain(task)`; `def parked_in(task)`; `async def bounded_live_call(awaitable)`; `def require_answering_ollama(deadline)`; `…`
-- **tests/integration/mcp_permission_peer.py** — Native external MCP peer that records actual tool side effects.
+- **tests/integration/mcp_permission_peer.py** — Native external MCP peer with a real filesystem side-effect witness.
   - `def main()`
+- **tests/integration/mcp_permission_peers.py** — Owned Docker and native HTTPS peers for the same host security campaign.
+  - `class MCPTestPeer`; `async def docker_peer(tmp_path)`; `async def https_peer(tmp_path, monkeypatch)`
 - **tests/integration/native_memory_original_control.py** — Owned local SDK/SQLite/PG fixtures; not Agent READY or paid-provider acceptance.
   - `class NativeMemoryOwners`; `async def native_memory_owners(native_pg, tmp_path, monkeypatch)`; `def native_vector_consumers(native_memory_owners)`; `def actual_native_loss(lease, observed)`
 - **tests/integration/test_a2a_cancel_authorization_backends.py** — SQLite/PostgreSQL parity for atomic A2A cancellation authority (#3134).
@@ -2796,8 +2798,8 @@ Repo entry points and standard project files.
   - `async def test_handoff_releases_physically_acquired_lock_after_join_observer_failure(native_pg, onboarding_owner, monkeypatch)`; `async def test_budget_release_inner_admission_joins_original_task(native_pg, onboarding_owner, monkeypatch, mode, …)`; `async def test_standalone_descendant_boundary_joins_original_before_releasing_manager(native_pg, onboarding_owner, monkeypatch, mode, …)`
 - **tests/integration/test_manager_terminal_harvest_originals.py** — Terminal consumers harvest original physical owners without callback ACKs.
   - `class UnexpectedControl`; `async def test_original_join_keeps_cyclic_native_component_beside_independent_observer(native_pg, onboarding_owner, monkeypatch, eager, …)`; `async def test_terminal_join_retires_completed_record_after_callback_publication_failure(native_pg, onboarding_owner, monkeypatch, surface, …)`; `async def test_whole_native_group_survives_sweep_filters_and_independent_attempts(native_pg, onboarding_owner, monkeypatch, surface, …)`; `async def test_child_settlement_raised_group_still_attempts_compensation_or_reconciliation(native_pg, onboarding_owner, monkeypatch, surface, …)`; `async def test_child_specific_reader_preserves_native_result_and_actual_withdrawal(native_pg, onboarding_owner, monkeypatch, source_cancel)`; `async def test_ttl_consumer_preserves_prior_terminal_and_late_native_reader_failure(native_pg, onboarding_owner, monkeypatch, entry, …)`; `async def test_ttl_successful_reader_never_reconstructs_actual_native_withdrawal(native_pg, onboarding_owner, monkeypatch, entry, …)`; `…`
-- **tests/integration/test_mcp_permission_boundary.py** — Installed MCP package, real Docker peer, and the host's actual security rail.
-  - `class MCPBoundary`; `async def mcp_boundary(tmp_path)`; `async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary)`; `async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary)`; `async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary)`
+- **tests/integration/test_mcp_permission_boundary.py** — Installed MCP package, native peers, and the host's actual security rail.
+  - `class MCPBoundary`; `async def mcp_boundary(request, tmp_path, monkeypatch)`; `async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary)`; `async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary)`; `async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary)`; `async def test_remote_reconnect_refuses_the_real_uninitialized_enablement_service(mcp_boundary)`; `async def test_remote_feature_restore_reads_the_real_enablement_rows(mcp_boundary)`
 - **tests/integration/test_memory_access_hot_retention.py** — Bounded actual memory work, declared retired-lease callbacks, repeated reads.
   - `async def test_original_memory_receipt_keeps_one_payload_and_bounded_reader_frames(native_memory_owners, monkeypatch, reader)`
 - **tests/integration/test_memory_access_native_publication.py** — Actual bound rehearsal SQL must settle before context publication.

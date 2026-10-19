@@ -447,10 +447,12 @@ jobs:
           enable-cache: true
       - name: Install the host and released MCP feature
         run: uv sync --python 3.14 --locked --extra mcp-integration
-      - name: Exercise installed MCP permissions against a real Docker peer
-        # budget-basis(mcp): slowest-pass=2.0 worst-runner-ratio=1.85 samples=8 longest-test=180
-        # Eight local three-case passes across reviewed host revisions include
-        # cold bytecode and public installs; slowest 114.60s, rounded up.
+      - name: Exercise installed MCP permissions against real Docker and HTTPS peers
+        # budget-basis(mcp): slowest-pass=2.0 worst-runner-ratio=1.85 samples=10 longest-test=180
+        # Eight historical three-case Docker passes include cold bytecode and
+        # public installs; slowest 114.60s, rounded up. Two expanded native
+        # Docker/HTTPS campaigns passed in 46.73s (six cases) and 48.42s (eight
+        # cases) using private candidate wheels before public-floor promotion.
         # The ratio is the integration tier's observed runner spread. Its
         # conftest also enforces the 180s per-test ceiling on these tests.
         run: >-
@@ -838,7 +840,7 @@ jobs:
         # thresholds are the least trustworthy thing to assert on a shared
         # runner. It still runs weekly via weekly-analysis.yml, which
         # invokes run_tests.py with no marker filter.
-        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 --session-timeout=2700 -m "not native_postgres and not docker_mcp and not cloud_resource and not bench"
+        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 --session-timeout=2700 -m "not native_postgres and not docker_mcp and not mcp_integration and not cloud_resource and not bench"
         # 20 was too tight, then 30 was too tight, each for the same reason
         # 10 was too tight on the unit tier above: they started killing
         # PASSING runs. #3212 is the third instance, and the repetition is
@@ -963,7 +965,7 @@ jobs:
         # establish the new lane's actual timing; no historical skip counts
         # are represented as passes. Collection uses the canonical native_pg
         # dependency marker before pytest's -m deselection.
-        run: uv run pytest tests/integration/ -p pytest_asyncio.plugin -p pytest_timeout -o addopts='' -v --tb=short -x --timeout=120 --session-timeout=2700 -m "native_postgres and not docker_mcp and not cloud_resource and not bench"
+        run: uv run pytest tests/integration/ -p pytest_asyncio.plugin -p pytest_timeout -o addopts='' -v --tb=short -x --timeout=120 --session-timeout=2700 -m "native_postgres and not docker_mcp and not mcp_integration and not cloud_resource and not bench"
         timeout-minutes: 50
         env:
           TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
