@@ -1039,12 +1039,15 @@ def _reattach_branch(git) -> str:
 def _run_git_fetch(project_dir: Path) -> Tuple[int, str]:
     """Run ``git fetch`` in ``project_dir`` — the fetch half of the pull.
 
-    Updates remote-tracking refs only; the checkout is untouched. Returns
-    ``(returncode, combined_output)``.
+    Updates remote-tracking refs only; the checkout is untouched, and so is
+    ``FETCH_HEAD``: a restart coordinator update fetches its target ref and
+    then checks out ``FETCH_HEAD``, and a preflight that reads another fetch
+    in the same checkout between the two must not retarget it (#3702).
+    Returns ``(returncode, combined_output)``.
     """
     try:
         result = subprocess.run(
-            ["git", "fetch"],
+            ["git", "fetch", "--no-write-fetch-head"],
             cwd=str(project_dir),
             capture_output=True,
             text=True,
@@ -1592,19 +1595,14 @@ def _report_core_lock() -> None:
         print(f"    {line}", file=sys.stderr)
 
 
-def _run_sync_preflight(
-    manifest: Path,
-    *,
-    lock_revision: Optional[str] = None,
-    fetch: bool = True,
-    allow_dirty: bool = False,
-) -> int:
-    """``kestrel feature sync --preflight`` on *manifest*: 0 when the sync can be held."""
+def _run_sync_preflight(manifest: Path, **options) -> int:
+    """``kestrel feature sync --preflight`` on *manifest*: 0 when the sync can be held.
+
+    *options* are :func:`~kestrel_sovereign.cli_features.run_sync_preflight`'s.
+    """
     from kestrel_sovereign.cli_features import run_sync_preflight
 
-    return run_sync_preflight(
-        manifest, lock_revision=lock_revision, fetch=fetch, allow_dirty=allow_dirty,
-    )
+    return run_sync_preflight(manifest, **options)
 
 
 def _update_argv(args) -> list:
@@ -1686,10 +1684,11 @@ def _continue_update_in_fresh_interpreter(args) -> int:
     code runs against the packages the old code was installed with, and it
     need not even import against them (a new ``fastapi`` symbol is enough).
     The interpreter that imported the old code is the one that can drive the
-    install. The continuation skips the steps already done and is told the
-    package changed, so it judges every agent as this process would have.
+    install. The continuation skips the steps already done, and
+    ``--after-install`` tells it the package changed and the adoption gate
+    already ran (see :func:`cmd_update`).
     """
-    argv = [*_update_argv(args), "--no-pull", "--no-install", "--package-changed"]
+    argv = [*_update_argv(args), "--no-pull", "--no-install", "--after-install"]
     print(
         "• continue: the install replaced code this process loaded; the "
         "remaining steps run in a fresh interpreter"
@@ -1740,7 +1739,7 @@ def cmd_update(args) -> int:
         had pruned the packages it restores (#3702). ``--continue-on-error``
         warns instead, as it does for the sync failure this predicts.
       - The install hands the remaining steps to a fresh interpreter
-        (``--no-pull --no-install --package-changed``), so they run the code
+        (``--no-pull --no-install --after-install``), so they run the code
         and packages now on disk rather than the ones this process imported
         (#3702).
     """
@@ -1762,10 +1761,9 @@ def cmd_update(args) -> int:
     no_deps = bool(getattr(args, "no_deps", False))
     continue_on_error = bool(getattr(args, "continue_on_error", False))
     allow_safe_mode = bool(getattr(args, "allow_constitution_safe_mode", False))
-    # Set on a continuation (#3702): an earlier phase of this update already
-    # pulled or installed, so the package changed even though this phase skips
-    # those steps.
-    package_changed = bool(getattr(args, "package_changed", False))
+    # Set on the continuation of an install (#3702): this phase skips the pull
+    # and install, but they ran, so the package changed.
+    after_install = bool(getattr(args, "after_install", False))
     # --prefer-source / --prefer-pypi bulk-override the per-feature reconcile
     # update mode (issue #1788). Mutually exclusive at the parser level.
     prefer = None
@@ -1812,7 +1810,7 @@ def cmd_update(args) -> int:
         and source_checkout is not None
         and cli._project_dir_is_git(source_checkout)
     )
-    package_changing = package_changed or pull or install or features
+    package_changing = after_install or pull or install or features
     judged = None if package_changing or not target else [target]
     incoming_revision = (
         _incoming_revision(source_checkout, fetch=not dry_run) if pulling else None
@@ -1826,22 +1824,29 @@ def cmd_update(args) -> int:
         if pulling
         else INSTALLED_CODE
     )
-    rc = _constitution_adoption_gate(
-        lambda: check_constitution_adoption(
-            project_dir,
-            agent_names=judged,
-            deployed_content=incoming,
+    if after_install:
+        # Judged before anything changed, by the phase that installed. Judging
+        # again here could only refuse after `uv sync` had pruned the features
+        # this phase restores; what the install changed, the restart judges in
+        # a fresh interpreter, after the restore, as it always has.
+        print("• constitution: judged before the install; the restart judges what it installed")
+    else:
+        rc = _constitution_adoption_gate(
+            lambda: check_constitution_adoption(
+                project_dir,
+                agent_names=judged,
+                deployed_content=incoming,
+                code_label=code_label,
+            ),
             code_label=code_label,
-        ),
-        code_label=code_label,
-        allow_safe_mode=allow_safe_mode,
-        refuse=restart,
-        running=lambda names: _running_agents(project_dir, names),
-        command="update",
-        untouched="nothing was pulled, installed or restarted",
-    )
-    if rc != 0:
-        return rc
+            allow_safe_mode=allow_safe_mode,
+            refuse=restart,
+            running=lambda names: _running_agents(project_dir, names),
+            command="update",
+            untouched="nothing was pulled, installed or restarted",
+        )
+        if rc != 0:
+            return rc
 
     # Step 0.5: preflight (#3702). `uv sync` prunes every package its lock does
     # not name and `feature sync` restores them, holding each install to the
@@ -2465,11 +2470,14 @@ def add_lifecycle_subparsers(subparsers) -> None:
         "--force", action="store_true",
         help="Forwarded to `kestrel restart` (force-kill stale processes)",
     )
-    # Internal: what a pull/install phase passes the fresh interpreter it hands
-    # the rest of the update to (#3702). It only widens what is checked (every
-    # agent is judged, as after a package change), so it is harmless by hand.
+    # Internal: what the install phase passes the fresh interpreter it hands
+    # the rest of the update to (#3702), with --no-pull --no-install. The
+    # restart then judges every agent against the installed code, as after any
+    # package change, and the pre-install adoption gate is not run again: it
+    # judged the revision before the install, and a second refusal could only
+    # come after `uv sync` had pruned the features this phase restores.
     update_p.add_argument(
-        "--package-changed", action="store_true", help=argparse.SUPPRESS,
+        "--after-install", action="store_true", help=argparse.SUPPRESS,
     )
     _add_constitution_override_argument(update_p)
     _add_startup_timeout_argument(update_p)

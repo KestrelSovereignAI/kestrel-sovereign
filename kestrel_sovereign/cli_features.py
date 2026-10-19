@@ -2957,6 +2957,7 @@ def sync_preflight(
     source_index,
     *,
     lock_revision: Optional[str] = None,
+    lock_checkout: Optional[Path] = None,
     fetch: bool = True,
     allow_dirty: bool = False,
 ) -> SyncPreflight:
@@ -2966,16 +2967,16 @@ def sync_preflight(
     manifest declares for core, none when it declares core from the index
     (an index wheel ships no lock), and otherwise the one beside the core
     installed now (:meth:`CoreInstallGuard.install_core` and
-    :meth:`CoreInstallGuard.refresh`). Each is read as it will be when the
-    sync uses it:
+    :meth:`CoreInstallGuard.refresh`). It is read as it will be when the sync
+    uses it:
 
-    * The installed core's checkout (core not declared, or declared on that
-      same checkout, as ``feature sync --capture`` writes it) is the one a
-      caller's pull or checkout moves: *lock_revision* is the revision it
-      lands on, read before the new code lands, since that code may not even
-      import against the packages installed now.
+    * *lock_revision* is the revision the caller's pull or checkout is about to
+      move *lock_checkout* to (default: the installed core's checkout). When
+      that is the checkout holding the sync, its lock is read as it lands
+      there, before the new code does: that code may not even import against
+      the packages installed now.
     * Otherwise a declared core the sync acts on is pulled by the sync itself
-      before it is linked, so it is read at that pull's revision
+      before it is linked, so it is read where that pull lands
       (:func:`_pending_core_pull`; *fetch* and *allow_dirty* as for the pull).
       The sync acts on it when it switches source (another checkout) or
       ensures declared extras: the editable half of
@@ -2984,14 +2985,15 @@ def sync_preflight(
       ``uv sync``, which is not the venv the sync will see.
     * Anything else is read from disk: nothing moves it.
 
-    Installs nothing.
+    "As it lands" is :func:`~kestrel_sovereign.core_lock.read_core_lock_landing`:
+    local edits to ``uv.lock`` survive the move. Installs nothing.
     """
     from kestrel_sovereign import feature_reconcile as fr
     from kestrel_sovereign.core_lock import (
         CoreLockError,
         core_lock_checkout,
         load_core_lock,
-        read_core_lock_at,
+        read_core_lock_landing,
     )
 
     guard = CoreInstallGuard.snapshot(source_index)
@@ -3009,21 +3011,23 @@ def sync_preflight(
             # Whether the declared checkout is the installed one cannot be
             # told; the sync will treat it as a source switch and pull it.
             installed = None
-        on_installed = declared is None or (
-            installed is not None and fr._same_path(str(declared), str(installed))
-        )
-        if on_installed and lock_revision is not None and installed is not None:
-            return read_core_lock_at(installed, lock_revision)
-        if declared is not None and (not on_installed or core.extras):
-            revision = _pending_core_pull(declared, fetch=fetch, allow_dirty=allow_dirty)
-            return (
-                read_core_lock_at(declared, revision) if revision
-                else load_core_lock(declared)
-            )
-        if installed is None:
+        holder = declared or installed
+        if holder is None:
             # An index-installed core ships no lock at any revision.
             return None
-        return cli._core_lock(guard.before)
+        moving = Path(lock_checkout).expanduser() if lock_checkout else installed
+        if (
+            lock_revision is not None
+            and moving is not None
+            and fr._same_path(str(holder), str(moving))
+        ):
+            return read_core_lock_landing(holder, lock_revision)
+        on_installed = installed is not None and fr._same_path(str(holder), str(installed))
+        if declared is not None and (not on_installed or core.extras):
+            revision = _pending_core_pull(declared, fetch=fetch, allow_dirty=allow_dirty)
+            if revision is not None:
+                return read_core_lock_landing(declared, revision)
+        return load_core_lock(holder)
 
     lock, error, _ = guard._bind_lock(read_lock)
     if error is not None:
@@ -3084,6 +3088,7 @@ def run_sync_preflight(
     path: Path,
     *,
     lock_revision: Optional[str] = None,
+    lock_checkout: Optional[Path] = None,
     fetch: bool = True,
     allow_dirty: bool = False,
 ) -> int:
@@ -3112,7 +3117,8 @@ def run_sync_preflight(
         return 0
     result = sync_preflight(
         fr.build_source_index(entries, load_registry()),
-        lock_revision=lock_revision, fetch=fetch, allow_dirty=allow_dirty,
+        lock_revision=lock_revision, lock_checkout=lock_checkout,
+        fetch=fetch, allow_dirty=allow_dirty,
     )
     report_sync_preflight(
         result, path, stream=sys.stderr if result.refuses else sys.stdout,
@@ -3309,6 +3315,7 @@ def cmd_feature_sync(args) -> int:
         return run_sync_preflight(
             path,
             lock_revision=getattr(args, "lock_revision", None),
+            lock_checkout=getattr(args, "lock_checkout", None),
             # A dry run contacts nothing, as it installs nothing.
             fetch=not getattr(args, "dry_run", False),
             allow_dirty=getattr(args, "allow_dirty", False),
@@ -4114,9 +4121,17 @@ def add_feature_subparser(subparsers) -> None:
         "--lock-revision",
         metavar="REV",
         help=(
-            "With --preflight: read core's uv.lock as git revision REV of "
-            "core's checkout records it (what a pull or checkout to REV "
-            "installs), instead of the working tree"
+            "With --preflight: the revision a pull or checkout is about to "
+            "move --lock-checkout to; when that checkout holds the sync's "
+            "lock, the lock is read as it will land there"
+        ),
+    )
+    feat_sync.add_argument(
+        "--lock-checkout",
+        metavar="PATH",
+        help=(
+            "With --lock-revision: the checkout REV belongs to (default: the "
+            "installed core's checkout)"
         ),
     )
     feat_sync.add_argument(

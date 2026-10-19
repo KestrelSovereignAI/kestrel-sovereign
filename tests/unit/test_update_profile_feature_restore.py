@@ -79,7 +79,8 @@ def test_the_manifest_is_checked_against_the_fetched_lock_before_anything_lands(
     # The lock FETCH_HEAD records: what the checkout and `uv sync` will install.
     assert preflight.argv == [
         sys.executable, "-m", "kestrel_sovereign.cli", "feature", "sync",
-        "--manifest", str(manifest), "--preflight", "--lock-revision", "FETCH_HEAD",
+        "--manifest", str(manifest), "--preflight",
+        "--lock-revision", "FETCH_HEAD", "--lock-checkout", "/repo",
     ]
     assert preflight.cwd == "/repo"
     # Fatal on failure: a refusal must stop the update before the install.

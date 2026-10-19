@@ -328,7 +328,10 @@ def _sovereign_local_uv_sync(
             1,
             UpdateStep(
                 "feature_preflight",
-                [*feature_sync, "--preflight", "--lock-revision", "FETCH_HEAD"],
+                [
+                    *feature_sync, "--preflight",
+                    "--lock-revision", "FETCH_HEAD", "--lock-checkout", repo_path,
+                ],
                 cwd=repo_path,
             ),
         )

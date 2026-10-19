@@ -571,6 +571,33 @@ def read_core_lock_at(
     return _lock_from_data(data, label, environment)
 
 
+def read_core_lock_landing(
+    checkout: Path, revision: str, *, environment: Optional[Dict[str, str]] = None,
+) -> Optional[CoreLock]:
+    """The ``uv.lock`` *checkout* will hold once it moves to *revision* (#3702).
+
+    What *revision* records (:func:`read_core_lock_at`), unless the working
+    tree has its own changes to ``uv.lock``: git carries those across a pull or
+    checkout that leaves the file alone (``--allow-dirty``) and refuses one that
+    would change it, so either way the lock that lands is the one on disk.
+    """
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--", LOCK_FILENAME],
+            cwd=str(checkout), capture_output=True, check=False,
+        )
+    except OSError as exc:
+        raise CoreLockError(f"{Path(checkout) / LOCK_FILENAME}: {exc}") from exc
+    if status.returncode != 0:
+        detail = status.stderr.decode("utf-8", "replace").strip()
+        raise CoreLockError(
+            f"{Path(checkout) / LOCK_FILENAME}: {detail or 'git status failed'}"
+        )
+    if status.stdout.strip():
+        return load_core_lock(Path(checkout))
+    return read_core_lock_at(checkout, revision, environment=environment)
+
+
 def _lock_from_data(
     data: dict, path: Path, environment: Optional[Dict[str, str]],
 ) -> CoreLock:

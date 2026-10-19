@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import types
+from pathlib import Path
 
 import pytest
 
@@ -541,3 +542,44 @@ def test_a_dry_run_preflight_fetches_nothing(incoming, tmp_path, monkeypatch):
 
     assert rc == 0
     assert fetches == []
+
+
+def test_the_revision_belongs_to_the_checkout_the_caller_names(incoming, tmp_path):
+    """The coordinator moves its repo, which need not be the checkout core is
+    linked from now: a manifest declaring that repo is read at the revision
+    the coordinator lands it on, and nothing is fetched there."""
+    clone, new = incoming
+    other = tmp_path / "other-core"
+    _git(tmp_path, "clone", "-q", str(clone), str(other))
+    _git(other, "checkout", "-q", "-b", "release")
+    tag = _commit_lock(other, _lock_text(**{"arize-phoenix": "21.0.0"}), "release lock")
+    _git(other, "checkout", "-q", "main")
+    index = _index(_manifest(
+        tmp_path,
+        f'[[feature]]\nname = "{CORE}"\neditable = "{other}"\n' + PHOENIX_STALE,
+    ))
+
+    result = sync_preflight(index, lock_revision=tag, lock_checkout=other)
+
+    assert [c.locked for c in result.conflicts] == ["21.0.0"]
+
+
+def test_local_lock_edits_are_the_lock_that_lands(incoming, tmp_path):
+    """``--allow-dirty``: git carries a local ``uv.lock`` edit across a pull
+    that leaves the file alone, so that edit is what the sync is held to."""
+    clone, _ = incoming
+    origin = Path(_git(clone, "remote", "get-url", "origin"))
+    (origin / "README").write_text("unrelated\n")
+    _git(origin, "add", "README")
+    _git(origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "readme")
+    _git(clone, "fetch", "-q")
+    _git(clone, "merge", "-q", "--ff-only", "origin/main~1")  # HEAD at the 20.23.0 lock
+    incoming_rev = _git(clone, "rev-parse", "origin/main")
+    (clone / "uv.lock").write_text(_lock_text(**{"arize-phoenix": "17.7.0"}))
+    index = _index(_manifest(
+        tmp_path, '[[feature]]\nname = "arize-phoenix"\npypi = "==20.23.0"\n',
+    ))
+
+    result = sync_preflight(index, lock_revision=incoming_rev)
+
+    assert [c.locked for c in result.conflicts] == ["17.7.0"]

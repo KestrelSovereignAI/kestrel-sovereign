@@ -110,10 +110,10 @@ def test_after_the_install_nothing_more_runs_in_this_process(steps, monkeypatch)
         "fetch", ("preflight", INCOMING), "pull", "uv sync", "continue",
     ]
     (argv,) = seen
-    assert argv[-3:] == ["--no-pull", "--no-install", "--package-changed"]
+    assert argv[-3:] == ["--no-pull", "--no-install", "--after-install"]
     continued = _parse(argv)
     assert (continued.pull, continued.install) == (False, False)
-    assert continued.features and continued.restart and continued.package_changed
+    assert continued.features and continued.restart and continued.after_install
 
 
 def test_the_continuation_exit_status_is_the_update_exit_status(steps, monkeypatch):
@@ -332,3 +332,44 @@ def test_the_preflight_pulls_as_the_update_would(steps, monkeypatch, flags, fetc
 
     ((kw),) = seen
     assert (kw["fetch"], kw["allow_dirty"]) == (fetch, allow_dirty)
+
+
+def test_the_continuation_does_not_judge_the_revision_again(steps, monkeypatch):
+    """The adoption gate ran before the install. Run again in the continuation,
+    a refusal could only come after `uv sync` pruned the features it restores;
+    the restart judges the installed code, after the restore."""
+    gates = []
+    monkeypatch.setattr(
+        cli_lifecycle, "_constitution_adoption_gate",
+        lambda *a, **kw: gates.append(kw["code_label"]) or 0,
+    )
+
+    assert _update() == 0
+
+    assert len(gates) == 1
+    assert "feature sync" in steps and "restart" in steps
+
+
+def test_the_fetch_leaves_fetch_head_alone(tmp_path):
+    """The coordinator checks out FETCH_HEAD after its own fetch; a preflight
+    fetch in between must not retarget it."""
+    def git(cwd, *args):
+        return subprocess.run(
+            ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "a")
+    git(origin, "tag", "release")
+    git(origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "b")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(origin), str(clone))
+    git(clone, "fetch", "-q", "origin", "release")
+    fetched = git(clone, "rev-parse", "FETCH_HEAD")
+
+    rc, _ = cli_lifecycle._run_git_fetch(clone)
+
+    assert rc == 0
+    assert git(clone, "rev-parse", "FETCH_HEAD") == fetched
