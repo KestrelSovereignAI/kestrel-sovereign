@@ -4,6 +4,12 @@ Key Rotation Service
 Allows changing the master encryption key (KESTREL_DATA_KEY) without
 losing access to encrypted data.
 
+The host owns one rotation service for a database and must quiesce legacy
+master-key-encrypted writers during rotation. Keep both original keys until
+COMPLETED; resume a failed or interrupted journal before changing the runtime
+key or starting another partially overlapping rotation. This module does not
+provide a distributed maintenance lease or an online writer cutover.
+
 Usage:
     from kestrel_sovereign.security.key_rotation import KeyRotationService
 
@@ -162,6 +168,7 @@ class KeyRotationService:
         self.storage = storage
         self._current_rotation: Optional[RotationRecord] = None
         self._rotation_tasks: set[asyncio.Task[None]] = set()
+        self._rotation_admission_lock = asyncio.Lock()
 
     async def initialize(self):
         """Create rotation tracking tables if they don't exist."""
@@ -208,58 +215,60 @@ class KeyRotationService:
             ValueError: If no new key provided or key is invalid
             RuntimeError: If a rotation is already in progress
         """
-        # Check for in-progress rotation
-        existing = await self._get_in_progress_rotation()
-        if existing:
-            raise RuntimeError(
-                f"Rotation {existing.id} is already in progress. "
-                "Resume or rollback before starting new rotation."
+        async with self._rotation_admission_lock:
+            # A failed attempt may already have durable rows under the new key.
+            # Its journal must be resumed, not replaced by a fresh rotation ID.
+            existing = await self._get_in_progress_rotation()
+            if existing:
+                raise RuntimeError(
+                    f"Rotation {existing.id} is unresolved. "
+                    "Resume with its original keys before starting a new rotation."
+                )
+
+            # Get new key
+            if new_key_file:
+                new_key = _read_key_from_file(new_key_file)
+            if not new_key:
+                raise ValueError("No new key provided")
+
+            # Validate the new key (raises if it can't be coerced to a usable cipher)
+            _validate_key(new_key)
+            new_master = _master_bytes_from_key(new_key)
+
+            # Get current key
+            from kestrel_sovereign.security.encryption import _get_data_key
+            old_key = _get_data_key()
+            if not old_key:
+                raise ValueError("No current key configured (KESTREL_DATA_KEY)")
+            old_master = _master_bytes_from_key(old_key)
+
+            # Create rotation record
+            rotation = RotationRecord(
+                id=str(uuid.uuid4()),
+                started_at=datetime.now(timezone.utc),
+                old_key_hash=_hash_key(old_key),
+                new_key_hash=_hash_key(new_key),
+                status=RotationStatus.IN_PROGRESS,
             )
 
-        # Get new key
-        if new_key_file:
-            new_key = _read_key_from_file(new_key_file)
-        if not new_key:
-            raise ValueError("No new key provided")
+            # Count records to rotate
+            rotation.records_total = await self._count_encrypted_records()
 
-        # Validate the new key (raises if it can't be coerced to a usable cipher)
-        _validate_key(new_key)
-        new_master = _master_bytes_from_key(new_key)
+            # Store rotation record
+            await self._save_rotation(rotation)
+            self._current_rotation = rotation
 
-        # Get current key
-        from kestrel_sovereign.security.encryption import _get_data_key
-        old_key = _get_data_key()
-        if not old_key:
-            raise ValueError("No current key configured (KESTREL_DATA_KEY)")
-        old_master = _master_bytes_from_key(old_key)
+            logger.info(
+                f"Starting key rotation {rotation.id}: "
+                f"{rotation.records_total} records to process"
+            )
 
-        # Create rotation record
-        rotation = RotationRecord(
-            id=str(uuid.uuid4()),
-            started_at=datetime.now(timezone.utc),
-            old_key_hash=_hash_key(old_key),
-            new_key_hash=_hash_key(new_key),
-            status=RotationStatus.IN_PROGRESS,
-        )
+            self._track_rotation_task(
+                self._execute_rotation(rotation, old_master, new_master),
+                rotation.id,
+            )
 
-        # Count records to rotate
-        rotation.records_total = await self._count_encrypted_records()
-
-        # Store rotation record
-        await self._save_rotation(rotation)
-        self._current_rotation = rotation
-
-        logger.info(
-            f"Starting key rotation {rotation.id}: "
-            f"{rotation.records_total} records to process"
-        )
-
-        self._track_rotation_task(
-            self._execute_rotation(rotation, old_master, new_master),
-            rotation.id,
-        )
-
-        return rotation.id
+            return rotation.id
 
     async def get_status(self, rotation_id: str) -> Optional[RotationRecord]:
         """Get the status of a rotation operation."""
@@ -283,7 +292,7 @@ class KeyRotationService:
 
     async def resume_rotation(self, rotation_id: str, key_file: str) -> bool:
         """
-        Resume an interrupted rotation.
+        Resume an interrupted or failed rotation with its original key pair.
 
         Args:
             rotation_id: ID of the rotation to resume
@@ -292,32 +301,47 @@ class KeyRotationService:
         Returns:
             True if resumed successfully
         """
-        rotation = await self.get_status(rotation_id)
-        if not rotation:
-            raise ValueError(f"Rotation {rotation_id} not found")
+        async with self._rotation_admission_lock:
+            rotation = await self.get_status(rotation_id)
+            if not rotation:
+                raise ValueError(f"Rotation {rotation_id} not found")
 
-        if rotation.status != RotationStatus.IN_PROGRESS:
-            raise ValueError(f"Rotation {rotation_id} is not in progress")
+            if rotation.status not in {RotationStatus.IN_PROGRESS, RotationStatus.FAILED}:
+                raise ValueError(f"Rotation {rotation_id} is not resumable")
+            if any(not task.done() and task.get_name() == f"key-rotation-{rotation_id}"
+                   for task in self._rotation_tasks):
+                raise RuntimeError(f"Rotation {rotation_id} is already running")
 
-        new_key = _read_key_from_file(key_file)
-        if not new_key or _hash_key(new_key) != rotation.new_key_hash:
-            raise ValueError("Key does not match rotation's new key")
+            new_key = _read_key_from_file(key_file)
+            if not new_key or _hash_key(new_key) != rotation.new_key_hash:
+                raise ValueError("Key does not match rotation's new key")
 
-        # Continue from where we left off
-        from kestrel_sovereign.security.encryption import _get_data_key
-        old_key = _get_data_key()
-        if not old_key:
-            raise ValueError("No current key configured (KESTREL_DATA_KEY)")
-        old_master = _master_bytes_from_key(old_key)
-        new_master = _master_bytes_from_key(new_key)
+            # Continue from where we left off
+            from kestrel_sovereign.security.encryption import _get_data_key
+            old_key = _get_data_key()
+            if not old_key:
+                raise ValueError("No current key configured (KESTREL_DATA_KEY)")
+            old_master = _master_bytes_from_key(old_key)
+            new_master = _master_bytes_from_key(new_key)
 
-        self._current_rotation = rotation
-        self._track_rotation_task(
-            self._execute_rotation(rotation, old_master, new_master),
-            rotation.id,
-        )
+            if _hash_key(old_key) != rotation.old_key_hash:
+                raise ValueError("Current key does not match rotation's old key")
+            # Progress rows commit atomically with their ciphertext. Counters may
+            # lag after cancellation, so recover them from that durable journal.
+            row = await self.storage.database.fetchone(
+                "SELECT COUNT(*) FROM rotation_progress WHERE rotation_id = ?", (rotation_id,))
+            rotation.records_processed = row[0]
+            rotation.status = RotationStatus.IN_PROGRESS
+            rotation.completed_at = None
+            rotation.error_message = None
+            await self._save_rotation(rotation)
+            self._current_rotation = rotation
+            self._track_rotation_task(
+                self._execute_rotation(rotation, old_master, new_master),
+                rotation.id,
+            )
 
-        return True
+            return True
 
     def _track_rotation_task(
         self,
@@ -401,10 +425,31 @@ class KeyRotationService:
             "agent_id_column": None,
             "is_text_column": False,  # BLOB/BYTEA — Python-side filter
         },
+        {
+            # Saved artifacts use envelope encryption; rotating the wrapped
+            # index/content root leaves their owner/blob addresses stable.
+            "table": "artifact_keys",
+            "content_column": "wrapped_key",
+            "id_column": "key_id",
+            "agent_id_column": None,
+            "is_text_column": False,
+            "optional": True,
+            "require_all": True,
+        },
     ]
 
     # Prefixes that mark an encrypted row, used by the BLOB Python-side filter.
     _ENCRYPTED_PREFIXES = (b"gAAAAA", b"KSAv2:")
+
+    async def _entry_available(self, entry: Dict[str, Any]) -> bool:
+        if not entry.get("optional"):
+            return True
+        db = self.storage.database
+        if db.backend_type == "postgres":
+            row = await db.fetchone("SELECT to_regclass(?) IS NOT NULL", (entry["table"],))
+            return bool(row and row[0])
+        row = await db.fetchone("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (entry["table"],))
+        return row is not None
 
     async def _execute_rotation(
         self,
@@ -423,6 +468,8 @@ class KeyRotationService:
         same_key = old_master == new_master
         try:
             for entry in self.ENCRYPTED_TABLES:
+                if not await self._entry_available(entry):
+                    continue
                 await self._rotate_table(
                     rotation, old_master, new_master,
                     table=entry["table"],
@@ -432,6 +479,7 @@ class KeyRotationService:
                     is_text_column=entry.get("is_text_column", True),
                     skip_v2=same_key,
                     progress_alias=entry.get("progress_alias"),
+                    require_all=entry.get("require_all", False),
                 )
 
             # Rotation complete
@@ -463,6 +511,7 @@ class KeyRotationService:
         is_text_column: bool = True,
         skip_v2: bool = False,
         progress_alias: Optional[str] = None,
+        require_all: bool = False,
     ):
         """Rotate encryption for a single table.
 
@@ -490,6 +539,11 @@ class KeyRotationService:
         table (one per encrypted column) record progress under distinct
         rotation_progress keys. SQL queries still use ``table``; the
         progress table sees ``progress_alias or table``.
+
+        Every selected encrypted row must succeed, including a verified write
+        and atomic progress receipt. A failure retains a resumable journal.
+        ``require_all`` additionally makes envelope-root entries mandatory:
+        malformed/empty key tables and invalid resumed roots cannot be skipped.
         """
         progress_key = progress_alias or table
         already_rotated_rows = await self.storage.database.fetchall(
@@ -512,7 +566,7 @@ class KeyRotationService:
         # no implicit text↔BYTEA cast, so a ``LIKE 'gAAAAA%'`` predicate
         # against ``files.content`` (BLOB → BYTEA) does not compile. BLOB
         # tables read all rows and apply the prefix check in Python below.
-        if is_text_column:
+        if is_text_column and not require_all:
             if skip_v2:
                 where = f"{safe_content_col} LIKE 'gAAAAA%'"
             else:
@@ -540,9 +594,14 @@ class KeyRotationService:
                 elif isinstance(content, (bytes, bytearray, memoryview)):
                     content_bytes = bytes(content)
                 else:
+                    if require_all:
+                        raise RuntimeError(f"Required encrypted record in {table} is invalid")
                     continue
-                if any(content_bytes.startswith(p) for p in wanted_prefixes):
+                if require_all or any(content_bytes.startswith(p) for p in wanted_prefixes):
                     rows.append(row)
+
+        if require_all and not rows:
+            raise RuntimeError(f"Required encrypted key table {table} is empty")
 
         # Pre-build the global cipher pair; per-agent ciphers are derived per row
         old_global = AEADCipher(old_master)
@@ -551,7 +610,6 @@ class KeyRotationService:
         # Memoize per-agent cipher pairs to avoid re-running HKDF for every row
         agent_cipher_cache: Dict[str, tuple] = {}
 
-        consecutive_failures = 0
         for row in rows:
             record_id = row[0]
             encrypted_content = row[1]
@@ -559,6 +617,9 @@ class KeyRotationService:
 
             record_id_str = str(record_id)
             if record_id_str in already_rotated:
+                if require_all:
+                    value = encrypted_content.encode() if isinstance(encrypted_content, str) else encrypted_content
+                    new_global.decrypt(value)
                 continue
 
             # Pick the right NEW cipher (encrypt side). For per-agent tables
@@ -603,11 +664,15 @@ class KeyRotationService:
 
                 # UPDATE + progress INSERT atomic
                 async with self.storage.database.transaction():
-                    await self.storage.database.execute(
+                    affected = await self.storage.database.execute(
                         f"UPDATE {safe_tbl} SET {safe_content_col} = ? "
                         f"WHERE {safe_id_col} = ?",
                         (new_value, record_id),
                     )
+                    stored = await self.storage.database.fetchone(
+                        f"SELECT {safe_content_col} FROM {safe_tbl} WHERE {safe_id_col} = ?", (record_id,))
+                    if affected != 1 or stored is None or stored[0] != new_value:
+                        raise RuntimeError(f"Required encrypted record in {table} was not updated")
                     await self.storage.database.execute(
                         "INSERT INTO rotation_progress "
                         "(rotation_id, table_name, record_id, rotated_at) "
@@ -619,7 +684,6 @@ class KeyRotationService:
                     )
 
                 rotation.records_processed += 1
-                consecutive_failures = 0
 
                 if rotation.records_processed % 100 == 0:
                     await self._save_rotation(rotation)
@@ -629,22 +693,10 @@ class KeyRotationService:
                     )
 
             except Exception as e:
-                consecutive_failures += 1
-                logger.warning(
-                    f"Failed to rotate record {record_id} in {table} "
-                    f"(agent_id={agent_id}): {e}"
-                )
-                # Abort the run if the first 5 rows all fail — that smells
-                # like a key-derivation bug, not isolated row corruption.
-                # Keeps a regression like the #931 passphrase-derivation
-                # mismatch from silently completing with records_processed=0.
-                if consecutive_failures >= 5 and rotation.records_processed == 0:
-                    raise RuntimeError(
-                        f"Rotation aborting: first {consecutive_failures} rows "
-                        f"in {table} all failed to decrypt. Likely a key-"
-                        f"derivation drift between rotation and runtime. Last "
-                        f"error: {e}"
-                    ) from e
+                # A skipped encrypted row would remain under the old key even
+                # if the overall run reported success. Preserve partial progress
+                # and require an explicit resume with both original keys instead.
+                raise RuntimeError(f"Encrypted record in {table} could not be rotated") from e
 
     async def _count_encrypted_records(self) -> int:
         """Count total encrypted records across all registered tables.
@@ -656,6 +708,8 @@ class KeyRotationService:
         """
         total = 0
         for entry in self.ENCRYPTED_TABLES:
+            if not await self._entry_available(entry):
+                continue
             table = entry["table"]
             column = entry["content_column"]
             is_text = entry.get("is_text_column", True)
@@ -721,10 +775,12 @@ class KeyRotationService:
         return await self.start_rotation(new_key=new_key, new_key_file=new_key_file)
 
     async def _get_in_progress_rotation(self) -> Optional[RotationRecord]:
-        """Check for any in-progress rotation."""
+        """Find active work or a failed rotation with durable partial progress."""
         row = await self.storage.database.fetchone(
-            "SELECT * FROM key_rotations WHERE status = ?",
-            (RotationStatus.IN_PROGRESS.value,),
+            "SELECT * FROM key_rotations k WHERE k.status = ? OR (k.status = ? "
+            "AND EXISTS (SELECT 1 FROM rotation_progress p WHERE p.rotation_id = k.id)) "
+            "ORDER BY started_at LIMIT 1",
+            (RotationStatus.IN_PROGRESS.value, RotationStatus.FAILED.value),
         )
         if row:
             return RotationRecord(
