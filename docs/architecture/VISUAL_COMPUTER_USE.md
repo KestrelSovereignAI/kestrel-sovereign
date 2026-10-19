@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Visual computer use and durable artifacts
+description: Provider-neutral visual sessions and producer-neutral saved outputs, with explicit ownership, authority, custody and delivery gates.
+resource: /docs/architecture/VISUAL_COMPUTER_USE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-10-19T00:00:00Z'
+status: active
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Visual computer use and durable artifacts
 
 Implementation decision record for [#3703](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3703), tracked by [#3707](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3707).
@@ -96,6 +113,35 @@ volatile modes do not publish durable artifacts or retain screen/action logs.
 Retention and local-only destination policy apply to materialization as well
 as inference and environment selection.
 
+## Workspace transfer ownership
+
+Core's artifact service owns the workspace transfer broker, delivered jointly
+by #3711 (authorization, publication and materialization) and #3709 (the Docker
+workspace transport); #3710 owns its authenticated network boundary. It is an
+adapter at the artifact/driver boundary, not a new store or environment owner.
+The SDK follow-up #86 must define the typed transfer extension before providers
+implement it. A `files` capability without this negotiated extension is not
+sufficient to enable transfer. EnvironmentProvider remains provisioning-only.
+
+For import, an authenticated host operation selects an admitted session and
+explicit bounded workspace export. The broker holds the current owner/privacy
+and session lease guards, reads through the driver's workspace extension, and
+stages verified bytes with the same `OperatorContext` used for publication.
+The environment cannot supply an owner context or choose a storage key. The
+host creates the manifest after checking each regular file's hash, size and
+relative path. The transport must reject symlinks, device files, hard-link
+escapes, archive expansion and path aliases at the actual filesystem boundary;
+string-only path validation is insufficient.
+
+For materialization, the broker reads an authorized pinned `ArtifactRef`,
+checks destination privacy/capability/lease policy, and writes only into a
+fresh contained workspace target. The driver verifies containment and hashes
+before reporting completion. Partial transfers never count as published or
+materialized; cancellation retains bounded staging and cleanup custody.
+No path into the host filesystem, ambient home directory or mounted cloud
+credentials is implicitly available. A driver lacking the extension refuses
+transfer rather than substituting unrestricted shell/file access.
+
 ## Interaction and resource custody
 
 Persist the admitted request and accepted quote before acquisition. Quotes bind
@@ -173,8 +219,10 @@ machine, reopen/edit revision 2 in the shared panel, materialize exact revision
 isolation, revoked authority, quota failures, stale control/edits, lost
 acknowledgements, restart reconciliation and physical cleanup.
 
-Before each PR, review the entire worktree diff with Claude CLI Opus 5.5. If
-Claude tokens are exhausted, use GPT-6.1 Sol Codex review and disclose the
-fallback. Record the complete verdict for the exact candidate, fix findings,
-and prove regression guards with failing mutations. Unit tests do not claim
-real provider support or a completed live-agent journey.
+Follow the full-diff review and merge gates in [AGENTS.md](../../AGENTS.md).
+For this epic's current implementation, the user additionally selected Claude
+CLI Opus 5.5 before each PR, with GPT-6.1 Sol Codex review only if Claude tokens
+are exhausted. That session-specific model choice does not replace the general
+repository policy. Record the complete verdict for the exact candidate, fix
+findings, and prove regression guards with failing mutations. Unit tests do
+not claim real provider support or a completed live-agent journey.

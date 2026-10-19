@@ -716,6 +716,20 @@
     },
     {
       "existing_code_refs": [
+        "AGENTS.md"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/VISUAL_COMPUTER_USE.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Visual computer use and durable artifacts",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
         "kestrel_sovereign/data/feature_registry.toml"
       ],
       "findings": [],
