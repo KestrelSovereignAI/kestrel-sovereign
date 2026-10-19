@@ -59,7 +59,9 @@ Artifact support here prepares the rotation boundary for the saved-output
 repository; it does not enable an artifact service. Rewrapping an envelope root
 preserves artifact addresses and content keys. It is not recovery from a
 compromised envelope root. Graph properties, external backups and unregistered
-stores are outside this service's coverage.
+stores are outside this service's coverage. In particular, encrypted channel
+messages and agent identity resources are not registered; coverage and safe
+cutover are tracked in [#3728](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3728).
 
 ## Journal and failure behavior
 

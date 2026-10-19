@@ -1,8 +1,9 @@
 """
 Key Rotation Service
 
-Allows changing the master encryption key (KESTREL_DATA_KEY) without
-losing access to encrypted data.
+Re-encrypts registered stores for a master-key (KESTREL_DATA_KEY) change.
+The host owns maintenance isolation and key cutover; unregistered stores
+are outside this service's coverage.
 
 The host owns one rotation service for a database and must quiesce legacy
 master-key-encrypted writers during rotation. Keep both original keys until
