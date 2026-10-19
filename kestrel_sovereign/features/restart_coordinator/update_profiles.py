@@ -294,7 +294,6 @@ def _sovereign_local_uv_sync(
             native="reattach_branch",
             native_args=(repo_path, target_ref),
         ),
-        UpdateStep("install", ["uv", "sync"], cwd=repo_path),
     ]
 
     # Restore out-of-tree feature packages that bare ``uv sync`` prunes (F234).
@@ -305,19 +304,35 @@ def _sovereign_local_uv_sync(
     # a missing manifest); a host with no out-of-tree features has nothing to
     # prune and needs no restore.
     manifest = _host_feature_manifest()
-    if manifest is not None:
-        # Invoke via the RUNNING interpreter (``sys.executable -m ...``), never a
-        # bare ``kestrel`` PATH lookup: a host launched from a venv by absolute
-        # path (systemd/cron) may not have ``kestrel`` on PATH, and a machine
-        # with multiple installs could resolve it to the wrong interpreter and
-        # restore features into a venv the host isn't running (codex P1).
+    # Invoke via the RUNNING interpreter (``sys.executable -m ...``), never a
+    # bare ``kestrel`` PATH lookup: a host launched from a venv by absolute
+    # path (systemd/cron) may not have ``kestrel`` on PATH, and a machine
+    # with multiple installs could resolve it to the wrong interpreter and
+    # restore features into a venv the host isn't running (codex P1). A fresh
+    # interpreter also loads the code the checkout step just landed.
+    feature_sync = (
+        [
+            sys.executable, "-m", "kestrel_sovereign.cli",
+            "feature", "sync", "--manifest", str(manifest),
+        ]
+        if manifest is not None
+        else None
+    )
+    if feature_sync is not None:
+        # Before the prune, as ``kestrel update`` does (#3702): a manifest
+        # window the landed lock contradicts fails every restore, and finding
+        # that after ``uv sync`` leaves the host without its features.
+        steps.append(
+            UpdateStep(
+                "feature_preflight", [*feature_sync, "--preflight"], cwd=repo_path,
+            )
+        )
+    steps.append(UpdateStep("install", ["uv", "sync"], cwd=repo_path))
+    if feature_sync is not None:
         steps.append(
             UpdateStep(
                 "feature_sync",
-                [
-                    sys.executable, "-m", "kestrel_sovereign.cli",
-                    "feature", "sync", "--manifest", str(manifest),
-                ],
+                feature_sync,
                 cwd=repo_path,
                 reports_lock_findings=True,
             )

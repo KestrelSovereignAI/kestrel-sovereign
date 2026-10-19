@@ -2383,10 +2383,13 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _git_working_tree_dirty,
     _run_git_pull,
     _run_git_fetch,
+    _git_head,
     _pull_target_revision,
     _git_reattach_if_safely_detached,
     _run_uv_sync,
     _run_uv_pip_install_editable,
+    _run_sync_preflight,
+    _run_update_continuation,
     _GitFailedError,
 )
 from kestrel_sovereign.cli_stop import cmd_stop  # noqa: E402

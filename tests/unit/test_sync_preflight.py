@@ -1,0 +1,310 @@
+"""``feature sync --preflight``: what a sync would certainly refuse, before it runs (#3702).
+
+``kestrel update`` ran ``uv sync`` (which prunes every package its lock does
+not name) and then learned from ``feature sync`` that the host manifest pinned
+``arize-phoenix==17.7.0`` and ``pydantic-ai-slim==1.107.1`` while the incoming
+lock pinned 20.23.0 and 2.57.0. Every restore is held to the lock's line AND
+the manifest's window, so none could succeed, and the host was left without
+its features. The contradiction is in the two declarations, so it is decided
+here from them alone, before anything is installed, and the update refuses on
+it. Driven against the shared fake venv so the preflight's verdict can be
+checked against what the guarded sync actually does.
+"""
+
+from __future__ import annotations
+
+import argparse
+import types
+
+import pytest
+
+from kestrel_sovereign import cli, cli_lifecycle, paths
+from kestrel_sovereign import feature_reconcile as fr
+from kestrel_sovereign.cli_features import run_sync_preflight, sync_preflight
+from tests.utils.fake_uv import CORE, SDK, FakeUv, use_fake_uv
+
+
+def _lock_text(**pins) -> str:
+    """A lock that pins core, its SDK, and each ``name=version`` in *pins*."""
+    text = (
+        "version = 1\nrevision = 3\n"
+        f'\n[[package]]\nname = "{CORE}"\nversion = "0.52.0"\nsource = {{ editable = "." }}\n'
+        f'\n[[package]]\nname = "{SDK}"\nversion = "0.36.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    for name, version in pins.items():
+        text += (
+            f'\n[[package]]\nname = "{name.replace("_", "-")}"\nversion = "{version}"\n'
+            'source = { registry = "https://pypi.org/simple" }\n'
+        )
+    return text
+
+
+def _checkout(tmp_path, lock, name="kestrel-sovereign") -> str:
+    checkout = tmp_path / name
+    checkout.mkdir()
+    if lock is not None:
+        (checkout / "uv.lock").write_text(lock, encoding="utf-8")
+    return str(checkout)
+
+
+def _manifest(tmp_path, body: str):
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text(body, encoding="utf-8")
+    return manifest
+
+
+def _index(manifest):
+    return fr.build_source_index(cli._load_host_manifest(manifest), {})
+
+
+@pytest.fixture(autouse=True)
+def _own_project_home(monkeypatch, tmp_path):
+    monkeypatch.setenv(paths.HOME_ENV, str(tmp_path))
+    launch = tmp_path.parent / f"{tmp_path.name}-launch"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    monkeypatch.setattr("kestrel_sovereign.feature_registry.load_registry", lambda: {})
+
+
+@pytest.fixture
+def venv(monkeypatch, tmp_path):
+    """Editable core on a checkout whose lock pins phoenix 20.23.0 and slim 2.57.0.
+
+    Phoenix is the one package the double installs, published at both versions
+    and accepting this core, so the only thing that can fail its install is the
+    contradiction under test.
+    """
+    venv = FakeUv(
+        core_checkout=_checkout(
+            tmp_path,
+            _lock_text(**{"arize-phoenix": "20.23.0", "pydantic-ai-slim": "2.57.0"}),
+        ),
+        feature="arize-phoenix",
+        feature_version="20.23.0",
+        feature_requires=">=0.52",
+    )
+    venv.package_index["arize-phoenix"] = ["17.7.0", "20.23.0"]
+    use_fake_uv(monkeypatch, venv)
+    return venv
+
+
+PHOENIX_STALE = '[[feature]]\nname = "arize-phoenix"\npypi = "==17.7.0"\n'
+
+
+# The host manifest as it stood on 2026-10-19.
+STALE = (
+    '[[feature]]\nname = "arize-phoenix"\npypi = "==17.7.0"\n'
+    '[[feature]]\nname = "pydantic-ai-slim[anthropic,mcp]"\npypi = "==1.107.1"\n'
+)
+
+
+def test_a_window_that_excludes_the_locked_version_is_a_conflict(venv, tmp_path):
+    result = sync_preflight(_index(_manifest(tmp_path, STALE)))
+
+    assert result.refuses
+    assert [(c.package, c.window, c.locked) for c in result.conflicts] == [
+        ("arize-phoenix", "==17.7.0", "20.23.0"),
+        # Named without its inline extras, as the lock names it.
+        ("pydantic-ai-slim", "==1.107.1", "2.57.0"),
+    ]
+
+
+def test_the_guarded_sync_refuses_exactly_what_the_preflight_names(
+    venv, tmp_path, capsys,
+):
+    """Not a second opinion: the sync it predicts fails on the same entry, and
+    for the reason it names (the window and the lock's line together)."""
+    manifest = _manifest(tmp_path, PHOENIX_STALE)
+    sync = types.SimpleNamespace(
+        manifest=str(manifest), capture=False, dry_run=False, allow_dirty=False,
+    )
+
+    assert run_sync_preflight(manifest) == 1
+    capsys.readouterr()
+    assert cli.cmd_feature_sync(sync) != 0
+
+    out = capsys.readouterr().out
+    assert "arize-phoenix==17.7.0 and arize-phoenix===20.23.0" in out
+    assert "arize-phoenix" not in venv.installed
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[[feature]]\nname = "arize-phoenix"\npypi = ""\n',
+        '[[feature]]\nname = "arize-phoenix"\npypi = ">=20.23,<21"\n',
+        '[[feature]]\nname = "arize-phoenix"\n',
+    ],
+    ids=["any-version", "window-contains-it", "legacy-no-source"],
+)
+def test_a_window_that_contains_the_locked_version_passes(venv, tmp_path, body):
+    result = sync_preflight(_index(_manifest(tmp_path, body)))
+
+    assert not result.refuses
+    assert result.lock_path is not None
+
+
+def test_the_sync_installs_what_the_preflight_passes(venv, tmp_path):
+    manifest = _manifest(tmp_path, '[[feature]]\nname = "arize-phoenix"\npypi = ""\n')
+    sync = types.SimpleNamespace(
+        manifest=str(manifest), capture=False, dry_run=False, allow_dirty=False,
+    )
+
+    assert run_sync_preflight(manifest) == 0
+    assert cli.cmd_feature_sync(sync) == 0
+    assert venv.installed["arize-phoenix"] == "20.23.0"
+
+
+def test_a_package_the_lock_does_not_pin_has_nothing_to_contradict(venv, tmp_path):
+    result = sync_preflight(_index(_manifest(
+        tmp_path, '[[feature]]\nname = "kestrel-feature-voice"\npypi = "==0.1.0"\n',
+    )))
+
+    assert not result.refuses
+    assert result.compared == 0
+
+
+def test_a_locked_pre_release_is_inside_a_window_that_admits_it(monkeypatch, tmp_path):
+    use_fake_uv(monkeypatch, FakeUv(
+        core_checkout=_checkout(tmp_path, _lock_text(**{"arize-phoenix": "21.0.0rc1"})),
+    ))
+
+    result = sync_preflight(_index(_manifest(
+        tmp_path, '[[feature]]\nname = "arize-phoenix"\npypi = ">=20.23"\n',
+    )))
+
+    assert not result.refuses
+    assert result.compared == 1
+
+
+def test_an_entry_held_on_its_checkout_is_not_a_window(venv, tmp_path):
+    phoenix = tmp_path / "phoenix-checkout"
+    phoenix.mkdir()
+    result = sync_preflight(_index(_manifest(
+        tmp_path, f'[[feature]]\nname = "arize-phoenix"\neditable = "{phoenix}"\n',
+    )))
+
+    assert not result.refuses
+
+
+def test_a_lock_that_cannot_hold_the_sync_refuses(monkeypatch, tmp_path):
+    use_fake_uv(monkeypatch, FakeUv(
+        core_checkout=_checkout(tmp_path, "this is not a lock [[["),
+    ))
+
+    result = sync_preflight(_index(_manifest(
+        tmp_path, '[[feature]]\nname = "arize-phoenix"\npypi = ""\n',
+    )))
+
+    assert result.refuses
+    assert result.error
+
+
+def test_core_declared_from_the_index_brings_no_lock(venv, tmp_path):
+    result = sync_preflight(_index(_manifest(
+        tmp_path, f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52"\n' + STALE,
+    )))
+
+    assert not result.refuses
+
+
+def test_core_declared_on_another_checkout_is_held_to_that_checkouts_lock(
+    venv, tmp_path,
+):
+    other = _checkout(
+        tmp_path, _lock_text(**{"arize-phoenix": "17.7.0"}), name="other-core",
+    )
+    result = sync_preflight(_index(_manifest(
+        tmp_path,
+        f'[[feature]]\nname = "{CORE}"\neditable = "{other}"\n'
+        '[[feature]]\nname = "arize-phoenix"\npypi = "==17.7.0"\n',
+    )))
+
+    assert not result.refuses
+    assert str(result.lock_path).startswith(other)
+
+
+def test_the_cli_names_each_conflict_and_the_fix(venv, tmp_path, capsys):
+    manifest = _manifest(tmp_path, STALE)
+
+    rc = cli.cmd_feature_sync(argparse.Namespace(
+        manifest=str(manifest), capture=False, dry_run=False, allow_dirty=False,
+        preflight=True,
+    ))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "arize-phoenix: the manifest declares arize-phoenix==17.7.0, the lock pins 20.23.0" in err
+    assert 'pypi = ""' in err
+    assert "arize-phoenix" not in venv.installed
+
+
+def test_a_manifest_that_will_not_read_refuses(tmp_path, capsys):
+    assert run_sync_preflight(_manifest(tmp_path, "[[feature]]\npypi = 3\n")) == 1
+    assert "would not read" in capsys.readouterr().err
+
+
+# --- kestrel update refuses before the install prunes ------------------------
+
+
+@pytest.fixture
+def update(venv, tmp_path, monkeypatch):
+    """``kestrel update`` on the fake venv, recording the steps that change it."""
+    checkout = tmp_path / "kestrel-sovereign"
+    (checkout / ".git").mkdir()
+    steps = []
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: checkout)
+    monkeypatch.setattr(cli, "_run_uv_sync", lambda _: steps.append("uv sync") or (0, ""))
+    monkeypatch.setattr(
+        cli, "cmd_feature_sync", lambda args: steps.append("feature sync") or 0,
+    )
+    monkeypatch.setattr(
+        cli_lifecycle, "_run_feature_reconcile", lambda *a, **kw: 0,
+    )
+    monkeypatch.setattr(cli_lifecycle, "_report_core_lock", lambda: None)
+    monkeypatch.setattr(cli, "cmd_restart", lambda args: steps.append("restart") or 0)
+    return steps
+
+
+def _update(*flags):
+    return cli.cmd_update(cli.build_parser().parse_args(["update", "--no-pull", *flags]))
+
+
+def test_update_refuses_a_contradicted_manifest_before_installing(
+    update, tmp_path, capsys,
+):
+    _manifest(tmp_path, STALE)
+
+    assert _update() == 1
+
+    assert update == []
+    err = capsys.readouterr().err
+    assert "preflight: REFUSED" in err
+    assert "arize-phoenix==17.7.0" in err
+
+
+def test_update_with_continue_on_error_installs_anyway(update, tmp_path, capsys):
+    _manifest(tmp_path, STALE)
+
+    assert _update("--continue-on-error") == 0
+
+    assert update == ["uv sync", "feature sync", "restart"]
+    assert "continuing (--continue-on-error)" in capsys.readouterr().err
+
+
+def test_update_installs_when_the_manifest_agrees(update, tmp_path):
+    _manifest(tmp_path, '[[feature]]\nname = "arize-phoenix"\npypi = ""\n')
+
+    assert _update() == 0
+
+    assert update == ["uv sync", "feature sync", "restart"]
+
+
+def test_update_without_features_has_no_sync_to_predict(update, tmp_path):
+    _manifest(tmp_path, STALE)
+
+    assert _update("--no-features") == 0
+
+    assert update == ["uv sync", "restart"]

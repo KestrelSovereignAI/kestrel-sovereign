@@ -2870,6 +2870,173 @@ class CoreInstallGuard:
         return CORE_UNRESOLVED if outcome.unresolved else CORE_UNSAFE
 
 
+@dataclass(frozen=True)
+class WindowConflict:
+    """A manifest window that excludes the version core's lock pins (#3702)."""
+
+    package: str
+    window: str
+    locked: str
+
+    def describe(self) -> str:
+        return (
+            f"{self.package}: the manifest declares {self.package}{self.window}, "
+            f"the lock pins {self.locked}"
+        )
+
+
+@dataclass(frozen=True)
+class SyncPreflight:
+    """What a ``feature sync`` would certainly refuse, read before it runs (#3702).
+
+    Decided from the host manifest and core's ``uv.lock`` alone, so it can be
+    asked before ``uv sync`` prunes the packages the sync restores. Two answers
+    are certain, because every guarded install carries both lines the
+    contradiction is between (:attr:`CoreInstallGuard.install_constraints`):
+
+    * :attr:`conflicts` — a manifest window that excludes the version the lock
+      pins. Each install is held to ``name===<locked>`` and to the window, and
+      no version satisfies both.
+    * :attr:`error` — the lock cannot hold an install at all (it will not read,
+      or names no single version of a package here), which every guarded
+      install refuses without running (:meth:`CoreInstallGuard.run`).
+
+    What only a resolver can see, such as a feature whose own requirements
+    exclude a locked version, is not here: the sync still reports that.
+    """
+
+    lock_path: Optional[Path] = None
+    conflicts: tuple = ()
+    error: Optional[str] = None
+    #: Manifest windows compared against a locked version.
+    compared: int = 0
+
+    @property
+    def refuses(self) -> bool:
+        return bool(self.conflicts) or self.error is not None
+
+    def report_lines(self) -> list:
+        if self.error is not None:
+            return [f"core's uv.lock cannot hold the sync: {self.error}"]
+        return [conflict.describe() for conflict in self.conflicts]
+
+
+def _manifest_dist_name(package: str) -> str:
+    """*package* without extras: a manifest name may carry them inline."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    try:
+        return canonical_package(Requirement(package).name)
+    except InvalidRequirement:
+        return canonical_package(package)
+
+
+def sync_preflight(source_index) -> SyncPreflight:
+    """Check *source_index* against the lock a sync of it will be held to (#3702).
+
+    The lock is the one the sync's installs keep: beside the checkout the
+    manifest declares for core, none when it declares core from the index
+    (an index wheel ships no lock), and otherwise the one beside the core
+    installed now (:meth:`CoreInstallGuard.install_core` and
+    :meth:`CoreInstallGuard.refresh`). Installs nothing.
+    """
+    from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.core_lock import load_core_lock
+
+    guard = CoreInstallGuard.snapshot(source_index)
+    core = source_index.get(fr.CORE_DISTRIBUTION)
+    if core is not None and core.editable:
+        lock, error, _ = guard._bind_lock(
+            lambda: load_core_lock(Path(core.editable).expanduser())
+        )
+    elif core is not None and core.pypi is not None:
+        return SyncPreflight()
+    else:
+        lock, error = guard._lock, guard._lock_error
+    if error is not None:
+        return SyncPreflight(error=error)
+    if lock is None:
+        return SyncPreflight()
+
+    pinned = lock.versions()
+    conflicts = []
+    compared = 0
+    for package, entry in source_index.items():
+        name = _manifest_dist_name(package)
+        # An editable entry is held on its checkout, not to a locked version,
+        # and a declared-but-empty window is "any version": neither can
+        # contradict the lock.
+        if name == fr.CORE_DISTRIBUTION or entry.editable or not entry.pypi:
+            continue
+        if name not in pinned:
+            continue
+        compared += 1
+        if not _version_satisfies(pinned[name], entry.pypi):
+            conflicts.append(
+                WindowConflict(package=name, window=entry.pypi, locked=pinned[name])
+            )
+    return SyncPreflight(
+        lock_path=lock.path, conflicts=tuple(conflicts), compared=compared,
+    )
+
+
+def report_sync_preflight(result: SyncPreflight, manifest: Path, *, stream=None) -> None:
+    """Print *result*: one line when the manifest agrees, every conflict when not."""
+    stream = stream or sys.stdout
+    where = f" ({result.lock_path})" if result.lock_path else ""
+    if not result.refuses:
+        print(
+            f"• preflight: the host manifest agrees with core's uv.lock{where}; "
+            f"{result.compared} declared window(s) contain their locked version",
+            file=stream,
+        )
+        return
+    print(
+        f"• preflight: the host manifest {manifest} contradicts core's "
+        f"uv.lock{where}. `feature sync` would refuse every install held to it:",
+        file=stream,
+    )
+    for line in result.report_lines():
+        print(f"    {line}", file=stream)
+    if result.conflicts:
+        print(
+            "    The lock decides these versions. Declare each entry "
+            "`pypi = \"\"` (any version, so the lock's), or a window that "
+            "contains the locked version.",
+            file=stream,
+        )
+
+
+def run_sync_preflight(path: Path) -> int:
+    """``kestrel feature sync --preflight`` for the manifest at *path* (#3702).
+
+    0 when a sync of it can be held to core's lock; 1, with every reason
+    printed, when the sync would certainly refuse: a window the lock
+    contradicts, a lock that cannot hold it, or a manifest that will not read.
+    Installs nothing.
+    """
+    from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.feature_registry import load_registry
+
+    try:
+        entries = _load_host_manifest(path)
+    except (ValueError, OSError) as exc:
+        print(
+            f"• preflight: the host manifest {path} would not read ({exc}), so "
+            "`feature sync` would refuse it",
+            file=sys.stderr,
+        )
+        return 1
+    if not entries:
+        print(f"• preflight: {path} declares no features; nothing to check")
+        return 0
+    result = sync_preflight(fr.build_source_index(entries, load_registry()))
+    report_sync_preflight(
+        result, path, stream=sys.stderr if result.refuses else sys.stdout,
+    )
+    return 1 if result.refuses else 0
+
+
 def _capture_host_manifest(path: Path) -> int:
     """Snapshot currently-installed extension packages into a manifest.
 
@@ -3054,6 +3221,9 @@ def cmd_feature_sync(args) -> int:
         print("Create one from your current install with:")
         print("  kestrel feature sync --capture")
         return 1
+
+    if getattr(args, "preflight", False):
+        return run_sync_preflight(path)
 
     try:
         entries = _load_host_manifest(path)
@@ -3841,6 +4011,15 @@ def add_feature_subparser(subparsers) -> None:
         "--dry-run",
         action="store_true",
         help="Show what would be installed/restored without changing anything",
+    )
+    feat_sync.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Install nothing; exit non-zero when the manifest contradicts "
+            "core's uv.lock (a window excluding a locked version), which the "
+            "sync would refuse. `kestrel update` runs this before `uv sync`"
+        ),
     )
     feat_sync.add_argument(
         "--allow-dirty",

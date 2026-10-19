@@ -1,0 +1,277 @@
+"""``kestrel update`` continues in a fresh interpreter after it pulls or installs (#3702).
+
+On 2026-10-19 a host's update ran ``uv sync`` and then ``feature sync`` in the
+same process. The sync had removed ``importlib_metadata``, which that process
+had already imported and whose finder stdlib ``importlib.metadata`` still
+dispatched to, so the sync died on its first version lookup with every feature
+package pruned. Pinned here: after a pull that moved ``HEAD``, and after the
+install, nothing more runs in the process that imported the replaced code; the
+continuation is the same update minus the steps already done, and its exit
+status is the update's.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shlex
+import subprocess
+import sys
+
+import pytest
+
+from kestrel_sovereign import cli, cli_lifecycle
+
+
+@pytest.fixture
+def checkout(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_project_dir_is_git", lambda _: True)
+    monkeypatch.setattr(cli, "_git_working_tree_dirty", lambda _: (False, ""))
+    return tmp_path
+
+
+@pytest.fixture
+def steps(checkout, monkeypatch):
+    """Record every step the PARENT runs, and the continuation it hands off to."""
+    calls = []
+    manifest = checkout / ".kestrel-host-features.toml"
+    manifest.write_text("")
+    monkeypatch.setattr(cli, "_host_manifest_path", lambda args: manifest)
+    monkeypatch.setattr(
+        cli, "_run_git_pull", lambda _: calls.append("pull") or (0, "")
+    )
+    monkeypatch.setattr(
+        cli, "_run_sync_preflight", lambda _: calls.append("preflight") or 0
+    )
+    monkeypatch.setattr(
+        cli, "_run_uv_sync", lambda _: calls.append("uv sync") or (0, "")
+    )
+    monkeypatch.setattr(
+        cli, "cmd_feature_sync", lambda args: calls.append("feature sync") or 0
+    )
+    monkeypatch.setattr(
+        cli_lifecycle, "_run_feature_reconcile",
+        lambda *a, **kw: calls.append("reconcile") or 0,
+    )
+    monkeypatch.setattr(cli_lifecycle, "_report_core_lock", lambda: None)
+    monkeypatch.setattr(
+        cli, "cmd_restart", lambda args: calls.append("restart") or 0
+    )
+    return calls
+
+
+def _heads(monkeypatch, *heads):
+    """``_git_head`` answers *heads* in order: before the pull, then after."""
+    answers = iter(heads)
+    monkeypatch.setattr(cli, "_git_head", lambda _: next(answers))
+
+
+def _record_continuation(monkeypatch, calls, rc=0):
+    seen = []
+
+    def continuation(argv):
+        calls.append("continue")
+        seen.append(argv)
+        return rc
+
+    monkeypatch.setattr(cli, "_run_update_continuation", continuation)
+    return seen
+
+
+def _parse(argv):
+    return cli.build_parser().parse_args(argv)
+
+
+def _update(*argv):
+    return cli.cmd_update(_parse(["update", *argv]))
+
+
+def test_after_the_install_nothing_more_runs_in_this_process(steps, monkeypatch):
+    _heads(monkeypatch, "a", "a")
+    seen = _record_continuation(monkeypatch, steps, rc=0)
+
+    assert _update() == 0
+
+    assert steps == ["pull", "preflight", "uv sync", "continue"]
+    (argv,) = seen
+    assert argv[-3:] == ["--no-pull", "--no-install", "--package-changed"]
+    continued = _parse(argv)
+    assert (continued.pull, continued.install) == (False, False)
+    assert continued.features and continued.restart and continued.package_changed
+
+
+def test_a_pull_that_moved_head_hands_off_before_installing(steps, monkeypatch):
+    _heads(monkeypatch, "a", "b")
+    seen = _record_continuation(monkeypatch, steps)
+
+    assert _update() == 0
+
+    assert steps == ["pull", "continue"]
+    continued = _parse(seen[0])
+    assert continued.pull is False
+    assert continued.install is True
+    assert continued.package_changed is True
+
+
+def test_a_head_git_cannot_name_counts_as_moved(steps, monkeypatch):
+    _heads(monkeypatch, None, None)
+    _record_continuation(monkeypatch, steps)
+
+    assert _update() == 0
+
+    assert steps == ["pull", "continue"]
+
+
+def test_the_continuation_exit_status_is_the_update_exit_status(steps, monkeypatch):
+    _heads(monkeypatch, "a", "a")
+    _record_continuation(monkeypatch, steps, rc=7)
+
+    assert _update() == 7
+
+
+def test_without_a_pull_or_install_nothing_hands_off(steps, monkeypatch):
+    _record_continuation(monkeypatch, steps)
+
+    assert _update("--no-pull", "--no-install") == 0
+
+    assert steps == ["feature sync", "reconcile", "restart"]
+
+
+def test_a_dry_run_never_hands_off(steps, monkeypatch):
+    _record_continuation(monkeypatch, steps)
+
+    assert _update("--dry-run") == 0
+
+    assert "continue" not in steps
+
+
+def test_the_phases_run_every_step_once_in_order(steps, monkeypatch):
+    """End to end through the real parser, with the continuation re-entered here."""
+    _heads(monkeypatch, "a", "b")
+
+    assert _update("--allow-dirty", "--startup-timeout", "75.5") == 0
+
+    assert steps == [
+        "pull", "preflight", "uv sync", "feature sync", "reconcile", "restart",
+    ]
+
+
+def test_a_continuation_still_judges_every_agent(steps, monkeypatch, checkout):
+    """With ``--no-features`` the last phase changes nothing itself, but the
+    phases before it did: the restart must still check every agent."""
+    _heads(monkeypatch, "a", "a")
+    restarts = []
+    monkeypatch.setattr(cli, "cmd_restart", lambda args: restarts.append(args) or 0)
+
+    assert _update("Kite", "--no-features") == 0
+
+    (restart,) = restarts
+    assert restart.name == "Kite"
+    assert restart.constitution_check_all_agents is True
+
+
+# --- the argv the continuation is handed -----------------------------------
+
+
+def _update_parser():
+    subparsers = argparse.ArgumentParser().add_subparsers()
+    cli_lifecycle.add_lifecycle_subparsers(subparsers)
+    return subparsers.choices["update"]
+
+
+def _non_default_argvs():
+    """One argv per way each update action can differ from its default.
+
+    Generated from the parser, so a flag added later is covered without
+    editing this list, and :func:`cli_lifecycle._update_argv` must render it.
+    """
+    for action in _update_parser()._actions:
+        if isinstance(action, argparse._HelpAction):
+            continue
+        if not action.option_strings:
+            yield ["Kite"]
+        elif isinstance(action, argparse.BooleanOptionalAction):
+            yield [action.option_strings[0]]
+            yield [action.option_strings[1]]
+        elif isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+            yield [action.option_strings[0]]
+        else:
+            yield [action.option_strings[0], "12.5"]
+
+
+@pytest.mark.parametrize("flags", list(_non_default_argvs()), ids=shlex.join)
+def test_every_update_flag_reaches_the_continuation(flags):
+    parsed = _parse(["update", *flags])
+
+    assert _parse(cli_lifecycle._update_argv(parsed)) == parsed
+
+
+def test_flags_combine_in_the_continuation():
+    parsed = _parse([
+        "update", "Kite", "--no-pull", "--prefer-pypi", "--no-uv-sync",
+        "--continue-on-error", "--manifest", "/m.toml", "--force",
+        "--allow-constitution-safe-mode", "--startup-timeout", "9",
+    ])
+
+    assert _parse(cli_lifecycle._update_argv(parsed)) == parsed
+
+
+def test_an_action_it_cannot_render_is_refused_not_dropped(monkeypatch):
+    real = cli_lifecycle.add_lifecycle_subparsers
+
+    def with_an_append_flag(subparsers):
+        real(subparsers)
+        subparsers.choices["update"].add_argument("--tag", action="append")
+
+    monkeypatch.setattr(cli_lifecycle, "add_lifecycle_subparsers", with_an_append_flag)
+
+    with pytest.raises(TypeError, match="--tag"):
+        cli_lifecycle._update_argv(argparse.Namespace(tag=["x"]))
+
+
+# --- the spawn itself --------------------------------------------------------
+
+
+def test_the_continuation_is_this_venvs_kestrel_with_inherited_stdio(monkeypatch):
+    """The real spawn, minus ``update``: ``--version`` exits before any step."""
+    monkeypatch.setattr(
+        cli, "_run_update_continuation", cli_lifecycle._run_update_continuation,
+    )
+    runs = []
+    real_run = subprocess.run
+
+    def recording_run(command, **kwargs):
+        runs.append((command, kwargs))
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(cli_lifecycle.subprocess, "run", recording_run)
+
+    assert cli._run_update_continuation(["--version"]) == 0
+
+    ((command, kwargs),) = runs
+    assert command == [sys.executable, "-m", "kestrel_sovereign.cli", "--version"]
+    # No capture, env, or cwd override: the child writes to the operator's
+    # terminal and resolves the project exactly as this process did.
+    assert set(kwargs) == {"check"}
+
+
+def test_a_child_killed_by_a_signal_exits_as_a_shell_would(monkeypatch):
+    monkeypatch.setattr(
+        cli_lifecycle.subprocess, "run",
+        lambda command, **kw: subprocess.CompletedProcess(command, -15),
+    )
+
+    assert cli_lifecycle._run_update_continuation(["update"]) == 143
+
+
+def test_an_interpreter_that_will_not_start_says_how_to_finish(monkeypatch, capsys):
+    def refuse(command, **kw):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(cli_lifecycle.subprocess, "run", refuse)
+
+    assert cli_lifecycle._run_update_continuation(["update", "--no-pull"]) == 1
+    assert "kestrel update --no-pull" in capsys.readouterr().err

@@ -54,6 +54,34 @@ def test_feature_sync_step_added_when_manifest_present(tmp_path):
     assert str(manifest.resolve()) in fs.argv
 
 
+def test_the_manifest_is_checked_against_the_landed_lock_before_the_prune(tmp_path):
+    """#3702: ``uv sync`` prunes what ``feature sync`` restores, so a manifest
+    window the landed lock contradicts must stop the update before the sync,
+    as it does ``kestrel update``, not leave the host without its features."""
+    import sys
+
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+
+    steps = PROFILE.build_steps(
+        repo_path="/repo", target_ref="main", allow_migrations=False
+    )
+    names = _step_names(steps)
+
+    assert names.index("reattach_branch") < names.index("feature_preflight")
+    assert names.index("feature_preflight") < names.index("install")
+    preflight = next(s for s in steps if s.name == "feature_preflight")
+    # A fresh interpreter, so it is the landed code that judges the landed lock.
+    assert preflight.argv == [
+        sys.executable, "-m", "kestrel_sovereign.cli", "feature", "sync",
+        "--manifest", str(manifest), "--preflight",
+    ]
+    assert preflight.cwd == "/repo"
+    # Fatal on failure: a refusal must stop the update before the install.
+    assert preflight.read_only is False
+    assert preflight.allow_failure is False
+
+
 def test_a_linked_manifest_is_passed_as_the_project_directorys_path(tmp_path):
     """Not the link's target: a relative ``editable`` is relative to the
     manifest's directory, so the step must name the manifest where every other

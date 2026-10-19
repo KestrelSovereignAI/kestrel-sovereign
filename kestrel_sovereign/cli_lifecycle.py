@@ -978,6 +978,21 @@ def _run_git_pull(project_dir: Path) -> Tuple[int, str]:
     return result.returncode, out
 
 
+def _git_head(project_dir: Path) -> Optional[str]:
+    """The commit ``HEAD`` names in ``project_dir``, or None when git cannot say."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def _git_reattach_if_safely_detached(project_dir: Path) -> Optional[str]:
     """Reattach a detached-HEAD checkout to its default branch, but ONLY when
     doing so loses no commits. Returns the branch name if it reattached, else
@@ -1574,6 +1589,101 @@ def _report_core_lock() -> None:
         print(f"    {line}", file=sys.stderr)
 
 
+def _run_sync_preflight(manifest: Path) -> int:
+    """``kestrel feature sync --preflight`` on *manifest*: 0 when the sync can be held."""
+    from kestrel_sovereign.cli_features import run_sync_preflight
+
+    return run_sync_preflight(manifest)
+
+
+def _update_argv(args) -> list:
+    """The ``kestrel update`` argv that parses back to *args*.
+
+    Built from the update parser's own actions, so every flag it accepts is
+    forwarded, including any added after this was written. An action of a kind
+    this cannot render raises rather than being dropped: a continuation that
+    silently lost ``--allow-constitution-safe-mode`` or ``--manifest`` would run
+    a different update from the one the operator asked for.
+    """
+    subparsers = argparse.ArgumentParser().add_subparsers()
+    add_lifecycle_subparsers(subparsers)
+    options, positionals = [], []
+    for action in subparsers.choices["update"]._actions:
+        if isinstance(action, argparse._HelpAction):
+            continue
+        value = getattr(args, action.dest, action.default)
+        if not action.option_strings:
+            if value is not None:
+                positionals.append(str(value))
+        elif isinstance(action, argparse.BooleanOptionalAction):
+            if value is not None:
+                options.append(action.option_strings[0 if value else 1])
+        elif isinstance(action, argparse._StoreTrueAction):
+            if value:
+                options.append(action.option_strings[0])
+        elif isinstance(action, argparse._StoreFalseAction):
+            if not value:
+                options.append(action.option_strings[0])
+        elif type(action) is argparse._StoreAction and action.nargs is None:
+            if value is not None and value != action.default:
+                options += [action.option_strings[0], str(value)]
+        else:
+            raise TypeError(
+                f"`kestrel update` cannot forward {action.option_strings} "
+                f"({type(action).__name__}) to a fresh interpreter"
+            )
+    return ["update", *options, *positionals]
+
+
+def _run_update_continuation(argv: list) -> int:
+    """Run ``kestrel <argv>`` in a fresh interpreter of this venv; its exit status.
+
+    Inherits this process's stdio, environment and working directory, so the
+    operator sees one continuous update and the child resolves the project the
+    same way this process did.
+    """
+    command = [sys.executable, "-m", "kestrel_sovereign.cli", *argv]
+    try:
+        result = subprocess.run(command, check=False)
+    except OSError as exc:
+        print(
+            f"• continue: FAILED — could not start {sys.executable} ({exc}). "
+            f"Finish with `kestrel {' '.join(argv)}`.",
+            file=sys.stderr,
+        )
+        return 1
+    # A child killed by a signal reports -N; exit as a shell would.
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+def _continue_update_in_fresh_interpreter(args, *, after: str) -> int:
+    """Hand the rest of this update to an interpreter that loads what is on disk (#3702).
+
+    A process keeps every module it has imported after ``git pull`` or
+    ``uv sync`` replaces it on disk. Run on in this one, the remaining steps
+    mix pre-pull ``kestrel_sovereign`` modules with post-pull ones imported
+    lazily, and call into third-party modules whose files the sync deleted:
+    on 2026-10-19 the sync removed ``importlib_metadata``, which this process
+    had imported and whose finder stdlib ``importlib.metadata`` still
+    dispatched to, and ``feature sync`` died before restoring the packages the
+    sync had pruned. The continuation skips the steps already done and is told
+    the package changed, so it judges every agent as this process would have.
+    """
+    skips = ["--no-pull"] if after == "pull" else ["--no-pull", "--no-install"]
+    argv = [*_update_argv(args), *skips, "--package-changed"]
+    print(
+        f"• continue: the {after} replaced code this process loaded; the "
+        "remaining steps run in a fresh interpreter"
+    )
+    print(f"    kestrel {' '.join(argv)}")
+    print()
+    # The child writes to the same descriptors; flush so nothing printed here
+    # appears after its output when stdout is a pipe.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    return cli._run_update_continuation(argv)
+
+
 def cmd_update(args) -> int:
     """One-shot ``git pull`` + ``uv pip install -e .`` +
     ``kestrel feature sync`` + ``kestrel restart``.
@@ -1605,6 +1715,15 @@ def cmd_update(args) -> int:
         the restart (not on ``--dry-run``) the venv is compared against it.
         Every mismatch is printed; nothing is repaired and the exit status
         does not change.
+      - Before the install, when features will sync, a host manifest window
+        that excludes the version the lock pins refuses the update: the sync
+        would refuse every install held to both, after ``uv sync`` had pruned
+        the packages it restores (#3702). ``--continue-on-error`` warns
+        instead, as it does for the sync failure this predicts.
+      - A pull that moved ``HEAD``, and the install, each hand the remaining
+        steps to a fresh interpreter (``--no-pull`` / ``--no-install`` plus
+        ``--package-changed``), so they run the code and packages now on
+        disk rather than the ones this process imported (#3702).
     """
     from kestrel_sovereign.cli_features import core_state_refusal
 
@@ -1624,6 +1743,10 @@ def cmd_update(args) -> int:
     no_deps = bool(getattr(args, "no_deps", False))
     continue_on_error = bool(getattr(args, "continue_on_error", False))
     allow_safe_mode = bool(getattr(args, "allow_constitution_safe_mode", False))
+    # Set on a continuation (#3702): an earlier phase of this update already
+    # pulled or installed, so the package changed even though this phase skips
+    # those steps.
+    package_changed = bool(getattr(args, "package_changed", False))
     # --prefer-source / --prefer-pypi bulk-override the per-feature reconcile
     # update mode (issue #1788). Mutually exclusive at the parser level.
     prefer = None
@@ -1670,7 +1793,7 @@ def cmd_update(args) -> int:
         and source_checkout is not None
         and cli._project_dir_is_git(source_checkout)
     )
-    package_changing = pull or install or features
+    package_changing = package_changed or pull or install or features
     judged = None if package_changing or not target else [target]
     incoming = (
         _incoming_content(source_checkout, fetch=not dry_run)
@@ -1739,6 +1862,7 @@ def cmd_update(args) -> int:
                 )
             else:
                 print(f"• pull: git pull --ff-only ({source_checkout})")
+                head_before = cli._git_head(source_checkout)
                 rc, out = cli._run_git_pull(source_checkout)
                 if rc != 0:
                     # A sibling worktree's `gh pr merge --delete-branch` can flip
@@ -1763,8 +1887,49 @@ def cmd_update(args) -> int:
                 if out.strip():
                     for line in out.rstrip().splitlines():
                         print(f"    {line}")
+                # This process imported the code the pull just replaced. A HEAD
+                # git cannot name is treated as moved: a fresh interpreter is
+                # never the wrong place to continue, only a slower one.
+                head_after = cli._git_head(source_checkout)
+                if head_before is None or head_after != head_before:
+                    return _continue_update_in_fresh_interpreter(args, after="pull")
     else:
         print("• pull: skipped (--no-pull)")
+
+    # Step 1.5: preflight (#3702). `uv sync` prunes every package its lock does
+    # not name and `feature sync` restores them, holding each install to the
+    # lock and to the manifest's windows. A window that excludes the locked
+    # version makes every one of those installs unsatisfiable, and finding that
+    # out after the prune leaves the venv without its features. Decided from
+    # the manifest and the incoming lock alone, before anything is installed.
+    if install and features and source_checkout is not None:
+        preflight_manifest = cli._host_manifest_path(
+            argparse.Namespace(manifest=getattr(args, "manifest", None))
+        )
+        if preflight_manifest.exists():
+            if dry_run:
+                print(
+                    "• preflight: would check the host manifest against core's "
+                    "uv.lock before installing"
+                )
+            else:
+                rc = cli._run_sync_preflight(preflight_manifest)
+                if rc != 0 and not continue_on_error:
+                    print(
+                        "• preflight: REFUSED — nothing was installed or "
+                        "restarted. Fix the entries above in "
+                        f"{preflight_manifest}, then re-run `kestrel update`. "
+                        "(--continue-on-error installs anyway and lets the "
+                        "sync fail them.)",
+                        file=sys.stderr,
+                    )
+                    return rc
+                if rc != 0:
+                    print(
+                        "• preflight: continuing (--continue-on-error); the "
+                        "sync will fail the entries above",
+                        file=sys.stderr,
+                    )
 
     # Step 2: refresh the install from the source checkout.
     #
@@ -1782,6 +1947,7 @@ def cmd_update(args) -> int:
     # explicitly. PyPI installs (no source checkout) skip the step
     # entirely — there's no editable env to refresh.
     explicit_uv_sync = getattr(args, "uv_sync", None)
+    installed = False
     if install:
         if source_checkout is None:
             print(
@@ -1826,6 +1992,7 @@ def cmd_update(args) -> int:
                     ][-3:]
                     for line in tail:
                         print(f"    {line}")
+                    installed = True
             else:
                 cmd_label = (
                     "uv pip install"
@@ -1856,8 +2023,14 @@ def cmd_update(args) -> int:
                     ][-3:]
                     for line in tail:
                         print(f"    {line}")
+                    installed = True
     else:
         print("• install: skipped (--no-install)")
+
+    # The install replaced packages this process imported, and every step
+    # below imports more of them.
+    if installed:
+        return _continue_update_in_fresh_interpreter(args, after="install")
 
     # Step 2.5: kestrel feature sync — restore the host's out-of-tree feature
     # packages that `uv sync` just pruned (anything not in sovereign's lock).
@@ -2261,6 +2434,12 @@ def add_lifecycle_subparsers(subparsers) -> None:
     update_p.add_argument(
         "--force", action="store_true",
         help="Forwarded to `kestrel restart` (force-kill stale processes)",
+    )
+    # Internal: what a pull/install phase passes the fresh interpreter it hands
+    # the rest of the update to (#3702). It only widens what is checked (every
+    # agent is judged, as after a package change), so it is harmless by hand.
+    update_p.add_argument(
+        "--package-changed", action="store_true", help=argparse.SUPPRESS,
     )
     _add_constitution_override_argument(update_p)
     _add_startup_timeout_argument(update_p)
