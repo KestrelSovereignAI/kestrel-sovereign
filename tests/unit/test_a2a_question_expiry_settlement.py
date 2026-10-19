@@ -1005,19 +1005,62 @@ async def test_late_answer_survives_a_crash_before_its_wake_is_enqueued(fleet):
 
 
 @pytest.mark.asyncio
-async def test_crash_while_the_late_wake_is_in_flight_is_relayed_again(fleet):
+@pytest.mark.parametrize("delay_inflight_commit_ack", [False, True])
+async def test_crash_while_the_late_wake_is_in_flight_is_relayed_again(
+    fleet, monkeypatch, delay_inflight_commit_ack,
+):
     """The late wake was enqueued but its turn never finished: the row is not
     confirmed, so the restarted process relays it again. A duplicate is the
     price of never losing it."""
     await _late_answer_after_unreached_expiry(fleet, "q-inflight")
     in_flight = _BlockedHandle()
     fleet.feature.agent.dispatcher.next_handles.append(in_flight)
+    renewed = asyncio.Event()
+    commit_ack_pending = asyncio.Event()
+    release_commit_ack = asyncio.Event()
+    native_renew = fleet.store.renew_claim_lease
+    connection = fleet.db.backend._connection
+    native_commit = connection.commit
+
+    async def observed_commit():
+        await native_commit()
+        if delay_inflight_commit_ack and in_flight.waiting.is_set():
+            # The real native commit happened, but its ACK is still withheld.
+            # Pre-enqueue renewal must not release the crash barrier here.
+            commit_ack_pending.set()
+            await release_commit_ack.wait()
+
+    monkeypatch.setattr(connection, "commit", observed_commit)
+
+    async def observed_renewal(*args, **kwargs):
+        result = await native_renew(*args, **kwargs)
+        if result and in_flight.waiting.is_set():
+            renewed.set()
+        return result
+
+    monkeypatch.setattr(fleet.store, "renew_claim_lease", observed_renewal)
 
     first_pass = asyncio.create_task(fleet.settle())
-    await asyncio.wait_for(in_flight.waiting.wait(), timeout=30)
-    first_pass.cancel()  # the process dies mid-turn
-    with pytest.raises(asyncio.CancelledError):
-        await first_pass
+    try:
+        async with asyncio.timeout(30):
+            await in_flight.waiting.wait()
+            if delay_inflight_commit_ack:
+                await commit_ack_pending.wait()
+                assert not renewed.is_set(), "pre-enqueue renewal released the in-flight barrier"
+                release_commit_ack.set()
+            # Crash during the remote turn, after its actual SQLite renewal
+            # ACK, not during COMMIT (which must retain UNKNOWN if interrupted).
+            await renewed.wait()
+        first_pass.cancel()  # the process dies mid-turn
+        with pytest.raises(asyncio.CancelledError):
+            await first_pass
+    finally:
+        from kestrel_sovereign._async_ownership import await_owned_task
+
+        release_commit_ack.set()
+        if not first_pass.done():
+            first_pass.cancel()
+        await await_owned_task(first_pass)
     row = await fleet.store.get("q-inflight")
     assert row.status == "EXPIRED"
     assert row.receiver_settlement == RECEIVER_SETTLEMENT_LATE_ANSWER

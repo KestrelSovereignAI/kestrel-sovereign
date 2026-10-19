@@ -4603,6 +4603,18 @@
       "type": "Release Note"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.33.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.33",
+      "type": "Release Note"
+    },
+    {
       "existing_code_refs": [
         "scripts/ci/throughput_report.py",
         "tests/unit/test_host_features.py"
