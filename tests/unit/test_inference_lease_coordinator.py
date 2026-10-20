@@ -180,7 +180,7 @@ class _Provider:
         self.acquire_calls += 1
         self.last_request = request
         self.last_quote = quote
-        return _lease(request, quote, state=self.acquire_state)
+        return _lease(request, quote, state=self.acquire_state, updated_at=_now())
 
     async def status(self, owner_id: str, lease_id: str) -> InferenceLease:
         self.events.append("provider.status")
@@ -575,7 +575,7 @@ async def test_restore_ready_reference_refetches_host_only_route():
 
 
 @pytest.mark.asyncio
-async def test_restore_terminal_reference_does_not_repoll_provider():
+async def test_restore_terminal_reference_reconfirms_original_provider_state():
     provider = _Provider("runpod", total="0.20", ready_seconds=10)
     provider.acquire_state = InferenceLeaseState.READY
     first, persisted = _coordinator({"runpod": provider})
@@ -584,6 +584,7 @@ async def test_restore_terminal_reference_does_not_repoll_provider():
     payload = persisted[-1]
     assert payload is not None
     provider.status_calls = 0
+    provider.status_state = InferenceLeaseState.RELEASED
     second, _second_persisted = _coordinator({"runpod": provider})
 
     restored = await second.restore(payload)
@@ -591,7 +592,7 @@ async def test_restore_terminal_reference_does_not_repoll_provider():
     assert restored is not None
     assert restored.state is InferenceLeaseState.RELEASED
     assert restored.lease_id == released.lease_id
-    assert provider.status_calls == 0
+    assert provider.status_calls == 1
 
 
 @pytest.mark.asyncio
