@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import resource
 import signal
 import socket
 from pathlib import Path
@@ -16,8 +17,12 @@ async def probe():
     if os.getuid() == 0:
         raise RuntimeError("browser probe requires a non-root user")
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
-    if int(status["CapEff"].strip(), 16) != 0 or status["NoNewPrivs"].strip() != "1":
+    capabilities = {name: int(status[name].strip(), 16) for name in ("CapEff", "CapBnd", "CapPrm", "CapInh", "CapAmb")}
+    rtprio_limit, groups = resource.getrlimit(resource.RLIMIT_RTPRIO), os.getgroups()
+    if any(capabilities.values()) or status["NoNewPrivs"].strip() != "1":
         raise RuntimeError("browser probe requires no capabilities and no new privileges")
+    if rtprio_limit != (0, 0) or 0 in groups:
+        raise RuntimeError("browser probe requires no realtime priority and no root group")
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True, chromium_sandbox=True, channel="chromium",
@@ -54,7 +59,8 @@ async def probe():
                     raise RuntimeError("offline container unexpectedly reached a network destination")
             return {
                 "uid": os.getuid(), "browser_version": browser.version,
-                "capabilities": 0, "no_new_privileges": True, "sandbox": sandbox,
+                "capabilities": capabilities, "rtprio_limit": list(rtprio_limit), "groups": groups,
+                "no_new_privileges": status["NoNewPrivs"].strip() == "1", "sandbox": sandbox,
                 "fixture_result": result, "refused_destinations": refused,
                 "png_sha256": hashlib.sha256(png).hexdigest(),
                 "png_base64": base64.b64encode(png).decode(),

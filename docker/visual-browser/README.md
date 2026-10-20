@@ -24,7 +24,13 @@ The verified configuration uses a non-root `pwuser`, read-only root filesystem,
 no host mounts or Docker socket, no container capabilities, no privilege gain,
 private process/IPC/UTS/cgroup namespaces, bounded CPU/memory/PIDs and temporary storage,
 no swap, the default runc runtime and the reviewed proc/sys path masks,
-and `network=none`. Chromium must report its PID/network namespace and
+and `network=none`. `host-config.json` is the complete reviewed HostConfig from
+Docker 29.8.2, with local log retention disabled and realtime scheduling denied.
+Its bytes are pinned alongside seccomp; extra, missing or changed daemon fields
+are unsupported until reviewed. The verifier does not accept arbitrary daemon
+defaults. The process independently measures all five Linux capability sets,
+supplementary groups and RLIMIT_RTPRIO; root group and realtime priority fail.
+These profiles preserve LF bytes on Windows checkouts. Chromium must report its PID/network namespace and
 Seccomp-BPF sandboxes active. A synthetic form edit/click must persist its
 result, and public-IP and metadata-address connection attempts must fail.
 This is a real browser/container test; it does not exercise an agent, production

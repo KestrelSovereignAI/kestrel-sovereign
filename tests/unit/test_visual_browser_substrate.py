@@ -10,16 +10,10 @@ from scripts import verify_visual_browser_sandbox as probe
 
 
 def container():
+    host = probe.verified_host_configuration()
+    host["SecurityOpt"] = ["no-new-privileges", "seccomp=" + (probe.CONTEXT / "seccomp.json").read_text()]
     return {"Id": "c" * 64, "Image": "sha256:test", "Mounts": [],
-            "Config": {"Labels": {probe.LABEL: "test"}, "User": "pwuser"},
-            "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "Privileged": False,
-                "CapDrop": ["ALL"], "PidMode": "", "IpcMode": "private", "PublishAllPorts": False,
-                "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=256m,mode=1777"},
-                "MaskedPaths": sorted(probe.MASKED_PATHS), "ReadonlyPaths": sorted(probe.READONLY_PATHS),
-                "UTSMode": "", "UsernsMode": "", "CgroupnsMode": "private", "CgroupParent": "",
-                "Runtime": "runc", "OomKillDisable": False, "Init": True, "MemorySwap": 1024**3,
-                "Memory": 1024**3, "NanoCpus": 2_000_000_000, "PidsLimit": 256, "ShmSize": 256*1024**2,
-                "SecurityOpt": ["no-new-privileges", "seccomp=" + (probe.CONTEXT / "seccomp.json").read_text()]}}
+            "Config": {"Labels": {probe.LABEL: "test"}, "User": "pwuser"}, "HostConfig": host}
 
 
 def test_container_admission_and_command_agree_on_isolation():
@@ -30,6 +24,12 @@ def test_container_admission_and_command_agree_on_isolation():
                         ("--runtime", "runc"), ("--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777"),
                         ("--cpus", "2"), ("--shm-size", "256m"), ("--pids-limit", "256")]:
         assert arguments[arguments.index(name) + 1] == value
+    assert arguments[arguments.index("--name") + 1] == "kestrel-browser-probe-test"
+    assert arguments[arguments.index("--label") + 1] == f"{probe.LABEL}=test"
+    assert arguments[arguments.index("--ulimit") + 1] == "rtprio=0:0"
+    assert arguments[arguments.index("--log-driver") + 1] == "none"
+    assert [arguments[i + 1] for i, value in enumerate(arguments) if value == "--security-opt"] == [
+        "no-new-privileges", f"seccomp={probe.CONTEXT / 'seccomp.json'}"]
     assert "--read-only" in arguments and "--init" in arguments
     assert "--privileged" not in arguments and "--volume" not in arguments and "--publish" not in arguments
 
@@ -40,6 +40,9 @@ def test_container_admission_and_command_agree_on_isolation():
     ("Devices", [{"PathOnHost": "/dev/kvm"}]), ("PidMode", "host"), ("IpcMode", "host"),
     ("PublishAllPorts", True), ("Memory", 0), ("NanoCpus", 0), ("PidsLimit", 0),
     ("Tmpfs", {"/tmp": "rw,exec,mode=1777", "/home/pwuser": "rw,exec"}),
+    ("Ulimits", [{"Name": "rtprio", "Soft": 99, "Hard": 99}]),
+    ("GroupAdd", ["0"]), ("OomScoreAdj", -1000), ("RestartPolicy", {"Name": "always", "MaximumRetryCount": 0}),
+    ("LogConfig", {"Type": "syslog", "Config": {}}), ("Annotations", {"x": "y"}), ("Cgroup", "host"),
     ("MemorySwap", -1), ("Init", False), ("DeviceCgroupRules", ["a *:* rwm"]),
     ("CgroupParent", "other"), ("VolumesFrom", ["other"]), ("MaskedPaths", []), ("ReadonlyPaths", []),
     ("UTSMode", "host"), ("UsernsMode", "host"), ("CgroupnsMode", "host"),
@@ -65,7 +68,8 @@ def test_refuses_wrong_owner_image_and_implicit_image_volumes():
 
 def evidence():
     png = b"\x89PNG\r\n\x1a\nsynthetic"
-    return {"uid": 1001, "capabilities": 0, "no_new_privileges": True,
+    return {"uid": 1001, "capabilities": {name: 0 for name in ("CapEff", "CapBnd", "CapPrm", "CapInh", "CapAmb")},
+            "rtprio_limit": [0, 0], "groups": [100, 1001], "no_new_privileges": True,
             "fixture_result": "Persistent local browser draft", "refused_destinations": ["1.1.1.1", "169.254.169.254"],
             "sandbox": "PID namespaces\tYes\nNetwork namespaces\tYes\nSeccomp-BPF sandbox\tYes",
             "png_base64": base64.b64encode(png).decode(), "png_sha256": hashlib.sha256(png).hexdigest()}
@@ -178,3 +182,27 @@ def test_modified_seccomp_policy_is_rejected_before_docker_build(tmp_path, monke
     with pytest.raises(RuntimeError, match='seccomp policy digest'):
         probe.run(tmp_path / 'evidence', docker='docker')
     assert calls == []
+
+
+@pytest.mark.parametrize('change', [
+    {'rtprio_limit': [99, 99]}, {'groups': [0, 1001]},
+    {'capabilities': {'CapEff': 0, 'CapBnd': 0x2000, 'CapPrm': 0, 'CapInh': 0, 'CapAmb': 0}},
+])
+def test_refuses_unsafe_measured_process_limits(change):
+    with pytest.raises(RuntimeError): probe.verify_result({**evidence(), **change})
+
+
+def test_refuses_unknown_actual_host_configuration_fields():
+    record = container(); record['HostConfig']['FutureDaemonSetting'] = True
+    with pytest.raises(RuntimeError, match='required isolated'):
+        probe.verify_container(record, 'sha256:test', 'test')
+
+
+def test_host_configuration_profile_is_pinned_before_docker(tmp_path, monkeypatch):
+    context = tmp_path / 'context'; context.mkdir()
+    (context / 'seccomp.json').write_bytes((probe.CONTEXT / 'seccomp.json').read_bytes())
+    profile = probe.verified_host_configuration(); profile['GroupAdd'] = ['0']
+    (context / 'host-config.json').write_text(json.dumps(profile))
+    monkeypatch.setattr(probe, 'CONTEXT', context)
+    with pytest.raises(RuntimeError, match='host configuration digest'):
+        probe.run(tmp_path / 'evidence', docker='must-not-be-called')

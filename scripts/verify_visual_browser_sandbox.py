@@ -20,10 +20,7 @@ LABEL = "io.kestrel.visual-browser-probe"
 ROOT = Path(__file__).resolve().parents[1]
 CONTEXT = ROOT / "docker" / "visual-browser"
 SECCOMP_SHA256 = "38c15179be39d9bc1aadf19b06618bdb0dd9137f531435ff306c8dccf3b59f19"
-MASKED_PATHS = {"/proc/acpi", "/proc/asound", "/proc/interrupts", "/proc/kcore", "/proc/keys",
-                "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi", "/proc/timer_list",
-                "/proc/timer_stats", "/sys/devices/virtual/powercap", "/sys/firmware"}
-READONLY_PATHS = {"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"}
+HOST_CONFIG_SHA256 = "5b9799bdf8e9f9292554007d64778a9941dedd78dee2797dac362e881c06f394"
 
 
 def verified_seccomp_policy() -> dict:
@@ -32,6 +29,13 @@ def verified_seccomp_policy() -> dict:
         raise RuntimeError("browser seccomp policy digest differs from the reviewed profile")
     return json.loads(content)
 
+
+
+def verified_host_configuration() -> dict:
+    content = (CONTEXT / "host-config.json").read_bytes()
+    if hashlib.sha256(content).hexdigest() != HOST_CONFIG_SHA256:
+        raise RuntimeError("browser host configuration digest differs from the reviewed profile")
+    return json.loads(content)
 
 def container_arguments(image: str, identity: str) -> list[str]:
     return [
@@ -42,44 +46,31 @@ def container_arguments(image: str, identity: str) -> list[str]:
         "--memory", "1g", "--memory-swap", "1g", "--ipc", "private",
         "--cgroupns", "private", "--runtime", "runc", "--cpus", "2", "--pids-limit", "256", "--shm-size", "256m",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
+        "--ulimit", "rtprio=0:0", "--log-driver", "none",
         image, "python", "/opt/kestrel-browser/sandbox_probe.py",
     ]
 
 
 def verify_container(record: dict, image: str, identity: str) -> None:
-    host, config = record["HostConfig"], record["Config"]
-    policies = [option.partition("=")[2] for option in host["SecurityOpt"] if option.startswith("seccomp=")]
+    host, config = dict(record["HostConfig"]), record["Config"]
+    options = host.get("SecurityOpt") or []
+    policies = [option.partition("=")[2] for option in options if option.startswith("seccomp=")]
     expected_policy = verified_seccomp_policy()
-    policy_matches = len(policies) == 1 and json.loads(policies[0]) == expected_policy
+    try:
+        policy_matches = len(policies) == 1 and json.loads(policies[0]) == expected_policy
+    except (TypeError, ValueError):
+        policy_matches = False
+    if policy_matches:
+        host["SecurityOpt"] = ["seccomp=reviewed-policy" if option.startswith("seccomp=") else option
+                               for option in options]
+    # Compare the complete reviewed map, including default-valued fields. New
+    # daemon settings are unsupported until reviewed; they never pass silently.
     checks = (
+        host == verified_host_configuration(),
         record["Image"] == image,
         config["Labels"].get(LABEL) == identity,
         config["User"] == "pwuser",
-        host["NetworkMode"] == "none",
-        host["ReadonlyRootfs"] is True,
-        host["Privileged"] is False,
-        host["CapDrop"] == ["ALL"],
-        not host.get("CapAdd"),
-        not host.get("Binds"), not host.get("Mounts"),
-        not host.get("Devices"), not host.get("DeviceRequests"),
-        not host.get("PortBindings"), host.get("PublishAllPorts") is False,
         record.get("Mounts") == [],
-        host.get("Tmpfs") == {"/tmp": "rw,nosuid,nodev,size=256m,mode=1777"},
-        set(host.get("MaskedPaths") or []) == MASKED_PATHS,
-        set(host.get("ReadonlyPaths") or []) == READONLY_PATHS,
-        not host.get("VolumesFrom"), not host.get("DeviceCgroupRules"),
-        host.get("PidMode", "") == "",
-        host.get("IpcMode") == "private",
-        host.get("UTSMode") == "", host.get("UsernsMode") == "",
-        host.get("CgroupnsMode") == "private", host.get("CgroupParent") == "",
-        host.get("Runtime") == "runc", not host.get("Sysctls"),
-        host.get("OomKillDisable") is False, host.get("Init") is True,
-        host["Memory"] == host.get("MemorySwap") == 1024**3,
-        host["NanoCpus"] == 2_000_000_000,
-        host["PidsLimit"] == 256,
-        host["ShmSize"] == 256 * 1024**2,
-        len(host["SecurityOpt"]) == 2,
-        any(option in {"no-new-privileges", "no-new-privileges=true"} for option in host["SecurityOpt"]),
         policy_matches,
     )
     if not all(checks):
@@ -87,7 +78,9 @@ def verify_container(record: dict, image: str, identity: str) -> None:
 
 
 def verify_result(result: dict) -> bytes:
-    if (result.get("uid") in (None, 0) or result.get("capabilities") != 0
+    if (result.get("uid") in (None, 0) or result.get("capabilities") != {name: 0 for name in ("CapEff", "CapBnd", "CapPrm", "CapInh", "CapAmb")}
+            or result.get("rtprio_limit") != [0, 0]
+            or not isinstance(result.get("groups"), list) or 0 in result["groups"]
             or result.get("no_new_privileges") is not True
             or result.get("fixture_result") != "Persistent local browser draft"
             or result.get("refused_destinations") != ["1.1.1.1", "169.254.169.254"]):
@@ -103,6 +96,7 @@ def verify_result(result: dict) -> bytes:
 
 def run(output: Path, *, docker: str) -> dict:
     verified_seccomp_policy()
+    verified_host_configuration()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     identity = uuid.uuid4().hex
     tag = f"kestrel-visual-browser-probe:{identity}"
