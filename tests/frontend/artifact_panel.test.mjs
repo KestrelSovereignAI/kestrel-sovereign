@@ -6,8 +6,9 @@ import { publicationDigests, sha256 } from '../../kestrel_sovereign/static/js/ar
 
 const ref = { schema_version: 1, artifact_id: 'artifact', revision_id: 'revision1' };
 const scope = { schema_version: 1, tenant_id: 'tenant', principal_id: 'person', agent_id: 'agent' };
-async function fixture({ getError = null, content = '<script>alert(1)</script>', type = 'text/markdown', title = '<img src=x onerror=alert(1)>', confirmDiscard = () => true } = {}) {
+async function fixture({ getError = null, content = '<script>alert(1)</script>', type = 'text/markdown', title = '<img src=x onerror=alert(1)>', confirmDiscard = () => true, setupWindow = () => {} } = {}) {
     const dom = new JSDOM('<!doctype html><body></body>', { url: 'http://localhost/' });
+    setupWindow(dom.window);
     const bytes = new TextEncoder().encode(content);
     const file = { schema_version: 1, path: 'source.md', media_type: type, sha256: await sha256(bytes), size_bytes: bytes.length };
     const revision = { schema_version: 1, ref, scope, title,
@@ -204,4 +205,61 @@ test('a confirmed quota rejection keeps the editor and discard protection availa
     item.dom.window.dispatchEvent(event); assert.equal(event.defaultPrevented, true);
     edit(item.panel, item.dom.window, 'Smaller draft'); assert.equal(button(item.panel, 'Save revision').disabled, false);
     item.close();
+});
+
+test('insecure-context artifact opening explains HTTPS or localhost without making a request', async () => {
+    const original=Object.getOwnPropertyDescriptor(globalThis,'crypto'), cryptoValue=globalThis.crypto;
+    for(const crypto of [{randomUUID:cryptoValue.randomUUID},{subtle:cryptoValue.subtle}]) {
+        const item=await fixture();item.panel.dispose();item.panel.element.remove();let reads=0;
+        item.client.get=async()=>{reads++;throw new Error('must not fetch');};
+        try {
+            Object.defineProperty(globalThis,'crypto',{value:crypto,configurable:true});
+            const panel=createArtifactPanel({client:item.client,ref,document:item.dom.window.document});await panel.ready;
+            assert.equal(panel.draft.state,'secure_context_required');assert.equal(reads,0);
+            assert.match(panel.element.querySelector('[role="status"]').textContent,/require HTTPS or localhost/);
+            assert.equal(panel.draft.hasUnsavedChanges,false);panel.dispose();
+        } finally {Object.defineProperty(globalThis,'crypto',original);item.close();}
+    }
+});
+
+test('deletion before commit does not claim that the draft was previously saved', async () => {
+    const item=await fixture();
+    item.client.commit=async()=>{throw {status:404,code:'artifact_not_found'};};
+    item.client.get=async()=>{throw {status:404,code:'artifact_not_found'};};
+    edit(item.panel,item.dom.window,'Never saved draft');button(item.panel,'Save revision').click();
+    await until(()=>item.panel.draft.state==='erased');
+    assert.equal(item.panel.element.querySelector('[role="status"]').textContent,'The artifact was deleted. This draft cannot be republished automatically.');
+    assert.equal(button(item.panel,'Download draft').hidden,false);assert.equal(item.panel.draft.text,'Never saved draft');item.close();
+});
+
+test('downloads use an inert MIME type and disposal releases URLs and the unload guard', async () => {
+    const create=URL.createObjectURL,revoke=URL.revokeObjectURL;const made=[],revoked=[];
+    URL.createObjectURL=blob=>{const url=create(blob);made.push({url,blob});return url;};
+    URL.revokeObjectURL=url=>{revoked.push(url);revoke(url);};
+    try {
+        for(const type of ['text/html','image/svg+xml','application/pdf','text/markdown']) {
+            const listeners=new Set();
+            const item=await fixture({type,setupWindow:window=>{
+                const add=window.addEventListener.bind(window),remove=window.removeEventListener.bind(window);
+                window.addEventListener=(name,listener,...options)=>{if(name==='beforeunload')listeners.add(listener);return add(name,listener,...options);};
+                window.removeEventListener=(name,listener,...options)=>{if(name==='beforeunload')listeners.delete(listener);return remove(name,listener,...options);};
+            }});item.dom.window.HTMLAnchorElement.prototype.click=function(){};
+            assert.equal(listeners.size,1);
+            try {
+                const initial=made.length;button(item.panel,'Download source file').click();await until(()=>made.length>initial);
+                assert.equal(made.at(-1).blob.type,'application/octet-stream');
+                assert.deepEqual(new Uint8Array(await made.at(-1).blob.arrayBuffer()),item.panel.draft.bytes);
+                if(item.panel.draft.editable) {
+                    edit(item.panel,item.dom.window,'Private draft');const before=made.length;
+                    button(item.panel,'Download draft').click();await until(()=>made.length>before);
+                    assert.equal(made.at(-1).blob.type,'application/octet-stream');
+                    const event=new item.dom.window.Event('beforeunload',{cancelable:true});item.dom.window.dispatchEvent(event);assert.equal(event.defaultPrevented,true);
+                }
+                item.panel.dispose();
+                assert.equal(listeners.size,0,'closing releases the window-owned reference to the panel');
+                for(const {url} of made.slice(initial))assert.ok(revoked.includes(url));
+                const after=new item.dom.window.Event('beforeunload',{cancelable:true});item.dom.window.dispatchEvent(after);assert.equal(after.defaultPrevented,false);
+            } finally {item.close();}
+        }
+    } finally {URL.createObjectURL=create;URL.revokeObjectURL=revoke;}
 });

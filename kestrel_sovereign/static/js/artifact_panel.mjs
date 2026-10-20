@@ -6,10 +6,11 @@ const STATUS = {
     saving: 'Saving…', unknown: 'Save status is unknown. Check or retry the same save.',
     conflict: 'Another revision conflicts with this draft. Compare before saving again.',
     denied: 'Access is unavailable. Reopen after authentication or permissions change.',
-    erased: 'This save was erased. It cannot be republished automatically.',
+    erased: 'The artifact was deleted. This draft cannot be republished automatically.',
     failed: 'The draft cannot be saved. Keep text edits within 1 MiB.',
     rejected: 'The save was rejected. Your draft is retained; edit and try again, or download it.',
     unavailable: 'This revision is unavailable or cannot be verified for viewing.',
+    secure_context_required: 'Artifact viewing and editing require HTTPS or localhost.',
 };
 const IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const workspaces = new WeakMap();
@@ -42,10 +43,10 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
     const releasePreview = () => {
         if (previewURL) { URL.revokeObjectURL(previewURL); urls.delete(previewURL); previewURL = null; }
     };
-    const download = (bytes, name, type) => {
+    const download = (bytes, name) => {
         if (!bytes || disposed) return;
         const link = element(doc, 'a');
-        link.href = objectURL(bytes, type); link.download = name;
+        link.href = objectURL(bytes, 'application/octet-stream'); link.download = name;
         root.append(link); link.click(); link.remove();
         // Keep the URL only for this panel's lifetime; revoke on disposal.
     };
@@ -62,8 +63,8 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
     const retry = button('Retry same save', () => draft.retry());
     const compare = button('Compare latest', () => draft.compareLatest());
     const rebase = button('Use latest as save base', () => draft.useComparedRevision());
-    const exportSaved = button('Download source file', () => download(draft.bytes, draft.file?.path.split('/').pop(), draft.file?.media_type));
-    const exportDraft = button('Download draft', () => download(new TextEncoder().encode(draft.text), `draft-${draft.file?.path.split('/').pop() || 'notes.txt'}`, 'text/plain'));
+    const exportSaved = button('Download source file', () => download(draft.bytes, draft.file?.path.split('/').pop()));
+    const exportDraft = button('Download draft', () => download(new TextEncoder().encode(draft.text), `draft-${draft.file?.path.split('/').pop() || 'notes.txt'}`));
     const historyButton = button('Revision history', async () => {
         const page = await draft.history();
         if (disposed) return;

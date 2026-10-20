@@ -115,6 +115,9 @@ export class ArtifactDraft {
     async open(ref) {
         if (this.#closed || this.#opened) throw new Error('Create a new panel to open another revision.');
         this.#opened = true;
+        if (!globalThis.crypto?.subtle || typeof globalThis.crypto.randomUUID !== 'function') {
+            this.#set('secure_context_required'); return;
+        }
         try {
             const loaded = await this.#loadRevision(ref);
             if (this.#closed) return;

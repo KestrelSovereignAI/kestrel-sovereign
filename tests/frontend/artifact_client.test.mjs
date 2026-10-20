@@ -467,3 +467,10 @@ test('head lookup uses the original bound agent and authenticated artifact route
     assert.match(calls[0].url, /original-agent/); assert.ok(calls[0].url.endsWith('/api/artifacts/artifact/head'));
     assert.equal(calls[0].options.credentials, 'omit'); assert.equal(calls[0].options.cache, 'no-store');
 });
+
+test('unsupported reference versions are refused before fetching metadata', async () => {
+    const item=await fixture(); item.draft.close(); let reads=0;
+    item.client.get=async()=>{reads++;return item.revision;};
+    const draft=new ArtifactDraft(item.client);await draft.open({...ref,schema_version:2});
+    assert.equal(draft.state,'unavailable');assert.equal(reads,0);draft.close();
+});
