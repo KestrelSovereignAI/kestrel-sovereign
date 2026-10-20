@@ -2200,7 +2200,7 @@ class AgentManager:
             PeerProtocolError,
             PeerUnavailableError,
         )
-        from kestrel_sovereign.signals.sources.a2a import _deserialize_chain
+        from kestrel_sovereign.a2a.extensions import causation_metadata, deserialize_causation_chain
         from kestrel_sovereign.signals.sources.peer_stop import (
             PeerStopIntentError,
             decode_peer_stop_action_envelope,
@@ -2246,8 +2246,8 @@ class AgentManager:
             chain_provider = getattr(sender, "_provide_causation_chain", None)
             if callable(chain_provider):
                 serialized_chain = chain_provider()
-            chain = _deserialize_chain(
-                {"causation_chain": serialized_chain}
+            chain = deserialize_causation_chain(
+                causation_metadata(serialized_chain)
                 if serialized_chain
                 else {}
             )

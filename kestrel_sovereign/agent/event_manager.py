@@ -11,6 +11,16 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
+from a2a.types import TaskState
+from google.protobuf.json_format import MessageToDict
+
+from kestrel_sovereign.a2a.extensions import deserialize_causation_chain
+from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
+from kestrel_sovereign.a2a.stores.unified.task_store import (
+    TaskCognitionWakeCandidate,
+    require_native_wake,
+)
+
 # ---------------------------------------------------------------------------
 # emit_event delivery receipt (#2922)
 # ---------------------------------------------------------------------------
@@ -74,84 +84,18 @@ class EventDeliveryReceipt:
         return EVENT_REJECTED
 
 
-def describe_background_task(task) -> Tuple[str, str]:
-    """Derive a human-meaningful ``source/name`` label for a terminal
-    background task from its metadata.
-
-    Only keys that a real producer actually stamps on ``Task.metadata``
-    are read here — reading speculative keys no one writes would give a
-    false sense of coverage (#1526). The genuine producers are:
-
-    - ``TaskManager.execute_skill`` stamps ``agent_id`` + ``skill`` when
-      a peer agent runs one of our skills (``a2a/task_manager.py``).
-    - The inbound A2A submit endpoint passes the caller-supplied
-      ``sender`` (and optionally ``task_type``) straight through
-      ``create_task`` (``endpoints/agent.py`` → ``TaskSendParams.metadata``).
-    - ``TaskManager.create_task`` attaches a ``causation_chain`` whenever
-      a task is spawned during a signal-driven turn.
-
-    Scheduled tasks themselves never reach this callback directly: the
-    scheduler dispatches a *signal* (``cron.<task_name>``), not an A2A
-    task (``features/scheduler/feature.py``). The only thread connecting
-    a later spawned task back to that schedule is the causation chain, so
-    that is the canonical path for labelling scheduler-originated work —
-    a task whose chain records ``cron.restart_coordinator`` renders as
-    ``cron/restart_coordinator`` instead of the historical
-    ``unknown/task``.
-
-    Preferring the most specific identifiers available keeps completion
-    notifications from collapsing to ``unknown/task`` whenever a richer
-    field is present.
-
-    Returns a ``(source, name)`` tuple; the caller joins them as
-    ``source/name``.
-    """
-    md = getattr(task, "metadata", None)
-    if not isinstance(md, dict):
-        md = {}
-
-    source = md.get("agent_id") or md.get("sender")
-    name = md.get("skill") or md.get("task_type")
-
-    if source and name:
-        return str(source), str(name)
-    if source:
-        return str(source), "task"
+def describe_background_task(candidate: TaskCognitionWakeCandidate) -> Tuple[str, str]:
+    """Render admitted ownership and application labels without metadata identity."""
+    task = candidate.task
+    metadata = MessageToDict(task.metadata)
+    name = metadata.get("skill") or metadata.get("task_type")
     if name:
-        return "unknown", str(name)
-
-    # Fall back to the originating signal source recorded in the
-    # causation chain — e.g. a cron task (``cron.restart_coordinator``)
-    # that woke a turn which then spawned this task. The most recent
-    # frame is the proximate cause. ``cron.restart_coordinator`` renders
-    # as ``cron/restart_coordinator``; a single-segment source renders
-    # as ``<source>/task``.
-    frame_source = _causation_chain_source(md)
-    if frame_source:
-        head, sep, tail = frame_source.partition(".")
-        if sep and tail:
-            return head, tail
-        return frame_source, "task"
-
-    return "unknown", "task"
-
-
-def _causation_chain_source(metadata: Dict[str, Any]) -> str:
-    """Return the source of the most recent causation-chain frame, or ''.
-
-    Defensive against the wire-serialized chain shape produced by
-    ``signals.sources.a2a.serialize_chain_for_metadata`` (a list of
-    dicts, each with a ``source`` key).
-    """
-    chain = metadata.get("causation_chain")
-    if not isinstance(chain, list) or not chain:
-        return ""
-    frame = chain[-1]
-    if isinstance(frame, dict):
-        src = frame.get("source")
-        if src:
-            return str(src)
-    return ""
+        return candidate.ownership.creator_agent_id, str(name)
+    chain = deserialize_causation_chain(metadata)
+    if chain:
+        source, separator, tail = chain[-1].source.partition(".")
+        return source, tail if separator and tail else "task"
+    return candidate.ownership.creator_agent_id, "task"
 
 
 def background_task_identifiers(task) -> str:
@@ -463,7 +407,7 @@ class EventManagerMixin:
             await asyncio.sleep(delay)
             delay = min(delay * 2, A2A_WAKE_RETRY_MAX_SECONDS)
 
-    def _on_background_task_complete(self, task) -> None:
+    def _on_background_task_complete(self, candidate: TaskCognitionWakeCandidate) -> None:
         """
         Callback invoked when a background task completes.
 
@@ -475,31 +419,31 @@ class EventManagerMixin:
         2. Cognition signal (Phase 5 of #889) \u2014 enqueued via the
            dispatcher so the bird wakes up and decides what to do with
            the result. Carries the causation chain from
-           `task.metadata["causation_chain"]` so A\u2192B\u2192A ping-pong loops
+           the versioned native causation extension so A\u2192B\u2192A ping-pong loops
            are caught by Phase 1's cycle detection.
 
         Called by TaskManager when tasks reach terminal states
-        (COMPLETED, FAILED, CANCELED).
+        (COMPLETED, FAILED, CANCELED, REJECTED).
         """
-        from kestrel_sovereign.a2a.types import TaskState
-
+        candidate = require_native_wake(candidate, self.did)
+        task = candidate.task
         state = task.status.state
         task_id = task.id
 
-        # ---- 1. SSE notification (legacy path) ---------------------------
+        # ---- 1. SSE notification ---------------------------
 
         # Derive a meaningful source/name label and identifier suffix from
         # whatever metadata the producer stamped. Falls back to the
         # historical "unknown/task" only when nothing better is present, and
         # always exposes the full task id so the toast is resolvable (#1526).
-        source, name = describe_background_task(task)
+        source, name = describe_background_task(candidate)
         label = f"{source}/{name}"
         identifiers = background_task_identifiers(task)
 
         # Format notification based on state
-        if state == TaskState.COMPLETED:
+        if state == TaskState.TASK_STATE_COMPLETED:
             msg = f"\u2705 Background task completed: {label} ({identifiers})"
-        elif state == TaskState.FAILED:
+        elif state == TaskState.TASK_STATE_FAILED:
             error_msg = ""
             if task.status.message and task.status.message.parts:
                 for part in task.status.message.parts:
@@ -507,10 +451,12 @@ class EventManagerMixin:
                         error_msg = f": {part.text}"
                         break
             msg = f"\u274c Background task failed: {label}{error_msg} ({identifiers})"
-        elif state == TaskState.CANCELED:
+        elif state == TaskState.TASK_STATE_CANCELED:
             msg = f"\u26a0\ufe0f Background task canceled: {label} ({identifiers})"
+        elif state == TaskState.TASK_STATE_REJECTED:
+            msg = f"⛔ Background task rejected: {label} ({identifiers})"
         else:
-            return  # Don't notify for non-terminal states
+            return
 
         self._pending_task_notifications.append(msg)
         logging.info(f"Queued task notification: {msg}")
@@ -519,8 +465,8 @@ class EventManagerMixin:
 
         dispatcher = getattr(self, "dispatcher", None)
         if dispatcher is None:
-            # Pre-Phase-5 agents (or tests with mocked agents lacking a
-            # dispatcher) just get the SSE notification \u2014 backward compat.
+            # No cognition destination is available. The committed native
+            # task remains the reconciliation authority when one is attached.
             return
 
         try:
@@ -540,7 +486,7 @@ class EventManagerMixin:
             self._track_background_task(
                 self._deliver_a2a_wake_until_durable(
                     signal_factory=lambda: build_signal_for_completed_task(
-                        task=task,
+                        candidate=candidate,
                         target_agent=self.did,
                     ),
                     task_id=str(task_id),
@@ -559,7 +505,7 @@ class EventManagerMixin:
                 task_id, e, exc_info=True,
             )
 
-    def _on_task_submitted(self, task) -> None:
+    def _on_task_submitted(self, candidate: TaskCognitionWakeCandidate) -> None:
         """
         Callback invoked when a peer agent creates a new A2A task
         addressed to this agent.
@@ -582,34 +528,24 @@ class EventManagerMixin:
         """
         dispatcher = getattr(self, "dispatcher", None)
         if dispatcher is None:
-            # Pre-dispatcher agents (or test fixtures without one) get
-            # the persisted task but no wake. The TaskStore row still
-            # exists, so a subsequent reading turn can see it; just no
-            # autonomous trigger. Same backward-compat posture as
-            # ``_on_background_task_complete``.
+            # Host admission must start only after its dispatcher is ready.
+            # The durable task remains available for restart reconciliation.
             return
 
-        task_id = getattr(task, "id", "<unknown>")
+        candidate = require_native_wake(candidate, self.did)
+        task = candidate.task
+        task_id = task.id
         try:
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
                 DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_submitted_task,
             )
 
-            # ``sender`` lives in task.metadata when the create came
-            # via the inter-agent HTTP send path. Local self-spawn
-            # paths leave it blank, which is fine — the signal still
-            # fires (allow_self_loops=False prevents the degenerate
-            # case at dispatch time).
-            metadata = getattr(task, "metadata", None) or {}
-            sender = str(metadata.get("sender", "") or "") if isinstance(metadata, dict) else ""
-
             self._track_background_task(
                 self._deliver_a2a_wake_until_durable(
                     signal_factory=lambda: build_signal_for_submitted_task(
-                        task=task,
-                        target_agent=getattr(self, "did", ""),
-                        sender=sender,
+                        candidate=candidate,
+                        target_agent=self.did,
                     ),
                     task_id=str(task_id),
                     consumer_id=DURABLE_COGNITION_CONSUMER_ID,
@@ -653,35 +589,29 @@ class EventManagerMixin:
             return None
         if getattr(event, "target_agent", None) != getattr(self, "did", None):
             return None
-        task = await self.task_manager.get_task_for_recipient(task_id, self.did)
-        if task is None:
+        candidate = await self.task_manager.get_cognition_wake_candidate(
+            task_id, recipient_agent_id=self.did,
+        )
+        if candidate is None:
             return None
+        task = candidate.task
 
         if source == "a2a.task_submitted":
+            if task.status.state not in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
+                return None
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
                 build_signal_for_submitted_task,
             )
 
-            metadata = getattr(task, "metadata", None) or {}
-            sender = (
-                str(metadata.get("sender", "") or "")
-                if isinstance(metadata, dict)
-                else ""
-            )
-            recovered = build_signal_for_submitted_task(
-                task,
-                target_agent=self.did,
-                sender=sender,
-            )
+            recovered = build_signal_for_submitted_task(candidate, target_agent=self.did)
         else:
             from kestrel_sovereign.signals.sources.a2a import (
                 build_signal_for_completed_task,
             )
 
-            recovered = build_signal_for_completed_task(
-                task,
-                target_agent=self.did,
-            )
+            if task.status.state not in TERMINAL_STATES:
+                return None
+            recovered = build_signal_for_completed_task(candidate, target_agent=self.did)
         return replace(
             recovered,
             id=dispatch_signal.id,
@@ -705,16 +635,23 @@ class EventManagerMixin:
         would recreate the wake once every retention period.
         """
 
-        from kestrel_sovereign.a2a.types import TaskState
         from kestrel_sovereign.signals import DurableAdmissionDisposition
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
+        )
+        from kestrel_sovereign.signals.sources.a2a import (
             SOURCE_NAME as COMPLETE_SOURCE,
+        )
+        from kestrel_sovereign.signals.sources.a2a import (
             build_signal_for_completed_task,
         )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             SOURCE_NAME as SUBMITTED_SOURCE,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             build_signal_for_submitted_task,
         )
 
@@ -737,18 +674,8 @@ class EventManagerMixin:
         for candidate in tasks:
             task = candidate.task
             state = task.status.state
-            if state in {TaskState.SUBMITTED, TaskState.WORKING}:
-                metadata = getattr(task, "metadata", None) or {}
-                sender = (
-                    str(metadata.get("sender", "") or "")
-                    if isinstance(metadata, dict)
-                    else ""
-                )
-                signal = build_signal_for_submitted_task(
-                    task,
-                    target_agent=self.did,
-                    sender=sender,
-                )
+            if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
+                signal = build_signal_for_submitted_task(candidate, target_agent=self.did)
                 consumer_id = SUBMITTED_CONSUMER
                 # SUBMITTED owns the callback's original source identity.
                 # WORKING is a later durable lifecycle revision: if the
@@ -756,10 +683,10 @@ class EventManagerMixin:
                 # the task ID would deduplicate against that completed wake.
                 source_event_id = (
                     str(task.id)
-                    if state is TaskState.SUBMITTED
+                    if state == TaskState.TASK_STATE_SUBMITTED
                     else f"{task.id}:working:{candidate.lifecycle_revision}"
                 )
-                if state is TaskState.WORKING:
+                if state == TaskState.TASK_STATE_WORKING:
                     original = (
                         await self.dispatcher.get_durable_delivery_for_source_event(
                             consumer_id=SUBMITTED_CONSUMER,
@@ -774,7 +701,7 @@ class EventManagerMixin:
                         continue
             else:
                 signal = build_signal_for_completed_task(
-                    task,
+                    candidate,
                     target_agent=self.did,
                 )
                 consumer_id = COMPLETE_CONSUMER

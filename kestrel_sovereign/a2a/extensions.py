@@ -1,0 +1,147 @@
+"""Versioned native A2A metadata extensions; causation never grants authority."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+from kestrel_sdk.signals import CausationFrame
+
+EXTENSION_DOCUMENT = (
+    "https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/"
+    "docs/architecture/NATIVE_MCP_A2A.md"
+)
+SIGNED_SENDER_URI = EXTENSION_DOCUMENT + "#signed-sender-v1"
+RECIPIENT_POLICY_URI = EXTENSION_DOCUMENT + "#recipient-policy-v1"
+QUESTION_CORRELATION_URI = EXTENSION_DOCUMENT + "#question-correlation-v1"
+CAUSATION_URI = EXTENSION_DOCUMENT + "#causation-v1"
+
+
+def _payload(metadata: Mapping[str, Any], uri: str, keys: set[str]) -> dict | None:
+    if uri not in metadata:
+        return None
+    payload = metadata[uri]
+    if not isinstance(payload, dict) or set(payload) != keys:
+        raise ValueError(f"Invalid native A2A extension payload: {uri}")
+    # Protobuf Struct represents JSON numbers as doubles. 1 and 1.0 are the
+    # same supported version; booleans and string coercion are not versions.
+    version = payload["version"]
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, (int, float))
+        or version != 1
+    ):
+        raise ValueError(f"Unsupported native A2A extension version: {uri}")
+    return payload
+
+
+@dataclass(frozen=True)
+class QuestionCorrelation:
+    """Correlation data, subject to the sender/recipient's durable ledger."""
+
+    kind: str
+    question_id: str
+
+
+def parse_question_correlation(
+    metadata: Mapping[str, Any],
+) -> QuestionCorrelation | None:
+    """Read a namespaced correlation claim; this does not authorize a reply."""
+    payload = _payload(
+        metadata, QUESTION_CORRELATION_URI, {"version", "kind", "question_id"}
+    )
+    if payload is None:
+        return None
+    if not isinstance(payload["kind"], str) or payload["kind"] not in {
+        "question",
+        "answer",
+    }:
+        raise ValueError(
+            "Native A2A question correlation requires question or answer kind"
+        )
+    question_id = payload["question_id"]
+    if not isinstance(question_id, str) or not question_id.strip():
+        raise ValueError("Native A2A question correlation requires a question_id")
+    return QuestionCorrelation(payload["kind"], question_id)
+
+
+def serialize_chain_for_metadata(
+    chain: Sequence[CausationFrame],
+) -> list[dict[str, Any]]:
+    """Serialize the canonical frames used by local causation and persistence."""
+    frames = [
+        {
+            "agent_id": frame.agent_id,
+            "source": frame.source,
+            "signal_id": frame.signal_id,
+            "turn_id": frame.turn_id,
+            "depth": frame.depth,
+            "emitted_at": frame.emitted_at.isoformat(),
+        }
+        for frame in chain
+    ]
+    causation_metadata(frames)
+    return frames
+
+
+def causation_metadata(frames: list[dict[str, Any]]) -> dict[str, Any]:
+    """Place serialized causation under its native versioned extension URI."""
+    metadata = {CAUSATION_URI: {"version": 1, "chain": frames}}
+    deserialize_causation_chain(metadata)
+    return metadata
+
+
+def deserialize_causation_chain(metadata: Mapping[str, Any]) -> list[CausationFrame]:
+    """Reject malformed declared causation instead of silently resetting it."""
+    payload = _payload(metadata, CAUSATION_URI, {"version", "chain"})
+    if payload is None:
+        return []
+    if not isinstance(payload["chain"], list):
+        raise ValueError("Native A2A causation chain must be an array")
+    frames = []
+    required = {"agent_id", "source", "signal_id", "depth", "emitted_at"}
+    for entry in payload["chain"]:
+        if (
+            not isinstance(entry, dict)
+            or not required <= set(entry)
+            or set(entry) - required - {"turn_id"}
+        ):
+            raise ValueError("Native A2A causation frame has invalid fields")
+        for key in ("agent_id", "source", "signal_id", "emitted_at"):
+            if not isinstance(entry[key], str) or not entry[key].strip():
+                raise ValueError(f"Native A2A causation frame requires {key}")
+        turn_id = entry.get("turn_id")
+        if turn_id is not None and (
+            not isinstance(turn_id, str) or not turn_id.strip()
+        ):
+            raise ValueError(
+                "Native A2A causation turn_id must be a non-empty string or null"
+            )
+        depth = entry["depth"]
+        if (
+            isinstance(depth, bool)
+            or not isinstance(depth, (int, float))
+            or not math.isfinite(depth)
+            or depth < 0
+            or int(depth) != depth
+        ):
+            raise ValueError(
+                "Native A2A causation depth must be a non-negative integer"
+            )
+        emitted_at = datetime.fromisoformat(entry["emitted_at"])
+        if emitted_at.utcoffset() is None:
+            raise ValueError("Native A2A causation emitted_at requires a timezone")
+        frames.append(
+            CausationFrame(
+                agent_id=entry["agent_id"],
+                source=entry["source"],
+                signal_id=entry["signal_id"],
+                turn_id=turn_id,
+                depth=int(depth),
+                emitted_at=emitted_at,
+            )
+        )
+    return frames

@@ -7,10 +7,11 @@ allowing the same store code to work with both SQLite and PostgreSQL.
 Usage:
     from kestrel_sovereign.a2a.stores import TaskStore, SessionService, MemoryService, ...
     from kestrel_sovereign.storage.db import SQLiteBackend, PostgresBackend
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
 
     backend = SQLiteBackend("/path/to/db.sqlite")
     await backend.connect()
-    task_store = TaskStore(backend)
+    task_store = TaskStore(backend, scope=NativeRecipientScope("did:example:recipient"))
 
 Stores:
 1. TaskStore - Async task persistence and lifecycle
@@ -30,14 +31,6 @@ from kestrel_sovereign.a2a.stores.unified import (
     OrchestrationStore,
     FeedbackStore,
 )
-
-# Import legacy SQLite-specific classes for backward compatibility
-from kestrel_sovereign.a2a.stores.task_store import SQLiteTaskStore
-from kestrel_sovereign.a2a.stores.session_service import SQLiteSessionService
-from kestrel_sovereign.a2a.stores.memory_service import SQLiteMemoryService
-from kestrel_sovereign.a2a.stores.observability_store import SQLiteObservabilityStore
-from kestrel_sovereign.a2a.stores.orchestration_store import SQLiteOrchestrationStore
-from kestrel_sovereign.a2a.stores.feedback_store import SQLiteFeedbackStore
 
 # Import data models
 from kestrel_sovereign.a2a.stores.unified.session_service import SessionState
@@ -63,13 +56,6 @@ __all__ = [
     "ObservabilityStore",
     "OrchestrationStore",
     "FeedbackStore",
-    # Legacy SQLite stores (backward compatibility)
-    "SQLiteTaskStore",
-    "SQLiteSessionService",
-    "SQLiteMemoryService",
-    "SQLiteObservabilityStore",
-    "SQLiteOrchestrationStore",
-    "SQLiteFeedbackStore",
     # Data models
     "SessionState",
     "MemoryEntry",

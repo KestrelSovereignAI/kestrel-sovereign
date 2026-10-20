@@ -20,8 +20,8 @@ from pydantic import BaseModel
 
 from kestrel_sovereign.a2a.stores.base import generate_id, json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
-from kestrel_sovereign.storage.db.interface import DatabaseBackend
 from kestrel_sovereign.execution_custody import execution_terminal_error
+from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
@@ -155,14 +155,14 @@ class ObservabilityStore(UnifiedStoreBase):
     with a single implementation that works with any DatabaseBackend.
     """
 
-    def __init__(self, backend: DatabaseBackend):
+    def __init__(self, backend: DatabaseBackend, *, owns_backend: bool = True):
         """
         Initialize observability store with database backend.
 
         Args:
             backend: DatabaseBackend instance (SQLite or PostgreSQL)
         """
-        super().__init__(backend)
+        super().__init__(backend, owns_backend=owns_backend)
         # Privacy gate for content-bearing payloads (F076). The agent binds a
         # callable returning the live ``PrivacyConfig`` via
         # :meth:`set_privacy_config_provider`; captured by reference so

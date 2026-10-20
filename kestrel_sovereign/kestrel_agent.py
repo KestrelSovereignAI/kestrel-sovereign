@@ -84,16 +84,9 @@ class _BackgroundShutdownControl(RuntimeError):
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 
-from kestrel_sovereign.a2a.stores import (
-    SQLiteFeedbackStore,
-    SQLiteMemoryService,
-    SQLiteObservabilityStore,
-    SQLiteSessionService,
-    SQLiteTaskStore,
-)
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import TaskManager
 
-# PostgreSQL stores imported conditionally when pg_pool is available
 from kestrel_sovereign.agent import ContextBuilder, ContextManager
 from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.boot import (
@@ -3214,41 +3207,13 @@ class KestrelAgent(
 
     async def _boot_phase_a2a_observability_signals(self, ctx: BootContext) -> None:
         """Phase 2 — A2A stores, observability, and the signal spine. TaskManager + its stores, the observability/feedback sinks, the enablement store, the SignalDispatcher/registries, and the core (always-on) signal sources."""
-        # Initialize TaskManager for A2A unified routing
-        # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
-        if self._db_backend.lower() == "postgres":
-            # Reuse storage's guarded native backend in both shared-pool and
-            # DSN-only modes; wrappers must not drop its retained generation.
-            pg_backend = self._raw_storage._backend
-            from kestrel_sovereign.a2a.stores.postgres import (
-                PostgresFeedbackStore,
-                PostgresMemoryService,
-                PostgresObservabilityStore,
-                PostgresSessionService,
-                PostgresTaskStore,
-            )
-            task_store = PostgresTaskStore(backend=pg_backend)
-            session_service = PostgresSessionService(backend=pg_backend)
-            observability_store = PostgresObservabilityStore(backend=pg_backend)
-            memory_service = PostgresMemoryService(backend=pg_backend)
-            feedback_store = PostgresFeedbackStore(backend=pg_backend)
-            logging.info(f"Using PostgreSQL A2A stores for agent {self.did}")
-        else:
-            # SQLite mode: use SQLite stores with file path
-            task_store_path = self.storage_path
-            task_store = SQLiteTaskStore(task_store_path)
-            session_service = SQLiteSessionService(task_store_path)
-            observability_store = SQLiteObservabilityStore(task_store_path)
-            memory_service = SQLiteMemoryService(task_store_path)
-            feedback_store = SQLiteFeedbackStore(task_store_path)
-            logging.info(f"Using SQLite A2A stores for agent {self.did}")
-
-        self.task_manager = TaskManager(
-            task_store=task_store,
-            session_service=session_service,
-            observability_store=observability_store,
-            memory_service=memory_service,
-            feedback_store=feedback_store,
+        # Native admission and context ownership share the primary connection.
+        # AsyncStorage owns this backend; every A2A store borrows it so partial
+        # boot rollback cannot retire storage still held by other services.
+        self.task_manager = TaskManager.from_backend(
+            self._raw_storage._backend,
+            scope=NativeRecipientScope(self.did),
+            owns_backend=False,
             hooks_manager=self.hooks_manager,  # Pass hooks manager for security
             on_task_complete=self._on_background_task_complete,  # For notifications
             # Inbound-task callback: when a peer creates a task
@@ -3267,11 +3232,10 @@ class KestrelAgent(
             # causation chain (serialized) so outbound A2A tasks
             # carry the lineage. The dispatcher sets the chain on
             # the agent before calling process_input for COGNITION
-            # signals; create_task reads it via this provider.
+            # signals; local execute_skill reads it via this provider.
             # See #905 review P1 — without this, A→B→A loops would
             # restart at depth 1 every iteration.
             causation_chain_provider=self._provide_causation_chain,
-            host_agent_id=self.did,
         )
         # Register teardown BEFORE initialize: ``TaskManager.initialize()`` opens
         # its A2A store connections (task/session/observability/memory/feedback)
@@ -3281,7 +3245,9 @@ class KestrelAgent(
         ctx.on_rollback("task_manager", self._boot_teardown_task_manager)
         await self.task_manager.initialize()
 
-        # Expose feedback store for features and commands
+        feedback_store = self.task_manager.feedback_store
+        observability_store = self.task_manager.observability_store
+        # Expose the canonical stores for features and commands.
         self.feedback_store = feedback_store
 
         # Expose observability store for orchestrator instrumentation
@@ -6689,7 +6655,7 @@ class KestrelAgent(
         ``set_task_manager``). Any stage after the first can raise having left the
         EARLIER stages' registrations live: an ``on_enable`` failure strands the
         hooks already registered, and an ``_wire_feature_a2a`` failure past
-        ``register_agent`` strands both the hooks and the A2A agent. The old
+        ``register_provider`` strands both the hooks and the task provider. The old
         rollback popped the feature from ``self.features`` FIRST and then called
         only ``feature.shutdown()`` — which reverses the feature's OWN resources
         (signal sources / wait providers / owned tasks / sleep hooks) but NOT the
@@ -7125,15 +7091,12 @@ class KestrelAgent(
         await security.register_feature_tools(feature.name, feature)
 
     def _wire_feature_a2a(self, feature: "Feature") -> None:
-        """Register a feature as an A2A agent with the TaskManager.
+        """Register a feature's native skills with the host task manager.
 
-        Collects command prefixes, registers the feature's agent card + handler
-        for unified command routing, and wires the task_manager into features
-        that consume it. One source of truth shared by boot
-        (:meth:`_register_feature`) and runtime re-enable
-        (:meth:`_activate_feature_runtime`); the inverse is the
-        ``task_manager.unregister_agent`` call in
-        :meth:`_unregister_feature_runtime`.
+        A feature contributes skills and a handler; the serving agent owns the
+        single Agent Card and its transport interfaces. Boot and runtime
+        re-enable share this producer, and _unregister_feature_runtime removes
+        the same provider registration.
         """
         command_prefixes = {}
         for tool in feature.get_tools():
@@ -7144,15 +7107,16 @@ class KestrelAgent(
             )
 
         if self.task_manager:
-            agent_card = feature.get_agent_card()
-            self.task_manager.register_agent(
-                agent_card=agent_card,
+            skills = feature.get_agent_skills()
+            self.task_manager.register_provider(
+                provider_id=feature.name,
+                skills=skills,
                 handler=feature,
                 command_prefixes=command_prefixes,
             )
             logging.info(
-                f"Registered A2A agent '{agent_card.name}' with "
-                f"{len(agent_card.skills)} skills"
+                "Registered task provider '%s' with %d native skills",
+                feature.name, len(skills),
             )
 
             # Wire task_manager into features that need it
@@ -7382,7 +7346,7 @@ class KestrelAgent(
         * the feature's owned **signal sources** and **wait providers** (via
           ``feature.shutdown()`` — base :class:`Feature` unregisters both);
         * the hooks auto-registered from ``get_hooks()``;
-        * the A2A TaskManager agent registration;
+        * the native TaskManager provider registration;
         * the feature's dynamic tools + hidden-tool bookkeeping.
 
         ``unload`` controls the endpoint soft-toggle vs. full unload:
@@ -7487,7 +7451,7 @@ class KestrelAgent(
 
         if self.task_manager:
             try:
-                self.task_manager.unregister_agent(feature.get_agent_card().name)
+                self.task_manager.unregister_provider(feature.name)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
                 if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception) and not is_execution_control_error(exc):
                     raise

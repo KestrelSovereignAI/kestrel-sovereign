@@ -24,14 +24,19 @@ class UnifiedStoreBase:
     - Common patterns for row conversion
     """
 
-    def __init__(self, backend: DatabaseBackend):
+    def __init__(self, backend: DatabaseBackend, *, owns_backend: bool = True):
         """
         Initialize store with database backend.
 
         Args:
             backend: DatabaseBackend instance (SQLite or PostgreSQL)
+            owns_backend: Whether this store owns resource retirement. Host
+                services borrowing primary storage must set this to False.
         """
+        if not isinstance(owns_backend, bool):
+            raise TypeError("Store backend ownership must be explicit boolean policy")
         self._backend = backend
+        self._owns_backend = owns_backend
 
     @property
     def backend(self) -> DatabaseBackend:
@@ -234,7 +239,7 @@ class UnifiedStoreBase:
 
     async def close(self) -> None:
         """
-        Close the underlying database backend connection.
+        Close an owned backend; leave a borrowed host backend to its owner.
 
         Should be called when the store is no longer needed to prevent
         resource leaks from open database connections.
@@ -244,4 +249,5 @@ class UnifiedStoreBase:
         still being released, and only the backend can say whether they now
         are (#3558).
         """
-        await self._backend.close()
+        if self._owns_backend:
+            await self._backend.close()

@@ -110,6 +110,10 @@ dependencies = [
     # constraints that admit this line before Core is released. Do not weaken
     # Core's safety floor to make an older downstream resolver succeed.
     "kestrel-sovereign-sdk[httpx,tracing]>=0.39.2,<0.40",
+    # Native A2A types/bindings; signed-card publication remains gated on #3685.
+    "a2a-sdk[http-server,signing]>=1.2.3,<2",
+    # RFC 8785 for the Kestrel sender extension's complete native request digest.
+    "rfc8785>=0.1.4,<1",
     # Core web framework
     # Pre-1.0 router internals changed in a minor release. Advance this tested
     # current line with the native router/CSRF/frontend acceptance checks.

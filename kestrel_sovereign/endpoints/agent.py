@@ -3510,7 +3510,7 @@ async def stop_from_peer(request: Request):
         HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
     )
     from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
-    from kestrel_sovereign.signals.sources.a2a import _deserialize_chain
+    from kestrel_sovereign.a2a.extensions import deserialize_causation_chain
     from kestrel_sovereign.signals.sources.peer_stop import (
         PeerStopIntentError,
         decode_peer_stop_action_envelope,
@@ -3573,7 +3573,7 @@ async def stop_from_peer(request: Request):
             agent,
             actor_id=authorized_sender_id,
             intent=intent,
-            causation_chain=_deserialize_chain(params.metadata),
+            causation_chain=deserialize_causation_chain(params.metadata),
         )
 
     return await _create_verified_a2a_task(

@@ -1,28 +1,10 @@
-"""Signal source for inbound A2A task submission.
+"""Native inbound A2A cognition wakes after task admission commits.
 
-Closes the missing wakeup gap surfaced by Emma/Meridian: until this source
-existed, when peer agent A created an A2A task addressed to agent B, B's
-TaskStore got the row but B's cognition loop was never poked. The
-``a2a.task_complete`` source (already in `a2a.py`) wakes the CALLER when
-their outbound task finishes; this source is the symmetric INBOUND wake
-that fires on the CALLEE when a new task is submitted to them.
-
-The wiring mirrors `channels.feature.py:425`, the proven inbound pattern:
-
-    1. Sender calls TaskManager.create_task → task saved to store.
-    2. create_task builds a signal via build_signal_for_a2a_task_submitted.
-    3. create_task calls dispatcher.enqueue_signal(signal).
-    4. Dispatcher wakes the target agent.
-    5. Next cognition turn sees the task in context and decides what to do.
-
-Trust posture: A2A peers are TRUSTED in the v1 model (other sovereign
-agents we explicitly registered). Same posture as `a2a.task_complete`. If
-we ever federate with untrusted peers, flip to UNTRUSTED and add a
-sanitizer.
-
-Cycle safety: `allow_self_loops=False` and a dedupe key keyed on
-``task_id`` mean a peer that retries the same task creation (idempotency
-retry, network duplicate) collapses to one cognition wake.
+The manager delivers a native task snapshot with server-owned admission facts.
+The recipient builds its signal from those facts, maps the peer context into
+an isolated chat projection, and parses the declared correlation and causation
+extensions. Caller metadata cannot choose the trusted sender. The persisted
+task and lifecycle revision also drive restart reconciliation.
 """
 
 from __future__ import annotations
@@ -30,8 +12,9 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
 
+from a2a.types import TaskState
+from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.signals import (
     AttentionPolicy,
     RateLimit,
@@ -42,6 +25,16 @@ from kestrel_sdk.signals import (
     Trust,
     Urgency,
     Visibility,
+)
+
+from kestrel_sovereign.a2a.extensions import (
+    deserialize_causation_chain,
+    parse_question_correlation,
+)
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.a2a.stores.unified.task_store import (
+    TaskCognitionWakeCandidate,
+    require_native_wake,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,101 +159,37 @@ def build_a2a_task_submitted_registration() -> SourceRegistration:
 
 
 def build_signal_for_submitted_task(
-    task: Any, target_agent: str, sender: str = "",
+    candidate: TaskCognitionWakeCandidate, target_agent: str,
 ) -> Signal:
-    """Build an inbound COGNITION signal for an A2A task that just
-    landed in the target's store.
-
-    ``task`` is duck-typed (anything with .id, .sessionId, .metadata)
-    so this helper is testable without constructing real pydantic Task
-    objects. ``sender`` is the calling agent's identifier (DID or
-    name) — defaults to empty when the task wasn't created via an
-    inter-agent send path (e.g. local agent spawning its own
-    background task).
-
-    Causation chain: rehydrated from ``task.metadata["causation_chain"]``
-    (serialized form, same shape ``serialize_chain_for_metadata``
-    produces). Threading the chain into the Signal lets the dispatcher's
-    cycle detection catch A→B→A ping-pong at depth 2 — without it,
-    every inbound task started fresh at depth 1 and the loop bound
-    was only the per-source rate limit (codex P1 on PR #1366).
-    """
-    # Import locally to avoid a circular dependency between this
-    # source module and a2a.py.
-    from kestrel_sovereign.signals.sources.a2a import _deserialize_chain
-
-    task_id = str(getattr(task, "id", "<unknown>"))
-    session_id = str(getattr(task, "sessionId", "") or "")
-    metadata = getattr(task, "metadata", {}) or {}
-    # Extract the sender's actual question text from ``history[0]`` so the
-    # prompt template has the content INLINE — no extra ``check_task_status``
-    # round-trip required. Without this, the receiver's cognition turn
-    # gets only the task envelope (id, sender, verb) and has to either
-    # call a tool to fetch the body or guess. The empirical failure
-    # mode was guess-as-null (#1433).
+    """Wake the admitted recipient using ownership facts outside peer metadata."""
+    candidate = require_native_wake(candidate, target_agent)
+    task = candidate.task
+    if task.status.state not in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
+        raise ValueError("Task submission wake requires a submitted or working native task")
+    metadata = MessageToDict(task.metadata)
+    correlation = parse_question_correlation(metadata)
+    chain = deserialize_causation_chain(metadata)
     request_content = ""
-    history = getattr(task, "history", None) or []
-    if history:
-        parts = getattr(history[0], "parts", None) or []
-        for part in parts:
-            text = getattr(part, "text", None)
-            if isinstance(text, str) and text:
-                request_content = text
-                break
-    skill_id = ""
-    # ``a2a_verb`` discriminates message vs question vs task at the
-    # cognition-prompt level — codex P2 on PR #1380. Without this, an
-    # empty-skill message looks indistinguishable from an empty-skill
-    # task to the receiver. The PeersFeature send_a2a_* tools each
-    # stamp it; tasks created via other paths (local self-spawn,
-    # subagent dispatch, etc.) leave it empty and the prompt falls
-    # back to generic "task" framing.
-    a2a_verb = ""
-    reply_expected = False
-    if isinstance(metadata, dict):
-        skill_id = str(metadata.get("skill") or metadata.get("skill_id") or "")
-        a2a_verb = str(metadata.get("a2a_verb") or "")
-        reply_expected = bool(metadata.get("reply_expected", False))
-    chain = _deserialize_chain(metadata if isinstance(metadata, dict) else {})
-    effective_sender = sender or str(metadata.get("sender", "") or "")
-    # Trust tiering (#1721): the source is registered TRUSTED (the v1 same-host
-    # posture), but a wake whose claimed sender was NOT cryptographically
-    # verified self-downgrades to UNTRUSTED so the dispatcher routes it through
-    # the untrusted path (sanitizer / stricter governance). The endpoint stamps
-    # ``metadata["sender_verified"]`` from the envelope-signature verdict; a
-    # missing flag with a claimed sender is treated as unverified. A blank
-    # sender (local self-spawn / subagent dispatch) keeps the trusted default.
-    origin_trust = Trust.TRUSTED
-    if effective_sender:
-        verified = isinstance(metadata, dict) and bool(metadata.get("sender_verified"))
-        if not verified:
-            origin_trust = Trust.UNTRUSTED
+    if task.history:
+        request_content = "\n".join(part.text for part in task.history[0].parts if part.HasField("text"))
+    scope = NativeRecipientScope(candidate.ownership.recipient_agent_id, candidate.ownership.tenant)
     return Signal(
-        source=SOURCE_NAME,
-        kind="inbound",
-        mode=SignalMode.COGNITION,
+        source=SOURCE_NAME, kind="inbound", mode=SignalMode.COGNITION,
         payload={
-            "task_id": task_id,
-            "session_id": session_id,
-            "sender": effective_sender,
-            "skill_id": skill_id,
-            "a2a_verb": a2a_verb,
-            "reply_expected": reply_expected,
+            "task_id": task.id,
+            "session_id": scope.session_id_for_context(task.context_id),
+            "sender": candidate.ownership.creator_agent_id,
+            "skill_id": str(metadata.get("skill") or ""),
+            "a2a_verb": correlation.kind if correlation is not None else "task",
+            "reply_expected": correlation is not None and correlation.kind == "question",
+            "question_id": correlation.question_id if correlation is not None else "",
             "request_content": request_content,
         },
-        target_agent=target_agent,
-        visibility=Visibility.INTERNAL,
-        caller=sender or None,
-        urgency=Urgency.NORMAL,
-        origin_trust=origin_trust,
-        # Idempotency retries (same task_id resubmitted) collapse to
-        # one wake within the registration's coalescing window.
-        dedupe_key=task_id,
-        # Carry the lineage from the upstream turn that spawned this
-        # task so cycle detection rejects A→B→A loops at depth 2.
+        target_agent=target_agent, visibility=Visibility.INTERNAL,
+        caller=candidate.ownership.creator_agent_id, urgency=Urgency.NORMAL,
+        origin_trust=Trust.TRUSTED, dedupe_key=task.id,
         causation_chain=list(chain),
     )
-
 
 __all__ = [
     "PROMPT_TEMPLATE",

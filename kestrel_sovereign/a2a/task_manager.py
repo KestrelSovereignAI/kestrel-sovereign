@@ -12,25 +12,46 @@ This is the primary API for working with A2A tasks.
 
 import asyncio
 import logging
-from datetime import datetime
+from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
+from datetime import UTC, datetime
 from typing import (
     TYPE_CHECKING,
     Any,
-    AsyncGenerator,
-    Callable,
-    Coroutine,
     Optional,
     Protocol,
     runtime_checkable,
 )
 from uuid import uuid4
 
+from a2a.helpers.proto_helpers import new_task_from_user_message, new_text_message
+from a2a.types import (
+    AgentSkill,
+    Artifact,
+    Message,
+    Role,
+    SendMessageRequest,
+    Task,
+    TaskArtifactUpdateEvent,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+)
+from a2a.utils.errors import InvalidParamsError
+from a2a.utils.proto_utils import validate_proto_required_fields
+from google.protobuf.json_format import MessageToDict
+
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
     raise_owned_outcome,
 )
-from kestrel_sovereign.a2a.agent_card import AgentCard
+from kestrel_sovereign.a2a.extensions import (
+    causation_metadata,
+    deserialize_causation_chain,
+    parse_question_correlation,
+)
+from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_label
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores import (
     FeedbackStore,
     MemoryService,
@@ -38,28 +59,18 @@ from kestrel_sovereign.a2a.stores import (
     SessionService,
     TaskStore,
 )
+from kestrel_sovereign.a2a.stores.unified.context_store import ContextStore
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskCancellationSnapshot,
     TaskCognitionWakeCandidate,
     TaskMutationAuthorizationError,
     without_reserved_cancellation_receipt,
 )
-from kestrel_sovereign.a2a.types import (
-    Artifact,
-    Message,
-    Task,
-    TaskArtifactUpdateEvent,
-    TaskSendParams,
-    TaskState,
-    TaskStatus,
-    TaskStatusUpdateEvent,
-    TextPart,
-)
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
 )
-from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
+from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks import HooksManager
@@ -72,7 +83,7 @@ class TaskHandler(Protocol):
         """Handle an A2A task and return the updated task."""
         ...
 
-    def get_skill_for_command(self, command: str) -> Optional[str]:
+    def get_skill_for_command(self, command: str) -> str | None:
         """Find the skill that handles a given command prefix."""
         ...
 
@@ -83,15 +94,15 @@ class TaskCancellationAuthorizationError(PermissionError):
     """The caller has no durable creator/recipient authority for a task."""
 
 
-# Valid state transitions
-VALID_TRANSITIONS: dict[TaskState, set[TaskState]] = {
-    TaskState.SUBMITTED: {TaskState.WORKING, TaskState.CANCELED, TaskState.FAILED},
-    TaskState.WORKING: {TaskState.INPUT_REQUIRED, TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED},
-    TaskState.INPUT_REQUIRED: {TaskState.WORKING, TaskState.CANCELED, TaskState.FAILED},
-    TaskState.COMPLETED: set(),  # Terminal state
-    TaskState.CANCELED: set(),  # Terminal state
-    TaskState.FAILED: set(),  # Terminal state
-    TaskState.UNKNOWN: {TaskState.SUBMITTED},  # Can only become submitted
+# Only a recipient may advance a live task; cancellation has its own atomic
+# creator/recipient authority predicate. Interrupted tasks can resume or end.
+_LIVE_STATES = frozenset({
+    TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING,
+    TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED,
+})
+VALID_TRANSITIONS: dict[int, frozenset[int]] = {
+    state: (_LIVE_STATES | TERMINAL_STATES) - {state}
+    for state in _LIVE_STATES
 }
 
 
@@ -103,34 +114,68 @@ class TaskManager:
     to provide a unified API for task operations.
     """
 
+    @classmethod
+    def from_backend(
+        cls,
+        backend: DatabaseBackend,
+        *,
+        scope: NativeRecipientScope,
+        owns_backend: bool,
+        include_memory: bool = True,
+        include_feedback: bool = True,
+        hooks_manager: Optional["HooksManager"] = None,
+        on_task_complete: Callable[[TaskCognitionWakeCandidate], None] | None = None,
+        on_task_submitted: Callable[[TaskCognitionWakeCandidate], None] | None = None,
+        causation_chain_provider: Callable[[], list | None] | None = None,
+        on_task_cancelled: Callable[[Task], None] | None = None,
+        on_task_cancellation_started: Callable[[str, str], Callable[[], None] | None] | None = None,
+    ) -> "TaskManager":
+        """Build all native stores on one backend with explicit retirement policy.
+
+        Construction performs no I/O. Register boot rollback before awaiting
+        initialize; a host passes its existing backend with owns_backend=False.
+        """
+        return cls(
+            task_store=TaskStore(backend, scope=scope, owns_backend=owns_backend),
+            context_store=ContextStore(backend, owns_backend=owns_backend),
+            session_service=SessionService(backend, owns_backend=owns_backend),
+            observability_store=ObservabilityStore(backend, owns_backend=owns_backend),
+            memory_service=MemoryService(backend, owns_backend=owns_backend) if include_memory else None,
+            feedback_store=FeedbackStore(backend, owns_backend=owns_backend) if include_feedback else None,
+            hooks_manager=hooks_manager,
+            on_task_complete=on_task_complete,
+            on_task_submitted=on_task_submitted,
+            causation_chain_provider=causation_chain_provider,
+            on_task_cancelled=on_task_cancelled,
+            on_task_cancellation_started=on_task_cancellation_started,
+        )
+
     def __init__(
         self,
         task_store: TaskStore,
         session_service: SessionService,
         observability_store: ObservabilityStore,
-        memory_service: Optional[MemoryService] = None,
-        feedback_store: Optional[FeedbackStore] = None,
+        memory_service: MemoryService | None = None,
+        feedback_store: FeedbackStore | None = None,
         hooks_manager: Optional["HooksManager"] = None,
-        on_task_complete: Optional[Callable[[Task], None]] = None,
-        on_task_submitted: Optional[Callable[[Task], None]] = None,
-        causation_chain_provider: Optional[Callable[[], Optional[list]]] = None,
-        host_agent_id: Optional[str] = None,
-        on_task_cancelled: Optional[Callable[[Task], None]] = None,
-        on_task_cancellation_started: Optional[
-            Callable[[str, str], Optional[Callable[[], None]]]
-        ] = None,
+        on_task_complete: Callable[[TaskCognitionWakeCandidate], None] | None = None,
+        on_task_submitted: Callable[[TaskCognitionWakeCandidate], None] | None = None,
+        causation_chain_provider: Callable[[], list | None] | None = None,
+        on_task_cancelled: Callable[[Task], None] | None = None,
+        on_task_cancellation_started: Callable[[str, str], Callable[[], None] | None] | None = None,
+        *,
+        context_store: ContextStore,
     ):
+        if context_store.backend is not task_store.backend:
+            raise ValueError("Task and context admission require the same database backend")
+        self.context_store = context_store
         self.task_store = task_store
         self.session_service = session_service
         self.observability_store = observability_store
         self.memory_service = memory_service
         self.feedback_store = feedback_store
         self.hooks_manager = hooks_manager
-        if host_agent_id is not None and (
-            not isinstance(host_agent_id, str) or not host_agent_id.strip()
-        ):
-            raise ValueError("host_agent_id must be a concrete durable identity")
-        self.host_agent_id = host_agent_id
+        self.host_agent_id = task_store.scope.recipient_id
 
         # Callback for task completion notifications (for chat notifications)
         self._on_task_complete = on_task_complete
@@ -168,8 +213,8 @@ class TaskManager:
         # Event subscribers for SSE streaming
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
 
-        # Agent registry: agent_id -> (AgentCard, TaskHandler)
-        self._agents: dict[str, tuple[AgentCard, TaskHandler]] = {}
+        # Feature providers expose skills; they do not mint peer Agent Cards.
+        self._providers: dict[str, tuple[tuple[AgentSkill, ...], TaskHandler]] = {}
 
         # Skill -> agent mapping for fast lookup
         self._skill_to_agent: dict[str, str] = {}
@@ -182,13 +227,15 @@ class TaskManager:
         self._execution_authorities: dict[
             asyncio.Task[None], tuple[str, str]
         ] = {}
-        # Completed children must not disappear with an unresolved receipt.
-        # Retirement joins physical owners but does not reconcile that receipt.
+        # Retain the first infrastructure failure or stronger custody control
+        # after a child retires. Joining workers cannot reconcile a failed or
+        # uncertain durable write, and must not erase its original error.
         self._execution_control: BaseException | None = None
 
     async def initialize(self) -> None:
         """Initialize all stores."""
         await self.task_store.initialize()
+        await self.context_store.initialize()
         await self.session_service.initialize()
         await self.observability_store.initialize()
         if self.memory_service:
@@ -216,7 +263,7 @@ class TaskManager:
         try:
             await self.drain_execution_tasks(cancel=True)
         except BaseException as error:
-            if not is_execution_control_error(error):
+            if not isinstance(error, Exception) and not is_execution_control_error(error):
                 raise
             failures.append(("execution_tasks", error))
 
@@ -226,6 +273,7 @@ class TaskManager:
             ("memory_service", self.memory_service),
             ("observability_store", self.observability_store),
             ("session_service", self.session_service),
+            ("context_store", self.context_store),
             ("task_store", self.task_store),
         )
         for name, store in stores:
@@ -257,71 +305,62 @@ class TaskManager:
     # Agent Registry (Feature/A2A Unification)
     # =========================================================================
 
-    def register_agent(
+    def register_provider(
         self,
-        agent_card: AgentCard,
+        provider_id: str,
+        skills: Sequence[AgentSkill],
         handler: TaskHandler,
-        command_prefixes: Optional[dict[str, str]] = None,
+        command_prefixes: dict[str, str] | None = None,
     ) -> None:
-        """
-        Register a Feature/Agent with its AgentCard and TaskHandler.
+        """Index a feature's native skills without impersonating a peer agent."""
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            raise ValueError("A task provider requires a concrete registration ID")
+        if provider_id in self._providers:
+            raise ValueError(f"Task provider is already registered: {provider_id}")
+        copied = []
+        for skill in skills:
+            if not isinstance(skill, AgentSkill):
+                raise TypeError("Task providers require official A2A skills")
+            validate_proto_required_fields(skill)
+            if skill.id in self._skill_to_agent or any(item.id == skill.id for item in copied):
+                raise ValueError(f"Task skill is already registered: {skill.id}")
+            owned = AgentSkill()
+            owned.CopyFrom(skill)
+            copied.append(owned)
+        prefixes = dict(command_prefixes or {})
+        skill_ids = {item.id for item in copied}
+        for prefix, skill_id in prefixes.items():
+            if prefix in self._command_to_skill or skill_id not in skill_ids:
+                raise ValueError(f"Invalid or occupied task command: {prefix}")
+        self._providers[provider_id] = (tuple(copied), handler)
+        for skill in copied:
+            self._skill_to_agent[f"{provider_id}.{skill.id}"] = provider_id
+            self._skill_to_agent[skill.id] = provider_id
+        for prefix, skill_id in prefixes.items():
+            self._command_to_skill[prefix] = (provider_id, skill_id)
 
-        Args:
-            agent_card: The agent's capability description
-            handler: The TaskHandler that processes tasks for this agent
-            command_prefixes: Optional mapping of command prefixes to skill IDs
-                             (e.g., {"!list-models": "list_models"})
-        """
-        agent_id = agent_card.name
-        self._agents[agent_id] = (agent_card, handler)
-
-        # Index skills for lookup
-        for skill in agent_card.skills:
-            skill_key = f"{agent_id}.{skill.id}"
-            self._skill_to_agent[skill_key] = agent_id
-
-            # Also register just by skill name for convenience
-            if skill.id not in self._skill_to_agent:
-                self._skill_to_agent[skill.id] = agent_id
-
-        # Register command prefixes if provided
-        if command_prefixes:
-            for prefix, skill_id in command_prefixes.items():
-                self._command_to_skill[prefix] = (agent_id, skill_id)
-
-        logger.info(f"Registered agent: {agent_id} with {len(agent_card.skills)} skills")
-
-    def unregister_agent(self, agent_id: str) -> None:
-        """Unregister an agent."""
-        if agent_id not in self._agents:
+    def unregister_provider(self, provider_id: str) -> None:
+        """Retire a feature's skills and command routes together."""
+        registered = self._providers.pop(provider_id, None)
+        if registered is None:
             return
+        for skill in registered[0]:
+            self._skill_to_agent.pop(f"{provider_id}.{skill.id}", None)
+            self._skill_to_agent.pop(skill.id, None)
+        for command, registration in list(self._command_to_skill.items()):
+            if registration[0] == provider_id:
+                del self._command_to_skill[command]
 
-        agent_card, _ = self._agents[agent_id]
+    def get_agent_skills(self) -> list[AgentSkill]:
+        """Return independent native skill values for the host's one Agent Card."""
+        return [AgentSkill.FromString(skill.SerializeToString())
+                for skills, _ in self._providers.values() for skill in skills]
 
-        # Remove skill mappings
-        for skill in agent_card.skills:
-            skill_key = f"{agent_id}.{skill.id}"
-            self._skill_to_agent.pop(skill_key, None)
-            if self._skill_to_agent.get(skill.id) == agent_id:
-                self._skill_to_agent.pop(skill.id, None)
-
-        # Remove command mappings
-        to_remove = [k for k, v in self._command_to_skill.items() if v[0] == agent_id]
-        for k in to_remove:
-            del self._command_to_skill[k]
-
-        del self._agents[agent_id]
-        logger.info(f"Unregistered agent: {agent_id}")
-
-    def get_agent_cards(self) -> list[AgentCard]:
-        """Get all registered agent cards."""
-        return [card for card, _ in self._agents.values()]
-
-    def get_agent_for_skill(self, skill_id: str) -> Optional[str]:
+    def get_agent_for_skill(self, skill_id: str) -> str | None:
         """Find which agent handles a skill."""
         return self._skill_to_agent.get(skill_id)
 
-    def get_agent_for_command(self, command: str) -> Optional[tuple[str, str]]:
+    def get_agent_for_command(self, command: str) -> tuple[str, str] | None:
         """
         Find which agent/skill handles a command.
 
@@ -339,7 +378,7 @@ class TaskManager:
                 return self._command_to_skill[cmd]
 
         # Fallback: ask each handler
-        for agent_id, (_, handler) in self._agents.items():
+        for agent_id, (_, handler) in self._providers.items():
             skill_id = handler.get_skill_for_command(command)
             if skill_id:
                 return (agent_id, skill_id)
@@ -352,7 +391,7 @@ class TaskManager:
         skill_id: str,
         args: dict[str, Any],
         sync: bool = True,
-        session_id: Optional[str] = None,
+        session_id: str | None = None,
     ) -> Task:
         """
         Execute a skill on an agent.
@@ -370,21 +409,17 @@ class TaskManager:
         Returns:
             The completed (or in-progress) Task
         """
-        if agent_id not in self._agents:
+        if agent_id not in self._providers:
             raise ValueError(f"Unknown agent: {agent_id}")
 
-        _, handler = self._agents[agent_id]
-        authority_agent_id = self.host_agent_id or agent_id
+        _, handler = self._providers[agent_id]
+        authority_agent_id = self.host_agent_id
         hook_feature_name = getattr(handler, "name", None) or agent_id
 
-        # Create task
-        task_id = uuid4().hex
         session_id = session_id or uuid4().hex
-
-        # Execute PRE_TOOL_USE hooks if hooks_manager is configured
+        denied_reason = None
         if self.hooks_manager:
             from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
-
             hook_input = HookInput(
                 session_id=session_id,
                 hook_event_name=HookEvent.PRE_TOOL_USE.value,
@@ -392,101 +427,48 @@ class TaskManager:
                 tool_input=args,
                 feature_name=hook_feature_name,
             )
-
-            hook_output = await self.hooks_manager.execute_hooks(
-                HookEvent.PRE_TOOL_USE,
-                hook_input
-            )
-
-            # Handle hook decision
+            hook_output = await self.hooks_manager.execute_hooks(HookEvent.PRE_TOOL_USE, hook_input)
             if hook_output.permission_decision == PermissionDecision.DENY:
-                # Create a denied task
-                task = Task(
-                    id=task_id,
-                    sessionId=session_id,
-                    status=TaskStatus(
-                        state=TaskState.FAILED,
-                        message=Message(
-                            role="agent",
-                            parts=[TextPart(text=f"Permission denied: {hook_output.permission_reason or 'Blocked by security policy'}")]
-                        )
-                    ),
-                    metadata={"skill": skill_id, "args": args, "agent_id": agent_id, "denied": True},
-                    history=[],
-                )
-                await self.task_store.save(
-                    task,
-                    creator_agent_id=authority_agent_id,
-                    recipient_agent_id=authority_agent_id,
-                )
-                return task
-
-            # Note: SecurityHook handles ASK internally by blocking until
-            # the user responds via the approval queue, so hooks only ever
-            # return ALLOW or DENY here.  There is no need for an ASK branch.
-
-            # Update args if hook modified them
-            if hook_output.updated_input:
+                denied_reason = hook_output.permission_reason or "Blocked by security policy"
+            elif hook_output.updated_input is not None:
                 args = hook_output.updated_input
-
-        task = Task(
-            id=task_id,
-            sessionId=session_id,
-            status=TaskStatus(state=TaskState.SUBMITTED),
-            metadata={"skill": skill_id, "args": args, "agent_id": agent_id},
-            history=[
-                Message(
-                    role="user",
-                    parts=[TextPart(text=f"Execute {skill_id} on {agent_id}")]
-                )
-            ],
+        metadata = {"skill": skill_id, "args": args, "provider_id": agent_id}
+        if self._causation_chain_provider is not None:
+            chain = self._causation_chain_provider()
+            if chain is not None:
+                metadata.update(causation_metadata(chain))
+        request = SendMessageRequest(
+            tenant=self.task_store.scope.tenant,
+            message=new_text_message(
+                f"Execute {skill_id} on {agent_id}", role=Role.ROLE_USER,
+            ),
+            metadata=metadata,
         )
-
-        # Save initial task state
-        await self.task_store.save(
-            task,
-            creator_agent_id=authority_agent_id,
-            recipient_agent_id=authority_agent_id,
-        )
+        task = await self.create_task(request, creator_agent_id=authority_agent_id, notify_submitted=False)
+        if denied_reason is not None:
+            task.metadata.update({"denied": True})
+            task.status.CopyFrom(TaskStatus(
+                state=TaskState.TASK_STATE_REJECTED,
+                message=new_text_message(f"Permission denied: {denied_reason}"),
+            ))
+            task, _ = await self._persist_execution_outcome(
+                task, authority_agent_id=authority_agent_id,
+                expected_state=TaskState.TASK_STATE_SUBMITTED,
+            )
+            return task
 
         if sync:
             # Execute synchronously with transaction safety
             expected_state = task.status.state
             task = await handler.handle_task(task)
-            if task.status.state is TaskState.CANCELED:
-                task, _ = await self._persist_execution_outcome(
-                    task,
-                    authority_agent_id=authority_agent_id,
-                    expected_state=expected_state,
-                )
-            else:
-                try:
-                    async with self.task_store._backend.transaction():
-                        task, _ = await self._persist_execution_outcome(
-                            task,
-                            authority_agent_id=authority_agent_id,
-                            expected_state=expected_state,
-                        )
-                except Exception as save_err:
-                    if is_execution_control_error(save_err):
-                        raise
-                    logger.error(
-                        f"Failed to save task outcome {task.id}: {save_err}. "
-                        "Retrying outside transaction..."
-                    )
-                    try:
-                        task, _ = await self._persist_execution_outcome(
-                            task,
-                            authority_agent_id=authority_agent_id,
-                            expected_state=expected_state,
-                        )
-                    except Exception as retry_err:
-                        if is_execution_control_error(retry_err):
-                            raise
-                        logger.critical(
-                            f"Task outcome {task.id} failed to save permanently: {retry_err}. "
-                            f"Result lost for skill={skill_id}, agent={agent_id}"
-                        )
+            # The canonical outcome writer owns CAS and uncertain-commit
+            # reconciliation. A persistence failure must reach the caller; an
+            # extra transaction/retry cannot manufacture a completed receipt.
+            task, _ = await self._persist_execution_outcome(
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=expected_state,
+            )
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
                 from kestrel_sdk.hooks.base import HookEvent, HookInput
@@ -497,7 +479,7 @@ class TaskManager:
                     tool_name=skill_id,
                     tool_input=args,
                     feature_name=hook_feature_name,
-                    tool_response={"task_id": task.id, "state": task.status.state.value},
+                    tool_response={"task_id": task.id, "state": task_state_label(task.status.state)},
                 )
                 # Post hooks run in parallel (non-blocking)
                 await self.hooks_manager.execute_hooks_parallel(
@@ -528,16 +510,23 @@ class TaskManager:
         def _discard(done: asyncio.Task[None]) -> None:
             from kestrel_sovereign._async_ownership import owned_task_error
             error = owned_task_error(done)
-            if error is not None and is_execution_control_error(error):
-                self._remember_execution_control(error)
+            if error is not None:
+                self._remember_execution_error(error)
+                if not isinstance(error, asyncio.CancelledError) or is_execution_control_error(error):
+                    logger.error(
+                        "Background A2A task %s failed outside its handler",
+                        task_id, exc_info=(type(error), error, error.__traceback__),
+                    )
             self._execution_tasks.discard(done)
             self._execution_authorities.pop(done, None)
 
         task.add_done_callback(_discard)
         return task
 
-    def _remember_execution_control(self, error: BaseException) -> None:
-        if is_execution_control_error(error):
+    def _remember_execution_error(self, error: BaseException) -> None:
+        # A normal cooperative worker cancellation is settled by cancel_task.
+        # Storage failures and native custody receipts remain lifecycle errors.
+        if not isinstance(error, asyncio.CancelledError) or is_execution_control_error(error):
             self._execution_control = execution_terminal_error(self._execution_control, error)
 
     async def drain_execution_tasks(self, *, cancel: bool = False) -> None:
@@ -556,18 +545,19 @@ class TaskManager:
                             agent_name=authority_agent_id,
                         )
                     except ValueError as error:
-                        self._remember_execution_control(error)
+                        if is_execution_control_error(error):
+                            self._remember_execution_error(error)
                     except asyncio.CancelledError as cancellation:
-                        self._remember_execution_control(cancellation)
+                        self._remember_execution_error(cancellation)
                         terminal_errors.append(cancellation)
                     except BaseException as error:
-                        self._remember_execution_control(error)
+                        self._remember_execution_error(error)
                         if not isinstance(error, Exception) and not is_execution_control_error(error):
                             terminal_errors.append(error)
                         # Shutdown must still stop the in-memory worker when its
                         # durable receipt cannot be persisted. The backend error
-                        # is observable in logs, but cannot strand the worker or
-                        # prevent the remaining stores from closing.
+                        # is retained for the lifecycle caller, but cannot
+                        # strand the worker or skip closing the remaining stores.
                         logger.exception(
                             "Could not persist shutdown cancellation for task %s",
                             task_id,
@@ -580,7 +570,7 @@ class TaskManager:
         for task in tasks:
             result = await await_owned_task(task)
             if result.error is not None:
-                self._remember_execution_control(result.error)
+                self._remember_execution_error(result.error)
             if result.cancellation is not None:
                 terminal_errors.append(result.cancellation)
         self._execution_tasks.difference_update(tasks)
@@ -623,9 +613,10 @@ class TaskManager:
                 authority_agent_id,
             )
             if current is not None and current.status.state in {
-                TaskState.COMPLETED,
-                TaskState.FAILED,
-                TaskState.CANCELED,
+                TaskState.TASK_STATE_COMPLETED,
+                TaskState.TASK_STATE_FAILED,
+                TaskState.TASK_STATE_CANCELED,
+                TaskState.TASK_STATE_REJECTED,
             }:
                 return current
             raise
@@ -639,7 +630,19 @@ class TaskManager:
         """Execute a task asynchronously and update the store."""
         expected_state = task.status.state
         try:
-            task = await handler.handle_task(task)
+            try:
+                task = await handler.handle_task(task)
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
+                logger.error("Async task handler failed for %s", task.id, exc_info=True)
+                task.status.CopyFrom(TaskStatus(
+                    state=TaskState.TASK_STATE_FAILED,
+                    message=new_text_message(str(error)),
+                ))
+            # Persistence and notification are infrastructure boundaries. Their
+            # failure cannot rewrite a successful handler result as FAILED or
+            # initiate a second terminal write. The tracked owner retains it.
             task, owns_notification = await self._persist_execution_outcome(
                 task,
                 authority_agent_id=authority_agent_id,
@@ -649,7 +652,7 @@ class TaskManager:
                 await self._notify_status_update(
                     task,
                     final=task.status.state
-                    in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED},
+                    in TERMINAL_STATES,
                 )
         except asyncio.CancelledError as cancellation:
             if is_execution_control_error(cancellation):
@@ -665,27 +668,7 @@ class TaskManager:
                     raise
                 # An independently authorized cancellation or other terminal
                 # result won the race. Never narrate over that durable state.
-                pass
             raise
-        except Exception as e:
-            if is_execution_control_error(e):
-                raise
-            logger.error(f"Async task execution failed: {e}")
-            task.status = TaskStatus(
-                state=TaskState.FAILED,
-                message=Message(role="agent", parts=[TextPart(text=str(e))])
-            )
-            task, owns_notification = await self._persist_execution_outcome(
-                task,
-                authority_agent_id=authority_agent_id,
-                expected_state=expected_state,
-            )
-            if owns_notification:
-                await self._notify_status_update(
-                    task,
-                    final=task.status.state
-                    in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED},
-                )
 
     async def _persist_execution_outcome(
         self,
@@ -696,7 +679,7 @@ class TaskManager:
     ) -> tuple[Task, bool]:
         """Persist a worker result and report ownership of terminal notification."""
 
-        if task.status.state is TaskState.CANCELED:
+        if task.status.state == TaskState.TASK_STATE_CANCELED:
             return (
                 await self._persist_handler_cancellation(
                     task,
@@ -707,7 +690,7 @@ class TaskManager:
 
         terminal_operation_id = (
             uuid4().hex
-            if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}
+            if task.status.state in (TERMINAL_STATES - {TaskState.TASK_STATE_CANCELED})
             else None
         )
         try:
@@ -718,8 +701,6 @@ class TaskManager:
                 terminal_operation_id=terminal_operation_id,
             )
         except Exception as save_error:
-            if is_execution_control_error(save_error):
-                raise
             # Authority/uncertain-COMMIT control is not an ordinary transport
             # failure. A matching terminal token cannot authorize a retired
             # execution to claim a completion wake or start new readback work.
@@ -774,7 +755,7 @@ class TaskManager:
                     exc_info=True,
                 )
                 current = None
-            return (current or task), True
+            return (current if current is not None else task), True
         attempted_states: set[TaskState] = set()
         while saved is False:
             # A terminal writer owns the durable result and its notification.
@@ -789,12 +770,13 @@ class TaskManager:
                 return task, False
             current_state = current.status.state
             if current_state in {
-                TaskState.COMPLETED,
-                TaskState.FAILED,
-                TaskState.CANCELED,
+                TaskState.TASK_STATE_COMPLETED,
+                TaskState.TASK_STATE_FAILED,
+                TaskState.TASK_STATE_CANCELED,
+                TaskState.TASK_STATE_REJECTED,
             }:
                 return current, False
-            if current_state is task.status.state:
+            if current_state == task.status.state:
                 return current, False
             if (
                 task.status.state not in VALID_TRANSITIONS.get(current_state, set())
@@ -812,7 +794,7 @@ class TaskManager:
 
     def _refuse_command_authored_self_followup(
         self, skill_id: str, user_input: str
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Refuse a chat-typed ``self_followup`` schedule (#3112 P1).
 
         Returns a failure dict when the command would create a
@@ -874,11 +856,11 @@ class TaskManager:
         *,
         authority_agent_id: str,
         expected_state: TaskState,
-        terminal_operation_id: Optional[str],
+        terminal_operation_id: str | None,
     ) -> bool:
         """Persist a handler result without mistaking live progress for a winner."""
 
-        if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}:
+        if task.status.state in (TERMINAL_STATES - {TaskState.TASK_STATE_CANCELED}):
             if terminal_operation_id is None:
                 raise ValueError("Terminal execution outcome requires an operation ID")
             return await self.task_store.save_recipient_terminal_outcome(
@@ -891,7 +873,7 @@ class TaskManager:
             recipient_agent_id=authority_agent_id,
             expected_state=expected_state,
         )
-    async def execute_command(self, user_input: str) -> Optional[dict]:
+    async def execute_command(self, user_input: str) -> dict | None:
         """
         Execute a command by routing to the appropriate agent/skill.
 
@@ -930,7 +912,7 @@ class TaskManager:
 
         # Parse command arguments using the tool's parser if available
         args = {}
-        _, handler = self._agents.get(agent_id, (None, None))
+        _, handler = self._providers.get(agent_id, (None, None))
         if handler:
             # Try to get the tool from the handler to use its parse_command_args
             tool = handler._get_tool_by_name(skill_id) if hasattr(handler, '_get_tool_by_name') else None
@@ -955,20 +937,20 @@ class TaskManager:
                 )
 
             # Extract result from task artifacts
-            if task.status.state == TaskState.COMPLETED and task.artifacts:
+            if task.status.state == TaskState.TASK_STATE_COMPLETED and task.artifacts:
                 artifact = task.artifacts[0]
                 if artifact.parts:
                     part = artifact.parts[0]
-                    if hasattr(part, 'data'):
-                        return part.data
-                    elif hasattr(part, 'text'):
+                    if part.HasField('data'):
+                        return MessageToDict(part.data)
+                    elif part.HasField('text'):
                         return {"success": True, "result": part.text}
 
-            if task.status.state == TaskState.FAILED:
+            if task.status.state in {TaskState.TASK_STATE_FAILED, TaskState.TASK_STATE_REJECTED}:
                 error_msg = "Task failed"
                 if task.status.message and task.status.message.parts:
                     for p in task.status.message.parts:
-                        if hasattr(p, 'text'):
+                        if p.HasField('text'):
                             error_msg = p.text
                             break
                 return {"success": False, "error": error_msg}
@@ -1006,92 +988,64 @@ class TaskManager:
 
         return args
 
+    def session_id_for_context(self, context_id: str) -> str:
+        """Namespace an opaque peer context away from host chat session IDs."""
+        return self.task_store.scope.session_id_for_context(context_id)
+
     async def create_task(
         self,
-        params: TaskSendParams,
-        agent_name: str,
-        artifacts: Optional[list[Artifact]] = None,
+        params: SendMessageRequest,
         *,
-        creator_agent_id: Optional[str] = None,
+        creator_agent_id: str,
+        notify_submitted: bool = True,
     ) -> Task:
+        """Admit a new native task after sender and recipient authorization.
+
+        The caller supplies a verified creator, never metadata-derived identity.
+        A continuation must first authorize its existing task through the native
+        handler; this new-task path does not honor peer-chosen task IDs.
         """
-        Create a new task from send parameters.
-
-        Args:
-            params: Task creation parameters including message
-            agent_name: Name of the agent handling this task
-            artifacts: Optional artifacts/references the SENDER attached
-                at task-creation time (send-side handoff payload). These
-                are persisted on the task at SUBMITTED so the recipient
-                can retrieve them before producing any response — the
-                send-side mirror of the responder-side
-                ``add_artifact`` flow.
-            creator_agent_id: Trusted identity of the assigning agent.  This
-                must come from verified envelope or host-attested provenance,
-                never from request metadata.  Local tasks default to
-                ``agent_name`` as both creator and recipient.
-
-        Returns:
-            The created Task object
-        """
-        # Attach the in-flight turn's causation chain to outbound task
-        # metadata if a provider is registered (KestrelAgent wires this
-        # in initialize()). The receiving side reconstructs the chain
-        # via signals.sources.a2a._deserialize_chain when the task
-        # terminates. Empty/missing chains are not stored to avoid
-        # bloating metadata with empty lists.
-        outbound_metadata = dict(params.metadata) if params.metadata else {}
-        if self._causation_chain_provider is not None:
-            try:
-                chain = self._causation_chain_provider()
-            except Exception as e:
-                if is_execution_control_error(e):
-                    raise
-                logger.warning(
-                    "causation_chain_provider raised; proceeding "
-                    "without chain metadata: %s", e,
-                )
-                chain = None
-            if chain:
-                outbound_metadata["causation_chain"] = chain
-
-        # Create task. Sender-supplied artifacts (if any) are attached
-        # at creation so the recipient can retrieve the handoff payload
-        # the moment the task surfaces, without a second round-trip.
-        task = Task(
-            id=params.id,
-            sessionId=params.sessionId,
-            status=TaskStatus(state=TaskState.SUBMITTED),
-            history=[params.message],
-            metadata=without_reserved_cancellation_receipt(outbound_metadata),
-            artifacts=list(artifacts) if artifacts else None,
-        )
-
-        # Save to store
-        if not isinstance(agent_name, str) or not agent_name.strip():
-            raise ValueError("Task authority requires concrete agent identities")
-        recipient_agent_id = agent_name
-        if creator_agent_id is None:
-            creator_id = recipient_agent_id
-        elif isinstance(creator_agent_id, str) and creator_agent_id.strip():
-            creator_id = creator_agent_id
-        else:
-            raise ValueError("Task authority requires concrete agent identities")
-        await self.task_store.save(
-            task,
-            creator_agent_id=creator_id,
-            recipient_agent_id=recipient_agent_id,
-        )
-
+        if not isinstance(params, SendMessageRequest):
+            raise TypeError("Task admission requires an official A2A SendMessageRequest")
+        validate_proto_required_fields(params)
+        metadata = MessageToDict(params.metadata)
+        deserialize_causation_chain(metadata)
+        parse_question_correlation(metadata)
+        if not isinstance(creator_agent_id, str) or not creator_agent_id.strip():
+            raise ValueError("Task admission requires a verified creator identity")
+        if params.tenant != self.task_store.scope.tenant:
+            raise InvalidParamsError(message="A2A tenant does not match the selected recipient")
+        if params.message.task_id:
+            raise InvalidParamsError(message="New task admission cannot select an existing task ID")
+        if params.message.role != Role.ROLE_USER:
+            raise InvalidParamsError(message="Task admission requires a user message")
+        task = new_task_from_user_message(params.message)
+        task.metadata.update(without_reserved_cancellation_receipt(MessageToDict(params.metadata)))
+        # Reserve ownership and task in ONE backend transaction. A failed insert
+        # cannot strand a context reservation or authorize another creator.
+        transaction = (self.task_store.backend.transaction(immediate=True)
+                       if self.task_store.is_sqlite else self.task_store.backend.transaction())
+        async with transaction:
+            ownership = await self.context_store.reserve(
+                task.context_id, self.task_store.scope, creator_agent_id=creator_agent_id,
+            )
+            await self.task_store.create(
+                task, creator_agent_id=creator_agent_id,
+                recipient_agent_id=self.task_store.scope.recipient_id,
+            )
+        projection_id = self.session_id_for_context(task.context_id)
         # Admission is complete only when the durable reservation can wake its
         # recipient.  Fire the synchronous bridge immediately after commit,
         # before any cancellable session/observability await.  The bridge owns
         # its asynchronous delivery through the agent's background-task
         # tracker, so cancellation of this transport coroutine cannot strand a
         # durably SUBMITTED row with no cognition wake.
-        if self._on_task_submitted is not None:
+        if notify_submitted and self._on_task_submitted is not None:
             try:
-                self._on_task_submitted(task)
+                self._on_task_submitted(TaskCognitionWakeCandidate(
+                    task=Task.FromString(task.SerializeToString()),
+                    lifecycle_revision=0, ownership=ownership,
+                ))
             except Exception as e:
                 if is_execution_control_error(e):
                     raise
@@ -1106,20 +1060,17 @@ class TaskManager:
         # are best-effort after the durable task commit; their failure cannot
         # turn an accepted task into a 500 that a retry experiences as a 409.
         try:
-            session = await self.session_service.get_session(params.sessionId)
+            session = await self.session_service.get_session(projection_id)
             if not session:
                 await self.session_service.create_session(
-                    session_id=params.sessionId,
-                    agent_name=agent_name,
-                    metadata=params.metadata or {},
+                    session_id=projection_id,
+                    agent_name=self.host_agent_id,
+                    metadata={"a2a_context_id": task.context_id},
                 )
             await self.session_service.append_event(
-                session_id=params.sessionId,
+                session_id=projection_id,
                 event_type="user_message",
-                data={
-                    "role": params.message.role,
-                    "parts": [p.model_dump() for p in params.message.parts],
-                },
+                data=MessageToDict(params.message),
             )
         except Exception as execution_error:
             if is_execution_control_error(execution_error):
@@ -1132,9 +1083,9 @@ class TaskManager:
 
         try:
             await self.observability_store.log_tool_call(
-                agent_name=agent_name,
+                agent_name=self.host_agent_id,
                 tool_name="task_create",
-                session_id=params.sessionId,
+                session_id=projection_id,
                 metadata={"task_id": task.id},
             )
         except Exception as execution_error:
@@ -1184,19 +1135,20 @@ class TaskManager:
             canonical = task
         if (
             canonical_read_succeeded
-            and canonical.status.state is TaskState.SUBMITTED
+            and canonical.status.state == TaskState.TASK_STATE_SUBMITTED
         ):
             await self._notify_status_update(canonical, final=False)
 
-        logger.info(f"Task created: {task.id} in session {params.sessionId}")
+        logger.info("Native A2A task created: %s in context %s", task.id, task.context_id)
         return canonical
+
 
     async def update_status(
         self,
         task_id: str,
         new_state: TaskState,
-        message: Optional[Message] = None,
-        agent_name: Optional[str] = None,
+        message: Message | None = None,
+        agent_name: str | None = None,
         *,
         recipient_agent_id: str,
     ) -> Task:
@@ -1216,7 +1168,7 @@ class TaskManager:
         Raises:
             ValueError: If state transition is invalid
         """
-        if new_state is TaskState.CANCELED:
+        if new_state == TaskState.TASK_STATE_CANCELED:
             raise TaskCancellationAuthorizationError(
                 "CANCELED is an authorized transition; use cancel_task"
             )
@@ -1225,7 +1177,7 @@ class TaskManager:
             task_id,
             recipient_agent_id,
         )
-        if not task:
+        if task is None:
             raise TaskMutationAuthorizationError(
                 f"Task mutation was not authorized or task was not found: {task_id}"
             )
@@ -1239,13 +1191,10 @@ class TaskManager:
             )
 
         # Update status
-        task.status = TaskStatus(
-            state=new_state,
-            message=message,
-        )
+        task.status.CopyFrom(TaskStatus(state=new_state, message=message))
 
         # Add message to history if provided
-        if message and task.history is not None:
+        if message is not None:
             task.history.append(message)
 
         # Save updated task (use save() to persist both status and history)
@@ -1259,16 +1208,16 @@ class TaskManager:
                 task_id,
                 recipient_agent_id,
             )
-            state = persisted.status.state if persisted else TaskState.UNKNOWN
+            state = persisted.status.state if persisted is not None else TaskState.TASK_STATE_UNSPECIFIED
             raise ValueError(
                 f"Invalid state transition: task is already {state}"
             )
 
         # Determine if this is a final state
-        is_final = new_state in (TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED)
+        is_final = new_state in TERMINAL_STATES
         await self._finish_status_projection(
             task,
-            old_state=current_state.value,
+            old_state=task_state_label(current_state),
             new_state=new_state,
             agent_name=agent_name,
             is_final=is_final,
@@ -1281,7 +1230,7 @@ class TaskManager:
         self,
         task_id: str,
         artifact: Artifact,
-        agent_name: Optional[str] = None,
+        agent_name: str | None = None,
         *,
         recipient_agent_id: str,
     ) -> Task:
@@ -1301,7 +1250,7 @@ class TaskManager:
             task_id,
             recipient_agent_id,
         )
-        if not task:
+        if task is None:
             raise TaskMutationAuthorizationError(
                 f"Task mutation was not authorized or task was not found: {task_id}"
             )
@@ -1320,7 +1269,7 @@ class TaskManager:
         )
 
         # Notify subscribers
-        await self._notify_artifact_update(task_id, artifact)
+        await self._notify_artifact_update(task, artifact)
 
         logger.info(f"Artifact added to task {task_id}: {artifact.name}")
         return task
@@ -1329,11 +1278,19 @@ class TaskManager:
         self,
         task_id: str,
         recipient_agent_id: str,
-    ) -> Optional[Task]:
+    ) -> Task | None:
         """Get one inbox task through its durable recipient principal."""
         return await self.task_store.get_for_recipient(
             task_id,
             recipient_agent_id,
+        )
+
+    async def get_cognition_wake_candidate(
+        self, task_id: str, *, recipient_agent_id: str,
+    ) -> TaskCognitionWakeCandidate | None:
+        """Recover task payload and admission ownership through one scoped read."""
+        return await self.task_store.get_cognition_wake_candidate(
+            task_id, recipient_agent_id=recipient_agent_id,
         )
 
     async def get_task_for_creator(
@@ -1342,7 +1299,7 @@ class TaskManager:
         creator_agent_id: str,
         *,
         recipient_agent_id: str,
-    ) -> Optional[Task]:
+    ) -> Task | None:
         """Get one outbound result through its creator and routed recipient."""
         return await self.task_store.get_for_creator(
             task_id,
@@ -1355,7 +1312,7 @@ class TaskManager:
         task_id: str,
         *,
         recipient_agent_id: str,
-    ) -> Optional[TaskCancellationSnapshot]:
+    ) -> TaskCancellationSnapshot | None:
         """Read the minimal durable state used to withdraw live cognition."""
 
         return await self.task_store.get_cancellation_snapshot(
@@ -1368,9 +1325,9 @@ class TaskManager:
 
         return await self.task_store.is_task_recipient(task_id, agent_id)
 
-    async def get_session_tasks(
+    async def get_context_tasks(
         self,
-        session_id: str,
+        context_id: str,
         *,
         recipient_agent_id: str,
         limit: int = 100,
@@ -1378,7 +1335,7 @@ class TaskManager:
         """Get all tasks in a session."""
         return await self.task_store.list_tasks(
             recipient_agent_id=recipient_agent_id,
-            session_id=session_id,
+            context_id=context_id,
             limit=limit,
         )
 
@@ -1398,9 +1355,9 @@ class TaskManager:
         self,
         *,
         recipient_agent_id: str,
-        session_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        status: Optional[TaskState] = None,
+        context_id: str | None = None,
+        user_id: str | None = None,
+        status: TaskState | None = None,
         limit: int = 100,
     ) -> list[Task]:
         """List tasks with optional filters, across ALL states.
@@ -1411,7 +1368,7 @@ class TaskManager:
         """
         return await self.task_store.list_tasks(
             recipient_agent_id=recipient_agent_id,
-            session_id=session_id,
+            context_id=context_id,
             user_id=user_id,
             status=status,
             limit=limit,
@@ -1435,10 +1392,10 @@ class TaskManager:
     async def cancel_task(
         self,
         task_id: str,
-        reason: Optional[str] = None,
-        agent_name: Optional[str] = None,
-        recipient_agent_id: Optional[str] = None,
-        task_payload: Optional[Task] = None,
+        reason: str | None = None,
+        agent_name: str | None = None,
+        recipient_agent_id: str | None = None,
+        task_payload: Task | None = None,
     ) -> Task:
         """
         Cancel a task.
@@ -1483,9 +1440,9 @@ class TaskManager:
         store_failure: BaseException | None = None
 
         async def is_this_actor_receipt(candidate: Task) -> bool:
-            receipt = (candidate.metadata or {}).get("cancellation_receipt") or {}
+            receipt = MessageToDict(candidate.metadata).get("cancellation_receipt") or {}
             return (
-                candidate.status.state is TaskState.CANCELED
+                candidate.status.state == TaskState.TASK_STATE_CANCELED
                 and receipt.get("actor_agent_id") == agent_name
                 and (
                     recipient_agent_id is None
@@ -1496,7 +1453,7 @@ class TaskManager:
                 )
             )
 
-        async def reconciliation_read() -> Optional[Task]:
+        async def reconciliation_read() -> Task | None:
             """Read only through the authority predicate used by this route."""
 
             if recipient_agent_id is not None:
@@ -1535,7 +1492,7 @@ class TaskManager:
                     and await self.task_store.get_cancellation_operation_id(task_id)
                     == operation_id
                 )
-            except BaseException as reconciliation_failure:
+            except BaseException as reconciliation_failure:  # noqa: BLE001 - preserve both native outcomes before re-raising
                 if rollback_local_intent is not None:
                     rollback_local_intent()
                 raise execution_terminal_error(error, reconciliation_failure)
@@ -1571,20 +1528,21 @@ class TaskManager:
             if rollback_local_intent is not None:
                 rollback_local_intent()
             if current.status.state not in {
-                TaskState.SUBMITTED,
-                TaskState.WORKING,
-                TaskState.INPUT_REQUIRED,
+                TaskState.TASK_STATE_SUBMITTED,
+                TaskState.TASK_STATE_WORKING,
+                TaskState.TASK_STATE_INPUT_REQUIRED,
+                TaskState.TASK_STATE_AUTH_REQUIRED,
             }:
                 raise ValueError(
                     f"Invalid state transition: {current.status.state} -> "
-                    f"{TaskState.CANCELED}"
+                    f"{TaskState.TASK_STATE_CANCELED}"
                 )
             raise TaskCancellationAuthorizationError(
                 f"Agent {agent_name!r} is not authorized to cancel task {task_id!r}"
             )
 
         try:
-            receipt = (task.metadata or {}).get("cancellation_receipt") or {}
+            receipt = MessageToDict(task.metadata).get("cancellation_receipt") or {}
             previous_state = receipt.get("status_before")
             if self._on_task_cancelled is not None:
                 try:
@@ -1600,13 +1558,13 @@ class TaskManager:
                     )
             await self._finish_status_projection(
                 task,
-                old_state=str(previous_state or TaskState.UNKNOWN.value),
-                new_state=TaskState.CANCELED,
+                old_state=str(previous_state or "unspecified"),
+                new_state=TaskState.TASK_STATE_CANCELED,
                 agent_name=agent_name,
                 is_final=True,
                 reason=reason,
             )
-        except BaseException as projection_failure:
+        except BaseException as projection_failure:  # noqa: BLE001 - preserve the original commit receipt before re-raising
             # Exact actor/operation readback proves which CAS committed, not
             # that its UNKNOWN transport outcome may be discarded. Retain the
             # FIRST native receipt through every later callback/projection.
@@ -1617,7 +1575,7 @@ class TaskManager:
             task_id,
             agent_name,
             previous_state,
-            TaskState.CANCELED.value,
+            task_state_label(TaskState.TASK_STATE_CANCELED),
         )
         if store_failure is not None:
             raise store_failure
@@ -1629,9 +1587,9 @@ class TaskManager:
         *,
         old_state: str,
         new_state: TaskState,
-        agent_name: Optional[str],
+        agent_name: str | None,
         is_final: bool,
-        reason: Optional[str] = None,
+        reason: str | None = None,
     ) -> None:
         """Join post-commit projections before propagating caller cancellation."""
 
@@ -1656,7 +1614,7 @@ class TaskManager:
         self,
         task_id: str,
         error: str,
-        agent_name: Optional[str] = None,
+        agent_name: str | None = None,
         *,
         recipient_agent_id: str,
     ) -> Task:
@@ -1671,14 +1629,11 @@ class TaskManager:
         Returns:
             Updated Task object
         """
-        message = Message(
-            role="agent",
-            parts=[TextPart(text=f"Task failed: {error}")]
-        )
+        message = new_text_message(f"Task failed: {error}")
 
         task = await self.update_status(
             task_id=task_id,
-            new_state=TaskState.FAILED,
+            new_state=TaskState.TASK_STATE_FAILED,
             message=message,
             agent_name=agent_name,
             recipient_agent_id=recipient_agent_id,
@@ -1693,7 +1648,7 @@ class TaskManager:
                     agent_name=agent_name,
                     error_type="task_failure",
                     error_message=error,
-                    session_id=task.sessionId,
+                    session_id=self.session_id_for_context(task.context_id),
                     metadata={"task_id": task_id},
                 )
             except Exception as execution_error:
@@ -1711,8 +1666,8 @@ class TaskManager:
         self,
         task_id: str,
         response: str,
-        agent_name: Optional[str] = None,
-        artifacts: Optional[list[Artifact]] = None,
+        agent_name: str | None = None,
+        artifacts: list[Artifact] | None = None,
         *,
         recipient_agent_id: str,
     ) -> Task:
@@ -1738,14 +1693,11 @@ class TaskManager:
                     recipient_agent_id=recipient_agent_id,
                 )
 
-        message = Message(
-            role="agent",
-            parts=[TextPart(text=response)]
-        )
+        message = new_text_message(response)
 
         return await self.update_status(
             task_id=task_id,
-            new_state=TaskState.COMPLETED,
+            new_state=TaskState.TASK_STATE_COMPLETED,
             message=message,
             agent_name=agent_name,
             recipient_agent_id=recipient_agent_id,
@@ -1757,9 +1709,9 @@ class TaskManager:
         *,
         old_state: str,
         new_state: TaskState,
-        agent_name: Optional[str],
+        agent_name: str | None,
         is_final: bool,
-        reason: Optional[str] = None,
+        reason: str | None = None,
     ) -> None:
         """Best-effort projections after the durable task row has committed.
 
@@ -1771,17 +1723,17 @@ class TaskManager:
         event_data: dict[str, Any] = {
             "task_id": task.id,
             "old_state": old_state,
-            "new_state": new_state.value,
+            "new_state": task_state_label(new_state),
         }
-        if new_state is TaskState.CANCELED:
+        if new_state == TaskState.TASK_STATE_CANCELED:
             event_data.update(
                 actor_agent_id=agent_name,
                 reason=reason,
             )
-        if task.sessionId:
+        if task.context_id:
             try:
                 await self.session_service.append_event(
-                    session_id=task.sessionId,
+                    session_id=self.session_id_for_context(task.context_id),
                     event_type="status_update",
                     data=event_data,
                 )
@@ -1797,15 +1749,15 @@ class TaskManager:
         if agent_name:
             metadata: dict[str, Any] = {
                 "task_id": task.id,
-                "state_transition": f"{old_state} -> {new_state.value}",
+                "state_transition": f"{old_state} -> {task_state_label(new_state)}",
             }
-            if new_state is TaskState.CANCELED:
+            if new_state == TaskState.TASK_STATE_CANCELED:
                 metadata["cancellation_reason"] = reason
             try:
                 await self.observability_store.log_agent_response(
                     agent_name=agent_name,
                     duration_ms=0,
-                    session_id=task.sessionId,
+                    session_id=self.session_id_for_context(task.context_id),
                     metadata=metadata,
                 )
             except Exception as execution_error:
@@ -1827,7 +1779,7 @@ class TaskManager:
                 task.id,
                 exc_info=True,
             )
-        if is_final and self.memory_service and task.sessionId:
+        if is_final and self.memory_service and task.context_id:
             try:
                 await self._save_to_memory(task)
             except Exception as execution_error:
@@ -1847,152 +1799,63 @@ class TaskManager:
         self,
         task_id: str,
         *,
-        creator_agent_id: Optional[str] = None,
-        recipient_agent_id: Optional[str] = None,
-    ) -> AsyncGenerator[dict, None]:
-        """
-        Subscribe to task updates via SSE.
-
-        Args:
-            task_id: ID of the task to subscribe to
-
-        Yields:
-            SSE event dictionaries with 'event' and 'data' keys
-        """
+        creator_agent_id: str | None = None,
+        recipient_agent_id: str | None = None,
+    ) -> AsyncGenerator[Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent, None]:
+        """Yield a native task snapshot followed by native SDK event values."""
         if recipient_agent_id is None:
-            raise ValueError(
-                "Task subscription requires the routed recipient identity"
-            )
-        if creator_agent_id is not None:
-            authorized_task = await self.task_store.get_for_creator(
-                task_id,
-                creator_agent_id,
-                recipient_agent_id=recipient_agent_id,
-            )
-        else:
-            authorized_task = await self.task_store.get_for_recipient(
-                task_id,
-                str(recipient_agent_id),
-            )
-        if authorized_task is None:
-            return
-
-        queue: asyncio.Queue = asyncio.Queue()
-
-        # Register subscriber
-        if task_id not in self._subscribers:
-            self._subscribers[task_id] = []
-        self._subscribers[task_id].append(queue)
-
-        try:
-            # Close the admission race: a terminal transition between the
-            # authorization read above and queue registration could not have
-            # notified this subscriber.  Once registered, repeat the same
-            # principal-scoped read; any later transition must enqueue its
-            # update.
+            raise ValueError("Task subscription requires the routed recipient identity")
+        async def read_authorized():
             if creator_agent_id is not None:
-                authorized_task = await self.task_store.get_for_creator(
-                    task_id,
-                    creator_agent_id,
-                    recipient_agent_id=recipient_agent_id,
+                return await self.task_store.get_for_creator(
+                    task_id, creator_agent_id, recipient_agent_id=recipient_agent_id,
                 )
-            else:
-                authorized_task = await self.task_store.get_for_recipient(
-                    task_id,
-                    str(recipient_agent_id),
-                )
-            if authorized_task is None:
+            return await self.task_store.get_for_recipient(task_id, recipient_agent_id)
+        if await read_authorized() is None:
+            return
+        queue: asyncio.Queue[TaskStatusUpdateEvent | TaskArtifactUpdateEvent] = asyncio.Queue()
+        self._subscribers.setdefault(task_id, []).append(queue)
+        try:
+            # Registration precedes the second read so a racing transition is
+            # either in this snapshot or in the queue, never lost between them.
+            task = await read_authorized()
+            if task is None:
                 return
-
-            # Send current state first. If the task is already terminal
-            # (late subscriber), yield with top-level ``final`` so the
-            # endpoint loop breaks cleanly — without this, the SSE
-            # stream stayed alive emitting keepalives until the client
-            # timed out (codex round 1 P2 on PR #1453). Match the same
-            # envelope shape ``_notify_status_update`` uses for the
-            # live-update path so subscribers can rely on one contract.
-            task = authorized_task
-            terminal = task.status.state in (
-                TaskState.COMPLETED,
-                TaskState.CANCELED,
-                TaskState.FAILED,
-            )
-            yield {
-                "event": "status",
-                "data": TaskStatusUpdateEvent(
-                    id=task_id,
-                    status=task.status,
-                    final=terminal,
-                ).model_dump_json(),
-                "final": terminal,
-            }
-            if terminal:
-                # Don't enter the keepalive loop — the subscriber
-                # already has the terminal frame.
+            yield task
+            if task.status.state in TERMINAL_STATES:
                 return
-
-            # Stream updates
             while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=HTTP_TIMEOUT_DEFAULT)
-                    yield event
-
-                    # Stop if final event
-                    if event.get("final"):
-                        break
-                except asyncio.TimeoutError:
-                    # Send keepalive
-                    yield {"event": "keepalive", "data": ""}
-
+                event = await queue.get()
+                yield event
+                if isinstance(event, TaskStatusUpdateEvent) and event.status.state in TERMINAL_STATES:
+                    return
         finally:
-            # Unregister subscriber
-            if task_id in self._subscribers:
-                self._subscribers[task_id].remove(queue)
-                if not self._subscribers[task_id]:
-                    del self._subscribers[task_id]
+            self._subscribers[task_id].remove(queue)
+            if not self._subscribers[task_id]:
+                del self._subscribers[task_id]
 
     async def _notify_status_update(self, task: Task, final: bool) -> None:
-        """Notify all subscribers of a status update."""
-        # Call the global task completion callback if task is in terminal state
-        if final and self._on_task_complete:
+        """Publish the durable native status; no private final flag crosses wire."""
+        if final and self._on_task_complete is not None:
+            candidate = await self.task_store.get_cognition_wake_candidate(
+                task.id, recipient_agent_id=self.host_agent_id,
+            )
+            if candidate is None:
+                raise RuntimeError("Committed task completion has no authoritative wake snapshot")
             try:
-                self._on_task_complete(task)
-            except Exception as e:
-                if is_execution_control_error(e):
+                self._on_task_complete(candidate)
+            except Exception as error:
+                if is_execution_control_error(error):
                     raise
-                logger.error(f"Task completion callback error: {e}")
-
-        # Notify SSE subscribers
-        if task.id not in self._subscribers:
-            return
-
-        event = {
-            "event": "status",
-            "data": TaskStatusUpdateEvent(
-                id=task.id,
-                status=task.status,
-                final=final,
-            ).model_dump_json(),
-            "final": final,
-        }
-
-        for queue in self._subscribers[task.id]:
+                logger.exception("Task completion callback failed for %s", task.id)
+        event = TaskStatusUpdateEvent(task_id=task.id, context_id=task.context_id, status=task.status)
+        for queue in self._subscribers.get(task.id, ()):
             await queue.put(event)
 
-    async def _notify_artifact_update(self, task_id: str, artifact: Artifact) -> None:
-        """Notify all subscribers of a new artifact."""
-        if task_id not in self._subscribers:
-            return
-
-        event = {
-            "event": "artifact",
-            "data": TaskArtifactUpdateEvent(
-                id=task_id,
-                artifact=artifact,
-            ).model_dump_json(),
-        }
-
-        for queue in self._subscribers[task_id]:
+    async def _notify_artifact_update(self, task: Task, artifact: Artifact) -> None:
+        """Publish a native artifact update in the task's context."""
+        event = TaskArtifactUpdateEvent(task_id=task.id, context_id=task.context_id, artifact=artifact)
+        for queue in self._subscribers.get(task.id, ()):
             await queue.put(event)
 
     # =========================================================================
@@ -2001,27 +1864,27 @@ class TaskManager:
 
     async def _save_to_memory(self, task: Task) -> None:
         """Save completed task conversation to long-term memory."""
-        if not self.memory_service or not task.sessionId:
+        if not self.memory_service or not task.context_id:
             return
 
         # Build content from history
         if task.history:
             content_parts = []
             for msg in task.history:
-                role = msg.role
+                role = Role.Name(msg.role)
                 for part in msg.parts:
-                    if hasattr(part, 'text'):
+                    if part.HasField('text'):
                         content_parts.append(f"{role}: {part.text}")
 
             content = "\n".join(content_parts)
 
             await self.memory_service.add_memory(
-                session_id=task.sessionId,
+                session_id=self.session_id_for_context(task.context_id),
                 content=content,
-                tags=["task", task.status.state.value],
+                tags=["task", task_state_label(task.status.state)],
                 metadata={
                     "task_id": task.id,
-                    "completed_at": datetime.now().isoformat(),
+                    "completed_at": datetime.now(UTC).isoformat(),
                 }
             )
 
@@ -2042,48 +1905,24 @@ class TaskManager:
         return await self.task_store.cleanup_old(older_than_days=older_than_days)
 
 
-# Factory function for easy creation
 async def create_task_manager(
     db_path: str,
+    *,
+    scope: NativeRecipientScope,
     include_memory: bool = True,
     include_feedback: bool = True,
-    host_agent_id: Optional[str] = None,
 ) -> TaskManager:
-    """
-    Factory function to create a TaskManager with SQLite stores.
-
-    Args:
-        db_path: Path to SQLite database
-        include_memory: Whether to include MemoryService
-        include_feedback: Whether to include FeedbackStore
-        host_agent_id: Durable DID that owns in-process feature tasks
-
-    Returns:
-        Initialized TaskManager
-    """
-    from kestrel_sovereign.a2a.stores import (
-        SQLiteFeedbackStore,
-        SQLiteMemoryService,
-        SQLiteObservabilityStore,
-        SQLiteSessionService,
-        SQLiteTaskStore,
+    """Create native task admission on one owned SQLite connection."""
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    backend = SQLiteBackend(db_path)
+    await backend.connect()
+    manager = TaskManager.from_backend(
+        backend, scope=scope, owns_backend=True,
+        include_memory=include_memory, include_feedback=include_feedback,
     )
-
-    task_store = SQLiteTaskStore(db_path)
-    session_service = SQLiteSessionService(db_path)
-    observability_store = SQLiteObservabilityStore(db_path)
-
-    memory_service = SQLiteMemoryService(db_path) if include_memory else None
-    feedback_store = SQLiteFeedbackStore(db_path) if include_feedback else None
-
-    manager = TaskManager(
-        task_store=task_store,
-        session_service=session_service,
-        observability_store=observability_store,
-        memory_service=memory_service,
-        feedback_store=feedback_store,
-        host_agent_id=host_agent_id,
-    )
-
-    await manager.initialize()
+    try:
+        await manager.initialize()
+    except BaseException:
+        await backend.close()
+        raise
     return manager

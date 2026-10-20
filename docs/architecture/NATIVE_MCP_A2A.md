@@ -25,9 +25,11 @@ and open gates are recorded in [the spike report](NATIVE_PROTOCOL_SPIKES.md).
 ## Protocol lock and ownership
 
 Use the published [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
-and [A2A 1.0 specification](https://a2a-protocol.org/v1.0.0/specification/).
-Use official Python SDKs at every network boundary. The initial candidates are
-`mcp==2.3.0` and `a2a-sdk==1.2.2`; exact versions belong in dependency locks,
+and [A2A 1.0.1 specification](https://a2a-protocol.org/v1.0.1/specification/),
+the latest released A2A revision checked on 2026-10-19.
+Use official Python SDKs at every network boundary. MCP was tested at 2.3.0;
+the native A2A migration uses the public `a2a-sdk` 1.2.3 release.
+Exact versions belong in dependency locks,
 and dependency ranges must admit the releases we actually test. Old dependency
 caps are subject to migration, not reasons to downgrade the protocol target.
 
@@ -38,10 +40,22 @@ caps are subject to migration, not reasons to downgrade the protocol target.
 | `kestrel-sovereign-sdk` | Remove draft wire models; shared host/feature credential and typed-part contracts; update all consumers |
 | Host manifest packages | Survey published constraints and editable sources; release incompatible consumers before the host floor moves |
 
-Core's `kestrel_sovereign/a2a/types.py` and `kestrel_sovereign/a2a/agent_card.py` are re-exports. The actual
-handwritten models are in `kestrel_sdk/a2a/`. Removing only the core files
-would leave the private wire intact. Inventory both namespaces and their
-consumers before the coordinated SDK/core release. Keep the SDK lightweight:
+The coordinated Core cutover requires **SDK 0.41.0 or newer**. SDK
+[PR #87](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/87)
+and [PR #88](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/88)
+add the shared computer-use, artifact, resource-scope and workspace-transfer
+contracts. Both are included at SDK commit
+`c01a6e933665bf7778c656a9b13dd8b79e371e36`. The immutable `v0.40.0` tag
+at `eff4c1f86bee3a5cf5c40b4d36c95b3ee29e02a8` predates these contracts.
+Use 0.41 as the minimum for Core's eventual dependency upgrade, including its
+lock, consumer constraints and installed-package acceptance tests. The SDK's
+protected publishing review and native-A2A release gates still apply.
+
+Core's `kestrel_sovereign/a2a/types.py` and
+`kestrel_sovereign/a2a/agent_card.py` forward the draft models supplied by its
+current SDK 0.39 line. SDK 0.40 removed those handwritten models; the Core
+cutover to 0.41 must retire both forwarding modules and every old import and
+serialized caller. Keep the SDK lightweight:
 the official A2A dependency belongs to consumers of A2A, not every feature.
 The MCP feature owns the direct `mcp` requirement. Core owns the compatible
 lock and Phoenix dependencies; the dependency spike adds protocol packages as
@@ -363,6 +377,22 @@ bindings enter the same authorization path, including get/list/cancel/subscribe
 and push-notification configuration. Multi-tenant routing binds the recipient
 before signature verification; a signed audience cannot select another tenant.
 
+### Native context ownership
+
+A peer-supplied `contextId` does not authorize access to local chat-session
+state. The native context ownership ledger is keyed by recipient, selected
+tenant and context ID, and binds the context to its verified creator. Reserve
+it after sender verification and recipient authorization, before admitting a
+task. Both bindings use the same ledger. A different sender cannot acquire an
+existing context by submitting another message with its ID.
+
+For a continuation, obtain the context from the authorized existing task and
+reject an inconsistent message context. Read operations check ownership
+without creating a context. Session history remains a projection; it cannot
+grant context ownership. Populate the ledger during the one-time migration
+from authoritative task principals, and fail preflight on ambiguous ownership
+rather than choosing an owner from caller metadata or historical display names.
+
 ### Semantic mapping
 
 Extension identifiers below are the canonical URL of this document followed by
@@ -384,7 +414,95 @@ holds extension payloads. Unknown required extensions fail before task creation.
 | Cancellation authority | Core CancelTask plus recipient policy | Authenticate creator/recipient authority on every mutation |
 | Wake signals | Internal transition events | One committed transition drives existing wake hooks |
 
+### Recipient policy v1
+
+Native admission authenticates the caller and applies recipient policy before
+creating a context or task. The committed task's creator, recipient and tenant
+columns are the authority for later reads and wakes. A native wake snapshot
+carries these admission facts together with its context and lifecycle revision;
+it is not an independent authentication proof. Every public producer must pass
+the verified caller and host-selected recipient scope to the same admission
+path. Caller metadata such as `sender`, `sender_verified`, or a claimed creator
+never changes those facts or the signal's trust.
+
+Immediate callbacks, restart reads and privacy-elided signal rehydration use
+the same snapshot. Reject missing principals and a recipient/context mismatch.
+Peer context IDs map to a host-chat projection that includes recipient and
+tenant; a peer cannot select an existing human chat session by naming it.
+
+Reuse `RecipientA2ASenderAuthorizer`, scoped requester contexts and durable
+cancellation authority. An external peer may authenticate with a standard
+advertised security scheme without implementing the DID extension only when
+the recipient explicitly permits that principal and the extension is optional
+on that card. A recipient requiring DID proof must advertise it as required;
+do not lower that policy to pass an interop test. Standard-only peer tests use
+an explicitly provisioned principal and a compatible card policy.
+
+### Question correlation v1
+
+The metadata key is this document's `#question-correlation-v1` URI. Its payload
+has exactly `version`, `kind`, and `question_id`:
+
+```json
+{"version": 1, "kind": "question", "question_id": "sender-owned-question-id"}
+```
+
+`kind` is `question` or `answer`; `question_id` is a non-empty opaque string
+chosen and persisted by the question sender before dispatch. An answer uses
+that same ID. These fields describe correlation and never authorize settlement:
+the receiver must match the outstanding question's durable sender, recipient
+and tenant before recording an answer or emitting a question-answered wake.
+The native intake/outbound integration must enforce that ledger check; parsing
+or displaying this payload alone does not satisfy the correlation gate.
+
+### Causation v1
+
+The metadata key is this document's `#causation-v1` URI. Its payload has exactly
+`version` and `chain`. The chain contains canonical SDK `CausationFrame` values:
+
+```json
+{"version": 1, "chain": [{"agent_id": "did:example:sender", "source": "cron.followup", "signal_id": "source-event-id", "turn_id": null, "depth": 1, "emitted_at": "2026-10-20T00:00:00+00:00"}]}
+```
+
+Frame identity/source strings must be non-empty, depth is a non-negative
+integer, and timestamps require a timezone. `turn_id` may be omitted or null.
+Reject malformed declared extensions before task/context admission; do not
+drop broken frames and restart a chain. Protobuf Struct's integral numeric
+forms such as `1.0` retain the same numeric meaning as `1`; booleans are not
+versions or depths. Causation supports attribution and loop detection only.
+It never chooses the creator, recipient or authorization policy.
+
 ### Signed sender v1
+
+The proof travels in exactly one `Kestrel-A2A-Sender-Proof` HTTP header for
+every native operation, including reads and subscriptions whose request types
+have no metadata. Activate the extension through `A2A-Extensions`. Its compact
+encoding is `base64url(claims).base64url(classical_signature).base64url(pq_signature)`;
+all segments are unpadded and canonical. This format is an extension proof,
+not JWS. Reject duplicates, non-ASCII headers and headers exceeding the host's
+configured size limit before resolving a DID. The initial limit is 8192 bytes.
+
+Claims are RFC 8785 bytes with these exact fields: `version` (1), `protocol`
+(`"1.0"`), `extension` (this extension URI), `sender`, `recipient`, `operation`
+(the SDK service operation name), `request_digest` (lowercase SHA-256 hex of
+the complete official ProtoJSON request), `timestamp` (integer Unix seconds),
+`nonce` (32 lowercase hex characters), `extensions` (sorted unique activated
+extension URIs), and `signers` (the ordered `{alg,kid}` entries). V1 uses
+`ed25519` followed by `ml-dsa-65`; signatures cover the exact claims bytes,
+including their signer identifiers. The separate proof header excludes no
+field from the native request digest. Claim JSON must be canonical, with no
+unknown fields or duplicate keys. Validate required native request fields and
+the actual operation/input-type pair before hashing.
+
+The default verification window permits 300 seconds of clock skew in either
+direction. Spend a verified nonce in the mandatory shared replay store for
+twice that window, covering a future-dated proof's full validity. A replay
+store failure or uncertain reservation propagates; there is no process-local
+degradation or nonce rollback. These limits are host policy configuration.
+The proof establishes identity only. Recipient authorization and live
+identity-epoch validation must still precede task creation or other effects.
+This schema is an implementation contract; Core route integration, signed
+cards, conformance and interoperability remain release gates below.
 
 The extension contains sender DID, recipient DID, operation, timestamp, nonce
 and the sender proof. Bind the complete official request payload (including
@@ -409,7 +527,7 @@ and explicitly set optional defaults, and exclude `signatures`. The normative
 [section 8.4.1](https://a2a-protocol.org/v1.0.0/specification/#841-canonicalization-requirements)
 is the canonical-byte oracle, not a same-helper signing round trip.
 
-**Signed-card release gate:** `a2a-sdk==1.2.2` does not implement that oracle:
+**Signed-card release gate:** the public `a2a-sdk==1.2.3` still does not implement that oracle:
 its default `MessageToDict` serialization omits required no-presence fields
 at their defaults (including `description` and required repeated fields),
 then its recursive empty cleanup removes explicitly present empties such as
@@ -427,35 +545,24 @@ absent versus explicitly empty optional values, explicit false capabilities,
 and the implicit empty interface tenant. Require both official SDK helpers
 and an independent verifier to pass before releasing signed cards and the
 coordinated A2A cutover. Plain `model_dump()` plus JCS is insufficient.
+
+On October 20, 2026, upstream closed the contributed
+[presence repair #1355](https://github.com/a2aproject/a2a-python/pull/1355#issuecomment-6290258412)
+without merging it: changing signed bytes requires a major release under its
+compatibility policy. The upstream reviewer identified
+[#1278](https://github.com/a2aproject/a2a-python/issues/1278) as the active
+discussion and [#1279](https://github.com/a2aproject/a2a-python/pull/1279) as the
+non-breaking warning response. A warning does not satisfy the byte/signature
+gate above. This external gate applies to signed cards and the coordinated
+release; continue the native host, transport, storage and outbound migration
+while it remains unresolved. There is no need to retain the draft wire protocol
+while developing those changes in the cutover worktree.
+
 Use the agent's Ed25519 verification method and a DID-bound `kid`; the existing hybrid message
 proof is not substituted for an interoperable Agent Card signature. Verify the
 card against a trusted DID resolution result before trusting advertised URLs
 or capabilities. A card containing its own untrusted key is not a trust root.
 Card signature verification does not authenticate an incoming caller.
-
-### Recipient policy v1
-
-Reuse `RecipientA2ASenderAuthorizer`, scoped requester contexts and durable
-cancellation authority. An external peer may authenticate with a standard
-advertised security scheme without implementing the DID extension only when
-the recipient explicitly permits that principal and the extension is optional
-on that card. A recipient requiring DID proof must advertise it as required;
-do not lower that policy to pass an interop test. Standard-only peer tests use
-an explicitly provisioned principal and a compatible card policy.
-
-### Question correlation v1
-
-Carry question ID, reply expectation and answer reference in extension
-metadata. Use core task/context/message identifiers for transport identity.
-Retain `kestrel_sovereign/storage/async_pending_a2a_question_store.py`, recipient binding and
-`a2a_question_answered` wake behavior. Duplicate, unsolicited and wrong-peer
-answers cannot satisfy another agent's pending wait.
-
-### Causation v1
-
-Carry the typed CausationFrame chain in extension metadata, covered by sender
-proof. Apply existing depth/loop validation. Caller-supplied causation cannot
-authorize reads, cancel a task, govern descendants or bypass approval.
 
 ### Persistence, outbound and retirement
 
@@ -505,13 +612,22 @@ changes). Signing a card does not authorize arbitrary callback egress.
    is required for ordinary tool access.
 3. Add remote connections/OAuth/registry, then Apps and Tasks. Remote write
    scopes remain gated on [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
-4. Before the breaking A2A core/SDK release, publish/test consumers admitting
-   the new floors: Talon 0.2.13 and Features 0.3.2 currently cap core below
-   0.54. Telegram, Talon, Features and editable Claws/Eye/Flight also cap SDK
-   below 0.40. Update their constraints and actual callers; do not weaken the
-   new core/SDK floor. Then release the coordinated SDK/core A2A cutover with
-   storage migration and every consumer updated. Run both A2A bindings through the TCK and a
-   different-framework bidirectional task/card-verification exercise.
+4. Complete the native-A2A callers and storage migration, then publish/test
+   the coordinated Core dependency cutover with **SDK >=0.41.0**. Re-survey
+   consumers and update their actual callers and constraints: the recorded
+   survey found Core ceilings below 0.54 in Talon/Features and SDK ceilings
+   below 0.40 in Telegram, Talon, Features and editable Claws/Eye/Flight.
+   Verify clean installed SDK 0.41 contracts and the full host feature manifest;
+   an isolated source install does not establish Core compatibility. Reconcile
+   this branch with current main before its final full-diff review, preserving
+   the architecture/artifact-safety prerequisites and the encrypted-store
+   recovery code and documentation merged in
+   [#3730](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/3730).
+   Run both A2A bindings through the TCK and a different-framework bidirectional
+   task/card-verification exercise. Computer-use runtime, artifact viewer/editor
+   and provider acceptance remain tracked in
+   [#3703](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3703)
+   and [#3711](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3711).
 5. Implement the server direction under [#1990](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1990),
    reusing MCP 2.x, per-agent routing, protected-resource metadata, credential
    governance and the normal memory/turn persistence path.

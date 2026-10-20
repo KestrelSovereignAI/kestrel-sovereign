@@ -92,14 +92,14 @@ class FeedbackStore(UnifiedStoreBase):
     with a single implementation that works with any DatabaseBackend.
     """
 
-    def __init__(self, backend: DatabaseBackend):
+    def __init__(self, backend: DatabaseBackend, *, owns_backend: bool = True):
         """
         Initialize feedback store with database backend.
 
         Args:
             backend: DatabaseBackend instance (SQLite or PostgreSQL)
         """
-        super().__init__(backend)
+        super().__init__(backend, owns_backend=owns_backend)
 
     async def initialize(self) -> None:
         """Create tables if not exists."""
