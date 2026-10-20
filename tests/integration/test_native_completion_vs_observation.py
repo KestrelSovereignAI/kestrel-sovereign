@@ -9,6 +9,7 @@ from kestrel_sovereign.host_features.context import _close_partial_host_resource
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from tests.integration.test_host_onboarding_original_admission import onboarding_owner as _onboarding_owner
 from tests.unit.test_host_context_native_cleanup import _actual_operation
+from tests.utils.native_admission_fault import create_admission_task
 from tests.utils.original_failure import OriginalFailure
 
 onboarding_owner = _onboarding_owner
@@ -33,11 +34,35 @@ def observation_factory(predicate, failure, attached, accepted, previous, *, eag
 
     def factory(loop, coroutine, **kwargs):
         if predicate(_actual_operation(coroutine)):
-            task = ObservationTask(coroutine, loop=loop, eager_start=eager, **kwargs)
+            task = create_admission_task(ObservationTask, coroutine, loop=loop, eager=eager, **kwargs)
             accepted.append(task)
             return task
         return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
     return factory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eager", [False, True])
+async def test_actual_admission_task_constructor_preserves_requested_start(eager):
+    entered = []
+
+    class OriginalTask(asyncio.Task):
+        pass
+
+    async def operation():
+        entered.append(asyncio.current_task())
+        return "original completion"
+
+    task = create_admission_task(
+        OriginalTask, operation(), loop=asyncio.get_running_loop(), eager=eager,
+    )
+    try:
+        assert type(task) is OriginalTask
+        assert bool(entered) is eager
+        assert await task == "original completion"
+        assert entered == [task]
+    finally:
+        await await_owned_task(task)
 
 
 @pytest.mark.asyncio

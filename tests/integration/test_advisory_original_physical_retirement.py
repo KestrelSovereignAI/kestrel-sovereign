@@ -15,10 +15,11 @@ from kestrel_sovereign.execution_custody import (
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
 from tests.integration.test_execution_custody_review56_pg import lose_native_ack
+from kestrel_sovereign.storage.db.postgres import TerminalAdvisoryBarrier
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("route", "shared"), [("advisory", False), ("advisory", True), ("polled", False)])
+@pytest.mark.parametrize(("route", "shared"), [("advisory", False), ("advisory", True), ("polled", False), ("terminal", False)])
 @pytest.mark.parametrize("body_kind", ["unknown", "cancel"])
 async def test_advisory_error_exit_joins_original_server_session(
     native_pg, monkeypatch, route, shared, body_kind,
@@ -45,8 +46,9 @@ async def test_advisory_error_exit_joins_original_server_session(
     task = None
 
     async def run():
-        lease = (backend.advisory_locks([key], shared=shared, on_loss=lambda _lease: None)
-                 if route == "advisory" else backend.polled_advisory_lock(key))
+        lease = (backend.polled_advisory_lock(key) if route == "polled" else
+                 backend.advisory_locks(TerminalAdvisoryBarrier((key,)) if route == "terminal" else [key],
+                                        shared=shared, on_loss=lambda _lease: None))
         async with lease as capability:
             connection = (capability._connection if capability is not None else
                           next(holder._proxy for holder in backend._advisory_pool._holders if holder._in_use is not None))
@@ -202,7 +204,7 @@ async def test_advisory_failed_closer_retains_original_resource_debt(native_pg, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["advisory", "polled"])
+@pytest.mark.parametrize("route", ["advisory", "polled", "terminal"])
 async def test_unlock_ack_failure_joins_original_native_protocol_tail(native_pg, monkeypatch, route):
     import asyncpg
 
@@ -238,7 +240,8 @@ async def test_unlock_ack_failure_joins_original_native_protocol_tail(native_pg,
         with monkeypatch.context() as patch:
             patch.setattr(asyncpg.Connection, "execute", observed_execute)
             patch.setattr(asyncpg.Connection, "fetchval", observed_fetchval)
-            lease = backend.advisory_locks([key]) if route == "advisory" else backend.polled_advisory_lock(key)
+            lease = (backend.polled_advisory_lock(key) if route == "polled" else
+                     backend.advisory_locks(TerminalAdvisoryBarrier((key,)) if route == "terminal" else [key]))
             with pytest.raises(OSError) as caught:
                 async with lease as capability:
                     proxy = (capability._connection if capability is not None else

@@ -25,35 +25,48 @@ ADVANCED MODE:
 import asyncio
 import contextvars
 import logging
-from collections.abc import Callable, Sequence as SequenceABC
+from collections.abc import Callable
+from collections.abc import Sequence as SequenceABC
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
-from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
-from kestrel_sovereign.native_retirement import (
-    _begin_native_resource, _native_observation_requested,
-    _settle_native_observer_enrollment,
-    _require_native_observation_for_connection,
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission,
+    await_owned_task,
+    create_owned_task,
 )
 from kestrel_sovereign.execution_custody import (
     AcknowledgedExecutionCommit,
-    NativeExecutionRetirement,
     ExecutionAuthorityError,
-    ExecutionCustody,
     ExecutionCommitOutcomeError,
+    ExecutionCustody,
+    NativeExecutionRetirement,
+    bind_execution_cleanup,
+    current_execution_custody,
     execution_commit_outcome,
     execution_denial_scopes,
     execution_error_with_cause,
     execution_terminal_error,
-    current_execution_custody,
+    is_execution_control_error,
     lock_execution_authority,
     require_execution_backend,
+    require_execution_work,
     retain_acknowledged_execution_commit,
-    is_execution_control_error,
+)
+from kestrel_sovereign.native_retirement import (
+    _begin_native_resource,
+    _native_observation_requested,
+    _require_native_observation_for_connection,
+    _settle_native_observer_enrollment,
 )
 
+from .after_commit import (
+    AfterCommitCallback,
+    AfterCommitCallbacks,
+    run_after_commit,
+)
 from .interface import (
     ConnectionError,
     DatabaseBackend,
@@ -64,13 +77,8 @@ from .interface import (
 )
 from .placeholder import sqlite_to_postgres
 from .timestamp import TimestamptzParameter
-from .after_commit import (
-    AfterCommitCallback,
-    AfterCommitCallbacks,
-    run_after_commit,
-)
-from .write_audit import record_write_query, record_write_script
 from .transaction_control import reject_transaction_control
+from .write_audit import record_write_query, record_write_script
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +171,66 @@ class _OperationalSessionLease:
     commit_state: _ExecutionCommitState = field(default_factory=_ExecutionCommitState)
 
 
+@dataclass(frozen=True)
+class TerminalAdvisoryBarrier:
+    """Exact exclusive keys for a physical terminal barrier, NOT work authority.
+
+    A host's fixed terminal API must independently validate original durable
+    target/operation permission. This request supplies no executor, connection,
+    callback or claim, and cannot initialize a disconnected backend.
+    """
+
+    keys: tuple[tuple[int, int], ...]
+    backend_type: str = field(default="postgres", init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.keys) is not tuple or not self.keys:
+            raise ValueError("terminal advisory barrier requires nonempty immutable keys")
+        for pair in self.keys:
+            if type(pair) is not tuple or len(pair) != 2:
+                raise TypeError("terminal advisory keys must be immutable integer pairs")
+            if any(type(value) is not int for value in pair):
+                raise TypeError("terminal advisory keys must be signed 32-bit integers, not bool")
+            if any(not -(2**31) <= value < 2**31 for value in pair):
+                raise ValueError("terminal advisory keys must be signed 32-bit integers")
+
+    def require_work(self) -> None:
+        raise ExecutionAuthorityError("terminal physical barrier never admits ordinary work")
+
+    async def lock_and_validate(self, connection: Any) -> None:
+        self.require_work()
+
+
+@dataclass(frozen=True)
+class _TerminalAdvisoryLifetime:
+    """Finite original connected-backend identities across awaited checkout."""
+
+    backend: Any
+    pool: Any
+    delegate: Any
+
+    @classmethod
+    def capture(cls, backend: Any) -> "_TerminalAdvisoryLifetime":
+        original = cls(backend, backend._pool, backend._advisory_backend)
+        original.require_live()
+        return original
+
+    def require_live(self) -> None:
+        if (self.pool is None or self.backend._pool is not self.pool
+            or self.backend._advisory_backend is not self.delegate
+            or (self.delegate is not None and
+                (self.delegate._pool is not self.pool or self.delegate._advisory_backend is not None))):
+            raise ConnectionError("terminal advisory barrier requires the original connected backend and shared owner")
+        native = self.pool.native_pool if isinstance(self.pool, PostgresPoolAdapter) else self.pool
+        if asyncpg is None or not isinstance(native, asyncpg.Pool) or native.is_closing():
+            raise ConnectionError("terminal advisory barrier requires the original connected backend native pool")
+
+    def require_backend(self, backend: Any) -> None:
+        self.require_live()
+        if backend is not self.backend and backend is not self.delegate:
+            raise ConnectionError("terminal advisory barrier cannot substitute its backend")
+
+
 class AdvisoryLease:
     """Exact physical-session capability, never revived by reconnection.
 
@@ -192,6 +260,10 @@ class AdvisoryLease:
                 self._on_loss(self)
 
     def require_live(self) -> None:
+        self.require_physical()
+
+    def require_physical(self) -> None:
+        """Validate this SAME original session, without admitting new work."""
         if self._state in ("acquiring", "held"):
             try:
                 closed = self._connection.is_closed()
@@ -208,7 +280,7 @@ class AdvisoryLease:
             )
 
     def _admit(self) -> None:
-        self.require_live()
+        self.require_physical()
         self._state = "held"
 
     def _retire(self) -> None:
@@ -226,6 +298,31 @@ class AdvisoryLease:
             # probing that invalid proxy must not mask the original loss.
             return False
         return True
+
+
+class TerminalAdvisoryLease(AdvisoryLease):
+    """Physical exclusion only; even a new ordinary fence cannot upgrade it."""
+
+    def __init__(self, connection: Any, on_loss: Callable[[AdvisoryLease], None] | None,
+                 *, lifetime: _TerminalAdvisoryLifetime) -> None:
+        super().__init__(connection, on_loss)
+        self._lifetime = lifetime
+        self._loss_scopes = current_execution_custody(lifetime.backend)
+
+    def _connection_terminated(self, connection: Any) -> None:
+        # asyncpg dispatches in the transport's creation context, not listener
+        # registration context. A reused ordinary session predates this barrier.
+        # Keep the original scope union and cleanup-only admission for callbacks
+        # and their children; never restore an unrestricted transport context.
+        with bind_execution_cleanup(self._lifetime.backend, self._loss_scopes):
+            super()._connection_terminated(connection)
+
+    def require_physical(self) -> None:
+        self._lifetime.require_live()
+        super().require_physical()
+
+    def require_live(self) -> None:
+        raise ExecutionAuthorityError("terminal advisory barrier never admits ordinary work")
 
 
 def is_concurrent_update_error(exc: BaseException) -> bool:
@@ -758,8 +855,6 @@ class PostgresBackend(DatabaseBackend):
         Borrowed primary pools are only detached; their caller retains custody.
         """
         errors: list[BaseException] = []
-        from kestrel_sovereign._async_ownership import owned_task_admission_error, owned_task_error
-        owners = vars(self).setdefault("_pool_close_owners", {})
         for attribute in ("_advisory_pool", "_pool"):
             pool = getattr(self, attribute)
             if pool is None:
@@ -768,42 +863,52 @@ class PostgresBackend(DatabaseBackend):
                 if self._pool is pool:
                     self._pool = None
                 continue
-            record = owners.get(attribute)
-            if record is None or record[0] is not pool:
-                admission = OwnedTaskAdmission()
-                record = [pool, None, None]
-                owners[attribute] = record
-                try:
-                    record[1] = create_owned_task(
-                        pool.close(), retirement_resource=pool, retain_originals=True,
-                        admission=admission,
-                    )
-                except BaseException as error:
-                    record[1] = admission.task
-                    record[2] = owned_task_admission_error(pool, admission, error)
-            task, opening = record[1:]
-            if task is None:
-                errors.append(opening)
-                continue
-            outcome = await await_owned_task(task)
-            errors.extend((opening, outcome.error, outcome.cancellation))
-            physical = owned_task_error(task)
-            if opening is None and physical is None and getattr(self, attribute) is pool:
-                setattr(self, attribute, None)
-                owners.pop(attribute, None)
-            elif opening is None and physical is not None and not is_execution_control_error(physical):
-                # An ordinary, physically joined availability failure keeps
-                # the pool handle and its legacy explicit-call retry contract.
-                # Refused/unpublished admission or native uncertainty never
-                # takes this branch, and no live original can be overlapped.
-                if owners.get(attribute) is record:
-                    owners.pop(attribute, None)
+            errors.append(await self._retire_owned_pool(attribute, pool))
         terminal = execution_terminal_error(
             *errors, retain_originals=True, prefer_cancellation=True,
             isolate_control_originals=True,
         )
         if terminal is not None:
             raise terminal
+
+    async def _retire_owned_pool(self, attribute: str, pool: Any) -> BaseException | None:
+        """One exact pool closer for backend exit and refused new allocation."""
+        from kestrel_sovereign._async_ownership import (
+            owned_task_admission_error,
+            owned_task_error,
+        )
+
+        owners = vars(self).setdefault("_pool_close_owners", {})
+        record = owners.get(attribute)
+        if record is None or record[0] is not pool:
+            admission = OwnedTaskAdmission()
+            record = [pool, None, None]
+            owners[attribute] = record
+            try:
+                record[1] = create_owned_task(
+                    pool.close(), retirement_resource=pool, retain_originals=True,
+                    admission=admission,
+                )
+            except BaseException as error:
+                record[1] = admission.task
+                record[2] = owned_task_admission_error(pool, admission, error)
+        task, opening = record[1:]
+        if task is None:
+            return opening
+        outcome = await await_owned_task(task)
+        physical = owned_task_error(task)
+        if opening is None and physical is None and getattr(self, attribute) is pool:
+            setattr(self, attribute, None)
+            owners.pop(attribute, None)
+        elif opening is None and physical is not None and not is_execution_control_error(physical):
+            # Preserve the ordinary joined availability-failure retry contract;
+            # refused/unpublished or uncertain owners never take this branch.
+            if owners.get(attribute) is record:
+                owners.pop(attribute, None)
+        return execution_terminal_error(
+            opening, outcome.error, outcome.cancellation, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
     
     def _ensure_connected(self) -> asyncpg.Pool:
         """Ensure we have an active pool."""
@@ -812,17 +917,26 @@ class PostgresBackend(DatabaseBackend):
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._pool
 
-    async def _ensure_advisory_pool(self) -> "asyncpg.Pool":
+    async def _ensure_advisory_pool(
+        self, *, terminal_lifetime: _TerminalAdvisoryLifetime | None = None,
+    ) -> "asyncpg.Pool":
         """Return the bounded pool used only for long advisory-lock gates."""
 
         # Retain the normal backend lifecycle check: an advisory pool is not a
         # hidden replacement for a closed primary database backend.
-        self._ensure_connected()
+        if terminal_lifetime is None:
+            self._ensure_connected()
+        elif type(terminal_lifetime) is not _TerminalAdvisoryLifetime:
+            raise TypeError("terminal advisory allocation requires its typed physical barrier")
+        else:
+            terminal_lifetime.require_backend(self)
         if self._advisory_backend is not None:
-            return await self._advisory_backend._ensure_advisory_pool()
+            return await self._advisory_backend._ensure_advisory_pool(terminal_lifetime=terminal_lifetime)
         if self._advisory_pool is not None:
             return self._advisory_pool
         async with self._advisory_pool_lock:
+            if terminal_lifetime is not None:
+                terminal_lifetime.require_backend(self)
             if self._advisory_pool is not None:
                 return self._advisory_pool
             kwargs = dict(self._advisory_connect_kwargs)
@@ -857,6 +971,15 @@ class PostgresBackend(DatabaseBackend):
                     f"Failed to create dedicated PostgreSQL advisory-lock pool: {exc}"
                 ), exc)
             self._advisory_pool = pool
+            if terminal_lifetime is not None:
+                try:
+                    terminal_lifetime.require_backend(self)
+                except ConnectionError as refusal:
+                    cleanup = await self._retire_owned_pool("_advisory_pool", pool)
+                    raise execution_terminal_error(
+                        refusal, cleanup, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
             return pool
     
     def _convert_query(self, query: str) -> str:
@@ -1766,12 +1889,12 @@ class PostgresBackend(DatabaseBackend):
     @asynccontextmanager
     async def advisory_locks(
         self,
-        keys: Sequence[Tuple[int, int]],
+        keys: Sequence[Tuple[int, int]] | TerminalAdvisoryBarrier,
         *,
         shared: bool = False,
         expected_cluster_identity: Optional[str] = None,
         on_loss: Callable[[AdvisoryLease], None] | None = None,
-    ) -> AsyncIterator[AdvisoryLease | None]:
+    ) -> AsyncIterator[AdvisoryLease | TerminalAdvisoryLease | None]:
         """Hold multiple session advisory locks on one bounded-pool connection.
 
         A multi-tenant bootstrap can need to drain effects for more than one
@@ -1791,7 +1914,13 @@ class PostgresBackend(DatabaseBackend):
         intentionally separate from the operational pool, so merely probing
         the latter does not prove which cluster serialized the operation.
         """
-        normalized_keys = tuple(keys)
+        terminal = type(keys) is TerminalAdvisoryBarrier
+        if isinstance(keys, TerminalAdvisoryBarrier) and not terminal:
+            raise TypeError("terminal advisory barrier must use the exact canonical request type")
+        if terminal and shared is not False:
+            raise ValueError("terminal advisory barriers must be exclusive")
+        request = keys if terminal else None
+        normalized_keys = request.keys if terminal else tuple(keys)
         for namespace, key in normalized_keys:
             if not isinstance(namespace, int) or not isinstance(key, int):
                 raise TypeError("PostgreSQL advisory lock keys must be integers")
@@ -1803,21 +1932,61 @@ class PostgresBackend(DatabaseBackend):
                 raise ValueError("empty advisory keys cannot grant authority custody")
             yield None
             return
+        failure = None
+        admission = ExecutionCustody(request) if terminal else None
+        try:
+            # Denial begins BEFORE allocation, listener registration or init
+            # callbacks, and remains through original native pool retirement.
+            # This request is an always-denying fence, not an acquiring lease.
+            with bind_execution_cleanup(self, (admission,)) if terminal else nullcontext():
+                async with self._advisory_lock_session(
+                    normalized_keys, shared=shared, expected_cluster_identity=expected_cluster_identity,
+                    on_loss=on_loss, terminal_lifetime=_TerminalAdvisoryLifetime.capture(self) if terminal else None,
+                ) as capability:
+                    yield capability
+        except BaseException as error:
+            failure = error
+        finally:
+            if admission is not None:
+                admission.revoke("terminal advisory barrier retired")
+        if terminal:
+            # The fixed operation is physically finished, not a replacement
+            # admission. Sample ALL original scopes after exit/reset has joined,
+            # including when acquisition or the terminal body failed.
+            try:
+                require_execution_work(self)
+            except BaseException as denial:
+                failure = execution_terminal_error(
+                    failure, denial, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+        if failure is not None:
+            raise failure
+
+    @asynccontextmanager
+    async def _advisory_lock_session(
+        self, normalized_keys: tuple[tuple[int, int], ...], *, shared: bool,
+        expected_cluster_identity: str | None,
+        on_loss: Callable[[AdvisoryLease], None] | None,
+        terminal_lifetime: _TerminalAdvisoryLifetime | None,
+    ) -> AsyncIterator[AdvisoryLease]:
+        """One native allocator/retirement algorithm for both capability types."""
         lock_function = "pg_advisory_lock_shared" if shared else "pg_advisory_lock"
         unlock_function = (
             "pg_advisory_unlock_shared" if shared else "pg_advisory_unlock"
         )
-        advisory_pool = await self._ensure_advisory_pool()
+        advisory_pool = await self._ensure_advisory_pool(terminal_lifetime=terminal_lifetime)
         # Pool acquisition queues outside the operational query pool.  A
         # cancellation while waiting therefore cannot strand an operational
         # connection that an admitted effect still needs.
-        async with advisory_pool.acquire() as conn:
+        async with self._tracked_pool_checkout(advisory_pool, admit_work=False) as (conn, _):
             acquired: list[Tuple[int, int]] = []
-            capability = AdvisoryLease(conn, on_loss)
+            capability = (TerminalAdvisoryLease(conn, on_loss, lifetime=terminal_lifetime)
+                          if terminal_lifetime is not None else AdvisoryLease(conn, on_loss))
             conn.add_termination_listener(capability._connection_terminated)
             listener_attached = True
             try:
-                capability.require_live()
+                capability.require_physical()
                 if expected_cluster_identity is not None:
                     actual_cluster_identity = await conn.fetchval(
                         "SELECT system_identifier::text "
@@ -1837,10 +2006,10 @@ class PostgresBackend(DatabaseBackend):
                         f"SELECT {lock_function}($1, $2)", namespace, key
                     )
                     acquired.append((namespace, key))
-                    capability.require_live()
+                    capability.require_physical()
                 capability._admit()
                 yield capability
-                capability.require_live()
+                capability.require_physical()
             except BaseException as original:
                 # A cancellation can race PostgreSQL granting a blocking lock
                 # after asyncpg has sent the cancellation request. Terminating
@@ -2050,6 +2219,7 @@ class PostgresBackend(DatabaseBackend):
         from kestrel_sovereign.execution_custody import ProcessRuntimeExecutionFence
         from kestrel_sovereign.storage.async_storage import AsyncStorage
         from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
         from .ephemeral_cleanup import _purge_original_ephemeral_session
 
         scope = getattr(self, "_execution_custody", None)
@@ -2088,7 +2258,9 @@ class PostgresBackend(DatabaseBackend):
         It serializes with canonical owner recovery using its exact key.
         """
         from kestrel_sovereign.signals.durable import DurableSignalStore
-        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
 
         if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
             raise ValueError("cognition cleanup requires exact owner identities")

@@ -3108,7 +3108,7 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.53.35"
+version = "0.53.36"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
