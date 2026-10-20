@@ -223,14 +223,12 @@ class TestAuthKeyEndpoint:
     """Tests for /api/auth/key bootstrap endpoint using TestClient."""
 
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch):
         """TestClient with mock agent."""
         from server import app
         from unittest.mock import MagicMock
-        import os
 
-        original_bootstrap = os.environ.get("KESTREL_ENABLE_API_KEY_BOOTSTRAP")
-        os.environ["KESTREL_ENABLE_API_KEY_BOOTSTRAP"] = "true"
+        monkeypatch.setenv("KESTREL_ENABLE_API_KEY_BOOTSTRAP", "true")
         mock_agent = MagicMock()
         mock_agent.agent_id = "did:test:auth_key"
         mock_agent.storage = None
@@ -242,10 +240,6 @@ class TestAuthKeyEndpoint:
             with TestClient(app) as client:
                 yield client
         finally:
-            if original_bootstrap is None:
-                os.environ.pop("KESTREL_ENABLE_API_KEY_BOOTSTRAP", None)
-            else:
-                os.environ["KESTREL_ENABLE_API_KEY_BOOTSTRAP"] = original_bootstrap
             app.router.lifespan_context = original_lifespan
             app.state.agent = None
 
@@ -284,11 +278,14 @@ class TestProtectedEndpointsRequireAuth:
     """Tests that protected endpoints require authentication using TestClient."""
 
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch):
         """TestClient with mock agent."""
         from server import app
         from unittest.mock import MagicMock, AsyncMock
 
+        # The requests send no key; without one the server mints its own
+        # into the environment (#3671).
+        monkeypatch.setenv("KESTREL_API_KEY", "test-key-for-protected-endpoints")
         mock_agent = MagicMock()
         mock_agent.agent_id = "did:test:auth_test"
         mock_agent.storage = MagicMock()

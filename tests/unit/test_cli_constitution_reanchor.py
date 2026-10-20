@@ -659,13 +659,13 @@ def test_reanchor_reads_the_agent_homes_env_not_the_operators_shell(
 
 
 def test_reanchor_env_does_not_override_an_exported_value(
-    reanchor_env, restore_environ,
+    reanchor_env, restore_environ, monkeypatch,
 ):
     """``.env`` is a default, not an override — the same ``setdefault``
     semantics every other target-aware CLI path uses. An operator who exports
     a value deliberately keeps it."""
     (reanchor_env / ".env").write_text("KESTREL_DB_BACKEND=postgres\n")
-    os.environ["KESTREL_DB_BACKEND"] = "sqlite"
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
     args = _parse(["constitution", "reanchor", "--agent-name", "Test"])
     result = ReanchorResult(
         agent_name="Test",
@@ -896,7 +896,7 @@ def test_reanchor_refuses_a_blank_project_key_against_an_exported_one(
 
 
 def test_a_key_only_in_the_environment_is_not_a_conflict(
-    reanchor_env, monkeypatch,
+    reanchor_env, monkeypatch, restore_environ,
 ):
     """The file saying nothing means the export reaches the agent too.
 
@@ -1217,13 +1217,13 @@ def test_a_source_descriptor_other_than_the_configured_one_is_refused(
     ],
 )
 def test_an_exported_governing_source_setting_the_agent_does_not_get_is_refused(
-    reanchor_env, restore_environ, capsys, variable
+    reanchor_env, restore_environ, capsys, variable, monkeypatch
 ):
     """The shell exports A, the project .env says B. The agent and doctor
     resolve B; reanchoring with A would anchor bytes the agent then rejects.
     It refuses rather than choosing, as for the data key (#2553 review)."""
     (reanchor_env / ".env").write_text(f"{variable}=/secure/from-the-file.json\n")
-    os.environ[variable] = "/secure/from-the-shell.json"
+    monkeypatch.setenv(variable, "/secure/from-the-shell.json")
 
     err = _refused_without_writing(
         reanchor_env,
@@ -1236,13 +1236,13 @@ def test_an_exported_governing_source_setting_the_agent_does_not_get_is_refused(
 
 
 def test_a_blank_project_descriptor_against_an_exported_one_is_refused(
-    reanchor_env, restore_environ, capsys
+    reanchor_env, restore_environ, capsys, monkeypatch
 ):
     """Blank in the file is an answer: the agent then has no descriptor."""
     (reanchor_env / ".env").write_text(
         "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH=\n"
     )
-    os.environ["KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH"] = "/secure/a.json"
+    monkeypatch.setenv("KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH", "/secure/a.json")
 
     err = _refused_without_writing(
         reanchor_env,

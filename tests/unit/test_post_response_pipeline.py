@@ -319,30 +319,22 @@ class TestEpisodeCreationThreshold:
     """Tests for the configurable dual episode-creation threshold."""
 
     @pytest.mark.asyncio
-    async def test_default_threshold_is_15(self):
+    async def test_default_threshold_is_15(self, monkeypatch):
         """Default episode threshold should be 15, not the old 20."""
         import os
 
-        # Ensure env var is not set
-        old_val = os.environ.pop("KESTREL_EPISODE_THRESHOLD", None)
-        try:
-            threshold = int(os.environ.get("KESTREL_EPISODE_THRESHOLD", "15"))
-            assert threshold == 15
-        finally:
-            if old_val is not None:
-                os.environ["KESTREL_EPISODE_THRESHOLD"] = old_val
+        monkeypatch.delenv("KESTREL_EPISODE_THRESHOLD", raising=False)
+        threshold = int(os.environ.get("KESTREL_EPISODE_THRESHOLD", "15"))
+        assert threshold == 15
 
     @pytest.mark.asyncio
-    async def test_configurable_threshold(self):
+    async def test_configurable_threshold(self, monkeypatch):
         """KESTREL_EPISODE_THRESHOLD env var should override default."""
         import os
 
-        os.environ["KESTREL_EPISODE_THRESHOLD"] = "25"
-        try:
-            threshold = int(os.environ.get("KESTREL_EPISODE_THRESHOLD", "15"))
-            assert threshold == 25
-        finally:
-            del os.environ["KESTREL_EPISODE_THRESHOLD"]
+        monkeypatch.setenv("KESTREL_EPISODE_THRESHOLD", "25")
+        threshold = int(os.environ.get("KESTREL_EPISODE_THRESHOLD", "15"))
+        assert threshold == 25
 
 
 # ─────────────────────────────────────────────────────────────────────────────

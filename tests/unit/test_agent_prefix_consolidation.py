@@ -19,6 +19,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def _host_key(monkeypatch):
+    """The host's key; without one the server mints its own into the environment.
+
+    The requests below send a different key, so each stops at authentication.
+    These tests assert routing, and the Stop handler behind it would open host
+    Stop state that ``_restore_app`` does not put back.
+    """
+    monkeypatch.setenv("KESTREL_API_KEY", "prefix-consolidation-host-key")
+
+
 def _prepare_app(agent):
     from server import app
 

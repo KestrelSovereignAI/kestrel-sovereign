@@ -18,21 +18,26 @@ project_root = Path(__file__).parent.parent.parent
 load_dotenv(project_root / ".env")
 
 sys.path.insert(0, str(project_root))
-from server import app, get_api_key
+from server import app
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign import storage
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 import tempfile
 
 
-@pytest.fixture(scope="function")
-def api_key():
-    """Get the API key from environment."""
-    return get_api_key()
+API_KEY = "test-key-for-constitution-real-llm"
 
 
 @pytest.fixture(scope="function")
-async def client(monkeypatch):
+def api_key(monkeypatch):
+    """The sovereign key the server checks; without one it mints its own
+    into the environment (#3671)."""
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    return API_KEY
+
+
+@pytest.fixture(scope="function")
+async def client(monkeypatch, api_key):
     """
     This fixture sets up a clean agent environment for each test function.
     It uses monkeypatch to ensure the app uses a temporary data directory.

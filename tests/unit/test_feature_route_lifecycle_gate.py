@@ -24,7 +24,6 @@ and a feature removed between matching and handling pins the dispatch check.
 Cross-agent requests and app dependencies also pin the native inclusion wiring.
 """
 
-import os
 from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -297,9 +296,9 @@ def _bridge_health_route_count(app) -> int:
     )
 
 
-def test_bridge_route_gated_by_live_enabled_state():
+def test_bridge_route_gated_by_live_enabled_state(monkeypatch):
     """Enabled → 200, soft-disabled → 404, re-enabled → 200; route never churns."""
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     bridge = _make_bridge_feature()
     app, _agent, restore = _boot({"BridgeFeature": bridge})
     try:
@@ -332,9 +331,9 @@ def test_bridge_route_gated_by_live_enabled_state():
         restore()
 
 
-def test_bridge_route_404s_when_feature_removed():
+def test_bridge_route_404s_when_feature_removed(monkeypatch):
     """A full remove (feature dropped from agent.features) 404s the route too."""
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     bridge = _make_bridge_feature()
     app, agent, restore = _boot({"BridgeFeature": bridge})
     try:
@@ -474,9 +473,9 @@ def test_dynamic_feature_routes_invalidate_openapi_schema_on_mount_and_unmount()
         assert path not in client.get("/openapi.json").json()["paths"]
 
 
-def test_disabled_websocket_feature_route_is_not_matched():
+def test_disabled_websocket_feature_route_is_not_matched(monkeypatch):
     """A disabled WebSocket feature is excluded before an HTTP response emits."""
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     feature = _WebSocketFeatureStub()
     app, _agent, restore = _boot({"WebSocketFeature": feature})
     try:
@@ -502,7 +501,7 @@ def test_disabled_websocket_feature_route_is_not_matched():
         restore()
 
 
-def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
+def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload(monkeypatch):
     """One shape-mounted route must never retain the first tenant's callable.
 
     ``include_router`` copies Alice's bound endpoint during startup.  Bob has
@@ -511,7 +510,7 @@ def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
     each agent-prefixed request.  This also proves an in-place feature reload
     replaces the callable without adding a duplicate route.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice = _InstanceBoundRouterFeature("alice-v1")
     bob = _InstanceBoundRouterFeature("bob-v1")
     agents = {
@@ -552,10 +551,10 @@ def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
         restore()
 
 
-def test_request_scoped_feature_route_closes_when_target_is_unpublished():
+def test_request_scoped_feature_route_closes_when_target_is_unpublished(monkeypatch):
     """A scoped route cannot outlive the manager publication it resolved from."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     target = _make_agent({"ProxyFeature": _InstanceBoundRouterFeature("retired")})
     agents = {"target": target}
     app, restore = _boot_multi_agent(agents)
@@ -580,7 +579,7 @@ def test_request_scoped_feature_route_closes_when_target_is_unpublished():
 
 
 @pytest.mark.parametrize("nested_prefix", ["", "/nested"])
-def test_current_feature_route_keeps_app_overrides_and_live_dependencies(nested_prefix):
+def test_current_feature_route_keeps_app_overrides_and_live_dependencies(nested_prefix, monkeypatch):
     """Current feature dispatch must preserve FastAPI's app-bound execution.
 
     The mounted route belongs to Alice, but this request selects Bob. The
@@ -589,7 +588,7 @@ def test_current_feature_route_keeps_app_overrides_and_live_dependencies(nested_
     inclusion context rather than Bob's source route.
     """
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     events: list[str] = []
 
     async def host_dependency():
@@ -636,9 +635,9 @@ def test_current_feature_route_keeps_app_overrides_and_live_dependencies(nested_
         restore()
 
 
-def test_webhook_dispatch_is_live_and_enabled_filtered():
+def test_webhook_dispatch_is_live_and_enabled_filtered(monkeypatch):
     """The shared /webhooks/{name} router dispatches only to ENABLED features."""
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     hook_feature = _WebhookFeatureStub()
     app, _agent, restore = _boot({"WebhookFeature": hook_feature})
     try:
@@ -690,7 +689,7 @@ def test_first_dynamic_webhook_candidate_mounts_shared_dispatch_before_publish()
     assert response.status_code == 200
 
 
-def test_agent_prefixed_webhook_disabled_target_does_not_dispatch_to_peer():
+def test_agent_prefixed_webhook_disabled_target_does_not_dispatch_to_peer(monkeypatch):
     """#2522: POST /api/agents/A/webhooks/deposit must NOT reach agent B.
 
     Real ASGI collision: agent A's WebhookFeature is DISABLED and agent B's is
@@ -700,7 +699,7 @@ def test_agent_prefixed_webhook_disabled_target_does_not_dispatch_to_peer():
     event. With scope-aware resolution the request sees only A's (empty)
     receiver set → bare 404, and B records nothing.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=False)
     b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
     agents = {
@@ -722,14 +721,14 @@ def test_agent_prefixed_webhook_disabled_target_does_not_dispatch_to_peer():
         restore()
 
 
-def test_agent_prefixed_webhook_dispatches_only_to_resolved_agent():
+def test_agent_prefixed_webhook_dispatches_only_to_resolved_agent(monkeypatch):
     """#2522: each agent-prefixed request reaches ONLY its own receiver.
 
     Both A and B are enabled and both own ``deposit``. Posting to A dispatches
     to A's receiver only; posting to B dispatches to B's receiver only — the
     request-scoped agent, not first-match-wins across the aggregate.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
     b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
     agents = {
@@ -756,7 +755,7 @@ def test_agent_prefixed_webhook_dispatches_only_to_resolved_agent():
         restore()
 
 
-def test_unprefixed_webhook_form_retains_aggregate_lookup():
+def test_unprefixed_webhook_form_retains_aggregate_lookup(monkeypatch):
     """#2522 regression guard: the bare /webhooks/{name} form still aggregates.
 
     With no agent prefix there is no request-scoped agent, so the dispatch
@@ -764,7 +763,7 @@ def test_unprefixed_webhook_form_retains_aggregate_lookup():
     the pre-existing cross-agent behavior for keyless external callers that
     address the host, not a specific agent.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     # Only B owns "deposit"; the unprefixed form must still find it.
     a_hook = _WebhookFeatureStub(webhook_name="other", enabled=True)
     b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
@@ -828,7 +827,7 @@ def _post_unprefixed_and_prefixed_ambiguous(agents, a_hook, b_hook):
         restore()
 
 
-def test_unprefixed_webhook_ambiguous_ownership_is_refused_in_either_fleet_order():
+def test_unprefixed_webhook_ambiguous_ownership_is_refused_in_either_fleet_order(monkeypatch):
     """#3216: two enabled agents own ``deposit``; the unprefixed form must not
     let fleet iteration order choose the target.
 
@@ -839,7 +838,7 @@ def test_unprefixed_webhook_ambiguous_ownership_is_refused_in_either_fleet_order
     keyless caller learns nothing about which names collide — while the
     explicit ``/api/agents/{name}/webhooks/deposit`` form keeps working.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     for order in (("a", "b"), ("b", "a")):
         a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
         b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
@@ -860,7 +859,7 @@ def test_unprefixed_webhook_ambiguous_ownership_is_refused_in_either_fleet_order
         assert unknown.json() == {"error": "Unknown webhook: ghost"}, order
 
 
-def test_unprefixed_webhook_ambiguity_tracks_live_enabled_owners():
+def test_unprefixed_webhook_ambiguity_tracks_live_enabled_owners(monkeypatch):
     """#3216: only ENABLED owners count, and the count is read live.
 
     A enabled + B disabled is one owner → the unprefixed form dispatches to
@@ -868,7 +867,7 @@ def test_unprefixed_webhook_ambiguity_tracks_live_enabled_owners():
     Disabling A leaves B the sole owner → dispatches to B. A stale or
     enabled-blind count would fail one of the three legs.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
     b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=False)
     agents = {
@@ -898,7 +897,7 @@ def test_unprefixed_webhook_ambiguity_tracks_live_enabled_owners():
         restore()
 
 
-def test_one_receiver_reachable_through_two_agents_is_one_owner():
+def test_one_receiver_reachable_through_two_agents_is_one_owner(monkeypatch):
     """#3216: dedupe-by-identity is now load-bearing for correctness.
 
     The aggregate provider dedupes receivers by identity because one
@@ -908,7 +907,7 @@ def test_one_receiver_reachable_through_two_agents_is_one_owner():
     same feature instance mounted on two fleet entries must still dispatch
     exactly once.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     shared_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
     agents = {
         "a": _make_agent({"WebhookFeature": shared_hook}),
@@ -994,14 +993,14 @@ class _MinimalReceiverFeatureStub:
         return None
 
 
-def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404():
+def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404(monkeypatch):
     """#3216 round 3: a receiver that meets only the required contract
     (no ``record_refusal``) must not turn the refusal into a 500 — that would
     be the ownership oracle the shared response denies. Same 404, no
     dispatch to either owner, the core owner still audits, and the host log
     says the other owner could not audit its own refusal.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
     minimal = _MinimalReceiverFeatureStub(webhook_name="deposit")
     for order in (("core", "third"), ("third", "core")):
@@ -1028,7 +1027,7 @@ def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404():
             restore()
 
 
-def test_two_distinct_receivers_that_compare_equal_are_two_owners():
+def test_two_distinct_receivers_that_compare_equal_are_two_owners(monkeypatch):
     """#3216 round 4: the dedupe must be by identity, never ``==``.
 
     An out-of-tree receiver class with value equality (a dataclass, a
@@ -1037,7 +1036,7 @@ def test_two_distinct_receivers_that_compare_equal_are_two_owners():
     ``in``-based dedupe, so the unprefixed form dispatched again — to
     whichever agent the fleet listed first. Both orders must refuse.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
 
     class _ValueEqualReceiver(_MinimalReceiverFeatureStub._Receiver):
         def __eq__(self, other):
@@ -1113,14 +1112,14 @@ def test_two_distinct_receivers_that_compare_equal_are_two_owners():
     ],
 )
 def test_a_foreign_refusal_audit_that_misbehaves_never_changes_the_404(
-    record_refusal, label
+    record_refusal, label, monkeypatch
 ):
     """#3216 round 4: the refusal path awaits foreign ``record_refusal``
     implementations. One that raises, or returns nothing awaitable, must not
     turn the indistinguishable 404 into a 500 (the ownership oracle). The
     core owner still audits; the failure is host-logged.
     """
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
     Foreign = type(
         "_ForeignReceiver",
@@ -1168,13 +1167,13 @@ def _reorder(agents: dict, *names: str) -> None:
     agents.update(snapshot)
 
 
-def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_order():
+def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_order(monkeypatch):
     """Once the mount owner is withdrawn, two remaining agents that both serve
     the shape must not be chosen between by ``list_agents()`` order: the
     unprefixed form is refused in both orders and neither endpoint runs, while
     each agent-prefixed form still serves its own agent."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice = _InstanceBoundRouterFeature("alice-v1")
     bob = _InstanceBoundRouterFeature("bob-v1")
     carol = _InstanceBoundRouterFeature("carol-v1")
@@ -1215,10 +1214,10 @@ def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_
         restore()
 
 
-def test_unprefixed_feature_route_requires_an_agent_url_after_owner_withdrawal():
+def test_unprefixed_feature_route_requires_an_agent_url_after_owner_withdrawal(monkeypatch):
     """An address never silently switches agents after its owner disappears."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice = _InstanceBoundRouterFeature("alice-v1")
     bob = _InstanceBoundRouterFeature("bob-v1")
     agents = {
@@ -1240,9 +1239,9 @@ def test_unprefixed_feature_route_requires_an_agent_url_after_owner_withdrawal()
         restore()
 
 
-def test_unprefixed_route_stays_unbound_while_other_agents_change():
+def test_unprefixed_route_stays_unbound_while_other_agents_change(monkeypatch):
     """Peer lifecycle changes cannot claim an unprefixed address."""
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice = _InstanceBoundRouterFeature("alice-v1")
     bob = _InstanceBoundRouterFeature("bob-v1")
     carol = _InstanceBoundRouterFeature("carol-v1")
@@ -1272,14 +1271,14 @@ def test_unprefixed_route_stays_unbound_while_other_agents_change():
         restore()
 
 
-def test_unprefixed_feature_route_follows_the_mount_owner_across_its_reload():
+def test_unprefixed_feature_route_follows_the_mount_owner_across_its_reload(monkeypatch):
     """Review r1 P2: the mount owner reloaded under a NEW object with the same
     routing name and DID is still the mount owner. Retention by object
     identity made that a permanent 404 while another agent served the shape;
     the DID is the stable identity, so the reloaded owner serves — even with
     two other survivors that would otherwise be an ambiguous pair."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice_v1 = _InstanceBoundRouterFeature("alice-v1")
     bob = _InstanceBoundRouterFeature("bob-v1")
     carol = _InstanceBoundRouterFeature("carol-v1")
@@ -1340,12 +1339,12 @@ class _FeaturesOnceThenGone(dict):
         return super().get(key, default)
 
 
-def test_dispatch_refuses_a_feature_that_vanished_after_the_match():
+def test_dispatch_refuses_a_feature_that_vanished_after_the_match(monkeypatch):
     """Review r1 M12: the match gate admits the request, then the feature is
     gone by dispatch. Dispatch must refuse, never fall back to the mounted
     copy's first-tenant endpoint (which is #3240 itself)."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice = _InstanceBoundRouterFeature("alice-v1")
     agent = _make_agent({"ProxyFeature": alice})
     agents = {"alice": agent}
@@ -1381,12 +1380,12 @@ class _FeaturesDisabledAfterFirstLookup(dict):
         return feature
 
 
-def test_dispatch_refuses_a_feature_disabled_after_the_match():
+def test_dispatch_refuses_a_feature_disabled_after_the_match(monkeypatch):
     """Review r2: the match gate admits the request, then the feature is
     soft-disabled before dispatch. Dispatch re-checks ``enabled`` itself and
     refuses; it must not serve on the match gate's stale answer."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice = _InstanceBoundRouterFeature("alice-v1")
     agent = _make_agent({"ProxyFeature": alice})
     app, restore = _boot_multi_agent({"alice": agent})
@@ -1411,14 +1410,14 @@ def test_dispatch_refuses_a_feature_disabled_after_the_match():
         restore()
 
 
-def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
+def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer(monkeypatch):
     """A mount owner
     re-created under its DID with the feature disabled (readiness rollback,
     then retry) is still the owner: the unprefixed form refuses rather than
     quietly rebinding to the one peer that serves, which is exactly the
     order-chosen executor this ticket removes."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice_v1 = _InstanceBoundRouterFeature("alice-v1")
     bob = _InstanceBoundRouterFeature("bob-v1")
     agents = {
@@ -1484,11 +1483,11 @@ class _CountingRouterFeature:
         return router
 
 
-def test_unrelated_requests_do_not_build_the_gated_features_routers():
+def test_unrelated_requests_do_not_build_the_gated_features_routers(monkeypatch):
     """A request to a path this route cannot match never resolves the live
     owner or route, so no feature router is built for it."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice = _CountingRouterFeature("alice-v1")
     bob = _CountingRouterFeature("bob-v1")
     agents = {
@@ -1515,11 +1514,11 @@ def test_unrelated_requests_do_not_build_the_gated_features_routers():
         restore()
 
 
-def test_a_disabled_feature_answers_not_found_even_for_the_wrong_method():
+def test_a_disabled_feature_answers_not_found_even_for_the_wrong_method(monkeypatch):
     """Fail-closed property preserved: the path matches but the method does
     not (Starlette's PARTIAL); a disabled feature is NONE there, never 405."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     alice = _CountingRouterFeature("alice-v1")
     agents = {"alice": _make_agent({"ProxyFeature": alice})}
     app, restore = _boot_multi_agent(agents)

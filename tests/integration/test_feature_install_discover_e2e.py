@@ -559,6 +559,8 @@ class TestFeatureStoreAPI:
         with tempfile.TemporaryDirectory() as agent_dir:
             monkeypatch.setenv("KESTREL_DB_PATH", agent_dir)
             monkeypatch.setenv("KESTREL_DATA_KEY", "test-key-for-feature-e2e-32chars!")
+            # Without one the server mints a key into the environment (#3671).
+            monkeypatch.setenv("KESTREL_API_KEY", "test-key-for-feature-e2e-api")
             monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
             monkeypatch.delenv(DISABLED_FEATURES_ENV, raising=False)
             monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
@@ -593,6 +595,8 @@ class TestFeatureStoreAPI:
         with tempfile.TemporaryDirectory() as agent_dir:
             monkeypatch.setenv("KESTREL_DB_PATH", agent_dir)
             monkeypatch.setenv("KESTREL_DATA_KEY", "test-key-for-feature-e2e-32chars!")
+            # Without one the server mints a key into the environment (#3671).
+            monkeypatch.setenv("KESTREL_API_KEY", "test-key-for-feature-e2e-api")
             monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
             monkeypatch.setenv(DISABLED_FEATURES_ENV, "ExternalGPUFeature")
             monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
