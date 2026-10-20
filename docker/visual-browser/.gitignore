@@ -1,0 +1,3 @@
+# Reviewed sandbox configuration, not local credentials.
+!seccomp.json
+!host-config.json
