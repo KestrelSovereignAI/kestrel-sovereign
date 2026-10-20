@@ -4,37 +4,21 @@ import asyncio
 import base64
 import hashlib
 import json
-import os
-import resource
 import signal
 import socket
-from pathlib import Path
 
 from playwright.async_api import async_playwright
+from sandbox_checks import chromium_evidence, process_evidence
 
 
 async def probe():
-    if os.getuid() == 0:
-        raise RuntimeError("browser probe requires a non-root user")
-    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
-    capabilities = {name: int(status[name].strip(), 16) for name in ("CapEff", "CapBnd", "CapPrm", "CapInh", "CapAmb")}
-    rtprio_limit, groups = resource.getrlimit(resource.RLIMIT_RTPRIO), os.getgroups()
-    if any(capabilities.values()) or status["NoNewPrivs"].strip() != "1":
-        raise RuntimeError("browser probe requires no capabilities and no new privileges")
-    if rtprio_limit != (0, 0) or 0 in groups:
-        raise RuntimeError("browser probe requires no realtime priority and no root group")
+    evidence = process_evidence()
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True, chromium_sandbox=True, channel="chromium",
         )
         try:
-            page = await browser.new_page(viewport={"width": 800, "height": 600})
-            await page.goto("chrome://sandbox")
-            sandbox = await page.locator("body").inner_text()
-            for check in ("PID namespaces\tYes", "Network namespaces\tYes", "Seccomp-BPF sandbox\tYes"):
-                if check not in sandbox:
-                    raise RuntimeError("Chromium did not confirm the required sandbox")
-            await page.close()
+            evidence.update(await chromium_evidence(browser))
             page = await browser.new_page(viewport={"width": 800, "height": 600})
             await page.set_content(
                 '<!doctype html><title>Isolated browser fixture</title>'
@@ -58,9 +42,7 @@ async def probe():
                     connection.close()
                     raise RuntimeError("offline container unexpectedly reached a network destination")
             return {
-                "uid": os.getuid(), "browser_version": browser.version,
-                "capabilities": capabilities, "rtprio_limit": list(rtprio_limit), "groups": groups,
-                "no_new_privileges": status["NoNewPrivs"].strip() == "1", "sandbox": sandbox,
+                **evidence,
                 "fixture_result": result, "refused_destinations": refused,
                 "png_sha256": hashlib.sha256(png).hexdigest(),
                 "png_base64": base64.b64encode(png).decode(),

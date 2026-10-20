@@ -1,9 +1,10 @@
 # Local visual browser substrate
 
 This is the pinned browser image and sandbox verification for Core #3709,
-part of #3703. It contains Chromium and a synthetic offline probe. It does
-not yet contain a governed computer driver, a session API, artifact transfer,
-takeover or network access. It is not a completed visual-computer capability.
+part of #3703. It contains Chromium, a synthetic offline probe and a private persistent
+browser worker. Host SDK-driver registration, current-grant authorization,
+provider custody, artifact transfer, human takeover and governed network access
+remain separate work. It is not a completed visual-computer capability.
 
 Build and verify on an available local Docker daemon:
 
@@ -66,3 +67,56 @@ Docker probe. A passing probe does not by itself authorize visiting untrusted
 websites: that release additionally needs the driver, current grants, isolated
 egress, authenticated transport, control fencing and live evidence in #3708,
 #3709, #3710 and #3715. See the [official Docker guidance](https://playwright.dev/python/docs/docker).
+
+## Private worker
+
+Run `python scripts/verify_visual_browser_sandbox.py --worker --output /tmp/kestrel-worker-evidence-new`
+to exercise the same admitted container with a persistent page. This check
+creates synthetic offline content, operates it over separate authenticated Unix
+socket exchanges and confirms physical expiry without a close request. It uses
+the same unique ownership labels, policy verification and exact cleanup as the
+substrate probe. Evidence records source revision/dirty state and actual build
+context hashes and actual process/Chromium sandbox admission evidence; expiry acceptance requires a normal exit at or after the admitted
+expiry, not merely a stopped container. Its screenshot contains only the synthetic draft.
+
+The image's `worker.py` accepts one trusted-host bootstrap through
+`docker exec -i <exact-owned-container-id> python /opt/kestrel-browser/rpc_client.py initialize`.
+Bootstrap JSON travels on stdin, includes a new 256-bit secret, a SDK-shaped
+SessionRequest and at most 64 KiB of initial offline HTML. It must be submitted
+only after container admission. Bootstrap is one-shot; an unknown initialize
+outcome is reconciled against that container, never replaced with new custody.
+The temporary secret file is removed before browser startup; a marker prevents
+reinitialization. The socket directory is private and there is no published port,
+CDP endpoint or environment/argv credential. Local Docker access remains trusted
+host authority, not a capability granted to an agent.
+
+Subsequent `rpc_client.py` stdin exchanges require that secret and bind one owner,
+lease, session and control epoch. A fresh transport reaches the existing page.
+Actions use the latest produced frame, bounded age, deadline and action IDs.
+Accepted effects retain completed/unknown receipts and are never automatically
+replayed. A lost observation response requires observing again. Unknown transport
+results require status reconciliation; control retries reconcile with session
+status. If an accepted input times out or its waiter is cancelled, the worker
+fences and retires the session: cancelling a Playwright wait cannot unsend a
+Chromium input. That session cannot report a successful pause or be resumed.
+Pause and close remain available when the control-history budget is exhausted;
+resuming is refused. Transport has four connection slots with a 20-second bound;
+the trusted host must avoid holding idle slots and retain physical cleanup
+authority if control transport is unavailable. Priority human control remains
+part of host integration. Pause fences
+queued input before draining accepted work, suspends observations and advances
+the control epoch; resume advances it again. This is not human takeover. A frame
+is an observation identity, not a promise that autonomous page content is static.
+
+Only screenshot, click, text, a restricted key set, scroll and wait are supported.
+Waits send no browser input: a wait that cannot fit its deadline is refused,
+and an interrupted wait has a known denial without retiring a healthy page.
+The maximum 10-second wait has a separate bounded scheduling allowance.
+Navigation, clipboard, files, exec and takeover are refused. Sessions last at most
+one hour, with wall and monotonic expiry, bounded receipts and IPC, an async
+retirement loop and an OS process deadline (up to ten seconds of teardown grace).
+With the reviewed no-restart Docker configuration, process termination retires
+its child processes. Lost worker state is not recoverable accepted-action state;
+a replacement is a new session. The host must retain custody until physical
+container retirement is confirmed. None of this is the host's authorization,
+privacy policy, egress gateway, inference adapter or SDK provider/driver factory.

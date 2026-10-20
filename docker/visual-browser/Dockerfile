@@ -3,5 +3,5 @@ FROM mcr.microsoft.com/playwright/python:v1.63.0-noble@sha256:72bd171a9ffc2b4b59
 
 COPY requirements.txt /opt/kestrel-browser/requirements.txt
 RUN pip install --no-cache-dir --require-hashes -r /opt/kestrel-browser/requirements.txt
-COPY sandbox_probe.py /opt/kestrel-browser/sandbox_probe.py
+COPY sandbox_probe.py sandbox_checks.py controller.py worker.py wire.py rpc_client.py /opt/kestrel-browser/
 USER pwuser

@@ -37,7 +37,7 @@ def verified_host_configuration() -> dict:
         raise RuntimeError("browser host configuration digest differs from the reviewed profile")
     return json.loads(content)
 
-def container_arguments(image: str, identity: str) -> list[str]:
+def container_arguments(image: str, identity: str, *, worker: bool = False) -> list[str]:
     return [
         "create", "--name", f"kestrel-browser-probe-{identity}", "--label", f"{LABEL}={identity}",
         "--init", "--network", "none", "--read-only", "--cap-drop", "ALL",
@@ -47,7 +47,7 @@ def container_arguments(image: str, identity: str) -> list[str]:
         "--cgroupns", "private", "--runtime", "runc", "--cpus", "2", "--pids-limit", "256", "--shm-size", "256m",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
         "--ulimit", "rtprio=0:0", "--log-driver", "none",
-        image, "python", "/opt/kestrel-browser/sandbox_probe.py",
+        image, "python", "/opt/kestrel-browser/worker.py" if worker else "/opt/kestrel-browser/sandbox_probe.py",
     ]
 
 
@@ -94,7 +94,21 @@ def verify_result(result: dict) -> bytes:
     return png
 
 
-def run(output: Path, *, docker: str) -> dict:
+def source_identity() -> dict:
+    """Bind evidence to actual context bytes, including dirty/fault-injected builds."""
+    files = {path.relative_to(CONTEXT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+             for path in sorted(CONTEXT.rglob("*"))
+             if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"}
+    context_digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    revision = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, check=False)
+    status = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, check=False)
+    head = revision.stdout.decode(errors="replace").strip()
+    return {"revision": head if revision.returncode == 0 and re.fullmatch(r"[a-f0-9]{40}", head) else None,
+            "dirty": bool(status.stdout) if status.returncode == 0 else None,
+            "build_context_sha256": context_digest, "build_context_files": files}
+
+
+def run(output: Path, *, docker: str, worker_check=None) -> dict:
     verified_seccomp_policy()
     verified_host_configuration()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -102,21 +116,22 @@ def run(output: Path, *, docker: str) -> dict:
     tag = f"kestrel-visual-browser-probe:{identity}"
     state = {"probe_id": identity, "tag": tag, "container_name": f"kestrel-browser-probe-{identity}",
              "container_id": None, "image_id": None,
-             "cleanup_confirmed": False, "scope": "offline browser substrate; not host/session/Kite acceptance"}
+             "cleanup_confirmed": False, "scope": "offline browser worker" if worker_check else "offline browser substrate",
+             "host_or_kite_acceptance": False, "source": source_identity()}
     manifest = output / "custody.json"
 
     def record():
         manifest.write_text(json.dumps(state, indent=2) + "\n")
 
-    def invoke(arguments, *, timeout=30):
+    def invoke(arguments, *, timeout=30, input=None):
         try:
-            return subprocess.run([docker, *arguments], capture_output=True, timeout=timeout)
+            return subprocess.run([docker, *arguments], input=input, capture_output=True, timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             state["outcome_unknown"] = True; record()
             raise
 
-    def checked(arguments, *, timeout=30):
-        result = invoke(arguments, timeout=timeout)
+    def checked(arguments, *, timeout=30, input=None):
+        result = invoke(arguments, timeout=timeout, input=input)
         if result.returncode:
             raise RuntimeError(f"Docker {' '.join(arguments[:2])} failed: {result.stderr.decode(errors='replace')[-3000:]}")
         return result.stdout
@@ -131,12 +146,17 @@ def run(output: Path, *, docker: str) -> dict:
         if image["Config"]["Labels"].get(LABEL) != identity:
             raise RuntimeError("browser image ownership does not match")
         state["image_id"] = image["Id"]; record()
-        cid = checked(container_arguments(image["Id"], identity)).decode().strip()
+        cid = checked(container_arguments(image["Id"], identity, worker=worker_check is not None)).decode().strip()
         if not re.fullmatch(r"[a-f0-9]{64}", cid):
             raise RuntimeError("Docker did not return an exact container identity")
         state["container_id"] = cid; record()
         config = json.loads(checked(["container", "inspect", cid]))[0]
         verify_container(config, image["Id"], identity)
+        if worker_check is not None:
+            checked(["start", cid])
+            state["result"] = worker_check(checked, cid, output)
+            record()
+            return state
         completed = invoke(["start", "--attach", cid], timeout=120)
         (output / "browser.stderr").write_bytes(completed.stderr)
         if completed.returncode:
@@ -177,11 +197,16 @@ def run(output: Path, *, docker: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="New evidence directory; must not exist")
+    parser.add_argument("--worker", action="store_true", help="Exercise persistent authenticated offline worker IPC")
     args = parser.parse_args()
     docker = shutil.which("docker")
     if not docker:
         parser.error("Docker CLI is required")
-    result = run(args.output.resolve(), docker=docker)
+    worker_check = None
+    if args.worker:
+        from verify_visual_browser_worker import exercise
+        worker_check = exercise
+    result = run(args.output.resolve(), docker=docker, worker_check=worker_check)
     print(json.dumps({"passed": True, "cleanup_confirmed": result["cleanup_confirmed"], "evidence": str(args.output.resolve())}))
 
 
