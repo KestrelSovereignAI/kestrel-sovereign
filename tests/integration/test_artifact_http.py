@@ -1,0 +1,230 @@
+"""Real private ASGI publication/view/edit flow against both database engines."""
+
+import asyncio
+import base64
+from contextlib import asynccontextmanager
+
+import httpx
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from kestrel_sdk.operator import OperatorAuthorizationError
+
+from kestrel_sovereign.artifacts.http import create_artifact_router
+from tests.integration.test_artifact_repository import repository  # noqa: F401
+from tests.integration.test_artifact_service import access  # noqa: F401
+
+
+@pytest_asyncio.fixture
+async def api(access):
+    @asynccontextmanager
+    async def resolve(request):
+        # This fixture is the trusted host resolver, not production auth proof.
+        if request.headers.get("authorization") != "Bearer test-only":
+            raise OperatorAuthorizationError("caller is not authenticated")
+        context = access.context()
+        with access.bind(context):
+            yield context
+    app = FastAPI()
+    app.include_router(create_artifact_router(access.service, resolve_context=resolve))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        yield client, app
+
+
+AUTH = {"Authorization": "Bearer test-only"}
+
+
+async def publish(client, *, key="publish", ref=None, content=b"# Hello", media_type="text/markdown"):
+    staged = await client.post("/api/artifacts/staging", headers=AUTH, json={
+        "publication_key": key, "path": "report.md", "media_type": media_type,
+        "content_base64": base64.b64encode(content).decode(),
+    })
+    assert staged.status_code == 200, staged.text
+    commit = {"idempotency_key": key, "title": "Saved report",
+              "manifest": {"files": [staged.json()], "entrypoint": "report.md"}}
+    if ref:
+        commit.update(artifact_id=ref["artifact_id"], expected_revision_id=ref["revision_id"])
+    response = await client.post("/api/artifacts/publications", headers=AUTH, json=commit)
+    return response, commit
+
+
+def revision_url(ref):
+    return f'/api/artifacts/{ref["artifact_id"]}/revisions/{ref["revision_id"]}'
+
+
+@pytest.mark.asyncio
+async def test_private_publish_edit_history_and_delete(api):
+    client, _ = api
+    initial, request = await publish(client)
+    assert initial.status_code == 200, initial.text
+    ref = initial.json()["ref"]
+    metadata = await client.get(revision_url(ref), headers=AUTH)
+    assert metadata.json()["title"] == "Saved report"
+    assert (await client.get(revision_url(ref) + "/file", params={"path": "report.md"}, headers=AUTH)).content == b"# Hello"
+    second, _ = await publish(client, key="edit", ref=ref, content=b"# Edited")
+    assert second.status_code == 200
+    assert second.json()["ref"]["artifact_id"] == ref["artifact_id"]
+    history = await client.get(f'/api/artifacts/{ref["artifact_id"]}/history', headers=AUTH)
+    assert len(history.json()["items"]) == 2
+    assert (await client.get("/api/artifacts/publications/edit", headers=AUTH)).json() == second.json()
+    conflict, _ = await publish(client, key="conflict", ref=ref)
+    assert conflict.status_code == 409
+    # A lost acknowledgement is resolved by the original exact request/key.
+    retry = await client.post("/api/artifacts/publications", headers=AUTH, json=request)
+    assert retry.json() == initial.json()
+    gone = await client.delete(f'/api/artifacts/{ref["artifact_id"]}', headers=AUTH,
+                              params={"expected_revision_id": second.json()["ref"]["revision_id"]})
+    assert gone.status_code == 204
+    assert (await client.get(revision_url(ref), headers=AUTH)).status_code == 404
+    assert (await client.post("/api/artifacts/publications", headers=AUTH, json=request)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_authentication_scope_input_and_private_response_headers(api):
+    client, _ = api
+    denied = await client.get("/api/artifacts")
+    assert denied.status_code == 403
+    assert "no-store" in denied.headers["cache-control"]
+    initial, request = await publish(client)
+    ref = initial.json()["ref"]
+    assert (await client.get(revision_url(ref))).status_code == 403
+    forged = await client.post("/api/artifacts/publications", headers=AUTH, json={
+        **request, "scope": {"principal_id": "victim"},
+    })
+    assert forged.status_code == 400
+    assert "victim" not in forged.text
+    for response in (initial, await client.get(revision_url(ref), headers=AUTH), denied, forged):
+        assert response.headers["cache-control"] == "private, no-store, max-age=0"
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_untrusted_mime_cannot_execute_on_application_origin(api):
+    client, _ = api
+    response, _ = await publish(client, content=b"<script>parent.alert(1)</script>", media_type="text/html")
+    body = await client.get(revision_url(response.json()["ref"]) + "/file", headers=AUTH, params={"path": "report.md"})
+    assert body.headers["content-type"] == "application/octet-stream"
+    assert body.headers["content-disposition"].startswith("attachment;")
+    assert "sandbox" in body.headers["content-security-policy"]
+
+
+@pytest.mark.asyncio
+async def test_bounded_body_and_validation_do_not_echo_private_content(api, access):
+    from dataclasses import replace
+    client, _ = api
+    access.service.repository.limits = replace(access.service.repository.limits, max_file_bytes=1)
+    response = await client.post("/api/artifacts/staging", headers=AUTH, json={
+        "publication_key": "large", "path": "report.md", "media_type": "text/plain",
+        "content_base64": "private-content" * 5000,
+    })
+    assert response.status_code == 413
+    assert "private-content" not in response.text
+    malformed = await client.post("/api/artifacts/staging", headers=AUTH, json={"private-content": "secret"})
+    assert malformed.status_code == 400
+    assert "secret" not in malformed.text
+
+
+@pytest.mark.asyncio
+async def test_authority_gate_retained_until_body_send(api, access):
+    client, app = api
+    initial, _ = await publish(client)
+    ref = initial.json()["ref"]
+    path = revision_url(ref) + "/file"
+    entered, release, revoked = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            entered.set()
+            await release.wait()
+        messages.append(message)
+
+    async def revoke():
+        async with access.authority_gate:
+            access.granted = False
+            revoked.set()
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "GET", "scheme": "http", "path": path, "raw_path": path.encode(),
+             "query_string": b"path=report.md", "root_path": "", "server": ("test", 80),
+             "client": ("test", 1), "headers": [(b"authorization", b"Bearer test-only")]}
+    serving = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(entered.wait(), 3)
+    revoking = asyncio.create_task(revoke())
+    try:
+        await asyncio.sleep(0)
+        assert not revoked.is_set()
+        release.set()
+        await asyncio.wait_for(serving, 3)
+        await asyncio.wait_for(revoking, 3)
+        assert b"".join(item.get("body", b"") for item in messages) == b"# Hello"
+        assert (await client.get(revision_url(ref), headers=AUTH)).status_code == 403
+    finally:
+        release.set()
+        for task in (serving, revoking):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(serving, revoking, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_slow_upload_has_deadline_and_releases_authority(access):
+    @asynccontextmanager
+    async def resolve(request):
+        with access.bind(access.context()) as context:
+            yield context
+    app = FastAPI()
+    app.include_router(create_artifact_router(access.service, resolve_context=resolve, timeout_seconds=0.05))
+    entered = asyncio.Event()
+
+    async def slow_body():
+        entered.set()
+        await asyncio.Event().wait()
+        yield b"{}"
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await asyncio.wait_for(client.post("/api/artifacts/staging", content=slow_body(),
+                                     headers={"Content-Type": "application/json"}), 1)
+    assert entered.is_set()
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "artifact_outcome_unknown"
+    assert not access.authority_gate.locked()
+    assert not access.authority._bindings
+    assert not access.authority._operations
+
+
+@pytest.mark.asyncio
+async def test_queued_revocation_does_not_deadlock_nested_service_call(api, access):
+    client, _ = api
+    entered, release, revoked = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def upload():
+        entered.set()
+        await release.wait()
+        yield b'{"publication_key":"queued","path":"a.txt","media_type":"text/plain","content_base64":"YQ=="}'
+
+    async def revoke():
+        async with access.authority_gate:
+            access.granted = False
+            revoked.set()
+
+    sending = asyncio.create_task(client.post("/api/artifacts/staging", headers={
+        **AUTH, "Content-Type": "application/json"}, content=upload()))
+    await asyncio.wait_for(entered.wait(), 3)
+    revoking = asyncio.create_task(revoke())
+    try:
+        await asyncio.sleep(0)
+        assert not revoked.is_set()
+        release.set()
+        response = await asyncio.wait_for(sending, 3)
+        assert response.status_code == 200
+        await asyncio.wait_for(revoking, 3)
+    finally:
+        release.set()
+        for task in (sending, revoking):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(sending, revoking, return_exceptions=True)

@@ -69,11 +69,29 @@ There are no known external consumers requiring compatibility with these new
 interfaces. Replace conflicting ownership semantics deliberately; do not add
 aliases or a parallel artifact service to avoid a coordinated cutover.
 
-SDK main is 0.40, including the independently tracked native-A2A migration.
+The resource contracts require SDK 0.41; the immutable 0.40 tag predates them.
+SDK main also includes the independently tracked native-A2A migration.
 Core main currently constrains SDK below 0.40 and imports the removed legacy
 A2A API. The Core SDK upgrade must land through #3679 before a runtime PR can
 claim normal installation/boot. Candidate-SDK tests in an isolated worktree are
 useful development evidence, but do not substitute for the combined host suite.
+
+The artifact repository, authorized service and private HTTP router are internal
+implementation components until that coordinated cutover. The router is a
+factory requiring a host authentication resolver; importing it installs no
+routes. Host wiring must bind the exact resolved context for the entire request,
+provide current grant checks and a shared authority transition gate, and use the
+existing privacy persistence gate. Grant/key mutations take the authority gate
+exclusive; lock order is privacy, authority, database. These gates require one
+owning host process and do not coordinate multiple processes. Native commit
+expiry or lost delivery requires publication reconciliation, not a failed-save
+claim. The host must quiesce the service for same-database key maintenance.
+
+Private responses remain authorized through body delivery, use no-store caching
+and serve source bytes as attachments with nosniff and a sandbox policy. The
+viewer chooses safe renderers after an authorized fetch. Raw artifact access is
+refused in volatile, anonymized and deidentified modes; generic binary content
+has no approved transform. Explicit authorized deletion remains available.
 
 ## Ownership, authority and publication
 
