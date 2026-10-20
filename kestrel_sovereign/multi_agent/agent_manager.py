@@ -2284,12 +2284,20 @@ class AgentManager:
 
     def _revoke_a2a_hosted_policy(self, recipient: object) -> None:
         recipient_id = _loaded_agent_did(recipient)
-        if not isinstance(recipient_id, str):
-            return
-        policy = self._a2a_hosted_policies.get(recipient_id)
-        if policy is not None and policy.recipient is recipient:
-            self._a2a_policy_generation += 1
-            self._a2a_hosted_policies.pop(recipient_id, None)
+        if isinstance(recipient_id, str):
+            policy = self._a2a_hosted_policies.get(recipient_id)
+            if policy is not None and policy.recipient is recipient:
+                self._a2a_policy_generation += 1
+                self._a2a_hosted_policies.pop(recipient_id, None)
+        # Revoke authority before retiring routes. Corrupt app routing must
+        # never leave a stale handler's recipient policy usable after removal.
+        publication = vars(recipient).get("_native_a2a_publication")
+        if publication is not None:
+            from kestrel_sovereign.a2a.native_publication import HostedNativeA2APublication
+
+            if not isinstance(publication, HostedNativeA2APublication):
+                raise TypeError("Native publication must be owned by the host")
+            publication.withdraw()
 
     def a2a_sender_identity_witness(
         self,
@@ -6131,6 +6139,17 @@ class AgentManager:
         if arm_restored_ttl:
             try:
                 self._commit_restored_child_ttl(name, agent)
+            except BaseException:
+                self._withdraw_initialized_agent(name, agent)
+                raise
+        publication = vars(agent).get("_native_a2a_publication")
+        if publication is not None:
+            from kestrel_sovereign.a2a.native_publication import HostedNativeA2APublication
+
+            try:
+                if not isinstance(publication, HostedNativeA2APublication):
+                    raise TypeError("Native publication must be owned by the host")
+                publication.publish()
             except BaseException:
                 self._withdraw_initialized_agent(name, agent)
                 raise

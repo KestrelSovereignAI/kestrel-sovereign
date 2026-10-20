@@ -27,6 +27,365 @@ from tests.utils.native_a2a_security import (
 )
 
 
+@pytest_asyncio.fixture
+async def publication(hosted, hosted_recipient_signing):
+    from a2a.types import AgentSkill
+    from starlette.applications import Starlette
+
+    from kestrel_sovereign.a2a.native_publication import (
+        prepare_hosted_native_publication,
+    )
+    from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    recipient = hosted.recipient
+    pair, document = hosted_recipient_signing
+    recipient.identity = AgentIdentity(
+        hybrid_keypair=pair,
+        new_did=document["id"],
+        new_verification_methods=document["verificationMethod"],
+    )
+    recipient.storage = None
+    recipient.get_public_profile = KestrelAgent.get_public_profile.__get__(recipient)
+    recipient.features = {}
+    recipient._agent_name = "Live Name"
+    recipient.resolve_effective_name = KestrelAgent.resolve_effective_name.__get__(
+        recipient
+    )
+    hosted.manager.register_provider(
+        "test",
+        [AgentSkill(id="ask", name="Ask", description="Ask", tags=["chat"])],
+        object(),
+    )
+    app = Starlette()
+    native = await prepare_hosted_native_publication(
+        app,
+        hosted.host,
+        "registered-agent",
+        recipient,
+        {
+            "KESTREL_BASE_URL": "https://native.test",
+            "KESTREL_A2A_DISCOVERY_AGENT": "registered-agent",
+        },
+    )
+    recipient._native_a2a_publication = native
+    yield SimpleNamespace(**vars(hosted), app=app, publication=native)
+    async with hosted.host.a2a_lifecycle_lease():
+        native.withdraw()
+
+
+async def test_manager_commits_native_routes_and_card_as_one_publication(publication):
+    import httpx
+    from a2a.types import AgentCard
+    from google.protobuf.json_format import ParseDict
+    from starlette.exceptions import HTTPException
+
+    from kestrel_sovereign.a2a.native_card import verify_native_agent_card
+    from kestrel_sovereign.a2a.native_routes import native_card_path
+
+    p = publication
+    assert p.app.routes == []
+    async with p.host.a2a_lifecycle_lease():
+        p.host._register_agent("registered-agent", p.recipient)
+    assert len(p.app.routes) == 3
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(p.app), base_url="https://native.test"
+    ) as http:
+        direct = await http.get(native_card_path("registered-agent"))
+        root = await http.get("/.well-known/agent-card.json")
+        assert direct.status_code == root.status_code == 200
+        assert direct.json() == root.json()
+        verify_native_agent_card(
+            ParseDict(root.json(), AgentCard()),
+            signing_did=p.recipient.identity.signing_did,
+            trusted_document={
+                "id": p.recipient.identity.signing_did,
+                "verificationMethod": p.recipient.identity.new_verification_methods,
+            },
+        )
+        etag = direct.headers["etag"]
+        assert (
+            await http.get(
+                native_card_path("registered-agent"), headers={"If-None-Match": etag}
+            )
+        ).status_code == 304
+        p.recipient._agent_name = "Session Rename"
+        renamed = await http.get(
+            native_card_path("registered-agent"), headers={"If-None-Match": etag}
+        )
+        assert renamed.status_code == 200 and renamed.json()["name"] == "Session Rename"
+        assert renamed.headers["etag"] != etag
+        assert (
+            renamed.json()["supportedInterfaces"]
+            == direct.json()["supportedInterfaces"]
+        )
+        async with p.host.a2a_lifecycle_lease():
+            p.host._withdraw_initialized_agent("registered-agent", p.recipient)
+        assert p.app.routes == []
+        assert (await http.get(native_card_path("registered-agent"))).status_code == 404
+        with pytest.raises(HTTPException) as denied:
+            await p.publication.get_card()
+        assert denied.value.status_code == 404
+
+
+@pytest.mark.parametrize("fault", ["policy", "identity", "registration"])
+async def test_public_card_revalidates_the_exact_recipient_generation(
+    publication, fault
+):
+    from starlette.exceptions import HTTPException
+
+    p = publication
+    async with p.host.a2a_lifecycle_lease():
+        p.host._register_agent("registered-agent", p.recipient)
+        if fault == "policy":
+            p.host.install_a2a_hosted_policy(
+                p.recipient,
+                resolver=p.policy.resolver,
+                authorizer=p.policy.authorizer,
+                router=p.policy.router,
+                requester=p.policy.requester,
+            )
+        elif fault == "identity":
+            p.recipient.identity = replace(
+                p.recipient.identity, new_verification_methods=[]
+            )
+        else:
+            p.host._agents["registered-agent"] = SimpleNamespace(**vars(p.recipient))
+    with pytest.raises(HTTPException) as denied:
+        await p.publication.get_card()
+    assert denied.value.status_code == 403
+
+
+async def test_native_publication_failure_withdraws_manager_registration(publication):
+    from starlette.responses import Response
+    from starlette.routing import Route
+
+    p = publication
+    conflict = Route("/.well-known/agent-card.json", lambda request: Response())
+    p.app.routes.append(conflict)
+    async with p.host.a2a_lifecycle_lease():
+        with pytest.raises(RuntimeError, match="already owned"):
+            p.host._register_agent("registered-agent", p.recipient)
+    assert p.host.get_agent("registered-agent") is None
+    assert p.host.a2a_hosted_policy_for(p.recipient) is None
+    assert p.app.routes == [conflict]
+
+
+async def test_public_card_holds_generation_through_async_profile_read(publication):
+    p = publication
+    async with p.host.a2a_lifecycle_lease():
+        p.host._register_agent("registered-agent", p.recipient)
+    reading, resume, attempted, changed = (asyncio.Event() for _ in range(4))
+
+    class Storage:
+        async def get_node(self, agent_id):
+            assert agent_id == p.recipient.agent_id
+            reading.set()
+            await resume.wait()
+            # This read also uses the actual native SQLite/PostgreSQL connection.
+            await p.backend.fetch_one("SELECT principal FROM native_test_principals")
+            return SimpleNamespace(properties={"description": "Public description"})
+
+    async def replace_policy():
+        attempted.set()
+        async with p.host.a2a_lifecycle_lease():
+            changed.set()
+            p.host.install_a2a_hosted_policy(
+                p.recipient,
+                resolver=p.policy.resolver,
+                authorizer=p.policy.authorizer,
+                router=p.policy.router,
+                requester=p.policy.requester,
+            )
+
+    p.recipient.storage = Storage()
+    card_read = asyncio.create_task(p.publication.get_card())
+    writer = None
+    try:
+        await asyncio.wait_for(reading.wait(), timeout=2)
+        writer = asyncio.create_task(replace_policy())
+        await asyncio.wait_for(attempted.wait(), timeout=2)
+        assert not changed.is_set(), (
+            "Card profile I/O must retain its recipient generation"
+        )
+        resume.set()
+        card = await asyncio.wait_for(card_read, timeout=2)
+        assert card.description == "Public description"
+        await asyncio.wait_for(writer, timeout=2)
+    finally:
+        resume.set()
+        await asyncio.gather(
+            card_read, *([writer] if writer is not None else []), return_exceptions=True
+        )
+
+
+async def test_private_native_preparation_refuses_bad_identity_before_routes(
+    publication,
+):
+    from kestrel_sovereign.a2a.native_publication import (
+        HostedNativeA2APublication,
+        NativeHostingConfiguration,
+    )
+
+    p = publication
+    p.recipient.identity = None
+    with pytest.raises(ValueError, match="hybrid recipient identity"):
+        await HostedNativeA2APublication.prepare(
+            p.host,
+            p.app.state.native_a2a_http,
+            p.recipient,
+            "registered-agent",
+            NativeHostingConfiguration("https://native.test"),
+        )
+    assert p.app.routes == []
+
+
+async def test_native_preparation_refuses_registry_from_another_app(publication):
+    from starlette.applications import Starlette
+
+    from kestrel_sovereign.a2a.native_publication import (
+        prepare_hosted_native_publication,
+    )
+
+    other_app = Starlette()
+    other_app.state.native_a2a_http = publication.app.state.native_a2a_http
+    with pytest.raises(ValueError, match="different application"):
+        await prepare_hosted_native_publication(
+            other_app,
+            publication.host,
+            "registered-agent",
+            publication.recipient,
+            {"KESTREL_BASE_URL": "https://native.test"},
+        )
+    assert other_app.routes == publication.app.routes == []
+
+
+async def test_policy_revocation_precedes_route_cleanup_failure(publication):
+    from starlette.exceptions import HTTPException
+
+    p = publication
+    async with p.host.a2a_lifecycle_lease():
+        p.host._register_agent("registered-agent", p.recipient)
+    binding = p.publication._binding
+    missing_route = binding.card_routes[0]
+    p.app.routes.remove(missing_route)
+    try:
+        async with p.host.a2a_lifecycle_lease():
+            with pytest.raises(RuntimeError, match="lost its published route"):
+                p.host._revoke_a2a_hosted_policy(p.recipient)
+        assert p.host.a2a_hosted_policy_for(p.recipient) is None
+        # Even a retained SDK handler must fail its original policy guard.
+        async with p.host.a2a_execution_lease():
+            with pytest.raises(HTTPException) as denied:
+                p.publication._guard.authority_factory().require_current(None)
+        assert denied.value.status_code == 403
+    finally:
+        p.app.routes.append(missing_route)
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+async def test_actual_host_onboarding_publication_discovery_and_sdk_request(
+    publication, monkeypatch, protocol
+):
+    import time
+    from uuid import uuid4
+
+    import httpx
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.client.card_resolver import A2ACardResolver
+    from a2a.types import GetTaskRequest
+    from a2a.utils.errors import TaskNotFoundError
+    from fastapi import FastAPI
+    from starlette.middleware.sessions import SessionMiddleware
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.a2a.native_card import (
+        REQUIRED_NATIVE_EXTENSIONS,
+        verify_native_agent_card,
+    )
+    from kestrel_sovereign.a2a.native_client import NativeSenderInterceptor
+    from kestrel_sovereign.a2a.native_routes import native_card_path
+
+    p = publication
+    monkeypatch.setenv("KESTREL_BASE_URL", "https://native.test")
+    monkeypatch.setenv("KESTREL_A2A_DISCOVERY_AGENT", "registered-agent")
+    operator_checks = []
+
+    def operator_key():
+        operator_checks.append(True)
+        return "operator-key"
+
+    monkeypatch.setattr(server, "get_api_key", operator_key)
+    app = FastAPI()
+    app.state.agent_manager = p.host
+    app.middleware("http")(server.auth_middleware)
+    app.add_middleware(SessionMiddleware, secret_key="native-publication-test")
+    async with p.host.a2a_lifecycle_lease():
+        p.host._agents.pop("registered-agent")
+        p.host._agent_names.pop(p.recipient.agent_id)
+        p.host._onboarding_agents["registered-agent"] = p.recipient
+        rollback = await server._onboard_host_registered_agent(
+            app, p.host, "registered-agent", p.recipient
+        )
+        native = p.recipient._native_a2a_publication
+        assert not app.state.native_a2a_http._registrations
+        assert p.host.get_agent("registered-agent") is None
+        p.host._register_agent("registered-agent", p.recipient)
+        p.host._onboarding_agents.pop("registered-agent")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app),
+        base_url="https://native.test",
+        headers={"A2A-Version": "1.0"},
+    ) as http:
+
+        def verifier(card):
+            verify_native_agent_card(
+                card,
+                signing_did=p.recipient.identity.signing_did,
+                trusted_document={
+                    "id": p.recipient.identity.signing_did,
+                    "verificationMethod": p.recipient.identity.new_verification_methods,
+                },
+            )
+
+        card = await A2ACardResolver(http, "https://native.test").get_agent_card(
+            signature_verifier=verifier
+        )
+        assert await native.get_card() == card
+        interceptor = NativeSenderInterceptor(
+            keypair=p.signing[0],
+            sender=SENDER,
+            recipient=p.scope,
+            extensions=REQUIRED_NATIVE_EXTENSIONS,
+            policy=p.guard.proof_policy,
+            classical_kid="key-1",
+            pq_kid="key-2",
+            clock=time.time,
+            nonce=lambda: uuid4().hex,
+        )
+        sdk = ClientFactory(
+            ClientConfig(
+                httpx_client=http,
+                streaming=False,
+                supported_protocol_bindings=[protocol],
+            )
+        ).create(card, interceptors=[interceptor])
+        with pytest.raises(TaskNotFoundError):
+            await sdk.get_task(GetTaskRequest(id="missing", tenant=p.scope.tenant))
+        assert not operator_checks, (
+            "Published discovery and SDK routes must not enter operator auth"
+        )
+        # Only the installed card route's actual read methods are public.
+        assert (
+            await http.post(native_card_path("registered-agent"))
+        ).status_code == 401
+        assert operator_checks
+        async with p.host.a2a_lifecycle_lease():
+            p.host._withdraw_initialized_agent("registered-agent", p.recipient)
+            await rollback()
+        assert not app.state.native_a2a_http._registrations
+
+
 @pytest.fixture(scope="module")
 def hosted_recipient_signing():
     return signing_identity("did:web:recipient.test:agent")
@@ -78,7 +437,7 @@ async def hosted(native_request_admission, hosted_recipient_signing, tmp_path):
     async with host.a2a_lifecycle_lease():
         policy = host.install_a2a_hosted_policy(
             recipient,
-            resolver=resolver,
+            resolver=resolver.resolve,
             authorizer=authorizer,
             router=router,
             requester=requester,
@@ -319,7 +678,7 @@ async def test_overlapping_sender_verifications_keep_separate_identity_witnesses
 
     class CoordinatedResolver:
         async def resolve(self, did):
-            document = hosted.policy.resolver.resolve(did)
+            document = hosted.policy.resolver(did)
             if did == SENDER:
                 entered.set()
                 await release.wait()
@@ -334,7 +693,7 @@ async def test_overlapping_sender_verifications_keep_separate_identity_witnesses
         hosted.host._agent_names[second_principal] = "second"
         hosted.host.install_a2a_hosted_policy(
             hosted.recipient,
-            resolver=CoordinatedResolver(),
+            resolver=CoordinatedResolver().resolve,
             authorizer=hosted.policy.authorizer,
             router=hosted.policy.router,
             requester=hosted.policy.requester,

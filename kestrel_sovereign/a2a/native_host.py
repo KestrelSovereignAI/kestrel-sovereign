@@ -95,7 +95,7 @@ class _HostedNativeRequest:
             raise RuntimeError("A native request cannot replace its sender witness")
         self.sender_did = did
         self.sender_witness = self.manager.a2a_sender_identity_witness(did)
-        document = self.policy.resolver.resolve(did)
+        document = self.policy.resolver(did)
         if inspect.isawaitable(document):
             document = await document
         self.require_current(None)
@@ -135,7 +135,7 @@ def create_hosted_native_guard(
         or manager.get_agent(routing_key) is not recipient
         or policy is None
         or policy.recipient_id != scope.recipient_id
-        or not callable(getattr(policy.resolver, "resolve", None))
+        or not callable(policy.resolver)
         or not callable(getattr(policy.authorizer, "has_valid_policy_scope", None))
         or not callable(
             getattr(policy.authorizer, "authorize_principal_with_policy", None)

@@ -391,10 +391,27 @@ remains HTTP 403, and database failures become the standard internal error with
 the original retained for host diagnostics. An operator key cannot promote a
 native peer request to sovereign authority.
 
-These registrations and guarded SDK operations are implementation foundations.
-Publishing signed cards, host startup/onboarding publication, push configuration,
-outbound cutover, old-route retirement and full host interoperability remain
-acceptance work; isolated SDK HTTP tests do not establish their completion.
+Host onboarding now prepares a signed native card privately. The manager's
+synchronous registration commit publishes that card and both SDK bindings under
+its topology writer; policy revocation withdraws exactly that registration's
+routes. Public card reads retain the matching reader through profile I/O and
+recheck the original policy and identity. Live names and skills are refreshed
+before signing; the manager's routing key and interface URLs remain stable.
+The console's `/api/agents` response uses public display profiles independently
+of this protocol publication.
+
+Public hosting requires `KESTREL_BASE_URL`. Without it, operator APIs remain
+available and no peer card or binding is published; a listen address is never
+substituted for a public URL. `KESTREL_A2A_DISCOVERY_AGENT` explicitly selects
+the registration key served at the authority-root well-known path. Other
+recipients expose only their directly configured card URLs. Blank or invalid
+configuration refuses publication.
+
+This is a private implementation candidate, exercised with unpublished SDK
+builds containing the reviewed signing and HTTP-authorization repairs. Push
+configuration, outbound cutover, question-ledger enforcement, old-route
+retirement, released dependency adoption and full host interoperability remain
+acceptance work. The isolated HTTP tests do not establish those gates.
 
 The native task manager records the handler's admitted Task as its baseline.
 Lifecycle and cancellation writes apply that handler's delta to the latest
@@ -577,7 +594,7 @@ must respect each field's required annotation and presence. Resolve
 upgrading to a corrected official SDK release or contributing the repair to
 that SDK and consuming a tested release. Do not ship a Kestrel canonicalizer,
 relax verification, or remove valid empty fields just to evade the defect.
-The contributed [native SDK repair](https://github.com/a2aproject/a2a-python/pull/1355)
+The contributed [next-major SDK repair](https://github.com/a2aproject/a2a-python/pull/1360)
 has completed an independent full worktree review and independent signature
 probes. An open PR does not satisfy this release gate: consume a published
 corrected SDK and rerun the vectors before releasing the cutover.
@@ -598,6 +615,9 @@ gate above. This external gate applies to signed cards and the coordinated
 release; continue the native host, transport, storage and outbound migration
 while it remains unresolved. There is no need to retain the draft wire protocol
 while developing those changes in the cutover worktree.
+The replacement [PR #1360](https://github.com/a2aproject/a2a-python/pull/1360)
+targets a 2.0 release and has completed full worktree review. Its open state
+does not prevent private implementation work or establish published availability.
 
 Use the agent's Ed25519 verification method and a DID-bound `kid`; the existing hybrid message
 proof is not substituted for an interoperable Agent Card signature. Verify the
@@ -618,15 +638,25 @@ one advertised binding and use the SDK client. Persist the outbound dispatch
 before submission and record the returned task identity without losing failure
 evidence. Local routing enters the same official-type submission contract.
 
+The sender owns an immutable local dispatch ID and original message ID. The
+remote task ID is nullable until acknowledged; accepting a remote ID never
+rekeys the dispatch or another dispatch's retained route. Bind the directory's
+stable recipient, verified card identity, selected interface and tenant before
+submission. Record submission intent durably before entering the SDK send.
+After an uncertain acknowledgement, retain `UNKNOWN` and reconcile only by
+authorized reads of the original context/message. An absent result is not
+permission to replay a send. Taskless native Message responses retain their
+actual type rather than acquiring an invented task ID. Questions use the
+sender-owned correlation ID and the same durable recipient/tenant binding.
+
 Ship inbound and outbound together. Delete `POST /api/agent/tasks/send`, old
 task read/cancel/subscribe routes, all draft wire models and all callers.
 Replace the retired entries in `kestrel_sovereign/a2a/transport_auth.py` with
-narrow method/path allowlists for the SDK's JSON-RPC and HTTP+JSON binding
-endpoints in the peer lane of host authentication, before operator-key handling
-and agent-prefix stripping. Include the REST tenant-qualified paths above.
-Cover bare routes plus both
-`/api/agents/{routing_name}` and `/api/agent-routes/{encoded_routing_name}`
-forms; test every binding and alias using the peer transport credential.
+classification from the actual installed SDK route objects, in the peer lane
+of host authentication before operator-key handling and agent-prefix stripping.
+Include only the REST tenant aliases advertised by that registration. Public
+card exemptions use its exact card routes and methods. Do not retain a second
+method/path pattern list or add old per-agent path aliases.
 Adjacent operator endpoints must remain denied. Do not repurpose the operator
 API key as peer authority. Drain or explicitly stop old in-flight work during the host
 upgrade; mixed draft/new workers are unsupported. Rollback requires the saved

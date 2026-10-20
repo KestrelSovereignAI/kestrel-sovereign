@@ -180,7 +180,7 @@ from kestrel_sovereign.telemetry import (
 )
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.a2a.agent_card import AgentCard
+    from a2a.types import AgentCard
     from kestrel_sovereign.execution_custody import ExecutionCustody
     from kestrel_sovereign.features.peers.directory import (
         PeerDirectoryRouter,
@@ -10010,64 +10010,30 @@ Expected Duration: {expected_duration}
                 return name
         return default
 
+    async def get_public_profile(self) -> dict[str, str]:
+        """Public display fields shared by console discovery and signed cards."""
+        node = (
+            await self.storage.get_node(self.agent_id)
+            if self.storage is not None else None
+        )
+        description = "Constitutional AI Agent with sovereign memory"
+        if node is not None:
+            description = node.properties.get("description", description)
+        if not isinstance(description, str):
+            raise ValueError("Agent public description must be text")
+        return {
+            "name": self.resolve_effective_name(node, default="Kestrel Agent"),
+            "description": description,
+        }
+
     async def get_agent_card(self) -> "AgentCard":
-        """
-        Generate an AgentCard for this agent (for A2A discovery).
-        Returns agent identity, capabilities, and available skills.
-        """
-        from kestrel_sovereign.a2a.agent_card import (
-            AgentCapabilities,
-            AgentCard,
-            AgentProvider,
-        )
+        """Return this host's signed native card under its live publication lease."""
+        from kestrel_sovereign.a2a.native_publication import HostedNativeA2APublication
 
-        # Get agent name from storage node if available
-        agent_name = "Kestrel Agent"
-        agent_description = "Constitutional AI Agent with sovereign memory"
-
-        agent_node = None
-        if self.storage:
-            try:
-                agent_node = await self.storage.get_node(self.agent_id)
-                if agent_node and agent_node.properties:
-                    agent_description = agent_node.properties.get("description", agent_description)
-            except Exception as e:
-                logging.warning(f"Could not load agent node for card generation: {e}")
-
-        # Prefer the live session name so a volatile-mode rename (which skips the
-        # durable node write) is reflected on the card instead of the stale stored
-        # name (#2672 review P2).
-        agent_name = self.resolve_effective_name(agent_node, default=agent_name)
-
-        # Build base URL - in production this would be the agent's public URL
-        # For now, use localhost
-        base_url = os.environ.get("KESTREL_BASE_URL", "http://localhost:8888")
-
-        # Collect skills from all features
-        skills = []
-        for feature in self.features.values():
-            if hasattr(feature, 'get_agent_card'):
-                feature_card = feature.get_agent_card()
-                skills.extend(feature_card.skills)
-
-        return AgentCard(
-            name=agent_name,
-            description=agent_description,
-            url=base_url,
-            version="0.1.0",
-            provider=AgentProvider(
-                organization="Kestrel Sovereign AI",
-                url="https://github.com/KestrelSovereignAI/kestrel-sovereign"
-            ),
-            capabilities=AgentCapabilities(
-                streaming=True,
-                pushNotifications=False,
-                stateTransitionHistory=True
-            ),
-            defaultInputModes=["text"],
-            defaultOutputModes=["text"],
-            skills=skills
-        )
+        publication = vars(self).get("_native_a2a_publication")
+        if not isinstance(publication, HostedNativeA2APublication):
+            raise RuntimeError("Native Agent Card requires configured public hosting")
+        return await publication.get_card()
 
     async def _close_standalone_hold_context(
         self,

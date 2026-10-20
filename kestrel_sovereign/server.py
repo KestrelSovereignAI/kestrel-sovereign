@@ -1480,6 +1480,7 @@ async def _onboard_host_registered_agent(
         install_a2a_inbound_sender_authorizer,
         mark_a2a_inbound_scoped_policy,
     )
+    from kestrel_sovereign.a2a.native_publication import prepare_hosted_native_publication
 
     missing = object()
     rollback_state_fields = (
@@ -1524,11 +1525,13 @@ async def _onboard_host_registered_agent(
     owned_ui_mount_paths: set[str] = set()
     owned_ui_mount_route_ids: dict[str, set[int]] = {}
     owns_webhook_dispatch = False
+    native_publication = None
     agent_fields = (
         "_scoped_policy_required",
         "_a2a_host_manager",
         "a2a_did_resolver",
         "a2a_inbound_sender_authorizer",
+        "_native_a2a_publication",
     )
     prior_agent_state = {
         field: vars(agent).get(field, missing)
@@ -1537,6 +1540,8 @@ async def _onboard_host_registered_agent(
 
     async def rollback_host_onboarding() -> None:
         """Remove only app/agent state introduced by this private candidate."""
+        if native_publication is not None:
+            native_publication.withdraw()
 
         current_agents = dict(manager.list_agents())
         other_agent_map = {
@@ -1725,6 +1730,11 @@ async def _onboard_host_registered_agent(
         router=peer_router,
         requester=peer_requester,
     )
+    native_publication = await prepare_hosted_native_publication(
+        app, manager, name, agent, os.environ
+    )
+    if native_publication is not None:
+        agent._native_a2a_publication = native_publication
     _attach_stop_runtime(app, agent)
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
@@ -4484,6 +4494,8 @@ async def auth_middleware(request: Request, call_next):
 
         if not isinstance(native_a2a, NativeA2AHTTPRegistry):
             raise TypeError("Host native A2A routes require their published registry")
+        if native_a2a.admits_public_card(request.scope):
+            return await call_next(request)
         if native_a2a.admits(request.scope):
             request.state.caller = CallerContext.a2a_transport()
             return await call_next(request)

@@ -1,11 +1,13 @@
 """One SDK route registration for dispatch, advertised URLs and peer admission."""
 
 import math
+from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
+from a2a.server.routes.agent_card_routes import create_agent_card_routes
 from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
 from a2a.server.routes.rest_routes import create_rest_routes
-from a2a.types import AgentInterface
+from a2a.types import AgentCard, AgentInterface
 from starlette.applications import Starlette
 from starlette.datastructures import URLPath
 from starlette.routing import BaseRoute, Match, Mount
@@ -23,6 +25,11 @@ from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
 def native_route_prefix(routing_key: str) -> str:
     """Use the manager registration key, never a display name or signing DID."""
     return f"/api/agent-routes/{encode_agent_route_name(routing_key)}/a2a"
+
+
+def native_card_path(routing_key: str) -> str:
+    """Direct per-agent discovery; only the authority root is well-known."""
+    return f"/api/agent-routes/{encode_agent_route_name(routing_key)}/agent-card.json"
 
 
 def native_http_interfaces(
@@ -103,6 +110,8 @@ class NativeA2AHTTP:
         *,
         public_base_url: str,
         shutdown_grace_period: float = 0,
+        card_modifier: Callable[[AgentCard], Awaitable[AgentCard]] | None = None,
+        public_discovery: bool = False,
     ):
         if not math.isfinite(shutdown_grace_period) or shutdown_grace_period < 0:
             raise ValueError(
@@ -149,10 +158,32 @@ class NativeA2AHTTP:
             )
         )
         self.route = Mount(self.prefix, routes=routes)
+        if public_discovery and card_modifier is None:
+            raise ValueError("Public discovery requires a live recipient card gate")
+        self.card_routes = []
+        if card_modifier is not None:
+            paths = [native_card_path(self.routing_key)]
+            if public_discovery:
+                paths.append("/.well-known/agent-card.json")
+            for path in paths:
+                self.card_routes.extend(
+                    create_agent_card_routes(
+                        handler.agent_card,
+                        card_modifier=card_modifier,
+                        card_url=path,
+                        cache_control="no-cache",
+                    )
+                )
+        self.routes = (self.route, *self.card_routes)
 
     def admits(self, scope: Scope) -> bool:
         """Classify only methods and full endpoints in this SDK registration."""
         return scope["type"] == "http" and _matches_endpoint(self.route, scope)
+
+    def admits_public_card(self, scope: Scope) -> bool:
+        return scope["type"] == "http" and any(
+            _matches_endpoint(route, scope) for route in self.card_routes
+        )
 
 
 class NativeA2AHTTPRegistry:
@@ -170,39 +201,65 @@ class NativeA2AHTTPRegistry:
     def publish(self, binding: NativeA2AHTTP) -> None:
         """Synchronously publish or replace one manager routing key."""
         previous = self._registrations.get(binding.routing_key)
-        if previous is None:
-            if any(
-                getattr(route, "path", None) == binding.prefix
-                for route in self._app.routes
-            ):
-                raise RuntimeError(
-                    "Native A2A mount is already owned by another registration"
-                )
-            self._app.routes.insert(0, binding.route)
-        else:
-            self._app.routes[self._route_index(previous)] = binding.route
+        previous_ids = {id(route) for route in previous.routes} if previous else set()
+        if previous is not None:
+            self._require_routes(previous)
+        paths = {route.path for route in binding.routes}
+        if any(
+            id(route) not in previous_ids and getattr(route, "path", None) in paths
+            for route in self._app.routes
+        ):
+            raise RuntimeError(
+                "Native A2A mount is already owned by another registration"
+            )
+        # Validate every collision and every old route before mutating the app.
+        self._app.routes[:] = [
+            route for route in self._app.routes if id(route) not in previous_ids
+        ]
+        self._app.routes[0:0] = binding.routes
         self._registrations[binding.routing_key] = binding
 
-    def _route_index(self, binding: NativeA2AHTTP) -> int:
-        for index, route in enumerate(self._app.routes):
-            if route is binding.route:
-                return index
-        raise RuntimeError("Native A2A registry lost its published route")
+    def _require_routes(self, binding: NativeA2AHTTP) -> None:
+        if any(
+            sum(route is owned for route in self._app.routes) != 1
+            for owned in binding.routes
+        ):
+            raise RuntimeError("Native A2A registry lost its published route")
+
+    def is_current(self, binding: NativeA2AHTTP) -> bool:
+        if self._registrations.get(binding.routing_key) is not binding:
+            return False
+        self._require_routes(binding)
+        return True
 
     def withdraw(self, binding: NativeA2AHTTP) -> bool:
         """Withdraw this generation only; a later publication remains intact."""
-        if self._registrations.get(binding.routing_key) is not binding:
+        if not self.is_current(binding):
             return False
-        del self._app.routes[self._route_index(binding)]
+        owned_ids = {id(route) for route in binding.routes}
+        self._app.routes[:] = [
+            route for route in self._app.routes if id(route) not in owned_ids
+        ]
         del self._registrations[binding.routing_key]
         return True
 
     def admits(self, scope: Scope) -> bool:
         """Fail clearly on corrupt publication, and match the installed SDK routes."""
-        if scope.get("app") is not self._app:
-            raise ValueError("Native A2A registry belongs to a different application")
+        self.require_application(scope.get("app"))
         for binding in self._registrations.values():
-            self._route_index(binding)
+            self._require_routes(binding)
             if binding.admits(scope):
+                return True
+        return False
+
+    def require_application(self, app: Starlette) -> None:
+        if app is not self._app:
+            raise ValueError("Native A2A registry belongs to a different application")
+
+    def admits_public_card(self, scope: Scope) -> bool:
+        self.require_application(scope.get("app"))
+        for binding in self._registrations.values():
+            self._require_routes(binding)
+            if binding.admits_public_card(scope):
                 return True
         return False
