@@ -1,6 +1,7 @@
 /** Local, canvas-only PDF rendering: no document actions, links or form scripts. */
 const ASSETS = new URL('./vendor/pdfjs/', import.meta.url);
 const MAX_PIXELS = 4_000_000;
+const MAX_SOURCE_IMAGE_PIXELS = 80_000_000;
 const MAX_SIDE = 2048;
 const PREVIEW_TIMEOUT_MS = 15_000;
 
@@ -64,7 +65,7 @@ export function createPdfPreview(bytes, doc = globalThis.document, {
             worker = new library.PDFWorker();
             loadingTask = library.getDocument({ data: bytes.slice(), worker, enableXfa: false,
                 stopAtErrors: true, useSystemFonts: false, disableFontFace: true,
-                maxImageSize: MAX_PIXELS, canvasMaxAreaInBytes: MAX_PIXELS * 4,
+                maxImageSize: MAX_SOURCE_IMAGE_PIXELS, canvasMaxAreaInBytes: MAX_PIXELS * 4,
                 cMapUrl: new URL('cmaps/', ASSETS).href,
                 standardFontDataUrl: new URL('standard_fonts/', ASSETS).href,
                 wasmUrl: new URL('wasm/', ASSETS).href });

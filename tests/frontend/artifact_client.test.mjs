@@ -268,3 +268,36 @@ test('receipt recovery distinguishes host 404 from artifact erasure through boun
         assert.match(calls[0], new RegExp(`/publications/${key}$`)); draft.close();
     }
 });
+
+
+test('an upload failure before any commit still permits confirmed conflict recovery', async () => {
+    const { draft, client, committed } = await fixture(); const stage = client.stage;
+    client.stage = async () => { throw new TypeError('Failed to fetch'); };
+    draft.edit('retained draft'); await draft.save();
+    assert.equal(committed.length, 0); assert.equal(draft.state, 'unknown');
+    client.stage = stage; client.commit = async () => { throw { status: 409, code: 'artifact_conflict' }; };
+    await draft.retry(); assert.equal(draft.state, 'conflict');
+    await draft.compareLatest(); assert.equal(draft.comparison.text, '# Original');
+    assert.equal(draft.useComparedRevision(), true); assert.equal(draft.text, 'retained draft'); draft.close();
+});
+
+test('opening without permission never creates a draft to discard', async () => {
+    for (const error of [{ status: 401 }, { status: 403 }, { code: 'artifact_auth_changed' }]) {
+        const draft = new ArtifactDraft({ get: async () => { throw error; } });
+        await draft.open(ref); assert.equal(draft.state, 'denied');
+        assert.equal(draft.hasUnsavedChanges, false); draft.close();
+    }
+});
+
+
+test('a failed restage cannot forget an earlier uncertain commit', async () => {
+    const { draft, client } = await fixture(); const stage = client.stage;
+    client.commit = async () => { throw { status: 404 }; };
+    draft.edit('keep'); await draft.save(); const key = draft.pendingKey;
+    client.stage = async () => { throw new Error('stage lost'); };
+    await draft.retry(); assert.equal(draft.state, 'unknown');
+    client.stage = stage; client.commit = async () => { throw { status: 409 }; };
+    await draft.retry(); assert.equal(draft.state, 'unknown');
+    await draft.compareLatest(); assert.equal(draft.useComparedRevision(), false);
+    assert.equal(draft.pendingKey, key); draft.close();
+});

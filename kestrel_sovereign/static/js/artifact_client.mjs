@@ -86,7 +86,7 @@ export class ArtifactDraft {
     get editable() { return this.#editable; }
     get pendingKey() { return this.#pending?.request.idempotency_key ?? null; }
     get comparison() { return this.#comparison; }
-    get hasUnsavedChanges() { return ['dirty', 'saving', 'unknown', 'conflict', 'denied', 'failed', 'erased'].includes(this.#state); }
+    get hasUnsavedChanges() { return !!this.#revision && ['dirty', 'saving', 'unknown', 'conflict', 'denied', 'failed', 'erased'].includes(this.#state); }
     #set(state) { if (!this.#closed) { this.#state = state; this.#changed(this); } }
     async #loadRevision(ref) {
         ref = artifactRef(ref);
@@ -185,7 +185,7 @@ export class ArtifactDraft {
                 pending.phase = 'stage'; pending.uncertain = true; this.#set('unknown');
             }
             else if (error.status === 409 && pending.phase === 'commit' && !pending.uncertain) this.#set('conflict');
-            else { pending.uncertain = true; this.#set('unknown'); }
+            else { pending.uncertain ||= pending.phase === 'commit'; this.#set('unknown'); }
         }
     }
     async reconcile() {

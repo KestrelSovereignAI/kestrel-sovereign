@@ -6,7 +6,7 @@ import { publicationDigests, sha256 } from '../../kestrel_sovereign/static/js/ar
 
 const ref = { schema_version: 1, artifact_id: 'artifact', revision_id: 'revision1' };
 const scope = { schema_version: 1, tenant_id: 'tenant', principal_id: 'person', agent_id: 'agent' };
-async function fixture({ content = '<script>alert(1)</script>', type = 'text/markdown', title = '<img src=x onerror=alert(1)>', confirmDiscard = () => true } = {}) {
+async function fixture({ getError = null, content = '<script>alert(1)</script>', type = 'text/markdown', title = '<img src=x onerror=alert(1)>', confirmDiscard = () => true } = {}) {
     const dom = new JSDOM('<!doctype html><body></body>', { url: 'http://localhost/' });
     const bytes = new TextEncoder().encode(content);
     const file = { schema_version: 1, path: 'source.md', media_type: type, sha256: await sha256(bytes), size_bytes: bytes.length };
@@ -14,7 +14,7 @@ async function fixture({ content = '<script>alert(1)</script>', type = 'text/mar
         manifest: { schema_version: 1, files: [file], entrypoint: file.path },
         provenance: { schema_version: 1, session_id: null, run_id: null, tool_name: null }, committed_at: '2026-10-20T12:00:00Z' };
     const client = {
-        get: async () => structuredClone(revision), read: async () => bytes,
+        get: async () => { if (getError) throw getError; return structuredClone(revision); }, read: async () => bytes,
         stage: async (key, file) => file,
         commit: async request => ({ schema_version: 1, ref: { ...ref, revision_id: 'revision2' }, scope,
             idempotency_key: request.idempotency_key, ...await publicationDigests(request), committed_at: revision.committed_at, storage_id: 'local' }),
@@ -179,4 +179,14 @@ test('conversation replacement keeps a dirty artifact panel and its unload guard
         const close = [...item.dom.window.document.querySelectorAll('button')].find(node => node.textContent === 'Close');
         globalThis.confirm = () => true; close.click(); await tick();
     } finally { globalThis.document = before; globalThis.MutationObserver = beforeObserver; globalThis.confirm = beforeConfirm; item.close(); }
+});
+
+
+test('a denied open can close and leave without a discard confirmation', async () => {
+    let asked = 0;
+    const item = await fixture({ getError: { status: 403 }, confirmDiscard: () => { asked++; return false; } });
+    const event = new item.dom.window.Event('beforeunload', { cancelable: true });
+    item.dom.window.dispatchEvent(event); assert.equal(event.defaultPrevented, false);
+    button(item.panel, 'Close').click(); await tick();
+    assert.equal(asked, 0); assert.equal(item.panel.element.isConnected, false); item.close();
 });

@@ -30,6 +30,9 @@ test('PDF renderer copies source bytes, uses local assets and caps canvas dimens
     const item = fixture(); await item.preview.ready;
     const { options, render } = item.observed;
     assert.notEqual(options.data, item.bytes); assert.deepEqual(options.data, item.bytes);
+    assert.equal(options.stopAtErrors, true);
+    assert.equal(options.maxImageSize, 80_000_000);
+    assert.equal(options.canvasMaxAreaInBytes, 16_000_000);
     assert.equal(options.enableXfa, false); assert.equal(options.disableFontFace, true);
     for (const field of ['cMapUrl', 'standardFontDataUrl', 'wasmUrl']) assert.match(options[field], /static\/js\/vendor\/pdfjs\//);
     assert.ok(render.canvas.width * render.canvas.height <= 4_000_000);
