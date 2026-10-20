@@ -1476,8 +1476,9 @@ async def test_unresponsive_recipient_costs_one_attempt_per_pass(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delayed_ack", [False, True])
 async def test_rows_behind_a_hung_row_are_reached_on_the_next_pass(
-    fleet, monkeypatch,
+    fleet, monkeypatch, delayed_ack,
 ):
     """One row whose settlement hangs skips its recipient's other rows for
     that pass only: the next pass starts with them. The stuck row sorts first
@@ -1489,18 +1490,37 @@ async def test_rows_behind_a_hung_row_are_reached_on_the_next_pass(
     fleet.router.reachable = True
     real_cancel = fleet.feature.cancel_outbound_task
     attempts = []
+    hung_timeout = 0.05
 
     async def _hangs_for_one(task_id, *, reason):
         attempts.append(task_id)
         if task_id == "q-a-stuck":
             await asyncio.Event().wait()
-        return await real_cancel(task_id, reason=reason)
+        result = await real_cancel(task_id, reason=reason)
+        if delayed_ack:
+            # The receiver already committed. Delayed acknowledgement must
+            # not make fairness depend on its round-trip fitting in 50 ms.
+            await asyncio.sleep(2 * hung_timeout)
+        return result
     fleet.feature.cancel_outbound_task = _hangs_for_one
-    monkeypatch.setattr(
-        PeersFeature, "QUESTION_SETTLEMENT_TIMEOUT_SECONDS", 0.05,
-    )
+    real_settle = fleet.feature._settle_question_with_receiver
+
+    async def _short_deadline_only_for_hung_row(**kwargs):
+        # Force the genuinely hung row to time out quickly on either pass.
+        # Its healthy sibling retains the ordinary production deadline: the
+        # fairness invariant does not require real SQLite/ACK I/O in 50 ms.
+        with monkeypatch.context() as deadline:
+            if kwargs["task_id"] == "q-a-stuck":
+                deadline.setattr(
+                    fleet.feature, "QUESTION_SETTLEMENT_TIMEOUT_SECONDS",
+                    hung_timeout,
+                )
+            return await real_settle(**kwargs)
+
+    fleet.feature._settle_question_with_receiver = _short_deadline_only_for_hung_row
 
     await fleet.settle()
+    assert attempts == ["q-a-stuck"]
     await fleet.settle()
 
     assert attempts[0] == "q-a-stuck"

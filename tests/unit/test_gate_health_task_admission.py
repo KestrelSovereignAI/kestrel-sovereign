@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -88,7 +89,7 @@ async def test_refused_original_gate_or_persist_coroutine_is_closed(
             for pair in refused
             for coro in pair
         ), "fresh unaccepted lifecycle coroutine remained open"
-        with sqlite3.connect(db.backend.db_path) as independent:
+        with closing(sqlite3.connect(db.backend.db_path)) as independent, independent:
             table = "health_log" if surface == "health" else "original_gate_admission"
             assert independent.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[
                 0
