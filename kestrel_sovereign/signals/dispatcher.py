@@ -4887,12 +4887,11 @@ class SignalDispatcher:
 
         if resident is not None:
             from kestrel_sovereign._async_ownership import await_owned_task
-            from kestrel_sovereign.execution_custody import execution_terminal_error
             # This original dispatch remains admitted until its new resident
             # child physically settles. Explicit handle cancellation forwards
             # once; borrowed admission readers still never cancel this owner.
             outcome = await await_owned_task(resident, cancel_on_caller_cancellation=True)
-            terminal = execution_terminal_error(
+            terminal = execution_finite_error(
                 outcome.error, outcome.cancellation, retain_originals=True,
             )
             if terminal is not None:

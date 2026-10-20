@@ -88,8 +88,10 @@ class _FakeAgent:
         self.process_input_calls.append(prompt)
         return self.process_input_return
 
-    def _track_background_task(self, coro, *, name: str):
-        task = asyncio.create_task(coro, name=name)
+    def _track_background_task(self, coro, *, name: str, admission=None):
+        from kestrel_sovereign._async_ownership import create_owned_task
+
+        task = create_owned_task(coro, name=name, admission=admission)
         self.background_tasks.append(task)
         return task
 
@@ -117,6 +119,9 @@ async def dispatcher_components(db_path):
         backend=backend,
         locks=locks,
     )
+    # Retire the actual dispatcher timers before draining its owned writers.
+    dispatcher.shutdown()
+    await dispatcher.shutdown_durable_delivery()
     # Drain background log writes before closing the backend.
     pending = [t for t in agent.background_tasks if not t.done()]
     if pending:
@@ -1296,14 +1301,17 @@ async def test_enqueue_signal_returns_handle_immediately(dispatcher_components):
     await started.wait()
     assert not handle.done
 
-    # ACK-bearing ingress needs the earlier durable receipt, not this
-    # background handle. The event is committed before a slow handler runs.
-    receipt = await handle.wait_for_durable_admission()
-    assert receipt.disposition is DurableAdmissionDisposition.COMMITTED
-    assert receipt.signal_id == handle.signal_id
+    # Finite action work has no resident owner. Its transport may not retire
+    # the original ingress before the handler and outcome writers settle.
+    admission = asyncio.create_task(handle.wait_for_durable_admission())
+    await asyncio.sleep(0)
+    assert not admission.done()
     assert not handle.done
 
     can_finish.set()
+    receipt = await admission
+    assert receipt.disposition is DurableAdmissionDisposition.COMMITTED
+    assert receipt.signal_id == handle.signal_id
     result = await handle.wait()
     assert result.status == Status.OK
     assert result.action_result == "done"
