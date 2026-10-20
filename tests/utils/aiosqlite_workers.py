@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import threading
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from typing import Any
@@ -13,6 +14,8 @@ from unittest.mock import patch
 import aiosqlite
 
 import kestrel_sovereign.storage.db.sqlite as sqlite_module
+from kestrel_sovereign._async_ownership import create_owned_task, owned_task_error
+from kestrel_sovereign.execution_custody import execution_observation_error
 from tests.utils.virtual_clock import (
     HANG_GUARD_SECONDS,
     await_within_hang_guard,
@@ -148,6 +151,28 @@ async def normal_close_schedule():
     owners = []
     workers = []
     retirement_maps = []
+    failures = []
+
+    async def settle(tasks, *, step):
+        # The guard observes this exact completion Future, so withdrawing a
+        # caller never cancels the original close/join owners. Repeated C does
+        # not reset the independent real-time hang deadline.
+        completion = asyncio.gather(*tasks, return_exceptions=True)
+        deadline = time.monotonic() + HANG_GUARD_SECONDS
+        try:
+            while not completion.done():
+                try:
+                    await await_within_hang_guard(
+                        completion, step=step,
+                        seconds=max(0.0, deadline - time.monotonic()),
+                    )
+                except asyncio.CancelledError as error:
+                    failures.append(error)
+        finally:
+            # Harvest the actual owners, not cancellation projections returned
+            # by gather, and never discard a late native UNKNOWN or error.
+            failures.extend(owned_task_error(task) for task in tasks if task.done())
+
     # Late cleanup still needs the real stage observer after clock restoration.
     with observe_bounded_close_stages() as stages:
         try:
@@ -156,7 +181,7 @@ async def normal_close_schedule():
                     retirement_maps.append(retained_closes)
                     worker = aiosqlite_worker(connection)
                     workers.append(worker)
-                    close_task = asyncio.create_task(operation)
+                    close_task = create_owned_task(operation, retain_originals=True)
                     owners.append(close_task)
                     await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
                     deadline = stages.deadlines[connection]
@@ -175,30 +200,33 @@ async def normal_close_schedule():
                     )
 
                 yield finish
+        except BaseException as error:  # noqa: BLE001 - rethrow every original body/control after joining
+            failures.append(error)
         finally:
             # The caller first drains enclosing operations that can register
             # more closes. Keep observing while settling every original owner.
-            if owners:
-                await await_within_hang_guard(
-                    asyncio.gather(*owners, return_exceptions=True),
-                    step="settling the original SQLite close/join owners",
-                )
-            for worker in workers:
-                await await_within_hang_guard(
-                    asyncio.to_thread(worker.join, HANG_GUARD_SECONDS),
-                    step="joining the original SQLite worker on exceptional exit",
-                )
-                assert not worker.is_alive(), "original SQLite worker did not retire"
-            retirement_tasks = {
-                retained.retirement_task
-                for retained_closes in retirement_maps
-                for retained in retained_closes.values()
-                if retained.retirement_task is not None
-            }
-            await await_within_hang_guard(
-                asyncio.gather(*retirement_tasks, return_exceptions=True),
-                step="joining original SQLite retirement tasks",
-            )
+            try:
+                if owners:
+                    await settle(owners, step="settling the original SQLite close/join owners")
+                worker_joins = [
+                    asyncio.create_task(asyncio.to_thread(worker.join, HANG_GUARD_SECONDS))
+                    for worker in workers
+                ]
+                await settle(worker_joins, step="joining the original SQLite worker on exceptional exit")
+                for worker in workers:
+                    assert not worker.is_alive(), "original SQLite worker did not retire"
+                retirement_tasks = {
+                    retained.retirement_task
+                    for retained_closes in retirement_maps
+                    for retained in retained_closes.values()
+                    if retained.retirement_task is not None
+                }
+                await settle(retirement_tasks, step="joining original SQLite retirement tasks")
+            except BaseException as error:  # noqa: BLE001 - compose, never hide, physical cleanup failure
+                failures.append(error)
+            terminal = execution_observation_error(*failures)
+            if terminal is not None:
+                raise terminal
 
 
 @contextmanager

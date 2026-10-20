@@ -7,6 +7,10 @@ from contextlib import nullcontext
 import pytest
 
 import kestrel_sovereign.storage.db.sqlite as sqlite_module
+from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
+    execution_commit_outcome,
+)
 from kestrel_sovereign.storage.db import SQLiteBackend
 from tests.utils.aiosqlite_workers import (
     CloseStage,
@@ -17,6 +21,7 @@ from tests.utils.aiosqlite_workers import (
     observe_bounded_close_stages,
     wait_for_lifecycle_checkpoint,
 )
+from tests.utils.original_failure import OriginalFailure
 from tests.utils.virtual_clock import (
     HANG_GUARD_SECONDS,
     await_within_hang_guard,
@@ -314,31 +319,66 @@ async def test_normal_close_schedule_preserves_native_failure_and_restores_clock
 
 
 @pytest.mark.asyncio
-async def test_normal_close_schedule_joins_on_caller_cancellation_and_restores_clock(tmp_path):
+@pytest.mark.parametrize("late_failure", [None, "ordinary", "unknown"])
+@pytest.mark.parametrize("repeated", [False, True])
+async def test_normal_close_schedule_joins_on_caller_cancellation_and_restores_clock(
+    tmp_path, monkeypatch, late_failure, repeated,
+):
     backend = SQLiteBackend(str(tmp_path / "cancelled-close.db"))
     await backend.connect()
     connection = backend._connection
     assert connection is not None
     worker = aiosqlite_worker(connection)
     entered, release = block_aiosqlite_native_close(connection)
+    failure = (
+        ExecutionCommitOutcomeError("unknown") if late_failure == "unknown" else
+        OSError("original late native close failure") if late_failure == "ordinary" else None
+    )
+    native_original = OriginalFailure.capture(failure) if failure is not None else None
+    if failure is not None:
+        close = connection.close
+
+        async def fail_after_real_close():
+            await close()
+            raise failure
+
+        monkeypatch.setattr(connection, "close", fail_after_real_close)
     loop = asyncio.get_running_loop()
     real_clock = loop.time
+    caller_originals = []
+    caller_observed = asyncio.Event()
 
     async def retire():
         async with normal_close_schedule() as finish:
-            await finish(
-                connection, backend.close(),
-                retained_closes=backend._retired_connection_closes,
-            )
+            try:
+                await finish(
+                    connection, backend.close(),
+                    retained_closes=backend._retired_connection_closes,
+                )
+            except asyncio.CancelledError as error:
+                caller_originals.append(OriginalFailure.capture(error))
+                caller_observed.set()
+                raise
 
     owner = asyncio.create_task(retire())
     try:
         await wait_for_thread_event(entered, step="native close entry")
         assert worker.is_alive() and not owner.done()
         owner.cancel("original caller")
+        await await_within_hang_guard(caller_observed.wait(), step="original caller cancellation")
+        if repeated:
+            owner.cancel("repeated original caller")
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not owner.done(), "repeated caller C escaped before the original worker retired"
         release.set()
-        with pytest.raises(asyncio.CancelledError, match="original caller"):
+        with pytest.raises(BaseException) as caught:
             await await_within_hang_guard(owner, step="cancelled close schedule retiring")
+        assert len(caller_originals) == 1
+        caller_originals[0].assert_retained(caught.value)
+        if native_original is not None:
+            native_original.assert_retained(caught.value)
+        assert execution_commit_outcome(caught.value) == ("unknown" if late_failure == "unknown" else None)
         assert loop.time == real_clock
         assert not worker.is_alive()
         assert not backend.connection_retirement_pending
