@@ -92,8 +92,7 @@ and serve source bytes as attachments with nosniff and a sandbox policy. The
 bounded upload body is parsed before taking privacy/grant gates, so an idle
 uploader cannot prevent revocation. Authorization is rechecked after parsing.
 Any authority failure after durable acceptance requires reconciliation.
-The
-viewer chooses safe renderers after an authorized fetch. Raw artifact access is
+The viewer chooses safe renderers after an authorized fetch. Raw artifact access is
 refused in volatile, anonymized and deidentified modes; generic binary content
 has no approved transform. Explicit authorized deletion remains available.
 
@@ -122,6 +121,12 @@ persist the complete request digest and receipt atomically. A caller-owned
 outer transaction cannot produce a durable receipt. Return success only after
 the outermost commit is acknowledged. A lost commit response is reconciled with
 the original publication key; no generated replacement key or blind retry.
+
+Conflict comparison resolves the current revision through the authorized
+`head` operation and `GET /api/artifacts/{artifact_id}/head`. A single database
+snapshot joins the committed head pointer to its immutable revision; history
+timestamps and revision IDs cannot establish the head. This read is not a lock:
+the subsequent publication still compares the selected expected revision.
 
 Staging has a bounded lifetime and owner quota. Expired unreferenced staging may
 be collected; committed source revisions may not. Edits conflict rather than
