@@ -601,7 +601,10 @@ class ExecutionFence(Protocol):
     checkout. Validators must not publish effects or start/commit transactions.
     """
 
-    backend_type: str
+    @property
+    def backend_type(self) -> str:
+        """Observe the bound backend without requiring a mutable host fence."""
+        ...
 
     def require_work(self) -> None: ...
 
