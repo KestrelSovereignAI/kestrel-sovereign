@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 DIRECTORY = Path("/tmp/kestrel-browser")
-MAX_REQUEST = 128 * 1024
+MAX_REQUEST = 512 * 1024  # Includes worst-case JSON escaping of bounded Unicode text.
 MAX_RESPONSE = 23 * 1024 * 1024
 SECRET = re.compile(r"^[a-f0-9]{64}$")
 

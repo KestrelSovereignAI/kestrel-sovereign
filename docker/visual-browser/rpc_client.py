@@ -4,6 +4,7 @@ import socket
 import sys
 
 from wire import DIRECTORY, MAX_REQUEST, MAX_RESPONSE, decode, encode
+from worker import bootstrap
 
 
 def exchange(raw):
@@ -27,7 +28,6 @@ def initialize(raw):
     # seeing partial JSON; O_EXCL and one-shot startup prohibit a second session.
     if len(raw) > MAX_REQUEST:
         raise ValueError("invalid_bootstrap")
-    from worker import bootstrap
     bootstrap(decode(raw))
     (DIRECTORY / "initialized").touch(mode=0o600, exist_ok=False)
     path = DIRECTORY / "bootstrap.pending"

@@ -94,11 +94,21 @@ def exercise(checked, cid, output):
     while time.monotonic() < deadline:
         record = json.loads(checked(["container", "inspect", cid]))[0]
         if not record["State"]["Running"]:
+            state = record["State"]
+            try:
+                finished = datetime.fromisoformat(state["FinishedAt"])
+                expiry = datetime.fromisoformat(request["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                raise RuntimeError("worker expiry evidence lacks a valid physical retirement time") from None
+            if (state["ExitCode"] != 0 or state.get("OOMKilled") is not False
+                    or finished.tzinfo is None or finished < expiry):
+                raise RuntimeError("worker did not retire normally at expiry")
             break
         time.sleep(0.25)
     else:
         raise RuntimeError("worker did not physically retire on expiry")
     return {"passed": True, "session_id": session["session_id"], "retired_exit_code": record["State"]["ExitCode"],
+            "expires_at": request["expires_at"], "finished_at": record["State"]["FinishedAt"],
             "png_sha256": hashlib.sha256(saved).hexdigest(), "same_action_not_replayed": True,
             "transport_reconnect_preserved_state": True, "stale_frame_refused": True,
             "pause_fenced_input_and_observation": True, "expiry_physically_retired": True}

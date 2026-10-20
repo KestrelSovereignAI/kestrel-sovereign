@@ -11,13 +11,23 @@ from tests.unit.test_visual_browser_controller import action
 from tests.unit.test_visual_browser_controller import controller as fixture_controller
 
 ROOT = Path(__file__).parents[2] / "docker/visual-browser"
-sys.path.insert(0, str(ROOT))
+_names = ("controller", "wire", "sandbox_checks", "worker", "rpc_client")
+_previous = {name: sys.modules.get(name) for name in _names}
+_loaded = {}
 try:
-    worker = importlib.import_module("worker")
-    wire = importlib.import_module("wire")
-    rpc = importlib.import_module("rpc_client")
+    for name in _names:
+        spec = importlib.util.spec_from_file_location(name, ROOT / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        _loaded[name] = module
+    worker, wire, rpc, sandbox_checks = (_loaded[name] for name in ("worker", "wire", "rpc_client", "sandbox_checks"))
 finally:
-    sys.path.remove(str(ROOT))
+    for name, previous in _previous.items():
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
 
 SECRET = "a" * 64
 
@@ -156,6 +166,24 @@ async def test_expiry_retires_page_and_removes_socket(ipc_dir):
     assert driver.status(session["scope"], session["session_id"])["state"] == "closed"
 
 
+@pytest.mark.asyncio
+async def test_closing_state_ends_worker_service_without_waiting_for_expiry(ipc_dir):
+    driver, page, session = controller()
+    task = asyncio.create_task(worker.serve(driver, SECRET, directory=ipc_dir))
+    path = ipc_dir / "worker.sock"
+    async with asyncio.timeout(2):
+        while not path.exists():
+            await asyncio.sleep(0.01)
+        page.fail_close = True
+        request = {"schema_version": 1, "request_id": "close", "session_id": session["session_id"],
+                   "expected_control_epoch": 0, "operation": "close"}
+        with pytest.raises(worker.Refused, match="control_outcome_unknown"):
+            await driver.control(session, request)
+        assert driver.status(session["scope"], session["session_id"])["state"] == "closing"
+        await task
+    assert not path.exists()  # main then closes the browser or exits the process.
+
+
 def test_bootstrap_is_one_shot_and_secret_file_is_private(ipc_dir, monkeypatch):
     _driver, _page, session = controller()
     request = {key: session[key] for key in ("schema_version", "session_id", "scope", "lease_id", "surface", "expires_at")}
@@ -174,15 +202,26 @@ def test_bootstrap_is_one_shot_and_secret_file_is_private(ipc_dir, monkeypatch):
             worker.bootstrap(wire.decode(invalid))
 
 
+def test_ipc_byte_budget_includes_worst_case_json_escaping():
+    _driver, _page, session = controller()
+    request = {key: session[key] for key in ("schema_version", "session_id", "scope", "lease_id", "surface", "expires_at")}
+    request["required_capabilities"] = ["screenshot"]
+    initial = {"schema_version": 1, "secret": SECRET, "request": request, "document_html": "\x00" * 65536}
+    assert len(wire.encode(worker.bootstrap(initial))) <= wire.MAX_REQUEST
+    typed = message("act", {"session": session, "request": {"action": {"kind": "type", "text": "😀" * 16384}}})
+    assert len(wire.encode(typed)) <= wire.MAX_REQUEST
+
+
 @pytest.mark.parametrize("change", [{}, {"uid": 0}, {"CapEff": "1"}, {"CapBnd": "1"},
                                       {"CapPrm": "1"}, {"CapInh": "1"}, {"CapAmb": "1"},
                                       {"NoNewPrivs": "0"}, {"groups": [0]}, {"rtprio": (1, 1)}])
 def test_shared_process_admission_checks_actual_limits(monkeypatch, change):
-    checks = sys.modules["sandbox_checks"]
+    checks = sandbox_checks
     values = {name: "0" for name in ("CapEff", "CapBnd", "CapPrm", "CapInh", "CapAmb")}
     values.update(NoNewPrivs="1")
     values.update({name: value for name, value in change.items() if name in values})
-    monkeypatch.setattr(checks.Path, "read_text", lambda _: "\n".join(f"{name}:{value}" for name, value in values.items()))
+    from types import SimpleNamespace
+    monkeypatch.setattr(checks, "Path", lambda _: SimpleNamespace(read_text=lambda: "\n".join(f"{name}:{value}" for name, value in values.items())))
     monkeypatch.setattr(checks.os, "getuid", lambda: change.get("uid", 1000))
     monkeypatch.setattr(checks.os, "getgroups", lambda: change.get("groups", [1000]))
     monkeypatch.setattr(checks.resource, "RLIMIT_RTPRIO", 14, raising=False)

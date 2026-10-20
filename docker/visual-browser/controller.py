@@ -66,7 +66,7 @@ class BrowserController:
 
     Reconnecting a transport may query this existing controller. Constructing a
     replacement controller is a new session, never recovery of accepted actions.
-    Frames identify the latest delivered observation, not a semantic guarantee
+    Frames identify the latest produced observation, not a semantic guarantee
     that autonomous page content cannot change. The host governs consequential
     effects; this worker does not infer permission from a model's click intent.
     """
@@ -111,17 +111,20 @@ class BrowserController:
 
     def _live(self):
         if self.monotonic() >= self.deadline or self.clock() >= instant(self._session["expires_at"]):
-            if self._session["state"] not in {"closing", "closed"}:
-                self._session.update(state="closing", controller="none", control_epoch=self._session["control_epoch"] + 1)
-                self._frame = None
+            self._fence_retirement()
             raise Refused("session_expired")
 
+    def _fence_retirement(self):
+        if self._session["state"] not in {"closing", "closed"}:
+            self._session.update(state="closing", controller="none", control_epoch=self._session["control_epoch"] + 1)
+        self._frame = None
+
     def _owner(self, scope, session_id):
-        if scope != self._session["scope"] or session_id != self._session["session_id"]:
+        if not version_one(scope) or scope != self._session["scope"] or session_id != self._session["session_id"]:
             raise Refused("session_unavailable")
 
     def _bound(self, session, *, agent=False):
-        if not isinstance(session, dict):
+        if not version_one(session) or not version_one(session.get("scope")):
             raise Refused("session_unavailable")
         self._owner(session.get("scope"), session.get("session_id"))
         if (session.get("lease_id") != self._session["lease_id"]
@@ -145,9 +148,7 @@ class BrowserController:
         """Worker-owned expiry/disconnect cleanup; no agent command calls this."""
         if self._session["state"] == "closed":
             return True
-        if self._session["state"] != "closing":
-            self._session.update(state="closing", controller="none", control_epoch=self._session["control_epoch"] + 1)
-        self._frame = None
+        self._fence_retirement()
         try:
             async with asyncio.timeout(5):
                 await self.page.context.close()
@@ -241,9 +242,15 @@ class BrowserController:
                     await effect()
                 receipt.update(outcome="completed", reason_code=None, recorded_at=self.clock().isoformat())
             except asyncio.CancelledError:
+                # Cancelling the Python waiter does not unsend a Chromium input.
+                # Fence synchronously; the worker must physically retire it.
+                self._fence_retirement()
                 raise
-            except Exception:  # noqa: BLE001, S110 — accepted effect remains explicitly unknown
-                pass  # Accepted effects are never automatically replayed.
+            except Exception:  # noqa: BLE001 — accepted effect remains explicitly unknown
+                # A renderer can deliver a timed-out click later. Do not report
+                # a successful pause or permit resume with that input pending.
+                self._fence_retirement()
+                await self.retire()
             return copy.deepcopy(receipt)
 
     def action_status(self, session, action_id):
@@ -266,7 +273,7 @@ class BrowserController:
             raise Refused("unsupported_control")
         if self._control_pending:
             raise Refused("control_pending")
-        if len(self._controls) >= 1024:
+        if len(self._controls) >= 1024 and request["operation"] == "resume":
             raise Refused("control_budget_exhausted")
         if request_id in self._controls:
             raise Refused("control_conflict")
@@ -284,7 +291,8 @@ class BrowserController:
                                      state="ready" if operation == "resume" else "paused" if operation == "pause" else "closing",
                                      controller="agent" if operation == "resume" else "none")
                 self._frame = None
-                self._controls[request_id] = digest(request)
+                if len(self._controls) < 1024:
+                    self._controls[request_id] = digest(request)
                 if operation == "close":
                     try:
                         async with asyncio.timeout(5):

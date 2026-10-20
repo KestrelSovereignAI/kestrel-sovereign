@@ -94,6 +94,20 @@ def verify_result(result: dict) -> bytes:
     return png
 
 
+def source_identity() -> dict:
+    """Bind evidence to actual context bytes, including dirty/fault-injected builds."""
+    files = {path.relative_to(CONTEXT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+             for path in sorted(CONTEXT.rglob("*"))
+             if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"}
+    context_digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    revision = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, check=False)
+    status = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, check=False)
+    head = revision.stdout.decode(errors="replace").strip()
+    return {"revision": head if revision.returncode == 0 and re.fullmatch(r"[a-f0-9]{40}", head) else None,
+            "dirty": bool(status.stdout) if status.returncode == 0 else None,
+            "build_context_sha256": context_digest, "build_context_files": files}
+
+
 def run(output: Path, *, docker: str, worker_check=None) -> dict:
     verified_seccomp_policy()
     verified_host_configuration()
@@ -103,7 +117,7 @@ def run(output: Path, *, docker: str, worker_check=None) -> dict:
     state = {"probe_id": identity, "tag": tag, "container_name": f"kestrel-browser-probe-{identity}",
              "container_id": None, "image_id": None,
              "cleanup_confirmed": False, "scope": "offline browser worker" if worker_check else "offline browser substrate",
-             "host_or_kite_acceptance": False}
+             "host_or_kite_acceptance": False, "source": source_identity()}
     manifest = output / "custody.json"
 
     def record():

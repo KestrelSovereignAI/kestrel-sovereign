@@ -105,7 +105,7 @@ async def serve(controller, secret, *, directory=DIRECTORY):
     try:
         os.chmod(socket_path, 0o600)
         async with server:
-            while controller._session["state"] != "closed":
+            while controller._session["state"] not in {"closing", "closed"}:
                 await asyncio.sleep(0.1)
                 try:
                     controller._live()

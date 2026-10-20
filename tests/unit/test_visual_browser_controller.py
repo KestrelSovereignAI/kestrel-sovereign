@@ -87,8 +87,12 @@ async def test_cancelled_accepted_effect_remains_unknown_without_replay():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert driver.action_status(session, "input")["outcome"] == "unknown"
-    assert (await driver.act(session, request))["outcome"] == "unknown"
+    closing = driver.status(session["scope"], session["session_id"])
+    assert closing["state"] == "closing" and closing["control_epoch"] == 1
+    assert driver.action_status(closing, "input")["outcome"] == "unknown"
+    with pytest.raises(Refused, match="stale_control"):
+        await driver.act(session, request)
+    assert await driver.retire()
     assert len(page.effects) == 1
 
 
@@ -182,6 +186,10 @@ async def test_boolean_versions_and_clock_rollback_cannot_extend_input_authority
     elapsed = [0]
     driver, page, session = controller(clock=lambda: now[0], monotonic=lambda: elapsed[0])
     request = await action(driver, session)
+    with pytest.raises(Refused, match="session_unavailable"):
+        driver.status({**session["scope"], "schema_version": True}, session["session_id"])
+    with pytest.raises(Refused, match="session_unavailable"):
+        await driver.observe({**session, "schema_version": True})
     with pytest.raises(Refused, match="invalid_action"):
         await driver.act(session, {**request, "schema_version": True})
     with pytest.raises(Refused, match="invalid_action"):
@@ -197,3 +205,35 @@ async def test_boolean_versions_and_clock_rollback_cannot_extend_input_authority
     assert await driver.retire()
     assert page.closed
     assert driver.status(session["scope"], session["session_id"])["state"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_exhausting_control_budget_preserves_pause_and_close():
+    driver, page, session = controller()
+    for index in range(1024):
+        session = await driver.control(session, control(session, "pause" if index % 2 == 0 else "resume", f"control-{index}"))
+    assert session["state"] == "ready"
+    paused = await driver.control(session, control(session, "pause", "safety-pause"))
+    assert paused["state"] == "paused"
+    with pytest.raises(Refused, match="control_budget_exhausted"):
+        await driver.control(paused, control(paused, "resume", "exhausted-resume"))
+    closed = await driver.control(paused, control(paused, "close", "safety-close"))
+    assert closed["state"] == "closed" and page.closed
+    assert len(driver._controls) <= 1024
+
+
+@pytest.mark.asyncio
+async def test_timed_out_input_retires_instead_of_reporting_a_quiescent_pause():
+    driver, page, session = controller()
+    request = await action(driver, session)
+    request["not_after"] = (datetime.now(UTC) + timedelta(milliseconds=20)).isoformat()
+    page.gate = asyncio.Event()
+    assert (await driver.act(session, request))["outcome"] == "unknown"
+    current = driver.status(session["scope"], session["session_id"])
+    assert current["state"] == "closed" and page.closed
+    assert driver.action_status(current, "input")["outcome"] == "unknown"
+    with pytest.raises(Refused, match="stale_control"):
+        await driver.control(session, control(session, "pause"))
+    with pytest.raises(Refused, match="session_closed"):
+        await driver.control(current, control(current, "resume"))
+    assert len(page.effects) == 1

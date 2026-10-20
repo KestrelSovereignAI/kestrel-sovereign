@@ -121,6 +121,8 @@ def test_cleanup_finds_owned_container_even_when_create_response_is_lost(tmp_pat
     else:
         assert probe.run(output, docker="docker")["cleanup_confirmed"] is True
     state = json.loads((output / "custody.json").read_text())
+    assert state["source"]["build_context_sha256"]
+    assert state["source"]["build_context_files"]["Dockerfile"]
     assert state["cleanup_confirmed"] is (not unknown_create)
     assert ["container", "rm", "--force", "c" * 64] in calls
     assert ["image", "rm", tag] in calls
@@ -206,3 +208,23 @@ def test_host_configuration_profile_is_pinned_before_docker(tmp_path, monkeypatc
     monkeypatch.setattr(probe, 'CONTEXT', context)
     with pytest.raises(RuntimeError, match='host configuration digest'):
         probe.run(tmp_path / 'evidence', docker='must-not-be-called')
+
+
+def test_source_identity_binds_actual_nested_context_bytes_and_dirty_head(tmp_path, monkeypatch):
+    context = tmp_path / "context"
+    (context / "nested").mkdir(parents=True)
+    (context / "Dockerfile").write_text("COPY nested /opt/worker")
+    source = context / "nested" / "worker.py"
+    source.write_text("original")
+    monkeypatch.setattr(probe, "CONTEXT", context)
+
+    def git(command, **options):
+        output = b"a" * 40 if "rev-parse" in command else b" M nested/worker.py"
+        return subprocess.CompletedProcess(command, 0, output, b"")
+
+    monkeypatch.setattr(probe.subprocess, "run", git)
+    before = probe.source_identity()
+    assert before["revision"] == "a" * 40 and before["dirty"] is True
+    assert before["build_context_files"]["nested/worker.py"] == hashlib.sha256(b"original").hexdigest()
+    source.write_text("changed")
+    assert probe.source_identity()["build_context_sha256"] != before["build_context_sha256"]

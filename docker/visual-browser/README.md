@@ -75,7 +75,9 @@ to exercise the same admitted container with a persistent page. This check
 creates synthetic offline content, operates it over separate authenticated Unix
 socket exchanges and confirms physical expiry without a close request. It uses
 the same unique ownership labels, policy verification and exact cleanup as the
-substrate probe. Its screenshot contains only the synthetic draft.
+substrate probe. Evidence records source revision/dirty state and actual build
+context hashes; expiry acceptance requires a normal exit at or after the admitted
+expiry, not merely a stopped container. Its screenshot contains only the synthetic draft.
 
 The image's `worker.py` accepts one trusted-host bootstrap through
 `docker exec -i <exact-owned-container-id> python /opt/kestrel-browser/rpc_client.py initialize`.
@@ -90,9 +92,15 @@ host authority, not a capability granted to an agent.
 
 Subsequent `rpc_client.py` stdin exchanges require that secret and bind one owner,
 lease, session and control epoch. A fresh transport reaches the existing page.
-Actions use the latest delivered frame, bounded age, deadline and action IDs.
+Actions use the latest produced frame, bounded age, deadline and action IDs.
 Accepted effects retain completed/unknown receipts and are never automatically
-replayed. Unknown transport results require status reconciliation. Pause fences
+replayed. A lost observation response requires observing again. Unknown transport
+results require status reconciliation; control retries reconcile with session
+status. If an accepted input times out or its waiter is cancelled, the worker
+fences and retires the session: cancelling a Playwright wait cannot unsend a
+Chromium input. That session cannot report a successful pause or be resumed.
+Pause and close remain available when the control-history budget is exhausted;
+resuming is refused. Pause fences
 queued input before draining accepted work, suspends observations and advances
 the control epoch; resume advances it again. This is not human takeover. A frame
 is an observation identity, not a promise that autonomous page content is static.
