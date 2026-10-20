@@ -255,6 +255,9 @@ class DurableAdmissionResult:
 
     disposition: DurableAdmissionDisposition
     signal_id: str
+    # Core's finite dispatch has transferred the selected lease and every
+    # remaining writer to the original resident runtime before publication.
+    resident_owned: bool = False
 
     @property
     def acknowledged(self) -> bool:
@@ -1175,6 +1178,24 @@ class SignalDispatcher:
 
         ctx_token = set_current_signal(signal)
         admission_error = None
+        staged_admission = (
+            asyncio.get_running_loop().create_future()
+            if _durable_admission is not None else None
+        )
+
+        def publish_resident_admission(staged):
+            # Finite duplicate/terminal branches do not escape their ingress
+            # before their own outcome writers have physically settled.
+            if staged.cancelled():
+                return
+            error = staged.exception()
+            if error is None:
+                receipt = staged.result()
+                if receipt.resident_owned and not _durable_admission.done():
+                    _durable_admission.set_result(receipt)
+
+        if staged_admission is not None:
+            staged_admission.add_done_callback(publish_resident_admission)
         try:
             async with self._admit_durable_operation():
                 result = await self._run(
@@ -1185,13 +1206,13 @@ class SignalDispatcher:
                         if source_event_id is not None
                         else getattr(signal, "source_event_id", None)
                     ),
-                    durable_admission=_durable_admission,
+                    durable_admission=staged_admission,
                     durable_delivery_consumer_id=_durable_delivery_consumer_id,
                     durable_terminal_consumer_id=_durable_terminal_consumer_id,
                 )
                 if (
-                    _durable_admission is not None
-                    and not _durable_admission.done()
+                    staged_admission is not None
+                    and not staged_admission.done()
                 ):
                     # A validation/cycle refusal is a proven terminal no-op for
                     # this exact signal.  Every other unresolved outcome,
@@ -1203,7 +1224,7 @@ class SignalDispatcher:
                         in {Status.DROPPED_VALIDATION, Status.DROPPED_CYCLE}
                         else DurableAdmissionDisposition.NOT_ADMITTED
                     )
-                    _durable_admission.set_result(
+                    staged_admission.set_result(
                         DurableAdmissionResult(disposition, signal.id)
                     )
                 # The public dispatch contract returns only after its own
@@ -1211,6 +1232,8 @@ class SignalDispatcher:
                 # remains separately admitted so a caller cancellation in
                 # this await cannot create a storage-close gap.
                 await self._drain_outcome_logs_for_signal(signal.id)
+                if _durable_admission is not None and not _durable_admission.done():
+                    _durable_admission.set_result(staged_admission.result())
                 return result
         except _DurableDeliveryShuttingDownError as error:
             if is_execution_control_error(error):
@@ -1321,7 +1344,13 @@ class SignalDispatcher:
             if consumer_id in self._started_durable_cognition_consumers:
                 self._schedule_durable_cognition_drain(consumer_id, delay=0.0)
 
-        task.add_done_callback(release_live_admission)
+        # This callback releases an ingress-local reservation but re-arms an
+        # existing resident consumer. Capture that SAME runtime while the
+        # publisher is admitted, not the expiring HTTP/turn context inherited
+        # by the dispatch task. Revocation of the original runtime still wins.
+        task.add_done_callback(
+            release_live_admission, context=self._resident_timer_context(),
+        )
         return SignalDispatchHandle(
             signal_id=signal.id,
             task=task,
@@ -1525,10 +1554,7 @@ class SignalDispatcher:
         timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
         if timer is not None:
             timer.cancel()
-        tracker = getattr(self._agent, "_track_runtime_task", None)
-        if not callable(getattr(type(self._agent), "_track_runtime_task", None)):
-            tracker = asyncio.create_task
-        task = tracker(
+        task = self._track_resident_durable_task(
             self._drain_durable_cognition_consumer(consumer_id),
             name=f"durable_cognition_drain:{consumer_id}:{self._agent.did}",
         )
@@ -1551,7 +1577,22 @@ class SignalDispatcher:
             if consumer_id in self._durable_cognition_drain_rerun:
                 self._start_durable_cognition_drain(consumer_id)
 
-        task.add_done_callback(complete)
+        task.add_done_callback(complete, context=self._resident_timer_context())
+
+    def _track_resident_durable_task(self, coro, *, name):
+        """One resident publisher for initial delivery handoff and retry drains."""
+        tracker = getattr(type(self._agent), "_track_runtime_task", None)
+        if callable(tracker):
+            return tracker(self._agent, coro, name=name)
+        # Legacy dispatcher embeddings have no hosted execution authority.
+        # They may not impersonate a runtime handoff under an admitted scope.
+        from kestrel_sovereign.execution_custody import (
+            ExecutionAuthorityError, current_execution_custody,
+        )
+        if current_execution_custody(self._agent):
+            coro.close()
+            raise ExecutionAuthorityError("durable handoff requires original runtime owner")
+        return asyncio.create_task(coro, name=name)
 
     async def _drain_durable_cognition_consumer(self, consumer_id: str) -> None:
         """Claim and route all currently-due work for one durable consumer."""
@@ -4757,6 +4798,39 @@ class SignalDispatcher:
                 registration=registration,
             )
 
+        if durable_admission is not None:
+            # The exact claim was obtained under live ingress authority. Its
+            # remaining work must be owned before any early cursor receipt:
+            # caller recovery, cognition, renewal, settlement AND audit tails.
+            async def resident_delivery():
+                from kestrel_sovereign.signals.context import (
+                    reset_current_signal, set_current_signal,
+                )
+                owner = asyncio.current_task()
+                token = self._durable_admission.set((owner, 1))
+                signal_token = set_current_signal(signal)
+                self._durable_admission_owners.add(owner)
+                try:
+                    try:
+                        return await self._execute_claimed_durable_cognition(
+                            signal, registration, start, delivery=delivery,
+                            consumer_id=consumer_id, use_live_signal=use_live_signal,
+                            retry_delay=retry_delay, durable_admission=durable_admission,
+                            persisted_event_id=persisted_event_id,
+                        )
+                    finally:
+                        await self._drain_outcome_logs_for_signal(signal.id)
+                finally:
+                    self._durable_admission_owners.discard(owner)
+                    reset_current_signal(signal_token)
+                    self._durable_admission.reset(token)
+
+            resident = self._track_resident_durable_task(
+                resident_delivery(), name=f"durable_cognition_owner:{delivery.delivery_id}",
+            )
+        else:
+            resident = None
+
         # This exact selected delivery is now leased to the current dispatcher
         # owner.  That durable lease is the retry authority a cursor-owning
         # producer needs; later cognition/NACK work can no longer make an
@@ -4771,8 +4845,35 @@ class SignalDispatcher:
                         else DurableAdmissionDisposition.DUPLICATE
                     ),
                     signal.id,
+                    resident_owned=resident is not None,
                 )
             )
+
+        if resident is not None:
+            from kestrel_sovereign._async_ownership import await_owned_task
+            from kestrel_sovereign.execution_custody import execution_terminal_error
+            # This original dispatch remains admitted until its new resident
+            # child physically settles. Explicit handle cancellation forwards
+            # once; borrowed admission readers still never cancel this owner.
+            outcome = await await_owned_task(resident, cancel_on_caller_cancellation=True)
+            terminal = execution_terminal_error(
+                outcome.error, outcome.cancellation, retain_originals=True,
+            )
+            if terminal is not None:
+                raise terminal
+            return outcome.result
+        return await self._execute_claimed_durable_cognition(
+            signal, registration, start, delivery=delivery, consumer_id=consumer_id,
+            use_live_signal=use_live_signal, retry_delay=retry_delay,
+            durable_admission=durable_admission,
+            persisted_event_id=persisted_event_id,
+        )
+
+    async def _execute_claimed_durable_cognition(
+        self, signal, registration, start, *, delivery, consumer_id,
+        use_live_signal, retry_delay, durable_admission, persisted_event_id,
+    ):
+        """Execute the already claimed lease under its existing runtime owner."""
 
         # A retried persistence-allowed event must execute the canonical
         # durable envelope, not whatever a duplicate provider callback happens
