@@ -89,6 +89,10 @@ claim. The host must quiesce the service for same-database key maintenance.
 
 Private responses remain authorized through body delivery, use no-store caching
 and serve source bytes as attachments with nosniff and a sandbox policy. The
+bounded upload body is parsed before taking privacy/grant gates, so an idle
+uploader cannot prevent revocation. Authorization is rechecked after parsing.
+Any authority failure after durable acceptance requires reconciliation.
+The
 viewer chooses safe renderers after an authorized fetch. Raw artifact access is
 refused in volatile, anonymized and deidentified modes; generic binary content
 has no approved transform. Explicit authorized deletion remains available.

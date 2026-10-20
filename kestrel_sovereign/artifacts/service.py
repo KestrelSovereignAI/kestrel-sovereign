@@ -115,7 +115,10 @@ caller: role alone does not prove a still-current credential or live grant.
             context.require_boundary(storage_id)
             if binding.check_current(context, action, link) is not None:
                 raise TypeError("artifact authority checker must return None or raise")
-        except OperatorAuthorizationError:
+        except Exception:
+            # A failed current-grant lookup is a denial, including plain
+            # PermissionError or infrastructure failures. Never turn a checker
+            # failure after durable acceptance into an ordinary save failure.
             raise ArtifactAccessDenied("artifact authority is unavailable") from None
         # Generic binary/source artifacts have no PII/deidentification transform.
         # Refuse those modes instead of treating persistent storage as consent
@@ -181,12 +184,12 @@ class AuthorizedArtifactService:
                 # Native COMMIT can await after the repository's final check.
                 # Never disclose bytes or a receipt under an expired authority.
                 check()
-            except ArtifactAccessDenied:
+            except Exception:
                 if mutation:
                     raise ResourceOutcomeUnknown(
                         "artifact operation completed without delivery authority; reconcile with current authority"
                     ) from None
-                raise
+                raise ArtifactAccessDenied("artifact result authority is unavailable") from None
             return result
 
     async def stage(self, context: OperatorContext, content: bytes, *, publication_key: str,

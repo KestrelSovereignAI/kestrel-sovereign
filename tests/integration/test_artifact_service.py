@@ -356,3 +356,62 @@ async def test_revocation_serializes_with_commit_acknowledgement(access, monkeyp
                 if not task.done():
                     task.cancel()
             await asyncio.gather(commit_task, revoke_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [PermissionError, RuntimeError])
+async def test_any_authority_lookup_failure_after_commit_is_unknown(access, monkeypatch, error_type):
+    context = access.context()
+    store = access.service.repository
+    transaction = store.db.transaction
+    failed = False
+    check = access.check
+    def lookup(*args):
+        if failed:
+            raise error_type("private grant infrastructure error")
+        return check(*args)
+    access.check = lookup
+
+    @asynccontextmanager
+    async def fail_after_commit(*args, **kwargs):
+        nonlocal failed
+        async with transaction(*args, **kwargs):
+            yield
+        failed = True
+
+    with access.bind(context):
+        request = await staged(access, context)
+        monkeypatch.setattr(store.db, "transaction", fail_after_commit)
+        with pytest.raises(ResourceOutcomeUnknown):
+            await access.service.commit(context, request)
+        monkeypatch.setattr(store.db, "transaction", transaction)
+        failed = False
+        receipt = await access.service.publication_status(context, request.idempotency_key)
+        assert receipt is not None
+        assert await access.service.commit(context, request) == receipt
+
+
+@pytest.mark.asyncio
+async def test_plain_permission_failure_before_commit_rolls_back_as_denial(access, monkeypatch):
+    context = access.context()
+    store = access.service.repository
+    execute = store.db.execute
+    failed = False
+    check = access.check
+    def lookup(*args):
+        if failed:
+            raise PermissionError("private lookup failure")
+        return check(*args)
+    access.check = lookup
+    async def execute_then_fail(sql, *args, **kwargs):
+        nonlocal failed
+        result = await execute(sql, *args, **kwargs)
+        if sql.startswith("INSERT INTO artifact_heads"):
+            failed = True
+        return result
+    with access.bind(context):
+        request = await staged(access, context)
+        monkeypatch.setattr(store.db, "execute", execute_then_fail)
+        with pytest.raises(ArtifactAccessDenied):
+            await access.service.commit(context, request)
+    assert (await store.db.fetchone("SELECT COUNT(*) FROM artifact_revisions"))[0] == 0

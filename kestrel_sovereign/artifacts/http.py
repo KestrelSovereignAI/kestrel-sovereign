@@ -96,11 +96,12 @@ def _error(error: Exception) -> Response:
 class _AuthorizedResponse(Response):
     """Keep caller/privacy/grant custody until the final ASGI body is sent."""
 
-    def __init__(self, request, service, resolve_context, action, build, timeout_seconds):
+    def __init__(self, request, service, resolve_context, action, build, timeout_seconds, prepare=None):
         super().__init__()
         self.request, self.service = request, service
         self.resolve_context, self.action, self.build = resolve_context, action, build
         self.timeout_seconds = timeout_seconds
+        self.prepare = prepare
 
     async def __call__(self, scope, receive, send):
         started = False
@@ -117,10 +118,15 @@ class _AuthorizedResponse(Response):
                 async with self.resolve_context(self.request) as context:
                     remaining = (context.expires_at - self.service.authority.clock()).total_seconds()
                     async with asyncio.timeout(max(0, remaining)):
+                        # Authentication owns the context, but untrusted input
+                        # must not retain a privacy/revocation lease while it
+                        # trickles in. Recheck current policy AFTER parsing.
+                        value = await self.prepare() if self.prepare is not None else None
                         async with self.service.authority.operation(
                             context, self.action, self.service.repository.storage_id,
+                            link=value if isinstance(value, ArtifactLink) else None,
                         ) as check:
-                            response = await self.build(context)
+                            response = await self.build(context, value) if self.prepare is not None else await self.build(context)
                             prepared = True
                             check()
                             await response(scope, receive, guarded_send)
@@ -129,8 +135,7 @@ class _AuthorizedResponse(Response):
             # Abort a partial transfer; never send private bytes after denial.
             if started:
                 raise
-            if (prepared and self.request.method in {"POST", "DELETE"}
-                    and isinstance(error, OperatorAuthorizationError)):
+            if prepared and self.request.method in {"POST", "DELETE"}:
                 error = ResourceOutcomeUnknown("artifact result requires reconciliation")
             if isinstance(error, TimeoutError):
                 # A timed-out mutation is never asserted to have rolled back.
@@ -152,8 +157,8 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
         raise ValueError("artifact HTTP timeout must be positive and finite")
     router = APIRouter(prefix="/api/artifacts", tags=["artifacts"])
 
-    def respond(request, action, build):
-        return _AuthorizedResponse(request, service, resolve_context, action, build, timeout_seconds)
+    def respond(request, action, build, prepare=None):
+        return _AuthorizedResponse(request, service, resolve_context, action, build, timeout_seconds, prepare)
 
     def page_query(request):
         try:
@@ -170,7 +175,7 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
 
     @router.post("/staging")
     async def stage(request: Request) -> Response:
-        async def build(context):
+        async def prepare():
             maximum = service.repository.limits.max_file_bytes
             # Base64 expansion plus bounded path/media/key JSON overhead.
             value = await _body(request, 4 * ((maximum + 2) // 3) + 16384, _Stage)
@@ -178,17 +183,20 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
                 content = base64.b64decode(value.content_base64, validate=True)
             except (ValueError, binascii.Error):
                 raise _InvalidRequest("invalid artifact encoding") from None
+            return value, content
+        async def build(context, parsed):
+            value, content = parsed
             file = await service.stage(context, content, publication_key=value.publication_key,
                                        path=value.path, media_type=value.media_type)
             return _json(file)
-        return respond(request, ArtifactAction.WRITE, build)
+        return respond(request, ArtifactAction.WRITE, build, prepare)
 
     @router.post("/publications")
     async def commit(request: Request) -> Response:
-        async def build(context):
-            value = await _body(request, service.repository.limits.max_metadata_bytes, ArtifactCommit)
+        async def build(context, value):
             return _json(await service.commit(context, value))
-        return respond(request, ArtifactAction.WRITE, build)
+        return respond(request, ArtifactAction.WRITE, build,
+                       lambda: _body(request, service.repository.limits.max_metadata_bytes, ArtifactCommit))
 
     @router.get("/publications/{key}")
     async def publication(key: str, request: Request) -> Response:
@@ -228,19 +236,17 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
 
     @router.post("/links")
     async def link(request: Request) -> Response:
-        async def build(context):
-            value = await _body(request, 16384, ArtifactLink)
+        async def build(context, value):
             await service.link(context, value)
             return Response(status_code=204, headers=_HEADERS)
-        return respond(request, ArtifactAction.LINK, build)
+        return respond(request, ArtifactAction.LINK, build, lambda: _body(request, 16384, ArtifactLink))
 
     @router.delete("/links")
     async def unlink(request: Request) -> Response:
-        async def build(context):
-            value = await _body(request, 16384, ArtifactLink)
+        async def build(context, value):
             await service.unlink(context, value)
             return Response(status_code=204, headers=_HEADERS)
-        return respond(request, ArtifactAction.LINK, build)
+        return respond(request, ArtifactAction.LINK, build, lambda: _body(request, 16384, ArtifactLink))
 
     @router.delete("/{artifact_id}")
     async def delete(artifact_id: str, request: Request) -> Response:

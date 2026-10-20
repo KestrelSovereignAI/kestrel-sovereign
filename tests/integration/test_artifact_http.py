@@ -197,7 +197,7 @@ async def test_slow_upload_has_deadline_and_releases_authority(access):
 
 
 @pytest.mark.asyncio
-async def test_queued_revocation_does_not_deadlock_nested_service_call(api, access):
+async def test_idle_upload_does_not_hold_privacy_or_revocation_gates(api, access):
     client, _ = api
     entered, release, revoked = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
@@ -216,11 +216,11 @@ async def test_queued_revocation_does_not_deadlock_nested_service_call(api, acce
     await asyncio.wait_for(entered.wait(), 3)
     revoking = asyncio.create_task(revoke())
     try:
-        await asyncio.sleep(0)
-        assert not revoked.is_set()
+        await asyncio.wait_for(revoked.wait(), 0.3)
+        assert not access.holder.gate.locked()
         release.set()
         response = await asyncio.wait_for(sending, 3)
-        assert response.status_code == 200
+        assert response.status_code == 403
         await asyncio.wait_for(revoking, 3)
     finally:
         release.set()
@@ -228,3 +228,84 @@ async def test_queued_revocation_does_not_deadlock_nested_service_call(api, acce
             if not task.done():
                 task.cancel()
         await asyncio.gather(sending, revoking, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_http_post_commit_lookup_failure_never_reports_plain_failure(api, access, monkeypatch):
+    client, _ = api
+    response = await client.post("/api/artifacts/staging", headers=AUTH, json={
+        "publication_key": "lookup", "path": "a.txt", "media_type": "text/plain", "content_base64": "YQ==",
+    })
+    file = response.json()
+    check = access.check
+    failed = False
+    def lookup(*args):
+        if failed:
+            raise PermissionError("private lookup failure")
+        return check(*args)
+    access.check = lookup
+    transaction = access.service.repository.db.transaction
+    @asynccontextmanager
+    async def fail_after_commit(*args, **kwargs):
+        nonlocal failed
+        async with transaction(*args, **kwargs):
+            yield
+        failed = True
+    monkeypatch.setattr(access.service.repository.db, "transaction", fail_after_commit)
+    response = await client.post("/api/artifacts/publications", headers=AUTH, json={
+        "idempotency_key": "lookup", "title": "private",
+        "manifest": {"files": [file], "entrypoint": "a.txt"},
+    })
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "artifact_outcome_unknown"
+    monkeypatch.setattr(access.service.repository.db, "transaction", transaction)
+    failed = False
+    assert (await client.get("/api/artifacts/publications/lookup", headers=AUTH)).json()["ref"]
+
+
+@pytest.mark.asyncio
+async def test_http_failure_after_receipt_encoding_is_unknown(api, access, monkeypatch):
+    from kestrel_sdk.artifacts import PublicationReceipt
+
+    from kestrel_sovereign.artifacts import http
+    client, _ = api
+    original_json = http._json
+    check = access.check
+    failed = False
+    def encode(*args, **kwargs):
+        nonlocal failed
+        response = original_json(*args, **kwargs)
+        if isinstance(args[0], PublicationReceipt):
+            failed = True
+        return response
+    def lookup(*args):
+        if failed:
+            raise RuntimeError("private infrastructure diagnostic")
+        return check(*args)
+    access.check = lookup
+    monkeypatch.setattr(http, "_json", encode)
+    response, request = await publish(client)
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "artifact_outcome_unknown"
+    monkeypatch.setattr(http, "_json", original_json)
+    failed = False
+    receipt = await client.get("/api/artifacts/publications/publish", headers=AUTH)
+    assert receipt.status_code == 200
+    assert receipt.json()["idempotency_key"] == request["idempotency_key"]
+
+
+@pytest.mark.asyncio
+async def test_link_resolver_always_receives_real_target(api, access):
+    client, _ = api
+    receipt, _ = await publish(client)
+    check = access.check
+    def require_link_target(context, action, link):
+        from kestrel_sovereign.artifacts.service import ArtifactAction
+        if action == ArtifactAction.LINK and link is None:
+            raise OperatorAuthorizationError("target required")
+        return check(context, action, link)
+    access.check = require_link_target
+    response = await client.post("/api/artifacts/links", headers=AUTH, json={
+        "ref": receipt.json()["ref"], "context_kind": "conversation", "context_id": "conversation",
+    })
+    assert response.status_code == 204
