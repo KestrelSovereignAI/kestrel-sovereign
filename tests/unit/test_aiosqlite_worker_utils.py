@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from contextlib import nullcontext
 
 import pytest
 
@@ -10,8 +11,16 @@ from kestrel_sovereign.storage.db import SQLiteBackend
 from tests.utils.aiosqlite_workers import (
     CloseStage,
     aiosqlite_worker,
+    block_aiosqlite_native_close,
+    delay_aiosqlite_worker_exit,
+    normal_close_schedule,
     observe_bounded_close_stages,
     wait_for_lifecycle_checkpoint,
+)
+from tests.utils.virtual_clock import (
+    HANG_GUARD_SECONDS,
+    await_within_hang_guard,
+    wait_for_thread_event,
 )
 
 
@@ -219,3 +228,122 @@ def test_close_stages_restore_the_close_helpers() -> None:
     assert (
         sqlite_module._wait_for_aiosqlite_worker_shutdown is wait_for_worker_exit
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [CloseStage.CONNECTION_CLOSE, CloseStage.WORKER_EXIT])
+async def test_normal_close_schedule_joins_the_exact_blocked_worker(tmp_path, stage):
+    entered, release = threading.Event(), threading.Event()
+    delayed_exit = (
+        delay_aiosqlite_worker_exit(release, entered)
+        if stage is CloseStage.WORKER_EXIT else nullcontext()
+    )
+    loop = asyncio.get_running_loop()
+    real_clock = loop.time
+    budget = sqlite_module.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
+    backend = SQLiteBackend(str(tmp_path / "normal-close.db"))
+    owner = None
+    with delayed_exit:
+        await backend.connect()
+        connection = backend._connection
+        assert connection is not None
+        worker = aiosqlite_worker(connection)
+        if stage is CloseStage.CONNECTION_CLOSE:
+            entered, release = block_aiosqlite_native_close(connection)
+        try:
+            with observe_bounded_close_stages() as stages:
+                async with normal_close_schedule() as finish:
+                    owner = asyncio.create_task(finish(
+                        connection, backend.close(),
+                        retained_closes=backend._retired_connection_closes,
+                    ))
+                    await wait_for_thread_event(entered, step=stage.value)
+                    await stages.reached(connection, stage)
+                    original_close = stages.close_tasks[connection]
+                    assert worker.is_alive() and not owner.done()
+                    if stage is CloseStage.CONNECTION_CLOSE:
+                        assert not original_close.done()
+                    release.set()
+                    await await_within_hang_guard(owner, step="the original close completing")
+                    assert original_close.done()
+            assert loop.time == real_clock
+            assert not worker.is_alive()
+            assert not backend.connection_retirement_pending
+            assert sqlite_module.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S == budget
+        finally:
+            release.set()
+            if owner is not None:
+                await await_within_hang_guard(
+                    asyncio.gather(owner, return_exceptions=True),
+                    step="joining the close schedule owner",
+                )
+            await asyncio.to_thread(worker.join, HANG_GUARD_SECONDS)
+            assert not worker.is_alive()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", [False, True])
+async def test_normal_close_schedule_preserves_native_failure_and_restores_clock(
+    tmp_path, monkeypatch, control,
+):
+    backend = SQLiteBackend(str(tmp_path / "failed-close.db"))
+    await backend.connect()
+    connection = backend._connection
+    assert connection is not None
+    worker = aiosqlite_worker(connection)
+    close = connection.close
+    failure = asyncio.CancelledError("native close control") if control else RuntimeError("native close failed")
+
+    async def fail_after_real_close():
+        await close()
+        raise failure
+
+    monkeypatch.setattr(connection, "close", fail_after_real_close)
+    loop = asyncio.get_running_loop()
+    real_clock = loop.time
+    with pytest.raises(type(failure)) as caught:
+        async with normal_close_schedule() as finish:
+            await finish(
+                connection, backend.close(),
+                retained_closes=backend._retired_connection_closes,
+            )
+    assert caught.value is failure
+    assert loop.time == real_clock
+    assert not worker.is_alive()
+    assert not backend.connection_retirement_pending
+
+
+@pytest.mark.asyncio
+async def test_normal_close_schedule_joins_on_caller_cancellation_and_restores_clock(tmp_path):
+    backend = SQLiteBackend(str(tmp_path / "cancelled-close.db"))
+    await backend.connect()
+    connection = backend._connection
+    assert connection is not None
+    worker = aiosqlite_worker(connection)
+    entered, release = block_aiosqlite_native_close(connection)
+    loop = asyncio.get_running_loop()
+    real_clock = loop.time
+
+    async def retire():
+        async with normal_close_schedule() as finish:
+            await finish(
+                connection, backend.close(),
+                retained_closes=backend._retired_connection_closes,
+            )
+
+    owner = asyncio.create_task(retire())
+    try:
+        await wait_for_thread_event(entered, step="native close entry")
+        assert worker.is_alive() and not owner.done()
+        owner.cancel("original caller")
+        release.set()
+        with pytest.raises(asyncio.CancelledError, match="original caller"):
+            await await_within_hang_guard(owner, step="cancelled close schedule retiring")
+        assert loop.time == real_clock
+        assert not worker.is_alive()
+        assert not backend.connection_retirement_pending
+    finally:
+        release.set()
+        await asyncio.gather(owner, return_exceptions=True)
+        await asyncio.to_thread(worker.join, HANG_GUARD_SECONDS)
+        assert not worker.is_alive()

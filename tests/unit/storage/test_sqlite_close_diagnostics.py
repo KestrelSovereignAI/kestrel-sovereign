@@ -11,7 +11,7 @@ import logging
 import re
 import sys
 import threading
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -21,7 +21,9 @@ from kestrel_sovereign.storage.db import ConnectionError, SQLiteBackend
 from tests.utils.aiosqlite_workers import (
     CloseStage,
     aiosqlite_worker,
+    block_aiosqlite_native_close,
     delay_aiosqlite_worker_exit,
+    normal_close_schedule,
     observe_bounded_close_stages,
 )
 from tests.utils.virtual_clock import (
@@ -32,100 +34,14 @@ from tests.utils.virtual_clock import (
 )
 
 
-@asynccontextmanager
-async def _normal_close_schedule():
-    """Exercise real closes before their deadlines, not a disk-speed claim.
-
-    Pin before the enclosing operation captures its deadline. Each original
-    close and worker must actually finish; only then wake its worker poll.
-    Thread-based guards bound real hangs independently of the pinned clock.
-    """
-    owners = []
-    workers = []
-    retirement_maps = []
-    # Late cleanup still needs the real stage observer after clock restoration.
-    with observe_bounded_close_stages() as stages:
-        try:
-            with pinned_loop_clock() as clock:
-                async def finish(connection, operation, *, retained_closes):
-                    retirement_maps.append(retained_closes)
-                    worker = aiosqlite_worker(connection)
-                    workers.append(worker)
-                    close_task = asyncio.create_task(operation)
-                    owners.append(close_task)
-                    await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
-                    deadline = stages.deadlines[connection]
-                    join_task = asyncio.create_task(
-                        asyncio.to_thread(worker.join, _HANG_GUARD_SECONDS)
-                    )
-                    owners.append(join_task)
-                    await await_within_hang_guard(
-                        join_task, step="the original SQLite worker retiring"
-                    )
-                    assert not worker.is_alive()
-                    clock.advance(sqlite_backend_module._AIOSQLITE_WORKER_SHUTDOWN_POLL_S * 1.1)
-                    assert clock.time() < deadline
-                    return await await_within_hang_guard(
-                        close_task, step="the original SQLite close completing"
-                    )
-
-                yield finish
-        finally:
-            # The caller first drains enclosing operations that can register
-            # more closes. Keep observing while settling every original owner.
-            if owners:
-                await await_within_hang_guard(
-                    asyncio.gather(*owners, return_exceptions=True),
-                    step="settling the original SQLite close/join owners",
-                )
-            for worker in workers:
-                await await_within_hang_guard(
-                    asyncio.to_thread(worker.join, _HANG_GUARD_SECONDS),
-                    step="joining the original SQLite worker on exceptional exit",
-                )
-                assert not worker.is_alive(), "original SQLite worker did not retire"
-            retirement_tasks = {
-                retained.retirement_task
-                for retained_closes in retirement_maps
-                for retained in retained_closes.values()
-                if retained.retirement_task is not None
-            }
-            await await_within_hang_guard(
-                asyncio.gather(*retirement_tasks, return_exceptions=True),
-                step="joining original SQLite retirement tasks",
-            )
-
-
 async def _normal_backend_close(backend):
     connection = backend._ensure_connected()
-    async with _normal_close_schedule() as finish:
+    async with normal_close_schedule() as finish:
         await finish(connection, backend.close(), retained_closes=backend._retired_connection_closes)
 
 # The patched worker-shutdown window. Close budgets add one 10ms poll to it.
 _SHORT_WINDOW_S = 0.05
 _SHORT_BUDGET = "budget=0.06s"
-
-
-class _SlowCloseConnection:
-    """A sqlite3 connection whose ``close`` blocks in aiosqlite's worker.
-
-    Stands in for a final checkpoint stalled on disk I/O: the worker is
-    genuinely busy inside ``close`` until the test releases it, then the real
-    close runs.
-    """
-
-    def __init__(self, real, entered: threading.Event, release: threading.Event):
-        self._real = real
-        self._entered = entered
-        self._release = release
-
-    def close(self) -> None:
-        self._entered.set()
-        self._release.wait(_HANG_GUARD_SECONDS)
-        self._real.close()
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
 
 
 @pytest.fixture
@@ -159,11 +75,7 @@ async def _page_size(backend: SQLiteBackend) -> int:
 def _block_close(backend: SQLiteBackend):
     """Make the backend's next close block in its worker; return the handles."""
     connection = backend._ensure_connected()
-    entered = threading.Event()
-    release = threading.Event()
-    connection._connection = _SlowCloseConnection(
-        connection._connection, entered, release
-    )
+    entered, release = block_aiosqlite_native_close(connection)
     return connection, entered, release
 
 
@@ -493,11 +405,7 @@ async def test_snapshot_close_reports_primary_journal_mode(
 ):
     backend = await _connected_wal_backend(tmp_path / "snapshot.db")
     snapshot = await backend._open_snapshot_read_connection()
-    entered = threading.Event()
-    release = threading.Event()
-    snapshot._connection = _SlowCloseConnection(
-        snapshot._connection, entered, release
-    )
+    _entered, release = block_aiosqlite_native_close(snapshot)
     worker = aiosqlite_worker(snapshot)
     try:
         # Only the deliberately stalled snapshot close has a 60ms budget.
@@ -540,7 +448,7 @@ async def test_every_backend_close_names_the_database_it_closes(
             holding.set()
             await release.wait()
 
-    async with _normal_close_schedule() as finish:
+    async with normal_close_schedule() as finish:
         async def record_diagnostics(connection, **kwargs):
             reported.append(kwargs.get("diagnostics"))
             await finish(connection, real_close(connection, **kwargs), retained_closes=kwargs["retained_closes"])

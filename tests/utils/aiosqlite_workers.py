@@ -6,19 +6,52 @@ import asyncio
 import enum
 import threading
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from typing import Any
 from unittest.mock import patch
 
 import aiosqlite
 
 import kestrel_sovereign.storage.db.sqlite as sqlite_module
-from tests.utils.virtual_clock import await_within_hang_guard
+from tests.utils.virtual_clock import (
+    HANG_GUARD_SECONDS,
+    await_within_hang_guard,
+    pinned_loop_clock,
+)
 
 
 def aiosqlite_worker(connection: aiosqlite.Connection) -> threading.Thread:
     """Return the worker for either supported aiosqlite threading model."""
     return getattr(connection, "_thread", connection)
+
+
+class _SlowCloseConnection:
+    """Hold a real native close at the same boundary as stalled disk I/O."""
+
+    def __init__(self, real, entered: threading.Event, release: threading.Event):
+        self._real = real
+        self._entered = entered
+        self._release = release
+
+    def close(self) -> None:
+        self._entered.set()
+        self._release.wait(HANG_GUARD_SECONDS)
+        self._real.close()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def block_aiosqlite_native_close(
+    connection: aiosqlite.Connection,
+) -> tuple[threading.Event, threading.Event]:
+    """Block the next native close; return its entered and release events."""
+    entered = threading.Event()
+    release = threading.Event()
+    connection._connection = _SlowCloseConnection(
+        connection._connection, entered, release
+    )
+    return entered, release
 
 
 class CloseStage(enum.Enum):
@@ -101,6 +134,71 @@ def observe_bounded_close_stages() -> Iterator[BoundedCloseStages]:
         observed_wait_for_worker_exit,
     ):
         yield stages
+
+
+@asynccontextmanager
+async def normal_close_schedule():
+    """Exercise real closes before their deadlines, not a disk-speed claim.
+
+    Pin before the enclosing operation captures its deadline. Each original
+    close and worker must actually finish; only then wake its worker poll.
+    Thread-based guards bound real hangs independently of the pinned clock.
+    Production close budgets and deadline-expiry behavior are not changed.
+    """
+    owners = []
+    workers = []
+    retirement_maps = []
+    # Late cleanup still needs the real stage observer after clock restoration.
+    with observe_bounded_close_stages() as stages:
+        try:
+            with pinned_loop_clock() as clock:
+                async def finish(connection, operation, *, retained_closes):
+                    retirement_maps.append(retained_closes)
+                    worker = aiosqlite_worker(connection)
+                    workers.append(worker)
+                    close_task = asyncio.create_task(operation)
+                    owners.append(close_task)
+                    await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
+                    deadline = stages.deadlines[connection]
+                    join_task = asyncio.create_task(
+                        asyncio.to_thread(worker.join, HANG_GUARD_SECONDS)
+                    )
+                    owners.append(join_task)
+                    await await_within_hang_guard(
+                        join_task, step="the original SQLite worker retiring"
+                    )
+                    assert not worker.is_alive()
+                    clock.advance(sqlite_module._AIOSQLITE_WORKER_SHUTDOWN_POLL_S * 1.1)
+                    assert clock.time() < deadline
+                    return await await_within_hang_guard(
+                        close_task, step="the original SQLite close completing"
+                    )
+
+                yield finish
+        finally:
+            # The caller first drains enclosing operations that can register
+            # more closes. Keep observing while settling every original owner.
+            if owners:
+                await await_within_hang_guard(
+                    asyncio.gather(*owners, return_exceptions=True),
+                    step="settling the original SQLite close/join owners",
+                )
+            for worker in workers:
+                await await_within_hang_guard(
+                    asyncio.to_thread(worker.join, HANG_GUARD_SECONDS),
+                    step="joining the original SQLite worker on exceptional exit",
+                )
+                assert not worker.is_alive(), "original SQLite worker did not retire"
+            retirement_tasks = {
+                retained.retirement_task
+                for retained_closes in retirement_maps
+                for retained in retained_closes.values()
+                if retained.retirement_task is not None
+            }
+            await await_within_hang_guard(
+                asyncio.gather(*retirement_tasks, return_exceptions=True),
+                step="joining original SQLite retirement tasks",
+            )
 
 
 @contextmanager
