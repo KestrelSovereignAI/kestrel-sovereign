@@ -4,6 +4,7 @@
  */
 
 import API from './api.js';
+import { artifactPartRenderer } from './artifact_panel.mjs';
 import { state, AGENT_COMMANDS, Modal, Toast, getOrCreateChatPane, escapeHtml, getOverlayRoot } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import bus from './ui-ext/bus.js';
@@ -691,6 +692,8 @@ export function registerCoreParts() {
     registerPartRenderer('notice', noticePartRenderer);
     registerPartRenderer('channel_link', channelLinkPartRenderer);
     registerPartRenderer('todo', todoPartRenderer);
+    registerPartRenderer('artifact', (data, context) => artifactPartRenderer(data,
+        { ...context, workspaceRoot: getOverlayRoot() }, deps().api));
 }
 
 // ============================================================================

@@ -979,6 +979,7 @@ export function createApiClient({
         options = {},
         retried = false,
         onAuthPrepared = null,
+        readBody = (response) => response.json(),
     ) {
         let alreadyRetried = retried;
         let pendingUnauthorizedError = null;
@@ -988,7 +989,7 @@ export function createApiClient({
             try {
                 headers = await buildHeaders(options.headers);
                 if (typeof onAuthPrepared === 'function') {
-                    onAuthPrepared(state.authIdentityGeneration);
+                    onAuthPrepared(state.authIdentityGeneration, headers);
                 }
             } catch (error) {
                 throwIfAborted(options.signal);
@@ -1037,7 +1038,7 @@ export function createApiClient({
             if (!response.ok) {
                 throw await parseResponseError(response, { signal: options.signal });
             }
-            return response.json();
+            return readBody(response);
         }
     }
 
@@ -1082,6 +1083,41 @@ export function createApiClient({
         async requestForAgent(endpoint, options = {}, agent, retried = false) {
             const url = applyHostAgentPrefix(endpoint, agent);
             return performRequest(url, options, retried);
+        },
+
+        // Bind a document/working-copy lifetime to this exact credential and
+        // agent. Only explicit API-key/Bearer credentials can currently bind a
+        // working copy. Cookie sessions need a host-enforced owner precondition
+        // before this transport can support them. Omit cookies even with an API
+        // key, so a rejected credential cannot fall through to a different user.
+        async bindAgentRequests(agent = state.selectedHostAgent) {
+            const initialHeaders = await buildHeaders();
+            const generation = state.authIdentityGeneration;
+            const credential = credentialIdentity(initialHeaders);
+            const explicit = (headers) => {
+                const values = new Headers(headers);
+                return !!values.get('x-api-key')?.trim() || /^Bearer\s+\S/i.test(values.get('authorization') || '');
+            };
+            if (!explicit(initialHeaders)) {
+                const error = new Error('Artifact editing requires an explicit API key or bearer credential. Cookie sessions cannot bind drafts yet.');
+                error.code = 'artifact_auth_unbound'; throw error;
+            }
+            const checkIdentity = (preparedGeneration, headers) => {
+                if (preparedGeneration !== generation || !explicit(headers) || credentialIdentity(headers) !== credential) {
+                    const error = new Error('Authentication changed. Reopen the artifact.');
+                    error.code = 'artifact_auth_changed';
+                    throw error;
+                }
+            };
+            return Object.freeze({
+                request: (endpoint, options = {}) => performRequest(
+                    applyHostAgentPrefix(endpoint, agent), { ...options, credentials: 'omit' }, false, checkIdentity,
+                ),
+                readBytes: (endpoint, options = {}) => performRequest(
+                    applyHostAgentPrefix(endpoint, agent), { ...options, credentials: 'omit' }, false, checkIdentity,
+                    (response) => response.arrayBuffer(),
+                ),
+            });
         },
 
         // Request a host-ROOT endpoint (#2293). Unlike request(), the URL is
