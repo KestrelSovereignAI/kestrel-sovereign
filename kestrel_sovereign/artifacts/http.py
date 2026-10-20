@@ -212,6 +212,12 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
             return _json(await service.history(context, artifact_id, **page_query(request)))
         return respond(request, ArtifactAction.READ, build)
 
+    @router.get("/{artifact_id}/head")
+    async def head(artifact_id: str, request: Request) -> Response:
+        async def build(context):
+            return _json(await service.head(context, artifact_id))
+        return respond(request, ArtifactAction.READ, build)
+
     @router.get("/{artifact_id}/revisions/{revision_id}")
     async def revision(artifact_id: str, revision_id: str, request: Request) -> Response:
         async def build(context):

@@ -636,3 +636,39 @@ async def test_partial_rotation_resumes_its_journal_after_root_failure(repositor
             await db2.close()
     finally:
         await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_head_uses_committed_pointer_despite_clock_reversal(repository):
+    store, _ = repository
+    first, _ = await publish(store)
+    before = store.clock()
+    store.clock = lambda: before - timedelta(days=1)
+    second, _ = await publish(store, key="later-commit", artifact=first.ref)
+    assert (await store.page(SCOPE, artifact_id=first.ref.artifact_id)).items[0].ref == first.ref
+    assert (await store.head(SCOPE, first.ref.artifact_id)).ref == second.ref
+    for other in (SCOPE.model_copy(update={"tenant_id": "other"}),
+                  SCOPE.model_copy(update={"principal_id": "other"}),
+                  SCOPE.model_copy(update={"agent_id": "other"}),
+                  SCOPE.model_copy(update={"agent_id": None})):
+        with pytest.raises(ResourceNotFound):
+            await store.head(other, first.ref.artifact_id)
+    await store.delete(SCOPE, second.ref)
+    with pytest.raises(ResourceNotFound):
+        await store.head(SCOPE, first.ref.artifact_id)
+
+
+@pytest.mark.asyncio
+async def test_head_validates_identifier_and_decodes_owner_bound_revision(repository):
+    store, _ = repository
+    with pytest.raises(ValueError):
+        await store.head(SCOPE, "../invalid")
+    with pytest.raises(ResourceNotFound):
+        await store.head(SCOPE, "absent")
+    first, _ = await publish(store)
+    second, _ = await publish(store, key="different-artifact")
+    # A corrupt head link must not disclose a different artifact's payload.
+    await store.db.execute("UPDATE artifact_heads SET revision_id = ? WHERE artifact_id = ?",
+                           (second.ref.revision_id, first.ref.artifact_id))
+    with pytest.raises((ResourceNotFound, ArtifactIntegrityError)):
+        await store.head(SCOPE, first.ref.artifact_id)

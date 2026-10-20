@@ -25,7 +25,9 @@ from kestrel_sovereign.artifacts.service import (
 )
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
-from tests.integration.test_artifact_repository import SCOPE, repository  # noqa: F401
+from tests.integration.test_artifact_repository import SCOPE, repository as _repository_fixture
+
+repository = _repository_fixture
 
 
 class PolicyHolder:
@@ -415,3 +417,27 @@ async def test_plain_permission_failure_before_commit_rolls_back_as_denial(acces
         with pytest.raises(ArtifactAccessDenied):
             await access.service.commit(context, request)
     assert (await store.db.fetchone("SELECT COUNT(*) FROM artifact_revisions"))[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_head_requires_live_authenticated_read_authority(access, monkeypatch):
+    context = access.context()
+    with access.bind(context):
+        receipt = await access.service.commit(context, await staged(access, context))
+        assert (await access.service.head(context, receipt.ref.artifact_id)).ref == receipt.ref
+    with pytest.raises(ArtifactAccessDenied):
+        await access.service.head(context, receipt.ref.artifact_id)
+    denied = access.context(granted_actions=frozenset({"artifacts.write"}))
+    with access.bind(denied), pytest.raises(ArtifactAccessDenied):
+        await access.service.head(denied, receipt.ref.artifact_id)
+    store = access.service.repository
+    fetchone = store.db.fetchone
+    async def revoke_during_head(sql, *args, **kwargs):
+        result = await fetchone(sql, *args, **kwargs)
+        if "FROM artifact_heads" in sql:
+            access.granted = False
+        return result
+    with access.bind(context):
+        monkeypatch.setattr(store.db, "fetchone", revoke_during_head)
+        with pytest.raises(ArtifactAccessDenied):
+            await access.service.head(context, receipt.ref.artifact_id)

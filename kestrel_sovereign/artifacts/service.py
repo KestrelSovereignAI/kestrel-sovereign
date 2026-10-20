@@ -210,6 +210,10 @@ class AuthorizedArtifactService:
         return await self._perform(context, ArtifactAction.READ,
             lambda scope, check: self.repository.get(scope, ref, guard=check))
 
+    async def head(self, context: OperatorContext, artifact_id: str) -> ArtifactRevision:
+        return await self._perform(context, ArtifactAction.READ,
+            lambda scope, check: self.repository.head(scope, artifact_id, guard=check))
+
     async def read(self, context: OperatorContext, ref: ArtifactRef, path: str) -> bytes:
         return await self._perform(context, ArtifactAction.READ,
             lambda scope, check: self.repository.read(scope, ref, path, guard=check))

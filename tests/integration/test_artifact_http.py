@@ -11,8 +11,11 @@ from fastapi import FastAPI
 from kestrel_sdk.operator import OperatorAuthorizationError
 
 from kestrel_sovereign.artifacts.http import create_artifact_router
-from tests.integration.test_artifact_repository import repository  # noqa: F401
-from tests.integration.test_artifact_service import access  # noqa: F401
+from tests.integration.test_artifact_repository import repository as _repository_fixture
+from tests.integration.test_artifact_service import access as _access_fixture
+
+repository = _repository_fixture
+access = _access_fixture
 
 
 @pytest_asyncio.fixture
@@ -309,3 +312,28 @@ async def test_link_resolver_always_receives_real_target(api, access):
         "ref": receipt.json()["ref"], "context_kind": "conversation", "context_id": "conversation",
     })
     assert response.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_current_revision_route_is_authorized_private_and_tombstone_aware(api, access):
+    client, _ = api
+    first, _ = await publish(client)
+    ref = first.json()["ref"]
+    before = access.service.repository.clock()
+    from datetime import timedelta
+    access.service.repository.clock = lambda: before - timedelta(days=1)
+    second, _ = await publish(client, key="head-edit", ref=ref, content=b"# Current")
+    current = second.json()["ref"]
+    url = f'/api/artifacts/{ref["artifact_id"]}/head'
+    assert (await client.get(url)).status_code == 403
+    result = await client.get(url, headers=AUTH)
+    assert result.status_code == 200
+    assert result.json()["ref"] == current
+    assert result.headers["cache-control"] == "private, no-store, max-age=0"
+    access.granted = False
+    assert (await client.get(url, headers=AUTH)).status_code == 403
+    access.granted = True
+    await client.delete(f'/api/artifacts/{ref["artifact_id"]}', headers=AUTH,
+                        params={"expected_revision_id": current["revision_id"]})
+    deleted = await client.get(url, headers=AUTH)
+    assert deleted.status_code == 404 and deleted.json()["error"]["code"] == "artifact_not_found"
