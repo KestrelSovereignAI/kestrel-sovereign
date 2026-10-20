@@ -119,14 +119,27 @@ async def dispatcher_components(db_path):
         backend=backend,
         locks=locks,
     )
-    # Retire the actual dispatcher timers before draining its owned writers.
-    dispatcher.shutdown()
-    await dispatcher.shutdown_durable_delivery()
-    # Drain background log writes before closing the backend.
-    pending = [t for t in agent.background_tasks if not t.done()]
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
-    await backend.close()
+    try:
+        # Negative custody tests already join a failed shutdown and assert its
+        # retained audit receipt. Do not start a fresh retry of that uncertainty
+        # from fixture teardown, outside the test's owning exception scope.
+        completion = dispatcher._durable_shutdown_completion
+        if completion is None:
+            await dispatcher.shutdown_durable_delivery()
+        elif not completion.done():
+            await dispatcher._await_durable_shutdown_completion(completion)
+        else:
+            from kestrel_sovereign._async_ownership import owned_task_error
+
+            error = owned_task_error(completion)
+            if error is not None:
+                assert error is dispatcher._outcome_log_control_error
+    finally:
+        # Storage cleanup is independent even when a teardown assertion fails.
+        pending = [t for t in agent.background_tasks if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await backend.close()
 
 
 def _action_reg(name: str = "action_src", handler=None) -> SourceRegistration:
