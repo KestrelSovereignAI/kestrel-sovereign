@@ -25,6 +25,7 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign._async_ownership import create_owned_iterator
+from kestrel_sovereign.a2a.did_registry import same_a2a_sender_identity_witness
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
@@ -2801,16 +2802,6 @@ def _a2a_inbound_scope_unchanged(agent, snapshot) -> bool:
     )
 
 
-def _a2a_sender_witness_unchanged(before, after) -> bool:
-    """Compare manager-owned sender witnesses without invoking object equality."""
-    return (
-        before[0] == after[0]
-        and before[1] is after[1]
-        and before[2] is after[2]
-        and before[3] == after[3]
-    )
-
-
 def _a2a_inbound_requires_verified_sender(agent, authorizer) -> bool:
     """Fail closed when hosted scope is present or its seam is malformed."""
     from kestrel_sovereign.a2a.inbound_authorization import (
@@ -3051,7 +3042,7 @@ async def _create_a2a_task_under_lifecycle_lease(
         )
         if (
             sender_witness[0] == "ambiguous"
-            or not _a2a_sender_witness_unchanged(
+            or not same_a2a_sender_identity_witness(
                 sender_witness,
                 current_witness,
             )
@@ -3139,7 +3130,7 @@ async def _create_a2a_task_under_lifecycle_lease(
                 current_witness = manager.a2a_sender_identity_witness(
                     sender_verdict.sender
                 )
-                if not _a2a_sender_witness_unchanged(
+                if not same_a2a_sender_identity_witness(
                     sender_witness,
                     current_witness,
                 ):

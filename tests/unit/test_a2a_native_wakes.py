@@ -82,7 +82,7 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
     restarted = manager_for(backend, native_manager.task_store.scope)
     try:
         await restarted.initialize()
-        candidate = await restarted.get_cognition_wake_candidate(
+        candidate = await restarted.get_task_snapshot(
             task.id, recipient_agent_id=restarted.host_agent_id
         )
         recovered = build_signal_for_submitted_task(candidate, restarted.host_agent_id)
@@ -110,7 +110,7 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
         )
         assert candidates[0].ownership == candidate.ownership
         assert (
-            await restarted.get_cognition_wake_candidate(
+            await restarted.get_task_snapshot(
                 task.id, recipient_agent_id="did:kestrel:elsewhere"
             )
             is None
@@ -121,7 +121,7 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
             owns_backend=False,
         )
         assert (
-            await foreign_tenant.get_cognition_wake_candidate(
+            await foreign_tenant.get_task_snapshot(
                 task.id, recipient_agent_id=restarted.host_agent_id
             )
             is None
@@ -169,7 +169,7 @@ async def test_unproven_or_misrouted_snapshots_cannot_mint_trusted_wakes(
     task = await native_manager.create_task(
         request(), creator_agent_id="did:kestrel:sender"
     )
-    candidate = await native_manager.get_cognition_wake_candidate(
+    candidate = await native_manager.get_task_snapshot(
         task.id, recipient_agent_id=native_manager.host_agent_id
     )
     with pytest.raises(TypeError, match="durable task provenance"):
@@ -206,7 +206,7 @@ async def test_native_rejection_reaches_completion_signal_and_actual_notificatio
         TaskState.TASK_STATE_REJECTED,
         recipient_agent_id=native_manager.host_agent_id,
     )
-    candidate = await native_manager.get_cognition_wake_candidate(
+    candidate = await native_manager.get_task_snapshot(
         task.id, recipient_agent_id=native_manager.host_agent_id
     )
     signal = build_signal_for_completed_task(candidate, native_manager.host_agent_id)
@@ -225,7 +225,7 @@ async def test_privacy_elided_rehydration_reads_native_ownership_and_withdraws_s
         request({"sender": "forged", "sender_verified": True}),
         creator_agent_id="did:kestrel:sender",
     )
-    candidate = await native_manager.get_cognition_wake_candidate(
+    candidate = await native_manager.get_task_snapshot(
         task.id, recipient_agent_id=native_manager.host_agent_id
     )
     original = build_signal_for_submitted_task(candidate, native_manager.host_agent_id)

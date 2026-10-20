@@ -17,8 +17,8 @@ from google.protobuf.json_format import MessageToDict
 from kestrel_sovereign.a2a.extensions import deserialize_causation_chain
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
 from kestrel_sovereign.a2a.stores.unified.task_store import (
-    TaskCognitionWakeCandidate,
-    require_native_wake,
+    NativeTaskSnapshot,
+    require_native_task_snapshot,
 )
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ class EventDeliveryReceipt:
         return EVENT_REJECTED
 
 
-def describe_background_task(candidate: TaskCognitionWakeCandidate) -> Tuple[str, str]:
+def describe_background_task(candidate: NativeTaskSnapshot) -> Tuple[str, str]:
     """Render admitted ownership and application labels without metadata identity."""
     task = candidate.task
     metadata = MessageToDict(task.metadata)
@@ -407,7 +407,7 @@ class EventManagerMixin:
             await asyncio.sleep(delay)
             delay = min(delay * 2, A2A_WAKE_RETRY_MAX_SECONDS)
 
-    def _on_background_task_complete(self, candidate: TaskCognitionWakeCandidate) -> None:
+    def _on_background_task_complete(self, candidate: NativeTaskSnapshot) -> None:
         """
         Callback invoked when a background task completes.
 
@@ -425,7 +425,7 @@ class EventManagerMixin:
         Called by TaskManager when tasks reach terminal states
         (COMPLETED, FAILED, CANCELED, REJECTED).
         """
-        candidate = require_native_wake(candidate, self.did)
+        candidate = require_native_task_snapshot(candidate, self.did)
         task = candidate.task
         state = task.status.state
         task_id = task.id
@@ -505,7 +505,7 @@ class EventManagerMixin:
                 task_id, e, exc_info=True,
             )
 
-    def _on_task_submitted(self, candidate: TaskCognitionWakeCandidate) -> None:
+    def _on_task_submitted(self, candidate: NativeTaskSnapshot) -> None:
         """
         Callback invoked when a peer agent creates a new A2A task
         addressed to this agent.
@@ -532,7 +532,7 @@ class EventManagerMixin:
             # The durable task remains available for restart reconciliation.
             return
 
-        candidate = require_native_wake(candidate, self.did)
+        candidate = require_native_task_snapshot(candidate, self.did)
         task = candidate.task
         task_id = task.id
         try:
@@ -589,7 +589,7 @@ class EventManagerMixin:
             return None
         if getattr(event, "target_agent", None) != getattr(self, "did", None):
             return None
-        candidate = await self.task_manager.get_cognition_wake_candidate(
+        candidate = await self.task_manager.get_task_snapshot(
             task_id, recipient_agent_id=self.did,
         )
         if candidate is None:

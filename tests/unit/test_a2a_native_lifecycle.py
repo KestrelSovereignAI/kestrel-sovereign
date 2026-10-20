@@ -45,3 +45,8 @@ def test_rejected_is_terminal_and_auth_required_is_live():
 def test_private_unknown_state_is_not_a_native_state():
     with pytest.raises(ValueError):
         task_state_from_label("unknown")
+
+
+def test_unspecified_filter_cannot_silently_list_every_state():
+    with pytest.raises(ValueError, match="concrete lifecycle"):
+        task_state_from_label("unspecified")

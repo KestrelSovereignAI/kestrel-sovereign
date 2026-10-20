@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from typing import ClassVar, Optional
 
+from a2a.types import TaskState
 from kestrel_sdk.tools import Outcome, WaitStatus
 
+from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_from_label
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
@@ -81,7 +83,8 @@ class TaskWaitable:
                 data={"task_id": handle},
             )
 
-        status = data.get("status")
+        status = data["status"]
+        state = task_state_from_label(status)
         payload = {
             "task_id": data.get("task_id", handle),
             "status": status,
@@ -90,19 +93,19 @@ class TaskWaitable:
             "message": data.get("message"),
         }
 
-        if status in ("completed", "failed", "canceled"):
+        if state in TERMINAL_STATES:
             # The task store fences these against any later update, so no
             # later terminal event can follow and a watch re-armed over one
             # is retired rather than polled forever (#3399).
             payload[TERMINAL_EVENT_FINAL_KEY] = True
-        if status == "completed":
+        if state == TaskState.TASK_STATE_COMPLETED:
             n = len(data.get("artifacts") or [])
             return WaitStatus(
                 Outcome.DONE,
                 f"Task {handle[:8]} completed ({n} artifact(s))",
                 data=payload,
             )
-        if status in ("failed", "canceled"):
+        if state in TERMINAL_STATES:
             return WaitStatus(
                 Outcome.FAILED,
                 data.get("message") or f"Task {handle[:8]} {status}",

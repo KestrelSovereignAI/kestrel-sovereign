@@ -2763,7 +2763,7 @@ class _ReconcilingA2AAgent(_Agent):
 
     def __init__(self, did: str, task, lifecycle_revision: int):
         from kestrel_sovereign.a2a.stores.unified.task_store import (
-            TaskCognitionWakeCandidate,
+            NativeTaskSnapshot,
         )
         from kestrel_sovereign.signals.sources.a2a import (
             build_a2a_task_complete_registration,
@@ -2783,7 +2783,7 @@ class _ReconcilingA2AAgent(_Agent):
         self.task_manager = SimpleNamespace(
             list_cognition_wake_candidates=AsyncMock(
                 return_value=[
-                    TaskCognitionWakeCandidate(
+                    NativeTaskSnapshot(
                         task=task, lifecycle_revision=lifecycle_revision
                     )
                 ]

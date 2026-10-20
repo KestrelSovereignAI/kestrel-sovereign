@@ -204,15 +204,6 @@ class RecipientA2ASenderAuthorizer:
                 exc,
             )
             return False
-        except Exception as exc:  # noqa: BLE001 - injected provider boundary
-            if is_execution_control_error(exc):
-                raise
-            logger.warning(
-                "Inbound A2A sender authorization failed for %s",
-                sender_id,
-                exc_info=True,
-            )
-            return False
         # Require the explicit singleton, not merely a truthy provider value.
         return result is True
 

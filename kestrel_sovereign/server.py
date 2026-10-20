@@ -4474,6 +4474,19 @@ async def auth_middleware(request: Request, call_next):
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/ui/"]
 
     transport_only_process = is_a2a_transport_only_process()
+    # Native SDK routes authenticate the signed principal and recipient policy
+    # inside their shared handler. This lane must precede operator credentials:
+    # an added API key cannot promote a peer call to sovereign authority.
+    native_a2a = getattr(request.app.state, "native_a2a_http", None)
+    if native_a2a is not None:
+        from kestrel_sovereign.a2a.native_routes import NativeA2AHTTPRegistry
+        from kestrel_sovereign.auth import CallerContext
+
+        if not isinstance(native_a2a, NativeA2AHTTPRegistry):
+            raise TypeError("Host native A2A routes require their published registry")
+        if native_a2a.admits(request.scope):
+            request.state.caller = CallerContext.a2a_transport()
+            return await call_next(request)
     if request.url.path in public_paths:
         return await call_next(request)
     if request.url.path in auth_paths:

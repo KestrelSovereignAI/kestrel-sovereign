@@ -42,6 +42,7 @@ from kestrel_sovereign.a2a.native_context import (
     NativeServerCallContextBuilder,
     bind_native_request,
 )
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 
 
 def _digest(request):
@@ -57,7 +58,8 @@ class _DigestInterceptor(ClientCallInterceptor):
 
 
 class _TenantPeer(RequestHandler):
-    def __init__(self):
+    def __init__(self, tenant):
+        self.tenant = tenant
         self.recipient_id = "did:test:recipient"
         self.routing_key = "registered-agent"
         self.observed = []
@@ -68,7 +70,7 @@ class _TenantPeer(RequestHandler):
             params,
             context,
             routing_key=self.routing_key,
-            recipient_id=self.recipient_id,
+            scope=NativeRecipientScope(self.recipient_id, self.tenant),
         )
         # Validation returns a distinct native object; the SDK's parsed input
         # remains unchanged, including REST's transport-carried tenant.
@@ -105,7 +107,7 @@ class _TenantPeer(RequestHandler):
 
 @asynccontextmanager
 async def _peer(protocol, tenant="tenant-alpha"):
-    receiver = _TenantPeer()
+    receiver = _TenantPeer(tenant)
     binding = NativeRecipientBinding(
         receiver.routing_key, receiver.recipient_id, tenant, protocol
     )
@@ -365,7 +367,7 @@ async def test_missing_host_context_cannot_be_reconstructed_from_untrusted_param
             GetTaskRequest(id="known-task"),
             context,
             routing_key="registered-agent",
-            recipient_id="did:test:recipient",
+            scope=NativeRecipientScope("did:test:recipient"),
         )
 
 
@@ -380,7 +382,7 @@ async def test_nonnative_request_types_fail_before_reading_the_http_body(paramet
             parameters(),
             context,
             routing_key="registered-agent",
-            recipient_id="did:test:recipient",
+            scope=NativeRecipientScope("did:test:recipient"),
         )
 
 
@@ -395,7 +397,7 @@ async def test_inconsistent_sdk_context_cannot_reach_http_body_or_authorization(
             GetTaskRequest(id="known-task"),
             context,
             routing_key="registered-agent",
-            recipient_id="did:test:recipient",
+            scope=NativeRecipientScope("did:test:recipient"),
         )
 
 
@@ -417,7 +419,7 @@ async def test_rest_context_cannot_hide_a_conflicting_path_or_native_tenant(sour
             params,
             context,
             routing_key="registered-agent",
-            recipient_id="did:test:recipient",
+            scope=NativeRecipientScope("did:test:recipient"),
         )
 
 

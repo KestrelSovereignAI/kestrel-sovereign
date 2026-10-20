@@ -170,7 +170,10 @@ async def test_terminal_states_cannot_be_replaced_by_recipient_cas(store, state)
         await store.cancel_if_authorized("task-one", actor_agent_id="did:kestrel:alice")
     else:
         assert await store.save_recipient_terminal_outcome(
-            value, recipient_agent_id="did:kestrel:bob", operation_id="outcome-one"
+            value,
+            baseline=await store.get_for_recipient(value.id, store.scope.recipient_id),
+            recipient_agent_id="did:kestrel:bob",
+            operation_id="outcome-one",
         )
     with pytest.raises(ValueError, match="terminal"):
         await store.update_status(
@@ -282,7 +285,10 @@ async def test_a_recipient_can_reject_any_live_native_task(store, state):
     await create(store, value)
     value.status.state = TaskState.TASK_STATE_REJECTED
     assert await store.save_recipient_terminal_outcome(
-        value, recipient_agent_id="did:kestrel:bob", operation_id="rejection-one"
+        value,
+        baseline=await store.get_for_recipient(value.id, store.scope.recipient_id),
+        recipient_agent_id="did:kestrel:bob",
+        operation_id="rejection-one",
     )
     assert (await get(store)) == value
     assert (
@@ -328,11 +334,19 @@ async def test_a_recipient_outcome_cannot_move_an_existing_task_to_another_conte
     outcome.context_id = "another-context"
     if terminal:
         saved = await store.save_recipient_terminal_outcome(
-            outcome, recipient_agent_id="did:kestrel:bob", operation_id="wrong-context"
+            outcome,
+            baseline=await store.get_for_recipient(
+                outcome.id, store.scope.recipient_id
+            ),
+            recipient_agent_id="did:kestrel:bob",
+            operation_id="wrong-context",
         )
     else:
         saved = await store.save_recipient_lifecycle(
             outcome,
+            baseline=await store.get_for_recipient(
+                outcome.id, store.scope.recipient_id
+            ),
             recipient_agent_id="did:kestrel:bob",
             expected_state=TaskState.TASK_STATE_SUBMITTED,
         )
@@ -392,12 +406,18 @@ async def test_lifecycle_writes_reject_incomplete_native_messages(store, operati
         elif operation == "lifecycle":
             await store.save_recipient_lifecycle(
                 changed,
+                baseline=await store.get_for_recipient(
+                    changed.id, store.scope.recipient_id
+                ),
                 recipient_agent_id="did:kestrel:bob",
                 expected_state=TaskState.TASK_STATE_SUBMITTED,
             )
         else:
             await store.save_recipient_terminal_outcome(
                 changed,
+                baseline=await store.get_for_recipient(
+                    changed.id, store.scope.recipient_id
+                ),
                 recipient_agent_id="did:kestrel:bob",
                 operation_id="bad-outcome",
             )
@@ -489,12 +509,16 @@ async def test_all_lifecycle_writers_refuse_a_foreign_scope_even_for_the_actual_
     )
     assert not await foreign.save_recipient_lifecycle(
         working,
+        baseline=await store.get_for_recipient(working.id, store.scope.recipient_id),
         recipient_agent_id="did:kestrel:bob",
         expected_state=TaskState.TASK_STATE_SUBMITTED,
     )
     completed = task(TaskState.TASK_STATE_COMPLETED)
     assert not await foreign.save_recipient_terminal_outcome(
-        completed, recipient_agent_id="did:kestrel:bob", operation_id="foreign-outcome"
+        completed,
+        baseline=await store.get_for_recipient(completed.id, store.scope.recipient_id),
+        recipient_agent_id="did:kestrel:bob",
+        operation_id="foreign-outcome",
     )
     assert (
         await foreign.cancel_if_authorized(
@@ -527,6 +551,7 @@ async def test_terminal_receipts_and_retention_do_not_cross_the_bound_scope(
     second.status.state = TaskState.TASK_STATE_COMPLETED
     assert await store.save_recipient_terminal_outcome(
         second,
+        baseline=await store.get_for_recipient(second.id, store.scope.recipient_id),
         recipient_agent_id="did:kestrel:bob",
         operation_id="private-terminal-receipt",
     )
@@ -598,3 +623,125 @@ async def test_task_metadata_does_not_select_its_recipient_or_tenant(store, fore
     ) == [(store.scope.recipient_id, store.scope.tenant)]
     assert (await get(store)) == value
     assert await foreign._get_unscoped("task-one") is None
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_outcomes_preserve_chunks_and_history_added_after_the_baseline(
+    store, cancel
+):
+    original = task()
+    original.artifacts.append(new_text_artifact("body", "first", artifact_id="body"))
+    await create(store, original)
+    baseline = await get(store)
+    outcome = Task.FromString(baseline.SerializeToString())
+    outcome.artifacts.append(new_text_artifact("result", "done", artifact_id="result"))
+    outcome.metadata.update({"handler": [None, False, {}, []]})
+    outcome.status.state = (
+        TaskState.TASK_STATE_CANCELED if cancel else TaskState.TASK_STATE_COMPLETED
+    )
+    await store.add_artifact(
+        "task-one",
+        new_text_artifact("body", "second", artifact_id="body"),
+        recipient_agent_id="did:kestrel:bob",
+        append=True,
+    )
+    latest = await get(store)
+    progress = new_text_message(
+        "concurrent progress", task_id=latest.id, context_id=latest.context_id
+    )
+    latest.history.append(progress)
+    latest.status.state = TaskState.TASK_STATE_WORKING
+    latest.metadata.update({"progress": {"keep": [None, {}]}})
+    assert await store.save_recipient_lifecycle(
+        latest,
+        baseline=baseline,
+        recipient_agent_id="did:kestrel:bob",
+        expected_state=TaskState.TASK_STATE_SUBMITTED,
+    )
+    if cancel:
+        committed = await store.cancel_if_authorized(
+            "task-one",
+            actor_agent_id="did:kestrel:bob",
+            task_payload=outcome,
+            task_baseline=baseline,
+            operation_id="cancel-with-payload",
+        )
+        assert committed.status.message.task_id == committed.id
+        assert committed.status.message.context_id == committed.context_id
+    else:
+        committed = await store.save_recipient_terminal_outcome(
+            outcome,
+            baseline=baseline,
+            recipient_agent_id="did:kestrel:bob",
+            operation_id="complete-with-payload",
+        )
+    assert committed == await get(store)
+    assert [item.artifact_id for item in committed.artifacts] == ["body", "result"]
+    assert [part.text for part in committed.artifacts[0].parts] == ["first", "second"]
+    assert progress in committed.history
+    metadata = MessageToDict(committed.metadata)
+    assert metadata["progress"] == {"keep": [None, {}]}
+    assert metadata["handler"] == [None, False, {}, []]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_conflicting_handler_outcome_does_not_write_or_mint_a_receipt(
+    store, cancel
+):
+    from kestrel_sovereign.a2a.outcomes import TaskOutcomeConflictError
+
+    original = task()
+    original.artifacts.append(new_text_artifact("body", "original", artifact_id="body"))
+    await create(store, original)
+    baseline = await get(store)
+    await store.add_artifact(
+        "task-one",
+        new_text_artifact("body", "independent writer", artifact_id="body"),
+        recipient_agent_id="did:kestrel:bob",
+    )
+    before = await get(store)
+    outcome = Task.FromString(baseline.SerializeToString())
+    outcome.artifacts[0].parts[0].text = "conflicting handler"
+    outcome.status.state = (
+        TaskState.TASK_STATE_CANCELED if cancel else TaskState.TASK_STATE_COMPLETED
+    )
+    with pytest.raises(TaskOutcomeConflictError, match="Artifact changed"):
+        if cancel:
+            await store.cancel_if_authorized(
+                "task-one",
+                actor_agent_id="did:kestrel:bob",
+                task_payload=outcome,
+                task_baseline=baseline,
+                operation_id="refused-cancellation",
+            )
+        else:
+            await store.save_recipient_terminal_outcome(
+                outcome,
+                baseline=baseline,
+                recipient_agent_id="did:kestrel:bob",
+                operation_id="refused-completion",
+            )
+    assert await get(store) == before
+    row = await store.backend.fetch_one(
+        "SELECT cancel_operation_id, terminal_operation_id, lifecycle_revision FROM a2a_tasks WHERE id = ?",
+        ("task-one",),
+    )
+    assert row == (None, None, 0)
+
+
+async def test_the_returned_outcome_contains_only_durable_authority_metadata(store):
+    await create(store, task())
+    baseline = await get(store)
+    outcome = Task.FromString(baseline.SerializeToString())
+    outcome.status.state = TaskState.TASK_STATE_COMPLETED
+    outcome.metadata.update(
+        {"ordinary": [None, {}], "cancellation_receipt": {"actor_agent_id": "forged"}}
+    )
+    committed = await store.save_recipient_terminal_outcome(
+        outcome,
+        baseline=baseline,
+        recipient_agent_id="did:kestrel:bob",
+        operation_id="complete",
+    )
+    assert MessageToDict(committed.metadata) == {"ordinary": [None, {}]}
+    assert committed == await get(store)

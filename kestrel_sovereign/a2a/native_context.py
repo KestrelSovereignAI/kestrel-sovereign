@@ -63,6 +63,19 @@ class NativeServerCallContextBuilder(DefaultServerCallContextBuilder):
         return context
 
 
+def _native_http_request(context: ServerCallContext) -> _NativeHTTPRequest:
+    """Require the host's binding once for both validation and proof headers."""
+    bound = context.state.get(_CONTEXT_KEY)
+    if not isinstance(bound, _NativeHTTPRequest):
+        raise RuntimeError("Native A2A request lacks its host-owned HTTP context")  # noqa: TRY004
+    return bound
+
+
+def native_header_values(context: ServerCallContext, name: str) -> list[str]:
+    """Retain duplicate HTTP headers for the native proof verifier."""
+    return _native_http_request(context).request.headers.getlist(name)
+
+
 def _require_tenant(value: object, expected: str) -> None:
     # ProtoJSON null denotes an unset scalar. An explicitly unset tenant is
     # consistent only with the advertised default/empty tenant.
@@ -79,7 +92,7 @@ async def bind_native_request(
     context: ServerCallContext,
     *,
     routing_key: str,
-    recipient_id: str,
+    scope: NativeRecipientScope,
 ) -> _Request:
     """Validate routing before authorization, then resolve REST path fields.
 
@@ -87,12 +100,9 @@ async def bind_native_request(
     and an inconsistent body/query tenant is rejected before path resolution.
     This must precede signature verification and SDK-generated task/context IDs.
     """
-    bound = context.state.get(_CONTEXT_KEY)
-    if not isinstance(bound, _NativeHTTPRequest):
-        # Missing host wiring is a runtime configuration error.
-        raise RuntimeError("Native A2A request lacks its host-owned HTTP context")  # noqa: TRY004
+    bound = _native_http_request(context)
     binding, request = bound.binding, bound.request
-    if binding.routing_key != routing_key or binding.recipient_id != recipient_id:
+    if binding.routing_key != routing_key or binding.scope != scope:
         raise InvalidParamsError(
             message="A2A request does not match the selected recipient"
         )

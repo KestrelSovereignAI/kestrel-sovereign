@@ -371,6 +371,43 @@ Let the SDK define method names, binding resource paths, errors and events.
 
 `SDK request handler → verified principal + recipient policy → TaskManager → stores/worker`.
 
+The native HTTP registration mounts both SDK bindings below
+`/api/agent-routes/{encoded_routing_name}/a2a`: JSON-RPC uses `/rpc`, and
+HTTP+JSON uses the mount root with the selected interface's tenant alias.
+The route registry publishes the exact SDK route objects that host peer
+admission matches, including HTTP methods and complete nested endpoints.
+It does not maintain a second transport path pattern. Only the advertised
+tenant is served; an empty tenant uses the SDK's base routes. Replacing a
+registration retains its successor when an older owner withdraws.
+
+The native guard captures the exact published recipient policy, task manager,
+task store and hybrid identity. Each request separately retains the sender's
+host identity witness around verification and authorization. Waiting requests
+release the topology lease, then recheck their original policy and identities
+before the first or subsequent stream event and final read; this does not spend
+their replay nonce again. A replacement with the same DID and keys is still a
+different host generation. Missing proof remains HTTP 401, recipient refusal
+remains HTTP 403, and database failures become the standard internal error with
+the original retained for host diagnostics. An operator key cannot promote a
+native peer request to sovereign authority.
+
+These registrations and guarded SDK operations are implementation foundations.
+Publishing signed cards, host startup/onboarding publication, push configuration,
+outbound cutover, old-route retirement and full host interoperability remain
+acceptance work; isolated SDK HTTP tests do not establish their completion.
+
+The native task manager records the handler's admitted Task as its baseline.
+Lifecycle and cancellation writes apply that handler's delta to the latest
+recipient- and tenant-scoped row while holding its database lock. Independent
+artifact chunks, progress history and metadata survive finalization. A handler
+cannot remove published artifacts, rewrite committed history or silently
+replace data changed by another writer; conflicting edits fail before a write.
+The store returns the native payload it committed, including server-owned
+authority fields. A lost commit acknowledgement is reconciled through its
+private operation token and an authorized canonical read. If that read is
+unavailable, execution retains the infrastructure error instead of returning
+the attempted snapshot or running the handler again.
+
 Integrate the SDK request-handler and executor interfaces with the existing
 TaskManager lifecycle. Do not create a second task lifecycle or store. Both
 bindings enter the same authorization path, including get/list/cancel/subscribe

@@ -31,10 +31,11 @@ from kestrel_sovereign.a2a.extensions import (
     deserialize_causation_chain,
     parse_question_correlation,
 )
+from kestrel_sovereign.a2a.projections import message_text
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified.task_store import (
-    TaskCognitionWakeCandidate,
-    require_native_wake,
+    NativeTaskSnapshot,
+    require_native_task_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,19 +160,17 @@ def build_a2a_task_submitted_registration() -> SourceRegistration:
 
 
 def build_signal_for_submitted_task(
-    candidate: TaskCognitionWakeCandidate, target_agent: str,
+    candidate: NativeTaskSnapshot, target_agent: str,
 ) -> Signal:
     """Wake the admitted recipient using ownership facts outside peer metadata."""
-    candidate = require_native_wake(candidate, target_agent)
+    candidate = require_native_task_snapshot(candidate, target_agent)
     task = candidate.task
     if task.status.state not in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
         raise ValueError("Task submission wake requires a submitted or working native task")
     metadata = MessageToDict(task.metadata)
     correlation = parse_question_correlation(metadata)
     chain = deserialize_causation_chain(metadata)
-    request_content = ""
-    if task.history:
-        request_content = "\n".join(part.text for part in task.history[0].parts if part.HasField("text"))
+    request_content = (message_text(task.history[0]) or "") if task.history else ""
     scope = NativeRecipientScope(candidate.ownership.recipient_agent_id, candidate.ownership.tenant)
     return Signal(
         source=SOURCE_NAME, kind="inbound", mode=SignalMode.COGNITION,

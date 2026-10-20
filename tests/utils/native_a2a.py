@@ -12,6 +12,18 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from tests.utils.postgres_schema import disposable_postgres_schema, with_search_path
 
 
+def signing_identity(did):
+    """Build actual hybrid keys and their public DID verification document."""
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+    pair = generate_hybrid_keypair()
+    return pair, {
+        "id": did,
+        "verificationMethod": build_verification_methods(did, pair.public_keys()),
+    }
+
+
 def manager_for(backend, scope, *, owns_backend=True, **callbacks):
     """Construct the canonical native stores on one owned test backend."""
     from kestrel_sovereign.a2a.task_manager import TaskManager

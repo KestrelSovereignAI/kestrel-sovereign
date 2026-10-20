@@ -19,12 +19,12 @@ from kestrel_sovereign.a2a.native_sender import (
     verify_native_request,
 )
 from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
-from kestrel_sovereign.identity.did_web import build_verification_methods
 from kestrel_sovereign.identity.hybrid_keypair import (
     generate_hybrid_keypair,
     sign_hybrid,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from tests.utils.native_a2a import signing_identity
 
 SENDER = "did:web:sender.example:agents:alpha"
 RECIPIENT = "did:web:recipient.example:agents:beta"
@@ -36,11 +36,7 @@ POLICY = NativeProofPolicy()
 
 @pytest.fixture(scope="module")
 def identity():
-    pair = generate_hybrid_keypair()
-    return pair, {
-        "id": SENDER,
-        "verificationMethod": build_verification_methods(SENDER, pair.public_keys()),
-    }
+    return signing_identity(SENDER)
 
 
 @pytest.fixture

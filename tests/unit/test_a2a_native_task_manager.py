@@ -185,9 +185,8 @@ async def test_context_ownership_refuses_another_sender_without_creating_a_task(
     manager,
 ):
     first = await admit(manager)
-    with pytest.raises(TransactionError) as caught:
+    with pytest.raises(ContextOwnershipError, match="not owned"):
         await admit(manager, creator="did:kestrel:other-sender")
-    assert isinstance(caught.value.__cause__, ContextOwnershipError)
     assert await manager.task_store.backend.fetch_all("SELECT id FROM a2a_tasks") == [
         (first.id,)
     ]
@@ -432,17 +431,18 @@ async def test_background_storage_failure_is_not_a_tool_failure_and_survives_wor
         # Completion may retire the Task before a later drain observes it.
         # Its infrastructure failure must remain owned by the manager.
         assert execution not in instance._execution_tasks
-        assert isinstance(outcome.error, QueryError)
+        assert isinstance(outcome.error, TransactionError)
+        assert isinstance(outcome.error.__cause__, QueryError)
         assert provider.calls == 1
         assert completions == []
         assert await backend.fetch_all("SELECT id, status FROM a2a_tasks") == [
             (accepted.id, "submitted")
         ]
         for _ in range(2):
-            with pytest.raises(QueryError) as drained:
+            with pytest.raises(TransactionError) as drained:
                 await instance.drain_execution_tasks()
             assert drained.value is outcome.error
-        with pytest.raises(QueryError) as closed:
+        with pytest.raises(TransactionError) as closed:
             await instance.close()
         assert closed.value is outcome.error
         assert backend.is_connected is not owns_backend
@@ -452,7 +452,7 @@ async def test_background_storage_failure_is_not_a_tool_failure_and_survives_wor
             await await_owned_task(execution)
         # Cleanup must also work while running the deliberately failing
         # pre-fix counterexample, before its close assertion is reached.
-        with suppress(QueryError):
+        with suppress(TransactionError):
             await instance.close()
         await backend.close()
 
@@ -487,6 +487,8 @@ async def test_background_handler_outcome_commits_and_notifies_once(
     assert completions[0].task == persisted
     assert completions[0].ownership.creator_agent_id == manager.host_agent_id
     if state == TaskState.TASK_STATE_FAILED:
+        assert persisted.status.message.task_id == persisted.id
+        assert persisted.status.message.context_id == persisted.context_id
         assert (
             persisted.status.message.parts[0].text
             == "The requested tool operation failed"
@@ -558,7 +560,7 @@ async def test_a_failed_outcome_write_never_returns_a_fabricated_completed_task(
         tags=["test"],
     )
     manager.register_provider("feature", [skill], provider)
-    with pytest.raises(QueryError):
+    with pytest.raises(TransactionError):
         await manager.execute_skill("feature", skill.id, {})
     assert provider.calls == 1
     assert await backend.fetch_all("SELECT status FROM a2a_tasks") == [("submitted",)]
@@ -635,3 +637,141 @@ async def test_local_skill_completion_retains_the_current_turn_causation_extensi
     persisted = await manager.get_task_for_recipient(result.id, manager.host_agent_id)
     metadata = MessageToDict(persisted.metadata)
     assert CAUSATION_URI in metadata and "causation_chain" not in metadata
+
+
+@pytest.mark.parametrize("readback", ["available", "outage", "missing"])
+async def test_lost_commit_ack_reconciles_only_the_canonical_payload(
+    manager, monkeypatch, readback
+):
+    from a2a.helpers.proto_helpers import new_text_artifact
+
+    from kestrel_sovereign.a2a.stores.unified.task_store import (
+        TaskMutationAuthorizationError,
+    )
+
+    provider = CompletingProvider()
+    skill = AgentSkill(
+        id="native-tool", name="Native tool", description="Ack test", tags=["test"]
+    )
+    manager.register_provider("feature", [skill], provider)
+    canonical_save = manager.task_store.save_recipient_terminal_outcome
+    canonical_read = manager.task_store.get_for_recipient
+    ack_error = RuntimeError("lost terminal commit acknowledgement")
+    read_error = QueryError("canonical payload unavailable")
+    committed_id = None
+    writes = 0
+
+    async def commit_then_lose_ack(task, **kwargs):
+        nonlocal committed_id, writes
+        writes += 1
+        await manager.task_store.add_artifact(
+            task.id,
+            new_text_artifact("concurrent", "keep"),
+            recipient_agent_id=manager.host_agent_id,
+        )
+        saved = await canonical_save(task, **kwargs)
+        assert saved is not None
+        committed_id = task.id
+        raise ack_error
+
+    async def read(task_id, recipient_agent_id):
+        if task_id == committed_id:
+            if readback == "outage":
+                raise read_error
+            if readback == "missing":
+                return None
+        return await canonical_read(task_id, recipient_agent_id)
+
+    monkeypatch.setattr(
+        manager.task_store, "save_recipient_terminal_outcome", commit_then_lose_ack
+    )
+    monkeypatch.setattr(manager.task_store, "get_for_recipient", read)
+    if readback == "available":
+        returned = await manager.execute_skill("feature", skill.id, {})
+        assert returned == await canonical_read(committed_id, manager.host_agent_id)
+        assert {item.name for item in returned.artifacts} == {"concurrent", "result"}
+    else:
+        with pytest.raises(RuntimeError) as failed:
+            await manager.execute_skill("feature", skill.id, {})
+        assert failed.value is ack_error
+        if readback == "outage":
+            assert failed.value.__cause__ is read_error
+        else:
+            assert isinstance(failed.value.__cause__, TaskMutationAuthorizationError)
+    assert provider.calls == writes == 1
+    persisted = await canonical_read(committed_id, manager.host_agent_id)
+    assert persisted.status.state == TaskState.TASK_STATE_COMPLETED
+    assert {item.name for item in persisted.artifacts} == {"concurrent", "result"}
+
+
+async def test_denied_local_skill_returns_a_native_rejection_without_running_the_tool(
+    manager,
+):
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+
+    from kestrel_sovereign.hooks.manager import HooksManager
+
+    class DenyExport(Hook):
+        def __init__(self):
+            super().__init__("deny-native-export", events=[HookEvent.PRE_TOOL_USE])
+
+        async def execute(self, input):
+            return HookOutput.deny("This recipient does not permit export")
+
+    manager.hooks_manager = HooksManager()
+    manager.hooks_manager.register(DenyExport())
+    provider = CompletingProvider()
+    manager.register_provider(
+        "feature",
+        [
+            AgentSkill(
+                id="native-tool",
+                name="Native tool",
+                description="Native deny",
+                tags=["test"],
+            )
+        ],
+        provider,
+    )
+    result = await manager.execute_skill("feature", "native-tool", {})
+    assert provider.calls == 0
+    assert result.status.state == TaskState.TASK_STATE_REJECTED
+    assert result.status.message.task_id == result.id
+    assert result.status.message.context_id == result.context_id
+    assert MessageToDict(result.metadata)["denied"] is True
+    assert (
+        await manager.get_task_for_recipient(result.id, manager.host_agent_id) == result
+    )
+
+
+@pytest.mark.parametrize(
+    "state", [TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED]
+)
+@pytest.mark.parametrize("already_interrupted", [False, True])
+async def test_native_stream_closes_on_an_interruption_without_making_the_task_terminal(
+    manager, state, already_interrupted
+):
+    task = await admit(manager)
+    recipient = manager.host_agent_id
+    if already_interrupted:
+        await manager.update_status(task.id, state, recipient_agent_id=recipient)
+    stream = manager.subscribe(
+        task.id, creator_agent_id="did:kestrel:sender", recipient_agent_id=recipient
+    )
+    try:
+        initial = await anext(stream)
+        assert isinstance(initial, Task) and initial.id == task.id
+        if not already_interrupted:
+            await manager.update_status(task.id, state, recipient_agent_id=recipient)
+            event = await asyncio.wait_for(anext(stream), 1)
+            assert isinstance(event, TaskStatusUpdateEvent)
+            assert event.status.state == state
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(stream), 1)
+        assert task.id not in manager._subscribers
+        resumed = await manager.update_status(
+            task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=recipient
+        )
+        assert resumed.status.state == TaskState.TASK_STATE_WORKING
+    finally:
+        await stream.aclose()

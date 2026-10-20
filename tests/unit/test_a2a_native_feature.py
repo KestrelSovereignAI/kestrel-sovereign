@@ -88,3 +88,19 @@ def test_dynamic_tools_no_longer_carry_a_second_cached_skill_model():
     exposed = feature().get_tools()
     assert {item.name for item in exposed} == {"native_echo", "native_failure"}
     assert all(not hasattr(item, "agent_skill") for item in exposed)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"skill": "missing"},
+        {"skill": "native_echo", "args": {"value": {"nested": [None, {}]}}},
+        {"skill": "native_echo", "args": {}},
+        {"skill": "native_failure"},
+    ],
+)
+async def test_all_feature_status_messages_identify_their_parent_task(metadata):
+    result = await feature().handle_task(task(**metadata))
+    assert result.status.message.task_id == result.id
+    assert result.status.message.context_id == result.context_id

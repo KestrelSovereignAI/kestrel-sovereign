@@ -13,6 +13,11 @@ TERMINAL_STATES = frozenset(
     }
 )
 
+# An interrupted task can resume, but its current streaming response ends.
+STREAM_STOP_STATES = TERMINAL_STATES | frozenset(
+    {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
+)
+
 
 def task_state_label(state: int) -> str:
     """Use official enum names for internal storage and projection labels."""
@@ -23,4 +28,6 @@ def task_state_label(state: int) -> str:
 
 def task_state_from_label(state: str) -> int:
     """Reject unknown stored labels instead of inventing a native state."""
-    return TaskState.Value("TASK_STATE_" + state.upper().replace("-", "_"))
+    result = TaskState.Value("TASK_STATE_" + state.upper().replace("-", "_"))
+    task_state_label(result)
+    return result

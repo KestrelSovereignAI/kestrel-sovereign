@@ -33,8 +33,8 @@ from kestrel_sovereign.a2a.extensions import (
 )
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_label
 from kestrel_sovereign.a2a.stores.unified.task_store import (
-    TaskCognitionWakeCandidate,
-    require_native_wake,
+    NativeTaskSnapshot,
+    require_native_task_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -162,9 +162,9 @@ def build_a2a_task_complete_registration() -> SourceRegistration:
 # ---------------------------------------------------------------------------
 
 
-def build_signal_for_completed_task(candidate: TaskCognitionWakeCandidate, target_agent: str) -> Signal:
+def build_signal_for_completed_task(candidate: NativeTaskSnapshot, target_agent: str) -> Signal:
     """Build a terminal wake from the native row and its durable principals."""
-    candidate = require_native_wake(candidate, target_agent)
+    candidate = require_native_task_snapshot(candidate, target_agent)
     task = candidate.task
     if task.status.state not in TERMINAL_STATES:
         raise ValueError("Task completion wake requires a terminal native task")

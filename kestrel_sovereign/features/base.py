@@ -1305,17 +1305,29 @@ class Feature(_SdkFeature):
         skill_name = metadata.get("skill")
         args = metadata.get("args", {})
         if not isinstance(skill_name, str) or not skill_name:
-            task.status.CopyFrom(TaskStatus(
-                state=TaskState.TASK_STATE_REJECTED,
-                message=new_text_message("An explicit skill is required"),
-            ))
+            task.status.CopyFrom(
+                TaskStatus(
+                    state=TaskState.TASK_STATE_REJECTED,
+                    message=new_text_message(
+                        "An explicit skill is required",
+                        task_id=task.id,
+                        context_id=task.context_id,
+                    ),
+                )
+            )
             return task
         selected = self._get_tool_by_name(skill_name)
         if selected is None or not isinstance(args, dict):
-            task.status.CopyFrom(TaskStatus(
-                state=TaskState.TASK_STATE_REJECTED,
-                message=new_text_message(f"Unknown skill or invalid arguments: {skill_name}"),
-            ))
+            task.status.CopyFrom(
+                TaskStatus(
+                    state=TaskState.TASK_STATE_REJECTED,
+                    message=new_text_message(
+                        f"Unknown skill or invalid arguments: {skill_name}",
+                        task_id=task.id,
+                        context_id=task.context_id,
+                    ),
+                )
+            )
             return task
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         try:
@@ -1323,17 +1335,35 @@ class Feature(_SdkFeature):
         except Exception as error:
             if is_execution_control_error(error):
                 raise
-            logger.exception("Feature %s task handling failed for %s", self.name, skill_name)
-            task.status.CopyFrom(TaskStatus(
-                state=TaskState.TASK_STATE_FAILED, message=new_text_message(str(error)),
-            ))
+            logger.exception(
+                "Feature %s task handling failed for %s", self.name, skill_name
+            )
+            task.status.CopyFrom(
+                TaskStatus(
+                    state=TaskState.TASK_STATE_FAILED,
+                    message=new_text_message(
+                        str(error), task_id=task.id, context_id=task.context_id
+                    ),
+                )
+            )
             return task
         task.artifacts.append(new_data_artifact(f"{skill_name}_result", result))
-        failed = is_flat_toolresult_envelope(result) and result["status"] == ToolResultStatus.ERROR
-        task.status.CopyFrom(TaskStatus(
-            state=TaskState.TASK_STATE_FAILED if failed else TaskState.TASK_STATE_COMPLETED,
-            message=new_text_message(f"Failed {skill_name}" if failed else f"Completed {skill_name}"),
-        ))
+        failed = (
+            is_flat_toolresult_envelope(result)
+            and result["status"] == ToolResultStatus.ERROR
+        )
+        task.status.CopyFrom(
+            TaskStatus(
+                state=TaskState.TASK_STATE_FAILED
+                if failed
+                else TaskState.TASK_STATE_COMPLETED,
+                message=new_text_message(
+                    f"Failed {skill_name}" if failed else f"Completed {skill_name}",
+                    task_id=task.id,
+                    context_id=task.context_id,
+                ),
+            )
+        )
         return task
 
     def _get_tool_by_name(self, name: str) -> Optional[AgentTool]:

@@ -45,6 +45,16 @@ _PROCESS_REGISTRY_DIRECTORY = ".kestrel-launch"
 _PROCESS_REGISTRY_PREFIX = "a2a-peer-identities-"
 
 
+def same_a2a_sender_identity_witness(before: tuple, after: tuple) -> bool:
+    """Compare exact host/identity owners without invoking object equality."""
+    return (
+        before[0] == after[0]
+        and before[1] is after[1]
+        and before[2] is after[2]
+        and before[3] == after[3]
+    )
+
+
 class ProcessA2ADidResolverConfigurationError(RuntimeError):
     """A process-managed peer verification registry is malformed."""
 

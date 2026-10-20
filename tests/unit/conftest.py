@@ -71,6 +71,10 @@ from tests.utils.ci_budget import refuse_unbudgeted_timeouts
 from tests.utils.native_a2a import (
     native_a2a_backend_factory,  # noqa: F401 - pytest fixture
 )
+from tests.utils.native_a2a_security import (
+    admission as native_request_admission,  # noqa: F401 - pytest fixture
+    signing as native_signing,  # noqa: F401 - pytest fixture
+)
 
 #: The seeded manifest. A *default*, deliberately not a list of slugs: a list
 #: would name today's host features and silently miss tomorrow's, which is the
