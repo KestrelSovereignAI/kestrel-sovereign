@@ -226,8 +226,10 @@ async def test_exhausting_control_budget_preserves_pause_and_close():
 async def test_timed_out_input_retires_instead_of_reporting_a_quiescent_pause():
     driver, page, session = controller()
     request = await action(driver, session)
-    request["not_after"] = (datetime.now(UTC) + timedelta(milliseconds=20)).isoformat()
-    page.gate = asyncio.Event()
+    async def timeout_after_dispatch(*args, **kwargs):
+        page.effects.append((args, kwargs))
+        raise TimeoutError
+    page.click = timeout_after_dispatch
     assert (await driver.act(session, request))["outcome"] == "unknown"
     current = driver.status(session["scope"], session["session_id"])
     assert current["state"] == "closed" and page.closed
@@ -237,3 +239,67 @@ async def test_timed_out_input_retires_instead_of_reporting_a_quiescent_pause():
     with pytest.raises(Refused, match="session_closed"):
         await driver.control(current, control(current, "resume"))
     assert len(page.effects) == 1
+
+
+@pytest.mark.asyncio
+async def test_maximum_wait_completes_without_retiring_the_persistent_page():
+    driver, page, session = controller()
+    request = await action(driver, session, effect={"schema_version": 1, "kind": "wait", "milliseconds": 10000})
+    request["not_after"] = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+    started = asyncio.get_running_loop().time()
+    receipt = await driver.act(session, request)
+    assert asyncio.get_running_loop().time() - started >= 9.9
+    assert receipt["outcome"] == "completed"
+    assert driver.status(session["scope"], session["session_id"])["state"] == "ready"
+    assert not page.closed and page.effects == []
+
+
+@pytest.mark.asyncio
+async def test_wait_that_cannot_finish_by_deadline_is_refused_without_retirement():
+    driver, page, session = controller()
+    request = await action(driver, session, effect={"schema_version": 1, "kind": "wait", "milliseconds": 300})
+    request["not_after"] = (datetime.now(UTC) + timedelta(milliseconds=200)).isoformat()
+    with pytest.raises(Refused, match="action_expired"):
+        await driver.act(session, request)
+    assert driver.status(session["scope"], session["session_id"])["state"] == "ready"
+    assert not page.closed and page.effects == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effect", [
+    {"schema_version": 1, "kind": "key", "key": "ArrowDown"},
+    {"schema_version": 1, "kind": "scroll", "delta_x": 0, "delta_y": 10},
+])
+async def test_supported_key_and_scroll_complete_in_the_same_session(effect):
+    driver, page, session = controller()
+    request = await action(driver, session, effect=effect)
+    assert (await driver.act(session, request))["outcome"] == "completed"
+    assert len(page.effects) == 1 and not page.closed
+
+
+@pytest.mark.asyncio
+async def test_cancelled_wait_has_a_known_receipt_and_keeps_the_page():
+    driver, page, session = controller()
+    request = await action(driver, session, effect={"schema_version": 1, "kind": "wait", "milliseconds": 1000})
+    task = asyncio.create_task(driver.act(session, request))
+    await asyncio.sleep(0)
+    assert "input" in driver._actions
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert driver.action_status(session, "input")["outcome"] == "denied"
+    assert driver.status(session["scope"], session["session_id"])["state"] == "ready"
+    assert page.effects == [] and not page.closed
+
+
+@pytest.mark.asyncio
+async def test_interrupted_wait_does_not_enter_uncertain_browser_input_retirement():
+    driver, page, session = controller()
+    request = await action(driver, session, effect={"schema_version": 1, "kind": "wait", "milliseconds": 1})
+    async def interrupted_sleep():
+        raise TimeoutError
+    driver._effect = lambda action, frame: interrupted_sleep
+    receipt = await driver.act(session, request)
+    assert receipt["outcome"] == "denied" and receipt["reason_code"] == "wait_interrupted"
+    assert driver.status(session["scope"], session["session_id"])["state"] == "ready"
+    assert page.effects == [] and not page.closed

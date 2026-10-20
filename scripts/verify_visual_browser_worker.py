@@ -8,12 +8,12 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 
-def exercise(checked, cid, output):
+def exercise(checked, cid, output, *, monotonic=time.monotonic):
     secret = secrets.token_hex(32)
     scope = {"schema_version": 1, "tenant_id": "synthetic", "principal_id": "owner", "agent_id": "fixture"}
     request = {"schema_version": 1, "session_id": uuid4().hex, "lease_id": uuid4().hex, "scope": scope,
                "surface": "browser", "required_capabilities": ["screenshot", "click", "type"],
-               "expires_at": (datetime.now(UTC) + timedelta(seconds=30)).isoformat()}
+               "expires_at": (datetime.now(UTC) + timedelta(seconds=45)).isoformat()}
     program = ["exec", "-i", cid, "python", "/opt/kestrel-browser/rpc_client.py"]
     # Bootstrap is one-shot. Wait for its directory before submitting; do not
     # retry an uncertain initialize operation with a second secret or session.
@@ -26,6 +26,10 @@ def exercise(checked, cid, output):
     checked(["exec", cid, "python", "-c",
              ("import pathlib,time; p=pathlib.Path('/tmp/kestrel-browser/worker.sock'); "
              "\nfor _ in range(200):\n if p.exists(): break\n time.sleep(.05)\nelse: raise SystemExit(1)")])
+    admission = json.loads(checked(["exec", cid, "python", "-c",
+                                   "from pathlib import Path; import sys; sys.stdout.buffer.write(Path('/tmp/kestrel-browser/admission.json').read_bytes())"]))
+    if not isinstance(admission, dict) or not admission.get("sandbox") or not admission.get("browser_version"):
+        raise RuntimeError("worker sandbox admission evidence is missing")
 
     def rpc(operation, arguments, *, credential=secret):
         message = {"schema_version": 1, "secret": credential, "id": uuid4().hex,
@@ -85,13 +89,26 @@ def exercise(checked, cid, output):
         raise RuntimeError("paused observations were not suspended")
     resume = {**pause, "request_id": uuid4().hex, "expected_control_epoch": 1, "operation": "resume"}
     session = rpc("control", {"session": session, "request": resume})["result"]
-    _, resumed = observe()
+    frame, resumed = observe()
     if resumed != saved:
         raise RuntimeError("control handoff lost browser state")
+    for effect in ({"schema_version": 1, "kind": "key", "key": "ArrowDown"},
+                   {"schema_version": 1, "kind": "scroll", "delta_x": 0, "delta_y": 10},
+                   {"schema_version": 1, "kind": "wait", "milliseconds": 10000}):
+        request_action = action(frame, effect)
+        request_action["not_after"] = (datetime.now(UTC) + timedelta(seconds=20)).isoformat()
+        started = monotonic()
+        if rpc("act", {"session": session, "request": request_action})["result"]["outcome"] != "completed":
+            raise RuntimeError("supported key, scroll or maximum wait did not complete")
+        if effect["kind"] == "wait":
+            wait_seconds = monotonic() - started
+            if wait_seconds < 9.9:
+                raise RuntimeError("maximum wait returned before its requested duration")
+        frame, _ = observe()
     (output / "worker.png").write_bytes(saved)
     # No close request: prove expiry physically retires the process/container.
-    deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
+    deadline = monotonic() + 45
+    while monotonic() < deadline:
         record = json.loads(checked(["container", "inspect", cid]))[0]
         if not record["State"]["Running"]:
             state = record["State"]
@@ -109,6 +126,8 @@ def exercise(checked, cid, output):
         raise RuntimeError("worker did not physically retire on expiry")
     return {"passed": True, "session_id": session["session_id"], "retired_exit_code": record["State"]["ExitCode"],
             "expires_at": request["expires_at"], "finished_at": record["State"]["FinishedAt"],
+            "sandbox_admission": admission, "maximum_wait_preserved_session": True, "key_scroll_completed": True,
+            "maximum_wait_seconds": wait_seconds,
             "png_sha256": hashlib.sha256(saved).hexdigest(), "same_action_not_replayed": True,
             "transport_reconnect_preserved_state": True, "stale_frame_refused": True,
             "pause_fenced_input_and_observation": True, "expiry_physically_retired": True}

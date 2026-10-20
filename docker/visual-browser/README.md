@@ -76,7 +76,7 @@ creates synthetic offline content, operates it over separate authenticated Unix
 socket exchanges and confirms physical expiry without a close request. It uses
 the same unique ownership labels, policy verification and exact cleanup as the
 substrate probe. Evidence records source revision/dirty state and actual build
-context hashes; expiry acceptance requires a normal exit at or after the admitted
+context hashes and actual process/Chromium sandbox admission evidence; expiry acceptance requires a normal exit at or after the admitted
 expiry, not merely a stopped container. Its screenshot contains only the synthetic draft.
 
 The image's `worker.py` accepts one trusted-host bootstrap through
@@ -100,12 +100,18 @@ status. If an accepted input times out or its waiter is cancelled, the worker
 fences and retires the session: cancelling a Playwright wait cannot unsend a
 Chromium input. That session cannot report a successful pause or be resumed.
 Pause and close remain available when the control-history budget is exhausted;
-resuming is refused. Pause fences
+resuming is refused. Transport has four connection slots with a 20-second bound;
+the trusted host must avoid holding idle slots and retain physical cleanup
+authority if control transport is unavailable. Priority human control remains
+part of host integration. Pause fences
 queued input before draining accepted work, suspends observations and advances
 the control epoch; resume advances it again. This is not human takeover. A frame
 is an observation identity, not a promise that autonomous page content is static.
 
 Only screenshot, click, text, a restricted key set, scroll and wait are supported.
+Waits send no browser input: a wait that cannot fit its deadline is refused,
+and an interrupted wait has a known denial without retiring a healthy page.
+The maximum 10-second wait has a separate bounded scheduling allowance.
 Navigation, clipboard, files, exec and takeover are refused. Sessions last at most
 one hour, with wall and monotonic expiry, bounded receipts and IPC, an async
 retirement loop and an OS process deadline (up to ten seconds of teardown grace).

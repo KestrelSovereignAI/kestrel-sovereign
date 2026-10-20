@@ -120,7 +120,7 @@ async def serve(controller, secret, *, directory=DIRECTORY):
 
 async def main():
     # Keep Playwright's lifetime outside the readiness timeout and RPC lifetime.
-    process_evidence()
+    admission = process_evidence()
     os.umask(0o077)
     DIRECTORY.mkdir(mode=0o700, exist_ok=False)
     source = DIRECTORY / "bootstrap.json"
@@ -140,7 +140,8 @@ async def main():
     async with async_playwright() as playwright:
         async with asyncio.timeout(20):
             browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True, channel="chromium")
-            await chromium_evidence(browser)
+            admission.update(await chromium_evidence(browser))
+            (DIRECTORY / "admission.json").write_bytes(encode(admission))
             context = await browser.new_context(viewport={"width": 800, "height": 600},
                                                 accept_downloads=False, service_workers="block")
             page = await context.new_page()

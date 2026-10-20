@@ -224,12 +224,13 @@ class BrowserController:
                     or self.monotonic() - self._frame[1] > self.frame_ttl):
                 raise Refused("stale_observation")
             not_after = instant(request["not_after"])
+            effect = self._effect(request["action"], self._frame[0])
+            is_wait = request["action"]["kind"] == "wait"
             frame_deadline = self._frame[1] + (not_after - instant(self._frame[0]["observed_at"])).total_seconds()
             remaining = min((not_after - self.clock()).total_seconds(), frame_deadline - self.monotonic(),
-                            self.deadline - self.monotonic(), 10)
-            if remaining <= 0:
+                            self.deadline - self.monotonic(), 11 if is_wait else 10)
+            if remaining <= 0 or (is_wait and request["action"]["milliseconds"] / 1000 >= remaining):
                 raise Refused("action_expired")
-            effect = self._effect(request["action"], self._frame[0])
             receipt = {"schema_version": 1, "action_id": action_id, "session_id": self._session["session_id"],
                        "observation_id": request["observation_id"], "control_epoch": request["control_epoch"],
                        "outcome": "unknown", "recorded_at": self.clock().isoformat(), "reason_code": "outcome_unknown"}
@@ -244,13 +245,21 @@ class BrowserController:
             except asyncio.CancelledError:
                 # Cancelling the Python waiter does not unsend a Chromium input.
                 # Fence synchronously; the worker must physically retire it.
-                self._fence_retirement()
+                if is_wait:
+                    receipt.update(outcome="denied", reason_code="wait_cancelled", recorded_at=self.clock().isoformat())
+                else:
+                    self._fence_retirement()
                 raise
             except Exception:  # noqa: BLE001 — accepted effect remains explicitly unknown
                 # A renderer can deliver a timed-out click later. Do not report
                 # a successful pause or permit resume with that input pending.
-                self._fence_retirement()
-                await self.retire()
+                if is_wait:
+                    # Wait never sends browser input, so interruption is known
+                    # to have no pending physical effect and needs no retirement.
+                    receipt.update(outcome="denied", reason_code="wait_interrupted", recorded_at=self.clock().isoformat())
+                else:
+                    self._fence_retirement()
+                    await self.retire()
             return copy.deepcopy(receipt)
 
     def action_status(self, session, action_id):
