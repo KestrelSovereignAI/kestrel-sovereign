@@ -118,10 +118,14 @@ class CompletedRun:
 class SandboxBackend(ABC):
     """Abstract over the OS-touching layer."""
 
+    #: Whether ``exec`` can run anything. The ``shell`` gate refuses a
+    #: backend without it before the approval queue is asked.
+    supports_exec: bool = True
+
     @property
     @abstractmethod
     def name(self) -> str:
-        """One-word identifier — ``"docker"`` or ``"local"``."""
+        """One-word identifier — ``"docker"``, ``"local"`` or ``"none"``."""
 
     @abstractmethod
     async def read(self, path: Path, *, max_bytes: int) -> bytes:

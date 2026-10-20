@@ -1325,3 +1325,129 @@ async def test_fs_edit_diff_preview_present_in_approval_payload(
     assert "ORIGINAL" in diff
     assert "REPLACED" in diff
     assert target.read_text() == "line1\nREPLACED\nline3\n"
+
+
+# =============================================================================
+# backend = "none": the file tools for an agent granted no shell
+# =============================================================================
+#
+# Both shell backends refuse to construct without a shell grant, and every
+# tool needs a backend, so an agent granted only ``filesystem_read`` used to
+# have no working tool: fs_read was refused at readiness.
+
+
+@pytest.mark.asyncio
+async def test_read_only_grant_reads_through_backend_none(
+    workspace: Path, security_feature: SecurityFeature
+):
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read"},
+        security_feature=security_feature,
+        backend="none",
+    )
+    assert feature._backend is not None and feature._backend.name == "none"
+
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is ToolResultStatus.OK, envelope.error
+    assert envelope.data["content"] == "hello world"
+    listing = await feature.fs_list(path=str(workspace))
+    assert listing.status is ToolResultStatus.OK, listing.error
+    assert security_feature.approval_queue.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_backend_none_still_queues_reads_outside_the_allow_list(
+    workspace: Path, security_feature: SecurityFeature, tmp_path_factory
+):
+    outside = tmp_path_factory.mktemp("outside") / "elsewhere.txt"
+    outside.write_text("not allow-listed")
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read"},
+        security_feature=security_feature,
+        backend="none",
+    )
+
+    async with _ApprovalResponder(security_feature, decision=False) as responder:
+        envelope = await feature.fs_read(path=str(outside))
+
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("approval")
+    assert responder.responded_count == 1
+
+
+@pytest.mark.asyncio
+async def test_backend_none_refuses_shell_at_the_constitution_without_a_grant(
+    workspace: Path, security_feature: SecurityFeature
+):
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read"},
+        security_feature=security_feature,
+        backend="none",
+    )
+
+    async with _ApprovalResponder(security_feature, decision=True) as responder:
+        envelope = await feature.shell(command="echo hi")
+        write = await feature.fs_write(path=str(workspace / "new.txt"), content="x")
+
+    assert envelope.error == (
+        "constitution:Amendment IX missing grant 'shell_execution_sandboxed'"
+    )
+    # backend = "none" widens nothing: writing still needs its own grant.
+    assert write.error == "constitution:Amendment IX missing grant 'filesystem_write'"
+    assert not (workspace / "new.txt").exists()
+    assert responder.responded_count == 0
+
+
+@pytest.mark.asyncio
+async def test_backend_none_refuses_shell_before_approval_even_with_a_grant(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """A shell grant added later still runs nothing, and nobody is asked."""
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read", "shell_execution_sandboxed", "shell_execution_host"},
+        security_feature=security_feature,
+        backend="none",
+    )
+
+    # ``uname`` is on no list, so with an executing backend it would reach the
+    # queue, and this responder would approve it.
+    async with _ApprovalResponder(security_feature, decision=True) as responder:
+        envelope = await feature.shell(command="uname")
+
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error == "readiness:backend 'none' has no shell execution"
+    assert responder.responded_count == 0
+    last = _read_audit(workspace / "audit.jsonl")[-1]
+    assert last["allowed_by"] == ["privacy", "constitution", "denied:readiness:no_exec"]
+
+
+@pytest.mark.asyncio
+async def test_symlink_inside_the_allow_list_into_the_deny_list_is_refused(
+    workspace: Path, security_feature: SecurityFeature
+):
+    """The deny-list is matched on the realpath, so an allow-listed link can't reach it."""
+    os.symlink(workspace / "secret", workspace / "innocent_link")
+    feature, _ = await _make_feature(
+        workspace=workspace,
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read"},
+        security_feature=security_feature,
+        backend="none",
+    )
+
+    async with _ApprovalResponder(security_feature, decision=True) as responder:
+        envelope = await feature.fs_read(
+            path=str(workspace / "innocent_link" / "leak.txt")
+        )
+
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("policy:deny:")
+    assert responder.responded_count == 0

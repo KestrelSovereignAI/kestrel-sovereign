@@ -8,6 +8,7 @@ from .base import (
     SandboxBackend,
 )
 from .docker import DockerSandboxBackend
+from .filesystem_only import FilesystemOnlyBackend
 from .local import LocalSandboxBackend
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "CompletedRun",
     "DirEntry",
     "DockerSandboxBackend",
+    "FilesystemOnlyBackend",
     "LocalSandboxBackend",
     "SandboxBackend",
 ]

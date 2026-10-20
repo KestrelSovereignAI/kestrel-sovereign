@@ -214,6 +214,7 @@ class _StubBackend:
     """Returns exactly the CompletedRun it was given."""
 
     name = "local"
+    supports_exec = True
 
     def __init__(self, run: CompletedRun):
         self._run = run
@@ -1307,6 +1308,7 @@ async def test_the_fallback_covers_a_capture_that_holds_nothing(
 
     class _EmptyCaptureBackend:
         name = "local"
+        supports_exec = True
 
         async def exec(self, argv, *, cwd, env, timeout, capture=None):
             # Files exist and are empty: the shape of a write that failed.
