@@ -307,6 +307,15 @@ class TerminalAdvisoryLease(AdvisoryLease):
                  *, lifetime: _TerminalAdvisoryLifetime) -> None:
         super().__init__(connection, on_loss)
         self._lifetime = lifetime
+        self._loss_scopes = current_execution_custody(lifetime.backend)
+
+    def _connection_terminated(self, connection: Any) -> None:
+        # asyncpg dispatches in the transport's creation context, not listener
+        # registration context. A reused ordinary session predates this barrier.
+        # Keep the original scope union and cleanup-only admission for callbacks
+        # and their children; never restore an unrestricted transport context.
+        with bind_execution_cleanup(self._lifetime.backend, self._loss_scopes):
+            super()._connection_terminated(connection)
 
     def require_physical(self) -> None:
         self._lifetime.require_live()

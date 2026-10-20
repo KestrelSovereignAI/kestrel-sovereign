@@ -437,8 +437,12 @@ execution, including through `AdvisoryExecutionFence.require_work()` and
 `lock_and_validate()`. The immutable request is itself an always-denying fence,
 bound before allocator entry and retained through native retirement. Connection
 initializers, loss callbacks, reset owners, the body and copied children all
-retain that cleanup-only custody even when the caller had no original scope. The
-scope and physical handle retire monotonically; escaping a copied context does
+retain that cleanup-only custody even when the caller had no original scope.
+The loss listener explicitly rebinds its original scope union: asyncpg dispatches
+from the transport's creation context, so a session first warmed for an ordinary
+lease must not lend that unrestricted context to later terminal callbacks.
+Native tests reuse that exact warmed session before externally terminating it.
+The scope and physical handle retire monotonically; escaping a copied context does
 not keep the permission alive. Ordinary advisory handles retain their previous
 `require_live()` behavior.
 

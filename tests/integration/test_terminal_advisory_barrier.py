@@ -179,6 +179,85 @@ async def test_terminal_barrier_session_loss_never_revives(native_pg):
             lease.require_physical()
 
 
+@pytest.mark.parametrize("control", ["none", "denied", "unknown"])
+@pytest.mark.parametrize("eager", [False, True])
+async def test_reused_ordinary_session_loss_retains_terminal_callback_custody(
+    native_pg, control, eager
+):
+    backend, observer, schema = native_pg
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("eager task factory requires Python 3.12+")
+    # asyncpg transports retain their connection-creation context, which here
+    # deliberately predates every terminal/denied scope.
+    async with backend.advisory_locks((_key(),)) as warm:
+        warm_pid = warm.backend_pid
+    callbacks, children, outcomes = [], [], []
+    notified = asyncio.Event()
+    loop, previous = (
+        asyncio.get_running_loop(),
+        asyncio.get_running_loop().get_task_factory(),
+    )
+
+    def on_loss(_lease):
+        callbacks.append(current_execution_custody(backend))
+        children.append(
+            create_owned_task(
+                backend.execute(
+                    "INSERT INTO effects VALUES (37391, 'reused-session escape')"
+                ),
+                retain_originals=True,
+            )
+        )
+        notified.set()
+
+    async def operation():
+        async with backend.advisory_locks(
+            TerminalAdvisoryBarrier((_key(),)), on_loss=on_loss
+        ) as lease:
+            assert lease.backend_pid == warm_pid, (
+                "test must reuse the actual warmed session"
+            )
+            assert await observer.fetchval("SELECT pg_terminate_backend($1)", warm_pid)
+            await asyncio.wait_for(notified.wait(), 5)
+            outcomes.append(await await_owned_task(children[0]))
+
+    try:
+        if eager:
+            loop.set_task_factory(asyncio.eager_task_factory)
+        original = None
+        if control == "none":
+            result = await await_owned_task(
+                create_owned_task(operation(), retain_originals=True)
+            )
+        else:
+            with bind_execution_custody(GenerationFence()) as original:
+                if control == "unknown":
+                    original.preserve_commit_uncertainty("unknown")
+                else:
+                    original.revoke("original denied before session reuse")
+                result = await await_owned_task(
+                    create_owned_task(operation(), retain_originals=True)
+                )
+        assert len(callbacks) == len(outcomes) == 1
+        assert any(
+            isinstance(scope.fence, TerminalAdvisoryBarrier) for scope in callbacks[0]
+        ), "native reused-session callback lost its original terminal scope"
+        if original is not None:
+            assert original in callbacks[0], (
+                "native loss callback lost the original denied/unknown scope"
+            )
+        assert is_execution_control_error(outcomes[0].error)
+        assert execution_commit_outcome(outcomes[0].error) == (
+            "unknown" if control == "unknown" else None
+        )
+        assert is_execution_control_error(result.error)
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0
+    finally:
+        loop.set_task_factory(previous)
+        for child in children:
+            await await_owned_task(child)
+
+
 @pytest.mark.parametrize("phase", ["init", "on_loss", "reset"])
 @pytest.mark.parametrize("eager", [False, True])
 async def test_terminal_denial_covers_native_callbacks_before_and_after_body(
