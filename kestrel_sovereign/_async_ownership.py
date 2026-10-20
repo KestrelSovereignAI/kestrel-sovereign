@@ -124,12 +124,16 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     physical joining or a documented bounded retirement transfer.
     Native epilogues can opt into retaining an original enclosing cancellation
     with its explicit cause. Generic cleanup-error priority stays unchanged.
+    Without an explicit admission receipt, a postaccept publication failure is
+    delivered through the returned failed-gated Task. True allocation refusal
+    still raises synchronously; an explicit receipt retains raise-plus-receipt.
     A physical closer can name its original resource: refusal to allocate that
     closer is explicit unstarted retirement debt, never a successful close.
     An explicit running loop preserves callers' native loop-admission surface;
     a different loop cannot receive ownership of this caller's operation.
     """
     started = False
+    private_admission = admission is None
     if admission is None:
         admission = OwnedTaskAdmission()
     gate = None
@@ -150,11 +154,15 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             )
             task = asyncio.current_task()
             cached = getattr(task, "_kestrel_owned_terminal_error", None)
-            task._kestrel_owned_terminal_error = retained_execution_error(
+            terminal = retained_execution_error(
                 execution_observation_error(cached, error)
                 if cached is not None and cached is not error else
                 execution_terminal_error(error, retain_originals=retain_originals)
             )
+            try:
+                task._kestrel_owned_terminal_error = terminal
+            except BaseException as publication:
+                raise execution_observation_error(terminal, publication)
             raise
     wrapper = run()
     try:
@@ -185,8 +193,11 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 isolate_control_originals=True,
             )
         raise
+    unstarted_closed = False
     def close_unstarted(_task):
-        if not started:
+        nonlocal unstarted_closed
+        if not started and not unstarted_closed:
+            unstarted_closed = True
             close = getattr(operation, "close", None)
             if callable(close):
                 close()
@@ -200,26 +211,22 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             # source before any later consumer can cancel the Task before its
             # first step and replace the opening with a synthetic cancellation.
             from kestrel_sovereign.execution_custody import (
-                execution_terminal_error,
+                execution_observation_error, execution_terminal_error,
             )
             terminal = execution_terminal_error(opening, retain_originals=retain_originals)
             try:
                 _retain_owned_admission_error(task, terminal)
             except BaseException as publication:
-                terminal = execution_terminal_error(
-                    terminal, publication, retain_originals=True,
-                    isolate_control_originals=True,
-                )
+                terminal = execution_observation_error(terminal, publication)
             finally:
                 try:
                     close_unstarted(task)
                 except BaseException as close_error:
-                    terminal = execution_terminal_error(
-                        terminal, close_error, retain_originals=True,
-                        isolate_control_originals=True,
-                    )
+                    terminal = execution_observation_error(terminal, close_error)
                 finally:
                     gate.set_result(terminal)
+            if private_admission:
+                return task
             raise terminal
         raise
     if gate is not None:
@@ -969,7 +976,14 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     except asyncio.CancelledError as cancellation:
         error = cancellation
     if _has_owned_task_metadata(task):
-        task._kestrel_owned_terminal_error = error  # type: ignore[attr-defined]
+        try:
+            task._kestrel_owned_terminal_error = error  # type: ignore[attr-defined]
+        except BaseException as publication:
+            # This producer promised native metadata, then refused its cache.
+            # Report that broken contract alongside the physical outcome; a
+            # failed publication must never replace UNKNOWN/source C with it.
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            return execution_observation_error(error, publication)
     return error
 
 

@@ -2,6 +2,7 @@
 import asyncio
 import sqlite3
 import threading
+from contextlib import closing
 
 import pytest
 
@@ -17,7 +18,7 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, b
 @pytest.mark.parametrize("receipt", ["unknown", "committed"])
 async def test_bounded_observer_preserves_late_native_commit_on_multiple_joins(tmp_path, receipt):
     path = tmp_path / "native.db"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("CREATE TABLE effects(id INTEGER)")
     entered, release = threading.Event(), threading.Event()
     original = RuntimeError("native transaction acknowledgement")
@@ -26,7 +27,7 @@ async def test_bounded_observer_preserves_late_native_commit_on_multiple_joins(t
         entered.set()
         if not release.wait(3):
             raise TimeoutError("fixture thread not released")
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("INSERT INTO effects VALUES (1)")
         raise original
     native = create_owned_task(run_blocking_operation(commit))
@@ -49,7 +50,7 @@ async def test_bounded_observer_preserves_late_native_commit_on_multiple_joins(t
         first = await await_owned_task(native)
         second = await await_owned_task(native)
         assert first.error is second.error is original
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             assert connection.execute("SELECT COUNT(*) FROM effects").fetchone() == (1,)
     finally:
         release.set()

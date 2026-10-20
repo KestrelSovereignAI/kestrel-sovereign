@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 
 import pytest
 
 from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission,
     await_owned_operation,
     await_owned_task,
     create_owned_task,
@@ -259,6 +261,159 @@ async def test_metadata_receipt_publication_failure_joins_actual_accepted_task_w
     opening_source.assert_retained(outcome.error)
     if mode == "all_private":
         cache_source.assert_retained(outcome.error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+@pytest.mark.parametrize("mode", ["marker_before", "marker_after", "all_private", "callback_before", "callback_after"])
+@pytest.mark.parametrize("close_fails", [False, True])
+@pytest.mark.parametrize("source_kind", ["unknown", "cancelled"])
+@pytest.mark.parametrize("explicit_admission", [False, True])
+async def test_creator_preserves_exact_failed_task_when_postaccept_publication_is_refused(mode, eager, close_fails, source_kind, explicit_admission):
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    opening = (ExecutionCommitOutcomeError("unknown") if source_kind == "unknown"
+               else asyncio.CancelledError("original postaccept source cancellation"))
+    cache_error = OSError("accepted Task refused terminal cache")
+    close_error = OSError("original payload refused unstarted close")
+    opening_source, cache_source = OriginalFailure.capture(opening), OriginalFailure.capture(cache_error)
+    close_source = OriginalFailure.capture(close_error)
+    accepted, body, closed, diagnostics = [], [], [], []
+    previous_handler = loop.get_exception_handler()
+
+    class RefusingTask(asyncio.Task):
+        def __setattr__(self, name, value):
+            if not mode.startswith("callback") and name == "_kestrel_owned_admission":
+                if mode == "marker_after":
+                    super().__setattr__(name, value)
+                raise opening
+            if mode == "all_private" and name.startswith("_kestrel_"):
+                raise cache_error
+            return super().__setattr__(name, value)
+
+        def add_done_callback(self, callback, *, context=None):
+            if mode.startswith("callback"):
+                if mode == "callback_after":
+                    super().add_done_callback(callback, context=context)
+                raise opening
+            return super().add_done_callback(callback, context=context)
+
+    def factory(loop, coroutine, **kwargs):
+        options = {"eager_start": True} if eager else {}
+        task = RefusingTask(coroutine, loop=loop, **kwargs, **options)
+        accepted.append(task)
+        return task
+
+    async def payload():
+        body.append("refused paid effect must never start")
+
+    class CloseFailingPayload:
+        def __await__(self):
+            return payload().__await__()
+
+        def close(self):
+            closed.append("exact original close")
+            raise close_error
+
+    operation = CloseFailingPayload() if close_fails else payload()
+    outcome = None
+    try:
+        loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+        loop.set_task_factory(factory)
+        if explicit_admission:
+            admission = OwnedTaskAdmission()
+            with pytest.raises(BaseException) as caught:
+                create_owned_task(operation, retain_originals=True, admission=admission)
+            task = admission.task
+            opening_source.assert_retained(caught.value)
+        else:
+            task = create_owned_task(operation, retain_originals=True)
+        assert task is accepted[0], "default caller must receive its exact accepted Task"
+        outcome = await await_owned_task(task)
+    finally:
+        loop.set_task_factory(previous_factory)
+        for task in accepted:
+            await await_owned_task(task)
+        loop.set_exception_handler(previous_handler)
+    assert len(accepted) == 1 and accepted[0].done()
+    assert body == []
+    if close_fails:
+        assert closed == ["exact original close"], "refused close must not be retried by a late callback"
+        close_source.assert_retained(outcome.error)
+    else:
+        assert inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED
+    opening_source.assert_retained(outcome.error)
+    if source_kind == "unknown":
+        assert execution_commit_outcome(outcome.error) == "unknown"
+    if mode == "all_private":
+        cache_source.assert_retained(outcome.error)
+    loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+    try:
+        accepted.clear()
+        task = None
+        outcome = None
+        gc.collect()
+        await asyncio.sleep(0)
+        assert diagnostics == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+@pytest.mark.parametrize("source_kind", ["unknown", "cancelled"])
+async def test_native_task_cache_contract_failure_does_not_mask_actual_payload_outcome(eager, source_kind):
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    original = (ExecutionCommitOutcomeError("unknown") if source_kind == "unknown"
+                else asyncio.CancelledError("actual payload source cancellation"))
+    publication = OSError("native producer refused promised terminal metadata")
+    source, publication_source = OriginalFailure.capture(original), OriginalFailure.capture(publication)
+    accepted, diagnostics = [], []
+    previous_handler = loop.get_exception_handler()
+
+    class RefusingCacheTask(asyncio.Task):
+        def __setattr__(self, name, value):
+            if name == "_kestrel_owned_terminal_error":
+                raise publication
+            return super().__setattr__(name, value)
+
+    def factory(loop, coroutine, **kwargs):
+        options = {"eager_start": True} if eager else {}
+        task = RefusingCacheTask(coroutine, loop=loop, **kwargs, **options)
+        accepted.append(task)
+        return task
+
+    async def payload():
+        raise original
+
+    try:
+        loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+        loop.set_task_factory(factory)
+        task = create_owned_task(payload(), retain_originals=True)
+        first = await await_owned_task(task)
+        source.assert_retained(first.error)
+        publication_source.assert_retained(first.error)
+        # The actual Task outcome, not only a finite harvest envelope, must
+        # retain the source when its own cache publication was refused.
+        physical = task.exception()
+        source.assert_retained(physical)
+        publication_source.assert_retained(physical)
+        second = await await_owned_task(task)
+        source.assert_retained(second.error)
+        publication_source.assert_retained(second.error)
+        if source_kind == "unknown":
+            assert execution_commit_outcome(second.error) == "unknown"
+        task = None
+        accepted.clear()
+        gc.collect()
+        await asyncio.sleep(0)
+        assert diagnostics == []
+    finally:
+        loop.set_task_factory(previous_factory)
+        for task in accepted:
+            await await_owned_task(task)
+        loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio
