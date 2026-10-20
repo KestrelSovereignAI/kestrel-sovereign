@@ -10,6 +10,7 @@ from tests.integration.test_execution_authority_postgres import native_pg as _wo
 from tests.integration.test_maintenance_original_retirement import _original_control
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 from tests.utils.original_failure import OriginalFailure
+from kestrel_sovereign.storage.db.postgres import TerminalAdvisoryBarrier
 
 work_pg = _work_pg
 
@@ -17,8 +18,9 @@ work_pg = _work_pg
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["refuse", "publish-before", "publish-after"])
 @pytest.mark.parametrize("source_cancel", [False, True])
+@pytest.mark.parametrize("terminal", [False, True])
 async def test_advisory_closer_retains_original_accepted_task(
-    native_pg, work_pg, monkeypatch, mode, source_cancel,
+    native_pg, work_pg, monkeypatch, mode, source_cancel, terminal,
 ):
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch, source_cancel))
     backend, observer, _schema = work_pg
@@ -48,7 +50,8 @@ async def test_advisory_closer_retains_original_accepted_task(
         return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
 
     async def invoke():
-        async with backend.advisory_locks([(210, 338)]) as lease:
+        keys = TerminalAdvisoryBarrier(((210, 338),)) if terminal else [(210, 338)]
+        async with backend.advisory_locks(keys) as lease:
             sessions.append((lease._connection, lease._connection._con))
             raise OSError("actual original advisory operation failed")
 

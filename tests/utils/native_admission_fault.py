@@ -5,6 +5,13 @@ import inspect
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 
+def create_admission_task(task_type, coroutine, *, loop, eager, **kwargs):
+    """Select the requested actual constructor without changing lazy semantics."""
+    if eager:
+        return task_type(coroutine, loop=loop, eager_start=True, **kwargs)
+    return task_type(coroutine, loop=loop, **kwargs)
+
+
 class NativeAdmissionFault:
     def __init__(self, predicate, error, mode, *, eager=False):
         self.predicate, self.error, self.mode, self.eager = predicate, error, mode, eager
@@ -32,7 +39,7 @@ class NativeAdmissionFault:
                         raise fault.error
                     return super().add_done_callback(callback, *args, **options)
 
-            task = PublicationTask(coroutine, loop=loop, eager_start=self.eager, **kwargs)
+            task = create_admission_task(PublicationTask, coroutine, loop=loop, eager=self.eager, **kwargs)
             self.accepted.append(task)
             return task
         return self.previous(loop, coroutine, **kwargs) if self.previous else asyncio.Task(coroutine, loop=loop, **kwargs)
