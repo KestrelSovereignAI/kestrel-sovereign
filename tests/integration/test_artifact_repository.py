@@ -670,5 +670,5 @@ async def test_head_validates_identifier_and_decodes_owner_bound_revision(reposi
     # A corrupt head link must not disclose a different artifact's payload.
     await store.db.execute("UPDATE artifact_heads SET revision_id = ? WHERE artifact_id = ?",
                            (second.ref.revision_id, first.ref.artifact_id))
-    with pytest.raises((ResourceNotFound, ArtifactIntegrityError)):
+    with pytest.raises(ArtifactIntegrityError, match="head revision is unavailable"):
         await store.head(SCOPE, first.ref.artifact_id)

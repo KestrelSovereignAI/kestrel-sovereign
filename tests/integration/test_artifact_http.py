@@ -337,3 +337,17 @@ async def test_current_revision_route_is_authorized_private_and_tombstone_aware(
                         params={"expected_revision_id": current["revision_id"]})
     deleted = await client.get(url, headers=AUTH)
     assert deleted.status_code == 404 and deleted.json()["error"]["code"] == "artifact_not_found"
+
+
+@pytest.mark.asyncio
+async def test_corrupt_head_is_storage_failure_not_a_deletion_signal(api, access):
+    client, _ = api
+    first, _ = await publish(client)
+    ref = first.json()["ref"]
+    await access.service.repository.db.execute(
+        "UPDATE artifact_heads SET revision_id = ? WHERE artifact_id = ?",
+        ("missing-revision", ref["artifact_id"]),
+    )
+    response = await client.get(f'/api/artifacts/{ref["artifact_id"]}/head', headers=AUTH)
+    assert response.status_code == 503
+    assert response.json() == {"error": {"code": "artifact_integrity_failure"}}

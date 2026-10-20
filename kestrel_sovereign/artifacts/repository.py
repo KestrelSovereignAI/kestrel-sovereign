@@ -428,12 +428,14 @@ Cleanup rechecks expiry and references while holding each owner's writer lock.
             # timestamp-sorted history is not authoritative, even on one host.
             row = await self.db.fetchone(
                 "SELECT h.revision_id, r.payload FROM artifact_heads h "
-                "JOIN artifact_revisions r ON r.owner = h.owner AND r.artifact_id = h.artifact_id "
+                "LEFT JOIN artifact_revisions r ON r.owner = h.owner AND r.artifact_id = h.artifact_id "
                 "AND r.revision_id = h.revision_id WHERE h.owner = ? AND h.artifact_id = ?",
                 (owner, artifact_id),
             )
             if row is None:
                 raise ResourceNotFound("artifact is unavailable")
+            if row[1] is None:
+                raise ArtifactIntegrityError("artifact head revision is unavailable")
             return self._decode_revision(owner, ArtifactRef(artifact_id=artifact_id, revision_id=row[0]), row[1])
 
     async def read(self, scope: ResourceScope, ref: ArtifactRef, path: str, *,
