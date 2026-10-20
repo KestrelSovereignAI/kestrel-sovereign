@@ -196,6 +196,9 @@ def shell_syntax_refusal(
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
+# The only accepted ``[features.computer_use].backend`` values; anything else
+# leaves the feature unready (#3760).
+_BACKEND_NAMES = frozenset({"docker", "local", "none"})
 # Auto-approved binaries skip the ApprovalQueue (#1694). The default
 # list is deliberately narrow: only inert read-only tools where the
 # argv shape can't be turned into arbitrary host work via flags or
@@ -416,6 +419,15 @@ class ComputerUseFeature(Feature):
 
         granted = self._granted_capabilities()
         backend_name = self._cfg.get("backend", "docker")
+        if not isinstance(backend_name, str) or backend_name not in _BACKEND_NAMES:
+            # Never read an unrecognised value as the default: a mistyped
+            # "none" would otherwise build a backend that can execute (#3760).
+            self._init_refusal = (
+                f"backend refused init: unknown backend {backend_name!r}; "
+                f"expected one of {', '.join(sorted(_BACKEND_NAMES))}"
+            )
+            logger.error("ComputerUseFeature: %s", self._init_refusal)
+            return
         try:
             if backend_name == "local":
                 self._backend = LocalSandboxBackend(granted)

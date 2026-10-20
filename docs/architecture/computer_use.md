@@ -55,7 +55,7 @@ Filesystem reads, writes, and listings always run on the host — the agent is e
 - **`local`** — direct `asyncio.subprocess.exec` on the host. Refuses to construct unless Amendment IX grants both `shell_execution_sandboxed` *and* `shell_execution_host`. The two-grant model exists so a single permissive amendment cannot covertly widen sandboxed access into host access.
 - **`none`** — the file tools only, with no shell execution at all. Needs no shell grant. Every tool needs a backend, and both shell backends refuse to construct without a shell grant, so an agent granted only `filesystem_read` has no working tool unless it uses this one. `shell` is still refused at the constitution gate for an agent without the grant. An agent that later gains a shell grant without the backend being changed is refused right after that gate (`readiness:backend 'none' has no shell execution`), before path, policy or approval, so nobody is asked to approve a command that cannot run.
 
-The backend is selected once at feature init and cannot be swapped at runtime.
+The backend is selected once at feature init and cannot be swapped at runtime. Any value other than `docker`, `local` or `none` leaves the feature unready (`backend refused init: unknown backend …`). A mistyped `none` is never read as the default, because the default can execute (#3760).
 
 ## Tools
 

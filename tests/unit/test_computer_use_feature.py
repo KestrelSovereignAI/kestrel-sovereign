@@ -950,3 +950,22 @@ async def test_filesystem_only_backend_cannot_execute():
     assert backend.supports_exec is False
     with pytest.raises(CapabilityBlocked):
         await backend.exec(["true"], cwd=None, env=None, timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["None", "nnone", "filesystem", "Docker", "", None, 0, ["none"]])
+async def test_an_unknown_backend_is_refused_not_read_as_docker(tmp_path: Path, value):
+    """A mistyped "none" must not build a backend that can execute (#3760)."""
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read", "shell_execution_sandboxed", "shell_execution_host"},
+        queue=FakeApprovalQueue(),
+    )
+    feature = ComputerUseFeature(agent)
+    feature._cfg = {**_config(tmp_path), "backend": value}
+    await feature.initialize()
+
+    assert feature._backend is None
+    envelope = await feature.shell(command="echo hi")
+    assert envelope.error.startswith("readiness:backend not initialized")
+    assert f"unknown backend {value!r}" in envelope.error
