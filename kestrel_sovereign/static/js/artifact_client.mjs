@@ -1,0 +1,233 @@
+/** Revision-bound transport and recoverable working copies. No browser storage. */
+
+const TOKEN = /^[A-Za-z0-9](?:[A-Za-z0-9._:@-]{0,254}[A-Za-z0-9])?$/;
+const MAX_VIEW_BYTES = 16 * 1024 * 1024;
+export const MAX_EDIT_BYTES = 1024 * 1024;
+const EDIT_TYPES = new Set(['text/plain', 'text/markdown', 'text/x-python', 'text/javascript',
+    'text/css', 'application/json', 'application/javascript', 'application/xml', 'text/xml']);
+
+function token(value) {
+    if (typeof value !== 'string' || !TOKEN.test(value)) throw new Error('Invalid artifact reference.');
+    return value;
+}
+export function artifactRef(value) {
+    if (!value || (value.schema_version !== undefined && value.schema_version !== 1)) {
+        throw new Error('Unsupported artifact reference.');
+    }
+    return Object.freeze({ schema_version: 1, artifact_id: token(value.artifact_id), revision_id: token(value.revision_id) });
+}
+function revisionPath(ref) {
+    ref = artifactRef(ref);
+    return `/api/artifacts/${encodeURIComponent(ref.artifact_id)}/revisions/${encodeURIComponent(ref.revision_id)}`;
+}
+function canonical(value) {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort().map(key => `${canonical(key)}:${canonical(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value).replace(/[\u007f-\uffff]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+function codePointOrder(a, b) {
+    const left = Array.from(a, char => char.codePointAt(0)), right = Array.from(b, char => char.codePointAt(0));
+    for (let i = 0; i < Math.min(left.length, right.length); i++) if (left[i] !== right[i]) return left[i] - right[i];
+    return left.length - right.length;
+}
+export async function sha256(bytes) {
+    return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+        .map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+async function digest(value) { return sha256(new TextEncoder().encode(canonical(value))); }
+export async function publicationDigests(request) {
+    // Python's SDK sorts Unicode code points; JavaScript's default order sorts
+    // UTF-16 units, which differs for supplementary-plane filenames.
+    const manifest = { ...request.manifest, files: [...request.manifest.files].sort((a, b) => codePointOrder(a.path, b.path)) };
+    const manifest_sha256 = await digest(manifest);
+    return { manifest_sha256, request_sha256: await digest({ ...request, manifest: manifest_sha256 }) };
+}
+function sameScope(a, b) {
+    return a?.tenant_id === b?.tenant_id && a?.principal_id === b?.principal_id
+        && (a?.agent_id ?? null) === (b?.agent_id ?? null);
+}
+function base64(bytes) {
+    let encoded = '';
+    for (let start = 0; start < bytes.length; start += 8192) encoded += String.fromCharCode(...bytes.subarray(start, start + 8192));
+    return btoa(encoded);
+}
+
+export async function createArtifactClient(api, ownerAgent = api.getHostAgent()) {
+    const bound = await api.bindAgentRequests(ownerAgent);
+    const json = (path, body, signal) => bound.request(path, { method: 'POST', body: JSON.stringify(body), signal, cache: 'no-store' });
+    return Object.freeze({
+        get: (ref, signal) => bound.request(revisionPath(ref), { signal, cache: 'no-store' }),
+        read: (ref, path, signal) => bound.readBytes(`${revisionPath(ref)}/file?path=${encodeURIComponent(path)}`, { signal, cache: 'no-store' }),
+        history: (id, cursor = null, signal) => bound.request(`/api/artifacts/${encodeURIComponent(token(id))}/history?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { signal, cache: 'no-store' }),
+        stage: (key, file, bytes, signal) => json('/api/artifacts/staging', {
+            publication_key: key, path: file.path, media_type: file.media_type, content_base64: base64(bytes),
+        }, signal),
+        commit: (request, signal) => json('/api/artifacts/publications', request, signal),
+        status: (key, signal) => bound.request(`/api/artifacts/publications/${encodeURIComponent(token(key))}`, { signal, cache: 'no-store' }),
+    });
+}
+
+export class ArtifactDraft {
+    #client; #changed; #pending = null; #closed = false; #abort = new AbortController();
+    #revision = null; #file = null; #bytes = null; #text = ''; #state = 'loading';
+    #editable = false; #comparison = null; #opened = false;
+    constructor(client, changed = () => {}) { this.#client = client; this.#changed = changed; }
+    get state() { return this.#state; }
+    get revision() { return this.#revision; }
+    get file() { return this.#file; }
+    get bytes() { return this.#bytes; }
+    get text() { return this.#text; }
+    get editable() { return this.#editable; }
+    get pendingKey() { return this.#pending?.request.idempotency_key ?? null; }
+    get comparison() { return this.#comparison; }
+    get hasUnsavedChanges() { return ['dirty', 'saving', 'unknown', 'conflict', 'denied', 'failed', 'erased'].includes(this.#state); }
+    #set(state) { if (!this.#closed) { this.#state = state; this.#changed(this); } }
+    async #loadRevision(ref) {
+        ref = artifactRef(ref);
+        const revision = await this.#client.get(ref, this.#abort.signal);
+        if (revision.schema_version !== 1 || canonical(artifactRef(revision.ref)) !== canonical(ref)
+            || !revision.scope?.tenant_id || !revision.scope?.principal_id || typeof revision.title !== 'string') {
+            throw new Error('Artifact metadata does not match the requested revision.');
+        }
+        const file = revision.manifest?.files?.find(item => item.path === revision.manifest.entrypoint);
+        if (!file || !Number.isSafeInteger(file.size_bytes) || file.size_bytes < 0 || file.size_bytes > MAX_VIEW_BYTES
+            || !/^[a-f0-9]{64}$/.test(file.sha256) || typeof file.media_type !== 'string') {
+            throw new Error('Artifact is too large or cannot be verified for this viewer.');
+        }
+        const bytes = new Uint8Array(await this.#client.read(ref, file.path, this.#abort.signal));
+        if (bytes.length !== file.size_bytes || await sha256(bytes) !== file.sha256) {
+            throw new Error('Artifact content failed verification.');
+        }
+        let text = null;
+        if (EDIT_TYPES.has(file.media_type) && file.size_bytes <= MAX_EDIT_BYTES) {
+            try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); } catch (_) { /* Binary source remains downloadable. */ }
+        }
+        return { revision, file, bytes, text };
+    }
+    async open(ref) {
+        if (this.#closed || this.#opened) throw new Error('Create a new panel to open another revision.');
+        this.#opened = true;
+        try {
+            const loaded = await this.#loadRevision(ref);
+            if (this.#closed) return;
+            this.#revision = loaded.revision; this.#file = loaded.file; this.#bytes = loaded.bytes;
+            this.#text = loaded.text ?? '';
+            this.#editable = loaded.text !== null && loaded.revision.manifest.files.length === 1;
+            this.#set('saved');
+        } catch (error) { this.#set([401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unavailable'); }
+    }
+    edit(text) {
+        if (!this.#editable || this.#pending || this.#closed || this.#state === 'saving') return false;
+        this.#text = String(text); this.#set('dirty'); return true;
+    }
+    async save() {
+        if (this.#closed || this.#pending || !this.#editable || this.#state !== 'dirty') return;
+        this.#set('saving');
+        const bytes = new TextEncoder().encode(this.#text);
+        if (bytes.length > MAX_EDIT_BYTES) { this.#set('failed'); return; }
+        try {
+            const original = this.#file, revision = this.#revision;
+            const file = { schema_version: 1, path: original.path, media_type: original.media_type,
+                size_bytes: bytes.length, sha256: await sha256(bytes) };
+            const request = { schema_version: 1, idempotency_key: crypto.randomUUID(),
+                artifact_id: revision.ref.artifact_id, expected_revision_id: revision.ref.revision_id,
+                title: revision.title, manifest: { schema_version: 1, files: [file], entrypoint: file.path },
+                provenance: { schema_version: 1, session_id: null, run_id: null, tool_name: null } };
+            const digests = await publicationDigests(request);
+            if (this.#closed) return;
+            this.#pending = { request, file, bytes, digests, phase: 'stage', uncertain: false };
+            await this.#attempt();
+        } catch (_) { this.#set('failed'); }
+    }
+    async #accepted(receipt) {
+        const pending = this.#pending;
+        if (!receipt || receipt.schema_version !== 1 || !sameScope(receipt.scope, this.#revision.scope)
+            || receipt.idempotency_key !== pending.request.idempotency_key
+            || receipt.ref?.artifact_id !== pending.request.artifact_id
+            || receipt.ref?.revision_id === pending.request.expected_revision_id
+            || receipt.manifest_sha256 !== pending.digests.manifest_sha256
+            || receipt.request_sha256 !== pending.digests.request_sha256) {
+            throw new Error('Save receipt could not be verified.');
+        }
+        const ref = artifactRef(receipt.ref);
+        if (this.#closed) return;
+        this.#revision = { ...this.#revision, ref, parent_revision_id: pending.request.expected_revision_id,
+            manifest: pending.request.manifest, provenance: pending.request.provenance, committed_at: receipt.committed_at };
+        this.#bytes = pending.bytes; this.#file = pending.file; this.#pending = null; this.#comparison = null;
+        this.#set('saved');
+    }
+    async #attempt() {
+        const pending = this.#pending;
+        this.#set('saving');
+        try {
+            if (pending.phase === 'stage') {
+                const staged = await this.#client.stage(pending.request.idempotency_key, pending.file, pending.bytes, this.#abort.signal);
+                if (canonical(staged) !== canonical(pending.file)) throw new Error('Staging did not confirm this exact file.');
+                pending.phase = 'commit';
+            }
+            if (!this.#closed) await this.#accepted(await this.#client.commit(pending.request, this.#abort.signal));
+        } catch (error) {
+            if (this.#closed) return;
+            if ([401, 403].includes(error.status) || error.code === 'artifact_auth_changed') this.#set('denied');
+            else if (error.status === 404 && pending.phase === 'commit') {
+                // Missing staging may have expired. Only a 404 from status is
+                // terminal erasure. Retry retains the exact key/request/bytes.
+                pending.phase = 'stage'; pending.uncertain = true; this.#set('unknown');
+            }
+            else if (error.status === 409 && pending.phase === 'commit' && !pending.uncertain) this.#set('conflict');
+            else { pending.uncertain = true; this.#set('unknown'); }
+        }
+    }
+    async reconcile() {
+        if (this.#closed || !this.#pending || this.#state === 'saving') return;
+        const previous = this.#state;
+        this.#set('saving');
+        try {
+            const receipt = await this.#client.status(this.#pending.request.idempotency_key, this.#abort.signal);
+            if (receipt) await this.#accepted(receipt);
+            else this.#set(previous === 'conflict' ? 'conflict' : 'unknown');
+        } catch (error) {
+            this.#set(error.status === 404 ? 'erased' : [401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unknown');
+        }
+    }
+    async retry() {
+        if (this.#state !== 'unknown' || !this.#pending || this.#closed) return;
+        await this.reconcile();
+        if (this.#state === 'unknown' && this.#pending) await this.#attempt();
+    }
+    async compareLatest() {
+        if (this.#state !== 'conflict' || this.#pending?.uncertain || this.#closed) return;
+        await this.reconcile();
+        if (this.#state !== 'conflict') return;
+        this.#set('saving');
+        try {
+            const page = await this.#client.history(this.#revision.ref.artifact_id, null, this.#abort.signal);
+            const latest = page.items?.[0];
+            if (!latest || latest.ref.artifact_id !== this.#revision.ref.artifact_id) throw new Error('No current revision.');
+            const loaded = await this.#loadRevision(latest.ref);
+            if (!sameScope(loaded.revision.scope, this.#revision.scope) || loaded.text === null
+                || loaded.file.path !== this.#file.path || loaded.file.media_type !== this.#file.media_type
+                || loaded.revision.manifest.files.length !== 1) throw new Error('The artifact structure changed.');
+            if (this.#closed) return;
+            this.#comparison = loaded; this.#set('conflict');
+        } catch (_) { this.#set('conflict'); }
+    }
+    useComparedRevision() {
+        if (!this.#comparison || this.#state !== 'conflict' || this.#pending?.uncertain) return false;
+        // Explicit user choice after a confirmed rejected attempt and comparison.
+        // Keep the draft; the next Save stages it under a fresh key and exact CAS.
+        this.#revision = this.#comparison.revision;
+        this.#file = this.#comparison.file; this.#bytes = this.#comparison.bytes;
+        this.#pending = null; this.#comparison = null;
+        this.#set('dirty'); return true;
+    }
+    async history(cursor = null) {
+        return this.#client.history(this.#revision.ref.artifact_id, cursor, this.#abort.signal);
+    }
+    close() {
+        this.#closed = true; this.#abort.abort(); this.#pending = null; this.#bytes = null;
+        this.#text = ''; this.#comparison = null; this.#revision = null; this.#file = null;
+    }
+}

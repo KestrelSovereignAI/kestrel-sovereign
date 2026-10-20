@@ -979,6 +979,7 @@ export function createApiClient({
         options = {},
         retried = false,
         onAuthPrepared = null,
+        readBody = (response) => response.json(),
     ) {
         let alreadyRetried = retried;
         let pendingUnauthorizedError = null;
@@ -1037,7 +1038,7 @@ export function createApiClient({
             if (!response.ok) {
                 throw await parseResponseError(response, { signal: options.signal });
             }
-            return response.json();
+            return readBody(response);
         }
     }
 
@@ -1082,6 +1083,31 @@ export function createApiClient({
         async requestForAgent(endpoint, options = {}, agent, retried = false) {
             const url = applyHostAgentPrefix(endpoint, agent);
             return performRequest(url, options, retried);
+        },
+
+        // Bind a document/working-copy lifetime to this exact credential and
+        // agent. Re-authentication may not upload an old owner's draft into a
+        // new principal's staging namespace. The shared pipeline checks after
+        // auth preparation, including a 401 refresh, and BEFORE every fetch.
+        async bindAgentRequests(agent = state.selectedHostAgent) {
+            await buildHeaders();
+            const generation = state.authIdentityGeneration;
+            const checkIdentity = (preparedGeneration) => {
+                if (preparedGeneration !== generation) {
+                    const error = new Error('Authentication changed. Reopen the artifact.');
+                    error.code = 'artifact_auth_changed';
+                    throw error;
+                }
+            };
+            return Object.freeze({
+                request: (endpoint, options = {}) => performRequest(
+                    applyHostAgentPrefix(endpoint, agent), options, false, checkIdentity,
+                ),
+                readBytes: (endpoint, options = {}) => performRequest(
+                    applyHostAgentPrefix(endpoint, agent), options, false, checkIdentity,
+                    (response) => response.arrayBuffer(),
+                ),
+            });
         },
 
         // Request a host-ROOT endpoint (#2293). Unlike request(), the URL is
