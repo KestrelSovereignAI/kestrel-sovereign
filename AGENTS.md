@@ -371,6 +371,7 @@ kestrel update --dry-run          # preview (incl. the reconcile plan); mutate n
 What it actually does:
 
 1. `git pull --ff-only` in the source checkout (NOT `KESTREL_HOME`). Refuses on modified TRACKED files only — untracked `kestrel.toml.backup-*` etc. are ignored. `--allow-dirty` bypasses.
+   - **Preflight** (#3702), before the pull when features will sync: a `.kestrel-host-features.toml` window that excludes the version the incoming `uv.lock` pins (read from git at the revision the pull lands on) refuses the update, naming each entry. Every restore in step 3 is held to both, so it could only fail — after `uv sync` had pruned the packages it restores. Same check: `kestrel feature sync --preflight [--lock-revision REV]`. A package the lock covers is best declared `pypi = ""`: the lock decides its version.
 2. Install step **auto-detects** by `uv.lock` presence:
    - With `uv.lock` → `uv sync --active` (refreshes deps from lock + prunes anything not in it).
    - Without `uv.lock` → `uv pip install --python sys.executable -e .`.
@@ -380,7 +381,7 @@ What it actually does:
 5. Compare the venv against core's `uv.lock` and print every installed package whose version differs (report only, #3502). Steps 3 and 4 already hold every feature install to the lock's versions, so a mismatch here means something installed around them.
 6. `kestrel restart` brings agents back so they see the new install.
 
-Any step's failure short-circuits the rest — a half-applied update never reaches the restart phase. Full reference in [`README.md` § Pulling in upstream changes](README.md#pulling-in-upstream-changes-kestrel-update).
+Any step's failure short-circuits the rest — a half-applied update never reaches the restart phase. The install hands the remaining steps to a fresh interpreter (`kestrel update … --no-pull --no-install`, #3702): a process keeps every module it imported after `git pull` / `uv sync` replaces it on disk, and on 2026-10-19 that killed `feature sync` with every feature package pruned. The pull does not hand off: until the install, the pulled code need not import against the installed packages, so the old interpreter drives the install. The first update that pulls this change in still runs the old code; if it fails after `uv sync`, run `kestrel update` again (not `git pull && kestrel update`, which starts the new code on the old packages). Full reference in [`README.md` § Pulling in upstream changes](README.md#pulling-in-upstream-changes-kestrel-update).
 
 ### Adding a new endpoint
 1. Create the handler module in `kestrel_sovereign/endpoints/` (e.g. `mything.py`) exposing `router = APIRouter()`.

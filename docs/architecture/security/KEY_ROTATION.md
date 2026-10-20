@@ -1,8 +1,7 @@
 ---
 type: Architecture Spec
 title: Key Rotation Mechanism
-description: 'Key rotation allows the master encryption key (`KESTREL_DATA_KEY`) to
-  be changed without losing access to encrypted data. This is critical for:'
+description: Internal maintenance service for resumable rotation of registered encrypted stores, with explicit coverage and host integration limits.
 resource: /docs/architecture/security/KEY_ROTATION.md
 tags:
 - docs
@@ -18,196 +17,122 @@ privacy: public
 
 # Key Rotation Mechanism
 
-## Overview
+`KeyRotationService` is an internal maintenance service. Its Python API is
+implemented; the module's command-line entry point only parses arguments and
+prints a stub message. There is no working rotation CLI, agent command, or
+host endpoint. This document describes the service contract, not a deployed
+operator workflow.
 
-Key rotation allows the master encryption key (`KESTREL_DATA_KEY`) to be changed without losing access to encrypted data. This is critical for:
+## Maintenance ownership and keys
 
-1. **Key Compromise Recovery** - If the current key is leaked, rotate to a new one
-2. **Security Hygiene** - Periodic key rotation reduces exposure window
-3. **Agent Migration** - Transfer agent to new infrastructure with new keys
+The host must provide one service owner per database, stop concurrent legacy
+encrypted-data writers, and retain both original keys until the journal is
+`COMPLETED`. The service has a process-local admission lock and durable journal
+checks; it does not provide a distributed maintenance lease or online writer
+cutover. Rotation changes rows incrementally, so readers cannot assume every
+row uses the same key while maintenance is in progress.
 
-## Design Principles
+Use generated Fernet-format master keys. Salted passphrase derivation currently
+differs between runtime encryption and this service; such deployments cannot
+reliably rotate through this API. This existing limitation must be resolved
+before enabling an operator workflow for passphrase keys; tracked in
+[#3726](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3726).
 
-1. **Never lose data** - All encrypted content remains accessible during rotation
-2. **Atomic transition** - Rotation either completes fully or not at all
-3. **Audit trail** - Every rotation is logged and verifiable
-4. **Backward compatible** - Old content decrypted, new content encrypted with new key
+The service does not change `KESTREL_DATA_KEY`, secrets files, runtime cipher
+caches, or running agents. The host must verify completion and perform its own
+key configuration/cipher reload before restoring normal access. Retain the old
+key for any backups or other encrypted stores outside this registry.
 
-## Key Rotation Process
+## Covered data
 
-### Phase 1: Prepare
-```
-OLD_KEY -> still active
-NEW_KEY -> generated/received but not yet primary
-```
+The encrypted-table registry in
+[`key_rotation.py`](../../../kestrel_sovereign/security/key_rotation.py) covers:
 
-1. Generate or receive new key
-2. Store new key hash in database (not the key itself)
-3. Create rotation record with timestamp
+- `conversation_history.content` and `rendered_content`, with per-agent key
+  derivation when `agent_id` is present;
+- encrypted `files.content` rows; legacy plaintext files are skipped;
+- `artifact_keys.wrapped_key`, when the artifact envelope table exists in the
+  same database. An existing envelope table must contain valid key rows.
 
-### Phase 2: Re-encrypt
-```
-For each encrypted record:
-  1. Decrypt with OLD_KEY
-  2. Re-encrypt with NEW_KEY
-  3. Update record
-  4. Mark as rotated
-```
+Artifact support here prepares the rotation boundary for the saved-output
+repository; it does not enable an artifact service. Rewrapping an envelope root
+preserves artifact addresses and content keys. It is not recovery from a
+compromised envelope root. Graph properties, external backups and unregistered
+stores are outside this service's coverage. In particular, encrypted channel
+messages and agent identity resources are not registered; coverage and safe
+cutover are tracked in [#3728](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3728).
 
-Records processed:
-- Conversation messages
-- File store blobs
-- Knowledge graph encrypted properties
-- Backup artifacts (re-encrypt manifest)
+## Journal and failure behavior
 
-### Phase 3: Finalize
-```
-OLD_KEY -> retired (kept for emergency recovery)
-NEW_KEY -> promoted to primary
-```
+`initialize()` creates `key_rotations` and `rotation_progress`. A rotation
+journal records key fingerprints, status, counters and a failure message identifying the record. Each ciphertext update, exact write verification and progress
+receipt commit together. The entire database rotation is not one transaction.
 
-1. Update active key reference
-2. Archive old key hash (for forensics, not storage)
-3. Test decryption with new key
-4. Complete rotation record
+Both counting and rotation select conversation/file rows using the runtime
+`metadata.enc` flag. Ciphertext-like plaintext is left unchanged; flagged
+ciphertext with a damaged or missing prefix still fails closed. A NULL optional
+`rendered_content` has no ciphertext to rotate. Same-key AEAD upgrades verify
+and rewrite all flagged rows, including those already in AEAD format.
 
-## Implementation
+Every selected encrypted row must succeed. A decrypt, malformed mandatory
+root, or write-verification failure stops the run and saves `FAILED`; the
+service does not silently skip failed encrypted records and report completion.
+Cancellation leaves an `IN_PROGRESS` journal. `shutdown()` cancels and joins
+owned tasks before storage closes.
 
-### CLI Command
-```bash
-# Interactive rotation
-python -m security.key_rotation rotate --new-key-file /path/to/new_key
+Resume the same failed or interrupted journal using its original new-key file
+while the original old key remains configured. The service checks both key
+fingerprints and rebuilds the processed count from committed progress receipts.
+Correct the recorded failure before retrying; supplying an unrelated key does
+not repair it.
 
-# Automated rotation (requires existing key)
-python -m security.key_rotation rotate \
-  --old-key-file /run/secrets/kestrel_data_key \
-  --new-key-file /run/secrets/kestrel_data_key_new
+Both start and resume use the same admission guard. Any running task blocks
+another admission. An unresolved journal also blocks another rotation: an
+`IN_PROGRESS` journal, or a `FAILED` journal with durable progress. Only that
+exact journal may resume. A historical zero-progress attempt cannot take over
+a partially applied transition.
 
-# Check rotation status
-python -m security.key_rotation status
+Older databases may already contain inconsistent history, such as a partial
+failed journal followed by a later completed rotation. The service refuses
+that state; there is no automatic journal abandonment or rollback API. Diagnose
+and repair it with the original keys and backups before attempting maintenance.
 
-# Emergency recovery (if rotation failed mid-way)
-python -m security.key_rotation recover --key-file /path/to/backup_key
-```
+## Python API example
 
-### Agent Command
-```
-!rotate-key --new-key-file /path/to/new_key
-!key-status
-```
-
-### Database Schema
-
-```sql
--- Track key rotations
-CREATE TABLE IF NOT EXISTS key_rotations (
-    id TEXT PRIMARY KEY,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    old_key_hash TEXT NOT NULL,
-    new_key_hash TEXT NOT NULL,
-    status TEXT NOT NULL,  -- 'in_progress', 'completed', 'failed', 'rolled_back'
-    records_processed INTEGER DEFAULT 0,
-    records_total INTEGER DEFAULT 0,
-    error_message TEXT
-);
-
--- Track which records have been rotated (for resumable rotation)
-CREATE TABLE IF NOT EXISTS rotation_progress (
-    rotation_id TEXT NOT NULL,
-    table_name TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    rotated_at TEXT NOT NULL,
-    PRIMARY KEY (rotation_id, table_name, record_id)
-);
-```
-
-## Error Handling
-
-### Failure Scenarios
-
-1. **Power loss during rotation**
-   - Rotation table tracks progress
-   - Resume from last successful record
-   - Idempotent operations
-
-2. **New key is invalid**
-   - Validate new key before starting
-   - Test encryption/decryption cycle
-
-3. **Decryption fails for some records**
-   - Log failed records
-   - Continue with others
-   - Report summary at end
-   - Option to retry with different key
-
-4. **Out of disk space**
-   - Rotation is in-place, not copy
-   - Minimal space overhead
-
-### Recovery Commands
-
-```bash
-# List in-progress rotations
-python -m security.key_rotation list --status in_progress
-
-# Resume interrupted rotation
-python -m security.key_rotation resume --rotation-id <id> --key-file /path/to/key
-
-# Rollback failed rotation (if possible)
-python -m security.key_rotation rollback --rotation-id <id>
-```
-
-## Security Considerations
-
-1. **Key storage** - New key should be provided via file, not command line
-2. **Old key archival** - Hash stored for forensics, actual key should be securely deleted
-3. **Audit logging** - Every rotation step logged
-4. **Access control** - Only sovereign user can initiate rotation
-
-## Future Enhancements
-
-1. **Hardware Security Module (HSM) support** - Store keys in HSM
-2. **Automatic rotation schedule** - Rotate keys on a schedule
-3. **Multi-key support** - Different keys for different data types
-4. **Key escrow** - Split key into shares (Shamir's Secret Sharing)
-
-## Usage Example
+This example assumes initialized storage, exclusive maintenance ownership,
+quiesced writers and the original key already configured. It does not perform
+the host's key cutover or restart.
 
 ```python
-from security.key_rotation import KeyRotationService
+from kestrel_sovereign.security.key_rotation import (
+    KeyRotationService,
+    RotationStatus,
+)
 
-async def rotate_key():
+async def rotate_key(storage, new_key_file):
     service = KeyRotationService(storage)
-
-    # Start rotation
-    rotation_id = await service.start_rotation(
-        new_key_file="/run/secrets/new_key"
-    )
-
-    # Monitor progress
-    while True:
-        status = await service.get_status(rotation_id)
-        print(f"Progress: {status.records_processed}/{status.records_total}")
-        if status.is_complete:
-            break
-        await asyncio.sleep(1)
-
-    if status.status == "completed":
-        print("Rotation complete!")
-    else:
-        print(f"Rotation failed: {status.error_message}")
+    await service.initialize()
+    try:
+        rotation_id = await service.start_rotation(new_key_file=new_key_file)
+        await service.drain_rotations()
+        record = await service.get_status(rotation_id)
+        if record is None or record.status is not RotationStatus.COMPLETED:
+            raise RuntimeError(f"Rotation {rotation_id} needs recovery: {record}")
+        return rotation_id
+    finally:
+        await service.shutdown()
 ```
 
-## Migration Path
+Recovery uses `await service.resume_rotation(rotation_id, key_file)` followed
+by `drain_rotations()` and a status check under the same maintenance ownership.
+`upgrade_to_aead()` uses the rotation machinery with the current key to upgrade
+legacy Fernet ciphertext to AEAD; it has the same ownership and key-derivation
+constraints.
 
-For existing agents without rotation support:
+## Verification and remaining integration
 
-1. Export agent to IPFS (creates backup)
-2. Stop agent
-3. Update key in secrets file
-4. Run rotation command
-5. Verify decryption works
-6. Restart agent
-
-This ensures no data loss even if rotation mechanism itself fails.
+The recovery integration suite exercises SQLite and native PostgreSQL failure,
+resume, key identity, silent-write rejection and competing-journal admission.
+It does not prove host lifecycle integration, distributed maintenance ownership,
+backup recovery or an operator-facing command. Those must be implemented and
+verified before exposing this service as a supported maintenance workflow.

@@ -229,14 +229,19 @@ If you suspect the key has been compromised:
 1. Export sovereignty immediately with current key
 2. Generate new key following this ceremony
 3. Create new agent with new key
-4. Import sovereignty into new agent (if possible with key rotation)
-5. Destroy old key and all copies
+4. Verify restoration into the new agent and readability of every required encrypted store and retained export before retiring the old key.
+5. Follow the incident recovery plan for old keys and backups; the internal rotation service does not cover every encrypted store.
 
 ### Key Rotation
 
-**Note**: As of December 2025, key rotation is implemented but requires careful testing.
+Core has an internal rotation service for registered stores, with no working
+operator command or coordinated host cutover. Do not treat it as a complete
+key-replacement workflow. Retain the original keys until all required stores
+and backups have been verified under the intended recovery keys.
 
-See `security/key_rotation.py` and `docs/architecture/security/KEY_ROTATION.md` for details.
+See the [maintenance contract](../architecture/security/KEY_ROTATION.md) and
+[service implementation](../../kestrel_sovereign/security/key_rotation.py) for
+coverage, recovery requirements and known limitations.
 
 ## Verification Checklist
 

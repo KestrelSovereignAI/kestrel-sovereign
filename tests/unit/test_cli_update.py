@@ -33,11 +33,19 @@ def stub_project_dir(tmp_path, monkeypatch):
     ``_resolve_source_checkout()`` (introspecting the installed
     kestrel_sovereign package) and the runtime data root from
     ``_get_project_dir()``. For most tests they're indistinguishable
-    — patch both to point at tmp_path with a fake .git dir."""
+    — patch both to point at tmp_path with a fake .git dir.
+
+    The manifest preflight (#3702) asks git which revision the pull lands on
+    and reads its lock; that has its own tests (``test_sync_preflight.py``),
+    so here the fetch is a no-op, the pull brings no new revision, and the
+    preflight agrees."""
     (tmp_path / ".git").mkdir()
     (tmp_path / "pyproject.toml").touch()
     monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_run_git_fetch", lambda _: (0, ""))
+    monkeypatch.setattr(cli, "_pull_target_revision", lambda _: None)
+    monkeypatch.setattr(cli, "_run_sync_preflight", lambda *a, **kw: 0)
     return tmp_path
 
 

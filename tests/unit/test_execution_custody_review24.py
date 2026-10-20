@@ -174,6 +174,7 @@ async def test_real_scheduler_restart_excludes_only_its_original_live_occurrence
     )
     from tests.unit.test_restart_idle_gate_booted_agent import _booted_idle_agent
     from tests.unit.test_scheduler_durability import _database, _seed_due
+    from tests.utils.aiosqlite_workers import normal_close_schedule
     from tests.utils.scheduler_ticks import tick_and_settle
 
     async with _booted_idle_agent(tmp_path) as owner:
@@ -240,4 +241,13 @@ async def test_real_scheduler_restart_excludes_only_its_original_live_occurrence
                 blocker_task.cancel()
                 await asyncio.gather(blocker_task, return_exceptions=True)
             await runner.stop()
-            await database.close()
+            # This test asserts restart ownership, not WAL/fsync throughput.
+            # Retire this exact real connection/worker before returning while
+            # keeping production close deadlines covered by their own tests.
+            backend = database.backend
+            connection = backend._ensure_connected()
+            async with normal_close_schedule() as finish:
+                await finish(
+                    connection, database.close(),
+                    retained_closes=backend._retired_connection_closes,
+                )

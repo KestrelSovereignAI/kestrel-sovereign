@@ -716,6 +716,20 @@
     },
     {
       "existing_code_refs": [
+        "AGENTS.md"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/VISUAL_COMPUTER_USE.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "design-of-record",
+      "title": "Visual computer use and durable artifacts",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
         "kestrel_sovereign/data/feature_registry.toml"
       ],
       "findings": [],
@@ -1256,7 +1270,9 @@
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/security/key_rotation.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
@@ -2089,6 +2105,7 @@
         "tests/integration/test_compute_security_integration.py",
         "tests/integration/test_core_only_boot.py",
         "tests/integration/test_identity_export_import.py",
+        "tests/integration/test_mcp_permission_boundary.py",
         "tests/integration/test_sovereignty_e2e.py",
         "tests/integration/test_storage_backend_parity.py",
         "tests/unit/test_agent_backend_routing_contracts.py",
@@ -4615,6 +4632,30 @@
       "type": "Release Note"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.34.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.34",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.35.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.35",
+      "type": "Release Note"
+    },
+    {
       "existing_code_refs": [
         "scripts/ci/throughput_report.py",
         "tests/unit/test_host_features.py"
@@ -4818,7 +4859,9 @@
       "type": "User Guide"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/security/key_rotation.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
