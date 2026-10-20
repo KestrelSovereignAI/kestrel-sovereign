@@ -38,7 +38,7 @@ def owned_task_join_dependency(target, *, waiter=None):
     at physical completion, including nested joins and cancellation unwind.
     """
     waiter = waiter if waiter is not None else asyncio.current_task()
-    if waiter is None or target is waiter or target.done():
+    if waiter is None or target is waiter or target.done() or not _has_owned_task_metadata(target):
         yield
         return
     waiters = getattr(target, "_kestrel_owned_join_waiters", None)
@@ -93,6 +93,20 @@ class OwnedTaskAdmission:
     task: asyncio.Task | None = None
 
 
+def _has_owned_task_metadata(task) -> bool:
+    """Native storage or an EXACT producer-admitted metadata contract.
+
+    Future-like protocol alone grants no private writes or ancestry edges.
+    Even an asyncio subclass may be read-only. Core's task-bound admission
+    receipt covers its custom factory Tasks; a forwarding facade cannot reuse
+    the underlying Task's receipt as its own capability.
+    """
+    if type(task) in (asyncio.Task, asyncio.Future):
+        return True
+    admission = getattr(task, "_kestrel_owned_admission", None)
+    return type(admission) is OwnedTaskAdmission and admission.task is task
+
+
 def _retain_owned_admission_error(task, error):
     """Core-only failed start-gate handoff; the payload must remain unstarted."""
     from kestrel_sovereign.execution_custody import execution_observation_error, retained_execution_error
@@ -116,6 +130,8 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     a different loop cannot receive ownership of this caller's operation.
     """
     started = False
+    if admission is None:
+        admission = OwnedTaskAdmission()
     gate = None
     async def run():
         nonlocal started
@@ -142,10 +158,9 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             raise
     wrapper = run()
     try:
-        if admission is not None:
-            if type(admission) is not OwnedTaskAdmission or admission.task is not None:
-                raise TypeError("owned admission requires a fresh original receipt")
-            gate = asyncio.get_running_loop().create_future()
+        if type(admission) is not OwnedTaskAdmission or admission.task is not None:
+            raise TypeError("owned admission requires a fresh original receipt")
+        gate = asyncio.get_running_loop().create_future()
         if loop is None:
             task = asyncio.create_task(wrapper, name=name, context=context)
         else:
@@ -175,9 +190,9 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             close = getattr(operation, "close", None)
             if callable(close):
                 close()
-    if admission is not None:
-        admission.task = task
+    admission.task = task
     try:
+        task._kestrel_owned_admission = admission
         task.add_done_callback(close_unstarted)
     except BaseException as opening:
         if gate is not None:
@@ -187,9 +202,25 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             from kestrel_sovereign.execution_custody import (
                 execution_terminal_error,
             )
-            _retain_owned_admission_error(task, execution_terminal_error(opening, retain_originals=retain_originals))
-            close_unstarted(task)
-            gate.set_result(opening)
+            terminal = execution_terminal_error(opening, retain_originals=retain_originals)
+            try:
+                _retain_owned_admission_error(task, terminal)
+            except BaseException as publication:
+                terminal = execution_terminal_error(
+                    terminal, publication, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            finally:
+                try:
+                    close_unstarted(task)
+                except BaseException as close_error:
+                    terminal = execution_terminal_error(
+                        terminal, close_error, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
+                finally:
+                    gate.set_result(terminal)
+            raise terminal
         raise
     if gate is not None:
         gate.set_result(None)
@@ -917,6 +948,10 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     Asyncio consumes a cancelled task's original exception on first retrieval.
     A completion callback and a later lifecycle join must share that evidence,
     not manufacture a cause-free cancellation on the second read.
+
+    Protocol-only foreign Futures need no private storage. Their exact finite
+    observation belongs to OwnedTaskOutcome; producer-supplied retained error
+    remains readable, but this join does not invent cross-owner source caching.
     """
     retained = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
     if retained is not _TASK_ERROR_UNSET:
@@ -933,7 +968,8 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
         error = task.exception()
     except asyncio.CancelledError as cancellation:
         error = cancellation
-    task._kestrel_owned_terminal_error = error  # type: ignore[attr-defined]
+    if _has_owned_task_metadata(task):
+        task._kestrel_owned_terminal_error = error  # type: ignore[attr-defined]
     return error
 
 
