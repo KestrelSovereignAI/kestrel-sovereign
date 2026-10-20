@@ -1140,10 +1140,6 @@ jobs:
         run: node --test tests/js/test_voice_native_custody.cjs
         timeout-minutes: 3
 
-      - name: Verify local artifact PDF canvas rendering
-        run: node --test tests/frontend/artifact_pdf.browser.mjs
-        timeout-minutes: 2
-
       - name: Run the Console smoke against a fresh isolated instance
         run: uv run kestrel demo smoke --home "$RUNNER_TEMP/kestrel-console-smoke" --port "$SMOKE_PORT"
         timeout-minutes: 10

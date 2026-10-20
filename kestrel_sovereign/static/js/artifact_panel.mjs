@@ -1,6 +1,5 @@
 /** Shared artifact card/viewer. All producer-controlled values use DOM text. */
 import { ArtifactDraft, artifactRef, createArtifactClient } from './artifact_client.mjs';
-import { createPdfPreview } from './artifact_pdf.mjs';
 
 const STATUS = {
     loading: 'Opening saved revision…', saved: 'Saved revision', dirty: 'Unsaved changes',
@@ -9,6 +8,7 @@ const STATUS = {
     denied: 'Access is unavailable. Reopen after authentication or permissions change.',
     erased: 'This save was erased. It cannot be republished automatically.',
     failed: 'The draft cannot be saved. Keep text edits within 1 MiB.',
+    rejected: 'The save was rejected. Your draft is retained; edit and try again, or download it.',
     unavailable: 'This revision is unavailable or cannot be verified for viewing.',
 };
 const IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
@@ -34,13 +34,12 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
     const history = element(doc, 'div');
     const note = element(doc, 'p', 'Drafts stay in this panel until saved. Download a draft before closing if its save is unresolved.', 'text-muted');
     root.append(title, identity, status, toolbar, viewer, comparison, history, note);
-    let disposed = false, previewURL = null, pdfPreview = null, shownFile = null, editor = null, comparisonRef = null;
+    let disposed = false, previewURL = null, shownFile = null, editor = null, comparisonRef = null;
     const urls = new Set();
     const objectURL = (bytes, type) => {
         const url = URL.createObjectURL(new Blob([bytes], { type })); urls.add(url); return url;
     };
     const releasePreview = () => {
-        pdfPreview?.dispose(); pdfPreview = null;
         if (previewURL) { URL.revokeObjectURL(previewURL); urls.delete(previewURL); previewURL = null; }
     };
     const download = (bytes, name, type) => {
@@ -118,7 +117,7 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
                 const image = element(doc, 'img'); image.alt = draft.revision.title; image.src = previewURL;
                 image.style.maxWidth = '100%'; viewer.append(image);
             } else if (draft.file.media_type === 'application/pdf') {
-                pdfPreview = createPdfPreview(draft.bytes, doc); viewer.append(pdfPreview.element);
+                viewer.append(element(doc, 'p', 'Download this PDF to view it.'));
             } else if (draft.text) {
                 viewer.append(element(doc, 'p', 'This source has mixed line endings or belongs to a bundle. It is read-only here.'),
                     element(doc, 'pre', draft.text));
@@ -126,7 +125,7 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
                 viewer.append(element(doc, 'p', 'Preview is unavailable for this file or bundle. Download the saved source to open it.'));
             }
         }
-        if (editor) editor.readOnly = !['saved', 'dirty', 'failed'].includes(draft.state) || !!draft.pendingKey;
+        if (editor) editor.readOnly = !['saved', 'dirty', 'failed', 'rejected'].includes(draft.state) || !!draft.pendingKey;
         if (draft.comparison?.revision.ref.revision_id !== comparisonRef) {
             comparison.replaceChildren(); comparisonRef = draft.comparison?.revision.ref.revision_id;
             if (draft.comparison) {

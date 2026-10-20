@@ -86,7 +86,7 @@ export class ArtifactDraft {
     get editable() { return this.#editable; }
     get pendingKey() { return this.#pending?.request.idempotency_key ?? null; }
     get comparison() { return this.#comparison; }
-    get hasUnsavedChanges() { return !!this.#revision && ['dirty', 'saving', 'unknown', 'conflict', 'denied', 'failed', 'erased'].includes(this.#state); }
+    get hasUnsavedChanges() { return !!this.#revision && ['dirty', 'saving', 'unknown', 'conflict', 'denied', 'failed', 'rejected', 'erased'].includes(this.#state); }
     #set(state) { if (!this.#closed) { this.#state = state; this.#changed(this); } }
     async #loadRevision(ref) {
         ref = artifactRef(ref);
@@ -179,6 +179,25 @@ export class ArtifactDraft {
         } catch (error) {
             if (this.#closed) return;
             if ([401, 403].includes(error.status) || error.code === 'artifact_auth_changed') this.#set('denied');
+            else if (!pending.uncertain && ((error.status === 400 && error.code === 'invalid_artifact_request')
+                || (error.status === 413 && error.code === 'artifact_quota_exceeded'))) {
+                // These typed service errors confirm rollback. A prior unknown
+                // attempt still owns its key even if a later attempt rejects.
+                this.#pending = null; this.#set('rejected');
+            }
+            else if (error.status === 404 && error.code === 'artifact_not_found'
+                && pending.phase === 'commit' && !pending.uncertain) {
+                // The service rejected this attempt before commit. Determine
+                // whether its staging expired or the artifact was deleted.
+                pending.phase = 'stage';
+                try {
+                    await this.#client.get(this.#revision.ref, this.#abort.signal);
+                    this.#set('unknown');
+                } catch (lookup) {
+                    this.#set(lookup.status === 404 && lookup.code === 'artifact_not_found' ? 'erased'
+                        : [401, 403].includes(lookup.status) || lookup.code === 'artifact_auth_changed' ? 'denied' : 'unknown');
+                }
+            }
             else if (error.status === 404 && pending.phase === 'commit') {
                 // Missing staging may have expired. Only an artifact_not_found status response is
                 // terminal erasure. Retry retains the exact key/request/bytes.
@@ -228,6 +247,8 @@ export class ArtifactDraft {
         // Keep the draft; the next Save stages it under a fresh key and exact CAS.
         this.#revision = this.#comparison.revision;
         this.#file = this.#comparison.file; this.#bytes = this.#comparison.bytes;
+        this.#lineEnding = this.#comparison.lineEnding;
+        this.#text = this.#text.replace(/\r\n|\r|\n/g, this.#lineEnding);
         this.#pending = null; this.#comparison = null;
         this.#set('dirty'); return true;
     }

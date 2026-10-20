@@ -78,11 +78,12 @@ test('closing a dirty panel requires the user to accept discarding its draft', a
     assert.equal(item.panel.element.isConnected, false); assert.equal(item.panel.draft.text, ''); item.close();
 });
 
-test('SVG and HTML have no active preview and PDF uses a canvas without active document elements', async () => {
+test('SVG, HTML and PDF remain downloadable without decoding active documents in the draft workspace', async () => {
     for (const type of ['image/svg+xml', 'text/html', 'application/pdf']) {
         const item = await fixture({ type });
-        assert.equal(item.panel.element.querySelectorAll('script,object,embed,img,iframe').length, 0);
-        assert.equal(!!item.panel.element.querySelector('canvas'), type === 'application/pdf');
+        assert.equal(item.panel.element.querySelectorAll('script,object,embed,img,iframe,canvas').length, 0);
+        assert.equal(button(item.panel, 'Download source file').disabled, false);
+        if (type === 'application/pdf') assert.match(item.panel.element.textContent, /Download this PDF to view it/);
         item.close();
     }
 });
@@ -166,7 +167,7 @@ test('conversation replacement keeps a dirty artifact panel and its unload guard
             readBytes: async () => bytes };
         const api = { getHostAgent: () => 'agent', bindAgentRequests: async () => transport };
         const pane = item.dom.window.document.createElement('div'); item.dom.window.document.body.append(pane);
-        const card = artifactPartRenderer({ ref, title: 'Notes' }, { paneElement: pane }, api); pane.append(card); await tick();
+        const card = artifactPartRenderer({ ref, title: 'Notes' }, { paneElement: pane, workspaceRoot: pane }, api); pane.append(card); await tick();
         card.querySelector('button').click(); await until(() => item.dom.window.document.querySelector('textarea'));
         const editor = item.dom.window.document.querySelector('textarea');
         editor.value = 'Retain after conversation switch'; editor.dispatchEvent(new item.dom.window.Event('input'));
@@ -189,4 +190,17 @@ test('a denied open can close and leave without a discard confirmation', async (
     item.dom.window.dispatchEvent(event); assert.equal(event.defaultPrevented, false);
     button(item.panel, 'Close').click(); await tick();
     assert.equal(asked, 0); assert.equal(item.panel.element.isConnected, false); item.close();
+});
+
+test('a confirmed quota rejection keeps the editor and discard protection available', async () => {
+    const item = await fixture({ confirmDiscard: () => false });
+    item.client.commit = async () => { throw { status: 413, code: 'artifact_quota_exceeded' }; };
+    edit(item.panel, item.dom.window, 'Retained draft'); button(item.panel, 'Save revision').click();
+    await until(() => item.panel.draft.state === 'rejected');
+    assert.equal(item.panel.element.querySelector('textarea').readOnly, false);
+    assert.equal(button(item.panel, 'Download draft').hidden, false);
+    const event = new item.dom.window.Event('beforeunload', { cancelable: true });
+    item.dom.window.dispatchEvent(event); assert.equal(event.defaultPrevented, true);
+    edit(item.panel, item.dom.window, 'Smaller draft'); assert.equal(button(item.panel, 'Save revision').disabled, false);
+    item.close();
 });

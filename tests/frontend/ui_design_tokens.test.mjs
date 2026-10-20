@@ -44,9 +44,6 @@ function rootDeclarations(source) {
 // lands outside this set and fails the scan until it is classified here.
 const vendoredAssetRoots = new Set([
     join(repoRoot, 'kestrel_sovereign', 'data', 'semantic', 'standards'),
-    // Pinned, checksum-verified upstream PDF.js runtime. Its optional viewer
-    // CSS vocabulary is not the application's theme contract.
-    join(repoRoot, 'kestrel_sovereign', 'static', 'js', 'vendor', 'pdfjs'),
 ]);
 
 function firstPartyAssets(directory) {
@@ -175,7 +172,6 @@ test('the vendored skip drops only third-party data, never first-party UI', () =
         join('kestrel_sovereign', 'static', 'index.css'),
         join('kestrel_sovereign', 'static', 'js', 'approvals.js'),
         join('kestrel_sovereign', 'features', 'spawn', 'static', 'spawn.js'),
-        join('kestrel_sovereign', 'static', 'js', 'artifact_pdf.mjs'),
     ]) {
         assert.ok(scanned.includes(firstParty), `${firstParty} is still scanned`);
     }

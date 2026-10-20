@@ -301,3 +301,141 @@ test('a failed restage cannot forget an earlier uncertain commit', async () => {
     await draft.compareLatest(); assert.equal(draft.useComparedRevision(), false);
     assert.equal(draft.pendingKey, key); draft.close();
 });
+
+test('explicit rebase adopts the latest source line endings for retained and subsequent edits', async () => {
+    for (const ending of ['\r\n', '\r']) {
+        const { draft, client, revision, staged } = await fixture('a\nb\n');
+        const commit = client.commit; client.commit = async () => { throw { status: 409 }; };
+        draft.edit('a\nb\nmine\n'); await draft.save();
+        const bytes = new TextEncoder().encode(`new${ending}base${ending}`);
+        const file = { ...revision.manifest.files[0], size_bytes: bytes.length, sha256: await sha256(bytes) };
+        const latest = { ...revision, ref: { ...ref, revision_id: 'new-base' }, manifest: { ...revision.manifest, files: [file] } };
+        client.history = async () => ({ items: [latest] }); client.get = async () => latest; client.read = async () => bytes;
+        await draft.compareLatest(); assert.equal(draft.useComparedRevision(), true);
+        assert.equal(draft.text, `a${ending}b${ending}mine${ending}`);
+        draft.edit('a\nb\nmine\nmore\n'); client.commit = commit; await draft.save();
+        assert.equal(new TextDecoder().decode(staged.at(-1).content), `a${ending}b${ending}mine${ending}more${ending}`);
+        draft.close();
+    }
+});
+
+test('opening rejects mismatched references, invalid metadata and corrupt content', async t => {
+    const cases = {
+        reference: (r) => { r.ref.revision_id = 'unexpected'; },
+        schema: (r) => { r.schema_version = 2; },
+        tenant: (r) => { delete r.scope.tenant_id; },
+        principal: (r) => { delete r.scope.principal_id; },
+        title: (r) => { r.title = {}; },
+        entrypoint: (r) => { r.manifest.entrypoint = 'missing'; },
+        fractionalSize: (r) => { r.manifest.files[0].size_bytes = 0.5; },
+        negativeSize: (r) => { r.manifest.files[0].size_bytes = -1; },
+        viewLimit: (r) => { r.manifest.files[0].size_bytes = 16 * 1024 * 1024 + 1; },
+        invalidHash: (r) => { r.manifest.files[0].sha256 = 'bad'; },
+        mediaType: (r) => { r.manifest.files[0].media_type = {}; },
+        sizeMismatch: (r) => { r.manifest.files[0].size_bytes++; },
+        hashMismatch: (r) => { r.manifest.files[0].sha256 = '0'.repeat(64); },
+    };
+    for (const [name, corrupt] of Object.entries(cases)) await t.test(name, async () => {
+        const item = await fixture(); item.draft.close(); const revision = structuredClone(item.revision); corrupt(revision);
+        let reads = 0; item.client.get = async () => revision; item.client.read = async () => { reads++; return item.bytes; };
+        const draft = new ArtifactDraft(item.client); await draft.open(ref);
+        assert.equal(draft.state, 'unavailable'); assert.equal(draft.bytes, null); assert.equal(draft.edit('x'), false);
+        if (name === 'viewLimit') assert.equal(reads, 0, 'oversized source must be refused before download');
+        draft.close();
+    });
+});
+
+test('single-file edit and byte limits prevent destructive bundle saves and oversized uploads', async () => {
+    const item = await fixture(); item.draft.close();
+    item.revision.manifest.files.push({ ...item.revision.manifest.files[0], path: 'second.md' });
+    const bundle = new ArtifactDraft(item.client); await bundle.open(ref);
+    assert.equal(bundle.state, 'saved'); assert.equal(bundle.editable, false); assert.equal(bundle.edit('drop files'), false);
+    await bundle.save(); assert.equal(item.staged.length, 0); bundle.close();
+    const large = await fixture('x'.repeat(1024 * 1024 + 1));
+    assert.equal(large.draft.state, 'saved'); assert.equal(large.draft.editable, false); large.draft.close();
+    const exact = await fixture('x'.repeat(1024 * 1024)); assert.equal(exact.draft.editable, true);
+    exact.draft.edit('é'.repeat(512 * 1024 + 1)); await exact.draft.save();
+    assert.equal(exact.draft.state, 'failed'); assert.equal(exact.staged.length, 0); assert.equal(exact.committed.length, 0);
+    exact.draft.close();
+});
+
+test('staging must confirm the exact bytes and manifest before any commit', async () => {
+    for (const change of [{ sha256: '0'.repeat(64) }, { size_bytes: 0 }, { path: 'other' }, { media_type: 'text/plain' }]) {
+        const { draft, client, committed } = await fixture();
+        client.stage = async (key, file) => ({ ...file, ...change });
+        draft.edit('keep this'); await draft.save();
+        assert.equal(committed.length, 0); assert.equal(draft.state, 'unknown'); assert.equal(draft.text, 'keep this'); draft.close();
+    }
+});
+
+test('comparison refuses a different owner, source structure or noneditable content', async t => {
+    const cases = {
+        tenant: (r) => { r.scope.tenant_id = 'other'; },
+        principal: (r) => { r.scope.principal_id = 'other'; },
+        agent: (r) => { r.scope.agent_id = 'other'; },
+        path: (r) => { r.manifest.entrypoint = r.manifest.files[0].path = 'other.md'; },
+        type: (r) => { r.manifest.files[0].media_type = 'text/plain'; },
+        bundle: (r) => { r.manifest.files.push({ ...r.manifest.files[0], path: 'second.md' }); },
+        binary: (r) => { r.manifest.files[0].media_type = 'application/octet-stream'; },
+        invalidUtf8: () => {},
+        mixedLines: () => {},
+    };
+    for (const [name, change] of Object.entries(cases)) await t.test(name, async () => {
+        const { draft, client, revision } = await fixture(); client.commit = async () => { throw { status: 409 }; };
+        draft.edit('retained'); await draft.save(); const key = draft.pendingKey;
+        const latest = structuredClone(revision); latest.ref.revision_id = 'new-base';
+        const bytes = name === 'invalidUtf8' ? new Uint8Array([0xff])
+            : new TextEncoder().encode(name === 'mixedLines' ? 'a\nb\r\nc' : 'new source');
+        Object.assign(latest.manifest.files[0], { size_bytes: bytes.length, sha256: await sha256(bytes) }); change(latest);
+        client.history = async () => ({ items: [latest] }); client.get = async () => latest; client.read = async () => bytes;
+        await draft.compareLatest(); assert.equal(draft.comparison, null); assert.equal(draft.useComparedRevision(), false);
+        assert.equal(draft.pendingKey, key); assert.equal(draft.text, 'retained'); draft.close();
+    });
+});
+
+test('bound binary download refuses changed credentials before reading another owner source', async () => {
+    let identity = 'original'; const calls = [];
+    const api = createApiClient({
+        authProvider: { ensureAuthenticated: async () => {}, applyAuth: async headers => ({ ...headers, Authorization: `Bearer ${identity}` }) },
+        fetchFn: async (url, options) => { calls.push({ url, options }); return new Response('private source'); },
+        sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} }, location: { href: 'http://test/', search: '' },
+    });
+    const bound = await api.bindAgentRequests('original-agent'); identity = 'other';
+    await assert.rejects(bound.readBytes('/api/artifacts/file'), error => error.code === 'artifact_auth_changed');
+    assert.equal(calls.length, 0);
+});
+
+test('confirmed validation or quota rejection retains an editable draft without pretending a commit is pending', async () => {
+    for (const error of [{ status: 400, code: 'invalid_artifact_request' }, { status: 413, code: 'artifact_quota_exceeded' }]) {
+        const { draft, client } = await fixture(); client.commit = async () => { throw error; };
+        draft.edit('retained'); await draft.save(); assert.equal(draft.state, 'rejected');
+        assert.equal(draft.pendingKey, null); assert.equal(draft.hasUnsavedChanges, true);
+        assert.equal(draft.edit('corrected'), true); assert.equal(draft.state, 'dirty'); draft.close();
+    }
+});
+
+test('known expired staging permits a later conflict while a deleted artifact becomes terminal', async () => {
+    for (const deleted of [false, true]) {
+        const { draft, client } = await fixture();
+        client.commit = async () => { throw { status: 404, code: 'artifact_not_found' }; };
+        if (deleted) client.get = async () => { throw { status: 404, code: 'artifact_not_found' }; };
+        draft.edit('retained'); await draft.save();
+        assert.equal(draft.state, deleted ? 'erased' : 'unknown');
+        if (!deleted) {
+            client.commit = async () => { throw { status: 409, code: 'artifact_conflict' }; };
+            await draft.retry(); assert.equal(draft.state, 'conflict');
+        }
+        assert.equal(draft.text, 'retained'); draft.close();
+    }
+});
+
+test('later typed rejections never clear an earlier unknown commit or permit a new key', async () => {
+    for (const error of [{ status: 400, code: 'invalid_artifact_request' }, { status: 413, code: 'artifact_quota_exceeded' },
+        { status: 404, code: 'artifact_not_found' }]) {
+        const { draft, client } = await fixture(); client.commit = async () => { throw new Error('lost'); };
+        draft.edit('retained'); await draft.save(); const key = draft.pendingKey;
+        client.commit = async () => { throw error; }; await draft.retry();
+        assert.equal(draft.state, 'unknown'); assert.equal(draft.pendingKey, key); assert.equal(draft.edit('new'), false);
+        draft.close();
+    }
+});
