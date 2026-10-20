@@ -921,3 +921,51 @@ async def test_local_backend_requires_both_shell_grants(workspace: Path):
     envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
     assert envelope.status is not ToolResultStatus.OK
     assert envelope.error.startswith("readiness:")
+
+
+@pytest.mark.asyncio
+async def test_shell_backend_refusal_names_backend_none_for_a_read_only_grant(tmp_path: Path):
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read"},
+        queue=FakeApprovalQueue(),
+    )
+    feature = ComputerUseFeature(agent)
+    feature._cfg = _config(tmp_path, backend="docker")
+    await feature.initialize()
+
+    envelope = await feature.fs_read(path=str(tmp_path / "ok.txt"))
+    assert envelope.error.startswith("readiness:backend not initialized")
+    assert 'backend = "none"' in envelope.error
+
+
+@pytest.mark.asyncio
+async def test_filesystem_only_backend_cannot_execute():
+    from kestrel_sovereign.features.computer_use.backends import (
+        CapabilityBlocked,
+        FilesystemOnlyBackend,
+    )
+
+    backend = FilesystemOnlyBackend()
+    assert backend.supports_exec is False
+    with pytest.raises(CapabilityBlocked):
+        await backend.exec(["true"], cwd=None, env=None, timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["None", "nnone", "filesystem", "Docker", "", None, 0, ["none"]])
+async def test_an_unknown_backend_is_refused_not_read_as_docker(tmp_path: Path, value):
+    """A mistyped "none" must not build a backend that can execute (#3760)."""
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read", "shell_execution_sandboxed", "shell_execution_host"},
+        queue=FakeApprovalQueue(),
+    )
+    feature = ComputerUseFeature(agent)
+    feature._cfg = {**_config(tmp_path), "backend": value}
+    await feature.initialize()
+
+    assert feature._backend is None
+    envelope = await feature.shell(command="echo hi")
+    assert envelope.error.startswith("readiness:backend not initialized")
+    assert f"unknown backend {value!r}" in envelope.error
