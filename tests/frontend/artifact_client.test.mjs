@@ -23,6 +23,7 @@ async function fixture(content = '# Original') {
                 committed_at: '2026-10-20T12:01:00Z', storage_id: 'local' };
         },
         status: async key => { statuses.push(key); return null; },
+        head: async () => structuredClone(revision),
         history: async () => ({ items: [revision], next_cursor: null }),
     };
     const draft = new ArtifactDraft(client); await draft.open(ref);
@@ -109,7 +110,7 @@ test('conflicting edit is preserved and requires explicit comparison before reba
     const latestFile = { ...revision.manifest.files[0], sha256: await sha256(latestBytes), size_bytes: latestBytes.length };
     const latest = { ...revision, ref: { ...ref, revision_id: 'concurrent' }, manifest: { ...revision.manifest, files: [latestFile] } };
     client.get = async () => latest; client.read = async () => latestBytes;
-    client.history = async () => ({ items: [latest] });
+    client.head = async () => latest; client.history = async () => ({ items: [latest] });
     await draft.compareLatest(); assert.equal(draft.comparison.text, 'someone else');
     assert.equal(draft.text, 'my draft'); const key = draft.pendingKey;
     assert.equal(draft.useComparedRevision(), true);
@@ -310,7 +311,7 @@ test('explicit rebase adopts the latest source line endings for retained and sub
         const bytes = new TextEncoder().encode(`new${ending}base${ending}`);
         const file = { ...revision.manifest.files[0], size_bytes: bytes.length, sha256: await sha256(bytes) };
         const latest = { ...revision, ref: { ...ref, revision_id: 'new-base' }, manifest: { ...revision.manifest, files: [file] } };
-        client.history = async () => ({ items: [latest] }); client.get = async () => latest; client.read = async () => bytes;
+        client.head = async () => latest; client.history = async () => ({ items: [latest] }); client.get = async () => latest; client.read = async () => bytes;
         await draft.compareLatest(); assert.equal(draft.useComparedRevision(), true);
         assert.equal(draft.text, `a${ending}b${ending}mine${ending}`);
         draft.edit('a\nb\nmine\nmore\n'); client.commit = commit; await draft.save();
@@ -387,7 +388,7 @@ test('comparison refuses a different owner, source structure or noneditable cont
         const bytes = name === 'invalidUtf8' ? new Uint8Array([0xff])
             : new TextEncoder().encode(name === 'mixedLines' ? 'a\nb\r\nc' : 'new source');
         Object.assign(latest.manifest.files[0], { size_bytes: bytes.length, sha256: await sha256(bytes) }); change(latest);
-        client.history = async () => ({ items: [latest] }); client.get = async () => latest; client.read = async () => bytes;
+        client.head = async () => latest; client.history = async () => ({ items: [latest] }); client.get = async () => latest; client.read = async () => bytes;
         await draft.compareLatest(); assert.equal(draft.comparison, null); assert.equal(draft.useComparedRevision(), false);
         assert.equal(draft.pendingKey, key); assert.equal(draft.text, 'retained'); draft.close();
     });
@@ -438,4 +439,31 @@ test('later typed rejections never clear an earlier unknown commit or permit a n
         assert.equal(draft.state, 'unknown'); assert.equal(draft.pendingKey, key); assert.equal(draft.edit('new'), false);
         draft.close();
     }
+});
+
+test('conflict comparison reads the committed head independently of history order', async () => {
+    const { draft, client, revision } = await fixture();
+    client.commit = async () => { throw { status: 409 }; }; draft.edit('mine'); await draft.save();
+    const latest = structuredClone(revision); latest.ref.revision_id = 'committed-head';
+    latest.committed_at = '2026-10-19T00:00:00Z';
+    client.head = async id => { assert.equal(id, ref.artifact_id); return latest; };
+    client.history = async () => { throw new Error('history cannot select a head'); };
+    client.get = async requested => { assert.equal(requested.revision_id, 'committed-head'); return latest; };
+    await draft.compareLatest();
+    assert.equal(draft.comparison.revision.ref.revision_id, 'committed-head');
+    assert.equal(draft.useComparedRevision(), true); assert.equal(draft.revision.ref.revision_id, 'committed-head');
+    assert.equal(draft.text, 'mine'); draft.close();
+});
+
+test('head lookup uses the original bound agent and authenticated artifact route', async () => {
+    const { revision, draft } = await fixture(); draft.close(); const calls=[];
+    const api = createApiClient({
+        authProvider: { ensureAuthenticated: async () => {}, applyAuth: async headers => ({ ...headers, Authorization: 'Bearer owner' }) },
+        fetchFn: async (url, options) => { calls.push({url, options}); return new Response(JSON.stringify(revision), {headers:{'Content-Type':'application/json'}}); },
+        sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} }, location: { href:'http://test/', search:'' },
+    });
+    api.setHostAgent('original-agent'); const client=await createArtifactClient(api);
+    api.setHostAgent('another-agent'); assert.deepEqual(await client.head('artifact'), revision);
+    assert.match(calls[0].url, /original-agent/); assert.ok(calls[0].url.endsWith('/api/artifacts/artifact/head'));
+    assert.equal(calls[0].options.credentials, 'omit'); assert.equal(calls[0].options.cache, 'no-store');
 });

@@ -18,7 +18,8 @@ async function fixture({ getError = null, content = '<script>alert(1)</script>',
         stage: async (key, file) => file,
         commit: async request => ({ schema_version: 1, ref: { ...ref, revision_id: 'revision2' }, scope,
             idempotency_key: request.idempotency_key, ...await publicationDigests(request), committed_at: revision.committed_at, storage_id: 'local' }),
-        status: async () => null, history: async () => ({ items: [revision], next_cursor: null }),
+        status: async () => null, head: async () => structuredClone(revision),
+        history: async () => ({ items: [revision], next_cursor: null }),
     };
     const opened = [];
     const panel = createArtifactPanel({ client, ref, document: dom.window.document, confirmDiscard,

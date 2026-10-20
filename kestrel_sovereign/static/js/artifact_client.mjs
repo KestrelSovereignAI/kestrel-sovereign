@@ -63,6 +63,7 @@ export async function createArtifactClient(api, ownerAgent = api.getHostAgent())
     const json = (path, body, signal) => bound.request(path, { method: 'POST', body: JSON.stringify(body), signal, cache: 'no-store' });
     return Object.freeze({
         get: (ref, signal) => bound.request(revisionPath(ref), { signal, cache: 'no-store' }),
+        head: (id, signal) => bound.request(`/api/artifacts/${encodeURIComponent(token(id))}/head`, { signal, cache: 'no-store' }),
         read: (ref, path, signal) => bound.readBytes(`${revisionPath(ref)}/file?path=${encodeURIComponent(path)}`, { signal, cache: 'no-store' }),
         history: (id, cursor = null, signal) => bound.request(`/api/artifacts/${encodeURIComponent(token(id))}/history?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { signal, cache: 'no-store' }),
         stage: (key, file, bytes, signal) => json('/api/artifacts/staging', {
@@ -230,8 +231,7 @@ export class ArtifactDraft {
         if (this.#state !== 'conflict') return;
         this.#set('saving');
         try {
-            const page = await this.#client.history(this.#revision.ref.artifact_id, null, this.#abort.signal);
-            const latest = page.items?.[0];
+            const latest = await this.#client.head(this.#revision.ref.artifact_id, this.#abort.signal);
             if (!latest || latest.ref.artifact_id !== this.#revision.ref.artifact_id) throw new Error('No current revision.');
             const loaded = await this.#loadRevision(latest.ref);
             if (!sameScope(loaded.revision.scope, this.#revision.scope) || loaded.text === null || loaded.lineEnding === null
