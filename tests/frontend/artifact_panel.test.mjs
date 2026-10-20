@@ -107,3 +107,76 @@ test('artifact card does not interpret an untrusted title or a URL as a referenc
         assert.equal(invalid.textContent, 'Invalid artifact reference');
     } finally { globalThis.document = before; dom.window.close(); }
 });
+
+test('editing textarea source retains CRLF and CR byte conventions', async () => {
+    for (const ending of ['\r\n', '\r']) {
+        const source = `line1${ending}line2${ending}`, item = await fixture({ content: source });
+        let staged;
+        item.client.stage = async (key, file, bytes) => { staged = bytes; return file; };
+        edit(item.panel, item.dom.window, item.panel.element.querySelector('textarea').value + 'X');
+        button(item.panel, 'Save revision').click(); await until(() => item.panel.draft.state === 'saved');
+        assert.equal(new TextDecoder().decode(staged), source + 'X'); item.close();
+    }
+});
+
+test('unknown save remains reconcilable after its conversation card is removed', async () => {
+    const item = await fixture(), before = globalThis.document, beforeConfirm = globalThis.confirm;
+    globalThis.document = item.dom.window.document;
+    const { revision } = item.panel.draft, bytes = item.panel.draft.bytes;
+    item.panel.dispose(); item.panel.element.remove();
+    let publicationKey, checkedKey;
+    try {
+        const transport = {
+            request: async (path, options = {}) => {
+                if (path.endsWith('/staging')) {
+                    const request = JSON.parse(options.body); publicationKey = request.publication_key;
+                    const content = Uint8Array.from(atob(request.content_base64), c => c.charCodeAt(0));
+                    return { schema_version: 1, path: request.path, media_type: request.media_type,
+                        size_bytes: content.length, sha256: await sha256(content) };
+                }
+                if (path.endsWith('/publications')) throw new Error('lost response');
+                if (path.includes('/publications/')) { checkedKey = path.split('/').at(-1); return null; }
+                return revision;
+            }, readBytes: async () => bytes,
+        };
+        const api = { getHostAgent: () => 'agent', bindAgentRequests: async () => transport };
+        const pane = item.dom.window.document.createElement('div'); item.dom.window.document.body.append(pane);
+        const card = artifactPartRenderer({ ref, title: 'Notes' }, { paneElement: pane }, api); pane.append(card);
+        card.querySelector('button').click(); await until(() => item.dom.window.document.querySelector('textarea'));
+        const root = item.dom.window.document.querySelector('.artifact-panel');
+        edit({ element: root }, item.dom.window, 'Unresolved draft');
+        button({ element: root }, 'Save revision').click();
+        await until(() => root.querySelector('[role="status"]').textContent.includes('unknown'));
+        pane.replaceChildren(); await tick();
+        button({ element: root }, 'Check save').click(); await until(() => checkedKey);
+        assert.equal(checkedKey, publicationKey); assert.equal(root.querySelector('textarea').value, 'Unresolved draft');
+        globalThis.confirm = () => true; button({ element: root }, 'Close').click(); await tick();
+    } finally { globalThis.document = before; globalThis.confirm = beforeConfirm; item.close(); }
+});
+
+test('conversation replacement keeps a dirty artifact panel and its unload guard alive', async () => {
+    const item = await fixture(); const before = globalThis.document, beforeObserver = globalThis.MutationObserver;
+    const beforeConfirm = globalThis.confirm;
+    globalThis.document = item.dom.window.document; globalThis.MutationObserver = item.dom.window.MutationObserver;
+    const { revision } = item.panel.draft; const bytes = item.panel.draft.bytes;
+    item.panel.dispose(); item.panel.element.remove();
+    try {
+        const transport = { request: async path => path.endsWith('/publications') ? Promise.reject(new Error('lost')) :
+            path.endsWith('/staging') ? revision.manifest.files[0] : revision,
+            readBytes: async () => bytes };
+        const api = { getHostAgent: () => 'agent', bindAgentRequests: async () => transport };
+        const pane = item.dom.window.document.createElement('div'); item.dom.window.document.body.append(pane);
+        const card = artifactPartRenderer({ ref, title: 'Notes' }, { paneElement: pane }, api); pane.append(card); await tick();
+        card.querySelector('button').click(); await until(() => item.dom.window.document.querySelector('textarea'));
+        const editor = item.dom.window.document.querySelector('textarea');
+        editor.value = 'Retain after conversation switch'; editor.dispatchEvent(new item.dom.window.Event('input'));
+        pane.replaceChildren(); await tick();
+        assert.ok(editor.isConnected, 'artifact working copy must outlive its conversation card');
+        assert.equal(editor.value, 'Retain after conversation switch');
+        let guarded = false; const event = new item.dom.window.Event('beforeunload', { cancelable: true });
+        item.dom.window.dispatchEvent(event); guarded = event.defaultPrevented;
+        assert.equal(guarded, true, 'retained draft keeps its unload warning');
+        const close = [...item.dom.window.document.querySelectorAll('button')].find(node => node.textContent === 'Close');
+        globalThis.confirm = () => true; close.click(); await tick();
+    } finally { globalThis.document = before; globalThis.MutationObserver = beforeObserver; globalThis.confirm = beforeConfirm; item.close(); }
+});

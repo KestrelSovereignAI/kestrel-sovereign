@@ -2,12 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { ArtifactDraft, publicationDigests, sha256 } from '../../kestrel_sovereign/static/js/artifact_client.mjs';
-import { createApiClient } from '../../kestrel_sovereign/static/js/api_client.mjs';
+import { createApiClient, createKestrelStandaloneAuthProvider } from '../../kestrel_sovereign/static/js/api_client.mjs';
 
 const scope = { schema_version: 1, tenant_id: 'tenant', principal_id: 'person', agent_id: 'agent' };
 const ref = { schema_version: 1, artifact_id: 'artifact', revision_id: 'revision1' };
-async function fixture() {
-    const bytes = new TextEncoder().encode('# Original');
+async function fixture(content = '# Original') {
+    const bytes = new TextEncoder().encode(content);
     const file = { schema_version: 1, path: 'notes.md', media_type: 'text/markdown', size_bytes: bytes.length, sha256: await sha256(bytes) };
     const revision = { schema_version: 1, ref, scope, title: 'Notes', parent_revision_id: null,
         manifest: { schema_version: 1, entrypoint: file.path, files: [file] },
@@ -151,6 +151,7 @@ test('bound API requests pin original agent and refuse changed authentication be
     api.setHostAgent('original-agent'); const bound = await api.bindAgentRequests();
     api.setHostAgent('other-agent'); await bound.request('/api/artifacts');
     assert.match(calls[0].url, /original-agent/);
+    assert.equal(calls[0].options.credentials, 'omit');
     identity = 'new-principal';
     await assert.rejects(bound.request('/api/artifacts/staging', { method: 'POST', body: 'private' }), error => error.code === 'artifact_auth_changed');
     assert.equal(calls.length, 1);
@@ -166,6 +167,7 @@ test('bound binary request uses shared authentication and preserves exact bytes'
     const bound = await api.bindAgentRequests(null);
     assert.deepEqual(new Uint8Array(await bound.readBytes('/api/artifacts/file')), new Uint8Array([0, 255, 7]));
     assert.equal(calls[0].options.headers.Authorization, 'Bearer original');
+    assert.equal(calls[0].options.credentials, 'omit');
 });
 
 test('401 refresh cannot resend a bound upload under replacement credentials', async () => {
@@ -194,4 +196,45 @@ test('a second concurrent open cannot replace a panel revision', async () => {
     const opening = draft.open(ref);
     await assert.rejects(draft.open({ ...ref, revision_id: 'other' }), /new panel/);
     await opening; assert.equal(draft.revision.ref.revision_id, 'revision1'); draft.close();
+});
+
+test('standalone OAuth cookie authentication refuses to bind an artifact draft', async () => {
+    const calls = [], sessionStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+    const location = { href: 'http://test/', search: '' };
+    const fetchFn = async url => { calls.push(url); return url === '/api/auth/key'
+        ? new Response('{}', { status: 404 }) : new Response('{"email":"owner@example.invalid"}'); };
+    const auth = createKestrelStandaloneAuthProvider({ fetchFn, sessionStorage, location, requestApiKey: null,
+        logger: { log() {}, warn() {}, error() {} } });
+    const api = createApiClient({ authProvider: auth, fetchFn, sessionStorage, location });
+    await api.init();
+    await assert.rejects(api.bindAgentRequests('agent'), error => error.code === 'artifact_auth_unbound');
+    assert.deepEqual(calls, ['/api/auth/key', '/auth/me']);
+});
+
+test('bound request omits cookies even when a caller tries to include them', async () => {
+    const calls = [];
+    const api = createApiClient({ authProvider: { ensureAuthenticated: async () => {},
+        applyAuth: async headers => ({ ...headers, 'X-API-Key': 'explicit' }) },
+        fetchFn: async (url, options) => { calls.push(options); return new Response('{}'); },
+        sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} }, location: { href: 'http://test/', search: '' } });
+    const bound = await api.bindAgentRequests('agent');
+    await bound.request('/api/artifacts/staging', { method: 'POST', body: 'private', credentials: 'include' });
+    assert.equal(calls[0].credentials, 'omit');
+});
+
+test('a stable declared principal cannot conceal a changed bearer credential', async () => {
+    let token = 'A'; const calls = [];
+    const api = createApiClient({ authProvider: { ensureAuthenticated: async () => {},
+        getPrincipalIdentity: async () => 'stable', applyAuth: async headers => ({ ...headers, Authorization: `Bearer ${token}` }) },
+        fetchFn: async (url, options) => { calls.push(options); return new Response('{}'); },
+        sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} }, location: { href: 'http://test/', search: '' } });
+    const bound = await api.bindAgentRequests('agent'); token = 'B';
+    await assert.rejects(bound.request('/api/artifacts/staging', { method: 'POST', body: 'private' }), error => error.code === 'artifact_auth_changed');
+    assert.equal(calls.length, 0);
+});
+
+test('mixed line endings stay read-only and retain original source bytes', async () => {
+    const { draft, bytes } = await fixture('first\r\nsecond\nthird\r');
+    assert.equal(draft.editable, false); assert.equal(draft.edit('replacement'), false);
+    assert.deepEqual(draft.bytes, bytes); draft.close();
 });

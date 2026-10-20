@@ -48,6 +48,10 @@ function sameScope(a, b) {
     return a?.tenant_id === b?.tenant_id && a?.principal_id === b?.principal_id
         && (a?.agent_id ?? null) === (b?.agent_id ?? null);
 }
+function sourceLineEnding(text) {
+    const endings = new Set(text.match(/\r\n|\r|\n/g) || []);
+    return endings.size > 1 ? null : [...endings][0] || '\n';
+}
 function base64(bytes) {
     let encoded = '';
     for (let start = 0; start < bytes.length; start += 8192) encoded += String.fromCharCode(...bytes.subarray(start, start + 8192));
@@ -72,7 +76,7 @@ export async function createArtifactClient(api, ownerAgent = api.getHostAgent())
 export class ArtifactDraft {
     #client; #changed; #pending = null; #closed = false; #abort = new AbortController();
     #revision = null; #file = null; #bytes = null; #text = ''; #state = 'loading';
-    #editable = false; #comparison = null; #opened = false;
+    #editable = false; #comparison = null; #opened = false; #lineEnding = '\n';
     constructor(client, changed = () => {}) { this.#client = client; this.#changed = changed; }
     get state() { return this.#state; }
     get revision() { return this.#revision; }
@@ -104,7 +108,8 @@ export class ArtifactDraft {
         if (EDIT_TYPES.has(file.media_type) && file.size_bytes <= MAX_EDIT_BYTES) {
             try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); } catch (_) { /* Binary source remains downloadable. */ }
         }
-        return { revision, file, bytes, text };
+        const lineEnding = text === null ? null : sourceLineEnding(text);
+        return { revision, file, bytes, text, lineEnding };
     }
     async open(ref) {
         if (this.#closed || this.#opened) throw new Error('Create a new panel to open another revision.');
@@ -114,13 +119,16 @@ export class ArtifactDraft {
             if (this.#closed) return;
             this.#revision = loaded.revision; this.#file = loaded.file; this.#bytes = loaded.bytes;
             this.#text = loaded.text ?? '';
-            this.#editable = loaded.text !== null && loaded.revision.manifest.files.length === 1;
+            this.#editable = loaded.text !== null && loaded.lineEnding !== null && loaded.revision.manifest.files.length === 1;
+            this.#lineEnding = loaded.lineEnding;
             this.#set('saved');
         } catch (error) { this.#set([401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unavailable'); }
     }
     edit(text) {
         if (!this.#editable || this.#pending || this.#closed || this.#state === 'saving') return false;
-        this.#text = String(text); this.#set('dirty'); return true;
+        // Textareas normalize CRLF/CR to LF. Restore the source convention;
+        // mixed-ending files remain read-only rather than being rewritten.
+        this.#text = String(text).replace(/\r\n|\r|\n/g, this.#lineEnding); this.#set('dirty'); return true;
     }
     async save() {
         if (this.#closed || this.#pending || !this.#editable || this.#state !== 'dirty') return;
@@ -207,7 +215,7 @@ export class ArtifactDraft {
             const latest = page.items?.[0];
             if (!latest || latest.ref.artifact_id !== this.#revision.ref.artifact_id) throw new Error('No current revision.');
             const loaded = await this.#loadRevision(latest.ref);
-            if (!sameScope(loaded.revision.scope, this.#revision.scope) || loaded.text === null
+            if (!sameScope(loaded.revision.scope, this.#revision.scope) || loaded.text === null || loaded.lineEnding === null
                 || loaded.file.path !== this.#file.path || loaded.file.media_type !== this.#file.media_type
                 || loaded.revision.manifest.files.length !== 1) throw new Error('The artifact structure changed.');
             if (this.#closed) return;

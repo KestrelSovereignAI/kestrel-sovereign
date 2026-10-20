@@ -33,15 +33,16 @@ test('real PDF bytes paint two navigable canvas pages without running document J
             if (path === '/') {
                 response.setHeader('Content-Type', 'text/html');
                 response.end(`<!doctype html><body><script type="module">
-                    import { createPdfPreview } from '/static/js/artifact_pdf.mjs';
+                    import { createPdfPreview } from '/js/artifact_pdf.mjs';
                     window.preview = createPdfPreview(Uint8Array.from(atob('${source}'), c => c.charCodeAt(0)));
                     document.body.append(preview.element); await preview.ready; window.ready = true;
                 </script></body>`); return;
             }
-            if (path !== '/static/js/artifact_pdf.mjs' && !path.startsWith('/static/vendor/pdfjs/')) {
+            // Match the product's /js mount; /vendor is deliberately absent.
+            if (path !== '/js/artifact_pdf.mjs' && !path.startsWith('/js/vendor/pdfjs/')) {
                 response.writeHead(404); response.end(); return;
             }
-            const file = new URL(path.slice('/static/'.length), assetRoot);
+            const file = new URL(`js/${path.slice('/js/'.length)}`, assetRoot);
             if (!file.href.startsWith(assetRoot.href)) throw new Error('Outside test assets');
             response.setHeader('Content-Type', path.endsWith('.mjs') || path.endsWith('.js') ? 'text/javascript'
                 : path.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream');
@@ -60,7 +61,7 @@ test('real PDF bytes paint two navigable canvas pages without running document J
             return route.continue();
         });
         await page.goto(origin); await page.waitForFunction(() => window.ready === true);
-        await page.getByText('Page 1 of 2', { exact: true }).waitFor();
+        assert.equal(await page.locator('p').textContent(), 'Page 1 of 2');
         const painted = async () => page.locator('canvas').evaluate(canvas => {
             const bytes = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
             let dark = 0;

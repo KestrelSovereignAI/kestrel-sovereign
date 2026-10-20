@@ -692,7 +692,8 @@ export function registerCoreParts() {
     registerPartRenderer('notice', noticePartRenderer);
     registerPartRenderer('channel_link', channelLinkPartRenderer);
     registerPartRenderer('todo', todoPartRenderer);
-    registerPartRenderer('artifact', (data, context) => artifactPartRenderer(data, context, deps().api));
+    registerPartRenderer('artifact', (data, context) => artifactPartRenderer(data,
+        { ...context, workspaceRoot: getOverlayRoot() }, deps().api));
 }
 
 // ============================================================================

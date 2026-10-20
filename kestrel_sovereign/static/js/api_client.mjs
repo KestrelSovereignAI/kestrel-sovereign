@@ -989,7 +989,7 @@ export function createApiClient({
             try {
                 headers = await buildHeaders(options.headers);
                 if (typeof onAuthPrepared === 'function') {
-                    onAuthPrepared(state.authIdentityGeneration);
+                    onAuthPrepared(state.authIdentityGeneration, headers);
                 }
             } catch (error) {
                 throwIfAborted(options.signal);
@@ -1086,14 +1086,24 @@ export function createApiClient({
         },
 
         // Bind a document/working-copy lifetime to this exact credential and
-        // agent. Re-authentication may not upload an old owner's draft into a
-        // new principal's staging namespace. The shared pipeline checks after
-        // auth preparation, including a 401 refresh, and BEFORE every fetch.
+        // agent. Only explicit API-key/Bearer credentials can currently bind a
+        // working copy. Cookie sessions need a host-enforced owner precondition
+        // before this transport can support them. Omit cookies even with an API
+        // key, so a rejected credential cannot fall through to a different user.
         async bindAgentRequests(agent = state.selectedHostAgent) {
-            await buildHeaders();
+            const initialHeaders = await buildHeaders();
             const generation = state.authIdentityGeneration;
-            const checkIdentity = (preparedGeneration) => {
-                if (preparedGeneration !== generation) {
+            const credential = credentialIdentity(initialHeaders);
+            const explicit = (headers) => {
+                const values = new Headers(headers);
+                return !!values.get('x-api-key')?.trim() || /^Bearer\s+\S/i.test(values.get('authorization') || '');
+            };
+            if (!explicit(initialHeaders)) {
+                const error = new Error('Artifact editing requires an explicit API key or bearer credential. Cookie sessions cannot bind drafts yet.');
+                error.code = 'artifact_auth_unbound'; throw error;
+            }
+            const checkIdentity = (preparedGeneration, headers) => {
+                if (preparedGeneration !== generation || !explicit(headers) || credentialIdentity(headers) !== credential) {
                     const error = new Error('Authentication changed. Reopen the artifact.');
                     error.code = 'artifact_auth_changed';
                     throw error;
@@ -1101,10 +1111,10 @@ export function createApiClient({
             };
             return Object.freeze({
                 request: (endpoint, options = {}) => performRequest(
-                    applyHostAgentPrefix(endpoint, agent), options, false, checkIdentity,
+                    applyHostAgentPrefix(endpoint, agent), { ...options, credentials: 'omit' }, false, checkIdentity,
                 ),
                 readBytes: (endpoint, options = {}) => performRequest(
-                    applyHostAgentPrefix(endpoint, agent), options, false, checkIdentity,
+                    applyHostAgentPrefix(endpoint, agent), { ...options, credentials: 'omit' }, false, checkIdentity,
                     (response) => response.arrayBuffer(),
                 ),
             });

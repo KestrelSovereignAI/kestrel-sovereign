@@ -12,6 +12,7 @@ const STATUS = {
     unavailable: 'This revision is unavailable or cannot be verified for viewing.',
 };
 const IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const workspaces = new WeakMap();
 
 function element(doc, tag, text, className) {
     const node = doc.createElement(tag);
@@ -62,7 +63,7 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
     const retry = button('Retry same save', () => draft.retry());
     const compare = button('Compare latest', () => draft.compareLatest());
     const rebase = button('Use latest as save base', () => draft.useComparedRevision());
-    const exportSaved = button('Download revision', () => download(draft.bytes, draft.file?.path.split('/').pop(), draft.file?.media_type));
+    const exportSaved = button('Download source file', () => download(draft.bytes, draft.file?.path.split('/').pop(), draft.file?.media_type));
     const exportDraft = button('Download draft', () => download(new TextEncoder().encode(draft.text), `draft-${draft.file?.path.split('/').pop() || 'notes.txt'}`, 'text/plain'));
     const historyButton = button('Revision history', async () => {
         const page = await draft.history();
@@ -118,6 +119,9 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
                 image.style.maxWidth = '100%'; viewer.append(image);
             } else if (draft.file.media_type === 'application/pdf') {
                 pdfPreview = createPdfPreview(draft.bytes, doc); viewer.append(pdfPreview.element);
+            } else if (draft.text) {
+                viewer.append(element(doc, 'p', 'This source has mixed line endings or belongs to a bundle. It is read-only here.'),
+                    element(doc, 'pre', draft.text));
             } else {
                 viewer.append(element(doc, 'p', 'Preview is unavailable for this file or bundle. Download the saved source to open it.'));
             }
@@ -148,6 +152,31 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
     return { element: root, draft, ready, dispose };
 }
 
+/** Open working copies belong to the app workspace, independently of chat cards. */
+export function openArtifactPanel({ client, ref, owner, root = globalThis.document.body }) {
+    const doc = root.ownerDocument;
+    let workspace = workspaces.get(root);
+    if (!workspace || !workspace.element.isConnected) {
+        const container = element(doc, 'aside', undefined, 'artifact-workspace');
+        container.setAttribute('aria-label', 'Open artifacts');
+        container.style.cssText = 'position:fixed;right:1rem;top:4rem;width:min(44rem,calc(100vw - 2rem));max-height:calc(100vh - 5rem);overflow:auto;z-index:1500;padding:1rem;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border-color);border-radius:12px;';
+        const heading = element(doc, 'h2', 'Open artifacts'), list = element(doc, 'div');
+        const toggle = element(doc, 'button', 'Collapse artifacts', 'btn btn-secondary'); toggle.type = 'button';
+        toggle.addEventListener('click', () => { list.hidden = !list.hidden; toggle.textContent = list.hidden ? 'Show artifacts' : 'Collapse artifacts'; });
+        container.append(heading, toggle, list); root.append(container);
+        workspace = { element: container, list, toggle }; workspaces.set(root, workspace);
+    }
+    workspace.list.hidden = false; workspace.toggle.textContent = 'Collapse artifacts';
+    const panel = createArtifactPanel({ client, ref, document: doc,
+        onOpenRevision: next => openArtifactPanel({ client, ref: next, owner, root }),
+        onClose: () => {
+            if (!workspace.list.childElementCount) { workspace.element.remove(); workspaces.delete(root); }
+        } });
+    if (owner) panel.element.prepend(element(doc, 'p', `Agent: ${owner}`, 'text-muted'));
+    workspace.list.append(panel.element); panel.element.scrollIntoView?.({ block: 'nearest' });
+    return panel;
+}
+
 export function artifactPartRenderer(data, context = {}, api) {
     const doc = globalThis.document;
     const card = element(doc, 'article', undefined, 'artifact-card');
@@ -157,33 +186,24 @@ export function artifactPartRenderer(data, context = {}, api) {
     const open = element(doc, 'button', 'Open saved artifact', 'btn btn-secondary'); open.type = 'button';
     card.append(title, open);
     const owner = context.ownerAgent === undefined ? api.getHostAgent() : context.ownerAgent;
-    const panels = new Set();
-    let opening = false, disposed = false;
+    let opening = false;
     async function show(ref) {
-        if (opening || disposed) return;
+        if (opening) return;
         opening = true; open.disabled = true;
         try {
             const client = await createArtifactClient(api, owner);
-            if (disposed) return;
-            const panel = createArtifactPanel({ client, ref, document: doc, onOpenRevision: show,
-                onClose: () => panels.delete(panel) });
-            panels.add(panel); card.append(panel.element);
+            // The overlay root is supplied by the embedder (the standalone
+            // console uses body). Never let a chat transcript own the draft.
+            const candidate = context.workspaceRoot;
+            const root = candidate?.isConnected && !context.paneElement?.contains(candidate) ? candidate : doc.body;
+            const panel = openArtifactPanel({ client, ref, owner, root });
             await panel.ready;
-        } catch (_) { open.textContent = 'Artifact access is unavailable'; }
+        } catch (error) {
+            open.textContent = error.code === 'artifact_auth_unbound'
+                ? 'Artifact access requires an API key or bearer credential' : 'Artifact access is unavailable';
+        }
         finally { opening = false; open.disabled = false; }
     }
     open.addEventListener('click', () => show(ref));
-    // Detached agent panes are retained by the console. Dispose only when the
-    // card itself is removed from its parent, not when its pane is off-screen.
-    if (globalThis.MutationObserver) queueMicrotask(() => {
-        if (!card.parentNode) return;
-        const ownerRoot = context.paneElement || card.closest('.chat-container-pane') || card.parentNode;
-        const observer = new MutationObserver(() => {
-            if (ownerRoot.contains(card)) return;
-            disposed = true;
-            observer.disconnect(); for (const panel of panels) panel.dispose(); panels.clear();
-        });
-        observer.observe(ownerRoot, { childList: true, subtree: true });
-    });
     return card;
 }

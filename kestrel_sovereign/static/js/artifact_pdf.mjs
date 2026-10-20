@@ -1,11 +1,11 @@
 /** Local, canvas-only PDF rendering: no document actions, links or form scripts. */
-const ASSETS = new URL('../vendor/pdfjs/', import.meta.url);
+const ASSETS = new URL('./vendor/pdfjs/', import.meta.url);
 const MAX_PIXELS = 4_000_000;
 const MAX_SIDE = 2048;
 const PREVIEW_TIMEOUT_MS = 15_000;
 
 export function createPdfPreview(bytes, doc = globalThis.document, {
-    loadLibrary = () => import('../vendor/pdfjs/pdf.min.mjs'),
+    loadLibrary = () => import('./vendor/pdfjs/pdf.min.mjs'),
     timeoutMs = PREVIEW_TIMEOUT_MS,
 } = {}) {
     const root = doc.createElement('section'); root.setAttribute('aria-label', 'PDF preview');
