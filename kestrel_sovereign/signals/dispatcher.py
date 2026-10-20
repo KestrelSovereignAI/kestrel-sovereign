@@ -1579,11 +1579,12 @@ class SignalDispatcher:
 
         task.add_done_callback(complete, context=self._resident_timer_context())
 
-    def _track_resident_durable_task(self, coro, *, name):
+    def _track_resident_durable_task(self, coro, *, name, admission=None):
         """One resident publisher for initial delivery handoff and retry drains."""
         tracker = getattr(type(self._agent), "_track_runtime_task", None)
         if callable(tracker):
-            return tracker(self._agent, coro, name=name)
+            options = {"admission": admission} if admission is not None else {}
+            return tracker(self._agent, coro, name=name, **options)
         # Legacy dispatcher embeddings have no hosted execution authority.
         # They may not impersonate a runtime handoff under an admitted scope.
         from kestrel_sovereign.execution_custody import (
@@ -1592,7 +1593,8 @@ class SignalDispatcher:
         if current_execution_custody(self._agent):
             coro.close()
             raise ExecutionAuthorityError("durable handoff requires original runtime owner")
-        return asyncio.create_task(coro, name=name)
+        from kestrel_sovereign._async_ownership import create_owned_task
+        return create_owned_task(coro, name=name, admission=admission)
 
     async def _drain_durable_cognition_consumer(self, consumer_id: str) -> None:
         """Claim and route all currently-due work for one durable consumer."""
@@ -4825,9 +4827,43 @@ class SignalDispatcher:
                     reset_current_signal(signal_token)
                     self._durable_admission.reset(token)
 
-            resident = self._track_resident_durable_task(
-                resident_delivery(), name=f"durable_cognition_owner:{delivery.delivery_id}",
-            )
+            from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            publication = OwnedTaskAdmission()
+            operation = resident_delivery()
+            try:
+                resident = self._track_resident_durable_task(
+                    operation, name=f"durable_cognition_owner:{delivery.delivery_id}",
+                    admission=publication,
+                )
+            except BaseException as opening:
+                accepted = publication.task
+                terminal = opening
+                if accepted is not None:
+                    accepted.cancel()
+                    outcome = await await_owned_task(accepted, cancel_on_caller_cancellation=True)
+                    terminal = execution_observation_error(
+                        opening, outcome.error, outcome.cancellation,
+                    )
+                    finish = getattr(type(self._agent), "_finish_background_task", None)
+                    if callable(finish):
+                        finish(self._agent, accepted)
+                # The native completed callback may be the publication that
+                # failed. Only this physical join permits closing its submitted
+                # coroutine if the READY wrapper never entered it.
+                operation.close()
+                try:
+                    if is_execution_control_error(terminal):
+                        await self._terminalize_failed_cognition(delivery, terminal)
+                    else:
+                        await self.nack_durable_delivery(
+                            consumer_id=consumer_id, delivery_id=delivery.delivery_id,
+                            lease_token=delivery.lease_token or "",
+                            error="Resident delivery publication failed", retry_delay=retry_delay,
+                        )
+                except BaseException as cleanup:
+                    raise execution_observation_error(terminal, cleanup)
+                raise terminal
         else:
             resident = None
 

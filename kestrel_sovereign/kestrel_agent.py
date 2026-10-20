@@ -9501,13 +9501,16 @@ Expected Duration: {expected_duration}
             context.run(_CURRENT_CUSTODY.set, (scope,))
         return context
 
-    def _track_runtime_task(self, coro, *, name: str) -> asyncio.Task:
+    def _track_runtime_task(self, coro, *, name: str, admission=None) -> asyncio.Task:
         """Publish an explicit first-party resident owner, never an effect child.
 
         Creation requires every current admission to be live; READY publication
         checks them again. Only then does this service run under the original
         runtime generation. Ordinary `_track_background_task` children retain
         all denying ancestors and never receive this handoff.
+
+        An explicit admission receipt retains the exact accepted Task if later
+        publication raises; that caller must join it before releasing storage.
         """
         from kestrel_sovereign.execution_custody import require_execution_work
         try:
@@ -9530,12 +9533,22 @@ Expected Duration: {expected_duration}
         # it does not mint a replacement admission or refresh a generation.
         from kestrel_sovereign._async_ownership import create_owned_task
         try:
-            task = create_owned_task(resident(), name=name, context=context)
+            try:
+                task = create_owned_task(
+                    resident(), name=name, context=context, admission=admission,
+                )
+            finally:
+                if admission is not None and admission.task is not None:
+                    # The exact accepted owner survives even if create_owned
+                    # or a subsequent publication callback refuses to return.
+                    admission.task._kestrel_started_at = time.monotonic()
+                    self._background_tasks.add(admission.task)
         except BaseException:
             # Canonical admission closes the refused resident wrapper. Its
             # submitted operation has not entered (READY remains separate),
             # so this original publisher must close that fresh coroutine too.
-            coro.close()
+            if admission is None or admission.task is None:
+                coro.close()
             raise
         task._kestrel_started_at = time.monotonic()
         self._background_tasks.add(task)
