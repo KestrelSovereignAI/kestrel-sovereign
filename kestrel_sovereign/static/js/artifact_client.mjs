@@ -180,7 +180,7 @@ export class ArtifactDraft {
             if (this.#closed) return;
             if ([401, 403].includes(error.status) || error.code === 'artifact_auth_changed') this.#set('denied');
             else if (error.status === 404 && pending.phase === 'commit') {
-                // Missing staging may have expired. Only a 404 from status is
+                // Missing staging may have expired. Only an artifact_not_found status response is
                 // terminal erasure. Retry retains the exact key/request/bytes.
                 pending.phase = 'stage'; pending.uncertain = true; this.#set('unknown');
             }
@@ -197,7 +197,7 @@ export class ArtifactDraft {
             if (receipt) await this.#accepted(receipt);
             else this.#set(previous === 'conflict' ? 'conflict' : 'unknown');
         } catch (error) {
-            this.#set(error.status === 404 ? 'erased' : [401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unknown');
+            this.#set(error.status === 404 && error.code === 'artifact_not_found' ? 'erased' : [401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unknown');
         }
     }
     async retry() {

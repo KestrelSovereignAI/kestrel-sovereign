@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { ArtifactDraft, publicationDigests, sha256 } from '../../kestrel_sovereign/static/js/artifact_client.mjs';
+import { ArtifactDraft, createArtifactClient, publicationDigests, sha256 } from '../../kestrel_sovereign/static/js/artifact_client.mjs';
 import { createApiClient, createKestrelStandaloneAuthProvider } from '../../kestrel_sovereign/static/js/api_client.mjs';
 
 const scope = { schema_version: 1, tenant_id: 'tenant', principal_id: 'person', agent_id: 'agent' };
@@ -84,7 +84,7 @@ test('erased publication is terminal and cannot automatically republish', async 
     const { draft, client, staged } = await fixture();
     client.commit = async () => { throw new Error('lost'); };
     draft.edit('keep'); await draft.save();
-    client.status = async () => { throw { status: 404 }; };
+    client.status = async () => { throw { status: 404, code: 'artifact_not_found' }; };
     await draft.retry(); assert.equal(draft.state, 'erased');
     await draft.retry(); await draft.save(); assert.equal(staged.length, 1); draft.close();
 });
@@ -237,4 +237,34 @@ test('mixed line endings stay read-only and retain original source bytes', async
     const { draft, bytes } = await fixture('first\r\nsecond\nthird\r');
     assert.equal(draft.editable, false); assert.equal(draft.edit('replacement'), false);
     assert.deepEqual(draft.bytes, bytes); draft.close();
+});
+
+
+test('receipt recovery distinguishes host 404 from artifact erasure through bound transport', async () => {
+    for (const body of [{ error: { code: 'agent_not_found', message: 'Agent unavailable' } }, { detail: 'Not Found' },
+        { error: { code: 'artifact_not_found', message: 'Publication erased' } }]) {
+        const { draft, client, committed } = await fixture();
+        const commit = client.commit; let receipt;
+        client.commit = async request => { receipt = await commit(request); throw new Error('lost acknowledgement'); };
+        draft.edit('recoverable'); await draft.save(); const key = draft.pendingKey;
+        const responses = [new Response(JSON.stringify(body), { status: 404 }), new Response(JSON.stringify(receipt))];
+        const calls = [];
+        const api = createApiClient({ authProvider: { ensureAuthenticated: async () => {},
+            applyAuth: async headers => ({ ...headers, Authorization: 'Bearer original' }) },
+            fetchFn: async url => { calls.push(url); return responses.shift(); },
+            sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+            location: { href: 'http://test/', search: '' } });
+        client.status = (await createArtifactClient(api, 'agent')).status;
+        await draft.reconcile();
+        if (body.error?.code === 'artifact_not_found') {
+            assert.equal(draft.state, 'erased'); await draft.retry();
+            assert.equal(calls.length, 1); draft.close(); continue;
+        }
+        assert.equal(draft.state, 'unknown'); assert.equal(draft.pendingKey, key);
+        assert.equal(draft.text, 'recoverable');
+        await draft.retry();
+        assert.equal(draft.state, 'saved'); assert.equal(committed.length, 1);
+        assert.equal(calls.length, 2); assert.equal(calls[0], calls[1]);
+        assert.match(calls[0], new RegExp(`/publications/${key}$`)); draft.close();
+    }
 });
