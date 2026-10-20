@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-19
-**Scope:** 3150 tracked files (2339 `.py`, 362 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-20
+**Scope:** 3153 tracked files (2341 `.py`, 363 `.md`, 449 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1907,7 +1907,7 @@ Repo entry points and standard project files.
 - **docs/architecture/security/IDENTITY_PACKAGE_PRIVACY.md** — Identity Package Privacy Contract — ## Contract
 - **docs/architecture/security/INTEGRITY_AUDIT_SYSTEM.md** — Kestrel Integrity Audit System — **Date:** November 9, 2025 **Version:** 1.0 **Component:** Constitutional AI Enforcement Mechanism
 - **docs/architecture/security/KEY_MANAGEMENT.md** — Key Management Architecture — ## Overview
-- **docs/architecture/security/KEY_ROTATION.md** — Key Rotation Mechanism — ## Overview
+- **docs/architecture/security/KEY_ROTATION.md** — Key Rotation Mechanism — `KeyRotationService` is an internal maintenance service.
 - **docs/architecture/security/MEMORY_CONTENT_ENCRYPTION.md** — Saved-item and RAG content encryption — ## Status and scope
 - **docs/architecture/security/PHOENIX_TRACE_CUSTODY.md** — Phoenix trace custody — Phoenix stores observability data that can contain user prompts, model outputs, tool inputs and results, provider metadata, and exception details.
 - **docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md** — Post-Quantum Cryptography Migration — PRD v2 — **Status:** ✅ All technical waves shipped (May 2026).
@@ -2158,6 +2158,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.53.32.md** — Core 0.53.32 — Atomic stream-owner construction — Status: candidate; publication and artifact verification remain required.
 - **docs/releases/v0.53.33.md** — Core 0.53.33 — Wait-worker resident custody — Status: candidate; review, CI, publication and artifact verification are required.
 - **docs/releases/v0.53.34.md** — Core 0.53.34 — Sovereignty retrieval and portable conversations — Status: candidate; release review, CI, publication and artifact verification are required.
+- **docs/releases/v0.53.35.md** — Core 0.53.35 — Original Future and Task custody — Status: candidate; product merge, release review, CI, publication and artifact verification are required.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
@@ -2762,6 +2763,8 @@ Repo entry points and standard project files.
   - `def stub_agent()`; `def scrub_github_tokens(monkeypatch)`; `async def test_create_issue_returns_ok_against_stub_github(stub_agent)`; `async def test_create_issue_bypasses_shell_subprocess(stub_agent)`
 - **tests/integration/test_key_management.py** — Integration Tests for API Key Management System.
   - `async def temp_db()`; `def data_key()`; `async def key_storage(temp_db, data_key)`; `class TestServiceKeyStorage`; `class TestKeyResolutionService`; `class TestKeyManagementFeature`; `class TestKnownProviders`; `class TestMasterKeyNotConfigured`; `…`
+- **tests/integration/test_key_rotation_recovery.py** — Real SQLite/PostgreSQL recovery tests, using Core's current SDK dependency.
+  - `async def rotation_store(tmp_path, monkeypatch, request)`; `async def reject_writes(db, table, failure)`; `async def assert_rotated(store)`; `async def test_partial_failure_resumes_original_journal(rotation_store, monkeypatch, tmp_path, table, …)`; `async def test_mandatory_envelope_rows_cannot_be_skipped(rotation_store, failure)`; `async def test_legacy_database_without_artifact_table_still_rotates(rotation_store)`; `async def test_valid_journal_can_be_resumed_after_an_interruption(rotation_store)`; `async def allow_writes(db, table)`; `…`
 - **tests/integration/test_late_native_finite_evidence.py** — Later native evidence cannot lose an earlier actual finite withdrawal.
   - `async def test_forwarded_manager_summary_stays_unscoped_after_real_native_denials(native_pg, onboarding_owner, monkeypatch, writer, …)`; `async def test_ordinary_first_join_keeps_current_c_until_later_native_control(native_pg, onboarding_owner, monkeypatch, surface, …)`; `async def test_lifecycle_join_returns_actual_native_failure_and_every_current_c(native_pg, onboarding_owner, monkeypatch, source_cancel, …)`
 - **tests/integration/test_legacy_session_stamp_backends.py** — #3120's migration, run against a real PostgreSQL as well as SQLite.
@@ -2996,8 +2999,8 @@ Repo entry points and standard project files.
   - `async def test_runtime_report_distinguishes_missing_zero_and_system_disabled(tmp_path)`; `async def test_enabled_schedules_without_valid_next_run_are_not_runnable(tmp_path)`; `async def test_multi_owner_health_uses_fresh_healthy_worker_without_peer_flap(tmp_path)`; `async def test_runtime_status_bounds_historical_owners_and_reaps_expired_rows(tmp_path)`; `async def test_runtime_status_reaps_revoked_tenants_without_deleting_peer_rows(tmp_path)`; `async def test_paged_runtime_status_retains_other_authority_pages(tmp_path)`; `async def test_runtime_status_migrates_agent_primary_key_without_losing_report(tmp_path)`; `async def test_terminal_one_shot_is_history_not_recoverable_disablement(tmp_path)`; `…`
 - **tests/integration/test_scheduler_scope_entry.py** — Original Scheduler deadline loss at native evidence ACK, before scope yield.
   - `async def test_original_deadline_expiry_before_scope_yield_is_not_host_failure(native_pg, monkeypatch)`
-- **tests/integration/test_scheduler_watcher_admission.py** — Watcher refusal must join its original real native COMMIT-ACK owner.
-  - `async def test_refused_lease_watcher_joins_original_native_effect(native_pg, monkeypatch, lost_ack, phase)`
+- **tests/integration/test_scheduler_watcher_admission.py** — Gated watcher admission and reachable original native COMMIT-ACK retirement.
+  - `async def test_refused_lease_watcher_retires_original_gated_effect(native_pg, monkeypatch, phase, eager)`; `async def test_original_native_effect_retirement_after_commit(native_pg, monkeypatch, lost_ack, phase, …)`
 - **tests/integration/test_sdk_response_close_original_control.py** — Actual SDK-acquired HTTP response close keeps native PG originals.
   - `async def test_sdk_native_response_close_preserves_original_admission_and_observers(native_pg, monkeypatch, provider, route, …)`
 - **tests/integration/test_sdk_retry_original_native_control.py** — Real SDK retries against localhost must not consume original PG control.
@@ -4160,6 +4163,8 @@ Repo entry points and standard project files.
   - `def source(kind)`; `async def test_finite_native_composer_keeps_actual_current_c_and_immutable_sources(kind)`; `def test_finite_nonnative_caused_cancellation_keeps_generic_default(retain)`; `def test_observation_of_already_enclosing_original_does_not_add_envelope_history(kind)`; `def test_finite_composition_keeps_cyclic_component_beside_independent_original(composer, order, kind)`; `def test_all_three_lifecycle_consumers_use_explicit_finite_policy()`; `def test_manager_summary_monotonic_priority_and_exact_selected_source(order)`; `def test_many_distinct_completed_sources_do_not_form_manager_lifetime_history()`; `…`
 - **tests/unit/test_fleet_orchestrator_definition.py** — The Fleet Orchestrator agent definition (#2321).
   - `def test_friendly_name_and_slug()`; `def test_feature_ceiling_has_the_dispatch_and_read_surface()`; `def test_feature_ceiling_excludes_write_edit_features()`; `def test_mandatory_tool_floor_is_derived_from_real_feature_classes()`; `def test_allowlist_denies_write_edit_and_mutation_tools()`; `def test_allowed_dispatch_and_read_tools_are_not_denied()`; `def test_scheduler_read_status_tools_remain_available()`; `def test_explicit_mandatory_mutations_are_the_only_allow_deny_overlap()`; `…`
+- **tests/unit/test_foreign_future_custody.py** — The asyncio Future-like protocol does not require writable private metadata.
+  - `class SlotFutureLike`; `class ReadOnlyNativeFuture`; `async def test_slots_only_future_protocol_needs_no_mutation_or_task_allocation(kind, future_kind, completed)`; `async def test_slots_only_future_retains_its_join_through_repeated_caller_cancellation(failure, future_kind)`; `async def test_readonly_foreign_facade_reuses_producer_retained_native_original()`; `async def test_core_owned_task_subclass_keeps_exact_admission_edges_and_original_error(eager)`; `async def test_metadata_receipt_publication_failure_joins_actual_accepted_task_without_running_payload(mode, eager)`; `async def test_creator_preserves_exact_failed_task_when_postaccept_publication_is_refused(mode, eager, close_fails, source_kind, …)`; `…`
 - **tests/unit/test_gate_health_task_admission.py** — Unaccepted original gate/persistence coroutines must be closed, not owned.
   - `def original_gate_proxy(agent)`; `async def test_refused_original_gate_or_persist_coroutine_is_closed(tmp_path, monkeypatch, surface)`; `async def test_gate_transition_does_not_adopt_actual_foreign_native_task(tmp_path, monkeypatch)`; `async def test_canonical_admission_does_not_move_original_work_to_another_loop(tmp_path, monkeypatch)`
 - **tests/unit/test_gate_rejected_attempt_telemetry.py** — #3576: a generation the gate rejects is recorded as a failed attempt.
@@ -5292,7 +5297,7 @@ Repo entry points and standard project files.
 - **tests/utils/agent_identities.py** — Real ``AgentIdentity`` values in each of the three on-disk shapes.
   - `def legacy_identity(did)`; `def rotated_identity(legacy_did, successor_did)`; `def born_hybrid_identity(did)`
 - **tests/utils/aiosqlite_workers.py** — Failure injection helpers for aiosqlite worker-lifecycle tests.
-  - `def aiosqlite_worker(connection)`; `class CloseStage`; `class BoundedCloseStages`; `def observe_bounded_close_stages()`; `def delay_aiosqlite_worker_exit(release_worker, worker_exit_delayed)`; `async def wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed)`; `async def wait_for_lifecycle_checkpoint(checkpoint, lifecycle_task)`
+  - `def aiosqlite_worker(connection)`; `def block_aiosqlite_native_close(connection)`; `class CloseStage`; `class BoundedCloseStages`; `def observe_bounded_close_stages()`; `async def normal_close_schedule()`; `def delay_aiosqlite_worker_exit(release_worker, worker_exit_delayed)`; `async def wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed)`; `…`
 - **tests/utils/anthropic_client.py** — Stand-ins for the two Anthropic SDK client surfaces a non-streaming ``AnthropicAdapter`` request touches (#3300).
   - `def anthropic_model_record(model_id)`; `def install_models_api(client)`; `def models_api()`; `class FinalMessageStream`; `def install_final_message(client, message)`; `def anthropic_client(message)`; `def anthropic_bad_request(message)`; `class ForcedToolRefusingMessages`; `…`
 - **tests/utils/async_waits.py** — Async wait utilities to replace hardcoded sleep statements.
