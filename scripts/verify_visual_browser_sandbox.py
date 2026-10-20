@@ -19,6 +19,18 @@ from pathlib import Path
 LABEL = "io.kestrel.visual-browser-probe"
 ROOT = Path(__file__).resolve().parents[1]
 CONTEXT = ROOT / "docker" / "visual-browser"
+SECCOMP_SHA256 = "38c15179be39d9bc1aadf19b06618bdb0dd9137f531435ff306c8dccf3b59f19"
+MASKED_PATHS = {"/proc/acpi", "/proc/asound", "/proc/interrupts", "/proc/kcore", "/proc/keys",
+                "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi", "/proc/timer_list",
+                "/proc/timer_stats", "/sys/devices/virtual/powercap", "/sys/firmware"}
+READONLY_PATHS = {"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"}
+
+
+def verified_seccomp_policy() -> dict:
+    content = (CONTEXT / "seccomp.json").read_bytes()
+    if hashlib.sha256(content).hexdigest() != SECCOMP_SHA256:
+        raise RuntimeError("browser seccomp policy digest differs from the reviewed profile")
+    return json.loads(content)
 
 
 def container_arguments(image: str, identity: str) -> list[str]:
@@ -27,7 +39,8 @@ def container_arguments(image: str, identity: str) -> list[str]:
         "--init", "--network", "none", "--read-only", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--security-opt", f"seccomp={CONTEXT / 'seccomp.json'}",
-        "--memory", "1g", "--cpus", "2", "--pids-limit", "256", "--shm-size", "256m",
+        "--memory", "1g", "--memory-swap", "1g", "--ipc", "private",
+        "--cgroupns", "private", "--runtime", "runc", "--cpus", "2", "--pids-limit", "256", "--shm-size", "256m",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
         image, "python", "/opt/kestrel-browser/sandbox_probe.py",
     ]
@@ -36,7 +49,7 @@ def container_arguments(image: str, identity: str) -> list[str]:
 def verify_container(record: dict, image: str, identity: str) -> None:
     host, config = record["HostConfig"], record["Config"]
     policies = [option.partition("=")[2] for option in host["SecurityOpt"] if option.startswith("seccomp=")]
-    expected_policy = json.loads((CONTEXT / "seccomp.json").read_text())
+    expected_policy = verified_seccomp_policy()
     policy_matches = len(policies) == 1 and json.loads(policies[0]) == expected_policy
     checks = (
         record["Image"] == image,
@@ -50,13 +63,22 @@ def verify_container(record: dict, image: str, identity: str) -> None:
         not host.get("Binds"), not host.get("Mounts"),
         not host.get("Devices"), not host.get("DeviceRequests"),
         not host.get("PortBindings"), host.get("PublishAllPorts") is False,
-        all(mount["Type"] == "tmpfs" and mount["Destination"] == "/tmp" for mount in record.get("Mounts", [])),
+        record.get("Mounts") == [],
+        host.get("Tmpfs") == {"/tmp": "rw,nosuid,nodev,size=256m,mode=1777"},
+        set(host.get("MaskedPaths") or []) == MASKED_PATHS,
+        set(host.get("ReadonlyPaths") or []) == READONLY_PATHS,
+        not host.get("VolumesFrom"), not host.get("DeviceCgroupRules"),
         host.get("PidMode", "") == "",
-        host.get("IpcMode") != "host",
-        host["Memory"] == 1024**3,
+        host.get("IpcMode") == "private",
+        host.get("UTSMode") == "", host.get("UsernsMode") == "",
+        host.get("CgroupnsMode") == "private", host.get("CgroupParent") == "",
+        host.get("Runtime") == "runc", not host.get("Sysctls"),
+        host.get("OomKillDisable") is False, host.get("Init") is True,
+        host["Memory"] == host.get("MemorySwap") == 1024**3,
         host["NanoCpus"] == 2_000_000_000,
         host["PidsLimit"] == 256,
         host["ShmSize"] == 256 * 1024**2,
+        len(host["SecurityOpt"]) == 2,
         any(option in {"no-new-privileges", "no-new-privileges=true"} for option in host["SecurityOpt"]),
         policy_matches,
     )
@@ -80,6 +102,7 @@ def verify_result(result: dict) -> bytes:
 
 
 def run(output: Path, *, docker: str) -> dict:
+    verified_seccomp_policy()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     identity = uuid.uuid4().hex
     tag = f"kestrel-visual-browser-probe:{identity}"

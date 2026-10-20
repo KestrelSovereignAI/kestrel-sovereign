@@ -14,6 +14,10 @@ def container():
             "Config": {"Labels": {probe.LABEL: "test"}, "User": "pwuser"},
             "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "Privileged": False,
                 "CapDrop": ["ALL"], "PidMode": "", "IpcMode": "private", "PublishAllPorts": False,
+                "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=256m,mode=1777"},
+                "MaskedPaths": sorted(probe.MASKED_PATHS), "ReadonlyPaths": sorted(probe.READONLY_PATHS),
+                "UTSMode": "", "UsernsMode": "", "CgroupnsMode": "private", "CgroupParent": "",
+                "Runtime": "runc", "OomKillDisable": False, "Init": True, "MemorySwap": 1024**3,
                 "Memory": 1024**3, "NanoCpus": 2_000_000_000, "PidsLimit": 256, "ShmSize": 256*1024**2,
                 "SecurityOpt": ["no-new-privileges", "seccomp=" + (probe.CONTEXT / "seccomp.json").read_text()]}}
 
@@ -21,7 +25,10 @@ def container():
 def test_container_admission_and_command_agree_on_isolation():
     probe.verify_container(container(), "sha256:test", "test")
     arguments = probe.container_arguments("sha256:test", "test")
-    for name, value in [("--network", "none"), ("--cap-drop", "ALL"), ("--memory", "1g"), ("--pids-limit", "256")]:
+    for name, value in [("--network", "none"), ("--cap-drop", "ALL"), ("--memory", "1g"),
+                        ("--memory-swap", "1g"), ("--ipc", "private"), ("--cgroupns", "private"),
+                        ("--runtime", "runc"), ("--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777"),
+                        ("--cpus", "2"), ("--shm-size", "256m"), ("--pids-limit", "256")]:
         assert arguments[arguments.index(name) + 1] == value
     assert "--read-only" in arguments and "--init" in arguments
     assert "--privileged" not in arguments and "--volume" not in arguments and "--publish" not in arguments
@@ -32,6 +39,12 @@ def test_container_admission_and_command_agree_on_isolation():
     ("CapDrop", []), ("CapAdd", ["SYS_ADMIN"]), ("Binds", ["/:/host"]),
     ("Devices", [{"PathOnHost": "/dev/kvm"}]), ("PidMode", "host"), ("IpcMode", "host"),
     ("PublishAllPorts", True), ("Memory", 0), ("NanoCpus", 0), ("PidsLimit", 0),
+    ("Tmpfs", {"/tmp": "rw,exec,mode=1777", "/home/pwuser": "rw,exec"}),
+    ("MemorySwap", -1), ("Init", False), ("DeviceCgroupRules", ["a *:* rwm"]),
+    ("CgroupParent", "other"), ("VolumesFrom", ["other"]), ("MaskedPaths", []), ("ReadonlyPaths", []),
+    ("UTSMode", "host"), ("UsernsMode", "host"), ("CgroupnsMode", "host"),
+    ("IpcMode", "container:other"), ("Runtime", "custom"), ("Sysctls", {"net.ipv4.ip_forward": "1"}),
+    ("OomKillDisable", True), ("SecurityOpt", container()["HostConfig"]["SecurityOpt"] + ["systempaths=unconfined"]),
     ("SecurityOpt", ["no-new-privileges", 'seccomp={"defaultAction":"SCMP_ACT_ALLOW"}']),
 ])
 def test_refuses_weakened_actual_docker_configuration(field, value):
@@ -66,7 +79,7 @@ def test_refuses_incomplete_or_unverified_browser_evidence(change):
 
 
 def test_seccomp_keeps_upstream_default_deny_and_enables_only_sandbox_namespaces():
-    profile = json.loads((probe.CONTEXT / "seccomp.json").read_text())
+    profile = probe.verified_seccomp_policy()
     assert profile["defaultAction"] == "SCMP_ACT_ERRNO"
     assert set(profile["syscalls"][0]["names"]) == {"clone", "chroot", "setns", "unshare"}
     assert profile["syscalls"][0]["action"] == "SCMP_ACT_ALLOW"
@@ -148,3 +161,20 @@ def test_cleanup_refuses_a_replaced_container_owner(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="unowned container"):
         probe.run(tmp_path / "evidence", docker="docker")
     assert not any("rm" in call for call in calls)
+
+
+def test_modified_seccomp_policy_is_rejected_before_docker_build(tmp_path, monkeypatch):
+    context = tmp_path / 'context'; context.mkdir()
+    profile = json.loads((probe.CONTEXT / 'seccomp.json').read_text())
+    profile['syscalls'].append({'names': ['bpf', 'mount', 'pivot_root', 'umount2', 'keyctl', 'add_key', 'perf_event_open'],
+                                'action': 'SCMP_ACT_ALLOW'})
+    (context / 'seccomp.json').write_text(json.dumps(profile))
+    monkeypatch.setattr(probe, 'CONTEXT', context)
+    calls = []
+    def engine(command, **kwargs):
+        calls.append(command)
+        raise AssertionError('modified policy reached Docker')
+    monkeypatch.setattr(probe.subprocess, 'run', engine)
+    with pytest.raises(RuntimeError, match='seccomp policy digest'):
+        probe.run(tmp_path / 'evidence', docker='docker')
+    assert calls == []
