@@ -53,6 +53,14 @@ class UnifiedStoreBase:
         """Check if using SQLite backend."""
         return self._backend.backend_type == "sqlite"
 
+    def write_transaction(self):
+        """Serialize a read/modify/write unit on the supported canonical backend."""
+        if self.is_sqlite:
+            return self._backend.transaction(immediate=True)
+        if self.is_postgres:
+            return self._backend.transaction()
+        raise ValueError("Native stores require a SQLite or PostgreSQL backend")
+
     # ==========================================================================
     # SQL Dialect Helpers
     # ==========================================================================

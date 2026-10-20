@@ -67,6 +67,7 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextOwnershipError,
     ContextStore,
 )
+from kestrel_sovereign.a2a.stores.unified.outbound_store import OutboundStore
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     NativeTaskSnapshot,
     TaskCancellationSnapshot,
@@ -196,6 +197,9 @@ class TaskManager:
         self.feedback_store = feedback_store
         self.hooks_manager = hooks_manager
         self.host_agent_id = task_store.scope.recipient_id
+        self.outbound_store = OutboundStore(
+            task_store.backend, sender_scope=task_store.scope, owns_backend=False
+        )
 
         # Callback for task completion notifications (for chat notifications)
         self._on_task_complete = on_task_complete
@@ -252,6 +256,7 @@ class TaskManager:
 
     async def initialize(self) -> None:
         """Initialize all stores."""
+        await self.outbound_store.initialize()
         await self.task_store.initialize()
         await self.context_store.initialize()
         await self.session_service.initialize()
@@ -295,6 +300,7 @@ class TaskManager:
             ("session_service", self.session_service),
             ("context_store", self.context_store),
             ("task_store", self.task_store),
+            ("outbound_store", self.outbound_store),
         )
         for name, store in stores:
             if store is None:
@@ -1137,11 +1143,7 @@ class TaskManager:
         )
         # Reserve ownership and task in ONE backend transaction. A failed insert
         # cannot strand a context reservation or authorize another creator.
-        transaction = (
-            self.task_store.backend.transaction(immediate=True)
-            if self.task_store.is_sqlite
-            else self.task_store.backend.transaction()
-        )
+        transaction = self.task_store.write_transaction()
         ownership_refusal = None
         async with transaction:
             try:

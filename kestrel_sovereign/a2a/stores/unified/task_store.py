@@ -684,11 +684,7 @@ class TaskStore(UnifiedStoreBase):
             recipient_agent_id,
             *(_stored_state(state) for state in expected_states),
         )
-        transaction = (
-            self._backend.transaction(immediate=True)
-            if self.is_sqlite
-            else self._backend.transaction()
-        )
+        transaction = self.write_transaction()
         conflict = None
         committed = None
         async with transaction:
@@ -1111,11 +1107,7 @@ class TaskStore(UnifiedStoreBase):
 
         timestamp = Timestamp()
         timestamp.FromDatetime(datetime.now(UTC))
-        transaction = (
-            self._backend.transaction(immediate=True)
-            if self.is_sqlite
-            else self._backend.transaction()
-        )
+        transaction = self.write_transaction()
         recipient_predicate = (
             "AND recipient_agent_id = ?"
             if expected_recipient_agent_id is not None
@@ -1263,11 +1255,7 @@ class TaskStore(UnifiedStoreBase):
         if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
             raise ValueError("Task artifact recipient must be a concrete identity")
 
-        transaction = (
-            self._backend.transaction(immediate=True)
-            if self.is_sqlite
-            else self._backend.transaction()
-        )
+        transaction = self.write_transaction()
         unauthorized = False
         terminal_status: str | None = None
         update_conflict = False
