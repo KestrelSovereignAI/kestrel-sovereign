@@ -474,3 +474,37 @@ test('unsupported reference versions are refused before fetching metadata', asyn
     const draft=new ArtifactDraft(item.client);await draft.open({...ref,schema_version:2});
     assert.equal(draft.state,'unavailable');assert.equal(reads,0);draft.close();
 });
+
+test('rebasing onto a single line retains the draft line-ending convention', async () => {
+    for(const ending of ['\r\n','\r']){
+        const {draft,client,revision,staged}=await fixture(`a${ending}b${ending}`);const commit=client.commit;
+        client.commit=async()=>{throw {status:409};};draft.edit('a\nb\nmine\n');await draft.save();
+        const bytes=new TextEncoder().encode('single line');const latest=structuredClone(revision);latest.ref.revision_id='single-line';
+        Object.assign(latest.manifest.files[0],{size_bytes:bytes.length,sha256:await sha256(bytes)});
+        client.head=async()=>latest;client.get=async()=>latest;client.read=async()=>bytes;
+        await draft.compareLatest();assert.equal(draft.useComparedRevision(),true);
+        assert.equal(draft.text,`a${ending}b${ending}mine${ending}`);client.commit=commit;await draft.save();
+        assert.equal(new TextDecoder().decode(staged.at(-1).content),`a${ending}b${ending}mine${ending}`);draft.close();
+    }
+});
+
+test('a failed comparison clears obsolete source and can retry without losing draft or save key', async () => {
+    const {draft,client,revision}=await fixture();client.commit=async()=>{throw {status:409};};
+    draft.edit('retained');await draft.save();const key=draft.pendingKey;
+    const latest=structuredClone(revision);latest.ref.revision_id='second';client.head=async()=>latest;client.get=async()=>latest;
+    await draft.compareLatest();assert.equal(draft.comparison.revision.ref.revision_id,'second');
+    client.head=async()=>{throw {status:404,code:'agent_not_found'};};await draft.compareLatest();
+    assert.equal(draft.state,'compare_failed');assert.equal(draft.comparison,null);assert.equal(draft.useComparedRevision(),false);
+    assert.equal(draft.hasUnsavedChanges,true);assert.equal(draft.text,'retained');assert.equal(draft.pendingKey,key);
+    client.head=async()=>latest;await draft.compareLatest();assert.equal(draft.state,'conflict');
+    assert.equal(draft.useComparedRevision(),true);assert.equal(draft.text,'retained');draft.close();
+});
+
+test('comparison reports typed deletion and revoked access without retaining an older comparison', async () => {
+    for(const error of [{status:404,code:'artifact_not_found'},{status:403},{code:'artifact_auth_changed'}]){
+        const {draft,client}=await fixture();client.commit=async()=>{throw {status:409};};draft.edit('retained');await draft.save();
+        await draft.compareLatest();assert.ok(draft.comparison);client.head=async()=>{throw error;};await draft.compareLatest();
+        assert.equal(draft.state,error.status===404?'erased':'denied');assert.equal(draft.comparison,null);
+        assert.equal(draft.useComparedRevision(),false);assert.equal(draft.text,'retained');assert.equal(draft.hasUnsavedChanges,true);draft.close();
+    }
+});

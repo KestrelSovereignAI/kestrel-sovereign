@@ -50,7 +50,7 @@ function sameScope(a, b) {
 }
 function sourceLineEnding(text) {
     const endings = new Set(text.match(/\r\n|\r|\n/g) || []);
-    return endings.size > 1 ? null : [...endings][0] || '\n';
+    return endings.size > 1 ? null : [...endings][0] || '';
 }
 function base64(bytes) {
     let encoded = '';
@@ -87,7 +87,7 @@ export class ArtifactDraft {
     get editable() { return this.#editable; }
     get pendingKey() { return this.#pending?.request.idempotency_key ?? null; }
     get comparison() { return this.#comparison; }
-    get hasUnsavedChanges() { return !!this.#revision && ['dirty', 'saving', 'unknown', 'conflict', 'denied', 'failed', 'rejected', 'erased'].includes(this.#state); }
+    get hasUnsavedChanges() { return !!this.#revision && ['dirty', 'saving', 'unknown', 'conflict', 'compare_failed', 'denied', 'failed', 'rejected', 'erased'].includes(this.#state); }
     #set(state) { if (!this.#closed) { this.#state = state; this.#changed(this); } }
     async #loadRevision(ref) {
         ref = artifactRef(ref);
@@ -124,7 +124,7 @@ export class ArtifactDraft {
             this.#revision = loaded.revision; this.#file = loaded.file; this.#bytes = loaded.bytes;
             this.#text = loaded.text ?? '';
             this.#editable = loaded.text !== null && loaded.lineEnding !== null && loaded.revision.manifest.files.length === 1;
-            this.#lineEnding = loaded.lineEnding;
+            this.#lineEnding = loaded.lineEnding || '\n';
             this.#set('saved');
         } catch (error) { this.#set([401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unavailable'); }
     }
@@ -218,7 +218,7 @@ export class ArtifactDraft {
         try {
             const receipt = await this.#client.status(this.#pending.request.idempotency_key, this.#abort.signal);
             if (receipt) await this.#accepted(receipt);
-            else this.#set(previous === 'conflict' ? 'conflict' : 'unknown');
+            else this.#set(['conflict', 'compare_failed'].includes(previous) ? previous : 'unknown');
         } catch (error) {
             this.#set(error.status === 404 && error.code === 'artifact_not_found' ? 'erased' : [401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unknown');
         }
@@ -229,9 +229,10 @@ export class ArtifactDraft {
         if (this.#state === 'unknown' && this.#pending) await this.#attempt();
     }
     async compareLatest() {
-        if (this.#state !== 'conflict' || this.#pending?.uncertain || this.#closed) return;
+        if (!['conflict', 'compare_failed'].includes(this.#state) || this.#pending?.uncertain || this.#closed) return;
         await this.reconcile();
-        if (this.#state !== 'conflict') return;
+        if (!['conflict', 'compare_failed'].includes(this.#state)) return;
+        this.#comparison = null;
         this.#set('saving');
         try {
             const latest = await this.#client.head(this.#revision.ref.artifact_id, this.#abort.signal);
@@ -242,7 +243,10 @@ export class ArtifactDraft {
                 || loaded.revision.manifest.files.length !== 1) throw new Error('The artifact structure changed.');
             if (this.#closed) return;
             this.#comparison = loaded; this.#set('conflict');
-        } catch (_) { this.#set('conflict'); }
+        } catch (error) {
+            this.#set(error.status === 404 && error.code === 'artifact_not_found' ? 'erased'
+                : [401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'compare_failed');
+        }
     }
     useComparedRevision() {
         if (!this.#comparison || this.#state !== 'conflict' || this.#pending?.uncertain) return false;
@@ -250,7 +254,7 @@ export class ArtifactDraft {
         // Keep the draft; the next Save stages it under a fresh key and exact CAS.
         this.#revision = this.#comparison.revision;
         this.#file = this.#comparison.file; this.#bytes = this.#comparison.bytes;
-        this.#lineEnding = this.#comparison.lineEnding;
+        this.#lineEnding = this.#comparison.lineEnding || this.#lineEnding;
         this.#text = this.#text.replace(/\r\n|\r|\n/g, this.#lineEnding);
         this.#pending = null; this.#comparison = null;
         this.#set('dirty'); return true;

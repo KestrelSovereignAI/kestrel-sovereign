@@ -5,6 +5,7 @@ const STATUS = {
     loading: 'Opening saved revision…', saved: 'Saved revision', dirty: 'Unsaved changes',
     saving: 'Saving…', unknown: 'Save status is unknown. Check or retry the same save.',
     conflict: 'Another revision conflicts with this draft. Compare before saving again.',
+    compare_failed: 'The current revision could not be compared. Your draft is retained; try again or download it.',
     denied: 'Access is unavailable. Reopen after authentication or permissions change.',
     erased: 'The artifact was deleted. This draft cannot be republished automatically.',
     failed: 'The draft cannot be saved. Keep text edits within 1 MiB.',
@@ -100,8 +101,8 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
         title.textContent = draft.revision?.title || 'Artifact';
         identity.textContent = draft.revision ? `Revision ${draft.revision.ref.revision_id}` : '';
         save.disabled = draft.state !== 'dirty';
-        check.hidden = !['unknown', 'conflict'].includes(draft.state);
-        retry.hidden = draft.state !== 'unknown'; compare.hidden = draft.state !== 'conflict';
+        check.hidden = !['unknown', 'conflict', 'compare_failed'].includes(draft.state);
+        retry.hidden = draft.state !== 'unknown'; compare.hidden = !['conflict', 'compare_failed'].includes(draft.state);
         rebase.hidden = !draft.comparison || draft.state !== 'conflict';
         exportSaved.disabled = !draft.bytes;
         exportDraft.hidden = !draft.editable || !draft.hasUnsavedChanges;

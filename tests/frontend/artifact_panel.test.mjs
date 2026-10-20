@@ -263,3 +263,17 @@ test('downloads use an inert MIME type and disposal releases URLs and the unload
         }
     } finally {URL.createObjectURL=create;URL.revokeObjectURL=revoke;}
 });
+
+test('failed comparison removes stale rebase controls and offers a visible retry', async () => {
+    const item=await fixture();const latest=structuredClone(item.panel.draft.revision);latest.ref.revision_id='latest';
+    item.client.get=async()=>latest;item.client.head=async()=>latest;item.client.commit=async()=>{throw {status:409};};
+    edit(item.panel,item.dom.window,'Keep draft');button(item.panel,'Save revision').click();await until(()=>item.panel.draft.state==='conflict');
+    button(item.panel,'Compare latest').click();await until(()=>item.panel.draft.comparison);
+    assert.equal(button(item.panel,'Use latest as save base').hidden,false);
+    item.client.head=async()=>{throw new Error('unavailable');};button(item.panel,'Compare latest').click();await until(()=>item.panel.draft.state==='compare_failed');
+    assert.match(item.panel.element.querySelector('[role="status"]').textContent,/could not be compared/);
+    assert.equal(item.panel.element.querySelector('h4'),null);assert.equal(button(item.panel,'Use latest as save base').hidden,true);
+    assert.equal(button(item.panel,'Compare latest').hidden,false);assert.equal(button(item.panel,'Download draft').hidden,false);
+    item.client.head=async()=>latest;button(item.panel,'Compare latest').click();await until(()=>item.panel.draft.comparison);
+    assert.equal(button(item.panel,'Use latest as save base').hidden,false);assert.equal(item.panel.draft.text,'Keep draft');item.close();
+});
