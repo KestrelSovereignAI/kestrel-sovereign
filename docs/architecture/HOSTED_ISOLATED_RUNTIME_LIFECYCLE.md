@@ -71,6 +71,10 @@ The provider-start receipt belongs to the whole original RPC owner: later
 custody validation or tool-envelope failure cannot erase an effect that already
 occurred, even after successful host confirmation and authority exit. A lost
 post-send result stays UNKNOWN rather than becoming a retryable tool rejection.
+Runtime binding is also part of protected hosted entry. A caller already denied
+before worker admission receives detached native control without exporting
+message/proxy traceback locals or permanently fencing an otherwise valid
+proxy. The channel bridge sheds its forwarding locals on every exit too.
 
 For hosted webhook admission, `admit_hosted_telegram_ingress(admission_fence=…)`
 accepts trusted host-only native transaction authority. It is propagated to

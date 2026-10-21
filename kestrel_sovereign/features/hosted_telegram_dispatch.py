@@ -59,12 +59,13 @@ def is_hosted_send(proxy: Any, name: Any) -> bool:
     )
 
 
-def start_dispatch(proxy: Any, name: Any, arguments: Any):
+def start_dispatch(proxy: Any, name: Any, arguments: Any, *, runtime_stack):
     """Snapshot and admit ONE original owner before publishing its task."""
     from kestrel_sovereign.features import isolated_runtime as runtime
     from kestrel_sovereign.features.scheduler.runner import (
         capture_scheduler_execution_scope,
     )
+    from kestrel_sovereign.execution_custody import bind_execution_runtime
 
     # This is private owner metadata, not a service ingress RPC. Tool names
     # use underscores; canonical ingress labels intentionally use hyphens.
@@ -83,6 +84,26 @@ def start_dispatch(proxy: Any, name: Any, arguments: Any):
         # the original worker. No refusal may become scheduler success data.
         scheduled_tool=capture_scheduler_execution_scope() is not None,
     )
+    try:
+        # Enter the exact original runtime before accepting its worker, but
+        # keep entry failures behind the SAME detached outcome boundary.
+        # A revoked caller may deny here before any physical owner exists.
+        runtime_stack.enter_context(bind_execution_runtime(proxy.agent))
+    except BaseException as error:  # noqa: BLE001 - trusted entry failure must not export request-bearing traceback frames
+        try:
+            # Authenticate native control through Core's existing validator
+            # and retained scope facts, never foreign exception attributes.
+            admission.require_work(proxy.agent)
+        except BaseException:  # noqa: BLE001 - validator records its private native outcome
+            pass
+        slot.outcome = admission.core_outcome or runtime._redacted_host_ingress_error(error)
+        try:
+            return proxy, admission, slot
+        finally:
+            # The original scope may privately retain its denial traceback.
+            # Even that private entry frame must shed caller message data.
+            proxy = arguments = request = runtime_stack = caller = None
+            del name
     proxy._host_ingress_admissions.add(admission)
 
     async def execute():

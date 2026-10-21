@@ -37,7 +37,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import Executor, Future
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -13030,15 +13030,15 @@ class ProxyFeature(Feature):
         from kestrel_sovereign.features.hosted_telegram_dispatch import (
             is_hosted_send, start_dispatch, wait_dispatch,
         )
-        with bind_execution_runtime(self.agent):
-            if isinstance(name, str):
-                # Flatten accepted string subclasses with the base operation,
-                # not an overridable __str__/__eq__ that could hide the actual
-                # JSON tool name from the hosted dispatch authority boundary.
-                name = str.__str__(name)
-            if is_hosted_send(self, name):
-                owner = start_dispatch(self, name, args)
-                self = name = args = None
+        if isinstance(name, str):
+            # Flatten accepted string subclasses with the base operation,
+            # not an overridable __str__/__eq__ that could hide the actual
+            # JSON tool name from the hosted dispatch authority boundary.
+            name = str.__str__(name)
+        if is_hosted_send(self, name):
+            with ExitStack() as runtime_stack:
+                owner = start_dispatch(self, name, args, runtime_stack=runtime_stack)
+                self = name = args = runtime_stack = None
                 outcome, cancellation = await wait_dispatch(owner)
                 scheduled = owner[1].scheduled_tool
                 owner = None
@@ -13048,6 +13048,7 @@ class ProxyFeature(Feature):
                     return {"status": "error", "error": "hosted Telegram dispatch is unavailable",
                             "tool": "telegram_send", "success": False}
                 return _deliver_host_ingress_outcome(outcome, cancellation)
+        with bind_execution_runtime(self.agent):
             return await self._call_isolated_tool_owned(name, args)
 
     async def _call_isolated_tool_owned(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -17162,7 +17163,11 @@ class ProxyChannelAdapter(ChannelAdapter):
         return None
 
     async def send_message(self, to: str, content: str, **kwargs):
-        result = await self._proxy.call_isolated_tool(
-            self._send_tool, {"to": to, "message": content}
-        )
-        return _delivery_receipt_from_result(self._channel_type, result)
+        try:
+            result = await self._proxy.call_isolated_tool(
+                self._send_tool, {"to": to, "message": content}
+            )
+            return _delivery_receipt_from_result(self._channel_type, result)
+        finally:
+            kwargs.clear()
+            self = to = content = result = None

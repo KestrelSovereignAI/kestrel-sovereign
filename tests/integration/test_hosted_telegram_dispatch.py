@@ -674,6 +674,53 @@ async def test_authorized_string_subclass_uses_canonical_dispatch(tmp_path, monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["tool", "bridge"])
+async def test_revoked_entry_does_not_export_hosted_arguments_or_poison_proxy(tmp_path, monkeypatch, path):
+    from kestrel_sovereign.execution_custody import bind_execution_custody
+
+    secret = "controlled-sensitive-message-entry-DO-NOT-EXPORT"
+    arguments = {"to": "555", "message": secret}
+
+    class Fence:
+        backend_type = "postgres"
+
+        def require_work(self):
+            pass
+
+        async def lock_and_validate(self, connection):
+            pass
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, _):
+        with bind_execution_custody(Fence()) as scope:
+            scope.revoke("original caller retired before hosted admission")
+            with pytest.raises(ExecutionAuthorityError) as denied:
+                if path == "tool":
+                    await proxy.call_isolated_tool("telegram_send", arguments)
+                else:
+                    await ProxyChannelAdapter(proxy, channel_type="telegram", send_tool="telegram_send").send_message("555", secret)
+        pending, seen = [denied.value], set()
+        while pending:
+            error = pending.pop()
+            if id(error) in seen:
+                continue
+            seen.add(id(error))
+            pending.extend(item for item in (error.__cause__, error.__context__) if item is not None)
+            pending.extend(getattr(error, "exceptions", ()))
+            trace = error.__traceback__
+            while trace is not None:
+                frame = trace.tb_frame
+                if "/kestrel_sovereign/" in frame.f_code.co_filename:
+                    values = tuple(frame.f_locals.values())
+                    assert all(value is not arguments and value is not proxy and not (type(value) is str and value == secret) for value in values), frame.f_code.co_name
+                    assert all(not (type(value) is dict and value.get("message") == secret) for value in values), frame.f_code.co_name
+                trace = trace.tb_next
+        assert services[0].sends == [] and proxy._host_ingress_public_control is None
+        assert not proxy._host_ingress_admissions
+        response = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "new valid caller"})
+        assert response["status"] == "ok" and len(services[0].sends) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["allocation", "publication"])
 async def test_scheduled_task_refusal_is_not_success_shaped_result(tmp_path, monkeypatch, phase):
     from kestrel_sovereign.features.isolated_runtime import (
