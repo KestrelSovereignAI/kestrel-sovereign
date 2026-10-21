@@ -18,7 +18,7 @@ from a2a.types import (
     Task,
 )
 from a2a.utils.proto_utils import validate_proto_required_fields
-from google.protobuf.json_format import MessageToDict
+from google.protobuf.json_format import MessageToDict, SerializeToJsonError
 
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_label
 from kestrel_sovereign.a2a.native_sender import native_request_digest
@@ -538,6 +538,15 @@ class OutboundStore(UnifiedStoreBase):
                 "Native outbound acknowledgement requires an official Task or Message"
             )
         validate_proto_required_fields(response)
+        try:
+            # A protobuf Struct can hold NaN/Infinity even though its native
+            # JSON representation cannot. Validate the entire response before
+            # any receipt/answer transaction can acquire a writer lease.
+            MessageToDict(response)
+        except (ValueError, SerializeToJsonError) as error:
+            raise OutboundDispatchConflict(
+                "Peer response cannot be represented as native A2A JSON"
+            ) from error
         if not response.context_id or (
             dispatch.requested_context_id
             and response.context_id != dispatch.requested_context_id

@@ -26,7 +26,7 @@ from a2a.types import (
 )
 from a2a.utils.constants import VERSION_HEADER
 from a2a.utils.proto_utils import validate_proto_required_fields
-from google.protobuf.json_format import MessageToDict
+from google.protobuf.json_format import MessageToDict, ParseError
 from google.protobuf.message import Message as ProtoMessage
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
@@ -62,6 +62,7 @@ from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     execution_work_operation,
     execution_work_stream,
+    is_execution_control_error,
     native_execution_response_owner,
     owned_execution_stream,
 )
@@ -338,7 +339,24 @@ class NativePeerSession:
             self._http, before_dispatch or self._admit
         ):
             async with native_execution_response_owner(self._http):
-                yield
+                try:
+                    yield
+                except (ParseError, ValueError, TypeError) as error:
+                    # The SDK's protobuf/JSON-RPC decoders can reject a peer
+                    # body without producing an A2AError. Keep that wire
+                    # failure distinct from storage and execution control.
+                    if is_execution_control_error(error) or isinstance(
+                        error,
+                        (
+                            NativePeerProtocolError,
+                            NativeSenderProofError,
+                            OutboundDispatchConflict,
+                        ),
+                    ):
+                        raise
+                    raise NativePeerProtocolError(
+                        "Official A2A SDK could not decode the peer response"
+                    ) from error
 
     @property
     def agent_card(self) -> AgentCard:

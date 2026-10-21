@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+from dataclasses import replace
 from time import monotonic
 
 from a2a.utils.errors import A2AError
@@ -13,6 +14,7 @@ from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
 from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
 from kestrel_sovereign.a2a.stores.unified.outbound_store import (
     DispatchState,
+    OutboundDispatch,
     OutboundDispatchConflict,
 )
 from kestrel_sovereign.a2a.stores.unified.question_store import (
@@ -126,6 +128,15 @@ class NativeQuestionSupervisor:
             self._require_current()
             await self._settle_local(question)
 
+    @staticmethod
+    def _observation_progress(
+        dispatch: OutboundDispatch | None,
+    ) -> OutboundDispatch | None:
+        """Exclude receipt-write bookkeeping from the remote progress signal."""
+        if dispatch is None:
+            return None
+        return replace(dispatch, revision=0, operation_id="", updated_at="")
+
     async def _read_pass(self, *, force: bool = False) -> None:
         self._require_current()
         questions = await self.store.unsettled()
@@ -163,7 +174,10 @@ class NativeQuestionSupervisor:
                 )
             after = await self.store.outbound_store.get(question.dispatch_id)
             delay = (
-                self.interval if after != before else min(delay * 2, self.max_interval)
+                self.interval
+                if self._observation_progress(after)
+                != self._observation_progress(before)
+                else min(delay * 2, self.max_interval)
             )
             self._next_read[question.question_id] = (self._clock() + delay, delay)
 
