@@ -2,17 +2,27 @@
 
 import time
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
+from uuid import uuid4
 
+import httpx
 from a2a.types import AgentCard
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 
 from kestrel_sovereign import __version__
+from kestrel_sovereign.a2a.did_registry import same_a2a_sender_identity_witness
+from kestrel_sovereign.a2a.extensions import CAUSATION_URI, QUESTION_CORRELATION_URI
 from kestrel_sovereign.a2a.native_card import (
     REQUIRED_NATIVE_EXTENSIONS,
     create_native_agent_card,
+)
+from kestrel_sovereign.a2a.native_client import (
+    NativePeerSession,
+    NativeSenderInterceptor,
 )
 from kestrel_sovereign.a2a.native_host import create_hosted_native_guard
 from kestrel_sovereign.a2a.native_routes import (
@@ -23,6 +33,12 @@ from kestrel_sovereign.a2a.native_routes import (
 from kestrel_sovereign.a2a.native_sender import NativeProofPolicy
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.execution_custody import owned_native_http_client
+from kestrel_sovereign.features.peers.directory import (
+    PeerAccessDeniedError,
+    PeerIdentity,
+    PeerUnavailableError,
+)
 from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
 
 if TYPE_CHECKING:
@@ -179,3 +195,153 @@ async def prepare_hosted_native_publication(
     return await HostedNativeA2APublication.prepare(
         manager, registry, recipient, routing_key, configuration
     )
+
+
+@asynccontextmanager
+async def open_hosted_native_peer_session(
+    app: Starlette,
+    manager: "AgentManager",
+    *,
+    sender,
+    requester,
+    peer: PeerIdentity,
+    timeout: httpx.Timeout,
+):
+    """Route a same-host peer through the installed official SDK HTTP binding.
+
+    The explicit ASGI transport is local host policy; advertised URLs are never
+    dialled or resolved. Both directions are reauthorized for every operation.
+    No operator credential or host-attested metadata becomes a wire principal.
+    """
+    async with manager.a2a_execution_lease():
+        _, recipient = await manager._authorize_host_attested_local_a2a_route(
+            sender=sender,
+            requester=requester,
+            peer=peer,
+        )
+        sender_policy = manager.a2a_hosted_policy_for(sender)
+        recipient_policy = manager.a2a_hosted_policy_for(recipient)
+        publication = getattr(recipient, "_native_a2a_publication", None)
+        if not isinstance(publication, HostedNativeA2APublication):
+            raise PeerUnavailableError("Peer has no published native A2A interface")
+        publication.registry.require_application(app)
+        card = await publication.get_card()
+        sender_identity = sender.identity
+        recipient_identity = recipient.identity
+        sender_witness = manager.a2a_sender_identity_witness(
+            sender_identity.signing_did
+        )
+        recipient_witness = manager.a2a_sender_identity_witness(
+            recipient_identity.signing_did
+        )
+        sender_manager = sender.task_manager
+        sender_task_store = sender_manager.task_store
+        sender_scope = sender_task_store.scope
+        outbound = sender_manager.outbound_store
+        scope = recipient.task_manager.task_store.scope
+        if sender_manager.task_store.scope.recipient_id != requester.identity:
+            raise PeerAccessDeniedError("Sender ledger differs from its host principal")
+        signing_document = {
+            "id": recipient_identity.signing_did,
+            "verificationMethod": recipient_identity.new_verification_methods,
+        }
+        interfaces = [
+            item
+            for item in card.supported_interfaces
+            if item.protocol_binding == "JSONRPC"
+        ]
+        if len(interfaces) != 1:
+            raise PeerUnavailableError(
+                "Published peer has no unique native JSON-RPC interface"
+            )
+        interface = interfaces[0]
+        signer = NativeSenderInterceptor.for_identity(
+            sender_identity,
+            recipient=scope,
+            extensions=REQUIRED_NATIVE_EXTENSIONS
+            | {CAUSATION_URI, QUESTION_CORRELATION_URI},
+            policy=NativeProofPolicy(),
+            clock=time.time,
+            nonce=lambda: uuid4().hex,
+        )
+
+    def require_current():
+        if (
+            manager.a2a_hosted_policy_for(sender) is not sender_policy
+            or manager.a2a_hosted_policy_for(recipient) is not recipient_policy
+            or sender.task_manager is not sender_manager
+            or sender_manager.outbound_store is not outbound
+            or sender_manager.task_store is not sender_task_store
+            or sender_task_store.scope != sender_scope
+            or getattr(recipient, "_native_a2a_publication", None) is not publication
+            or not publication.registry.is_current(publication._binding)
+            or not same_a2a_sender_identity_witness(
+                sender_witness,
+                manager.a2a_sender_identity_witness(sender_identity.signing_did),
+            )
+            or not same_a2a_sender_identity_witness(
+                recipient_witness,
+                manager.a2a_sender_identity_witness(recipient_identity.signing_did),
+            )
+        ):
+            raise PeerAccessDeniedError(
+                "Native peer session registration or identity changed"
+            )
+
+    async def authorize():
+        async with manager.a2a_execution_lease():
+            require_current()
+            current_peer = await sender_policy.router.resolve_peer_by_agent_id(
+                requester, peer.agent_id
+            )
+            require_current()
+            if not isinstance(current_peer, PeerIdentity) or (
+                current_peer.agent_id,
+                current_peer.routing_key,
+            ) != (peer.agent_id, peer.routing_key):
+                raise PeerAccessDeniedError(
+                    "Recipient is no longer in the sender's directory"
+                )
+            (
+                _,
+                current_recipient,
+            ) = await manager._authorize_host_attested_local_a2a_route(
+                sender=sender,
+                requester=requester,
+                peer=current_peer,
+            )
+            require_current()
+            if current_recipient is not recipient:
+                raise PeerAccessDeniedError(
+                    "Native peer recipient registration changed"
+                )
+
+    await authorize()
+    async with owned_native_http_client(
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app,
+                root_path=urlsplit(
+                    publication.configuration.public_base_url
+                ).path.rstrip("/"),
+            ),
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        )
+    ) as http:
+        session = NativePeerSession(
+            card=card,
+            signing_did=recipient_identity.signing_did,
+            trusted_document=signing_document,
+            recipient=scope,
+            interface=interface,
+            signer=signer,
+            http_client=http,
+            outbound_store=outbound,
+            authorize=authorize,
+        )
+        try:
+            yield session
+        finally:
+            await session.close()

@@ -574,6 +574,7 @@ class PeersFeature(Feature):
             local_get=getattr(self, "_local_host_get", None),
             local_subscribe=getattr(self, "_local_host_subscribe", None),
             principal_payload_factory=self._build_principal_action_payload,
+            native_session_factory=getattr(self, "_native_session_factory", None),
         )
 
     def _peer_directory_context(
@@ -630,6 +631,7 @@ class PeersFeature(Feature):
         local_stop=None,
         local_get=None,
         local_subscribe=None,
+        native_session_factory=None,
     ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
         """Refresh only the local compatibility adapter for hosted policy.
 
@@ -654,6 +656,7 @@ class PeersFeature(Feature):
         self._local_host_stop = local_stop
         self._local_host_get = local_get
         self._local_host_subscribe = local_subscribe
+        self._native_session_factory = native_session_factory
         self._peer_router = None
         self._peer_requester = None
         self._install_local_host_router()
@@ -2104,33 +2107,98 @@ class PeersFeature(Feature):
         self,
         recipient: str,
         message: str,
-        session_id: str = "",
+        context_id: str = "",
     ) -> ToolResult:
-        """
-        Send an async fire-and-forget A2A message. The recipient's
-        cognition loop wakes (a2a.task_submitted), they see the
-        message, they decide whether to act — but the caller doesn't
-        wait or track. Same wire as send_a2a_task but no skill_id is
-        attached (signals "informational, not work assignment").
-        """
-        task_data, _chain, _recipient_agent_id, err = await self._post_a2a_task(
-            recipient=recipient, message=message,
-            skill_id="", session_id=session_id,
-            extra_metadata={"a2a_verb": "message"},
-            dispatch_tool="send_a2a_message",
+        """Send one native message; its immutable dispatch ID is sender-owned."""
+        from uuid import uuid4
+
+        from a2a.client.errors import A2AClientError
+        from a2a.types import Message, Part, Role, SendMessageRequest
+
+        from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
+        from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
+        from kestrel_sovereign.a2a.extensions import causation_metadata
+        from kestrel_sovereign.a2a.stores.unified.outbound_store import (
+            DispatchState,
+            OutboundDispatchConflict,
         )
-        if err is not None:
-            return err
+
+        if not isinstance(message, str) or not message.strip():
+            return ToolResult.failed("A2A message must contain text")
+        provider = getattr(self.agent, "_provide_causation_chain", None)
+        chain = provider() if callable(provider) else None
+        metadata = causation_metadata(chain) if chain else {}
+        dispatch = None
+        try:
+            router, requester, peer = await self._resolve_automatic_peer(recipient)
+            async with router.open_a2a_session(requester, peer) as session:
+                request = SendMessageRequest(
+                    tenant=session.recipient_scope.tenant,
+                    message=Message(
+                        message_id=uuid4().hex,
+                        context_id=context_id,
+                        role=Role.ROLE_USER,
+                        parts=[Part(text=message)],
+                    ),
+                    metadata=metadata,
+                    configuration={"return_immediately": True},
+                )
+                dispatch, wire = await session.reserve(
+                    request,
+                    dispatch_tool="send_a2a_message",
+                    verb="message",
+                )
+                receipt = await session.send(dispatch, wire)
+        except (
+            PeerDirectoryError,
+            A2AClientError,
+            OutboundDispatchConflict,
+            NativePeerProtocolError,
+            NativeSenderProofError,
+        ) as error:
+            if is_execution_control_error(error):
+                raise
+            current = (
+                None
+                if dispatch is None
+                else await self.agent.task_manager.outbound_store.get(
+                    dispatch.dispatch_id
+                )
+            )
+            committed = current is not None and current.state in {
+                DispatchState.ACKNOWLEDGED, DispatchState.COMPLETE,
+            }
+            uncertain = dispatch is not None and (
+                current is None or current.state in {
+                    DispatchState.SUBMITTING, DispatchState.UNKNOWN,
+                }
+            )
+            return ToolResult.failed(
+                "A2A delivery was acknowledged; inspect the retained dispatch before further action"
+                if committed else "A2A delivery is uncertain; reconcile the dispatch before sending again"
+                if uncertain
+                else f"Could not send A2A message: {error}",
+                data={
+                    "sent": True if committed else None if uncertain else False,
+                    "recipient": recipient,
+                    "remote_task_id": current.remote_task_id if committed else None,
+                    "dispatch_id": dispatch.dispatch_id
+                    if dispatch is not None
+                    else None,
+                    "delivery_state": current.state.value
+                    if current is not None
+                    else "not_submitted",
+                },
+            )
         return ToolResult.ok(
-            confirmation=(
-                f"A2A message sent to {recipient} "
-                f"(task_id={task_data['id']}). Recipient has been signaled."
-            ),
+            confirmation=f"A2A message sent to {recipient}",
             data={
                 "sent": True,
-                "task_id": task_data["id"],
-                "session_id": task_data["sessionId"],
                 "recipient": recipient,
+                "dispatch_id": receipt.dispatch.dispatch_id,
+                "remote_task_id": receipt.dispatch.remote_task_id,
+                "context_id": receipt.dispatch.remote_context_id,
+                "response_kind": receipt.dispatch.response_kind,
             },
         )
 

@@ -1409,7 +1409,20 @@ def _hosted_peer_directory_context(
         local_stop = None
         local_get = None
         local_subscribe = None
+        native_session_factory = None
         if manager is not None:
+            import httpx
+
+            from kestrel_sovereign.a2a.native_publication import open_hosted_native_peer_session
+            from kestrel_sovereign.features.peers.directory import PEER_CONNECT_TIMEOUT, PEER_READ_TIMEOUT
+
+            def native_session_factory(requester, peer):
+                return open_hosted_native_peer_session(
+                    app, manager, sender=agent, requester=requester, peer=peer,
+                    timeout=httpx.Timeout(connect=PEER_CONNECT_TIMEOUT,
+                        read=PEER_READ_TIMEOUT, write=PEER_READ_TIMEOUT,
+                        pool=PEER_CONNECT_TIMEOUT),
+                )
             async def local_cancel(requester, peer, task_id, payload):
                 return await manager.cancel_host_attested_local_a2a_task(
                     sender=agent,
@@ -1450,6 +1463,7 @@ def _hosted_peer_directory_context(
             local_stop=local_stop,
             local_get=local_get,
             local_subscribe=local_subscribe,
+            native_session_factory=native_session_factory,
         )
         return refreshed if refreshed is not None else (None, None)
     return (

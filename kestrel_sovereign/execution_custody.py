@@ -964,6 +964,34 @@ def bind_native_execution_admission(validator: Callable[[], Awaitable[None]]) ->
         _NATIVE_ADMISSION_VALIDATORS.reset(token)
 
 
+@dataclass(frozen=True)
+class _NativeHTTPAdmission:
+    client: object = field(repr=False)
+    validator: Callable[[], Awaitable[None]] = field(repr=False)
+
+    async def __call__(self) -> None:
+        """Defer this client-specific gate until its original HTTP dispatch."""
+
+
+@contextmanager
+def bind_native_http_execution_admission(
+    client: object, validator: Callable[[], Awaitable[None]],
+) -> Iterator[None]:
+    """Reauthorize one selected native HTTP client after request observers.
+
+    An authorization lookup can use a different HTTP client. That lookup keeps
+    all ordinary execution gates, without recursively invoking the peer gate
+    whose decision it is computing. The immutable callback remains in copied
+    contexts and applies to every actual dispatch through the selected client.
+    """
+    if not isinstance(client, (_NativeHTTPXAsyncClient, _NativeHTTPX2AsyncClient)):
+        raise TypeError("Native HTTP admission requires an actual native client")
+    if not callable(validator):
+        raise TypeError("Native HTTP admission requires a trusted validator")
+    with bind_native_execution_admission(_NativeHTTPAdmission(client, validator)):
+        yield
+
+
 def capture_native_execution_admission() -> tuple[Callable[[], Awaitable[None]], ...]:
     """Retain the original trusted gate inventory for a deferred resource."""
     return _NATIVE_ADMISSION_VALIDATORS.get()
@@ -1231,7 +1259,11 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         with bind_execution_custody_snapshot(captured):
             require_original_native_work()
             for validator in validators:
-                await validator()
+                if isinstance(validator, _NativeHTTPAdmission):
+                    if validator.client is client:
+                        await validator.validator()
+                else:
+                    await validator()
             require_original_native_work()
             return await native_dispatch(request)
 

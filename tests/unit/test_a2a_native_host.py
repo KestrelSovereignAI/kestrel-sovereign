@@ -30,7 +30,7 @@ from tests.utils.native_a2a_security import (
 @pytest_asyncio.fixture
 async def publication(hosted, hosted_recipient_signing):
     from a2a.types import AgentSkill
-    from starlette.applications import Starlette
+    from fastapi import FastAPI
 
     from kestrel_sovereign.a2a.native_publication import (
         prepare_hosted_native_publication,
@@ -57,7 +57,7 @@ async def publication(hosted, hosted_recipient_signing):
         [AgentSkill(id="ask", name="Ask", description="Ask", tags=["chat"])],
         object(),
     )
-    app = Starlette()
+    app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     native = await prepare_hosted_native_publication(
         app,
         hosted.host,
@@ -894,3 +894,381 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
         await ctx.run_rollback()
         await llm.close()
         await storage.close()
+
+
+@pytest_asyncio.fixture(params=["", "/proxy"])
+async def local_native_peer(publication, request):
+    from kestrel_sovereign.a2a.did_registry import HostA2ADidResolver
+    from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
+    from kestrel_sovereign.features.peers.directory import PeerIdentity, PeerRequester
+    from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+    from tests.utils.native_a2a import manager_for
+
+    p = publication
+    if request.param:
+        from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
+
+        p.publication.configuration = NativeHostingConfiguration(
+            "https://native.test" + request.param
+        )
+    p.sender.identity = AgentIdentity(
+        hybrid_keypair=p.signing[0],
+        new_did=SENDER,
+        new_verification_methods=p.signing[1]["verificationMethod"],
+    )
+    sender_manager = manager_for(
+        p.backend, NativeRecipientScope(PRINCIPAL, "sender-tenant"), owns_backend=False
+    )
+    await sender_manager.initialize()
+    p.sender.task_manager = sender_manager
+    requester = PeerRequester(PRINCIPAL, object())
+    peer = PeerIdentity(p.recipient.did, "peer", "registered-agent", name="Peer")
+    state = SimpleNamespace(allowed=True)
+
+    class SenderDirectory:
+        async def resolve_peer_by_agent_id(self, selected, agent_id):
+            assert selected is requester
+            return peer if state.allowed and agent_id == peer.agent_id else None
+
+        async def resolve_peer(self, selected, name):
+            assert selected is requester
+            return peer if state.allowed and name == "Peer" else None
+
+        async def authorize_inbound_sender(self, selected, sender_id):
+            return selected is requester and state.allowed
+
+        def open_a2a_session(self, selected, selected_peer):
+            import httpx
+            from kestrel_sovereign.a2a.native_publication import (
+                open_hosted_native_peer_session,
+            )
+
+            return open_hosted_native_peer_session(
+                p.app,
+                p.host,
+                sender=p.sender,
+                requester=selected,
+                peer=selected_peer,
+                timeout=httpx.Timeout(10),
+            )
+
+    directory = SenderDirectory()
+    p.sender.peer_directory_router = directory
+    p.sender.peer_requester = requester
+    resolver = HostA2ADidResolver(p.host, recipient=p.sender)
+    authorizer = RecipientA2ASenderAuthorizer(p.host, recipient=p.sender)
+    async with p.host.a2a_lifecycle_lease():
+        p.host.install_a2a_hosted_policy(
+            p.sender,
+            resolver=resolver.resolve,
+            authorizer=authorizer,
+            router=directory,
+            requester=requester,
+        )
+        p.host._register_agent("registered-agent", p.recipient)
+    try:
+        yield SimpleNamespace(
+            **vars(p),
+            sender_manager=sender_manager,
+            requester=requester,
+            peer=peer,
+            directory=directory,
+            route_state=state,
+        )
+    finally:
+        await sender_manager.close()
+
+
+async def test_same_host_session_uses_real_sdk_binding_and_creator_ledger(
+    local_native_peer,
+):
+    from a2a.types import SendMessageRequest, Message, Part, Role
+
+    p = local_native_peer
+    async with p.directory.open_a2a_session(p.requester, p.peer) as session:
+        request = SendMessageRequest(
+            tenant=session.recipient_scope.tenant,
+            message=Message(
+                message_id="hosted-native-message",
+                role=Role.ROLE_USER,
+                parts=[Part(text="Native same-host delivery")],
+            ),
+            configuration={"return_immediately": True},
+        )
+        dispatch, wire = await session.reserve(
+            request, dispatch_tool="send_a2a_message", verb="message"
+        )
+        receipt = await session.send(dispatch, wire)
+        assert receipt.dispatch.remote_task_id == receipt.response.id
+        assert dispatch.dispatch_id != receipt.response.id
+        snapshot = await p.manager.get_task_snapshot(
+            receipt.response.id, recipient_agent_id=p.recipient.did
+        )
+        assert snapshot.ownership.creator_agent_id == PRINCIPAL
+        assert snapshot.ownership.tenant == p.scope.tenant
+        assert (
+            await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
+        ) == receipt.dispatch
+        assert await session.get_task(receipt.dispatch) == receipt.response
+
+
+async def test_native_peer_message_tool_reaches_official_host_binding(
+    local_native_peer,
+):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    result = await feature.send_a2a_message("Peer", "Message from real peer tool")
+    assert result.data["sent"] is True
+    assert result.data["dispatch_id"] != result.data["remote_task_id"]
+    assert result.data["response_kind"] == "task"
+    task = await p.manager.get_task_for_creator(
+        result.data["remote_task_id"], PRINCIPAL, recipient_agent_id=p.recipient.did
+    )
+    assert task.history[0].parts[0].text == "Message from real peer tool"
+    assert task.context_id == result.data["context_id"]
+
+
+async def test_same_host_session_rechecks_sender_directory_before_submission(
+    local_native_peer,
+):
+    from a2a.types import SendMessageRequest, Message, Part, Role
+    from kestrel_sovereign.features.peers.directory import PeerAccessDeniedError
+
+    p = local_native_peer
+    async with p.directory.open_a2a_session(p.requester, p.peer) as session:
+        dispatch, wire = await session.reserve(
+            SendMessageRequest(
+                tenant=p.scope.tenant,
+                message=Message(
+                    message_id="revoked-hosted-message",
+                    role=Role.ROLE_USER,
+                    parts=[Part(text="Refuse before submission")],
+                ),
+                configuration={"return_immediately": True},
+            ),
+            dispatch_tool="send_a2a_message",
+            verb="message",
+        )
+        p.route_state.allowed = False
+        with pytest.raises(PeerAccessDeniedError, match="sender's directory"):
+            await session.send(dispatch, wire)
+        assert (
+            await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
+        ).state.value == "reserved"
+        from a2a.types import ListTasksRequest
+
+        listed = await p.manager.task_store.list_for_creator(
+            ListTasksRequest(tenant=p.scope.tenant),
+            creator_agent_id=PRINCIPAL,
+            recipient_agent_id=p.recipient.did,
+        )
+        assert list(listed.tasks) == []
+
+
+async def test_native_message_tool_reports_lost_ack_as_unknown(local_native_peer):
+    import httpx
+    from a2a.types import ListTasksRequest
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+
+    class LostAcknowledgement:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            await self.app(scope, receive, send)
+            raise httpx.ReadError("Lost acknowledgement after committed native task")
+
+    p.app.add_middleware(LostAcknowledgement)
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    result = await feature.send_a2a_message(
+        "Peer", "Recipient committed, acknowledgement lost"
+    )
+    assert result.data["sent"] is None
+    assert result.data["delivery_state"] == "unknown"
+    current = await p.sender_manager.outbound_store.get(result.data["dispatch_id"])
+    assert current.state.value == "unknown" and current.remote_task_id is None
+    listed = await p.manager.task_store.list_for_creator(
+        ListTasksRequest(tenant=p.scope.tenant),
+        creator_agent_id=PRINCIPAL,
+        recipient_agent_id=p.recipient.did,
+    )
+    assert len(listed.tasks) == 1
+
+
+async def test_actual_server_refresh_wires_native_message_tool_and_local_directory(
+    local_native_peer,
+):
+    import httpx
+    from kestrel_sovereign import server
+    from kestrel_sovereign.endpoints import models
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+    from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.a2a.did_registry import HostA2ADidResolver
+    from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
+
+    p = local_native_peer
+    assert isinstance(p.sender.identity, AgentIdentity)
+    p.sender.storage = None
+    p.sender._agent_name = "Sender"
+    p.sender.get_public_profile = KestrelAgent.get_public_profile.__get__(p.sender)
+    p.sender.resolve_effective_name = KestrelAgent.resolve_effective_name.__get__(
+        p.sender
+    )
+    feature = PeersFeature(p.sender)
+    feature._own_name = "Sender"
+    feature._host_url = "http://local-host.test"
+    p.sender.features = {"PeersFeature": feature}
+    p.app.state.agent_manager = p.host
+    p.app.state.multi_agent_config = SimpleNamespace(
+        host=SimpleNamespace(bind="local-host.test", port=8888)
+    )
+    p.app.routes.extend(models.router.routes)
+    router, requester = server._hosted_peer_directory_context(
+        p.app, p.sender, manager=p.host
+    )
+    # Both directory HTTP and peer HTTP explicitly use the actual owned app.
+    router._client_factory = lambda **kwargs: httpx.AsyncClient(
+        transport=httpx.ASGITransport(p.app), **kwargs
+    )
+    resolver = HostA2ADidResolver(p.host, recipient=p.sender)
+    authorizer = RecipientA2ASenderAuthorizer(p.host, recipient=p.sender)
+    async with p.host.a2a_lifecycle_lease():
+        p.host.install_a2a_hosted_policy(
+            p.sender,
+            resolver=resolver.resolve,
+            authorizer=authorizer,
+            router=router,
+            requester=requester,
+        )
+    result = await feature.send_a2a_message(
+        "Live Name", "Through actual server and local directory"
+    )
+    assert result.data["sent"] is True
+    task = await p.manager.get_task_for_creator(
+        result.data["remote_task_id"], PRINCIPAL, recipient_agent_id=p.recipient.did
+    )
+    assert task.history[0].parts[0].text == "Through actual server and local directory"
+
+
+async def test_native_tool_does_not_report_acknowledged_race_as_not_sent(
+    local_native_peer,
+):
+    from a2a.types import ListTasksRequest
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+
+    class ReconciliationWins:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            await self.app(scope, receive, send)
+            # Another sender-owned observer reconciles after recipient commit,
+            # before the original sender receives its acknowledgement.
+            row = await p.backend.fetch_one(
+                "SELECT dispatch_id FROM a2a_outbound_dispatches WHERE sender_id = ? AND sender_tenant = ?",
+                (PRINCIPAL, "sender-tenant"),
+            )
+            store = p.sender_manager.outbound_store
+            submitting = await store.get(row[0])
+            unknown = await store.mark_unknown(
+                submitting, operation_id="reader-observed-uncertainty"
+            )
+            listed = await p.manager.task_store.list_for_creator(
+                ListTasksRequest(tenant=p.scope.tenant),
+                creator_agent_id=PRINCIPAL,
+                recipient_agent_id=p.recipient.did,
+            )
+            assert await store.reconcile(
+                unknown, list(listed.tasks), operation_id="read-witness"
+            )
+
+    p.app.add_middleware(ReconciliationWins)
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    result = await feature.send_a2a_message(
+        "Peer", "Acknowledged by the independent reader"
+    )
+    assert result.data["sent"] is True
+    assert result.data["delivery_state"] == "acknowledged"
+    assert result.data["remote_task_id"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "sender-policy",
+        "recipient-policy",
+        "sender-identity",
+        "recipient-identity",
+        "sender-store",
+    ],
+)
+async def test_same_host_session_cannot_spend_a_replaced_generation(
+    local_native_peer, fault
+):
+    from a2a.types import SendMessageRequest, Message, Part, Role
+    from kestrel_sovereign.features.peers.directory import PeerAccessDeniedError
+    from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+    from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
+
+    p = local_native_peer
+    async with p.directory.open_a2a_session(p.requester, p.peer) as session:
+        dispatch, wire = await session.reserve(
+            SendMessageRequest(
+                tenant=p.scope.tenant,
+                message=Message(
+                    message_id="generation-message",
+                    role=Role.ROLE_USER,
+                    parts=[Part(text="Do not submit after replacement")],
+                ),
+                configuration={"return_immediately": True},
+            ),
+            dispatch_tool="send_a2a_message",
+            verb="message",
+        )
+        async with p.host.a2a_lifecycle_lease():
+            selected = p.sender if fault.startswith("sender") else p.recipient
+            if fault.endswith("policy"):
+                old = p.host.a2a_hosted_policy_for(selected)
+                p.host.install_a2a_hosted_policy(
+                    selected,
+                    resolver=old.resolver,
+                    authorizer=old.authorizer,
+                    router=old.router,
+                    requester=old.requester,
+                )
+            elif fault.endswith("identity"):
+                old = selected.identity
+                selected.identity = AgentIdentity(
+                    hybrid_keypair=old.hybrid_keypair,
+                    new_did=old.signing_did,
+                    new_verification_methods=old.new_verification_methods,
+                )
+            else:
+                p.sender_manager.task_store = TaskStore(
+                    p.backend,
+                    scope=NativeRecipientScope(PRINCIPAL, "other-tenant"),
+                    owns_backend=False,
+                )
+        with pytest.raises(
+            PeerAccessDeniedError, match="registration or identity changed"
+        ):
+            await session.send(dispatch, wire)
+        assert (
+            await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
+        ).state.value == "reserved"

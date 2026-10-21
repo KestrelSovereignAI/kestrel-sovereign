@@ -383,3 +383,38 @@ def test_load_after_legacy_key_destroyed_succeeds(post_ceremony_agent_on_disk):
     # Hybrid signing still works
     assert identity.hybrid_keypair is not None
     assert identity.archival_keypair is not None
+
+
+def test_signing_key_ids_follow_public_keys_without_vm_order_or_default_fragments():
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+    pair = generate_hybrid_keypair()
+    did = "did:web:signing-ids.test:agent"
+    methods = build_verification_methods(did, pair.public_keys())
+    methods[0]["id"] = did + "#rotated-classical"
+    methods[1]["id"] = did + "#rotated-pq"
+    identity = AgentIdentity(hybrid_keypair=pair, new_did=did, new_verification_methods=list(reversed(methods)))
+    assert identity.signing_key_ids() == {
+        ALG_ED25519: did + "#rotated-classical",
+        ALG_ML_DSA_65: did + "#rotated-pq",
+    }
+
+
+def test_signing_key_ids_refuse_mismatched_private_key_material():
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+    pair = generate_hybrid_keypair()
+    other = generate_hybrid_keypair()
+    did = "did:web:signing-ids.test:agent"
+    identity = AgentIdentity(hybrid_keypair=pair, new_did=did,
+        new_verification_methods=build_verification_methods(did, other.public_keys()))
+    with pytest.raises(RuntimeIdentityError, match="does not match"):
+        identity.signing_key_ids()
+
+
+def test_signing_key_ids_refuse_legacy_only_identity():
+    with pytest.raises(RuntimeIdentityError, match="requires a hybrid identity"):
+        AgentIdentity(legacy_keypair=Secp256k1Suite().generate_keypair(),
+            legacy_did="did:pkh:eip155:1:legacy").signing_key_ids()

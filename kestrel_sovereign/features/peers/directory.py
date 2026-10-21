@@ -13,6 +13,7 @@ host behaviour.  It is deliberately an adapter, not a hosted tenancy policy.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Mapping, Optional, Protocol, Sequence
 from urllib.parse import quote
@@ -178,6 +179,9 @@ class PeerDirectoryRouter(Protocol):
     ) -> Mapping[str, Any]:
         """Authorize and synchronously invoke an already-resolved peer."""
 
+    def open_a2a_session(self, requester: PeerRequester, peer: PeerIdentity):
+        """Open an authorized official-SDK session for a stable peer binding."""
+
     async def send_a2a_task(
         self,
         requester: PeerRequester,
@@ -268,6 +272,7 @@ class LocalHostPeerDirectory:
         principal_payload_factory: Optional[
             Callable[[str, str], Mapping[str, Any]]
         ] = None,
+        native_session_factory: Callable[..., Any] | None = None,
     ) -> None:
         self._host_url = host_url.rstrip("/")
         self._execution_custody = execution_custody
@@ -282,6 +287,16 @@ class LocalHostPeerDirectory:
         # capability. They authenticate HTTP reads with the same signed,
         # replay-protected A2A envelope used for mutations.
         self._principal_payload_factory = principal_payload_factory
+        self._native_session_factory = native_session_factory
+
+    @asynccontextmanager
+    async def open_a2a_session(self, requester: PeerRequester, peer: PeerIdentity):
+        self._require_requester(requester)
+        authorized_peer = await self._authorize_peer(requester, peer)
+        if self._native_session_factory is None:
+            raise PeerDirectoryConfigurationError("Host has no native A2A session factory")
+        async with self._native_session_factory(requester, authorized_peer) as session:
+            yield session
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

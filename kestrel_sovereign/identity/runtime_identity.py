@@ -231,6 +231,16 @@ class AgentIdentity:
         """
         return self.new_did if self.is_hybrid else self.legacy_did
 
+    def signing_key_ids(self) -> dict[str, str]:
+        """Published key IDs whose public keys match this runtime hybrid pair."""
+        if not self.is_hybrid:
+            raise RuntimeIdentityError("Hybrid signing requires a hybrid identity")
+        return _validate_hybrid_key_binding(
+            self.hybrid_keypair,
+            self.new_verification_methods,
+            expected_did=self.signing_did,
+        )
+
 
 @dataclass(frozen=True)
 class _LoaderVerifiedIdentityBinding:
@@ -352,7 +362,7 @@ def _validate_hybrid_key_binding(
     verification_methods: list,
     *,
     expected_did: str,
-) -> None:
+) -> dict[str, str]:
     """Prove both local private halves match the DID's published keys.
 
     Merely decrypting both files is not enough: a copied key bundle can be
@@ -367,6 +377,7 @@ def _validate_hybrid_key_binding(
         hybrid.pq.suite_id: hybrid.pq,
     }
     public_by_alg: dict[str, object] = {}
+    ids_by_alg: dict[str, str] = {}
 
     for index, vm in enumerate(verification_methods):
         if not isinstance(vm, Mapping):
@@ -406,6 +417,7 @@ def _validate_hybrid_key_binding(
                 f"multiple verification methods claim {suite.alg_id!r}"
             )
         public_by_alg[suite.alg_id] = public_key
+        ids_by_alg[suite.alg_id] = vm_id
 
     missing = sorted(set(expected) - set(public_by_alg))
     if missing:
@@ -430,6 +442,7 @@ def _validate_hybrid_key_binding(
                 f"does not match the verification method controlled by "
                 f"{expected_did!r}"
             )
+    return ids_by_alg
 
 
 def _detect_hybrid_slug(storage_dir: Path) -> str:
