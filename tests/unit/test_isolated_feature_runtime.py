@@ -16894,6 +16894,42 @@ async def test_hosted_telegram_ingress_is_admitted_only_through_the_durable_rout
     )
 
 
+@pytest.mark.asyncio
+async def test_hosted_ack_correlation_is_selected_only_by_trusted_host():
+    feature = object.__new__(ProxyFeature)
+    feature._is_telegram_runtime = lambda: True
+    feature._hosted_telegram_startup_attested = True
+    feature._route_validated_inbound = AsyncMock(return_value={"durably_admitted": True})
+    payload = {"id": "telegram:v2:bot:42:update:12", "content": "OK",
+               "session_id": "forged", "acknowledgement_session_id": "forged"}
+    assert await feature.admit_hosted_telegram_ingress(
+        payload, acknowledgement_only=True, acknowledgement_session_id="original-run",
+    ) == {"durably_admitted": True}
+    feature._route_validated_inbound.assert_awaited_once_with(
+        payload, cursor_owned_protocol=True,
+        telegram_terminal_disposition="care_acknowledgement",
+        acknowledgement_session_id="original-run",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledgement_only,session_id", [
+    (False, "original-run"), (True, True), (True, 42), (True, ""),
+    (True, " leading"), (True, "line\nbreak"), (True, "x" * 257),
+])
+async def test_hosted_ack_session_rejects_other_purposes_and_bad_identity(acknowledgement_only, session_id):
+    feature = object.__new__(ProxyFeature)
+    feature._is_telegram_runtime = lambda: True
+    feature._hosted_telegram_startup_attested = True
+    feature._route_validated_inbound = AsyncMock()
+    with pytest.raises(isolated_runtime.ProtocolError):
+        await feature.admit_hosted_telegram_ingress(
+            {"id": "telegram:v2:bot:42:update:12"},
+            acknowledgement_only=acknowledgement_only, acknowledgement_session_id=session_id,
+        )
+    feature._route_validated_inbound.assert_not_awaited()
+
+
 def test_explicit_isolated_feature_data_directory_wins_over_storage_path(tmp_path):
     """Postgres-backed hosts can isolate venvs without a SQLite storage file."""
 

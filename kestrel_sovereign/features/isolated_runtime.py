@@ -659,6 +659,9 @@ _cursor_owned_inbound_protocol: ContextVar[bool] = ContextVar(
 _telegram_terminal_inbound_disposition: ContextVar[str | None] = ContextVar(
     "isolated_telegram_terminal_inbound_disposition", default=None
 )
+_telegram_acknowledgement_session_id: ContextVar[str | None] = ContextVar(
+    "isolated_telegram_acknowledgement_session_id", default=None
+)
 @dataclass(slots=True)
 class _ConfigIngressFenceLease:
     """Mutable authority for one exact proxy lifecycle ingress boundary.
@@ -16692,6 +16695,7 @@ class ProxyFeature(Feature):
         *,
         cursor_owned_protocol: bool,
         telegram_terminal_disposition: str | None = None,
+        acknowledgement_session_id: str | None = None,
     ) -> Any:
         """Route with a host-only protocol classification.
 
@@ -16702,15 +16706,25 @@ class ProxyFeature(Feature):
         or widening every legacy ChannelFeature implementation.
         """
 
+        from kestrel_sovereign.signals.sources.channels import validate_channel_session_id
+
+        if acknowledgement_session_id is not None and telegram_terminal_disposition != "care_acknowledgement":
+            raise ProtocolError("session correlation is restricted to host care acknowledgements")
+        try:
+            acknowledgement_session_id = validate_channel_session_id(acknowledgement_session_id)
+        except ValueError as error:
+            raise ProtocolError("invalid hosted acknowledgement session identity") from error
         token = _cursor_owned_inbound_protocol.set(cursor_owned_protocol)
         terminal_token = _telegram_terminal_inbound_disposition.set(
             telegram_terminal_disposition
         )
+        session_token = _telegram_acknowledgement_session_id.set(acknowledgement_session_id)
         try:
             return await self._route_inbound(payload)
         finally:
             _cursor_owned_inbound_protocol.reset(token)
             _telegram_terminal_inbound_disposition.reset(terminal_token)
+            _telegram_acknowledgement_session_id.reset(session_token)
 
     @_detached_host_ingress_control()
     async def admit_hosted_telegram_ingress(
@@ -16719,6 +16733,7 @@ class ProxyFeature(Feature):
         *,
         terminal_disposition: str | None = None,
         acknowledgement_only: bool = False,
+        acknowledgement_session_id: str | None = None,
     ) -> Any:
         """Durably admit one host-authenticated Telegram webhook result.
 
@@ -16730,6 +16745,12 @@ class ProxyFeature(Feature):
         success to Telegram.  This narrow host API preserves the proxy-owned
         agent/channel binding and refuses ordinary polling or un-attested
         children from manufacturing hosted admission.
+
+        ``acknowledgement_session_id`` is an optional trusted-host selection
+        of the original authorized workflow run. It is accepted only with
+        ``acknowledgement_only=True``; no provider/child DTO field selects it.
+        It preserves USER_VISIBLE/UNTRUSTED semantics, conveys no authority,
+        and must be repeated when verifying an exact terminal replay receipt.
         """
 
         if (
@@ -16747,16 +16768,26 @@ class ProxyFeature(Feature):
             acknowledgement_only and terminal_disposition is not None
         ):
             raise ProtocolError("invalid hosted acknowledgement admission")
+        from kestrel_sovereign.signals.sources.channels import validate_channel_session_id
+
+        if acknowledgement_session_id is not None and not acknowledgement_only:
+            raise ProtocolError("session correlation is restricted to host care acknowledgements")
+        try:
+            acknowledgement_session_id = validate_channel_session_id(acknowledgement_session_id)
+        except ValueError as error:
+            raise ProtocolError("invalid hosted acknowledgement session identity") from error
         # This classification is supplied only by the authenticated host API.
         # It is intentionally not a child-advertised terminal descriptor: a
         # transport may not downgrade arbitrary messages to care receipts.
         if acknowledgement_only:
             terminal_disposition = "care_acknowledgement"
-        return await self._route_validated_inbound(
-            payload,
-            cursor_owned_protocol=True,
-            telegram_terminal_disposition=terminal_disposition,
-        )
+        route_arguments = {
+            "cursor_owned_protocol": True,
+            "telegram_terminal_disposition": terminal_disposition,
+        }
+        if acknowledgement_session_id is not None:
+            route_arguments["acknowledgement_session_id"] = acknowledgement_session_id
+        return await self._route_validated_inbound(payload, **route_arguments)
 
     async def _route_inbound(self, payload: Any) -> Any:
         self._require_event_ingress_work()
@@ -16818,8 +16849,12 @@ class ProxyFeature(Feature):
             _cursor_owned_inbound_protocol.get(),
         )
         if terminal_disposition is not None:
+            terminal_arguments = {"disposition": terminal_disposition}
+            session_id = _telegram_acknowledgement_session_id.get()
+            if session_id is not None:
+                terminal_arguments["session_id"] = session_id
             return await channel.handle_terminal_inbound(
-                message, disposition=terminal_disposition
+                message, **terminal_arguments,
             )
         return await channel.handle_inbound(message)
 

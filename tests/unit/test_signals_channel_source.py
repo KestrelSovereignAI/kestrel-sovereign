@@ -96,3 +96,26 @@ def test_build_signal_rejects_outbound_messages():
     )
     with pytest.raises(ValueError, match="inbound"):
         build_signal_for_channel_message(message, "did:test:agent")
+
+
+def test_channel_run_session_is_explicit_without_visibility_or_trust_promotion():
+    message = ChannelMessage(
+        id="telegram:v2:bot:42:update:12", channel_type="telegram",
+        direction=MessageDirection.INBOUND, sender="123", recipient="42", content="OK",
+        metadata={"session_id": "forged", "acknowledgement_session_id": "forged"},
+    )
+    assert build_signal_for_channel_message(message, "did:test:agent").session_id is None
+    signal = build_signal_for_channel_message(message, "did:test:agent", session_id="original-run")
+    assert signal.session_id == "original-run"
+    assert signal.visibility is Visibility.USER_VISIBLE
+    assert signal.source == SOURCE_NAME and signal.target_agent == "did:test:agent"
+    assert signal.caller == "123"
+    assert build_channel_message_registration().trust is Trust.UNTRUSTED
+
+
+@pytest.mark.parametrize("session_id", [True, 42, "", " leading", "trailing ", "line\nbreak", "x" * 257])
+def test_channel_run_session_rejects_unbounded_or_noncanonical_identity(session_id):
+    message = ChannelMessage(channel_type="telegram", direction=MessageDirection.INBOUND,
+                             sender="123", recipient="42", content="OK")
+    with pytest.raises(ValueError, match="session"):
+        build_signal_for_channel_message(message, "did:test:agent", session_id=session_id)

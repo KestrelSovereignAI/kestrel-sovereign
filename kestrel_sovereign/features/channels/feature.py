@@ -50,6 +50,7 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_TERMINAL_MARKER_VALUE,
     build_channel_message_registration,
     build_signal_for_channel_message,
+    validate_channel_session_id,
 )
 
 from .models import (
@@ -986,7 +987,7 @@ class ChannelFeature(Feature):
     # ------------------------------------------------------------------
 
     async def handle_terminal_inbound(
-        self, message: ChannelMessage, *, disposition: str
+        self, message: ChannelMessage, *, disposition: str, session_id: str | None = None,
     ) -> InboundAdmission:
         """Durably own a bounded Telegram terminal update without cognition."""
 
@@ -996,6 +997,12 @@ class ChannelFeature(Feature):
             or getattr(message, "_kestrel_cursor_owned_protocol", False) is not True
             or _CANONICAL_TELEGRAM_UPDATE_ID.fullmatch(message.id or "") is None
         ):
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        if session_id is not None and disposition != "care_acknowledgement":
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        try:
+            session_id = validate_channel_session_id(session_id)
+        except ValueError:
             return InboundAdmission(InboundAdmissionDisposition.REJECTED)
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         if metadata.get("dedupe_key") != message.id:
@@ -1026,6 +1033,7 @@ class ChannelFeature(Feature):
             signal = build_signal_for_channel_message(
                 message,
                 target_agent=getattr(self.agent, "did", self._agent_id),
+                session_id=session_id,
             )
             signal.payload[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
             handle = await enqueue_terminal(
