@@ -31,6 +31,46 @@ from tests.utils.runtime_task_factory import refusing_runtime_completion_factory
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
+@pytest.mark.parametrize("offset", [0, -5, 9])
+@pytest.mark.parametrize("nullable", [False, True])
+async def test_real_pg_sleep_episode_timestamp_binding_and_native_reader(native_pg, offset, nullable):
+    """Exercise real persistence only: no sleep/reflection/provider invocation."""
+    import re
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.storage.async_database import CORE_SCHEMA
+    from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+    from kestrel_sovereign.storage.memory_models import MemoryEpisode
+
+    backend, _, _ = native_pg
+    db = AsyncDatabase(backend)
+    statements = re.findall(r"CREATE TABLE IF NOT EXISTS memory_episodes \([\s\S]*?\n\);", CORE_SCHEMA)
+    assert len(statements) == 1
+    await db.execute(statements[0])
+    zone = timezone(timedelta(hours=offset))
+    start = datetime(2026, 10, 20, 17, 15, 44, 971730, tzinfo=zone)
+    end = start + timedelta(minutes=3)
+    episode = MemoryEpisode(
+        id="native-sleep-episode", agent_id="did:test:sleep-episode",
+        title="Provider-free native persistence", summary="Typed timestamp boundary",
+        timespan_start=None if nullable else start, timespan_end=None if nullable else end,
+        key_message_ids=["one", "two"],
+    )
+    consolidator = MemoryConsolidator(db, episode.agent_id)
+    await consolidator._save_episode(episode)
+    row = await db.fetchone("SELECT timespan_start,timespan_end,created_at FROM memory_episodes")
+    expected_start = None if nullable else start.astimezone(timezone.utc).replace(tzinfo=None)
+    expected_end = None if nullable else end.astimezone(timezone.utc).replace(tzinfo=None)
+    assert row[0] == expected_start
+    assert row[1] == expected_end
+    assert isinstance(row[2], datetime)
+    episodes = await consolidator.get_episodes()
+    assert len(episodes) == 1
+    assert episodes[0].timespan_start == expected_start
+    assert episodes[0].timespan_end == expected_end
+    assert episodes[0].created_at == row[2]
+    assert episodes[0].key_message_ids == ["one", "two"]
+
+
 @pytest.mark.parametrize("privacy", ["normal", "ephemeral", "isolated", "anonymous"])
 async def test_real_pg_host_ack_targets_one_run_and_receipt_binds_session(native_pg, privacy):
     """Real proxy, producer, persistence and session selectors; no Workflows substitute claim."""
