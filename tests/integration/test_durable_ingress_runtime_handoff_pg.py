@@ -31,6 +31,159 @@ from tests.utils.runtime_task_factory import refusing_runtime_completion_factory
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
+@pytest.mark.parametrize("offset", [0, -5, 9])
+@pytest.mark.parametrize("nullable", [False, True])
+async def test_real_pg_sleep_episode_timestamp_binding_and_native_reader(native_pg, offset, nullable):
+    """Exercise real persistence only: no sleep/reflection/provider invocation."""
+    import re
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.storage.async_database import core_schema_sql
+    from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+    from kestrel_sovereign.storage.memory_models import MemoryEpisode
+
+    backend, _, _ = native_pg
+    db = AsyncDatabase(backend)
+    statements = re.findall(r"CREATE TABLE IF NOT EXISTS memory_episodes \([\s\S]*?\n\);", core_schema_sql("postgres"))
+    assert len(statements) == 1
+    await db.execute(statements[0])
+    zone = timezone(timedelta(hours=offset))
+    start = datetime(2026, 10, 20, 17, 15, 44, 971730, tzinfo=zone)
+    end = start + timedelta(minutes=3)
+    episode = MemoryEpisode(
+        id="native-sleep-episode", agent_id="did:test:sleep-episode",
+        title="Provider-free native persistence", summary="Typed timestamp boundary",
+        timespan_start=None if nullable else start, timespan_end=None if nullable else end,
+        key_message_ids=["one", "two"],
+    )
+    consolidator = MemoryConsolidator(db, episode.agent_id)
+    await consolidator._save_episode(episode)
+    row = await db.fetchone("SELECT timespan_start,timespan_end,created_at FROM memory_episodes")
+    expected_start = None if nullable else start.astimezone(timezone.utc).replace(tzinfo=None)
+    expected_end = None if nullable else end.astimezone(timezone.utc).replace(tzinfo=None)
+    assert row[0] == expected_start
+    assert row[1] == expected_end
+    assert isinstance(row[2], datetime)
+    episodes = await consolidator.get_episodes()
+    assert len(episodes) == 1
+    assert episodes[0].timespan_start == expected_start
+    assert episodes[0].timespan_end == expected_end
+    assert episodes[0].created_at == row[2]
+    assert episodes[0].key_message_ids == ["one", "two"]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_real_pg_sleep_archive_timestamp_binding(native_pg, legacy):
+    import json
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.storage.conversation_created_at import conversation_history_ddl
+    from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+    backend, _, _ = native_pg
+    db = AsyncDatabase(backend)
+    await db.execute(conversation_history_ddl("postgres").replace("CREATE TABLE {table}", "CREATE TABLE conversation_history"))
+    archived = datetime(2020, 1, 1, 17, 15, 44, 971730, tzinfo=timezone(timedelta(hours=9)))
+    metadata = {"archived": True, "archived_at": archived.isoformat()} if legacy else {"importance": 0.0}
+    await db.execute(
+        "INSERT INTO conversation_history (agent_id,role,content,metadata,created_at) VALUES (?, ?, ?, ?, ?)",
+        ("did:test:archive", "user", "provider-free archive", json.dumps(metadata), datetime(2020, 1, 1)),
+    )
+    before = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert await MemoryConsolidator(db, "did:test:archive")._archive_decayed() == 1
+    row = await db.fetchone("SELECT archived_at,metadata FROM conversation_history")
+    assert isinstance(row[0], datetime)
+    if legacy:
+        assert row[0] == archived.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        assert row[0] >= before
+    assert "archived" not in json.loads(row[1])
+
+
+@pytest.mark.parametrize("privacy", ["normal", "ephemeral", "isolated", "anonymous"])
+async def test_real_pg_host_ack_targets_one_run_and_receipt_binds_session(native_pg, privacy):
+    """Real proxy, producer, persistence and session selectors; no Workflows substitute claim."""
+    from dataclasses import replace
+    from kestrel_sdk.signals import Trust, Visibility
+    from kestrel_sovereign.features.channels.feature import ChannelFeature, InboundAdmissionDisposition
+    from kestrel_sovereign.features.channels.models import ChannelConfig, ChannelMessage, MessageDirection
+    from kestrel_sovereign.features.isolated_runtime import ProxyFeature
+    from kestrel_sovereign.signals.sources.channels import (
+        DURABLE_TERMINAL_CONSUMER_ID, DURABLE_TERMINAL_MARKER,
+        DURABLE_TERMINAL_MARKER_VALUE, build_signal_for_channel_message,
+    )
+    from tests.unit.test_channels_feature import StubAdapter
+    from tests.unit.test_durable_signal_delivery import _Agent
+
+    backend, control, schema = native_pg
+    agent = _Agent("did:test:pg-run-bound-ack")
+    agent.storage = SimpleNamespace(db=AsyncDatabase(backend), agent_id=agent.did)
+    agent.privacy_config = get_privacy_preset(privacy)
+    logs = SignalLogStore(backend)
+    await logs.initialize()
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    dispatcher = SignalDispatcher(agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=logs)
+    agent.dispatcher = dispatcher
+    agent.signal_registry = registry
+    channel = ChannelFeature(agent)
+    source_id = "telegram:v2:bot:42:update:19"
+    message = ChannelMessage(
+        id=source_id, channel_type="telegram", direction=MessageDirection.INBOUND,
+        sender="123", recipient="123", content=" OK ", agent_id=agent.did,
+        metadata={"dedupe_key": source_id, "chat_id": "123", "reply_to_message_id": "777",
+                  "session_id": "forged-run"},
+    )
+    proxy = object.__new__(ProxyFeature)
+    proxy.agent = agent
+    proxy._require_event_ingress_work = lambda: None
+    proxy._channel_feature = lambda: channel
+    proxy._authoritative_inbound_channel_type = lambda: "telegram"
+    try:
+        await channel.initialize()
+        channel.registry.register(StubAdapter(
+            channel="telegram", config=ChannelConfig(channel_type="telegram", allowed_senders=["123"]),
+        ))
+        for run in ("run-a", "run-b"):
+            await dispatcher.register_durable_consumer(DurableConsumerRegistration(
+                consumer_id=f"workflow-{run}", source="channel.message", agent_id=agent.did,
+                correlation_selector=f"session_id={run}",
+            ))
+        admission = await proxy._route_validated_inbound(
+            message.to_dict(), cursor_owned_protocol=True,
+            telegram_terminal_disposition="care_acknowledgement",
+            acknowledgement_session_id="run-a",
+        )
+        assert admission.disposition == InboundAdmissionDisposition.DURABLY_ADMITTED
+        expected = build_signal_for_channel_message(message, target_agent=agent.did, session_id="run-a")
+        expected.payload[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+        registration = registry.get("channel.message")
+        expected.payload = registration.schema(registration.sanitizer(expected.payload))
+        expected.origin_trust = registration.trust
+        args = dict(consumer_id=DURABLE_TERMINAL_CONSUMER_ID, source="channel.message", source_event_id=source_id)
+        async with asyncio.timeout(5):
+            while True:
+                receipt = await dispatcher.get_durable_delivery_for_source_event(**args)
+                if receipt is not None and receipt.status == "terminal_ackable":
+                    break
+                await asyncio.sleep(0.01)
+        receipt = await dispatcher.get_durable_delivery_for_source_event(**args, expected_channel_signal=expected)
+        assert receipt is not None
+        assert receipt.event.session_id == "run-a"
+        assert receipt.event.visibility == Visibility.USER_VISIBLE.value
+        assert registry.get("channel.message").trust == Trust.UNTRUSTED
+        for session in (None, "run-b"):
+            assert await dispatcher.get_durable_delivery_for_source_event(
+                **args, expected_channel_signal=replace(expected, session_id=session),
+            ) is None
+        deliveries = await dispatcher.list_durable_deliveries()
+        assert {delivery.consumer_id for delivery in deliveries} == {DURABLE_TERMINAL_CONSUMER_ID, "workflow-run-a"}
+        assert agent.action_calls == 0
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects') == 0
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".durable_signal_events') == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await asyncio.gather(*agent.tasks, return_exceptions=True)
+
+
 async def retire_handoff_test(agent, dispatcher):
     """A failing dispatcher close cannot skip its original native task joins."""
     try:

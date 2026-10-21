@@ -688,6 +688,13 @@ during sleep. It performs three operations.
 > in that PR; consolidation now runs nightly at 04:00 when the
 > `MemoryFeature` is loaded.
 
+`MemoryConsolidator` binds episode and archival timestamps through one
+backend-aware boundary: native naive UTC datetimes for legacy PostgreSQL
+`TIMESTAMP` columns, existing ISO text for SQLite. JSON graph properties keep
+their string representation. Episode listing and relevance recall share
+`MemoryEpisode.from_row`, which retains native datetimes instead of silently
+discarding them. No generic adapter guesses that arbitrary strings are dates.
+
 Both the nightly sleep cycle and the manual tool route through
 `MemorySystem.consolidate()`, the single bounded maintenance chokepoint. Set
 `retrieval.memory_consolidation_timeout_seconds` to change its positive,
