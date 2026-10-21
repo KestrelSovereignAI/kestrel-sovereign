@@ -26,14 +26,16 @@ import types
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
 from kestrel_sdk.features import (
     FeaturePermissionDefaults,
+)
+from kestrel_sdk.features import (
     PermissionLevel as SDKPermissionLevel,
 )
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.base import ToolCategory
+
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.features.base import Feature, tool
@@ -225,16 +227,16 @@ def _agent(tmp_path) -> KestrelAgent:
 
 
 class _RecordingTaskManager:
-    """Minimal A2A TaskManager double recording agent (un)registration."""
+    """Record the native provider registration owned by feature lifecycle."""
 
     def __init__(self) -> None:
-        self.agents: dict = {}
+        self.providers: dict = {}
 
-    def register_agent(self, *, agent_card, handler, command_prefixes):
-        self.agents[agent_card.name] = handler
+    def register_provider(self, provider_id, skills, handler, command_prefixes=None):
+        self.providers[provider_id] = handler
 
-    def unregister_agent(self, name):
-        self.agents.pop(name, None)
+    def unregister_provider(self, name):
+        self.providers.pop(name, None)
 
 
 async def _boot_feature(agent, feature) -> None:
@@ -257,7 +259,7 @@ def _live_registrations(agent, feature):
         "wait": agent.wait_registry.get("lifecycle") is not None,
         "hook": feature._hook
         in agent.hooks_manager.get_hooks(HookEvent.SESSION_START),
-        "a2a": feature.tool_name in agent.task_manager.agents,
+        "a2a": feature.name in agent.task_manager.providers,
         "tool": any(
             owner == feature.tool_name
             for owner in agent._tool_to_feature.values()
@@ -342,7 +344,7 @@ async def test_unregister_runtime_cleans_everything_when_on_disable_raises(tmp_p
     assert feature._hook not in agent.hooks_manager.get_hooks(
         HookEvent.SESSION_START
     )
-    assert feature.tool_name not in agent.task_manager.agents
+    assert feature.name not in agent.task_manager.providers
     assert not any(
         owner == feature.tool_name for owner in agent._tool_to_feature.values()
     )
@@ -373,7 +375,7 @@ async def test_unregister_runtime_cleans_everything_when_on_disable_cancels(tmp_
     assert feature._hook not in agent.hooks_manager.get_hooks(
         HookEvent.SESSION_START
     )
-    assert feature.tool_name not in agent.task_manager.agents
+    assert feature.name not in agent.task_manager.providers
     assert not any(
         owner == feature.tool_name for owner in agent._tool_to_feature.values()
     )
@@ -397,7 +399,7 @@ async def test_soft_disable_cleans_everything_when_on_disable_raises(tmp_path):
     assert feature._hook not in agent.hooks_manager.get_hooks(
         HookEvent.SESSION_START
     )
-    assert feature.tool_name not in agent.task_manager.agents
+    assert feature.name not in agent.task_manager.providers
     assert not any(
         owner == feature.tool_name for owner in agent._tool_to_feature.values()
     )
@@ -1020,7 +1022,7 @@ async def test_runtime_permission_registration_failure_rolls_back_activation(
 
     assert feature.enabled is False
     assert not agent.feature_contribution_runtime.is_active(feature)
-    assert feature.tool_name not in agent.task_manager.agents
+    assert feature.name not in agent.task_manager.providers
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1089,7 @@ async def test_endpoint_remove_drains_every_registration_and_direct_tool(tmp_pat
     assert _FullFeature.SOURCE not in agent.signal_registry
     assert agent.wait_registry.get("lifecycle") is None
     assert feature._hook not in agent.hooks_manager.get_hooks(HookEvent.SESSION_START)
-    assert feature.tool_name not in agent.task_manager.agents
+    assert feature.name not in agent.task_manager.providers
     assert feature._sleep_hook not in agent.sleep_hooks
     # The promoted direct tool is gone from the map AND no longer resolves, so a
     # removed feature's @tool methods can never be executed (the exact bug: the
@@ -1128,7 +1130,7 @@ class _OnEnableFailFeature(_FullFeature):
 
 
 class _A2AFailFeature(_FullFeature):
-    """Registration fails INSIDE ``_wire_feature_a2a`` AFTER ``register_agent``
+    """Registration fails INSIDE ``_wire_feature_a2a`` AFTER ``register_provider``
     already recorded the A2A agent — ``set_task_manager`` raises."""
 
     tool_name = "a2a_fail_feature"
@@ -1142,7 +1144,7 @@ def _no_registration_survives(agent, feature) -> None:
     assert _FullFeature.SOURCE not in agent.signal_registry
     assert agent.wait_registry.get("lifecycle") is None
     assert feature._hook not in agent.hooks_manager.get_hooks(HookEvent.SESSION_START)
-    assert feature.tool_name not in agent.task_manager.agents
+    assert feature.name not in agent.task_manager.providers
     assert not any(
         owner == feature.tool_name for owner in agent._tool_to_feature.values()
     )
@@ -1176,23 +1178,23 @@ async def test_register_feature_a2a_failure_strands_nothing(tmp_path):
     agent = _agent(tmp_path)
     feature = _A2AFailFeature(agent)
 
-    # Sanity: register_agent recorded the A2A agent before set_task_manager blew
+    # Sanity: register_provider recorded the native provider before set_task_manager blew
     # up — so this genuinely exercises the "failed AFTER registration" path.
-    original_register = agent.task_manager.register_agent
+    original_register = agent.task_manager.register_provider
     registered_names: list[str] = []
 
-    def _spy_register(*, agent_card, handler, command_prefixes):
-        registered_names.append(agent_card.name)
+    def _spy_register(*, provider_id, skills, handler, command_prefixes):
+        registered_names.append(provider_id)
         return original_register(
-            agent_card=agent_card, handler=handler, command_prefixes=command_prefixes
+            provider_id=provider_id, skills=skills, handler=handler, command_prefixes=command_prefixes
         )
 
-    agent.task_manager.register_agent = _spy_register
+    agent.task_manager.register_provider = _spy_register
 
     with pytest.raises(RuntimeError, match="a2a wiring boom"):
         await agent._register_feature(feature)
 
-    assert registered_names == ["a2a_fail_feature"], (
+    assert registered_names == [feature.name], (
         "A2A agent must have been registered before the failure for this test to "
         "exercise the post-registration strand"
     )

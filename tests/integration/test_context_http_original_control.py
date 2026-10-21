@@ -8,22 +8,19 @@ authenticated HTTP, canonical constitutional admission or Agent READY proof.
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
+from a2a.types import Message, Part, Role, SendMessageRequest
 from fastapi import HTTPException, Request
 from kestrel_sdk.tools.result import ToolResultStatus
 
-from kestrel_sovereign.a2a.stores.unified import (
-    ObservabilityStore,
-    SessionService,
-    TaskStore,
-)
-from kestrel_sovereign.a2a.task_manager import TaskManager
-from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.agent import salvage
 from kestrel_sovereign.agent.context_builder import ContextBuilder
 from kestrel_sovereign.agent.context_manager import ContextManager
-from kestrel_sovereign.endpoints.agent import compute_context_status, get_task
+from kestrel_sovereign.endpoints.agent import compute_context_status
+from kestrel_sovereign.endpoints.task_inbox import read_inbox
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     _explicit_control_chain,
@@ -37,6 +34,7 @@ from tests.integration.native_memory_original_control import (
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.utils.native_a2a import manager_for
 
 
 @pytest.mark.asyncio
@@ -66,18 +64,9 @@ async def test_native_context_and_task_reads_preserve_control_before_shaping(
             "Component governing text, not an authority grant.",
         ),
     )
-    tasks = TaskManager(
-        TaskStore(n.backend), SessionService(n.backend), ObservabilityStore(n.backend)
-    )
+    tasks = manager_for(n.backend, NativeRecipientScope(n.did), owns_backend=False)
     await tasks.initialize()
-    task = await tasks.create_task(
-        TaskSendParams(
-            id="native-read-task",
-            sessionId=session,
-            message=Message(role="user", parts=[TextPart(text="native stored task")]),
-        ),
-        agent_name=n.did,
-    )
+    task = await tasks.create_task(SendMessageRequest(message=Message(role=Role.ROLE_USER, parts=[Part(text='native stored task')], message_id=uuid4().hex, context_id=session)), creator_agent_id=n.did)
     builder = ContextBuilder(n.pg_storage, llm_service=n.service, model="gpt-4o")
     context = ContextManager(
         n.pg_storage,
@@ -179,12 +168,12 @@ async def test_native_context_and_task_reads_preserve_control_before_shaping(
 
         monkeypatch.setattr(salvage, "get_salvage_state_counts", counts)
     elif door == "task":
-        actual = tasks.get_task_for_recipient
+        actual = tasks.get_task_snapshot
 
         async def read_task(*args, **kwargs):
             return await at_read(actual, *args, **kwargs)
 
-        monkeypatch.setattr(tasks, "get_task_for_recipient", read_task)
+        monkeypatch.setattr(tasks, "get_task_snapshot", read_task)
 
     n.backend._execution_custody = ExecutionCustody(GenerationFence())
     if kind == "native-control":
@@ -193,7 +182,7 @@ async def test_native_context_and_task_reads_preserve_control_before_shaping(
     try:
         try:
             if door == "task":
-                result = await get_task(
+                result = await read_inbox(
                     Request({"type": "http", "state": {"agent": agent}}), task.id
                 )
             elif door.startswith("history-tool"):
@@ -221,7 +210,9 @@ async def test_native_context_and_task_reads_preserve_control_before_shaping(
             assert execution_commit_outcome(failure) == "committed"
         elif kind == "ordinary" and door.startswith("history-tool"):
             assert failure is None and result.status is ToolResultStatus.ERROR
-        elif kind == "ordinary" and door in {"history-http", "task"}:
+        elif kind == "ordinary" and door == "task":
+            assert failure is ordinary
+        elif kind == "ordinary" and door == "history-http":
             assert isinstance(failure, HTTPException) and failure.status_code == 500
             assert not is_execution_control_error(failure)
         else:

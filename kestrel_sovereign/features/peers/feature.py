@@ -12,7 +12,7 @@ from collections.abc import Sequence as SequenceABC
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 import httpx
 from kestrel_sdk.tools.base import ToolCategory
@@ -78,17 +78,6 @@ def _discover_host_url() -> Optional[str]:
     return None
 
 
-class OutboundSigningError(RuntimeError):
-    """A loaded hybrid identity could not authenticate an A2A envelope.
-
-    The public ``code`` is deliberately coarse: callers and the outbound audit
-    need an honest failure reason, but neither surface should receive provider
-    exception text that could disclose signing implementation details.
-    """
-
-    def __init__(self, code: str):
-        super().__init__("hybrid A2A envelope signing failed")
-        self.code = code
 
 
 class PeersFeature(Feature):
@@ -142,8 +131,8 @@ class PeersFeature(Feature):
         # A hosted runtime injects both objects at agent construction.  The
         # requester scope is host-authenticated, opaque to this feature, and
         # never sourced from a tool argument or user-provided metadata.  When
-        # neither is supplied, retain the local host HTTP adapter as the
-        # backwards-compatible default.
+        # neither is supplied, discover the local host roster and use its
+        # explicitly supplied native A2A session factory.
         self._peer_router = getattr(self.agent, "peer_directory_router", None)
         self._peer_requester = getattr(self.agent, "peer_requester", None)
         if (self._peer_router is None) != (self._peer_requester is None):
@@ -166,7 +155,7 @@ class PeersFeature(Feature):
             )
 
             # The endpoint reads its immutable policy from the agent, while
-            # the subprocess compatibility router normally belongs to this
+            # the subprocess directory client normally belongs to this
             # feature. Publish the exact pair only for a launcher-marked child.
             self.agent.peer_directory_router = self._peer_router
             self.agent.peer_requester = self._peer_requester
@@ -211,33 +200,25 @@ class PeersFeature(Feature):
 
         return "unknown"
 
-    def _current_legacy_outbound_sender(self) -> str:
-        """Return the current public display name for an unsigned envelope.
-
-        ``_own_name`` is intentionally retained as this feature's startup
-        identity for logs and legacy fallbacks, but it is stale after a
-        volatile rename. The hosted receiver authorizes unsigned legacy A2A
-        against the live name it publishes on its agent card, so this sender
-        metadata must resolve through the same live source. Hybrid envelopes
-        subsequently overwrite this value with their signing DID.
-        """
-
-        resolver = getattr(self.agent, "resolve_effective_name", None)
-        if callable(resolver):
-            resolved = resolver(default=None)
-            if isinstance(resolved, str) and resolved.strip():
-                return resolved
-        live_name = getattr(self.agent, "_agent_name", None)
-        if isinstance(live_name, str) and live_name.strip():
-            return live_name
-        return self._own_name
 
     def _install_local_host_router(self) -> None:
-        """Install the legacy local-host adapter with a private local scope."""
+        """Install authenticated roster discovery and its native session factory."""
         host_url = getattr(self, "_host_url", None)
         if not host_url:
             return
-        local_identity = str(getattr(self.agent, "did", None) or self._own_name)
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+
+        try:
+            local_identity = resolve_scoped_agent_did(self.agent)
+        except AgentIdentityUnavailable as error:
+            if is_execution_control_error(error):
+                raise
+            raise PeerDirectoryConfigurationError(
+                "Native peer discovery requires the agent's durable identity"
+            ) from error
         self._peer_requester = PeerRequester(
             identity=local_identity,
             authorization_scope=object(),
@@ -253,11 +234,6 @@ class PeersFeature(Feature):
                 *args,
                 **kwargs,
             ),
-            local_cancel=getattr(self, "_local_host_cancel", None),
-            local_stop=getattr(self, "_local_host_stop", None),
-            local_get=getattr(self, "_local_host_get", None),
-            local_subscribe=getattr(self, "_local_host_subscribe", None),
-            principal_payload_factory=self._build_principal_action_payload,
             native_session_factory=getattr(self, "_native_session_factory", None),
         )
 
@@ -268,7 +244,7 @@ class PeersFeature(Feature):
 
         Tests and embedding code that construct a feature directly historically
         set ``_host_url`` without running ``initialize``.  Lazily installing
-        the local adapter preserves that supported local behavior; an injected
+        the local directory client preserves that supported local behavior; an injected
         router never falls back to host discovery when its mandatory requester
         context is missing.
         """
@@ -311,16 +287,12 @@ class PeersFeature(Feature):
         *,
         host_url: str,
         transport_key: str,
-        local_cancel=None,
-        local_stop=None,
-        local_get=None,
-        local_subscribe=None,
         native_session_factory=None,
     ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
-        """Refresh only the local compatibility adapter for hosted policy.
+        """Refresh local roster discovery and native sessions for hosted policy.
 
         Host registration can occur after platform port resolution or peer-key
-        generation. Those are host-owned runtime facts, so the local adapter
+        generation. Those are host-owned runtime facts, so the local directory client
         must be reconstructed from them before the host freezes its inbound
         policy. An injected scoped router is intentionally never replaced.
         """
@@ -336,10 +308,6 @@ class PeersFeature(Feature):
             return self._peer_directory_context()
         self._host_url = host_url.rstrip("/")
         self._transport_key = transport_key
-        self._local_host_cancel = local_cancel
-        self._local_host_stop = local_stop
-        self._local_host_get = local_get
-        self._local_host_subscribe = local_subscribe
         self._native_session_factory = native_session_factory
         self._peer_router = None
         self._peer_requester = None
@@ -430,114 +398,7 @@ class PeersFeature(Feature):
             raise PeerSelfTargetError("Cannot route to the requesting agent")
         return router, requester, peer
 
-    def _maybe_sign_outbound(
-        self,
-        payload: Dict[str, Any],
-        *,
-        task_id: str,
-        sess_id: str,
-        message: str,
-    ) -> None:
-        """Sign the outbound A2A envelope for a loaded hybrid identity.
 
-        Sets ``metadata["sender"]`` to the signing DID — the *verified*
-        identifier — and attaches ``metadata["signature"]`` (hybrid Ed25519 +
-        ML-DSA-65 over the canonical view: sender, task_id, session_id, message,
-        timestamp). The kids are derived from the agent's published verification
-        methods so the recipient's verifier can match them. Non-hybrid
-        (pre-ceremony) agents send unsigned — the recipient allows that under
-        the same-host boundary (back-compat). Once a hybrid identity is loaded,
-        missing material or any signer error raises ``OutboundSigningError`` so
-        the caller can abort before constructing an HTTP client (#2475).
-        """
-        identity = getattr(self.agent, "identity", None)
-        if identity is None or not getattr(identity, "is_hybrid", False):
-            return
-        keypair = getattr(identity, "hybrid_keypair", None)
-        signing_did = getattr(identity, "signing_did", None)
-        vms = getattr(identity, "new_verification_methods", None)
-        if not keypair or not signing_did or not vms:
-            raise OutboundSigningError("missing_hybrid_signing_material")
-        try:
-            from datetime import datetime, timezone
-
-            from kestrel_sovereign.a2a.envelope_signing import (
-                bound_envelope_fields,
-                canonical_message,
-                kids_from_verification_methods,
-                sign_envelope,
-            )
-
-            md = payload.setdefault("metadata", {})
-            classical_kid, pq_kid = kids_from_verification_methods(vms)
-            # Bind the behaviour-steering fields (skill/verb/reply/causation
-            # chain) and the top-level artifacts so they can't be rewritten on
-            # an otherwise-valid envelope (#1721).
-            bound = bound_envelope_fields(md, artifacts=payload.get("artifacts"))
-            block = sign_envelope(
-                keypair,
-                sender=signing_did,
-                task_id=task_id,
-                message=canonical_message([message]),
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                session_id=sess_id,
-                bound=bound,
-                classical_kid=classical_kid,
-                pq_kid=pq_kid,
-            )
-            # The signed DID is the verified identifier the recipient binds to.
-            md["sender"] = signing_did
-            md["signature"] = block
-        except Exception as exc:  # noqa: BLE001 - fail closed at trust boundary
-            if is_execution_control_error(exc):
-                raise
-            logger.error(
-                "A2A sign-on-send failed for loaded hybrid identity (%s)",
-                type(exc).__name__,
-            )
-            raise OutboundSigningError("hybrid_signer_error") from exc
-
-    def _build_principal_action_payload(
-        self,
-        task_id: str,
-        verb: str,
-    ) -> Dict[str, Any]:
-        """Build a signed creator-principal envelope for HTTP read/SSE.
-
-        Process-isolated peers cannot carry the host manager's in-memory
-        capability. Binding the action verb, task id, session id, and message
-        into the ordinary replay-protected A2A signature gives the recipient
-        the same durable creator principal without trusting the shared API key.
-        """
-
-        if verb not in {"read_task", "subscribe_task"}:
-            raise OutboundSigningError("unsupported_principal_action")
-        if not isinstance(task_id, str) or not task_id:
-            raise OutboundSigningError("invalid_principal_task_id")
-        session_id = f"a2a-{verb}:{task_id}"
-        message = f"{verb}:{task_id}"
-        payload: Dict[str, Any] = {
-            "id": task_id,
-            "sessionId": session_id,
-            "message": {
-                "role": "user",
-                "parts": [{"type": "text", "text": message}],
-            },
-            "metadata": {
-                "sender": self._current_legacy_outbound_sender(),
-                "a2a_verb": verb,
-            },
-        }
-        self._maybe_sign_outbound(
-            payload,
-            task_id=task_id,
-            sess_id=session_id,
-            message=message,
-        )
-        metadata = payload.get("metadata") or {}
-        if not isinstance(metadata, Mapping) or not metadata.get("signature"):
-            raise OutboundSigningError("principal_signature_required")
-        return payload
 
     @tool(
         name="stop_peer",
@@ -851,7 +712,10 @@ class PeersFeature(Feature):
         for peer in directory:
             if not isinstance(peer, PeerIdentity):
                 logger.warning("Peer directory returned an invalid listing entry")
-                continue
+                return ToolResult.failed(
+                    "Could not list peers",
+                    data={"peers": [], "error": "Could not list peers"},
+                )
             if peer.agent_id != requester.identity:
                 peers.append(
                     {
@@ -1510,86 +1374,6 @@ class PeersFeature(Feature):
             confirmation=f"Found {len(rows)} outbound A2A dispatches",
             data={"rows": [asdict(row) for row in rows], "count": len(rows)},
         )
-
-    # ------------------------------------------------------------------
-    # Subscription supervisor (#1444)
-    #
-    # When ``send_a2a_question`` POSTs an outbound task, this helper is
-    # spawned as a tracked background coroutine. It opens an SSE stream
-    # to ``GET /tasks/{task_id}/subscribe`` on the recipient, parses
-    # ``status`` events, and when the terminal frame arrives:
-    #
-    #   - marks the pending row RESOLVED
-    #   - extracts reply text from the terminal status.message.parts
-    #   - builds an ``a2a.question_answered`` signal
-    #   - enqueues it on the local dispatcher so a fresh COGNITION turn
-    #     fires with the reply inline
-    #
-    # Reconnect: transient httpx failures back off 1s/2s/5s/10s capped,
-    # restarting the stream until either (a) we see a terminal frame,
-    # or (b) the wall-clock deadline passes. The hourly expiry sweep
-    # is the deadline backstop — even if this supervisor goes silent
-    # after a process crash, the resumption rail still fires.
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Expiry is propagated to the recipient (#3440)
-    #
-    # A question whose deadline passes is withdrawn from the recipient with
-    # the creator's signed cancellation before the asker is told ``expired``.
-    # The recipient's store then agrees with the sender's: its queued wake is
-    # suppressed, a stale re-delivery is refused at execution, and a late
-    # ``respond_to_a2a_task`` is refused as a terminal-state transition. If
-    # the recipient answered first, the cancellation conflicts and the asker
-    # is woken with that answer instead of ``expired``. A recipient that
-    # cannot be reached is settled later by the sweep, which relays its late
-    # answer if one arrives. Both stores must agree before a row is retired,
-    # however long the recipient is away: it keeps an undelivered submission
-    # wake for as long as that wake stays undelivered. Whichever wake the
-    # asker is owed stays on the sender's row until its delivery is
-    # confirmed, so a crash in between delays it but cannot lose it.
-    # ------------------------------------------------------------------
-
-    # Bound on settling one question with its recipient. The deadline wake
-    # waits for it, so it must stay short; an unreached recipient is retried
-    # by the sweep.
-    QUESTION_SETTLEMENT_TIMEOUT_SECONDS = 15.0
-    # Seconds between renewals of a question's claim lease while a wake for
-    # it is in flight. ``None`` renews three times per lease.
-    QUESTION_CLAIM_LEASE_RENEW_SECONDS: Optional[float] = None
-    QUESTION_EXPIRY_CANCEL_REASON = (
-        "The asking agent's deadline for this question passed before an "
-        "answer arrived, so it withdrew the question."
-    )
-
-    # ------------------------------------------------------------------
-    # Startup-replay + hourly expiry sweep (#1444 step 6)
-    #
-    # On boot, walk ``pending_a2a_questions WHERE status='WAITING'``:
-    #   - past-deadline rows → expire in a feature-owned task: settle with
-    #     the recipient, then fire ``a2a.question_answered`` (the
-    #     recipient's answer, or state='expired') so the asking lineage
-    #     resumes with a clean branch in the prompt template
-    #   - within-deadline rows → spawn a fresh subscription supervisor
-    #     so the SSE wait survives process restarts
-    # and resume receiver settlement for expired rows still unsettled: a
-    # recipient not yet confirmed terminal, or a late answer not yet
-    # delivered (#3440). A wake an earlier process claimed and never
-    # confirmed delivered goes back to WAITING (once its claim lapsed)
-    # carrying that wake, and is replayed with them.
-    #
-    # An hourly background task runs the same expired-row scan so rows
-    # whose deadline lapses without a supervisor (e.g. supervisor
-    # crashed) still get a synthetic terminal signal, plus the same
-    # abandoned-wake recovery and receiver-settlement retry.
-    # ------------------------------------------------------------------
-
-    # Hourly cron interval — overridable via constructor for test
-    # injection. 3600s is the Sovereign-decided default.
-    EXPIRY_SWEEP_INTERVAL_SECONDS = 3600
-
-    # The caller owns exactly one sweep: the resident service continues
-    # into it; the legacy host explicitly tracks it after replay.
 
     @tool(
         name="send_a2a_task",

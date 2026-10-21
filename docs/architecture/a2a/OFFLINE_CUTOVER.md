@@ -1,3 +1,17 @@
+---
+type: Migration Runbook
+title: Offline native A2A cutover
+description: Drain, verify, and migrate historical draft-protocol storage before native A2A startup.
+resource: /docs/architecture/a2a/OFFLINE_CUTOVER.md
+tags: [docs, architecture, a2a, migration]
+timestamp: '2026-10-21T00:00:00Z'
+status: draft
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Offline native A2A cutover
 
 The native release replaces the draft protocol. The serving runtime never

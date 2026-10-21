@@ -34,8 +34,10 @@ from kestrel_sovereign.a2a import transport_auth
         ),
     ],
 )
-def test_transport_allowlist_contains_only_peer_operations(method, path):
-    assert transport_auth.is_a2a_transport_path(method, path)
+def test_transport_credential_only_admits_the_roster(method, path):
+    assert transport_auth.is_peer_directory_request(method, path) is (
+        method == "GET" and path == "/api/agents"
+    )
 
 
 @pytest.mark.parametrize(
@@ -57,7 +59,7 @@ def test_transport_allowlist_contains_only_peer_operations(method, path):
     ],
 )
 def test_transport_allowlist_excludes_operator_and_near_miss_routes(method, path):
-    assert not transport_auth.is_a2a_transport_path(method, path)
+    assert not transport_auth.is_peer_directory_request(method, path)
 
 
 def test_transport_key_is_generated_once_and_is_not_the_sovereign_key(

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import ollama
@@ -9,13 +10,14 @@ import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
-from kestrel_sovereign.endpoints.agent import _authorize_verified_a2a_sender
+from kestrel_sovereign.a2a.native_security import NativeRequestAuthority
 from kestrel_sovereign.endpoints.features import _settle_feature_transition
 from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 from kestrel_sovereign.features.peers.directory import PeerDirectoryError, PeerRequester
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from tests.unit.test_execution_custody_review32 import receipt
+from tests.utils.native_a2a_security import send, signed_context
 
 
 @pytest.mark.asyncio
@@ -53,7 +55,7 @@ async def test_cancelled_feature_transition_keeps_original_sqlite_receipt(tmp_pa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["directory", "host"])
 @pytest.mark.parametrize("kind", ["unknown", "group", "authority", "directory-cause", "ordinary"])
-async def test_a2a_authorization_preserves_original_native_control(tmp_path, boundary, kind):
+async def test_a2a_authorization_preserves_original_native_control(tmp_path, native_request_admission, boundary, kind):
     db = await AsyncDatabase.sqlite(str(tmp_path / "authorization.db"))
     await db.execute("CREATE TABLE effects(id INTEGER)")
     original = receipt(kind)
@@ -74,14 +76,23 @@ async def test_a2a_authorization_preserves_original_native_control(tmp_path, bou
     authorizer = RecipientA2ASenderAuthorizer(
         SimpleNamespace(), recipient=recipient, sender_id_resolver=lambda did: did,
     )
+    async def native_admission():
+        admission = native_request_admission
+        original_authority = admission.guard.authority_factory()
+        authority = NativeRequestAuthority(
+            original_authority.resolver, authorizer.authorize_principal,
+            original_authority.require_current,
+        )
+        guard = replace(admission.guard, authority_factory=lambda: authority)
+        params = send(admission)
+        async with guard.admit(params, "SendMessage", signed_context(admission, params)):
+            return True
+
     operation = (authorizer.authorize("did:test:sender") if boundary == "directory"
-                 else _authorize_verified_a2a_sender(authorizer, "did:test:sender"))
+                 else native_admission())
     try:
         outcome = await await_owned_task(create_owned_task(operation))
-        if kind == "ordinary":
-            assert outcome.error is None and outcome.result in (False, None)
-        else:
-            assert outcome.error is original, "A2A authorization normalized native control into denial"
+        assert outcome.error is original, "A2A authorization normalized native failure into denial"
         assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
     finally:
         await db.close()

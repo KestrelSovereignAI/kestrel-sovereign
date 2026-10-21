@@ -9,16 +9,12 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from a2a.types import AgentInterface, Message, Part, Role, SendMessageRequest
 from kestrel_sdk.tools import Outcome, WaitStatus
+from kestrel_sdk.tools.result import ToolResult
 
-from kestrel_sovereign.a2a import outbound_store
-from kestrel_sovereign.a2a.stores.unified import (
-    ObservabilityStore,
-    SessionService,
-    TaskStore,
-)
-from kestrel_sovereign.a2a.task_manager import TaskManager
-from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+from kestrel_sovereign.a2a.lifecycle import task_state_label
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     execution_commit_outcome,
@@ -27,7 +23,6 @@ from kestrel_sovereign.execution_custody import (
 from kestrel_sovereign.features.peers.wait_provider import A2AWaitable
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.storage import AsyncStorage
-from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.waits.engine import WaitRegistry
 from kestrel_sovereign.waits.reconciler import (
@@ -37,6 +32,7 @@ from kestrel_sovereign.waits.reconciler import (
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.unit.test_execution_custody_review43_native import carries
+from tests.utils.native_a2a import manager_for
 
 
 @pytest.mark.asyncio
@@ -57,19 +53,10 @@ async def test_native_recipient_control_cannot_become_unverifiable_watch(
     native_pg, tmp_path, monkeypatch, route
 ):
     backend, observer, schema = native_pg
-    manager = TaskManager(
-        TaskStore(backend), SessionService(backend), ObservabilityStore(backend)
-    )
-    await manager.initialize()
     did = "did:web:original-wait-" + uuid4().hex
-    task = await manager.create_task(
-        TaskSendParams(
-            id=uuid4().hex,
-            sessionId=uuid4().hex,
-            message=Message(role="user", parts=[TextPart(text="native ownership")]),
-        ),
-        agent_name=did,
-    )
+    manager = manager_for(backend, NativeRecipientScope(did), owns_backend=False)
+    await manager.initialize()
+    task = await manager.create_task(SendMessageRequest(message=Message(role=Role.ROLE_USER, parts=[Part(text='native ownership')], message_id=uuid4().hex, context_id=uuid4().hex)), creator_agent_id=did)
     local_backend = SQLiteBackend(str(tmp_path / "local-wait.db"))
     await local_backend.connect()
     storage = AsyncStorage.from_backend(local_backend, agent_id=did)
@@ -99,43 +86,49 @@ async def test_native_recipient_control_cannot_become_unverifiable_watch(
 
         async def origin_session_id(self, handle):
             row = await manager.get_task_for_recipient(handle, did)
-            return row.sessionId if row is not None else None
+            return row.context_id if row is not None else None
 
         async def poll(self, handle):
             row = await manager.get_task_for_recipient(handle, did)
             return WaitStatus(
-                Outcome.PENDING, row.status.state.value if row else "absent"
+                Outcome.PENDING, task_state_label(row.status.state) if row else "absent"
             )
 
     provider = NativeWaitProvider()
     recipient.wait_registry.register(provider)
-    outbound_db = AsyncDatabase(backend)
-    await outbound_store.ensure_a2a_outbound_tasks_table(outbound_db)
-    await outbound_store.record_outbound_dispatch(
-        outbound_db,
-        agent_id=did,
-        task_id=task.id,
-        recipient="native-peer",
-        recipient_agent_id=did,
-        verb="task",
-        session_id=task.sessionId,
-        dispatch_tool="native_wait_fixture",
+    recipient.task_manager = manager
+    outbound = manager.outbound_for_actor(did)
+    dispatch = await outbound.reserve(
+        uuid4().hex,
+        SendMessageRequest(message=Message(
+            role=Role.ROLE_USER, message_id=uuid4().hex,
+            context_id=task.context_id, parts=[Part(text="Native tracked work")],
+        )),
+        recipient=NativeRecipientScope(did),
+        signing_did="did:web:original-peer.test",
+        interface=AgentInterface(url="https://original-peer.test/a2a", protocol_binding="JSONRPC", protocol_version="1.0"),
+        dispatch_tool="native_wait_fixture", verb="task",
     )
+    submitting = await outbound.begin_submission(dispatch, operation_id=uuid4().hex)
+    dispatch = await outbound.acknowledge(submitting, task, operation_id=uuid4().hex)
 
     @dataclass
     class NativeOutboundView:
-        # Actual initialized outbound store and real native callback are
-        # provider inputs, NOT peer HTTP/signature or live Agent proof.
+        # The primary native ledger and actual recipient read are component
+        # inputs; no peer HTTP/signature or Agent READY claim is made here.
         agent: RecipientView
-        _db: AsyncDatabase
-        _outbound_route_store_ready: bool = True
 
-        async def get_peer_task_result(self, recipient, handle):
-            return await manager.get_task_for_recipient(handle, did)
+        def _native_outbound_store(self):
+            return manager.outbound_for_actor(self.agent.did)
 
-    a2a_provider = A2AWaitable(NativeOutboundView(recipient, outbound_db))
+        async def get_peer_task_result(self, handle):
+            assert handle == dispatch.dispatch_id
+            row = await manager.get_task_for_recipient(task.id, did)
+            return ToolResult.ok("Native read", data={"state": task_state_label(row.status.state)})
+
+    a2a_provider = A2AWaitable(NativeOutboundView(recipient))
     recipient.wait_registry.register(a2a_provider)
-    original_outbound_get = outbound_store.get_outbound_task
+    original_outbound_get = outbound.get
     original_get = manager.get_task_for_recipient
     original_release = asyncpg.pool.PoolAcquireContext.__aexit__
     original = OSError("original native recipient read release ACK lost")
@@ -166,15 +159,15 @@ async def test_native_recipient_control_cannot_become_unverifiable_watch(
     try:
         backend._execution_custody = ExecutionCustody(GenerationFence())
         monkeypatch.setattr(manager, "get_task_for_recipient", observed_get)
-        monkeypatch.setattr(outbound_store, "get_outbound_task", observed_outbound_get)
+        monkeypatch.setattr(outbound, "get", observed_outbound_get)
         monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", lose_ack)
         try:
             if route == "task-own":
                 await task_provider.owns_handle(task.id)
             elif route == "a2a-own":
-                await a2a_provider.owns_handle(task.id)
+                await a2a_provider.owns_handle(dispatch.dispatch_id)
             elif route in {"a2a-poll", "a2a-peer"}:
-                await a2a_provider.poll(task.id)
+                await a2a_provider.poll(dispatch.dispatch_id)
             elif route == "origin":
                 await _provider_origin_session(provider, task.id)
             else:
@@ -185,7 +178,7 @@ async def test_native_recipient_control_cannot_become_unverifiable_watch(
                     if route == "a2a-register"
                     else "native"
                 )
-                await register_wait_watch(recipient, kind + ":" + task.id)
+                await register_wait_watch(recipient, kind + ":" + (dispatch.dispatch_id if kind == "a2a" else task.id))
         except BaseException as error:
             failure = error
         watch_rows = await storage.db.fetchone(

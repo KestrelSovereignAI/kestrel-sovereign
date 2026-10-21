@@ -4,10 +4,12 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
+from a2a.types import AgentSkill, Artifact, Part, TaskState, TaskStatus
+from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 
-from kestrel_sovereign.a2a.agent_card import AgentCapabilities, AgentCard, AgentSkill
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import TaskManager
-from kestrel_sovereign.a2a.types import Artifact, Message, TaskState, TaskStatus, TextPart
 from kestrel_sovereign.features.compute.feature import ComputeFeature
 from kestrel_sovereign.features.compute.models import (
     ComputePolicy,
@@ -22,34 +24,6 @@ from kestrel_sovereign.features.security.permissions import (
     PermissionStore,
 )
 from kestrel_sovereign.hooks.manager import HooksManager
-from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
-
-
-class _Transaction:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class _Backend:
-    def transaction(self):
-        return _Transaction()
-
-
-class _TaskStore:
-    def __init__(self):
-        self._backend = _Backend()
-        self.saved = []
-
-    async def save(self, task, **_authority):
-        self.saved.append(task)
-
-
-class _NoopStore:
-    async def log_tool_call(self, **kwargs):
-        return None
 
 
 class _SingleScriptStore:
@@ -149,10 +123,10 @@ class _ComputeFeatureHandler:
     def __init__(self):
         self.calls = 0
 
-    async def handle_task(self, task):
+    async def handle_task(self, task, *, arguments=None):
         self.calls += 1
-        task.status = TaskStatus(state=TaskState.COMPLETED)
-        task.artifacts = [Artifact(parts=[TextPart(text="executed")])]
+        task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_COMPLETED))
+        task.artifacts.append(Artifact(artifact_id="output", parts=[Part(text="executed")]))
         return task
 
     def _get_tool_by_name(self, name):
@@ -165,13 +139,6 @@ class _ComputeFeatureHandler:
         )
 
 
-def _make_manager(hooks):
-    return TaskManager(
-        task_store=_TaskStore(),
-        session_service=_NoopStore(),
-        observability_store=_NoopStore(),
-        hooks_manager=hooks,
-    )
 
 
 @pytest.fixture
@@ -212,30 +179,18 @@ def compute_approval_boundary():
     )
 
 
-def _compute_agent_card():
-    return AgentCard(
-        name="compute_feature",
-        url="/agents/compute_feature",
-        version="1.0.0",
-        capabilities=AgentCapabilities(),
-        skills=[
-            AgentSkill(
-                id="run_script",
-                name="run_script",
-                description="Run a staged compute script",
-            )
-        ],
-    )
 
 
 @pytest.mark.asyncio
-async def test_a2a_skill_uses_feature_class_name_for_permission_hooks():
+async def test_a2a_skill_uses_feature_class_name_for_permission_hooks(permission_manager):
     hooks = _DenyComputeRunScriptHooks()
-    manager = _make_manager(hooks)
+    manager = permission_manager
+    manager.hooks_manager = hooks
     handler = _ComputeFeatureHandler()
-    manager.register_agent(
-        agent_card=_compute_agent_card(),
-        handler=handler,
+    manager.register_provider(
+        "compute_feature",
+        [AgentSkill(id="run_script", name="run_script", description="Run compute", tags=["compute"])],
+        handler,
         command_prefixes={"!compute-run": "run_script"},
     )
 
@@ -248,20 +203,22 @@ async def test_a2a_skill_uses_feature_class_name_for_permission_hooks():
 
     assert hooks.inputs[0].feature_name == "ComputeFeature"
     assert hooks.inputs[0].tool_name == "run_script"
-    assert task.status.state == TaskState.FAILED
+    assert task.status.state == TaskState.TASK_STATE_REJECTED
     assert task.metadata["denied"] is True
     assert "Permission denied" in task.status.message.parts[0].text
     assert handler.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_command_routing_uses_same_permission_identity_as_a2a_skill():
+async def test_command_routing_uses_same_permission_identity_as_a2a_skill(permission_manager):
     hooks = _DenyComputeRunScriptHooks()
-    manager = _make_manager(hooks)
+    manager = permission_manager
+    manager.hooks_manager = hooks
     handler = _ComputeFeatureHandler()
-    manager.register_agent(
-        agent_card=_compute_agent_card(),
-        handler=handler,
+    manager.register_provider(
+        "compute_feature",
+        [AgentSkill(id="run_script", name="run_script", description="Run compute", tags=["compute"])],
+        handler,
         command_prefixes={"!compute-run": "run_script"},
     )
 
@@ -384,3 +341,18 @@ async def test_forged_empty_feature_scope_cannot_bypass_privileged_allow(tmp_pat
     # And the forged scope is never silently auto-allowed in the audit trail.
     logs = await permission_store.get_audit_log(limit=50)
     assert all(log["decision"] != "auto_allowed" for log in logs)
+
+
+@pytest_asyncio.fixture
+async def permission_manager(native_a2a_backend_factory):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    manager = TaskManager.from_backend(
+        backend, scope=NativeRecipientScope("did:test:permission-agent"),
+        owns_backend=True, include_memory=False, include_feedback=False,
+    )
+    try:
+        await manager.initialize()
+        yield manager
+    finally:
+        await manager.close()

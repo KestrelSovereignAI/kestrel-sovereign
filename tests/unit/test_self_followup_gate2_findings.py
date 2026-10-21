@@ -38,7 +38,6 @@ from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_sovereign.signals.sources.self_followup import (
     TASK_NAME as SELF_FOLLOWUP,
 )
-
 from tests.unit.test_inline_executor_contextvar_invariant import (
     _CodexReaderHarness,
 )
@@ -65,27 +64,19 @@ def _bind_inline_executor(agent, execute_named_tool):
 
 
 async def _task_manager(tmp_path, agent):
-    """A real TaskManager wired to the agent's REAL chain provider."""
-    from kestrel_sovereign.a2a.stores import (
-        SQLiteObservabilityStore,
-        SQLiteSessionService,
-        SQLiteTaskStore,
-    )
-    from kestrel_sovereign.a2a.task_manager import TaskManager
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    """Canonical native task manager using the live parent chain provider."""
+    from a2a.types import AgentSkill
 
-    db_path = str(tmp_path / "a2a.db")
-    manager = TaskManager(
-        task_store=SQLiteTaskStore(db_path),
-        session_service=SQLiteSessionService(db_path),
-        observability_store=SQLiteObservabilityStore(db_path),
-        # Same wiring as KestrelAgent.initialize(): the production provider
-        # reads the ContextVar chain of whichever task calls create_task.
-        causation_chain_provider=types.MethodType(
-            KestrelAgent._provide_causation_chain, agent
-        ),
-    )
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    from tests.unit.test_a2a_native_task_manager import CompletingProvider
+    from tests.utils.native_a2a import manager_for
+    backend = SQLiteBackend(str(tmp_path / "native-inline-task.db"))
+    await backend.connect()
+    manager = manager_for(backend, NativeRecipientScope(agent.did), causation_chain_provider=types.MethodType(KestrelAgent._provide_causation_chain, agent))
     await manager.initialize()
+    manager.register_provider("feature", [AgentSkill(id="native_fixture", name="Native fixture", description="Inline causation", tags=["test"])], CompletingProvider())
     return manager
 
 
@@ -95,10 +86,10 @@ async def _task_manager(tmp_path, agent):
 
 
 @pytest.mark.asyncio
-async def test_a2a_sent_inline_from_a_follow_up_keeps_the_single_hop_bound(
+async def test_native_task_started_inline_from_a_follow_up_keeps_the_single_hop_bound(
     followup_env, tmp_path
 ):
-    """self_followup -> inline A2A send -> completion turn -> refused.
+    """self_followup -> inline native task -> completion turn -> refused.
 
     End to end through the real runner, dispatcher, parent inline executor,
     TaskManager, chain provider and A2A completion signal builder. The codex
@@ -106,9 +97,13 @@ async def test_a2a_sent_inline_from_a_follow_up_keeps_the_single_hop_bound(
     frozen context has no chain and no signal: exactly the production
     topology in which the chain was lost.
     """
-    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+    from google.protobuf.json_format import MessageToDict
+
+    from kestrel_sovereign.a2a.extensions import CAUSATION_URI
     from kestrel_sovereign.signals.sources.a2a import (
         SOURCE_NAME as A2A_COMPLETE,
+    )
+    from kestrel_sovereign.signals.sources.a2a import (
         build_a2a_task_complete_registration,
         build_signal_for_completed_task,
     )
@@ -122,14 +117,8 @@ async def test_a2a_sent_inline_from_a_follow_up_keeps_the_single_hop_bound(
 
     async def execute_named_tool(name, args, *, session_id, source, _capture):
         _capture["effective_args"] = args
-        if name == "send_a2a_task":
-            params = TaskSendParams(
-                id=f"outbound-{len(outbound) + 1}",
-                sessionId="session-gate2",
-                message=Message(role="user", parts=[TextPart(text=args["message"])]),
-                metadata={"agent_id": "PeerB"},
-            )
-            outbound.append(await manager.create_task(params, agent_name="PeerB"))
+        if name == "run_native_task":
+            outbound.append(await manager.execute_skill("feature", "native_fixture", {"message":args["message"]}, sync=False))
             return {"ok": True}
         if name == "schedule_add_deadline":
             result = await feature.schedule_add_deadline(**args)
@@ -153,7 +142,7 @@ async def test_a2a_sent_inline_from_a_follow_up_keeps_the_single_hop_bound(
         async with agent._turn_lifecycle():
             executor = make_executor("")
             await harness.dispatch(
-                executor, "send_a2a_task", {"message": "check CI on PR 3096"}
+                executor, "run_native_task", {"message": "check CI on PR 3096"}
             )
         return "asked the peer to check CI"
 
@@ -166,7 +155,9 @@ async def test_a2a_sent_inline_from_a_follow_up_keeps_the_single_hop_bound(
         await _drain(agent)
 
         assert len(outbound) == 1, "the follow-up turn did not send its A2A task"
-        chain = outbound[0].metadata.get("causation_chain") or []
+        await manager.drain_execution_tasks()
+        completed = await manager.get_task_snapshot(outbound[0].id, recipient_agent_id=agent.did)
+        chain = MessageToDict(completed.task.metadata)[CAUSATION_URI]["chain"]
         assert SOURCE in {frame["source"] for frame in chain}, (
             "the outbound A2A task left without the follow-up turn's causation "
             "chain: the inline executor did not re-present it across the "
@@ -192,14 +183,6 @@ async def test_a2a_sent_inline_from_a_follow_up_keeps_the_single_hop_bound(
             return "handled the completion"
 
         agent.process_input = completion_turn
-        completed = SimpleNamespace(
-            id=outbound[0].id,
-            status=SimpleNamespace(
-                state=SimpleNamespace(value="completed"),
-                message=SimpleNamespace(parts=[SimpleNamespace(text="CI green")]),
-            ),
-            metadata=outbound[0].metadata,
-        )
         wake = build_signal_for_completed_task(completed, target_agent=agent.did)
         result = await agent.dispatcher.dispatch_signal(wake)
     finally:

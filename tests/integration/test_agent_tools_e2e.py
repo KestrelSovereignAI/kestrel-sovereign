@@ -20,6 +20,8 @@ import pytest
 import pytest_asyncio
 from pathlib import Path
 
+from a2a.types import TaskState
+
 from kestrel_sdk.tools.base import AgentTool, ToolSchema, ToolParameter, ToolCategory
 from kestrel_sovereign.features.model import ModelAgent
 from kestrel_sovereign.llm.service import LLMService
@@ -154,14 +156,12 @@ async def test_model_agent_get_tools(model_agent):
 
 
 @pytest.mark.asyncio
-async def test_model_agent_get_agent_card(model_agent):
-    """Verify ModelAgent generates valid AgentCard."""
-    card = model_agent.get_agent_card()
-    assert card is not None
-    assert card.name == "model_agent"
-    assert len(card.skills) > 0
-    skill_ids = [s.id for s in card.skills]
-    assert "list_models" in skill_ids
+async def test_model_agent_contributes_native_skills(model_agent):
+    """A feature contributes skills to its host's signed Agent Card."""
+    skills = model_agent.get_agent_skills()
+    assert skills
+    assert "list_models" in {skill.id for skill in skills}
+    assert all(skill.name and skill.description for skill in skills)
 
 
 @pytest.mark.asyncio
@@ -228,14 +228,14 @@ async def test_kestrel_agent_has_task_manager(kestrel_agent):
 
 @pytest.mark.asyncio
 async def test_kestrel_agent_features_registered(kestrel_agent):
-    """Verify features are registered as A2A agents."""
-    # Check TaskManager has registered agents
-    agent_cards = kestrel_agent.task_manager.get_agent_cards()
-    assert len(agent_cards) > 0
-
-    agent_names = [card.name for card in agent_cards]
-    # Should have model_agent registered
-    assert "model_agent" in agent_names
+    """The model feature contributes the same native skills as its host catalog."""
+    providers = kestrel_agent.task_manager.get_provider_skills()
+    feature = kestrel_agent.features["ModelAgent"]
+    assert "ModelAgent" in providers
+    assert providers["ModelAgent"] == feature.get_agent_skills()
+    assert "list_models" in {
+        skill.id for skill in kestrel_agent.task_manager.get_agent_skills()
+    }
 
 
 @pytest.mark.asyncio
@@ -320,7 +320,7 @@ async def test_task_manager_routes_command(kestrel_agent):
 
     assert result is not None
     agent_id, skill_id = result
-    assert agent_id == "model_agent"
+    assert agent_id == "ModelAgent"
     assert skill_id == "list_models"
 
 
@@ -329,18 +329,18 @@ async def test_task_manager_execute_skill(kestrel_agent, usable_model_list, live
     """Verify TaskManager can execute skills directly."""
     task = await bounded_live_call(
         kestrel_agent.task_manager.execute_skill(
-            agent_id="model_agent",
+            agent_id="ModelAgent",
             skill_id="list_models",
             args={},
             sync=True
         ),
         budget=live_call_budget,
-        what="TaskManager execute_skill(model_agent, list_models)",
+        what="TaskManager execute_skill(ModelAgent, list_models)",
         waiting_on=describe_discovery_routes(kestrel_agent.llm_service),
     )
 
     assert task is not None
-    assert task.status.state.value == "completed"
+    assert task.status.state == TaskState.TASK_STATE_COMPLETED
     assert task.artifacts is not None
     assert len(task.artifacts) > 0
 
@@ -371,21 +371,16 @@ async def test_e2e_feature_as_a2a_agent(kestrel_agent, usable_model_list, live_c
     model_feature = kestrel_agent.features.get("ModelAgent")
     assert model_feature is not None, f"ModelAgent not found. Available: {list(kestrel_agent.features.keys())}"
 
-    # Verify it has AgentCard
-    card = model_feature.get_agent_card()
-    assert card is not None
-    assert card.name == "model_agent"
+    # The feature contributes native skills; the host publishes its signed card.
+    assert "list_models" in {skill.id for skill in model_feature.get_agent_skills()}
+    from a2a.helpers.proto_helpers import new_task, new_text_message
+    from a2a.types import Role
 
-    # Verify it can handle tasks
-    from kestrel_sovereign.a2a.types import Task, TaskStatus, TaskState, Message, TextPart
-
-    task = Task(
-        id="test-task-001",
-        sessionId="test-session",
-        status=TaskStatus(state=TaskState.SUBMITTED),
-        metadata={"skill": "list_models", "args": {}},
-        history=[Message(role="user", parts=[TextPart(text="List models")])]
+    task = new_task(
+        "test-task-001", "test-context", TaskState.TASK_STATE_SUBMITTED,
+        history=[new_text_message("List models", role=Role.ROLE_USER)],
     )
+    task.metadata.update({"skill": "list_models", "args": {}})
 
     result_task = await bounded_live_call(
         model_feature.handle_task(task),
@@ -394,5 +389,5 @@ async def test_e2e_feature_as_a2a_agent(kestrel_agent, usable_model_list, live_c
         waiting_on=describe_discovery_routes(kestrel_agent.llm_service),
     )
 
-    assert result_task.status.state == TaskState.COMPLETED
+    assert result_task.status.state == TaskState.TASK_STATE_COMPLETED
     assert result_task.artifacts is not None

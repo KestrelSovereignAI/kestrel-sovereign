@@ -39,7 +39,7 @@ def _manager(monkeypatch, *, skill_id: str):
     rather than by a missing string in a message.
     """
     mgr = TaskManager.__new__(TaskManager)
-    mgr._agents = {}
+    mgr._providers = {}
     mgr.task_store = _StubTaskStore()
     mgr.hooks_manager = None
 
@@ -104,7 +104,7 @@ async def test_ordinary_scheduler_commands_still_run(monkeypatch):
     case, so over-broad matching fails here.
     """
     mgr = TaskManager.__new__(TaskManager)
-    mgr._agents = {}
+    mgr._providers = {}
     mgr.task_store = _StubTaskStore()
     mgr.hooks_manager = None
 
@@ -137,7 +137,7 @@ async def test_non_scheduler_command_mentioning_task_name_is_untouched(monkeypat
     narrow guard is meant to avoid.
     """
     mgr = TaskManager.__new__(TaskManager)
-    mgr._agents = {}
+    mgr._providers = {}
     mgr.task_store = _StubTaskStore()
     mgr.hooks_manager = None
 
@@ -180,7 +180,7 @@ async def test_task_name_inside_another_arguments_value_is_not_refused(
     and can only pass on the token fix.
     """
     mgr = TaskManager.__new__(TaskManager)
-    mgr._agents = {}
+    mgr._providers = {}
     mgr.task_store = _StubTaskStore()
     mgr.hooks_manager = None
 

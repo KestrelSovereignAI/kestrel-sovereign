@@ -67,8 +67,8 @@ class TestRegistration:
         # Must reference the placeholders we inject — without these the
         # template will KeyError at render time.
         for required in (
-            "{payload[recipient]}",
-            "{payload[task_id]}",
+            "{payload[recipient_id]}",
+            "{payload[dispatch_id]}",
             "{payload[original_question]}",
             "{payload[reply_text]}",
             "{payload[state]}",
@@ -78,293 +78,142 @@ class TestRegistration:
             )
 
 
-class TestSchema:
-    def _reg(self):
-        return build_a2a_question_answered_registration()
+def native_payload(**changes):
+    from a2a.helpers.proto_helpers import new_text_message
+    from a2a.types import Role
+    from google.protobuf.json_format import MessageToDict
 
-    def test_required_keys_enforced(self):
-        reg = self._reg()
-        with pytest.raises(ValueError, match="missing required key"):
-            reg.schema({})
-
-    def test_state_must_be_enum(self):
-        reg = self._reg()
-        with pytest.raises(ValueError, match="state must be one of"):
-            reg.schema({
-                "task_id": "t", "recipient": "r",
-                "original_question": "q", "reply_text": "r",
-                "state": "in_progress",  # not terminal
-            })
-
-    def test_state_accepts_each_valid_value(self):
-        reg = self._reg()
-        for state in ("completed", "failed", "canceled", "expired"):
-            out = reg.schema({
-                "task_id": "t", "recipient": "r",
-                "original_question": "q", "reply_text": "r",
-                "state": state,
-            })
-            assert out["state"] == state
-
-    def test_schema_injects_defaults_for_optional_fields(self):
-        """Per #1438 codex round 2 — legacy callers building a payload
-        with only required keys must still render through the prompt
-        template without KeyError. Schema injects defaults at validation
-        time."""
-        reg = self._reg()
-        out = reg.schema({
-            "task_id": "t", "recipient": "r",
-            "original_question": "q", "reply_text": "r",
-            "state": "completed",
-        })
-        assert out["origin_session_id"] == ""
-        assert out["truncated"] is False
-        # Smoke-test the actual prompt format against the schema's
-        # enriched payload — if anything we inject is missing the
-        # template needs, this raises.
-        template = PROMPT_TEMPLATE.read_text()
-        template.format(
-            source=SOURCE_NAME,
-            target_agent="did:test:agent",
-            arrived_at="2026-05-29T16:00:00Z",
-            urgency="normal",
-            payload=out,
-        )
+    return {
+        "question_id": "question-1", "dispatch_id": "dispatch-1",
+        "recipient_id": "did:test:peer", "original_question": "What is 2+2?",
+        "reply_text": "4", "state": "completed",
+        "request": MessageToDict(new_text_message("What is 2+2?", role=Role.ROLE_USER)),
+        **changes,
+    }
 
 
-class TestSignalBuilder:
-    def test_basic_signal_shape(self):
-        sig = build_signal_for_question_answered(
-            task_id="t-1", recipient="Meridian",
-            original_question="What is 2+2?",
-            reply_text="4", state="completed",
-            target_agent="did:test:sender",
-        )
-        assert sig.source == SOURCE_NAME
-        assert sig.target_agent == "did:test:sender"
-        assert sig.payload["task_id"] == "t-1"
-        assert sig.payload["recipient"] == "Meridian"
-        assert sig.payload["reply_text"] == "4"
-        assert sig.payload["state"] == "completed"
-        assert sig.payload["truncated"] is False
-        # Dedupe key prevents subscription + startup-replay racing for
-        # the same answer from waking two cognition turns.
-        assert sig.dedupe_key == "t-1:answered"
-
-    def test_oversized_reply_is_truncated_with_hint(self):
-        """Reply > 8 KiB inline cap must clip with a clear hint pointing
-        at get_a2a_task(task_id) for the full body. Sovereign decision
-        on #1444 question 2."""
-        big_reply = "A" * (REPLY_TEXT_INLINE_CAP_BYTES + 1024)
-        sig = build_signal_for_question_answered(
-            task_id="t-big", recipient="Meridian",
-            original_question="long?",
-            reply_text=big_reply, state="completed",
-            target_agent="did:test:sender",
-        )
-        assert sig.payload["truncated"] is True, (
-            "Oversized reply must set truncated=True so the prompt "
-            "template knows to render the overflow branch."
-        )
-        rendered = sig.payload["reply_text"]
-        assert len(rendered.encode("utf-8")) <= REPLY_TEXT_INLINE_CAP_BYTES, (
-            f"Truncated reply must fit under {REPLY_TEXT_INLINE_CAP_BYTES} "
-            f"bytes; got {len(rendered.encode('utf-8'))}."
-        )
-        assert "get_peer_task_result(\"Meridian\", \"t-big\")" in rendered, (
-            "Overflow hint must cite get_peer_task_result with BOTH "
-            "recipient and task_id so the resumed turn can fetch the "
-            "full body through the host proxy. Citing only task_id (or "
-            "a nonexistent get_a2a_task) makes the truncated reply "
-            "unrecoverable — codex round 2 P2b on PR #1453."
-        )
-
-    def test_signal_is_user_visible_for_live_chat_render(self):
-        """#1522: the wake must be USER_VISIBLE (not INTERNAL) so the
-        dispatcher emits a ``signal_completed`` SSE event after the
-        resumed turn logs. INTERNAL signals never reach the UI side
-        channel (see SignalDispatcher._log_safe), which is exactly the
-        bug — the A2A wake response persisted but the open chat tab
-        never rendered it live."""
-        sig = build_signal_for_question_answered(
-            task_id="t-1", recipient="Meridian",
-            original_question="What is 2+2?",
-            reply_text="4", state="completed",
-            target_agent="did:test:sender",
-        )
-        assert sig.visibility == Visibility.USER_VISIBLE, (
-            "A reply-capable A2A wake must be USER_VISIBLE so the open "
-            "chat renders the resumed turn live (#1522). INTERNAL would "
-            "log silently and the UI would only see it on a manual "
-            "refresh."
-        )
-
-    def test_causation_chain_threaded_through(self):
-        """A→B→A→B chains must hit the dispatcher's depth-2 cycle cap.
-        The supervisor rehydrates the chain from the terminal task's
-        metadata and threads it here; we just verify it survives."""
-        chain = [{"agent": "A", "source": "user", "frame_id": "f1"}]
-        sig = build_signal_for_question_answered(
-            task_id="t-c", recipient="B",
-            original_question="?", reply_text=".", state="completed",
-            target_agent="did:test:A",
-            causation_chain=chain,
-        )
-        assert sig.causation_chain == chain
-
-
-class TestPackagedTemplate:
-    """Pin that the prompt template ships inside the package wheel
-    (same lesson as #1416). If this regresses, deployed agents
-    FileNotFoundError on every a2a.question_answered wake."""
-
-    def test_template_path_inside_package(self):
-        package_root = Path(
-            __import__("kestrel_sovereign").__file__
-        ).resolve().parent
-        assert str(PROMPT_TEMPLATE).startswith(str(package_root)), (
-            f"Prompt template {PROMPT_TEMPLATE} must live inside the "
-            f"kestrel_sovereign package so it ships with the wheel. "
-            f"Package root: {package_root}."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Late answers (#3440)
-# ---------------------------------------------------------------------------
-
-
-def test_late_answer_is_a_distinct_flagged_wake():
-    from kestrel_sovereign.signals.sources.a2a_question_answered import (
-        build_signal_for_question_answered,
+def render(payload):
+    return PROMPT_TEMPLATE.read_text().format(
+        source=SOURCE_NAME, target_agent="did:test:sender",
+        arrived_at="2026-10-21T00:00:00Z", urgency="normal", payload=payload,
     )
 
-    on_time = build_signal_for_question_answered(
-        task_id="t-late", recipient="Nellie", original_question="q",
-        reply_text="", state="expired", target_agent="did:test:emma",
+
+@pytest.mark.parametrize("key", [
+    "question_id", "dispatch_id", "recipient_id", "original_question",
+    "reply_text", "state", "request",
+])
+def test_required_native_correlation_and_input(key):
+    payload = native_payload()
+    payload.pop(key)
+    with pytest.raises(ValueError, match=key if key != "request" else "native Message"):
+        build_a2a_question_answered_registration().schema(payload)
+
+
+@pytest.mark.parametrize("key", ["question_id", "dispatch_id", "recipient_id"])
+def test_identity_fields_cannot_be_empty(key):
+    with pytest.raises(ValueError, match="concrete"):
+        build_a2a_question_answered_registration().schema(native_payload(**{key: " "}))
+
+
+@pytest.mark.parametrize("state", ["completed", "failed", "canceled", "rejected", "expired"])
+def test_native_terminal_states_and_local_deadline(state):
+    payload = build_a2a_question_answered_registration().schema(native_payload(state=state))
+    assert payload["state"] == state
+    assert payload["origin_session_id"] == ""
+    assert not any(payload[key] for key in ("truncated", "late", "withdrawn", "requires_full_response"))
+    assert "dispatch-1" in render(payload)
+
+
+def test_nonterminal_state_is_not_an_answer():
+    with pytest.raises(ValueError, match="terminal state"):
+        build_a2a_question_answered_registration().schema(native_payload(state="working"))
+
+
+def test_builder_uses_immutable_outbox_identity_and_sender_dispatch():
+    payload = native_payload(origin_session_id="session-1")
+    sig = build_signal_for_question_answered(
+        event_id="outbox-event-1", payload=payload, target_agent="did:test:sender",
+    )
+    assert sig.id == sig.dedupe_key == "outbox-event-1"
+    assert sig.source == SOURCE_NAME and sig.target_agent == "did:test:sender"
+    assert sig.visibility == Visibility.USER_VISIBLE and sig.session_id == "session-1"
+    assert sig.caller == "did:test:peer"
+    assert sig.payload == build_a2a_question_answered_registration().schema(dict(payload))
+    assert sig.payload is not payload and "truncated" not in payload
+
+
+@pytest.mark.parametrize("character", ["A", "😀"])
+def test_oversized_reply_is_bounded_utf8_and_recoverable_by_dispatch(character):
+    sig = build_signal_for_question_answered(
+        event_id="large-answer", payload=native_payload(reply_text=character * REPLY_TEXT_INLINE_CAP_BYTES),
+        target_agent="did:test:sender",
+    )
+    # ASCII must exceed the cap too; the first exact-cap payload is unchanged.
+    if character == "A":
+        assert not sig.payload["truncated"]
+        sig = build_signal_for_question_answered(
+            event_id="large-answer", payload=native_payload(reply_text=character * (REPLY_TEXT_INLINE_CAP_BYTES + 1)),
+            target_agent="did:test:sender",
+        )
+    assert sig.payload["truncated"]
+    assert len(sig.payload["reply_text"].encode("utf-8")) <= REPLY_TEXT_INLINE_CAP_BYTES
+    assert 'get_peer_task_result("dispatch-1")' in sig.payload["reply_text"]
+
+
+def test_late_answer_and_deadline_use_distinct_durable_event_identities():
+    expired = build_signal_for_question_answered(
+        event_id="deadline-event", payload=native_payload(state="expired", reply_text=""),
+        target_agent="did:test:sender",
     )
     late = build_signal_for_question_answered(
-        task_id="t-late", recipient="Nellie", original_question="q",
-        reply_text="numbers", state="completed", target_agent="did:test:emma",
-        late=True,
+        event_id="late-answer-event", payload=native_payload(late=True), target_agent="did:test:sender",
     )
+    assert expired.dedupe_key != late.dedupe_key
+    assert expired.payload["dispatch_id"] == late.payload["dispatch_id"]
+    assert late.payload["late"] and not expired.payload["late"]
+    assert "Late answer: `True`" in render(late.payload)
 
-    assert on_time.payload["late"] is False
-    assert late.payload["late"] is True
-    assert on_time.dedupe_key == "t-late:answered"
-    assert late.dedupe_key == "t-late:answered:late"
+
+@pytest.mark.parametrize("changes,reason", [
+    ({"state": "expired", "late": True}, "late"),
+    ({"late": "yes"}, "bool"),
+    ({"withdrawn": True}, "withdrawn"),
+    ({"state": "expired", "withdrawn": "yes"}, "bool"),
+    ({"truncated": "yes"}, "bool"),
+    ({"requires_full_response": "yes"}, "boolean"),
+    ({"origin_session_id": 42}, "string"),
+])
+def test_optional_flags_reject_invalid_evidence(changes, reason):
+    with pytest.raises(ValueError, match=reason):
+        build_a2a_question_answered_registration().schema(native_payload(**changes))
 
 
-def test_schema_defaults_late_and_rejects_a_late_expiry():
-    from kestrel_sovereign.signals.sources.a2a_question_answered import (
-        _a2a_question_answered_schema,
-    )
-
-    base = {
-        "task_id": "t", "recipient": "Nellie", "original_question": "q",
-        "reply_text": "", "state": "expired",
-    }
-    assert _a2a_question_answered_schema(dict(base))["late"] is False
-    with pytest.raises(ValueError, match="late"):
-        _a2a_question_answered_schema({**base, "late": True})
-    with pytest.raises(ValueError, match="bool"):
-        _a2a_question_answered_schema(
-            {**base, "state": "completed", "late": "yes"}
+def test_expiry_prompt_preserves_withdrawal_uncertainty_and_structured_results():
+    for withdrawn in (False, True):
+        sig = build_signal_for_question_answered(
+            event_id="deadline", payload=native_payload(state="expired", withdrawn=withdrawn, requires_full_response=True),
+            target_agent="did:test:sender",
         )
+        body = render(sig.payload)
+        assert f"Confirmed withdrawal: `{withdrawn}`" in body
+        assert "Only `withdrawn=True` confirms cancellation" in body
+        assert "Do not resend an uncertain dispatch" in body
+        assert "structured data, files, or artifacts: fetch it" in body
 
 
-def test_prompt_template_renders_the_late_flag():
-    from kestrel_sovereign.signals.sources.a2a_question_answered import (
-        PROMPT_TEMPLATE,
-        _a2a_question_answered_schema,
+def test_causation_uses_the_declared_native_extension():
+    frame = {"agent_id": "did:test:sender", "source": "user", "signal_id": "signal-1",
+             "depth": 0, "emitted_at": "2026-10-21T00:00:00Z"}
+    sig = build_signal_for_question_answered(
+        event_id="answer", payload=native_payload(causation={"version": 1, "chain": [frame]}),
+        target_agent="did:test:sender",
     )
-
-    payload = _a2a_question_answered_schema({
-        "task_id": "t", "recipient": "Nellie", "original_question": "q",
-        "reply_text": "numbers", "state": "completed", "late": True,
-    })
-    rendered = PROMPT_TEMPLATE.read_text().format(
-        payload=payload, source="a2a.question_answered",
-        target_agent="did:test:emma", arrived_at="now", urgency="normal",
-    )
-    assert "late: `True`" in rendered
+    assert len(sig.causation_chain) == 1
+    assert sig.causation_chain[0].agent_id == frame["agent_id"]
+    assert "causation" not in sig.payload
 
 
-# ---------------------------------------------------------------------------
-# Withdrawn expiries (#3440)
-# ---------------------------------------------------------------------------
-
-
-def test_schema_defaults_withdrawn_and_rejects_it_off_an_expiry():
-    from kestrel_sovereign.signals.sources.a2a_question_answered import (
-        _a2a_question_answered_schema,
-    )
-
-    base = {
-        "task_id": "t", "recipient": "Nellie", "original_question": "q",
-        "reply_text": "", "state": "expired",
-    }
-    assert _a2a_question_answered_schema(dict(base))["withdrawn"] is False
-    assert _a2a_question_answered_schema(
-        {**base, "withdrawn": True}
-    )["withdrawn"] is True
-    with pytest.raises(ValueError, match="withdrawn"):
-        _a2a_question_answered_schema(
-            {**base, "state": "completed", "withdrawn": True}
-        )
-    with pytest.raises(ValueError, match="bool"):
-        _a2a_question_answered_schema({**base, "withdrawn": "yes"})
-
-
-def test_builder_carries_withdrawn():
-    from kestrel_sovereign.signals.sources.a2a_question_answered import (
-        build_signal_for_question_answered,
-    )
-
-    withdrawn = build_signal_for_question_answered(
-        task_id="t", recipient="Nellie", original_question="q",
-        reply_text="", state="expired", target_agent="did:test:emma",
-        withdrawn=True,
-    )
-    unreached = build_signal_for_question_answered(
-        task_id="t", recipient="Nellie", original_question="q",
-        reply_text="", state="expired", target_agent="did:test:emma",
-    )
-
-    assert withdrawn.payload["withdrawn"] is True
-    assert unreached.payload["withdrawn"] is False
-    # Same wake for the same question either way.
-    assert withdrawn.dedupe_key == unreached.dedupe_key
-
-
-def _render(payload: dict) -> str:
-    from kestrel_sovereign.signals.sources.a2a_question_answered import (
-        PROMPT_TEMPLATE,
-        _a2a_question_answered_schema,
-    )
-
-    return PROMPT_TEMPLATE.read_text().format(
-        payload=_a2a_question_answered_schema(payload),
-        source="a2a.question_answered", target_agent="did:test:emma",
-        arrived_at="now", urgency="normal",
-    )
-
-
-def test_prompt_does_not_claim_an_unreached_recipients_task_was_canceled():
-    """An expiry that could not reach the recipient leaves its task live. The
-    resumed turn must be told the withdrawal is unconfirmed, not that the
-    task was canceled and cannot be re-delivered."""
-    expiry = {
-        "task_id": "t", "recipient": "Nellie", "original_question": "q",
-        "reply_text": "", "state": "expired",
-    }
-
-    unreached = _render({**expiry, "withdrawn": False})
-    withdrawn = _render({**expiry, "withdrawn": True})
-
-    assert "`withdrawn`, which is `False` here" in unreached
-    assert "`withdrawn`, which is `True` here" in withdrawn
-    # Neither states a cancellation as fact outside the ``withdrawn`` branch.
-    for rendered in (unreached, withdrawn):
-        assert "The question has been withdrawn" not in rendered
-        assert "could NOT be confirmed" in rendered
+def test_template_path_inside_package():
+    package_root = Path(__import__("kestrel_sovereign").__file__).resolve().parent
+    assert PROMPT_TEMPLATE.is_relative_to(package_root)

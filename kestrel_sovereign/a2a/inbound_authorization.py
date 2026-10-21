@@ -16,7 +16,6 @@ import logging
 from typing import Any, Callable, Optional
 
 from kestrel_sovereign.execution_custody import is_execution_control_error
-
 from kestrel_sovereign.features.peers.directory import (
     PeerDirectoryError,
     PeerRequester,
@@ -74,9 +73,8 @@ class RecipientA2ASenderAuthorizer:
     def requires_verified_sender(self) -> bool:
         """Whether direct unsigned use of this recipient policy is forbidden.
 
-        Hosted requests report ``True`` here.  Their one legacy compatibility
-        exception is manager-owned and additionally proves an exact current
-        non-hybrid local sender before this authorizer sees its stable id.
+        Hosted native requests require a verified signing identity before
+        this authorizer evaluates the current recipient policy.
         """
         self._observe_live_scope()
         return self._scoped_policy_required
@@ -125,27 +123,6 @@ class RecipientA2ASenderAuthorizer:
             context,
         )
 
-    async def authorize_legacy_local_sender_with_policy(
-        self,
-        sender_id: str,
-        *,
-        router: Any,
-        requester: Any,
-    ) -> bool:
-        """Authorize one exact loaded pre-ceremony sender under host policy.
-
-        Unsigned A2A traffic has no signing DID to resolve.  Hosted callers
-        may use this narrowly scoped seam only after the manager has proved
-        that ``sender_id`` names a current same-host non-hybrid agent.  The
-        directory remains the user-scope authority, so this method never
-        restores the old global same-host fallback.
-        """
-        if not isinstance(sender_id, str) or not sender_id:
-            return False
-        context = self._validate_scoped_context(router, requester)
-        if context is None:
-            return False
-        return await self._authorize_sender_id_with_context(sender_id, context)
 
     async def authorize(self, verified_sender_did: str) -> bool:
         """Authorize a sender only after its signature has been verified."""

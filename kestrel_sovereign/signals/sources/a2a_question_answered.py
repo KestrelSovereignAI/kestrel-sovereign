@@ -37,7 +37,7 @@ PROMPT_TEMPLATE = (
 )
 
 # Soft cap on inline reply text. Overflow truncates with a hint to call
-# ``get_a2a_task(task_id)`` for the full body. Sized so a 16K-token
+# ``get_peer_task_result(dispatch_id)`` for the full body. Sized so a 16K-token
 # context budget can absorb it without crowding memories/RAG. See module
 # docstring.
 REPLY_TEXT_INLINE_CAP_BYTES = 8 * 1024
@@ -106,11 +106,8 @@ def _a2a_question_answered_schema(payload: dict) -> dict:
                 "a2a.question_answered withdrawn wake must carry state "
                 "'expired': only an expiry withdraws the question"
             )
-    # Inject defaults for the prompt template's full placeholder set so
-    # legacy callers (test fixtures, external integrations, future code
-    # paths) building a payload with only required keys don't KeyError
-    # at render time. Same hygiene posture as a2a_task_submitted (#1438
-    # codex round 2).
+    # Supply the optional local presentation fields required by the template.
+    # Native correlation and the original Message remain mandatory above.
     payload.setdefault("origin_session_id", "")
     payload.setdefault("truncated", False)
     payload.setdefault("late", False)

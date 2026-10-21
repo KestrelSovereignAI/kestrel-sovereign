@@ -418,7 +418,7 @@ async def test_seed_does_not_clobber_managed_row(make_store):
 @pytest.mark.asyncio
 async def test_agent_id_isolation(tmp_path, sqlite_database_factory):
     """A shared backend must not leak rows between agents (the codex P1
-    isolation contract carried over from PendingA2AQuestionStore)."""
+    isolation contract for the canonical wait ledger)."""
     db = await sqlite_database_factory(tmp_path / "shared.db")
     store_a = WaitSignalStore(db, agent_id="did:agent:A")
     store_b = WaitSignalStore(db, agent_id="did:agent:B")

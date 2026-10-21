@@ -1,222 +1,175 @@
-"""Native A2A receipts remain terminal across the new #3440 consumers."""
+"""Original effect receipts survive native question recovery and service shutdown.
+
+These exercise the replacement for draft receiver settlement, claim renewal,
+and SSE supervision: the primary native ledger and durable admission outbox.
+"""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from a2a.types import TaskState
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
-from kestrel_sovereign.features.peers import feature as peers
-from kestrel_sovereign.storage.async_pending_a2a_question_store import (
-    PendingA2AQuestionStore,
-)
-from tests.unit.test_execution_custody_review29 import native_owner, retire
+from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from kestrel_sovereign.features.peers.directory import PeerDirectoryError
+from tests.unit.test_a2a_native_question_store import questions as questions  # noqa: PLC0414 - pytest fixture export
+from tests.unit.test_a2a_native_question_store import reserve, response
+from tests.unit.test_a2a_native_question_supervisor import dispatcher_for
 from tests.unit.test_execution_custody_review48_native import terminal
 from tests.unit.test_execution_custody_review49_native import KINDS, join
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("route", [
-    "claim_check", "renew", "retire", "retire_late", "read_receiver",
-    "read_receiver_typed", "settlement_timeout_receipt",
-    "expire_claim", "receiver_row", "startup_reclaim", "sweep_reclaim",
-    "sweep_list", "sweep_settlement", "recovery_row", "boot_recovery",
+    "unsettled", "expire", "local_read", "open_peer", "reconcile",
+    "read_peer", "cancel_peer", "pending_wakes", "claim_wake", "enqueue",
+    "admission", "checkpoint",
 ])
 async def test_actual_a2a_consumer_preserves_original_native_receipt(
-    tmp_path, monkeypatch, kind, route,
+    questions, monkeypatch, kind, wrapped, route,
 ):
-    agent, db = await native_owner(tmp_path)
-    store = PendingA2AQuestionStore(db, agent.did)
-    agent.pending_a2a_questions = store
-    feature = peers.PeersFeature(agent)
-    agent.features = {"Peers": feature}
-    original = terminal(kind)
-    if route in {"read_receiver_typed", "settlement_timeout_receipt"}:
-        wrapper = (
-            peers.PeerDirectoryError("native receiver failure")
-            if route == "read_receiver_typed" else TimeoutError("native receipt")
+    p = questions
+    q, dispatch, request = await reserve(p)
+    submitting = await p.outbound.begin_submission(dispatch, operation_id="send")
+    handoff = route in {"pending_wakes", "claim_wake", "enqueue", "admission", "checkpoint"}
+    if route == "reconcile":
+        dispatch = await p.outbound.mark_unknown(submitting, operation_id="lost-ack")
+    else:
+        dispatch = await p.store.acknowledge(
+            submitting,
+            response(q, request, state=(TaskState.TASK_STATE_COMPLETED if handoff else TaskState.TASK_STATE_WORKING)),
+            operation_id="receipt",
         )
+    original = terminal(kind)
+    if wrapped:
+        wrapper = PeerDirectoryError("peer I/O retained its native effect receipt")
         wrapper.__cause__ = original
         original = wrapper
-    entered = asyncio.Event()
-    owner = None
+    await p.backend.execute("CREATE TABLE question_custody_effects (id INTEGER PRIMARY KEY)")
 
     async def effect(*args, **kwargs):
-        await db.execute("INSERT INTO effects VALUES (1)")
-        entered.set()
+        await p.backend.execute("INSERT INTO question_custody_effects VALUES (1)")
         raise original
 
-    async def empty(*args, **kwargs):
-        return []
+    class Peer:
+        async def reconcile(self, retained):
+            assert route == "reconcile"
+            return await effect()
+        async def get_task(self, retained):
+            if route == "read_peer":
+                return await effect()
+            return SimpleNamespace(dispatch=retained)
+        async def cancel_task(self, retained):
+            assert route == "cancel_peer"
+            return await effect()
 
-    async def expired_settlement(*args, **kwargs):
-        return peers.ReceiverSettlement(peers.ReceiverSettlementOutcome.UNCONFIRMED)
+    @asynccontextmanager
+    async def open_peer(dispatch_id):
+        assert dispatch_id == dispatch.dispatch_id
+        if route == "open_peer":
+            await effect()
+        yield Peer(), dispatch
 
-    row = SimpleNamespace(
-        task_id="question", recipient="Peer", recipient_agent_id="did:test:peer",
-        receiver_settlement="PENDING",
+    agent, dispatcher = await dispatcher_for(p)
+    supervisor = NativeQuestionSupervisor(
+        store=p.store, open_dispatch=open_peer, dispatcher=dispatcher,
+        interval=0.01, is_current=lambda: True,
     )
-    claim = peers._QuestionClaim(store, "native-claim")
+    if route == "unsettled":
+        monkeypatch.setattr(p.store, "unsettled", effect)
+    elif route in {"expire", "cancel_peer"}:
+        p.clock.now += timedelta(seconds=11)
+        if route == "expire":
+            monkeypatch.setattr(p.store, "expire", effect)
+    elif route == "local_read":
+        monkeypatch.setattr(p.outbound, "get", effect)
+    elif route in {"pending_wakes", "claim_wake"}:
+        monkeypatch.setattr(p.store, route, effect)
+    elif route == "enqueue":
+        monkeypatch.setattr(dispatcher, "enqueue_durable_cognition", effect)
+    elif route == "admission":
+        async def enqueue(*args, **kwargs):
+            return SimpleNamespace(wait_for_durable_admission=effect)
+        monkeypatch.setattr(dispatcher, "enqueue_durable_cognition", enqueue)
+    elif route == "checkpoint":
+        monkeypatch.setattr(p.store, "confirm_handoff", effect)
+    owner = create_owned_task(supervisor.recover_once())
     try:
-        await store.insert(
-            task_id="question", recipient="Peer", original_question="question",
-            origin_turn_id=None, origin_session_id="session",
-            deadline=datetime.now(timezone.utc) + timedelta(hours=1),
-        )
-        if route == "claim_check":
-            monkeypatch.setattr(store, "renew_claim_lease", effect)
-            operation = feature._holds_question_claim("question", claim)
-        elif route == "renew":
-            async def delivered():
-                return "delivered"
-            monkeypatch.setattr(store, "renew_claim_lease", effect)
-            handle = feature._renewing_claim_lease(
-                SimpleNamespace(wait=delivered), "question", claim,
-            )
-            operation = handle.wait()
-        elif route in {"retire", "retire_late"}:
-            monkeypatch.setattr(store, "confirm_wake_delivered", effect)
-            monkeypatch.setattr(store, "confirm_late_answer_delivered", effect)
-            operation = feature._retire_delivered_wake(
-                "question", claim, late=route == "retire_late",
-            )
-        elif route.startswith("read_receiver"):
-            monkeypatch.setattr(feature, "_question_recipient_agent_id", effect)
-            operation = feature._read_settled_peer_task(
-                task_id="question", recipient="Peer", recipient_agent_id=None,
-            )
-        elif route == "settlement_timeout_receipt":
-            monkeypatch.setattr(feature, "_settle_question_with_receiver_unbounded", effect)
-            operation = feature._settle_question_with_receiver(task_id="question", recipient="Peer")
-        elif route == "expire_claim":
-            monkeypatch.setattr(feature, "_settle_question_with_receiver", expired_settlement)
-            monkeypatch.setattr(store, "mark_expired", effect)
-            operation = feature._expire_pending_question(
-                store, task_id="question", recipient="Peer",
-                original_question="question", sess_id="session", causation_chain=None,
-            )
-        elif route == "receiver_row":
-            async def rows(*args, **kwargs):
-                return [row]
-            monkeypatch.setattr(store, "list_expired_awaiting_receiver", rows)
-            monkeypatch.setattr(feature, "_settle_expired_row_with_receiver", effect)
-            operation = feature._settle_expired_questions_with_receivers(store)
-        elif route == "startup_reclaim":
-            monkeypatch.setattr(store, "reclaim_abandoned_wakes", effect)
-            operation = feature._replay_pending_a2a_questions(store)
-        elif route.startswith("sweep_"):
-            feature.EXPIRY_SWEEP_INTERVAL_SECONDS = 0.001
-            monkeypatch.setattr(store, "reclaim_abandoned_wakes", empty)
-            monkeypatch.setattr(store, "list_waiting_past_deadline", empty)
-            monkeypatch.setattr(store, "list_expired_awaiting_receiver", empty)
-            if route == "sweep_reclaim":
-                monkeypatch.setattr(store, "reclaim_abandoned_wakes", effect)
-            elif route == "sweep_list":
-                monkeypatch.setattr(store, "list_waiting_past_deadline", effect)
-            else:
-                monkeypatch.setattr(store, "list_expired_awaiting_receiver", effect)
-            operation = feature._hourly_expiry_sweep_loop(store)
-        elif route == "recovery_row":
-            async def rows(*args, **kwargs):
-                return [row]
-            monkeypatch.setattr(store, "reclaim_abandoned_wakes", rows)
-            monkeypatch.setattr(feature, "_handle_retry_payload_row", effect)
-            operation = feature._redeliver_abandoned_wakes(store)
-        else:
-            from kestrel_sovereign.storage import async_pending_a2a_question_store
-            monkeypatch.setattr(async_pending_a2a_question_store, "QUESTION_CLAIM_LEASE", timedelta(milliseconds=1))
-            monkeypatch.setattr(store, "reclaim_abandoned_wakes", effect)
-            operation = feature._redeliver_abandoned_wakes_after_boot(store)
-        owner = create_owned_task(operation)
-        await asyncio.wait_for(entered.wait(), 2)
-        done, _ = await asyncio.wait({owner}, timeout=0.1)
-        assert done, "native control became a retry/sweep or a false success"
         outcome = await join(owner)
-        assert outcome.error is original, "original native receipt was normalized"
-        assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
+        assert outcome.error is original, "original effect receipt was normalized or retried"
+        assert (await p.backend.fetch_one("SELECT COUNT(*) FROM question_custody_effects"))[0] == 1
+        if handoff and route != "checkpoint":
+            assert (await p.backend.fetch_one("SELECT COUNT(*) FROM durable_signal_events"))[0] == 0
     finally:
-        if owner is not None:
-            if not owner.done():
-                owner.cancel()
-            await join(owner)
-        await retire(agent)
+        if not owner.done():
+            owner.cancel()
+        await await_owned_task(owner)
+        await dispatcher.shutdown_durable_delivery()
+        await asyncio.gather(*agent.tasks, return_exceptions=True)
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", KINDS)
-@pytest.mark.parametrize("route", ["renewing_wait", "released_claim_wait", "settlement_deadline", "delivered_checkpoint"])
-async def test_original_a2a_child_physically_joins_after_parent_cancellation(
-    tmp_path, monkeypatch, kind, route,
+@pytest.mark.parametrize("interrupt", ["caller", "sibling"])
+async def test_original_a2a_child_physically_joins_after_service_cancellation(
+    questions, monkeypatch, kind, interrupt,
 ):
-    agent, db = await native_owner(tmp_path)
-    feature = peers.PeersFeature(agent)
-    agent.features = {"Peers": feature}
+    p = questions
+    q, dispatch, request = await reserve(p)
+    submitting = await p.outbound.begin_submission(dispatch, operation_id="send")
+    dispatch = await p.store.acknowledge(
+        submitting, response(q, request, state=TaskState.TASK_STATE_WORKING),
+        operation_id="receipt",
+    )
     original = terminal(kind)
     entered, interrupted, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    owner = None
+    await p.backend.execute("CREATE TABLE question_custody_effects (id INTEGER PRIMARY KEY)")
 
-    async def effect(*args, **kwargs):
-        await db.execute("INSERT INTO effects VALUES (1)")
-        entered.set()
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            interrupted.set()
-            await await_owned_task(create_owned_task(release.wait()))
-        await db.execute("INSERT INTO effects VALUES (2)")
-        raise original
+    class Peer:
+        async def get_task(self, retained):
+            await p.backend.execute("INSERT INTO question_custody_effects VALUES (1)")
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                interrupted.set()
+                await await_owned_task(create_owned_task(release.wait()))
+            await p.backend.execute("INSERT INTO question_custody_effects VALUES (2)")
+            raise original
 
+    @asynccontextmanager
+    async def open_peer(_dispatch_id):
+        yield Peer(), dispatch
+
+    supervisor = NativeQuestionSupervisor(
+        store=p.store, open_dispatch=open_peer, dispatcher=None,
+        interval=0.01, is_current=lambda: True,
+    )
+    if interrupt == "sibling":
+        async def failed_deadline_lane():
+            await entered.wait()
+            raise ExecutionAuthorityError("other service lane retired")
+        monkeypatch.setattr(supervisor, "_deadline_loop", failed_deadline_lane)
+    owner = create_owned_task(supervisor.run())
     try:
-        if route in {"renewing_wait", "released_claim_wait"}:
-            async def renewed():
-                return route != "released_claim_wait"
-            handle = peers._ClaimLeaseRenewingHandle(
-                SimpleNamespace(wait=effect), interval=0.001, renew=renewed,
-            )
-            operation = handle.wait()
-        elif route == "settlement_deadline":
-            feature.QUESTION_SETTLEMENT_TIMEOUT_SECONDS = 0.25
-            monkeypatch.setattr(feature, "_settle_question_with_receiver_unbounded", effect)
-            operation = feature._settle_question_with_receiver(task_id="question", recipient="Peer")
-        else:
-            # Use the actual public delivery path and its native row retirement,
-            # not the private checkpoint helper introduced by this fix.
-            from tests.unit.test_send_a2a_question_supervisor import (
-                _DeliveredSignalHandle,
-            )
-            async def queued(*args, **kwargs):
-                return _DeliveredSignalHandle()
-            store = PendingA2AQuestionStore(db, agent.did)
-            monkeypatch.setattr(store, "confirm_wake_delivered", effect)
-            agent.dispatcher = SimpleNamespace(enqueue_signal=queued)
-            claim = peers._QuestionClaim(store, "original-claim")
-            async def holds(*args, **kwargs):
-                return True
-            monkeypatch.setattr(store, "renew_claim_lease", holds)
-            operation = feature._fire_question_answered_signal(
-                task_id="question", recipient="Peer", original_question="question",
-                sess_id="session", state="completed", reply_text="reply",
-                causation_chain=None, claim=claim,
-            )
-        owner = create_owned_task(operation)
         await asyncio.wait_for(entered.wait(), 2)
-        if route == "settlement_deadline":
-            await asyncio.wait_for(interrupted.wait(), 2)
-        else:
+        if interrupt == "caller":
             owner.cancel()
-            await asyncio.sleep(0)
-            owner.cancel()
+        await asyncio.wait_for(interrupted.wait(), 2)
+        owner.cancel()
         await asyncio.sleep(0.01)
-        assert not owner.done(), "original native child escaped its physical owner"
-        assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
+        assert not owner.done(), "service released its physically running original child"
+        assert (await p.backend.fetch_one("SELECT COUNT(*) FROM question_custody_effects"))[0] == 1
         release.set()
         outcome = await join(owner)
-        assert outcome.error is original, "late native receipt lost to caller cancellation/deadline"
-        assert await db.fetchval("SELECT COUNT(*) FROM effects") == 2
+        assert outcome.error is original, "late effect receipt lost to service cancellation"
+        assert (await p.backend.fetch_one("SELECT COUNT(*) FROM question_custody_effects"))[0] == 2
     finally:
         release.set()
-        if owner is not None:
-            await join(owner)
-        await retire(agent)
+        if not owner.done():
+            owner.cancel()
+        await await_owned_task(owner)

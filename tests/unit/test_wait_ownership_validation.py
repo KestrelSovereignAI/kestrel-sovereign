@@ -19,28 +19,34 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
-
-from kestrel_sovereign.signals.sources.github_pr_watch import CheckRollup
-
-from kestrel_sdk.signals import Status
-from kestrel_sdk.tools import Outcome, WaitStatus
-
-from kestrel_sovereign.a2a.outbound_store import (
-    ensure_a2a_outbound_tasks_table,
-    record_outbound_dispatch,
+from a2a.helpers.proto_helpers import new_text_message
+from a2a.types import (
+    AgentInterface,
+    Role,
+    SendMessageRequest,
+    Task,
+    TaskState,
+    TaskStatus,
 )
+from kestrel_sdk.signals import Status
+from kestrel_sdk.tools.result import ToolResult
+
+from kestrel_sovereign.a2a.lifecycle import task_state_from_label
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.a2a.stores.unified.outbound_store import OutboundStore
 from kestrel_sovereign.features.peers.wait_provider import A2AWaitable
 from kestrel_sovereign.features.scheduler.ci_wait_provider import CIWaitable
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
+from kestrel_sovereign.signals.sources.github_pr_watch import CheckRollup
 from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
 from kestrel_sovereign.waits.engine import WaitRegistry
 from kestrel_sovereign.waits.reconciler import (
     register_wait_watch,
     run_wait_reconcile,
 )
-from kestrel_sdk.tools.result import ToolResult
 
 AGENT_ID = "did:test:sender"
 OUTBOUND_ID = "c3f404fb77df4b79b0508a68ea46bbb7"
@@ -87,28 +93,51 @@ class _StubTaskFeature:
         self.agent = SimpleNamespace(did=AGENT_ID)
 
 
-class _StubPeers:
+class _NativeLedgerPeers:
     def __init__(self, db, agent, states):
-        self._db = db
-        self._outbound_route_store_ready = True
         self.agent = agent
-        self._own_name = "sender"
         self._states = states
+        self._outbound = OutboundStore(db.backend, sender_scope=NativeRecipientScope(agent.did))
 
-    async def get_peer_task_result(self, recipient, task_id):
-        state = self._states.get(task_id)
+    def _native_outbound_store(self):
+        return self._outbound
+
+    async def get_peer_task_result(self, dispatch_id):
+        state = self._states.get(dispatch_id)
         if state is None:
-            return ToolResult.failed("unreachable", data={"task_id": task_id})
-        return ToolResult.ok(
-            "fetched",
-            data={"recipient": recipient, "task_id": task_id, "state": state},
+            return ToolResult.failed("unreachable", data={"dispatch_id": dispatch_id})
+        current = await self._outbound.get(dispatch_id)
+        await self._outbound.acknowledge(
+            current,
+            Task(id=current.remote_task_id, context_id=current.remote_context_id,
+                 status=TaskStatus(state=task_state_from_label(state))),
+            operation_id=uuid4().hex,
         )
+        return ToolResult.ok("fetched", data={"dispatch_id": dispatch_id, "state": state})
+
+
+async def _reserve_dispatch(db, *, dispatch_id, verb):
+    store = OutboundStore(db.backend, sender_scope=NativeRecipientScope(AGENT_ID))
+    request = SendMessageRequest(message=new_text_message(
+        "Native tracked work", role=Role.ROLE_USER, context_id="peer-context",
+    ))
+    dispatch = await store.reserve(
+        dispatch_id, request, recipient=NativeRecipientScope("did:peer:nellie"),
+        signing_did="did:web:peer.test", dispatch_tool="send_a2a_" + verb, verb=verb,
+        interface=AgentInterface(url="https://peer.test/a2a", protocol_binding="JSONRPC", protocol_version="1.0"),
+    )
+    submitting = await store.begin_submission(dispatch, operation_id=uuid4().hex)
+    await store.acknowledge(
+        submitting,
+        Task(id="remote-" + dispatch_id, context_id="peer-context", status=TaskStatus(state=TaskState.TASK_STATE_WORKING)),
+        operation_id=uuid4().hex,
+    )
 
 
 @pytest.fixture
 async def db(tmp_path, sqlite_database_factory):
     database = await sqlite_database_factory(tmp_path / "agent.db")
-    await ensure_a2a_outbound_tasks_table(database)
+    await OutboundStore(database.backend, sender_scope=NativeRecipientScope(AGENT_ID)).initialize()
     return database
 
 
@@ -134,14 +163,11 @@ async def test_task_watch_on_outbound_a2a_id_is_rejected(db):
     agent = _make_agent(db)
     # The id is an OUTBOUND A2A dispatch (in the outbound audit), NOT a local
     # background task.
-    await record_outbound_dispatch(
-        db, agent_id=AGENT_ID, task_id=OUTBOUND_ID, recipient="Nellie",
-        verb="task", session_id="s1", dispatch_tool="send_a2a_task",
-    )
+    await _reserve_dispatch(db, dispatch_id=OUTBOUND_ID, verb='task')
     # Local task provider: the id is NOT in the local task store.
     agent.wait_registry.register(TaskWaitable(_StubTaskFeature(tasks={})))
     # The a2a provider DOES own it → used for the cross-provider hint.
-    agent.wait_registry.register(A2AWaitable(_StubPeers(db, agent, states={})))
+    agent.wait_registry.register(A2AWaitable(_NativeLedgerPeers(db, agent, states={})))
 
     with pytest.raises(ValueError) as exc:
         await register_wait_watch(agent, f"task:{OUTBOUND_ID}")
@@ -175,11 +201,8 @@ async def test_valid_local_task_watch_is_accepted(db):
 async def test_a2a_watch_on_owned_outbound_id_is_accepted(db):
     """The same id, registered with the CORRECT provider, is accepted."""
     agent = _make_agent(db)
-    await record_outbound_dispatch(
-        db, agent_id=AGENT_ID, task_id=OUTBOUND_ID, recipient="Nellie",
-        verb="task", session_id="s1", dispatch_tool="send_a2a_task",
-    )
-    agent.wait_registry.register(A2AWaitable(_StubPeers(db, agent, states={})))
+    await _reserve_dispatch(db, dispatch_id=OUTBOUND_ID, verb='task')
+    agent.wait_registry.register(A2AWaitable(_NativeLedgerPeers(db, agent, states={})))
     await register_wait_watch(agent, f"a2a:{OUTBOUND_ID}")
     store = WaitSignalStore(db, AGENT_ID)
     assert {(w.kind, w.handle) for w in await store.list_watched()} == {
@@ -194,11 +217,8 @@ async def test_a2a_watch_on_outbound_question_is_rejected(db):
     wait.complete rail would double-wake. No durable watch is created."""
     agent = _make_agent(db)
     question_id = "question-abc123"
-    await record_outbound_dispatch(
-        db, agent_id=AGENT_ID, task_id=question_id, recipient="Nellie",
-        verb="question", session_id="s1", dispatch_tool="send_a2a_question",
-    )
-    agent.wait_registry.register(A2AWaitable(_StubPeers(db, agent, states={})))
+    await _reserve_dispatch(db, dispatch_id=question_id, verb='question')
+    agent.wait_registry.register(A2AWaitable(_NativeLedgerPeers(db, agent, states={})))
 
     with pytest.raises(ValueError) as exc:
         await register_wait_watch(agent, f"a2a:{question_id}")
@@ -224,12 +244,9 @@ async def _drain_pair(agent):
 async def test_a2a_watch_rearms_across_restart_and_completes_once(db):
     dispatcher = _CapturingDispatcher()
     agent = _make_agent(db, dispatcher)
-    await record_outbound_dispatch(
-        db, agent_id=AGENT_ID, task_id=OUTBOUND_ID, recipient="Nellie",
-        verb="task", session_id="s1", dispatch_tool="send_a2a_task",
-    )
+    await _reserve_dispatch(db, dispatch_id=OUTBOUND_ID, verb='task')
     states = {OUTBOUND_ID: "submitted"}  # still in flight
-    provider = A2AWaitable(_StubPeers(db, agent, states=states))
+    provider = A2AWaitable(_NativeLedgerPeers(db, agent, states=states))
     agent.wait_registry.register(provider)
 
     await register_wait_watch(agent, f"a2a:{OUTBOUND_ID}")

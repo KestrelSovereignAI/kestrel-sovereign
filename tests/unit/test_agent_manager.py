@@ -19,8 +19,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
-from fastapi.testclient import TestClient
 from fastapi.routing import iter_route_contexts
+from fastapi.testclient import TestClient
 
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
@@ -37,6 +37,7 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 from kestrel_sovereign.identity.local_anchor import AgentDIDLookupMode
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     arm_host_authority_deadline,
@@ -46,22 +47,28 @@ from kestrel_sovereign.kestrel_agent import (
 )
 from kestrel_sovereign.knowledge import InferenceError, InferenceProfile, OntologyRef
 from kestrel_sovereign.multi_agent.agent_manager import (
-    AgentOperationAdmission,
+    RUNTIME_OFFBOARD_TIMEOUT_S,
     AgentManager,
+    AgentOperationAdmission,
     ChildTerminationReconciliationError,
+    HostedIsolatedRuntimeLifecyclePolicy,
     PersistedSpawnParentUnavailableError,
     QuarantinedShutdownHistory,
-    RUNTIME_OFFBOARD_TIMEOUT_S,
     RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
-    HostedIsolatedRuntimeLifecyclePolicy,
     SpawnAuthorityGraphError,
     _parse_runtime_offboard_timeout,
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
-from kestrel_sovereign.inception_service import generate_secp256k1_keypair
+from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.spawn.authority_registry import SpawnAuthorityRegistry
+from kestrel_sovereign.spawn.lifecycle import (
+    SpawnedAgentLifecycle,
+    SpawnMode,
+    SpawnStatus,
+    TerminationRefusalState,
+)
 from kestrel_sovereign.spawn.mandate import (
     PersistedSpawnMandateExpiredError,
     SpawnMandate,
@@ -70,13 +77,6 @@ from kestrel_sovereign.spawn.mandate import (
     verify_mandate,
 )
 from kestrel_sovereign.spawn.mandate_reload import read_spawn_mandate
-from kestrel_sovereign.spawn.lifecycle import (
-    SpawnedAgentLifecycle,
-    SpawnMode,
-    SpawnStatus,
-    TerminationRefusalState,
-)
-from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.stop import AuthoritativeStopDescendant
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 from tests.utils.scheduler_ticks import tick_and_settle
@@ -11315,25 +11315,29 @@ class TestAgentManagerBasics:
     async def test_scheduler_cold_wake_receives_host_a2a_and_feature_route_onboarding(
         self,
         tmp_path,
+        native_a2a_backend_factory,
     ):
         """A scheduler-loaded tenant is integrated like an autostart tenant."""
-        import kestrel_sovereign.endpoints.agent as agent_endpoint
+        from a2a.helpers.proto_helpers import new_text_message
+        from a2a.types import AgentSkill, Role, SendMessageRequest
+
         from kestrel_sovereign import server
         from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
-        from kestrel_sovereign.a2a.envelope_signing import (
-            bound_envelope_fields,
-            canonical_message,
-            sign_envelope,
-            verify_inbound_envelope,
-        )
         from kestrel_sovereign.a2a.inbound_authorization import (
             has_a2a_inbound_scoped_policy,
             install_a2a_inbound_sender_authorizer,
         )
-        from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+        from kestrel_sovereign.a2a.native_card import create_native_agent_card
+        from kestrel_sovereign.a2a.native_host import create_hosted_native_guard
+        from kestrel_sovereign.a2a.native_sender import NativeProofPolicy
+        from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
+        from kestrel_sovereign.a2a.scope import NativeRecipientScope
         from kestrel_sovereign.features.peers.directory import PeerRequester
         from kestrel_sovereign.identity.did_web import build_verification_methods
         from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+        from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+        from tests.utils.native_a2a import manager_for
+        from tests.utils.native_a2a_security import EXTENSIONS, NOW, signed_context
 
         host = FastAPI()
         manager = AgentManager(base_data_dir=tmp_path)
@@ -11383,12 +11387,9 @@ class TestAgentManagerBasics:
             did=cold_did,
             storage_path=str(tmp_path / "cold" / "kestrel_prime.db"),
         )
-        cold.identity = SimpleNamespace(
-            is_hybrid=True,
-            signing_did=cold_did,
-            new_verification_methods=build_verification_methods(
-                cold_did, cold_keypair.public_keys()
-            ),
+        cold.identity = AgentIdentity(
+            hybrid_keypair=cold_keypair, new_did=cold_did,
+            new_verification_methods=build_verification_methods(cold_did, cold_keypair.public_keys()),
         )
         # Normal AgentManager construction leaves these public injection attrs
         # empty. Its PeersFeature owns the live local-host route instead.
@@ -11407,106 +11408,76 @@ class TestAgentManagerBasics:
         }
         cold.peer_directory_router = None
         cold.peer_requester = None
-        cold.task_manager = SimpleNamespace(
-            create_task=AsyncMock(return_value=SimpleNamespace(id="cold-wake-a2a")),
-        )
-        cold.shutdown = AsyncMock()
-        cold.wait_for_shutdown_completion = None
-        cold._set_display_name = lambda _name: None
-        config = LocalAgentConfig(data_dir="cold", port=8802, autostart=False)
-        manager._seed_scheduler_authority({cold.agent_id: ("Cold", config)})
-        manager._initialize_agent = AsyncMock(return_value=cold)
-        manager.set_agent_registration_hook(
-            lambda name, agent: server._onboard_host_registered_agent(
-                host, manager, name, agent
+        native_backend = native_a2a_backend_factory()
+        await native_backend.connect()
+        cold.task_manager = manager_for(native_backend, NativeRecipientScope(cold_did))
+        await cold.task_manager.initialize()
+        try:
+            cold.shutdown = AsyncMock()
+            cold.wait_for_shutdown_completion = None
+            cold._set_display_name = lambda _name: None
+            config = LocalAgentConfig(data_dir="cold", port=8802, autostart=False)
+            manager._seed_scheduler_authority({cold.agent_id: ("Cold", config)})
+            manager._initialize_agent = AsyncMock(return_value=cold)
+            manager.set_agent_registration_hook(
+                lambda name, agent: server._onboard_host_registered_agent(
+                    host, manager, name, agent
+                )
             )
-        )
 
-        loaded = await manager.load_agent(
-            "Cold", config, expected_agent_id=cold.agent_id
-        )
+            loaded = await manager.load_agent(
+                "Cold", config, expected_agent_id=cold.agent_id
+            )
 
-        assert loaded is cold
-        assert cold.a2a_did_resolver(warm_did)["id"] == warm_did
-        assert warm.a2a_did_resolver(cold_did)["id"] == cold_did
-        assert warm.a2a_did_resolver.__self__ is warm_resolver
-        assert cold.a2a_did_resolver.__self__ is not warm.a2a_did_resolver.__self__
-        assert warm.a2a_inbound_sender_authorizer is warm_authorizer
-        assert cold.a2a_inbound_sender_authorizer is not warm_authorizer
-        assert has_a2a_inbound_scoped_policy(cold) is True
-        assert cold.a2a_inbound_sender_authorizer.requires_verified_sender is True
-        assert cold.a2a_inbound_sender_authorizer.has_valid_current_scope() is False
-        assert cold._a2a_host_manager is manager
-        hosted_policy = manager.a2a_hosted_policy_for(cold)
-        assert hosted_policy is not None
-        assert hosted_policy.router is live_router
-        assert hosted_policy.requester is live_requester
+            assert loaded is cold
+            assert cold.a2a_did_resolver(warm_did)["id"] == warm_did
+            assert warm.a2a_did_resolver(cold_did)["id"] == cold_did
+            assert warm.a2a_did_resolver.__self__ is warm_resolver
+            assert cold.a2a_did_resolver.__self__ is not warm.a2a_did_resolver.__self__
+            assert warm.a2a_inbound_sender_authorizer is warm_authorizer
+            assert cold.a2a_inbound_sender_authorizer is not warm_authorizer
+            assert has_a2a_inbound_scoped_policy(cold) is True
+            assert cold.a2a_inbound_sender_authorizer.requires_verified_sender is True
+            assert cold.a2a_inbound_sender_authorizer.has_valid_current_scope() is False
+            assert cold._a2a_host_manager is manager
+            hosted_policy = manager.a2a_hosted_policy_for(cold)
+            assert hosted_policy is not None
+            assert hosted_policy.router is live_router
+            assert hosted_policy.requester is live_requester
 
-        # Exercise the actual verification seam, not merely resolver lookup:
-        # a signed warm→cold same-host envelope must validate after the cold
-        # tenant is registered through the scheduler path.
-        timestamp = datetime.now(timezone.utc).isoformat()
-        metadata = {"sender": warm_did}
-        metadata["signature"] = sign_envelope(
-            warm_keypair,
-            sender=warm_did,
-            task_id="cold-wake-a2a",
-            message="scheduler woke cold peer",
-            timestamp=timestamp,
-            session_id="cold-wake-session",
-            bound=bound_envelope_fields(metadata),
-        )
-        verdict = await verify_inbound_envelope(
-            metadata,
-            task_id="cold-wake-a2a",
-            message="scheduler woke cold peer",
-            session_id="cold-wake-session",
-            resolver=cold.a2a_did_resolver,
-            require_signed=True,
-        )
-        assert verdict.ok is True and verdict.verified is True
-
-        # Exercise the recipient's real verified-send path under the manager
-        # lease. The raw agent attrs remain None, so this would fail if the
-        # hosted policy had not captured PeersFeature's effective context.
-        send_metadata = {"sender": warm_did}
-        send_metadata["signature"] = sign_envelope(
-            warm_keypair,
-            sender=warm_did,
-            task_id="cold-wake-a2a",
-            message=canonical_message(["scheduler woke cold peer"]),
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            session_id="cold-wake-session",
-            bound=bound_envelope_fields(send_metadata),
-        )
-        params = TaskSendParams(
-            id="cold-wake-a2a",
-            sessionId="cold-wake-session",
-            message=Message(
-                role="user", parts=[TextPart(text="scheduler woke cold peer")],
-            ),
-            metadata=send_metadata,
-        )
-        created = await agent_endpoint._create_verified_a2a_task(
-            cold,
-            params,
-            params.message.parts,
-            [],
-            [],
-        )
-        assert created.id == "cold-wake-a2a"
-        live_router.authorize_inbound_sender.assert_awaited_once_with(
-            live_requester, warm_did,
-        )
-        assert cold.task_manager.create_task.await_count == 1
-        with TestClient(host) as client:
-            response = client.get("/cold-only")
+            # The scheduler-loaded recipient uses the native guard and canonical
+            # task manager, even though its public injected scope attrs are None.
+            async with manager.a2a_lifecycle_lease():
+                guard = create_hosted_native_guard(
+                    manager, routing_key="Cold", recipient=cold,
+                    required_extensions=EXTENSIONS, proof_policy=NativeProofPolicy(), clock=lambda: NOW,
+                )
+            await guard.replay_store.ensure_table()
+            params = SendMessageRequest(message=new_text_message("scheduler woke cold peer", role=Role.ROLE_USER))
+            params.configuration.return_immediately = True
+            admission = SimpleNamespace(guard=guard, signing=(warm_keypair, {"id":warm_did}))
+            context = signed_context(admission, params, proof_changes={"sender":warm_did})
+            card = create_native_agent_card(
+                identity=cold.identity, scope=guard.scope, routing_key="Cold",
+                public_base_url="https://cold.test", name="Cold", description="Cold native peer", version="1",
+                skills=[AgentSkill(id="chat", name="Chat", description="Cognition", tags=["chat"])],
+            )
+            created = await NativeA2ARequestHandler(cold.task_manager, guard, card).on_message_send(params, context)
+            assert created.id and created.id != params.message.message_id
+            assert await cold.task_manager.get_task_for_creator(created.id, warm_did, recipient_agent_id=cold_did) == created
+            assert live_router.authorize_inbound_sender.await_args_list
+            assert all(call.args == (live_requester, warm_did) for call in live_router.authorize_inbound_sender.await_args_list)
+            with TestClient(host) as client:
+                response = client.get("/cold-only")
+                assert response.status_code == 200
+                assert await manager.remove_agent("Cold") is True
+                deleted_response = client.get("/cold-only")
             assert response.status_code == 200
-            assert await manager.remove_agent("Cold") is True
-            deleted_response = client.get("/cold-only")
-        assert response.status_code == 200
-        assert response.json() == {"cold": True}
-        assert deleted_response.status_code == 404
+            assert response.json() == {"cold": True}
+            assert deleted_response.status_code == 404
+
+        finally:
+            await cold.task_manager.close()
 
     @pytest.mark.asyncio
     async def test_remove_nonexistent_agent(self):
@@ -13747,8 +13718,8 @@ class TestLoadFromConfig:
         tmp_path,
         custody_bound,
     ):
-        from kestrel_sovereign.storage.db.postgres import PostgresBackend
         from kestrel_sovereign.execution_custody import ExecutionCustody
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
         from tests.unit.test_execution_custody import Authority
 
         class _Pool:

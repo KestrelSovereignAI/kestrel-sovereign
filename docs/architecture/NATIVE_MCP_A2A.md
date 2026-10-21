@@ -53,11 +53,10 @@ Use 0.41 as the minimum for Core's eventual dependency upgrade, including its
 lock, consumer constraints and installed-package acceptance tests. The SDK's
 protected publishing review and native-A2A release gates still apply.
 
-Core's `kestrel_sovereign/a2a/types.py` and
-`kestrel_sovereign/a2a/agent_card.py` forward the draft models supplied by its
-current SDK 0.39 line. SDK 0.40 removed those handwritten models; the Core
-cutover to 0.41 must retire both forwarding modules and every old import and
-serialized caller. Keep the SDK lightweight:
+The cutover worktree removes `kestrel_sovereign/a2a/types.py` and
+`kestrel_sovereign/a2a/agent_card.py`, which forwarded the draft models from
+SDK 0.39. SDK 0.40 removed those handwritten models; Core's coordinated
+adoption uses 0.41 and retires the old imports and serialized callers. Keep the SDK lightweight:
 the official A2A dependency belongs to consumers of A2A, not every feature.
 The MCP feature owns the direct `mcp` requirement. Core owns the compatible
 lock and Phoenix dependencies; the dependency spike adds protocol packages as
@@ -830,6 +829,37 @@ Adjacent operator endpoints must remain denied. Do not repurpose the operator
 API key as peer authority. Drain or explicitly stop old in-flight work during the host
 upgrade; mixed draft/new workers are unsupported. Rollback requires the saved
 pre-migration database and a coherent old host/SDK set, not a parallel handler.
+
+### Retired surface coverage
+
+The cutover deletes the private task worker, local-submission and envelope
+services, draft TaskStore and pending-question store, legacy outbound ledger,
+and private send/read/cancel/subscribe/Stop routes. Historical schema/migration
+code remains solely for the explicit offline migration; it is not a serving
+adapter. The tests for the removed protocol are replaced by these contracts:
+
+| Retired contract | Native checks in `tests/unit/` |
+| --- | --- |
+| Private routes, draft model imports, host callback seams | `test_a2a_native_retired_surface.py`, `test_a2a_native_host.py` |
+| Unsigned sender tiers, draft envelope signing and recipient reads/mutations | `test_a2a_native_sender.py`, `test_a2a_native_security.py`, `test_a2a_native_http.py`, `test_a2a_native_host.py` |
+| Draft task/session lifecycle and local submission | `test_a2a_native_task_manager.py`, `test_a2a_native_context_ownership.py`, `test_scoped_agent_did_guard.py` |
+| Legacy outbound audit, questions, replay, expiry and owed wakes | `test_a2a_native_outbound_store.py`, `test_a2a_native_question_store.py`, `test_a2a_native_question_supervisor.py`, `test_a2a_native_host.py` |
+| Private SSE forwarding, cancellation and HTTP resource custody | `test_a2a_native_client.py`, `test_execution_custody_review49_native.py`, `test_execution_custody_review54_native.py`, `test_execution_custody_production_routes.py` |
+| Draft Stop transport | `test_a2a_native_peer_stop.py`, `test_peer_stop_signals.py` |
+| Pending-question service storage and store shutdown | `test_execution_custody_a2a_merge_native.py`, `test_a2a_native_shutdown.py`, `storage/test_sqlite_timestamp_defaults.py` |
+
+The integration replacements are `test_native_a2a_authority_backends.py`
+(principal/recipient/tenant isolation, independent-connection CAS and cancellation
+races, and read-only refusal of draft databases) and
+`test_native_a2a_subscription_original_control.py` (real PostgreSQL release
+receipts, original generator retirement, and loopback SDK subscriptions on both
+bindings). The old integration tests for draft store auto-upgrades, PostgreSQL
+TaskStore wrappers and private SSE framing are retired with those implementations.
+Active wait, identity, context, cancellation and storage-parity integration
+callers use native snapshots and the primary ledger.
+
+This maps safety coverage, not a conformance or deployment claim. The final
+release still requires the published dependencies and acceptance gates below.
 
 Push notifications require authenticated configuration changes, recipient-bound
 ownership and outbound URL validation against SSRF (including redirect/DNS

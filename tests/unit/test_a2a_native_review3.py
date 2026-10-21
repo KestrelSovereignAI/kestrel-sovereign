@@ -32,7 +32,7 @@ from tests.unit.test_a2a_native_question_store import questions as questions
 from tests.unit.test_a2a_native_question_supervisor import dispatcher_for
 
 
-def malformed_response(request, task, protocol, fault):
+def response_with_wire_variation(request, task, protocol, fault):
     body = MessageToDict(task)
     if fault == "unknown-field":
         body["createdAt"] = "2026-10-21T00:00:00Z"
@@ -58,7 +58,7 @@ def malformed_response(request, task, protocol, fault):
 @pytest.mark.parametrize(
     "fault", ["unknown-field", "envelope-list", "malformed-json", "nonfinite"]
 )
-async def test_malformed_sdk_peer_read_has_typed_error_and_preserves_exact_receipt(
+async def test_sdk_peer_read_ignores_unknown_fields_and_refuses_malformed_values(
     peer_session, fault
 ):
     p = peer_session
@@ -68,18 +68,29 @@ async def test_malformed_sdk_peer_read_has_typed_error_and_preserves_exact_recei
 
     def respond(request):
         requests.append(request)
-        return malformed_response(
+        return response_with_wire_variation(
             request, accepted.response, p.arguments["interface"].protocol_binding, fault
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
         session = NativePeerSession(**(p.arguments | {"http_client": http}))
         try:
-            with pytest.raises(
-                (A2AError, NativePeerProtocolError, OutboundDispatchConflict)
-            ):
-                await session.get_task(accepted.dispatch)
-            assert await p.store.get(dispatch.dispatch_id) == accepted.dispatch
+            if fault == "unknown-field":
+                # A2A 1.0.1 section 5.7 recommends forward-compatible field
+                # handling. Unknown fields cannot become task authority.
+                receipt = await session.get_task(accepted.dispatch)
+                assert receipt.response == accepted.response
+                assert (
+                    receipt.dispatch.remote_task_id == accepted.dispatch.remote_task_id
+                )
+                assert receipt.dispatch.recipient_id == accepted.dispatch.recipient_id
+                assert await p.store.get(dispatch.dispatch_id) == receipt.dispatch
+            else:
+                with pytest.raises(
+                    (A2AError, NativePeerProtocolError, OutboundDispatchConflict)
+                ):
+                    await session.get_task(accepted.dispatch)
+                assert await p.store.get(dispatch.dispatch_id) == accepted.dispatch
             assert len(requests) == 1
         finally:
             await session.close()
@@ -88,16 +99,16 @@ async def test_malformed_sdk_peer_read_has_typed_error_and_preserves_exact_recei
 @pytest.mark.parametrize(
     "fault", ["unknown-field", "envelope-list", "malformed-json", "nonfinite"]
 )
-async def test_malformed_sdk_question_read_does_not_strand_another_deadline(
-    peer_session, fault
-):
+async def test_sdk_question_read_does_not_strand_another_deadline(peer_session, fault):
     p = peer_session
     clock = SimpleNamespace(now=datetime.now(UTC))
     questions = NativeQuestionStore(p.store, clock=lambda: clock.now)
     await questions.initialize()
     signer = replace(
         p.arguments["signer"],
-        extensions=frozenset(item.uri for item in p.arguments["card"].capabilities.extensions),
+        extensions=frozenset(
+            item.uri for item in p.arguments["card"].capabilities.extensions
+        ),
     )
     session = NativePeerSession(
         **(p.arguments | {"signer": signer, "question_store": questions})
@@ -128,7 +139,7 @@ async def test_malformed_sdk_question_read_does_not_strand_another_deadline(
         original_question = await questions.get(bad_id)
 
         def respond(request):
-            return malformed_response(
+            return response_with_wire_variation(
                 request,
                 accepted.response,
                 p.arguments["interface"].protocol_binding,
@@ -164,7 +175,14 @@ async def test_malformed_sdk_question_read_does_not_strand_another_deadline(
             )
             try:
                 await supervisor._read_pass()
-                assert await p.store.get(dispatch.dispatch_id) == accepted.dispatch
+                current = await p.store.get(dispatch.dispatch_id)
+                if fault == "unknown-field":
+                    assert current.revision == accepted.dispatch.revision + 1
+                    assert current.remote_task_id == accepted.dispatch.remote_task_id
+                    assert current.response_digest == accepted.dispatch.response_digest
+                    assert current.recipient_id == accepted.dispatch.recipient_id
+                else:
+                    assert current == accepted.dispatch
                 assert await questions.get(bad_id) == original_question
                 clock.now += timedelta(seconds=11)
                 await supervisor._deadline_pass()

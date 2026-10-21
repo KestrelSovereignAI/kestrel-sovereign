@@ -451,8 +451,7 @@ class WaitReconciler:
         from kestrel_sovereign.features.storage_access import resolve_scoped_agent_did
 
         agent_id = resolve_scoped_agent_did(agent)
-        # The agent's AsyncDatabase lives behind _raw_storage.db (same path
-        # PendingA2AQuestionStore is wired through in kestrel_agent.py).
+        # The agent's canonical AsyncDatabase lives behind _raw_storage.db.
         raw_storage = getattr(agent, "_raw_storage", None)
         db = getattr(raw_storage, "db", None)
         self._store = WaitSignalStore(db, agent_id)

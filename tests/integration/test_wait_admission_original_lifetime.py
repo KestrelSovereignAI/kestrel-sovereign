@@ -5,12 +5,12 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
 )
-from kestrel_sovereign.a2a.types import Message, TaskSendParams, TaskState, TextPart
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     is_execution_control_error,
@@ -38,21 +38,12 @@ async def test_original_failed_wait_lifetime_rejects_public_admission(
     backend, manager, first_task, runtime, owner, dispatcher = real_dispatch
     wait_feature = wait_native_runtime[4]
     await manager.update_status(
-        first_task.id, TaskState.WORKING, recipient_agent_id=runtime.did
+        first_task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=runtime.did
     )
     await manager.complete_task(
         first_task.id, "actual first task completed", recipient_agent_id=runtime.did
     )
-    second_task = await manager.create_task(
-        TaskSendParams(
-            id=uuid4().hex,
-            sessionId=uuid4().hex,
-            message=Message(
-                role="user", parts=[TextPart(text="new native public wait")]
-            ),
-        ),
-        agent_name=runtime.did,
-    )
+    second_task = await manager.create_task(SendMessageRequest(message=Message(role=Role.ROLE_USER, parts=[Part(text='new native public wait')], message_id=uuid4().hex, context_id=uuid4().hex)), creator_agent_id=runtime.did)
     await register_wait_watch(runtime, "task:" + first_task.id)
     reconciler = runtime._wait_reconciler
     consumer_id = "new-native-resume-" + uuid4().hex
@@ -182,16 +173,7 @@ async def test_first_reference_read_joins_the_same_failed_registration_lifetime(
     real_dispatch, wait_native_runtime, monkeypatch, door
 ):
     backend, manager, first_task, runtime, owner, dispatcher = real_dispatch
-    second_task = await manager.create_task(
-        TaskSendParams(
-            id=uuid4().hex,
-            sessionId=uuid4().hex,
-            message=Message(
-                role="user", parts=[TextPart(text="concurrent first native wait")]
-            ),
-        ),
-        agent_name=runtime.did,
-    )
+    second_task = await manager.create_task(SendMessageRequest(message=Message(role=Role.ROLE_USER, parts=[Part(text='concurrent first native wait')], message_id=uuid4().hex, context_id=uuid4().hex)), creator_agent_id=runtime.did)
     assert getattr(runtime, "_wait_reconciler", None) is None
     backend._execution_custody = ExecutionCustody(GenerationFence())
     entered, release = asyncio.Event(), asyncio.Event()

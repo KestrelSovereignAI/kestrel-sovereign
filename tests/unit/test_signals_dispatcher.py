@@ -315,14 +315,21 @@ async def test_held_a2a_wake_is_drained_automatically_after_release(
         build_signal_for_submitted_task,
     )
 
-    task = SimpleNamespace(
-        id="task-held-a2a",
-        sessionId="session-held-a2a",
-        metadata={},
-        history=[],
-    )
+    from a2a.helpers.proto_helpers import new_text_message
+    from a2a.types import Role, SendMessageRequest
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from tests.utils.native_a2a import manager_for
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import submitted_input_identity
 
     c = dispatcher_components
+    manager = manager_for(c.backend, NativeRecipientScope(c.agent.did), owns_backend=False)
+    await manager.initialize()
+    c.agent.task_manager = manager
+    task = await manager.create_task(
+        SendMessageRequest(message=new_text_message("Held native request", role=Role.ROLE_USER)),
+        creator_agent_id="did:test:sender",
+    )
+    snapshot = await manager.get_task_snapshot(task.id, recipient_agent_id=c.agent.did)
     c.registry.register(build_a2a_task_submitted_registration())
     await c.dispatcher.register_durable_consumer(
         DurableConsumerRegistration(
@@ -339,8 +346,8 @@ async def test_held_a2a_wake_is_drained_automatically_after_release(
     c.agent._hold_store = snapshots
 
     handle = await c.dispatcher.enqueue_durable_cognition(
-        build_signal_for_submitted_task(task, target_agent=c.agent.did),
-        source_event_id=task.id,
+        build_signal_for_submitted_task(snapshot, target_agent=c.agent.did),
+        source_event_id=submitted_input_identity(task.id, snapshot.input_revision),
         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
     )
     admission = await handle.wait_for_durable_admission()

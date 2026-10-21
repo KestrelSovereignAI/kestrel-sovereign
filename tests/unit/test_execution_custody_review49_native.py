@@ -18,6 +18,8 @@ from kestrel_sovereign._async_ownership import (
     owned_task_error,
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from tests.utils.native_a2a import manager_for
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, _explicit_control_chain, execution_cleanup_debts,
     execution_commit_outcome,
@@ -138,29 +140,37 @@ async def test_native_fanout_physically_joins_stronger_late_sibling(tmp_path, ro
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", KINDS)
 async def test_a2a_stores_all_close_after_original_receipt_and_later_cancel(tmp_path, kind):
-    databases = [await AsyncDatabase.sqlite(str(tmp_path / f"store-{i}.db")) for i in range(3)]
+    from tests.unit.test_a2a_native_shutdown import STORE_NAMES
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "native-stores.db"))
+    manager = TaskManager.from_backend(
+        db.backend, scope=NativeRecipientScope("did:test:recipient"), owns_backend=False,
+    )
+    await manager.initialize()
     original = terminal(kind)
-    closed = []
-    original_closes = [db.close for db in databases]
-    for index, db in enumerate(databases):
-        close = db.close
-        async def close_then_receipt(index=index, close=close):
+    closed, original_closes = [], []
+    for name in STORE_NAMES:
+        store = getattr(manager, name)
+        close = store.close
+        original_closes.append(close)
+        async def close_then_receipt(name=name, close=close):
             await close()
-            closed.append(index)
-            if index == 2:
+            closed.append(name)
+            if name == "observability_store":
                 raise original
-            if index == 1:
+            if name == "session_service":
                 raise asyncio.CancelledError("later independent store cleanup")
-        db.close = close_then_receipt
-    manager = TaskManager(*databases)
+        store.close = close_then_receipt
     try:
         result = await join(create_owned_task(manager.close()))
         assert result.error is original
-        assert closed == [2, 1, 0]
-        assert all(db.backend._connection is None for db in databases)
+        assert set(closed) == STORE_NAMES and len(closed) == len(STORE_NAMES)
+        assert db.backend.is_connected, "borrowed primary retired before its owner"
     finally:
         for close in original_closes:
             await close()
+        await db.close()
+
 
 
 @pytest.mark.asyncio
@@ -182,7 +192,7 @@ async def test_cancelled_drain_joins_native_effect_and_retains_receipt(tmp_path,
     hook = object()
     agent.sleep_hooks = []
     feature._register_sleep_hook(agent, hook)
-    manager = TaskManager(db, None, None)
+    manager = manager_for(db.backend, NativeRecipientScope(agent.did), owns_backend=False)
     async def effect():
         entered.set()
         try:
@@ -476,7 +486,7 @@ async def test_cancelled_read_closes_exact_late_native_cursor_before_next_begin(
 @pytest.mark.parametrize("kind", KINDS)
 async def test_a2a_cancel_group_cannot_skip_other_native_workers(tmp_path, kind):
     agent, db = await native_owner(tmp_path)
-    manager = TaskManager(db, None, None)
+    manager = manager_for(db.backend, NativeRecipientScope(agent.did), owns_backend=False)
     original = terminal(kind)
     entered = [asyncio.Event(), asyncio.Event()]
     workers = []

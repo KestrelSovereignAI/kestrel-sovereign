@@ -80,8 +80,8 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     The guard for the sites that scope a shared table to the calling agent
     and route through it: the consent log and audit anchors (#3229/#3230),
     observability (#3215), the ``!tasks`` command, and since #3246 the
-    A2A task routes' recipient (reads, subscribe, cancel, and the creation
-    of an inbound task), the host-attested local submission's recipient,
+    native operator task inbox's recipient (``endpoints/task_inbox``),
+    the native outbound sender (``features/peers``),
     the inbound-scope gate's recipient (``a2a/inbound_authorization``),
     the task feature's own durable identity, the task wait provider's
     ownership check, the pre-turn state sections, the restart

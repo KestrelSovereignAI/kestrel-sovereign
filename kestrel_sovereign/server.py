@@ -10,52 +10,69 @@ import re
 import secrets
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, fields
+from dataclasses import field as dataclass_field
 from datetime import datetime
-from dataclasses import dataclass, field as dataclass_field, fields
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.routing import APIRoute, APIWebSocketRoute, RouteContext, iter_route_contexts
-from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.routing import (
+    APIRoute,
+    APIWebSocketRoute,
+    RouteContext,
+    iter_route_contexts,
+)
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
+from slowapi.errors import RateLimitExceeded
 from starlette.routing import (
     Match,
+)
+from starlette.routing import (
     Route as StarletteRoute,
+)
+from starlette.routing import (
     WebSocketRoute as StarletteWebSocketRoute,
 )
-from kestrel_sovereign.main import get_agent_did_async
-from kestrel_sovereign.kestrel_agent import (
-    KestrelAgent,
-    await_agent_shutdown_completion,
-    await_lifecycle_task_completion,
+
+from kestrel_sovereign.a2a.transport_auth import (
+    A2A_TRANSPORT_KEY_HEADER,
+    ensure_a2a_transport_key,
+    is_a2a_transport_only_process,
+    is_peer_directory_request,
 )
-from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
-from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners, retire_unpublished_llm
-from kestrel_sovereign.execution_custody import execution_finite_error, execution_observation_error, is_execution_control_error
-from dotenv import load_dotenv
-from slowapi.errors import RateLimitExceeded
-from kestrel_sovereign.rate_limit import limiter
-from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
-from kestrel_sovereign.security.sovereign_key import mark_ephemeral_sovereign_key
 from kestrel_sovereign.api_errors import (
     api_error_response,
     api_unhandled_exception_handler,
     register_api_error_handlers,
 )
-from kestrel_sovereign.a2a.transport_auth import (
-    A2A_TRANSPORT_KEY_HEADER,
-    ensure_a2a_transport_key,
-    is_a2a_transport_path,
-    is_a2a_transport_only_process,
-)
 from kestrel_sovereign.auth import normalize_api_key
-from kestrel_sovereign.paths import SKIP_DOTENV_ENV
-
+from kestrel_sovereign.execution_custody import (
+    execution_finite_error,
+    execution_observation_error,
+    is_execution_control_error,
+)
+from kestrel_sovereign.kestrel_agent import (
+    KestrelAgent,
+    await_agent_shutdown_completion,
+    await_lifecycle_task_completion,
+)
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
+from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
+from kestrel_sovereign.llm.lifecycle import (
+    drain_unpublished_llm_owners,
+    retire_unpublished_llm,
+)
+from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.main import get_agent_did_async
+from kestrel_sovereign.paths import SKIP_DOTENV_ENV
+from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
+from kestrel_sovereign.security.sovereign_key import mark_ephemeral_sovereign_key
 from kestrel_sovereign.telemetry import setup_tracing
 
 
@@ -111,11 +128,11 @@ def load_server_dotenv(package_dir: Path = Path(__file__).parent) -> None:
 load_server_dotenv()
 
 from kestrel_sovereign.logging_config import (
-    setup_logging,
-    correlation_id_var,
-    session_id_var,
     agent_name_var,
+    correlation_id_var,
     resolve_correlation_id,
+    session_id_var,
+    setup_logging,
 )
 from kestrel_sovereign.paths import (
     AGENT_DB_PATH_ENV,
@@ -187,7 +204,8 @@ def _standalone_runtime_execution_custody(name, did, config):
     if not os.environ.get("KESTREL_DATABASE_URL"):
         return None
     from kestrel_sovereign.execution_custody import (
-        ExecutionCustody, ProcessRuntimeExecutionFence,
+        ExecutionCustody,
+        ProcessRuntimeExecutionFence,
     )
     return ExecutionCustody(ProcessRuntimeExecutionFence(agent_id=did))
 
@@ -1394,7 +1412,7 @@ def _hosted_peer_directory_context(
             )
 
             # Never replace an explicitly injected user-scoped router with
-            # global local-host discovery. Only the compatibility adapter is
+            # global local-host discovery. Only the local directory client is
             # rebuilt from the active host config/auth state.
             if not isinstance(router, LocalHostPeerDirectory):
                 return router, requester
@@ -1405,16 +1423,17 @@ def _hosted_peer_directory_context(
         refresh = getattr(peer_feature, "refresh_local_host_peer_directory", None)
         if not callable(refresh):
             return None, None
-        local_cancel = None
-        local_stop = None
-        local_get = None
-        local_subscribe = None
         native_session_factory = None
         if manager is not None:
             import httpx
 
-            from kestrel_sovereign.a2a.native_publication import open_hosted_native_peer_session
-            from kestrel_sovereign.features.peers.directory import PEER_CONNECT_TIMEOUT, PEER_READ_TIMEOUT
+            from kestrel_sovereign.a2a.native_publication import (
+                open_hosted_native_peer_session,
+            )
+            from kestrel_sovereign.features.peers.directory import (
+                PEER_CONNECT_TIMEOUT,
+                PEER_READ_TIMEOUT,
+            )
 
             def native_session_factory(requester, peer):
                 return open_hosted_native_peer_session(
@@ -1423,46 +1442,13 @@ def _hosted_peer_directory_context(
                         read=PEER_READ_TIMEOUT, write=PEER_READ_TIMEOUT,
                         pool=PEER_CONNECT_TIMEOUT),
                 )
-            async def local_cancel(requester, peer, task_id, payload):
-                return await manager.cancel_host_attested_local_a2a_task(
-                    sender=agent,
-                    requester=requester,
-                    peer=peer,
-                    task_id=task_id,
-                    payload=payload,
-                )
 
-            async def local_stop(requester, peer, payload):
-                return await manager.stop_host_attested_local_peer(
-                    sender=agent,
-                    requester=requester,
-                    peer=peer,
-                    payload=payload,
-                )
 
-            async def local_get(requester, peer, task_id):
-                return await manager.get_host_attested_local_a2a_task(
-                    sender=agent,
-                    requester=requester,
-                    peer=peer,
-                    task_id=task_id,
-                )
 
-            def local_subscribe(requester, peer, task_id):
-                return manager.subscribe_host_attested_local_a2a_task(
-                    sender=agent,
-                    requester=requester,
-                    peer=peer,
-                    task_id=task_id,
-                )
 
         refreshed = refresh(
             host_url=host_url,
             transport_key=ensure_a2a_transport_key(),
-            local_cancel=local_cancel,
-            local_stop=local_stop,
-            local_get=local_get,
-            local_subscribe=local_subscribe,
             native_session_factory=native_session_factory,
         )
         return refreshed if refreshed is not None else (None, None)
@@ -1494,7 +1480,9 @@ async def _onboard_host_registered_agent(
         install_a2a_inbound_sender_authorizer,
         mark_a2a_inbound_scoped_policy,
     )
-    from kestrel_sovereign.a2a.native_publication import prepare_hosted_native_publication
+    from kestrel_sovereign.a2a.native_publication import (
+        prepare_hosted_native_publication,
+    )
 
     missing = object()
     rollback_state_fields = (
@@ -1837,6 +1825,8 @@ def _host_config_mapping(config) -> dict:
 
     from kestrel_sovereign.security.tenant_resolver import (
         HOST_CONFIG_KEY as _TENANT_RESOLVER_KEY,
+    )
+    from kestrel_sovereign.security.tenant_resolver import (
         build_tenant_resolver,
     )
 
@@ -2083,7 +2073,6 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
             prepare_host_database,
             validate_sqlite_family_private,
         )
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.signals.sources.peer_stop import (
             resolve_peer_stop_circuit_policy,
         )
@@ -2093,6 +2082,7 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
             PeerStopCircuitStore,
             StopReceiptStore,
         )
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
 
         backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
         if backend == "postgres":
@@ -2292,7 +2282,10 @@ async def _shutdown_phoenix(app: FastAPI, *, withdrawals=None, finite_errors=Non
         return cancelled
 
     from kestrel_sovereign._async_ownership import (
-        OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
+        OwnedTaskAdmission,
+        await_owned_task,
+        create_owned_task,
+        owned_task_admission_error,
         owned_task_error,
     )
     from kestrel_sovereign.execution_custody import execution_native_source_error
@@ -2970,7 +2963,12 @@ async def _run_lifespan_shutdown_phase(
     admission boundary: a refused cleanup retains its actual original resource
     and closes the unstarted coroutine, never reporting successful retirement.
     """
-    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
+    from kestrel_sovereign._async_ownership import (
+        OwnedTaskAdmission,
+        await_owned_task,
+        create_owned_task,
+        owned_task_error,
+    )
 
     phase_task = None
     admission = OwnedTaskAdmission()
@@ -3181,7 +3179,10 @@ async def _lifespan_teardown_owner(app: FastAPI):
         raise
     finally:
         cancelled, teardown_failure = await _shutdown_server_resources(app, original_failure=body_failure)
-        from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
+        from kestrel_sovereign.execution_custody import (
+            execution_finite_error,
+            is_execution_control_error,
+        )
         terminal = execution_finite_error(body_failure, teardown_failure, retain_originals=True,
                                            isolate_control_originals=True)
         if terminal is not None and is_execution_control_error(terminal):
@@ -3571,7 +3572,9 @@ async def _lifespan_startup(app: FastAPI):
                             )
                         persisted_name = matches[0]
                         registered_config = current.agents[persisted_name]
-                        from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+                        from kestrel_sovereign.multi_agent.config import (
+                            LocalAgentConfig,
+                        )
 
                         if not isinstance(registered_config, LocalAgentConfig):
                             raise RuntimeError(
@@ -3816,7 +3819,9 @@ async def _lifespan_startup(app: FastAPI):
             execution_custody = _standalone_runtime_execution_custody(
                 "default", agent_did, None,
             )
-            from kestrel_sovereign.execution_custody import bind_execution_custody_snapshot
+            from kestrel_sovereign.execution_custody import (
+                bind_execution_custody_snapshot,
+            )
 
             captured = () if execution_custody is None else (execution_custody,)
             # Single-agent mode owns the same original process lifetime as
@@ -3859,7 +3864,9 @@ async def _lifespan_startup(app: FastAPI):
             await app.state.agent.initialize()
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
         except BaseException as e:
-            from kestrel_sovereign.execution_custody import retire_process_runtime_custody
+            from kestrel_sovereign.execution_custody import (
+                retire_process_runtime_custody,
+            )
 
             # Failed birth must deny surviving provider children BEFORE the
             # first cleanup await, including cancellation during initialize.
@@ -4325,27 +4332,28 @@ if SERVE_UI:
 # Include core routers (always present, not feature-gated)
 from kestrel_sovereign.endpoints import (
     agent_router,
-    task_inbox_router,
-    conversations_router,
-    memories_router,
-    sovereignty_router,
-    database_router,
-    models_router,
     commands_router,
-    files_router,
-    security_router,
-    saved_items_router,
-    metrics_router,
-    observability_router,
+    conversations_router,
+    database_router,
     features_router,
-    ui_router,
+    files_router,
     github_router,
     hold_router,
     host_stop_router,
+    memories_router,
+    metrics_router,
+    models_router,
+    observability_router,
+    saved_items_router,
+    security_router,
+    sovereignty_router,
+    task_inbox_router,
+    ui_router,
 )
+from kestrel_sovereign.endpoints.auth_oauth import oauth, register_oauth
+from kestrel_sovereign.endpoints.auth_oauth import router as auth_oauth_router
 from kestrel_sovereign.endpoints.rasa_shim import router as rasa_shim_router
 
-from kestrel_sovereign.endpoints.auth_oauth import router as auth_oauth_router, register_oauth, oauth
 app.include_router(auth_oauth_router)
 register_oauth(app)
 
@@ -4423,7 +4431,11 @@ async def logging_context_middleware(request: Request, call_next):
 @app.middleware("http")
 async def request_metrics_middleware(request: Request, call_next):
     """Record Prometheus request count and latency metrics."""
-    from kestrel_sdk.metrics import PROMETHEUS_AVAILABLE, REQUEST_COUNT, REQUEST_DURATION
+    from kestrel_sdk.metrics import (
+        PROMETHEUS_AVAILABLE,
+        REQUEST_COUNT,
+        REQUEST_DURATION,
+    )
     if not PROMETHEUS_AVAILABLE:
         return await call_next(request)
 
@@ -4559,8 +4571,8 @@ async def auth_middleware(request: Request, call_next):
     # A logged-in console (session cookie / API key) can also reach /phoenix via
     # the standard path, so absence of the embed cookie just falls through.
     if request.url.path == "/phoenix" or request.url.path.startswith("/phoenix/"):
+        from kestrel_sovereign.auth import AuthMethod, CallerContext
         from kestrel_sovereign.phoenix_supervisor import verify_embed_cookie
-        from kestrel_sovereign.auth import CallerContext, AuthMethod
 
         if verify_embed_cookie(request, _SESSION_SECRET):
             request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
@@ -4585,7 +4597,7 @@ async def auth_middleware(request: Request, call_next):
                 code="authentication_required",
                 message="Invalid or missing A2A transport key",
             )
-        if not is_a2a_transport_path(request.method, request.url.path):
+        if not is_peer_directory_request(request.method, request.url.path):
             return api_error_response(
                 status_code=403,
                 code="a2a_transport_scope_denied",
@@ -4610,7 +4622,7 @@ async def auth_middleware(request: Request, call_next):
     # authenticated (or deliberately unauthenticated) request stays OUTSIDE
     # it, so an unhandled downstream application fault keeps FastAPI's
     # 500 semantics instead of masquerading as a 401 (#2490).
-    from kestrel_sovereign.auth import CallerContext, AuthMethod
+    from kestrel_sovereign.auth import AuthMethod, CallerContext
 
     caller = None
     unauthenticated_root_dispatch = False
@@ -4781,6 +4793,7 @@ async def canonical_unhandled_error_middleware(request: Request, call_next):
 # Origins from KESTREL_CORS_ORIGINS (comma-separated) or built-in defaults;
 # build_cors_origins() rejects a wildcard since credentialed CORS is on.
 from kestrel_sovereign.config import build_cors_origins
+
 CORS_ORIGINS = build_cors_origins()
 app.add_middleware(
     CanonicalCORSMiddleware,
@@ -4926,7 +4939,9 @@ async def get_bootstrap_key(request: Request):
         and os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower()
         in {"1", "true", "yes", "on"}
     ):
-        from kestrel_sovereign.knowledge.kite_evidence_signing import kite_evidence_public_key
+        from kestrel_sovereign.knowledge.kite_evidence_signing import (
+            kite_evidence_public_key,
+        )
 
         response["kite_evidence_public_key"] = kite_evidence_public_key()
     return response
@@ -5463,8 +5478,8 @@ def _enforce_host_csrf(request: Request):
     Only host-feature router paths are checked so per-agent routes and the
     existing management endpoints keep their current behavior (#2293/#2382).
     """
-    from kestrel_sovereign.security.csrf import CSRFError, enforce_csrf
     from kestrel_sovereign.host_features import is_host_feature_path
+    from kestrel_sovereign.security.csrf import CSRFError, enforce_csrf
 
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return None
