@@ -1931,10 +1931,10 @@ class AgentManager:
         publication = vars(recipient).get("_native_a2a_publication")
         if publication is not None:
             from kestrel_sovereign.a2a.native_publication import (
-                HostedNativeA2APublication,
+                NativeA2APublication,
             )
 
-            if not isinstance(publication, HostedNativeA2APublication):
+            if not isinstance(publication, NativeA2APublication):
                 raise TypeError("Native publication must be owned by the host")
             publication.withdraw()
 
@@ -5794,11 +5794,11 @@ class AgentManager:
         publication = vars(agent).get("_native_a2a_publication")
         if publication is not None:
             from kestrel_sovereign.a2a.native_publication import (
-                HostedNativeA2APublication,
+                NativeA2APublication,
             )
 
             try:
-                if not isinstance(publication, HostedNativeA2APublication):
+                if not isinstance(publication, NativeA2APublication):
                     raise TypeError("Native publication must be owned by the host")
                 publication.publish()
             except BaseException:

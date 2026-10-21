@@ -224,19 +224,19 @@ async def test_private_native_preparation_refuses_bad_identity_before_routes(
     publication,
 ):
     from kestrel_sovereign.a2a.native_publication import (
-        HostedNativeA2APublication,
+        NativeA2APublication,
         NativeHostingConfiguration,
     )
 
     p = publication
     p.recipient.identity = None
     with pytest.raises(ValueError, match="hybrid recipient identity"):
-        await HostedNativeA2APublication.prepare(
-            p.host,
+        await NativeA2APublication.prepare(
             p.app.state.native_a2a_http,
             p.recipient,
             "registered-agent",
             NativeHostingConfiguration("https://native.test"),
+            guard_factory=lambda: p.guard,
         )
     assert p.app.routes == []
 
@@ -2373,3 +2373,29 @@ async def test_question_follow_up_deadline_is_rechecked_at_native_http(
         )
         question = await questions.for_dispatch(first.dispatch.dispatch_id)
         assert question.deadline == deadline.isoformat(timespec="microseconds")
+
+
+@pytest.mark.parametrize("fault", ["not-callable", "type", "scope", "routing-key"])
+async def test_native_publication_requires_a_guard_for_its_exact_contract(publication, fault):
+    from kestrel_sovereign.a2a.native_publication import NativeA2APublication
+
+    p = publication
+    if fault == "not-callable":
+        with pytest.raises(TypeError, match="guard factory"):
+            await NativeA2APublication.prepare(
+                p.app.state.native_a2a_http, p.recipient, "registered-agent",
+                p.publication.configuration, guard_factory=None,
+            )
+        assert p.app.routes == []
+        return
+    guard = (
+        object() if fault == "type"
+        else replace(p.guard, scope=NativeRecipientScope("did:foreign", p.guard.scope.tenant))
+        if fault == "scope" else replace(p.guard, routing_key="another-agent")
+    )
+    p.publication._guard_factory = lambda: guard
+    async with p.host.a2a_lifecycle_lease():
+        with pytest.raises(TypeError if fault == "type" else ValueError):
+            p.host._register_agent("registered-agent", p.recipient)
+    assert p.app.routes == []
+    assert p.host.get_agent("registered-agent") is None

@@ -114,7 +114,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/native_input.py** — Canonical native request digests and callback-free task input.
   - `class NativeSenderProofError`; `def native_request_digest(params, operation)`; `class NativeTaskInput`; `def prepare_native_task_input(request)`
 - **kestrel_sovereign/a2a/native_publication.py** — Host-owned publication of one current recipient's signed native contract.
-  - `class NativeHostingConfiguration`; `class HostedNativeA2APublication`; `async def prepare_hosted_native_publication(app, manager, routing_key, recipient, …)`; `async def open_hosted_native_peer_session(app, manager)`
+  - `class NativeHostingConfiguration`; `class NativeA2APublication`; `async def prepare_hosted_native_publication(app, manager, routing_key, recipient, …)`; `async def open_hosted_native_peer_session(app, manager)`
 - **kestrel_sovereign/a2a/native_routes.py** — One SDK route registration for dispatch, advertised URLs and peer admission.
   - `def native_route_prefix(routing_key)`; `def native_card_path(routing_key)`; `def native_http_interfaces(public_base_url)`; `class NativeA2AHTTP`; `class NativeA2AHTTPRegistry`
 - **kestrel_sovereign/a2a/native_schema.py** — Explicit stored-protocol boundary; runtime startup never converts draft data.

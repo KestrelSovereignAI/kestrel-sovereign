@@ -10043,10 +10043,10 @@ Expected Duration: {expected_duration}
 
     async def get_agent_card(self) -> "AgentCard":
         """Return this host's signed native card under its live publication lease."""
-        from kestrel_sovereign.a2a.native_publication import HostedNativeA2APublication
+        from kestrel_sovereign.a2a.native_publication import NativeA2APublication
 
         publication = vars(self).get("_native_a2a_publication")
-        if not isinstance(publication, HostedNativeA2APublication):
+        if not isinstance(publication, NativeA2APublication):
             raise RuntimeError("Native Agent Card requires configured public hosting")
         return await publication.get_card()
 

@@ -990,6 +990,13 @@ replays do not register again. Callback credentials never enter cognition prompt
 or plaintext task-input JSON. Signing a card does not authorize arbitrary
 callback egress.
 
+`NativeA2APublication` owns the common signed card, handler and SDK routes.
+Its host-owned guard factory supplies request authority and the matching
+lifecycle reader; the embedding host retains its writer during publication and
+withdrawal. The AgentManager embedding uses this contract. Standalone and
+launched-process publication and outbound sessions remain an implementation
+gate, using this same wire implementation.
+
 ## Review, verification and release order
 
 1. Review this design in its worktree; complete dependency/import and three

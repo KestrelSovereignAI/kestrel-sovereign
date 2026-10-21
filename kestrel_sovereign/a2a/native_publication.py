@@ -1,9 +1,10 @@
 """Host-owned publication of one current recipient's signed native contract."""
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -29,6 +30,7 @@ from kestrel_sovereign.a2a.native_routes import (
     NativeA2AHTTPRegistry,
     native_http_interfaces,
 )
+from kestrel_sovereign.a2a.native_security import NativeDIDRequestGuard
 from kestrel_sovereign.a2a.native_sender import NativeProofPolicy
 from kestrel_sovereign.a2a.push_policy import NativePushPolicy
 from kestrel_sovereign.a2a.push_service import start_native_push_service
@@ -83,25 +85,27 @@ class NativeHostingConfiguration:
         return cls(base, discovery, NativePushPolicy.from_environment(environment))
 
 
-class HostedNativeA2APublication:
-    """Prepare privately, publish without an await, withdraw by exact ownership.
+class NativeA2APublication:
+    """One native card, handler and route publication for every host owner.
 
-    AgentManager calls ``publish`` while retaining its topology writer, after
-    the candidate's registration and identity become visible to its own policy
-    checks. Requests and card reads acquire the matching reader, so no request
-    can observe an intermediate registration. Preparation owns no app routes.
+    The embedding host supplies its request guard factory and owns the matching
+    lifecycle writer during synchronous publish/withdraw. Requests and card
+    reads use that guard's reader. Preparation owns no application routes.
     """
 
     def __init__(
         self,
-        manager: "AgentManager",
         registry: NativeA2AHTTPRegistry,
         recipient: "KestrelAgent",
         routing_key: str,
         configuration: NativeHostingConfiguration,
         profile: dict[str, str],
+        *,
+        guard_factory: Callable[[], NativeDIDRequestGuard],
     ):
-        self.manager = manager
+        if not callable(guard_factory):
+            raise TypeError("Native publication requires its host-owned guard factory")
+        self._guard_factory = guard_factory
         self.registry = registry
         self.recipient = recipient
         self.routing_key = routing_key
@@ -112,10 +116,17 @@ class HostedNativeA2APublication:
         self._push_service = None
 
     @classmethod
-    async def prepare(cls, manager, registry, recipient, routing_key, configuration):
+    async def prepare(
+        cls, registry, recipient, routing_key, configuration, *, guard_factory
+    ):
         profile = await recipient.get_public_profile()
         publication = cls(
-            manager, registry, recipient, routing_key, configuration, profile
+            registry,
+            recipient,
+            routing_key,
+            configuration,
+            profile,
+            guard_factory=guard_factory,
         )
         # Bad configuration, keys or skills refuse private onboarding, before
         # AgentManager installs any routing entry for this candidate.
@@ -158,19 +169,14 @@ class HostedNativeA2APublication:
         )
 
     def publish(self) -> None:
-        """The manager owns its exclusive topology lease for this synchronous commit."""
+        """The host owns its lifecycle writer for this synchronous commit."""
         if self._binding is not None:
             if self.registry.is_current(self._binding):
                 return
             raise RuntimeError("A retired native publication cannot be republished")
-        guard = create_hosted_native_guard(
-            self.manager,
-            routing_key=self.routing_key,
-            recipient=self.recipient,
-            required_extensions=REQUIRED_NATIVE_EXTENSIONS,
-            proof_policy=NativeProofPolicy(),
-            clock=time.time,
-        )
+        guard = self._guard_factory()
+        if not isinstance(guard, NativeDIDRequestGuard):
+            raise TypeError("Native publication requires its canonical request guard")
         card = self._build_card(self._profile)
         binding = NativeA2AHTTP(
             NativeA2ARequestHandler(
@@ -218,7 +224,7 @@ async def prepare_hosted_native_publication(
     routing_key: str,
     recipient: "KestrelAgent",
     environment: Mapping[str, str],
-) -> HostedNativeA2APublication | None:
+) -> NativeA2APublication | None:
     """The startup/cold-onboarding seam; no public routes exist until commit."""
     configuration = NativeHostingConfiguration.from_environment(environment)
     if configuration is None:
@@ -230,8 +236,20 @@ async def prepare_hosted_native_publication(
     if not isinstance(registry, NativeA2AHTTPRegistry):
         raise TypeError("Host native A2A routes require their published registry")
     registry.require_application(app)
-    return await HostedNativeA2APublication.prepare(
-        manager, registry, recipient, routing_key, configuration
+    return await NativeA2APublication.prepare(
+        registry,
+        recipient,
+        routing_key,
+        configuration,
+        guard_factory=partial(
+            create_hosted_native_guard,
+            manager,
+            routing_key=routing_key,
+            recipient=recipient,
+            required_extensions=REQUIRED_NATIVE_EXTENSIONS,
+            proof_policy=NativeProofPolicy(),
+            clock=time.time,
+        ),
     )
 
 
@@ -261,7 +279,7 @@ async def open_hosted_native_peer_session(
         sender_policy = manager.a2a_hosted_policy_for(sender)
         recipient_policy = manager.a2a_hosted_policy_for(recipient)
         publication = getattr(recipient, "_native_a2a_publication", None)
-        if not isinstance(publication, HostedNativeA2APublication):
+        if not isinstance(publication, NativeA2APublication):
             raise PeerUnavailableError("Peer has no published native A2A interface")
         publication.registry.require_application(app)
         sender_identity = sender.identity
