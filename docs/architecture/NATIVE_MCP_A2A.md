@@ -411,7 +411,7 @@ configuration refuses publication.
 
 This is a private implementation candidate, exercised with unpublished SDK
 builds containing the reviewed signing and HTTP-authorization repairs. Push
-configuration, outbound same-task continuation, remaining draft-route retirement,
+configuration, remaining draft-route retirement,
 released dependency adoption and full host interoperability remain acceptance
 work. The offline reviewed migration is implemented; it has not been run on
 operator data. The isolated HTTP tests do not establish release acceptance.
@@ -459,6 +459,20 @@ from authoritative task principals, and fail preflight on ambiguous ownership
 rather than choosing an owner from caller metadata or historical display names.
 
 ### Admitted task input and execution ownership
+
+Outbound follow-ups use `send_a2a_task(continue_dispatch_id=...)` with the latest
+acknowledged local dispatch. Each message gets a distinct immutable dispatch ID
+and message ID, with durable parent and root dispatch references. The root owns
+the peer's task ID. Follow-ups retain that task, context, recipient, tenant,
+signing identity and selected interface; a new task response is refused. Only
+one follow-up can claim a parent until that attempt is proven not sent. Lost
+responses are reconciled through authorized history reads without replaying the
+message. Every ancestor must still acknowledge active work and have no pending
+cancellation when a follow-up is reserved and immediately before peer HTTP.
+A question follow-up retains the original question's correlation and deadline;
+it cannot become independent work by using another tool or delivery verb.
+The native core store bundle is revision 2. Earlier private candidate schemas
+are refused before startup writes; the runtime does not upgrade them in place.
 
 Incoming `SendMessage` continuations append the original message to the same
 creator-owned task. An omitted context is inferred from that task; a conflicting

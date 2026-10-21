@@ -2161,3 +2161,118 @@ async def test_public_question_sender_retains_live_submission_ownership_until_re
         if not sending.done():
             sending.cancel()
         await asyncio.gather(sending, return_exceptions=True)
+
+
+async def test_public_task_tool_continues_a_retained_native_task(local_native_peer):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router, feature._peer_requester = p.directory, p.requester
+    feature._own_name = "Sender"
+    original = await feature.send_a2a_task("Peer", "Start the native task")
+    assert original.data["sent"] is True
+    continued = await feature.send_a2a_task(
+        "Peer",
+        "Use this additional input",
+        continue_dispatch_id=original.data["dispatch_id"],
+    )
+    assert continued.data["sent"] is True, continued
+    assert continued.data["remote_task_id"] == original.data["remote_task_id"]
+    assert continued.data["root_dispatch_id"] == original.data["dispatch_id"]
+    assert continued.data["parent_dispatch_id"] == original.data["dispatch_id"]
+    task = await p.manager.get_task_for_creator(
+        original.data["remote_task_id"], PRINCIPAL, recipient_agent_id=p.recipient.did
+    )
+    assert len(task.history) == 2
+    assert task.history[-1].parts[0].text == "Use this additional input"
+    refused = await feature.send_a2a_task(
+        "Peer",
+        "Replace the context",
+        context_id="another-context",
+        continue_dispatch_id=continued.data["dispatch_id"],
+    )
+    assert refused.data["sent"] is False
+    assert len(await p.sender_manager.outbound_store.list_recent()) == 2
+
+
+@pytest.mark.parametrize("expiration_phase", [None, "before-send", "http-dispatch"])
+async def test_question_follow_up_deadline_is_rechecked_at_native_http(
+    local_native_peer, expiration_phase
+):
+    from datetime import UTC, datetime, timedelta
+    from uuid import uuid4
+
+    from a2a.types import Message, Part, Role, SendMessageRequest
+
+    from kestrel_sovereign.a2a.extensions import question_correlation_metadata
+    from kestrel_sovereign.a2a.stores.unified.question_store import QuestionConflict
+
+    p = local_native_peer
+    questions = p.sender_manager.questions_for_actor(PRINCIPAL)
+    deadline = datetime.now(UTC) + timedelta(seconds=60)
+    async with p.directory.open_a2a_session(p.requester, p.peer) as session:
+        params = SendMessageRequest(
+            tenant=p.scope.tenant,
+            metadata=question_correlation_metadata("question", uuid4().hex),
+            message=Message(
+                message_id=uuid4().hex,
+                role=Role.ROLE_USER,
+                parts=[Part(text="Original question")],
+            ),
+            configuration={"return_immediately": True},
+        )
+        dispatch, wire = await session.reserve(
+            params, dispatch_tool="send_a2a_question", verb="question"
+        )
+        await questions.reserve(
+            dispatch,
+            wire,
+            origin_turn_id="turn",
+            origin_session_id="chat",
+            deadline=deadline,
+        )
+        first = await session.send(dispatch, wire)
+        follow_up = SendMessageRequest(
+            tenant=p.scope.tenant,
+            message=Message(
+                message_id=uuid4().hex,
+                task_id=first.response.id,
+                context_id=first.response.context_id,
+                role=Role.ROLE_USER,
+                parts=[Part(text="Question follow-up")],
+            ),
+            configuration={"return_immediately": True},
+        )
+        child, wire = await session.reserve(
+            follow_up, dispatch_tool="send_a2a_task", verb="task", parent=first.dispatch
+        )
+
+        async def deadline_passes(_request):
+            questions._clock = lambda: deadline + timedelta(seconds=1)
+
+        if expiration_phase == "http-dispatch":
+            session._http.event_hooks["request"].append(deadline_passes)
+        elif expiration_phase == "before-send":
+            await deadline_passes(None)
+        if expiration_phase is None:
+            await session.send(child, wire)
+        else:
+            with pytest.raises(QuestionConflict, match="no longer live"):
+                await session.send(child, wire)
+        retained = await p.sender_manager.outbound_store.get(child.dispatch_id)
+        assert retained.state.value == (
+            "acknowledged"
+            if expiration_phase is None
+            else "reserved"
+            if expiration_phase == "before-send"
+            else "not-sent"
+        ), "Question continuation crossed its permitted admission phase"
+        task = await p.manager.get_task_for_creator(
+            first.response.id, PRINCIPAL, recipient_agent_id=p.recipient.did
+        )
+        assert len(task.history) == (2 if expiration_phase is None else 1), (
+            "Question continuation accepted the wrong input revision"
+        )
+        question = await questions.for_dispatch(first.dispatch.dispatch_id)
+        assert question.deadline == deadline.isoformat(timespec="microseconds")

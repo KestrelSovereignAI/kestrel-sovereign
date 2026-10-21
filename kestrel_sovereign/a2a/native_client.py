@@ -411,7 +411,12 @@ class NativePeerSession:
 
     @execution_work_operation
     async def reserve(
-        self, request: SendMessageRequest, *, dispatch_tool: str, verb: str
+        self,
+        request: SendMessageRequest,
+        *,
+        dispatch_tool: str,
+        verb: str,
+        parent: OutboundDispatch | None = None,
     ) -> tuple[OutboundDispatch, SendMessageRequest]:
         await self._admit()
         wire = SendMessageRequest.FromString(request.SerializeToString())
@@ -427,6 +432,7 @@ class NativePeerSession:
             interface=self._interface,
             dispatch_tool=dispatch_tool,
             verb=verb,
+            parent=parent,
         )
         return dispatch, wire
 
@@ -448,6 +454,7 @@ class NativePeerSession:
                 "Outbound request differs from its reservation"
             )
         await self._admit(dispatch)
+        await self._require_continuation_intent(dispatch)
         if dispatch.verb == "question":
             if self._questions is None:
                 raise NativePeerProtocolError(
@@ -472,6 +479,7 @@ class NativePeerSession:
                 )
             dispatch_claimed = True
             await self._admit()
+            await self._require_continuation_intent(submitting)
             if dispatch.verb == "question":
                 await self._questions.require_intent(submitting, wire)
             # No await separates this observation from the original native
@@ -529,6 +537,17 @@ class NativePeerSession:
                     )(submitting, operation_id=uuid4().hex),
                     original=sys.exc_info()[1],
                 )
+
+    async def _require_continuation_intent(self, dispatch: OutboundDispatch) -> None:
+        if dispatch.parent_dispatch_id is None:
+            return
+        root = await self._store.require_continuation(dispatch)
+        if root.verb == "question":
+            if self._questions is None:
+                raise NativePeerProtocolError(
+                    "Question continuation requires its primary correlation ledger"
+                )
+            await self._questions.require_continuation_intent(root)
 
     async def _acknowledge(self, dispatch, response):
         if dispatch.verb == "question":

@@ -3,7 +3,7 @@
 import hashlib
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import uuid4
@@ -87,6 +87,8 @@ class OutboundDispatch:
     cancel_operation_id: str | None
     cancel_request_digest: str | None
     cancel_state: DispatchState | None
+    root_dispatch_id: str
+    parent_dispatch_id: str | None
 
 
 _COLUMNS = ", ".join(OutboundDispatch.__dataclass_fields__)
@@ -201,12 +203,21 @@ class OutboundStore(UnifiedStoreBase):
                 cancel_operation_id TEXT,
                 cancel_request_digest TEXT,
                 cancel_state TEXT CHECK (cancel_state IN ({states})),
+                root_dispatch_id TEXT NOT NULL,
+                parent_dispatch_id TEXT,
                 PRIMARY KEY (sender_id, sender_tenant, dispatch_id),
-                UNIQUE (sender_id, sender_tenant, message_id)
+                UNIQUE (sender_id, sender_tenant, message_id),
+                FOREIGN KEY (sender_id, sender_tenant, root_dispatch_id)
+                    REFERENCES a2a_outbound_dispatches (sender_id, sender_tenant, dispatch_id),
+                FOREIGN KEY (sender_id, sender_tenant, parent_dispatch_id)
+                    REFERENCES a2a_outbound_dispatches (sender_id, sender_tenant, dispatch_id)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS a2a_outbound_remote_task_owner
             ON a2a_outbound_dispatches (sender_id, sender_tenant, recipient_id, tenant, remote_task_id)
-            WHERE remote_task_id IS NOT NULL;
+            WHERE remote_task_id IS NOT NULL AND parent_dispatch_id IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS a2a_outbound_continuation_owner
+            ON a2a_outbound_dispatches (sender_id, sender_tenant, parent_dispatch_id)
+            WHERE parent_dispatch_id IS NOT NULL AND state != 'not-sent';
             CREATE INDEX IF NOT EXISTS a2a_outbound_sender_created
             ON a2a_outbound_dispatches (sender_id, sender_tenant, created_at DESC, dispatch_id DESC);
         """)
@@ -268,10 +279,15 @@ class OutboundStore(UnifiedStoreBase):
         interface: AgentInterface,
         dispatch_tool: str,
         verb: str,
+        parent: OutboundDispatch | None = None,
     ) -> OutboundDispatch:
         _text(dispatch_id, "dispatch_id")
         _text(signing_did, "signing_did")
         _text(dispatch_tool, "dispatch_tool")
+        if parent is not None and not isinstance(parent, OutboundDispatch):
+            raise TypeError(
+                "Continuation parent must be a sender-owned dispatch snapshot"
+            )
         if verb not in {"message", "question", "task"}:
             raise ValueError("Native outbound verb must be message, question or task")
         validate_proto_required_fields(interface)
@@ -281,7 +297,7 @@ class OutboundStore(UnifiedStoreBase):
             or interface.tenant != recipient.tenant
             or request.tenant != recipient.tenant
             or request.message.role != Role.ROLE_USER
-            or request.message.task_id
+            or (parent is None and request.message.task_id)
         ):
             raise ValueError(
                 "Native outbound creation requires the selected native recipient interface"
@@ -319,13 +335,32 @@ class OutboundStore(UnifiedStoreBase):
             cancel_operation_id=None,
             cancel_request_digest=None,
             cancel_state=None,
+            root_dispatch_id=dispatch_id if parent is None else parent.root_dispatch_id,
+            parent_dispatch_id=None if parent is None else parent.dispatch_id,
         )
+        if parent is not None:
+            if (
+                verb == "question"
+                or request.message.task_id != parent.remote_task_id
+                or request.message.context_id != parent.remote_context_id
+            ):
+                raise OutboundDispatchConflict(
+                    "Continuation requires its retained native task, context and peer binding"
+                )
+            reservation = replace(
+                reservation,
+                remote_task_id=parent.remote_task_id,
+                remote_context_id=parent.remote_context_id,
+            )
+            await self.require_continuation(reservation, parent=parent)
         values = tuple(
             getattr(reservation, field)
             for field in OutboundDispatch.__dataclass_fields__
         )
         committed = None
         async with self.write_transaction():
+            if parent is not None:
+                await self.require_continuation(reservation, parent=parent, lock=True)
             affected = await self.backend.execute(
                 f"INSERT INTO a2a_outbound_dispatches ({_COLUMNS}) "
                 f"VALUES ({', '.join('?' for _ in values)}) ON CONFLICT DO NOTHING",
@@ -340,6 +375,72 @@ class OutboundStore(UnifiedStoreBase):
         if committed is None:
             raise RuntimeError("Committed outbound reservation was not readable")
         return committed
+
+    @staticmethod
+    def _route_binding(dispatch: OutboundDispatch) -> tuple[str, ...]:
+        return (
+            dispatch.sender_id,
+            dispatch.sender_tenant,
+            dispatch.recipient_id,
+            dispatch.tenant,
+            dispatch.signing_did,
+            dispatch.interface_url,
+            dispatch.protocol_binding,
+        )
+
+    async def require_continuation(
+        self,
+        dispatch: OutboundDispatch,
+        *,
+        parent: OutboundDispatch | None = None,
+        lock: bool = False,
+    ) -> OutboundDispatch:
+        """Fence a follow-up against the complete sender-owned task lineage.
+
+        A reserved follow-up is a new message attempt, never a new remote task
+        owner. Every ancestor must still acknowledge the same active task and
+        have no admitted cancellation. A retained question's root is returned
+        so the HTTP producer can enforce its original deadline as well.
+        """
+        if dispatch.parent_dispatch_id is None:
+            raise OutboundDispatchConflict("A continuation needs a retained parent")
+        route = self._route_binding(dispatch)
+        seen = {dispatch.dispatch_id}
+        ancestor_id = dispatch.parent_dispatch_id
+        while ancestor_id is not None:
+            if ancestor_id in seen:
+                raise OutboundDispatchConflict(
+                    "Outbound continuation lineage has a cycle"
+                )
+            seen.add(ancestor_id)
+            row = await self.backend.fetch_one(
+                f"SELECT {_COLUMNS} FROM a2a_outbound_dispatches "
+                "WHERE sender_id = ? AND sender_tenant = ? AND dispatch_id = ?"
+                + (" FOR UPDATE" if lock and self.is_postgres else ""),
+                (*route[:2], ancestor_id),
+            )
+            current = None if row is None else self._snapshot(row)
+            if (
+                current is None
+                or (
+                    parent is not None
+                    and ancestor_id == parent.dispatch_id
+                    and current != parent
+                )
+                or self._route_binding(current) != route
+                or current.root_dispatch_id != dispatch.root_dispatch_id
+                or current.state is not DispatchState.ACKNOWLEDGED
+                or current.remote_task_id != dispatch.remote_task_id
+                or current.remote_context_id != dispatch.remote_context_id
+                or current.cancel_state not in {None, DispatchState.NOT_SENT}
+            ):
+                raise OutboundDispatchConflict(
+                    "Continuation lineage is stale, terminal, canceled or belongs to another route"
+                )
+            ancestor_id = current.parent_dispatch_id
+        if current.dispatch_id != dispatch.root_dispatch_id:
+            raise OutboundDispatchConflict("Continuation has no original task owner")
+        return current
 
     async def _transition(
         self,

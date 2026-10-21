@@ -1094,6 +1094,7 @@ class PeersFeature(Feature):
         dispatch_tool: str,
         return_immediately: bool = True,
         question_deadline: datetime | None = None,
+        continue_dispatch_id: str = "",
     ):
         """The common native request, reservation and send path for peer tools."""
         from uuid import uuid4
@@ -1119,6 +1120,8 @@ class PeersFeature(Feature):
             return ToolResult.failed("A2A message must contain text")
         if not isinstance(context_id, str) or not isinstance(skill_id, str):
             return ToolResult.failed("A2A context_id and skill_id must be strings")
+        if not isinstance(continue_dispatch_id, str):
+            return ToolResult.failed("A2A continue_dispatch_id must be a string")
         if parts is not None and not isinstance(parts, list):
             return ToolResult.failed(
                 "A2A parts must be an array of standard Part objects"
@@ -1138,7 +1141,7 @@ class PeersFeature(Feature):
             if question_deadline is None:
                 raise ValueError("Native questions require a pre-dispatch deadline")
             metadata.update(question_correlation_metadata("question", uuid4().hex))
-        else:
+        elif not continue_dispatch_id:
             metadata.update(
                 delivery_intent_metadata(
                     "notification" if verb == "message" else "assignment"
@@ -1150,6 +1153,18 @@ class PeersFeature(Feature):
         store = None
         try:
             store = self._native_outbound_store()
+            parent = None
+            if continue_dispatch_id:
+                parent = await store.get(continue_dispatch_id)
+                if parent is None:
+                    raise OutboundDispatchConflict(
+                        "No sender-owned continuation dispatch exists"
+                    )
+                if context_id and context_id != parent.remote_context_id:
+                    raise OutboundDispatchConflict(
+                        "Continuation cannot change the retained task context"
+                    )
+                context_id = parent.remote_context_id or ""
             router, requester, peer = await self._resolve_automatic_peer(recipient)
             async with router.open_a2a_session(requester, peer) as session:
                 request = SendMessageRequest(
@@ -1157,6 +1172,7 @@ class PeersFeature(Feature):
                     message=Message(
                         message_id=uuid4().hex,
                         context_id=context_id,
+                        task_id=(parent.remote_task_id or "") if parent else "",
                         role=Role.ROLE_USER,
                         parts=content,
                     ),
@@ -1167,6 +1183,7 @@ class PeersFeature(Feature):
                     request,
                     dispatch_tool=dispatch_tool,
                     verb=verb,
+                    parent=parent,
                 )
                 if verb == "question":
                     await self._native_question_store().reserve(
@@ -1229,6 +1246,8 @@ class PeersFeature(Feature):
             "sent": True,
             "recipient": recipient,
             "dispatch_id": receipt.dispatch.dispatch_id,
+            "root_dispatch_id": receipt.dispatch.root_dispatch_id,
+            "parent_dispatch_id": receipt.dispatch.parent_dispatch_id,
             "remote_task_id": receipt.dispatch.remote_task_id,
             "context_id": receipt.dispatch.remote_context_id,
             "state": receipt.dispatch.remote_task_state,
@@ -1710,7 +1729,9 @@ class PeersFeature(Feature):
             "'filename':'plan.txt'} or {'data':{'ref_type':'memory','id':'...'}}. "
             "Artifacts are peer outputs. skill_id is an optional advisory hint from the "
             "peer's signed Agent Card; it grants no direct tool invocation. "
-            "Use context_id to continue a conversation context."
+            "Use context_id for a conversation context. To send follow-up input to an "
+            "existing task, set continue_dispatch_id to its latest acknowledged local "
+            "dispatch. The retained task, context and verified peer binding must match."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a send",
@@ -1723,6 +1744,7 @@ class PeersFeature(Feature):
         skill_id: str = "",
         context_id: str = "",
         parts: List[Any] = None,
+        continue_dispatch_id: str = "",
     ) -> ToolResult:
         """Delegate work using standard input Parts and an optional advisory skill."""
         receipt = await self._dispatch_native_peer(
@@ -1733,6 +1755,7 @@ class PeersFeature(Feature):
             skill_id=skill_id,
             verb="task",
             dispatch_tool="send_a2a_task",
+            continue_dispatch_id=continue_dispatch_id,
         )
         if isinstance(receipt, ToolResult):
             return receipt

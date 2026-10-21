@@ -9,7 +9,6 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from google.protobuf.json_format import ParseDict
 from a2a.types import (
     AgentInterface,
     Message,
@@ -20,6 +19,7 @@ from a2a.types import (
     TaskState,
     TaskStatus,
 )
+from google.protobuf.json_format import ParseDict
 
 from kestrel_sovereign.a2a.extensions import QUESTION_CORRELATION_URI
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
@@ -320,3 +320,45 @@ async def test_question_intent_retains_complete_structured_input_without_inventi
     )
     [wake] = await p.store.pending_wakes()
     assert json.loads(wake.payload_json)["request"] == preserved["message"]
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing-intent", "expired", "resolved", "settled", "deadline", "verb"]
+)
+async def test_continuation_requires_the_original_live_question_intent(
+    questions, fault
+):
+    p = questions
+    question, dispatch, request = await reserve(p)
+    submitting = await p.outbound.begin_submission(dispatch, operation_id=uuid4().hex)
+    root = await p.store.acknowledge(
+        submitting,
+        response(question, request, state=TaskState.TASK_STATE_SUBMITTED),
+        operation_id=uuid4().hex,
+    )
+    assert await p.store.require_continuation_intent(root) == question
+    if fault == "missing-intent":
+        await p.backend.execute(
+            "DELETE FROM a2a_native_questions WHERE question_id = ?",
+            (question.question_id,),
+        )
+    elif fault in {"expired", "resolved"}:
+        await p.backend.execute(
+            "UPDATE a2a_native_questions SET status = ? WHERE question_id = ?",
+            (fault.upper(), question.question_id),
+        )
+    elif fault == "settled":
+        await p.backend.execute(
+            "UPDATE a2a_native_questions SET receiver_settled = 1 WHERE question_id = ?",
+            (question.question_id,),
+        )
+    elif fault == "verb":
+        await p.backend.execute(
+            "UPDATE a2a_outbound_dispatches SET verb = 'task' WHERE dispatch_id = ?",
+            (root.dispatch_id,),
+        )
+        root = await p.outbound.get(root.dispatch_id)
+    else:
+        p.clock.now += timedelta(seconds=11)
+    with pytest.raises(QuestionConflict):
+        await p.store.require_continuation_intent(root)

@@ -89,7 +89,7 @@ async def test_protocol_encoding_marker_does_not_prove_the_store_bundle(
         )
         assert await backend.fetch_all(
             "SELECT component, revision FROM a2a_native_store_schema"
-        ) == [("core", 1)]
+        ) == [native_schema.NativeStoreSchema.CORE.value]
         for table in (
             "a2a_native_questions",
             "a2a_contexts",
@@ -115,13 +115,17 @@ async def test_optional_stores_are_completed_only_when_requested(
         await core.initialize()
         assert await backend.fetch_all(
             "SELECT component, revision FROM a2a_native_store_schema"
-        ) == [("core", 1)]
+        ) == [native_schema.NativeStoreSchema.CORE.value]
         assert not await backend.table_exists("a2a_memory")
         assert not await backend.table_exists("a2a_feedback")
         await full.initialize()
         assert await backend.fetch_all(
             "SELECT component, revision FROM a2a_native_store_schema ORDER BY component"
-        ) == [("core", 1), ("feedback", 1), ("memory", 1)]
+        ) == [
+            native_schema.NativeStoreSchema.CORE.value,
+            ("feedback", 1),
+            ("memory", 1),
+        ]
         memory_id = await full.memory_service.add_memory(
             "session", "A searchable native archive"
         )
@@ -140,7 +144,14 @@ async def test_optional_stores_are_completed_only_when_requested(
 
 @pytest.mark.parametrize(
     "component, revision",
-    [("core", 99), ("memory", 99), ("foreign", 1), ("memory", 1), ("core", 1)],
+    [
+        ("core", 99),
+        ("memory", 99),
+        ("foreign", 1),
+        ("memory", 1),
+        ("core", 1),
+        native_schema.NativeStoreSchema.CORE.value,
+    ],
 )
 async def test_unsupported_or_incomplete_store_versions_refuse_before_writes(
     native_a2a_backend_factory, component, revision
@@ -157,7 +168,10 @@ async def test_unsupported_or_incomplete_store_versions_refuse_before_writes(
         await backend.execute(
             "INSERT INTO a2a_native_store_schema VALUES (?, ?)", (component, revision)
         )
-        protocol_present = (component, revision) != ("core", 1)
+        protocol_present = (
+            component,
+            revision,
+        ) != native_schema.NativeStoreSchema.CORE.value
         if protocol_present:
             await backend.execute_script(
                 "CREATE TABLE a2a_protocol_schema (singleton INTEGER PRIMARY KEY, revision INTEGER NOT NULL)"
@@ -230,7 +244,9 @@ async def test_real_schema_failure_rolls_back_core_and_never_publishes_completio
             )
         await manager.initialize()
         expected = (
-            [("core", 1), ("memory", 1)] if failure == "memory-fts" else [("core", 1)]
+            [native_schema.NativeStoreSchema.CORE.value, ("memory", 1)]
+            if failure == "memory-fts"
+            else [native_schema.NativeStoreSchema.CORE.value]
         )
         assert (
             await backend.fetch_all(

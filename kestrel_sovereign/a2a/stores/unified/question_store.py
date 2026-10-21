@@ -375,6 +375,25 @@ class NativeQuestionStore(UnifiedStoreBase):
             )
         return question
 
+    async def require_continuation_intent(
+        self, root: OutboundDispatch
+    ) -> NativeQuestion:
+        """A follow-up cannot extend or replace its original question deadline."""
+        question = await self.for_dispatch(root.dispatch_id)
+        if question is None:
+            raise QuestionConflict(
+                "Question continuation has no original durable intent"
+            )
+        question = await self._binding(question.question_id, root)
+        if (
+            root.verb != "question"
+            or question.status != "WAITING"
+            or question.receiver_settled
+            or self.deadline_passed(question)
+        ):
+            raise QuestionConflict("Question continuation is no longer live")
+        return question
+
     async def record_answer(
         self,
         question_id: str,

@@ -833,6 +833,7 @@ async def test_official_client_commits_taskless_question_answer_with_its_receipt
     peer_session,
 ):
     from datetime import UTC, datetime, timedelta
+
     from kestrel_sovereign.a2a.extensions import (
         NATIVE_EXTENSION_URIS,
         question_correlation_metadata,
@@ -895,12 +896,71 @@ async def test_official_client_commits_taskless_question_answer_with_its_receipt
         await session.close()
 
 
-async def test_reconciliation_cannot_take_over_an_active_original_submission(peer_session):
+async def test_reconciliation_cannot_take_over_an_active_original_submission(
+    peer_session,
+):
     p = peer_session
-    dispatch, wire = await reserve(p)
+    dispatch, _wire = await reserve(p)
     submitting = await p.store.begin_submission(dispatch, operation_id="original")
-    with p.store.active_submission(dispatch):
-        with pytest.raises(OutboundDispatchConflict, match="still active"):
-            await p.session.reconcile(submitting)
+    with (
+        p.store.active_submission(dispatch),
+        pytest.raises(OutboundDispatchConflict, match="still active"),
+    ):
+        await p.session.reconcile(submitting)
     assert await p.store.get(dispatch.dispatch_id) == submitting
     assert p.state.received_messages == 0
+
+
+async def test_sdk_follow_up_uses_the_same_task_and_a_new_message_attempt(peer_session):
+    p = peer_session
+    original, wire = await reserve(p)
+    first = await p.session.send(original, wire)
+    params = request_for(p)
+    params.message.task_id = first.dispatch.remote_task_id
+    params.message.context_id = first.dispatch.remote_context_id
+    params.message.parts[0].text = "Here is the requested follow-up input"
+    follow_up, wire = await p.session.reserve(
+        params, dispatch_tool="send_a2a_task", verb="task", parent=first.dispatch
+    )
+    result = await p.session.send(follow_up, wire)
+    assert result.dispatch.dispatch_id != first.dispatch.dispatch_id
+    assert result.dispatch.root_dispatch_id == first.dispatch.dispatch_id
+    assert result.dispatch.parent_dispatch_id == first.dispatch.dispatch_id
+    assert result.response.id == first.response.id
+    assert len(result.response.history) == 2, (
+        "Native SendMessage created a new task instead of appending input"
+    )
+    assert result.response.history[-1].message_id == wire.message.message_id
+    assert result.response.history[-1].parts[0].text == params.message.parts[0].text
+    assert p.state.received_messages == 2
+
+
+async def test_lost_follow_up_receipt_reconciles_the_same_task_without_resend(
+    peer_session,
+):
+    p = peer_session
+    original, wire = await reserve(p)
+    first = await p.session.send(original, wire)
+    params = request_for(p)
+    params.message.task_id = first.dispatch.remote_task_id
+    params.message.context_id = first.dispatch.remote_context_id
+    params.message.parts[0].text = "A follow-up whose response is lost"
+    child, wire = await p.session.reserve(
+        params, dispatch_tool="send_a2a_task", verb="task", parent=first.dispatch
+    )
+    p.state.drop_ack = True
+    with pytest.raises(A2AClientError, match="Acknowledgement lost"):
+        await p.session.send(child, wire)
+    uncertain = await p.store.get(child.dispatch_id)
+    assert uncertain.state is DispatchState.UNKNOWN
+    assert uncertain.remote_task_id == first.response.id
+    reconciled = await p.session.reconcile(uncertain)
+    assert reconciled.state is DispatchState.ACKNOWLEDGED
+    assert reconciled.parent_dispatch_id == first.dispatch.dispatch_id
+    assert reconciled.remote_task_id == first.response.id
+    assert p.state.received_messages == 2, (
+        "Reconciliation replayed the follow-up message"
+    )
+    with pytest.raises(OutboundDispatchConflict):
+        await p.session.send(child, wire)
+    assert p.state.received_messages == 2

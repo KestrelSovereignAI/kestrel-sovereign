@@ -17,7 +17,7 @@ class NativeStoreSchema(Enum):
     payload encoding. A standalone TaskStore never proves the other stores.
     """
 
-    CORE = ("core", 1)
+    CORE = ("core", 2)
     MEMORY = ("memory", 1)
     FEEDBACK = ("feedback", 1)
 
