@@ -7,7 +7,11 @@ import pytest
 from a2a.types import TaskState
 from google.protobuf.json_format import MessageToDict
 
-from kestrel_sovereign.a2a.extensions import QUESTION_CORRELATION_URI, SKILL_HINT_URI
+from kestrel_sovereign.a2a.extensions import (
+    PEER_STOP_URI,
+    QUESTION_CORRELATION_URI,
+    SKILL_HINT_URI,
+)
 from kestrel_sovereign.a2a.migrate_legacy import (
     LegacyTaskMigrationError,
     convert_legacy_task,
@@ -101,6 +105,12 @@ def test_offline_conversion_retains_parts_and_assigns_stable_native_ids(archived
     assert metadata[SKILL_HINT_URI]["skill_id"] == "prior-skill"
     assert metadata[QUESTION_CORRELATION_URI]["question_id"] == task.id
     assert metadata["business"] == {"keep": 42}
+
+
+def test_draft_metadata_cannot_introduce_native_peer_control(archived):
+    archived["metadata"][PEER_STOP_URI] = {"version": 1, "intent": {}}
+    with pytest.raises(LegacyTaskMigrationError, match="Mixed native/draft"):
+        convert_legacy_task(archived, ownership=owner())
 
 
 @pytest.mark.parametrize("field", ["creator_agent_id", "recipient_agent_id"])

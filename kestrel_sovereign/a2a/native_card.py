@@ -19,6 +19,7 @@ from jwt.exceptions import InvalidKeyError
 
 from kestrel_sovereign.a2a.extensions import (
     NATIVE_EXTENSION_URIS,
+    PEER_STOP_URI,
     RECIPIENT_POLICY_URI,
     SIGNED_SENDER_URI,
 )
@@ -87,6 +88,7 @@ def create_native_agent_card(
     description: str,
     version: str,
     skills: Sequence[AgentSkill],
+    peer_stop: bool = False,
 ) -> AgentCard:
     """Build and sign the one public contract for a hosted native recipient."""
     if not isinstance(identity, AgentIdentity) or not identity.is_hybrid:
@@ -141,6 +143,7 @@ def create_native_agent_card(
                     ),
                 )
                 for uri in NATIVE_EXTENSION_URIS
+                if uri != PEER_STOP_URI or peer_stop
             ],
         ),
         security_schemes={

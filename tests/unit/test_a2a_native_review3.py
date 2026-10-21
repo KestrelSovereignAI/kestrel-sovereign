@@ -13,7 +13,6 @@ from a2a.utils.errors import A2AError
 from google.protobuf.json_format import MessageToDict
 
 from kestrel_sovereign.a2a.extensions import (
-    NATIVE_EXTENSION_URIS,
     question_correlation_metadata,
 )
 from kestrel_sovereign.a2a.native_client import (
@@ -96,7 +95,10 @@ async def test_malformed_sdk_question_read_does_not_strand_another_deadline(
     clock = SimpleNamespace(now=datetime.now(UTC))
     questions = NativeQuestionStore(p.store, clock=lambda: clock.now)
     await questions.initialize()
-    signer = replace(p.arguments["signer"], extensions=frozenset(NATIVE_EXTENSION_URIS))
+    signer = replace(
+        p.arguments["signer"],
+        extensions=frozenset(item.uri for item in p.arguments["card"].capabilities.extensions),
+    )
     session = NativePeerSession(
         **(p.arguments | {"signer": signer, "question_store": questions})
     )

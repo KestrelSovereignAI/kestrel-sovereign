@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncGenerator
+from uuid import uuid4
 
 from a2a.server.context import ServerCallContext
 from a2a.server.events.event_queue import Event
@@ -17,6 +18,9 @@ from a2a.types import (
     ListTaskPushNotificationConfigsResponse,
     ListTasksRequest,
     ListTasksResponse,
+    Message,
+    Part,
+    Role,
     SendMessageRequest,
     SubscribeToTaskRequest,
     Task,
@@ -38,11 +42,12 @@ from starlette.exceptions import HTTPException
 
 from kestrel_sovereign._async_ownership import gather_owned
 from kestrel_sovereign.a2a.extensions import (
+    PEER_STOP_URI,
     parse_message_metadata,
     require_metadata_extensions,
 )
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
-from kestrel_sovereign.a2a.media import validate_input_parts
+from kestrel_sovereign.a2a.media import encode_inline_json, validate_input_parts
 from kestrel_sovereign.a2a.native_context import wait_native_disconnect
 from kestrel_sovereign.a2a.native_security import (
     AuthorizedNativeRequest,
@@ -73,7 +78,8 @@ class NativeA2ARequestHandler(RequestHandler):
     """
 
     def __init__(
-        self, manager: TaskManager, guard: NativeDIDRequestGuard, card: AgentCard
+        self, manager: TaskManager, guard: NativeDIDRequestGuard, card: AgentCard,
+        *, peer_stop_target: object | None = None,
     ):
         if manager.task_store.scope != guard.scope:
             raise ValueError(
@@ -84,8 +90,23 @@ class NativeA2ARequestHandler(RequestHandler):
         validate_proto_required_fields(card)
         self.manager = manager
         self.guard = guard
+        self._peer_stop_target = peer_stop_target
         self._card = AgentCard.FromString(card.SerializeToString())
         extensions = self._card.capabilities.extensions
+        if (PEER_STOP_URI in {item.uri for item in extensions}) != (
+            peer_stop_target is not None
+        ) or (
+            peer_stop_target is not None
+            and getattr(peer_stop_target, "task_manager", None) is not manager
+        ):
+            raise ValueError("Peer Stop must bind the advertised recipient's task manager")
+        if peer_stop_target is not None:
+            from kestrel_sovereign.signals.sources.peer_stop import (
+                peer_stop_target_identity,
+            )
+
+            if peer_stop_target_identity(peer_stop_target) != guard.scope.recipient_id:
+                raise ValueError("Peer Stop target differs from its native recipient")
         if (
             len({item.uri for item in extensions}) != len(extensions)
             or {item.uri for item in extensions if item.required}
@@ -161,7 +182,7 @@ class NativeA2ARequestHandler(RequestHandler):
 
     async def _submit(
         self, admitted: AuthorizedNativeRequest[SendMessageRequest]
-    ) -> Task:
+    ) -> Task | Message:
         params, principal_id = admitted.request, admitted.principal_id
         validate_history_length(params.configuration)
         if params.configuration.HasField("task_push_notification_config"):
@@ -169,10 +190,45 @@ class NativeA2ARequestHandler(RequestHandler):
         try:
             metadata = MessageToDict(params.metadata)
             require_metadata_extensions(metadata, admitted.activated_extensions)
-            hint = parse_message_metadata(metadata).skill_hint
+            claims = parse_message_metadata(metadata)
         except ValueError as error:
             raise InvalidParamsError(message=str(error)) from error
-        modes = self._card.default_input_modes
+        validate_input_parts(params.message.parts, self._card.default_input_modes)
+        output_modes = params.configuration.accepted_output_modes
+        if output_modes and not set(output_modes).intersection(
+            self._card.default_output_modes
+        ):
+            raise ContentTypeNotSupportedError()
+        if claims.peer_stop is not None:
+            if self._peer_stop_target is None:
+                raise UnsupportedOperationError(message="Peer Stop is not advertised")
+            if (
+                params.message.task_id
+                or params.message.role != Role.ROLE_USER
+                or len(params.message.parts) != 1
+                or params.message.parts[0].WhichOneof("content") != "text"
+                or params.message.parts[0].text != (claims.peer_stop["reason"] or "")
+            ):
+                raise InvalidParamsError(message="Peer Stop requires its own user message and reason")
+            if output_modes:
+                validate_input_parts(
+                    [Part(raw=b"{}", media_type="application/json")], output_modes
+                )
+            from kestrel_sovereign.signals.sources.peer_stop import dispatch_peer_stop
+
+            receipt = await dispatch_peer_stop(
+                self._peer_stop_target,
+                actor_id=principal_id,
+                intent=claims.peer_stop,
+                causation_chain=claims.causation_chain,
+            )
+            return Message(
+                message_id=uuid4().hex,
+                context_id=params.message.context_id or uuid4().hex,
+                role=Role.ROLE_AGENT,
+                parts=[Part(raw=encode_inline_json(receipt), media_type="application/json")],
+            )
+        hint = claims.skill_hint
         if hint is not None:
             selected = next(
                 (
@@ -186,12 +242,6 @@ class NativeA2ARequestHandler(RequestHandler):
                 raise InvalidParamsError(
                     message="Recipient does not advertise the suggested skill"
                 )
-        validate_input_parts(params.message.parts, modes)
-        output_modes = params.configuration.accepted_output_modes
-        if output_modes and not set(output_modes).intersection(
-            self._card.default_output_modes
-        ):
-            raise ContentTypeNotSupportedError()
         try:
             if params.message.task_id:
                 task = await self.manager.continue_task(
@@ -249,9 +299,11 @@ class NativeA2ARequestHandler(RequestHandler):
 
     async def on_message_send(
         self, params: SendMessageRequest, context: ServerCallContext
-    ) -> Task:
+    ) -> Task | Message:
         async with self.guard.admit(params, "SendMessage", context) as admitted:
             task = await self._submit(admitted)
+            if isinstance(task, Message):
+                return task
             if admitted.request.configuration.return_immediately:
                 return apply_history_length(task, admitted.request.configuration)
             stream, initial = await self._open_stream(task.id, admitted.principal_id)
@@ -295,6 +347,9 @@ class NativeA2ARequestHandler(RequestHandler):
                     message="Streaming is not advertised by this agent"
                 )
             task = await self._submit(admitted)
+            if isinstance(task, Message):
+                yield task
+                return
             stream, initial = await self._open_stream(task.id, admitted.principal_id)
         async with owned_execution_stream(
             self, self._events(stream, initial, admitted)

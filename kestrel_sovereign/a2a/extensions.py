@@ -20,6 +20,7 @@ QUESTION_CORRELATION_URI = EXTENSION_DOCUMENT + "#question-correlation-v1"
 CAUSATION_URI = EXTENSION_DOCUMENT + "#causation-v1"
 SKILL_HINT_URI = EXTENSION_DOCUMENT + "#skill-hint-v1"
 DELIVERY_INTENT_URI = EXTENSION_DOCUMENT + "#delivery-intent-v1"
+PEER_STOP_URI = EXTENSION_DOCUMENT + "#peer-stop-v1"
 NATIVE_EXTENSION_URIS = (
     SIGNED_SENDER_URI,
     RECIPIENT_POLICY_URI,
@@ -27,6 +28,7 @@ NATIVE_EXTENSION_URIS = (
     CAUSATION_URI,
     SKILL_HINT_URI,
     DELIVERY_INTENT_URI,
+    PEER_STOP_URI,
 )
 
 
@@ -100,6 +102,7 @@ def require_metadata_extensions(
             CAUSATION_URI,
             SKILL_HINT_URI,
             DELIVERY_INTENT_URI,
+            PEER_STOP_URI,
         )
     ):
         raise ValueError("Native metadata uses an extension that was not activated")
@@ -246,6 +249,7 @@ class NativeMessageMetadata:
     skill_hint: str | None
     delivery_intent: str | None
     causation_chain: tuple[CausationFrame, ...]
+    peer_stop: dict[str, Any] | None
 
 
 def parse_message_metadata(metadata: Mapping[str, Any]) -> NativeMessageMetadata:
@@ -253,9 +257,20 @@ def parse_message_metadata(metadata: Mapping[str, Any]) -> NativeMessageMetadata
     correlation = parse_question_correlation(metadata)
     if correlation is not None and correlation.kind != "question":
         raise ValueError("Question answers must use their original task response")
+    hint = parse_skill_hint(metadata)
+    delivery = parse_delivery_intent(metadata)
+    control = _payload(metadata, PEER_STOP_URI, {"version", "intent"})
+    intent = None
+    if control is not None:
+        from kestrel_sovereign.signals.sources.peer_stop import parse_peer_stop_intent
+
+        intent = parse_peer_stop_intent(control["intent"])
+        if correlation is not None or hint is not None or delivery is not None:
+            raise ValueError("Peer Stop cannot also submit a task or question")
     return NativeMessageMetadata(
         correlation,
-        parse_skill_hint(metadata),
-        parse_delivery_intent(metadata),
+        hint,
+        delivery,
         tuple(deserialize_causation_chain(metadata)),
+        intent,
     )

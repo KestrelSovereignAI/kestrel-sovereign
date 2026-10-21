@@ -864,7 +864,6 @@ async def test_official_client_commits_taskless_question_answer_with_its_receipt
     from datetime import UTC, datetime, timedelta
 
     from kestrel_sovereign.a2a.extensions import (
-        NATIVE_EXTENSION_URIS,
         question_correlation_metadata,
     )
     from kestrel_sovereign.a2a.stores.unified.question_store import NativeQuestionStore
@@ -872,7 +871,7 @@ async def test_official_client_commits_taskless_question_answer_with_its_receipt
     p = peer_session
     questions = NativeQuestionStore(p.store)
     await questions.initialize()
-    extensions = frozenset(NATIVE_EXTENSION_URIS)
+    extensions = frozenset(item.uri for item in p.arguments["card"].capabilities.extensions)
     original_signer = p.arguments["signer"]
     signer = replace(original_signer, extensions=extensions, nonce=lambda: uuid4().hex)
     session = NativePeerSession(

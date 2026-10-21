@@ -15,7 +15,6 @@ from starlette.exceptions import HTTPException
 
 from kestrel_sovereign import __version__
 from kestrel_sovereign.a2a.did_registry import same_a2a_sender_identity_witness
-from kestrel_sovereign.a2a.extensions import NATIVE_EXTENSION_URIS
 from kestrel_sovereign.a2a.native_card import (
     REQUIRED_NATIVE_EXTENSIONS,
     create_native_agent_card,
@@ -127,6 +126,7 @@ class HostedNativeA2APublication:
             description=profile["description"],
             version=__version__,
             skills=self.recipient.task_manager.get_agent_skills(),
+            peer_stop=True,
         )
 
     def publish(self) -> None:
@@ -145,7 +145,9 @@ class HostedNativeA2APublication:
         )
         card = self._build_card(self._profile)
         binding = NativeA2AHTTP(
-            NativeA2ARequestHandler(self.recipient.task_manager, guard, card),
+            NativeA2ARequestHandler(
+                self.recipient.task_manager, guard, card, peer_stop_target=self.recipient
+            ),
             public_base_url=self.configuration.public_base_url,
             card_modifier=self.get_card,
             public_discovery=(
@@ -336,7 +338,7 @@ async def open_hosted_native_peer_session(
         signer = NativeSenderInterceptor.for_identity(
             sender_identity,
             recipient=scope,
-            extensions=frozenset(NATIVE_EXTENSION_URIS),
+            extensions=frozenset(item.uri for item in card.capabilities.extensions),
             policy=NativeProofPolicy(),
             clock=time.time,
             nonce=lambda: uuid4().hex,

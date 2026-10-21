@@ -514,6 +514,7 @@ holds extension payloads. Unknown required extensions fail before task creation.
 | Causation | `#causation-v1` | Attribution/loop control only; never grants authority |
 | Outbound task store | Internal persistence using core task/context IDs | Preserve dispatch evidence, final outcome and restart reconciliation |
 | Cancellation authority | Core CancelTask plus recipient policy | Authenticate creator/recipient authority on every mutation |
+| Cooperative peer Stop | SendMessage plus `#peer-stop-v1` | Keep dispatcher policy and durable Stop receipts; create no cognition task |
 | Wake signals | Internal transition events | One committed transition drives existing wake hooks |
 
 The operator console reads `/api/agent/task-inbox`, independently of the A2A
@@ -618,6 +619,32 @@ Notifications request no reply; assignments request task processing. Question
 correlation already defines question intent, so combining these extensions is
 invalid. Neither intent grants execution authority. Every known URI payload
 requires explicit extension activation; metadata cannot activate itself.
+
+### Peer Stop v1
+
+Hosts providing cooperative Stop advertise the optional `#peer-stop-v1`
+extension on their signed Agent Card. Clients activate it through
+`A2A-Extensions` and send `{"version": 1, "intent": {...}}` under its URI
+metadata key. The intent uses the canonical Stop schema: `scope`, `target`,
+`reason`, `cascade` and `correlation_id`. The user Message contains exactly one
+text Part with the same reason. It cannot carry a task ID or combine Stop with
+a skill hint, delivery intent or question correlation. Signed sender admission
+and the recipient's current policy precede every dispatch; causation retains
+its usual cycle and depth checks.
+
+Both SendMessage and SendStreamingMessage return one agent Message containing
+the canonical durable Stop receipt as inline `application/json`. The response
+keeps the requested context and creates no task, work item or cognition wake.
+The existing dispatcher decides rate limits, cycle policy, cascade refusals,
+the fleet circuit breaker and effect ownership. Stop cancels work cooperatively;
+it does not terminate a process or confer Hold authority.
+
+Only a transport failure can trigger a bounded Stop redelivery. Each delivery
+uses a new native Message ID, dispatch record and sender nonce while preserving
+the same intent, context and Stop correlation ID. The recipient's durable Stop
+receipt prevents repeating the effect. Ordinary task and question sends retain
+their single-attempt dispatch contract. Exhausted or interrupted delivery keeps
+its uncertain dispatch evidence and never reports a confirmed Stop.
 
 ### Skill hint v1
 
