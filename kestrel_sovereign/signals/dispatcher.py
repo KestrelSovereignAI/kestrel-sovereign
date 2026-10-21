@@ -2293,17 +2293,103 @@ class SignalDispatcher:
             )
 
     async def get_durable_delivery_for_source_event(
-        self, *, consumer_id: str, source: str, source_event_id: str
+        self, *, consumer_id: str, source: str, source_event_id: str,
+        expected_channel_signal: Signal | None = None,
     ) -> Optional[DurableDelivery]:
-        """Read one consumer delivery by its producer's source event ID."""
+        """Read one consumer delivery by its producer's source event ID.
+
+        An optional normalized channel signal requests an exact terminal-only
+        redelivery proof. It uses the same original keyed privacy binding or
+        retained projection as native ingress, without admitting new work,
+        activating a lease, or persisting the supplied envelope. The caller
+        must use the channel source's canonical builder, sanitizer and schema.
+        A mismatch returns ``None``; ordinary observational reads are unchanged.
+        """
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
-            return await self._durable_store.get_delivery_for_source_event(
+            delivery = await self._durable_store.get_delivery_for_source_event(
                 agent_id=self._agent.did,
                 consumer_id=consumer_id,
                 source=source,
                 source_event_id=source_event_id,
             )
+            if expected_channel_signal is None or delivery is None:
+                return delivery
+            registration = self._registry.get(source)
+            if (
+                not isinstance(expected_channel_signal, Signal)
+                or registration is None
+                or consumer_id != DURABLE_TERMINAL_CONSUMER_ID
+                or source != "channel.message"
+                or expected_channel_signal.source != source
+            ):
+                return None
+            recorded_binding = await self._durable_store.get_event_integrity(
+                agent_id=self._agent.did, event_id=delivery.event_id,
+            )
+            if not self._durable_channel_terminal_matches(
+                delivery, expected_channel_signal, registration,
+                recorded_binding=recorded_binding, source_event_id=source_event_id,
+            ):
+                return None
+            return delivery
+
+    def _durable_channel_terminal_matches(
+        self, delivery: DurableDelivery, candidate: Signal,
+        registration: SourceRegistration, *, recorded_binding: str | None,
+        source_event_id: str | None,
+    ) -> bool:
+        """One native equality rule for ingress and read-only terminal proof."""
+        event = delivery.event
+        if (
+            not isinstance(candidate.payload, dict)
+            or delivery.consumer_id != DURABLE_TERMINAL_CONSUMER_ID
+            or delivery.status != TERMINAL_ACKABLE
+            or delivery.agent_id != self._agent.did
+            or delivery.event_id != event.event_id
+            or event.agent_id != self._agent.did
+            or event.source != candidate.source
+            or event.source != "channel.message"
+            or event.source_event_id != source_event_id
+            or event.target_agent != candidate.target_agent
+            or candidate.target_agent != self._agent.did
+            or candidate.mode not in registration.allowed_modes
+            or event.mode != candidate.mode.value
+            or event.session_id != candidate.session_id
+            or event.visibility != candidate.visibility.value
+            or event.urgency != candidate.urgency.value
+            or candidate.origin_trust != registration.trust
+            or candidate.payload.get(DURABLE_TERMINAL_MARKER) != DURABLE_TERMINAL_MARKER_VALUE
+        ):
+            return False
+        if recorded_binding is not None:
+            return secrets.compare_digest(
+                recorded_binding,
+                self._volatile_source_integrity_binding(candidate, source_event_id),
+            )
+        if event.caller_identity is None:
+            # Elided/legacy rows with no original MAC cannot prove an envelope
+            # just because today's privacy policy allows payload persistence.
+            return False
+        projection = self._signal_for_durable_persistence(candidate, registration)
+        retained = self._signal_from_durable_event(event, dispatch_signal=candidate)
+        caller_matches = retained.caller == candidate.caller
+        if (
+            isinstance(retained.caller, str)
+            and retained.caller.startswith(_DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX)
+        ):
+            caller_matches = (
+                candidate.caller == retained.payload.get("sender")
+                == projection.signal.payload.get("sender")
+            )
+        return not projection.payload_elided and projection.signal.payload == candidate.payload and (
+            retained.source == candidate.source
+            and retained.target_agent == candidate.target_agent
+            and retained.kind == candidate.kind
+            and caller_matches
+            and retained.dedupe_key == candidate.dedupe_key
+            and retained.payload == projection.signal.payload
+        )
 
     def _delivery_with_transient_handoff(
         self, delivery: DurableDelivery
@@ -4391,44 +4477,11 @@ class SignalDispatcher:
                     expected.pop(DURABLE_COGNITION_MARKER, None)
                     expected[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
                     candidate = replace(signal, payload=expected)
-                    if recorded_binding is not None:
-                        # The provider retried the same envelope through the
-                        # normal door. Reassert ONLY the retained terminal
-                        # marker before comparing its original keyed binding.
-                        integrity_signal = candidate
-                        verified_terminal_retry = secrets.compare_digest(
-                            recorded_binding,
-                            self._volatile_source_integrity_binding(candidate, source_event_id),
-                        )
-                    else:
-                        # Legacy non-elided receipts still require their
-                        # privacy-safe persisted projection to match exactly.
-                        projection = self._signal_for_durable_persistence(candidate, registration)
-                        retained = self._signal_from_durable_event(terminal.event, dispatch_signal=signal)
-                        caller_matches = retained.caller == candidate.caller
-                        if (
-                            isinstance(retained.caller, str)
-                            and retained.caller.startswith(_DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX)
-                        ):
-                            # The protected field is intentionally opaque in
-                            # keyless NORMAL installs. This channel's original
-                            # raw sender is already in its retained payload;
-                            # it is the source-owned replay identity, not the
-                            # opaque audit label. Recovery above validated the
-                            # versioned label and exact payload equality below
-                            # still fences content and correlation metadata.
-                            caller_matches = (
-                                candidate.caller == retained.payload.get("sender")
-                                == projection.signal.payload.get("sender")
-                            )
-                        verified_terminal_retry = not projection.payload_elided and projection.signal.payload == candidate.payload and (
-                            retained.source == candidate.source
-                            and retained.target_agent == candidate.target_agent
-                            and retained.kind == candidate.kind
-                            and caller_matches
-                            and retained.dedupe_key == candidate.dedupe_key
-                            and retained.payload == projection.signal.payload
-                        )
+                    integrity_signal = candidate
+                    verified_terminal_retry = self._durable_channel_terminal_matches(
+                        terminal, candidate, registration,
+                        recorded_binding=recorded_binding, source_event_id=source_event_id,
+                    )
             if recorded_binding is not None:
                 live_integrity_binding = (
                     self._volatile_source_integrity_binding(integrity_signal, source_event_id)

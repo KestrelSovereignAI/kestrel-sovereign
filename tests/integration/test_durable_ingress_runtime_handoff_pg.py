@@ -48,6 +48,55 @@ async def test_channel_history_real_postgres_utc_roundtrip(native_pg, offset):
     await assert_channel_timestamp_roundtrip(backend, offset)
 
 
+@pytest.mark.parametrize("privacy", ["normal", "ephemeral", "isolated", "anonymous"])
+async def test_real_pg_terminal_receipt_proves_exact_private_envelope_without_work(native_pg, privacy):
+    from kestrel_sovereign.signals.sources.channels import (
+        DURABLE_TERMINAL_CONSUMER_ID, DURABLE_TERMINAL_MARKER,
+        DURABLE_TERMINAL_MARKER_VALUE,
+    )
+    from tests.unit.test_channel_terminal_receipt_verification import _terminal_signal
+    from tests.unit.test_durable_signal_delivery import _Agent
+
+    backend, control, schema = native_pg
+    agent = _Agent("did:test:pg-private-receipt")
+    agent.privacy_config = get_privacy_preset(privacy)
+    logs = SignalLogStore(backend)
+    await logs.initialize()
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    dispatcher = SignalDispatcher(agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=logs)
+    source_id = "telegram:v2:bot:42:update:17"
+    try:
+        await dispatcher.register_durable_consumer(DurableConsumerRegistration(
+            consumer_id=DURABLE_TERMINAL_CONSUMER_ID, source="channel.message", agent_id=agent.did,
+            correlation_selector=f"payload.{DURABLE_TERMINAL_MARKER}={DURABLE_TERMINAL_MARKER_VALUE}", max_attempts=0,
+        ))
+        handle = await dispatcher.enqueue_durable_terminal(
+            _terminal_signal(agent.did), source_event_id=source_id, consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+        )
+        assert (await handle.wait_for_durable_admission()).acknowledged
+        await handle.wait()
+        args = {"consumer_id": DURABLE_TERMINAL_CONSUMER_ID, "source": "channel.message", "source_event_id": source_id}
+        before = await dispatcher.get_durable_delivery_for_source_event(**args)
+        assert before is not None
+        if privacy in {"ephemeral", "isolated"}:
+            assert "content" not in before.event.payload
+        assert await dispatcher.get_durable_delivery_for_source_event(
+            **args, expected_channel_signal=_terminal_signal(agent.did),
+        ) == before
+        changed = _terminal_signal(agent.did)
+        changed.payload["metadata"]["reply_to_message_id"] = "778"
+        assert await dispatcher.get_durable_delivery_for_source_event(
+            **args, expected_channel_signal=changed,
+        ) is None
+        assert await dispatcher.get_durable_delivery_for_source_event(**args) == before
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".durable_signal_events') == 1
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects') == 0
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await asyncio.gather(*agent.tasks, return_exceptions=True)
+
+
 @pytest.mark.parametrize("ready_at_admission", [False, True])
 @pytest.mark.parametrize("publication_refusal", [False, True])
 async def test_real_pg_cognition_and_audit_survive_http_admission_retirement(
