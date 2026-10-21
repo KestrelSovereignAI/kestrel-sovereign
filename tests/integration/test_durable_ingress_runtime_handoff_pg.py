@@ -71,6 +71,33 @@ async def test_real_pg_sleep_episode_timestamp_binding_and_native_reader(native_
     assert episodes[0].key_message_ids == ["one", "two"]
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_real_pg_sleep_archive_timestamp_binding(native_pg, legacy):
+    import json
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.storage.conversation_created_at import conversation_history_ddl
+    from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+    backend, _, _ = native_pg
+    db = AsyncDatabase(backend)
+    await db.execute(conversation_history_ddl("postgres").replace("CREATE TABLE {table}", "CREATE TABLE conversation_history"))
+    archived = datetime(2020, 1, 1, 17, 15, 44, 971730, tzinfo=timezone(timedelta(hours=9)))
+    metadata = {"archived": True, "archived_at": archived.isoformat()} if legacy else {"importance": 0.0}
+    await db.execute(
+        "INSERT INTO conversation_history (agent_id,role,content,metadata,created_at) VALUES (?, ?, ?, ?, ?)",
+        ("did:test:archive", "user", "provider-free archive", json.dumps(metadata), datetime(2020, 1, 1)),
+    )
+    before = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert await MemoryConsolidator(db, "did:test:archive")._archive_decayed() == 1
+    row = await db.fetchone("SELECT archived_at,metadata FROM conversation_history")
+    assert isinstance(row[0], datetime)
+    if legacy:
+        assert row[0] == archived.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        assert row[0] >= before
+    assert "archived" not in json.loads(row[1])
+
+
 @pytest.mark.parametrize("privacy", ["normal", "ephemeral", "isolated", "anonymous"])
 async def test_real_pg_host_ack_targets_one_run_and_receipt_binds_session(native_pg, privacy):
     """Real proxy, producer, persistence and session selectors; no Workflows substitute claim."""
