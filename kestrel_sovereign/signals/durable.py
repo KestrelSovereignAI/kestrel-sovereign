@@ -3873,6 +3873,7 @@ class DurableSignalStore(UnifiedStoreBase):
         assert persistence is not None
         return persistence
 
+    @_with_admission_fence
     async def upgrade_legacy_delivery_for_redelivery(
         self,
         *,
@@ -3882,6 +3883,7 @@ class DurableSignalStore(UnifiedStoreBase):
         source_event_id: str,
         expected_signal: Signal,
         caller_identity_factory: Callable[[], str],
+        admission_fence: Any = None,
     ) -> bool:
         """Atomically add one delivery to a verified pre-consumer event.
 
@@ -3892,6 +3894,8 @@ class DurableSignalStore(UnifiedStoreBase):
         pre-upgrade schema, so it is sealed and the exact delivery is created
         in the same transaction.  Privacy-elided rows carry an integrity row
         and are refused here; their keyed-MAC retry path remains fail-closed.
+        A live host admission fence applies to this new delivery COMMIT too:
+        deduplicating an older event does not authorize a later upgrade.
         """
 
         self._require_nonempty("agent_id", agent_id)

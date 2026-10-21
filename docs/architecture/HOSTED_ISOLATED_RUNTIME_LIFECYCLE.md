@@ -77,6 +77,9 @@ into a signal or inherited as finite authority by resident cognition. The
 host's fence must validate on the **same commit connection** and fail closed
 on route/generation loss. This does not replace care-acknowledgement authority
 or grant permission to hold a second database checkout through cognition.
+An exact legacy redelivery can create its first cognition delivery in a second
+transaction after event deduplication. That upgrade uses the same host fence
+on its own original COMMIT; the earlier event's existence is not authorization.
 
 ## General lifecycle policy
 

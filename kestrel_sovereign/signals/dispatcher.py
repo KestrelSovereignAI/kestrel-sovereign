@@ -4543,6 +4543,8 @@ class SignalDispatcher:
                                 signal.caller, event_id=persisted.event_id
                             )
                         ),
+                        **({"admission_fence": durable_admission_fence}
+                           if durable_admission_fence is not None else {}),
                     )
                     if not upgraded_legacy_delivery:
                         # ``False`` deliberately carries no admission meaning:
