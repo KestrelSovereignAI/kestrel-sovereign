@@ -73,6 +73,11 @@ from tests.utils.native_a2a import (
 )
 from tests.utils.native_a2a_security import (
     admission as native_request_admission,  # noqa: F401 - pytest fixture
+)
+from tests.utils.native_a2a_security import (
+    native_push_runtime,  # noqa: F401 - pytest fixture
+)
+from tests.utils.native_a2a_security import (
     signing as native_signing,  # noqa: F401 - pytest fixture
 )
 

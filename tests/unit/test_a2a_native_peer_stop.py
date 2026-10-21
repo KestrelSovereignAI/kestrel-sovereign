@@ -29,7 +29,8 @@ from tests.unit import (
     test_peer_stop_signals,
 )
 from tests.utils.native_a2a import manager_for
-from tests.utils.native_a2a_security import PRINCIPAL
+from tests.utils.native_a2a_security import PRINCIPAL, signed_context
+from tests.utils.native_push import managed_push_service
 
 wire = test_a2a_native_http.wire
 rail = test_peer_stop_signals.rail
@@ -42,10 +43,14 @@ async def control(wire, rail, recipient_identity):
     rail.agent.task_manager = wire.manager
     identity, _ = recipient_identity
     card = create_native_agent_card(
-        identity=identity, scope=wire.admission.scope,
+        identity=identity,
+        scope=wire.admission.scope,
         routing_key=wire.admission.guard.routing_key,
-        public_base_url="http://native-core.test", name="Peer",
-        description="Native Stop peer", version="1", skills=wire.card.skills,
+        public_base_url="http://native-core.test",
+        name="Peer",
+        description="Native Stop peer",
+        version="1",
+        skills=wire.card.skills,
         peer_stop=True,
     )
     handler = NativeA2ARequestHandler(
@@ -57,6 +62,7 @@ async def control(wire, rail, recipient_identity):
         base_url="http://native-core.test",
         headers={"A2A-Version": "1.0"},
     ) as http:
+
         def client(*, streaming=False, activated=True):
             return wire.client(
                 streaming=streaming,
@@ -65,7 +71,9 @@ async def control(wire, rail, recipient_identity):
                 http_client=http,
                 sender_interceptor=replace(
                     wire.interceptor,
-                    extensions=frozenset(item.uri for item in card.capabilities.extensions)
+                    extensions=frozenset(
+                        item.uri for item in card.capabilities.extensions
+                    )
                     - (set() if activated else {PEER_STOP_URI}),
                 ),
             )
@@ -88,7 +96,8 @@ async def sender(control, recipient_identity):
     c = control
     manager = manager_for(
         c.wire.admission.backend,
-        NativeRecipientScope(PRINCIPAL, "sender-tenant"), owns_backend=False,
+        NativeRecipientScope(PRINCIPAL, "sender-tenant"),
+        owns_backend=False,
     )
     await manager.initialize()
     agent = SimpleNamespace(did=PRINCIPAL, agent_id=PRINCIPAL, task_manager=manager)
@@ -112,13 +121,23 @@ async def sender(control, recipient_identity):
                     raise PeerAccessDeniedError("Peer route revoked")
 
             session = NativePeerSession(
-                card=c.card, signing_did=identity.signing_did,
-                trusted_document=document, recipient=c.wire.admission.scope,
-                interface=next(item for item in c.card.supported_interfaces
-                               if item.protocol_binding == c.wire.protocol),
-                signer=replace(c.wire.interceptor,
-                               extensions=frozenset(item.uri for item in c.card.capabilities.extensions)),
-                http_client=c.http, outbound_store=manager.outbound_store,
+                card=c.card,
+                signing_did=identity.signing_did,
+                trusted_document=document,
+                recipient=c.wire.admission.scope,
+                interface=next(
+                    item
+                    for item in c.card.supported_interfaces
+                    if item.protocol_binding == c.wire.protocol
+                ),
+                signer=replace(
+                    c.wire.interceptor,
+                    extensions=frozenset(
+                        item.uri for item in c.card.capabilities.extensions
+                    ),
+                ),
+                http_client=c.http,
+                outbound_store=manager.outbound_store,
                 authorize=authorize,
             )
             try:
@@ -138,8 +157,11 @@ async def sender(control, recipient_identity):
 
 def request(**changes):
     intent = {
-        "scope": "agent", "target": None, "reason": "Please stop",
-        "cascade": False, "correlation_id": "native-stop-1",
+        "scope": "agent",
+        "target": None,
+        "reason": "Please stop",
+        "cascade": False,
+        "correlation_id": "native-stop-1",
     } | changes
     return SendMessageRequest(
         message=new_text_message(
@@ -152,9 +174,10 @@ def request(**changes):
 async def receipt(control, params=None, *, streaming=False):
     params = request() if params is None else params
     params.tenant = control.wire.admission.scope.tenant
-    events = [event async for event in control.client(streaming=streaming).send_message(
-        params
-    )]
+    events = [
+        event
+        async for event in control.client(streaming=streaming).send_message(params)
+    ]
     assert len(events) == 1 and events[0].WhichOneof("payload") == "message"
     message = events[0].message
     assert isinstance(message, Message) and message.role == Role.ROLE_AGENT
@@ -162,6 +185,35 @@ async def receipt(control, params=None, *, streaming=False):
     present, value = embedded_json_value(message.parts[0])
     assert present
     return value
+
+
+async def test_peer_stop_cannot_attach_a_callback_to_its_taskless_message(
+    control, monkeypatch
+):
+    c = control
+    async with managed_push_service(c.wire.manager, monkeypatch, pause_delivery=True):
+        card = c.handler.agent_card
+        card.capabilities.push_notifications = True
+        handler = NativeA2ARequestHandler(
+            c.wire.manager, c.wire.admission.guard, card, peer_stop_target=c.rail.agent
+        )
+        params = request()
+        params.tenant = c.wire.admission.scope.tenant
+        params.configuration.task_push_notification_config.url = (
+            "https://8.8.8.8/callback"
+        )
+        activated = frozenset(item.uri for item in card.capabilities.extensions)
+        context = signed_context(
+            c.wire.admission,
+            params,
+            activated=activated,
+            proof_changes={"extensions": activated},
+        )
+        with pytest.raises(InvalidParamsError, match="cannot register task push"):
+            await handler.on_message_send(params, context)
+        assert await c.wire.admission.backend.fetch_one(
+            "SELECT COUNT(*) FROM a2a_push_configs"
+        ) == (0,)
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -213,8 +265,12 @@ async def test_native_stop_preserves_signed_causation_cycle_policy(control):
     )
 
     frame = CausationFrame(
-        agent_id=control.rail.agent.did, source="a2a.peer_stop", signal_id="loop",
-        turn_id=None, depth=1, emitted_at=datetime.now(UTC),
+        agent_id=control.rail.agent.did,
+        source="a2a.peer_stop",
+        signal_id="loop",
+        turn_id=None,
+        depth=1,
+        emitted_at=datetime.now(UTC),
     )
     params = request()
     params.metadata.update(causation_metadata(serialize_chain_for_metadata([frame])))
@@ -228,12 +284,17 @@ async def test_native_stop_cannot_activate_its_own_extension(control):
     params = request()
     params.tenant = control.wire.admission.scope.tenant
     with pytest.raises(InvalidParamsError):
-        _ = [event async for event in control.client(activated=False).send_message(params)]
+        _ = [
+            event
+            async for event in control.client(activated=False).send_message(params)
+        ]
     assert control.rail.agent.cancelled == []
     assert not (await control.rail.receipts.list_receipts(limit=10)).receipts
 
 
-@pytest.mark.parametrize("fault", ["version", "actor", "skill", "task", "reason", "role"])
+@pytest.mark.parametrize(
+    "fault", ["version", "actor", "skill", "task", "reason", "role"]
+)
 async def test_native_stop_rejects_malformed_or_ambiguous_control(control, fault):
     params = request()
     if fault == "version":
@@ -263,7 +324,9 @@ async def test_native_stop_card_and_handler_bind_the_same_recipient(control):
     control.rail.agent.did = "did:wrong:recipient"
     with pytest.raises(ValueError, match="differs"):
         NativeA2ARequestHandler(
-            control.wire.manager, control.wire.admission.guard, control.card,
+            control.wire.manager,
+            control.wire.admission.guard,
+            control.card,
             peer_stop_target=control.rail.agent,
         )
 
@@ -309,7 +372,9 @@ async def test_public_stop_tool_cannot_reach_a_denied_peer(sender):
 
 
 @pytest.mark.parametrize("lost_responses", [1, 3])
-async def test_native_stop_retries_only_the_same_receipted_intent(sender, lost_responses):
+async def test_native_stop_retries_only_the_same_receipted_intent(
+    sender, lost_responses
+):
     import json
 
     calls = []
@@ -335,8 +400,10 @@ async def test_native_stop_retries_only_the_same_receipted_intent(sender, lost_r
         dispatch = await sender.manager.outbound_store.get(result.data["dispatch_id"])
         assert dispatch.state.value == "unknown"
     payloads = [json.loads(call.content) for call in calls]
-    intents = [body.get("params", body)["metadata"][PEER_STOP_URI]["intent"]
-               for body in payloads]
+    intents = [
+        body.get("params", body)["metadata"][PEER_STOP_URI]["intent"]
+        for body in payloads
+    ]
     assert all(intent == intents[0] for intent in intents)
     proofs = [call.headers["Kestrel-A2A-Sender-Proof"] for call in calls]
     assert len(set(proofs)) == len(proofs)

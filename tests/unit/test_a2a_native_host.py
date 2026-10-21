@@ -66,6 +66,7 @@ async def publication(hosted, hosted_recipient_signing):
         {
             "KESTREL_BASE_URL": "https://native.test",
             "KESTREL_A2A_DISCOVERY_AGENT": "registered-agent",
+            "KESTREL_A2A_PUSH_ENABLED": "false",  # authority fixture has no resident runtime
         },
     )
     recipient._native_a2a_publication = native
@@ -309,6 +310,7 @@ async def test_actual_host_onboarding_publication_discovery_and_sdk_request(
     p = publication
     monkeypatch.setenv("KESTREL_BASE_URL", "https://native.test")
     monkeypatch.setenv("KESTREL_A2A_DISCOVERY_AGENT", "registered-agent")
+    monkeypatch.setenv("KESTREL_A2A_PUSH_ENABLED", "false")  # policy fixture has no resident runtime
     operator_checks = []
 
     def operator_key():

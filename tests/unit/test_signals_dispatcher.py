@@ -62,6 +62,18 @@ from kestrel_sovereign.storage.db import SQLiteBackend
 # ---------------------------------------------------------------------------
 
 
+async def test_resident_services_borrow_only_the_initialized_live_primary_ledger(dispatcher_components):
+    dispatcher = dispatcher_components.dispatcher
+    with pytest.raises(RuntimeError, match="not initialized"):
+        _ = dispatcher.durable_store
+    await dispatcher.initialize_durable_delivery()
+    assert dispatcher.durable_store is dispatcher._durable_store
+    assert dispatcher.durable_store.backend is dispatcher_components.backend
+    await dispatcher.shutdown_durable_delivery()
+    with pytest.raises(RuntimeError, match="not initialized"):
+        _ = dispatcher.durable_store
+
+
 def _redaction() -> RedactionPolicy:
     return RedactionPolicy(summarize=lambda p: "<redacted>")
 

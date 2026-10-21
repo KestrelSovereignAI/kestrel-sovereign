@@ -102,6 +102,23 @@ def test_public_wire_card_verifies_with_independent_jcs_and_ed25519(
     )
 
 
+def test_push_capability_is_part_of_the_signed_native_contract(
+    card_arguments, card_identity
+):
+    card = create_native_agent_card(**card_arguments, push_notifications=True)
+    assert card.capabilities.push_notifications
+    verify(card, card_identity)
+    card.capabilities.push_notifications = False
+    with pytest.raises(InvalidSignaturesError):
+        verify(card, card_identity)
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_push_capability_requires_an_explicit_boolean(card_arguments, value):
+    with pytest.raises(TypeError, match="boolean"):
+        create_native_agent_card(**card_arguments, push_notifications=value)
+
+
 @pytest.mark.parametrize(
     "field", ["name", "description", "tenant", "recipient", "required", "skill"]
 )

@@ -63,7 +63,7 @@ from tests.utils.native_a2a_security import (
 
 
 @pytest_asyncio.fixture(params=["JSONRPC", "HTTP+JSON"])
-async def wire(native_request_admission, request):
+async def wire(native_request_admission, request, native_push_runtime):
     admission = native_request_admission
     protocol = request.param
     root = "http://native-core.test"
@@ -76,6 +76,7 @@ async def wire(native_request_admission, request):
         ),
         capabilities=AgentCapabilities(
             streaming=True,
+            push_notifications=native_push_runtime is not None,
             extensions=[
                 AgentExtension(uri=uri, required=True) for uri in sorted(EXTENSIONS)
             ],
@@ -172,6 +173,14 @@ async def submit(wire):
     events = [event async for event in wire.client().send_message(params)]
     assert len(events) == 1 and events[0].HasField("task")
     return events[0].task
+
+
+async def test_inline_callback_requires_the_advertised_push_capability(wire):
+    params = send(wire.admission)
+    params.configuration.task_push_notification_config.url = "https://8.8.8.8/callback"
+    with pytest.raises(PushNotificationNotSupportedError):
+        _ = [event async for event in wire.client().send_message(params)]
+    assert wire.submissions == []
 
 
 async def test_sdk_send_get_list_and_cancel_share_native_durable_authority(wire):

@@ -945,10 +945,33 @@ the original owner's failure. Refused publication closes the fresh coroutine;
 accepted publication failure joins that exact resident. Shutdown joins the
 original worker through observer cancellation and physical HTTP close.
 
-These components are implemented. The handler continues to advertise push as
-unsupported until managed host startup and standard config operations are
-connected. No network request may hold a
-database transaction.
+Hosted native publication starts this service after the agent's READY boundary,
+using the original runtime task publisher and the exact initialized primary
+signal ledger. The signed card advertises push only after the resident is ready.
+A failed or stopped configured service refuses publication and push operations;
+it does not silently downgrade the capability. Embeddings supply an explicit
+`NativePushPolicy`; operator-hosted publication enables its default policy when
+`KESTREL_BASE_URL` is set. `KESTREL_A2A_PUSH_ENABLED=false` explicitly disables
+push. The `KESTREL_A2A_PUSH_` settings `RETENTION_DAYS`, `LEASE_SECONDS`,
+`TIMEOUT_SECONDS`, `POLL_SECONDS`, `RENEWAL_SECONDS`, `RETRY_SECONDS`, and
+`BATCH_SIZE` override the one policy's defaults. Values must be positive integers,
+and renewal must precede lease expiration. Required encryption is checked before
+push schema initialization.
+
+Both official HTTP bindings expose standard Create/Get/List/Delete push
+configuration operations under the same signed request and task-creator policy
+as task access. List cursors bind the recipient, tenant, principal and task.
+Delete revokes future dispatch and waits for original local HTTP owners; another
+runtime's unretired attempt remains an explicit internal refusal with credentials
+retained for retirement. Peer Stop returns a Message and refuses inline task
+callbacks. No network request may hold a database transaction.
+
+Callback-scoped log filters redact the URL, normalized HTTP URL, notification
+token and authentication credentials. Retained error messages and explicit or
+implicit exception ancestry are redacted without replacing the original
+exceptions, commit evidence, request objects or actual headers. Original pending
+cleanup owners retain their redaction scope until they finish; unrelated
+concurrent requests keep their own logging context.
 
 `prepare_native_task_input` copies the complete official request and hashes its
 canonical JSON before extracting inline callback credentials. Initial and
@@ -960,10 +983,12 @@ task-input projection share one pure digest implementation, avoiding an
 agent/storage import cycle. Earlier input shapes require explicit offline
 migration; runtime startup refuses to reinterpret them.
 
-The transient callback projection still needs atomic encrypted registration
-with task admission and its durable consumer before push is advertised. Callback
-credentials must never enter cognition prompts or plaintext task-input JSON.
-Signing a card does not authorize arbitrary callback egress.
+Initial and continuation callback projections register atomically with task
+admission, encrypted configuration and the durable consumer. A registration
+refusal rolls back the task or input transition and its wake. Exact continuation
+replays do not register again. Callback credentials never enter cognition prompts
+or plaintext task-input JSON. Signing a card does not authorize arbitrary
+callback egress.
 
 ## Review, verification and release order
 

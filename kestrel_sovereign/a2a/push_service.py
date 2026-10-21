@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
+from datetime import timedelta
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskAdmission,
@@ -9,6 +10,7 @@ from kestrel_sovereign._async_ownership import (
     gather_owned,
     owned_task_error,
 )
+from kestrel_sovereign.a2a.push_policy import NativePushPolicy
 from kestrel_sovereign.a2a.push_worker import NativePushWorker
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
@@ -18,6 +20,47 @@ from kestrel_sovereign.execution_custody import (
 
 class PushServiceUnavailable(RuntimeError):
     """The resident cannot authorize effects in a caller's request lifetime."""
+
+
+async def start_native_push_service(
+    manager, signals, *, policy: NativePushPolicy, task_factory: Callable
+):
+    """Bind a ready resident using the host's canonical stores and task publisher."""
+    from kestrel_sovereign.a2a.push_outbox import NativePushOutbox
+    from kestrel_sovereign.a2a.push_transport import NativePushTransport
+    from kestrel_sovereign.a2a.stores.unified.push_config_store import PushConfigStore
+
+    if not isinstance(policy, NativePushPolicy):
+        raise TypeError("Native push startup requires its validated policy")
+    if manager.push_service is not None:
+        raise RuntimeError("Native push startup cannot replace a bound service")
+    outbox = NativePushOutbox(
+        PushConfigStore(manager.task_store),
+        signals,
+        retention_days=policy.retention_days,
+        lease_seconds=policy.lease_seconds,
+    )
+    worker = NativePushWorker(
+        outbox,
+        NativePushTransport(
+            outbox.configurations, timeout=timedelta(seconds=policy.timeout_seconds)
+        ),
+        poll_interval=timedelta(seconds=policy.poll_seconds),
+        renewal_interval=timedelta(seconds=policy.renewal_seconds),
+        retry_delay=timedelta(seconds=policy.retry_seconds),
+        batch_size=policy.batch_size,
+    )
+    service = NativePushService(worker, task_factory=task_factory)
+    await service.start()
+    try:
+        manager.bind_push_service(service)
+    except BaseException as original:
+        try:
+            await service.close()
+        except BaseException as retirement:  # noqa: BLE001 - original resource retirement
+            raise execution_terminal_error(original, retirement, retain_originals=True)
+        raise
+    return service
 
 
 class NativePushService:

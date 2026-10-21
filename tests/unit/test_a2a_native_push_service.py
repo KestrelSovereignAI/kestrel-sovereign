@@ -6,7 +6,12 @@ import inspect
 import pytest
 
 from kestrel_sovereign._async_ownership import create_owned_task
-from kestrel_sovereign.a2a.push_service import NativePushService, PushServiceUnavailable
+from kestrel_sovereign.a2a.push_policy import NativePushPolicy
+from kestrel_sovereign.a2a.push_service import (
+    NativePushService,
+    PushServiceUnavailable,
+    start_native_push_service,
+)
 from kestrel_sovereign.storage.db.interface import TransactionError
 from tests.unit.test_a2a_native_push_outbox import (
     outbox as outbox,  # noqa: PLC0414 - pytest fixture re-export
@@ -16,6 +21,7 @@ from tests.unit.test_a2a_native_push_outbox import (
 )
 from tests.unit.test_a2a_native_push_outbox import refuse_original_database_write
 from tests.unit.test_a2a_native_push_worker import register, worker
+from tests.unit.test_durable_callback_runtime_context import resident_dispatcher
 from tests.utils.native_push import intercept_push_commit_ack
 from tests.utils.outbound_tls import (
     outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - pytest fixture re-export
@@ -44,6 +50,80 @@ async def test_service_publishes_only_its_original_ready_worker_and_joins_shutdo
     with pytest.raises(PushServiceUnavailable) as stopped:
         service.require_ready()
     assert isinstance(stopped.value.__cause__, asyncio.CancelledError)
+
+
+async def test_canonical_startup_uses_actual_runtime_ready_publisher(outbox):
+    value, _ = outbox
+    manager = value.configurations.task_store
+    from tests.utils.native_a2a import manager_for
+
+    manager = manager_for(value.backend, manager.scope, owns_backend=False)
+    await manager.initialize()
+    runtime, _ = resident_dispatcher()
+    runtime._execution_custody = (
+        None  # standalone owner; this test performs real database work
+    )
+    policy = NativePushPolicy(timeout_seconds=7, batch_size=13)
+    try:
+        service = await start_native_push_service(
+            manager,
+            value.signals,
+            policy=policy,
+            task_factory=runtime._track_runtime_task,
+        )
+        assert manager.push_service is service
+        assert service.task in runtime._background_tasks
+        assert service.require_ready() is service.worker
+        assert service.worker.outbox.signals is value.signals
+        assert service.worker.outbox.configurations.task_store is manager.task_store
+        assert service.worker.transport.timeout == 7 and service.worker.batch_size == 13
+        with pytest.raises(RuntimeError, match="replace"):
+            await start_native_push_service(
+                manager,
+                value.signals,
+                policy=policy,
+                task_factory=runtime._track_runtime_task,
+            )
+        await manager.close()
+        assert service.task.done() and value.backend.is_connected
+    finally:
+        await manager.close()
+
+
+async def test_failed_binding_joins_actual_resident_before_startup_returns(
+    outbox, monkeypatch
+):
+    from tests.utils.native_a2a import manager_for
+
+    value, _ = outbox
+    manager = manager_for(value.backend, value.configurations.scope, owns_backend=False)
+    await manager.initialize()
+    accepted = []
+    original = RuntimeError("original task manager refused binding")
+
+    def publish(operation, *, name, admission):
+        task = create_owned_task(operation, name=name, admission=admission)
+        accepted.append(task)
+        return task
+
+    def refuse(_service):
+        raise original
+
+    monkeypatch.setattr(manager, "bind_push_service", refuse)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            await start_native_push_service(
+                manager, value.signals, policy=NativePushPolicy(), task_factory=publish
+            )
+        assert caught.value is original
+        assert len(accepted) == 1 and accepted[0].done()
+        assert manager.push_service is None and value.backend.is_connected
+    finally:
+        for task in accepted:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*accepted, return_exceptions=True)
+        await manager.close()
 
 
 async def test_failed_publication_keeps_and_joins_the_original_accepted_resident(

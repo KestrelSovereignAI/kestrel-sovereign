@@ -1,7 +1,11 @@
 """Official SDK operations over Kestrel's canonical native task lifecycle."""
 
 import asyncio
+import base64
+import binascii
+import json
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager, contextmanager
 from uuid import uuid4
 
 from a2a.server.context import ServerCallContext
@@ -26,8 +30,10 @@ from a2a.types import (
     Task,
     TaskPushNotificationConfig,
 )
+from a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
 from a2a.utils.errors import (
     ContentTypeNotSupportedError,
+    InternalError,
     InvalidAgentResponseError,
     InvalidParamsError,
     PushNotificationNotSupportedError,
@@ -36,8 +42,13 @@ from a2a.utils.errors import (
     UnsupportedOperationError,
 )
 from a2a.utils.proto_utils import validate_proto_required_fields
-from a2a.utils.task import apply_history_length, validate_history_length
+from a2a.utils.task import (
+    apply_history_length,
+    validate_history_length,
+    validate_page_size,
+)
 from google.protobuf.json_format import MessageToDict
+from kestrel_sdk.security.exceptions import SSRFError
 from starlette.exceptions import HTTPException
 
 from kestrel_sovereign._async_ownership import gather_owned
@@ -53,7 +64,13 @@ from kestrel_sovereign.a2a.native_security import (
     AuthorizedNativeRequest,
     NativeDIDRequestGuard,
 )
+from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
+from kestrel_sovereign.a2a.push_worker import NativePushWorker, PushRetirementPending
 from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnershipError
+from kestrel_sovereign.a2a.stores.unified.push_config_store import (
+    PushConfigConflict,
+    PushTaskNotFound,
+)
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskInputConflictError,
     TaskInputUnsupportedError,
@@ -69,6 +86,68 @@ from kestrel_sovereign.execution_custody import (
 )
 
 
+@contextmanager
+def _push_errors():
+    """Translate callback domain refusals, retaining original execution control."""
+    try:
+        yield
+    except (PushConfigConflict, SSRFError, PushServiceUnavailable) as error:
+        if is_execution_control_error(error):
+            raise
+        if isinstance(error, PushServiceUnavailable):
+            raise InternalError(
+                message="Native push delivery service is unavailable"
+            ) from error
+        if isinstance(error, PushTaskNotFound):
+            raise TaskNotFoundError() from error
+        if isinstance(error, PushRetirementPending):
+            raise InternalError(
+                message="Push deletion is waiting for original HTTP retirement"
+            ) from error
+        raise InvalidParamsError(
+            message="Push notification configuration was not accepted"
+        ) from error
+
+
+def _push_cursor(scope, principal_id, task_id, config_id):
+    return (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                [scope.recipient_id, scope.tenant, principal_id, task_id, config_id],
+                separators=(",", ":"),
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+
+
+def _push_after(token, scope, principal_id, task_id):
+    if not token:
+        return ""
+    try:
+        decoded = json.loads(
+            base64.b64decode(
+                token + "=" * (-len(token) % 4), altchars=b"-_", validate=True
+            )
+        )
+    except (ValueError, UnicodeError, binascii.Error) as error:
+        raise InvalidParamsError(
+            message="Invalid push configuration page token"
+        ) from error
+    if (
+        not isinstance(decoded, list)
+        or len(decoded) != 5
+        or decoded[:4] != [scope.recipient_id, scope.tenant, principal_id, task_id]
+        or not isinstance(decoded[4], str)
+        or not decoded[4]
+    ):
+        raise InvalidParamsError(
+            message="Push configuration page token belongs to another query"
+        )
+    return decoded[4]
+
+
 class NativeA2ARequestHandler(RequestHandler):
     """Both SDK HTTP bindings share one recipient, guard and task manager.
 
@@ -78,8 +157,12 @@ class NativeA2ARequestHandler(RequestHandler):
     """
 
     def __init__(
-        self, manager: TaskManager, guard: NativeDIDRequestGuard, card: AgentCard,
-        *, peer_stop_target: object | None = None,
+        self,
+        manager: TaskManager,
+        guard: NativeDIDRequestGuard,
+        card: AgentCard,
+        *,
+        peer_stop_target: object | None = None,
     ):
         if manager.task_store.scope != guard.scope:
             raise ValueError(
@@ -99,7 +182,9 @@ class NativeA2ARequestHandler(RequestHandler):
             peer_stop_target is not None
             and getattr(peer_stop_target, "task_manager", None) is not manager
         ):
-            raise ValueError("Peer Stop must bind the advertised recipient's task manager")
+            raise ValueError(
+                "Peer Stop must bind the advertised recipient's task manager"
+            )
         if peer_stop_target is not None:
             from kestrel_sovereign.signals.sources.peer_stop import (
                 peer_stop_target_identity,
@@ -115,13 +200,27 @@ class NativeA2ARequestHandler(RequestHandler):
             raise ValueError(
                 "Native Agent Card extensions must match the request guard"
             )
-        if (
-            self._card.capabilities.push_notifications
-            or self._card.capabilities.extended_agent_card
+        if self._card.capabilities.extended_agent_card:
+            raise ValueError("Native handler does not provide an extended card")
+        self._push_service = manager.push_service
+        if self._card.capabilities.push_notifications != (
+            self._push_service is not None
         ):
             raise ValueError(
-                "Native handler does not provide push notifications or an extended card"
+                "Native push capability must match its bound managed service"
             )
+        if self._push_service is not None:
+            self._require_push()
+
+    def _require_push(self) -> NativePushWorker:
+        if self._push_service is None:
+            raise PushNotificationNotSupportedError()
+        if self.manager.push_service is not self._push_service:
+            raise RuntimeError("Native handler lost its original push service binding")
+        worker = self._push_service.require_ready()
+        if worker.outbox.configurations.task_store is not self.manager.task_store:
+            raise RuntimeError("Native handler lost its canonical push task store")
+        return worker
 
     @property
     def agent_card(self) -> AgentCard:
@@ -186,7 +285,8 @@ class NativeA2ARequestHandler(RequestHandler):
         params, principal_id = admitted.request, admitted.principal_id
         validate_history_length(params.configuration)
         if params.configuration.HasField("task_push_notification_config"):
-            raise PushNotificationNotSupportedError()
+            with _push_errors():
+                self._require_push()
         try:
             metadata = MessageToDict(params.metadata)
             require_metadata_extensions(metadata, admitted.activated_extensions)
@@ -200,6 +300,10 @@ class NativeA2ARequestHandler(RequestHandler):
         ):
             raise ContentTypeNotSupportedError()
         if claims.peer_stop is not None:
+            if params.configuration.HasField("task_push_notification_config"):
+                raise InvalidParamsError(
+                    message="Peer Stop returns a Message and cannot register task push"
+                )
             if self._peer_stop_target is None:
                 raise UnsupportedOperationError(message="Peer Stop is not advertised")
             if (
@@ -209,7 +313,9 @@ class NativeA2ARequestHandler(RequestHandler):
                 or params.message.parts[0].WhichOneof("content") != "text"
                 or params.message.parts[0].text != (claims.peer_stop["reason"] or "")
             ):
-                raise InvalidParamsError(message="Peer Stop requires its own user message and reason")
+                raise InvalidParamsError(
+                    message="Peer Stop requires its own user message and reason"
+                )
             if output_modes:
                 validate_input_parts(
                     [Part(raw=b"{}", media_type="application/json")], output_modes
@@ -226,7 +332,9 @@ class NativeA2ARequestHandler(RequestHandler):
                 message_id=uuid4().hex,
                 context_id=params.message.context_id or uuid4().hex,
                 role=Role.ROLE_AGENT,
-                parts=[Part(raw=encode_inline_json(receipt), media_type="application/json")],
+                parts=[
+                    Part(raw=encode_inline_json(receipt), media_type="application/json")
+                ],
             )
         hint = claims.skill_hint
         if hint is not None:
@@ -255,6 +363,9 @@ class NativeA2ARequestHandler(RequestHandler):
             raise UnsupportedOperationError(message=str(error)) from error
         except TaskInputConflictError as error:
             raise InvalidParamsError(message=str(error)) from error
+        except (PushConfigConflict, SSRFError, PushServiceUnavailable):
+            with _push_errors():
+                raise
         except ContextOwnershipError as error:
             if is_execution_control_error(error):
                 raise
@@ -379,41 +490,87 @@ class NativeA2ARequestHandler(RequestHandler):
             async for event in events:
                 yield event
 
-    async def _unsupported_push(
-        self, params, context: ServerCallContext, operation: str
-    ):
-        async with self.guard.admit(params, operation, context):
-            raise PushNotificationNotSupportedError()
+    @asynccontextmanager
+    async def _admit_push(self, params, operation, context):
+        async with self.guard.admit(params, operation, context) as admitted:
+            with _push_errors():
+                yield admitted, self._require_push()
 
     async def on_create_task_push_notification_config(
         self, params: TaskPushNotificationConfig, context: ServerCallContext
     ) -> TaskPushNotificationConfig:
-        return await self._unsupported_push(
-            params, context, "CreateTaskPushNotificationConfig"
-        )
+        async with self._admit_push(
+            params, "CreateTaskPushNotificationConfig", context
+        ) as (admitted, worker):
+            await self._task(admitted.request.task_id, admitted.principal_id)
+            created = await worker.outbox.register(
+                admitted.request, creator_id=admitted.principal_id
+            )
+            return created.config
 
     async def on_get_task_push_notification_config(
         self, params: GetTaskPushNotificationConfigRequest, context: ServerCallContext
     ) -> TaskPushNotificationConfig:
-        return await self._unsupported_push(
-            params, context, "GetTaskPushNotificationConfig"
-        )
+        async with self._admit_push(
+            params, "GetTaskPushNotificationConfig", context
+        ) as (admitted, worker):
+            config = await worker.outbox.configurations.get(
+                admitted.request.task_id,
+                admitted.request.id,
+                creator_id=admitted.principal_id,
+            )
+            if config is None:
+                raise TaskNotFoundError()
+            return config.config
 
     async def on_list_task_push_notification_configs(
         self, params: ListTaskPushNotificationConfigsRequest, context: ServerCallContext
     ) -> ListTaskPushNotificationConfigsResponse:
-        return await self._unsupported_push(
-            params, context, "ListTaskPushNotificationConfigs"
-        )
+        async with self._admit_push(
+            params, "ListTaskPushNotificationConfigs", context
+        ) as (admitted, worker):
+            params = admitted.request
+            size = params.page_size or DEFAULT_LIST_TASKS_PAGE_SIZE
+            validate_page_size(size)
+            after = _push_after(
+                params.page_token,
+                self.guard.scope,
+                admitted.principal_id,
+                params.task_id,
+            )
+            configs = await worker.outbox.configurations.list(
+                params.task_id,
+                creator_id=admitted.principal_id,
+                limit=size + 1,
+                after=after,
+            )
+            return ListTaskPushNotificationConfigsResponse(
+                configs=[config.config for config in configs[:size]],
+                next_page_token=(
+                    _push_cursor(
+                        self.guard.scope,
+                        admitted.principal_id,
+                        params.task_id,
+                        configs[size - 1].config.id,
+                    )
+                    if len(configs) > size
+                    else ""
+                ),
+            )
 
     async def on_delete_task_push_notification_config(
         self,
         params: DeleteTaskPushNotificationConfigRequest,
         context: ServerCallContext,
     ) -> None:
-        await self._unsupported_push(
-            params, context, "DeleteTaskPushNotificationConfig"
-        )
+        async with self._admit_push(
+            params, "DeleteTaskPushNotificationConfig", context
+        ) as (admitted, worker):
+            await worker.delete(
+                admitted.request.task_id,
+                admitted.request.id,
+                creator_id=admitted.principal_id,
+            )
 
     async def on_get_extended_agent_card(
         self, params: GetExtendedAgentCardRequest, context: ServerCallContext

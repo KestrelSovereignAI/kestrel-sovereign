@@ -89,8 +89,11 @@ def create_native_agent_card(
     version: str,
     skills: Sequence[AgentSkill],
     peer_stop: bool = False,
+    push_notifications: bool = False,
 ) -> AgentCard:
     """Build and sign the one public contract for a hosted native recipient."""
+    if type(push_notifications) is not bool:
+        raise TypeError("Native push capability must be a boolean")
     if not isinstance(identity, AgentIdentity) or not identity.is_hybrid:
         raise ValueError("Native discovery requires a hybrid recipient identity")
     pair = identity.hybrid_keypair
@@ -127,6 +130,7 @@ def create_native_agent_card(
         ),
         capabilities=AgentCapabilities(
             streaming=True,
+            push_notifications=push_notifications,
             extensions=[
                 AgentExtension(
                     uri=uri,

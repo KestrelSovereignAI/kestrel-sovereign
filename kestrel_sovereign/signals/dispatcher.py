@@ -1746,6 +1746,13 @@ class SignalDispatcher:
             )
         )
 
+    @property
+    def durable_store(self) -> DurableSignalStore:
+        """Borrow the exact initialized primary ledger for host resident services."""
+        if not self._durable_initialized or self._durable_shutdown:
+            raise RuntimeError("The host durable signal ledger is not initialized")
+        return self._durable_store
+
     async def initialize_durable_delivery(self) -> None:
         """Initialize the durable consumer ledger exactly once.
 

@@ -30,6 +30,8 @@ from kestrel_sovereign.a2a.native_routes import (
     native_http_interfaces,
 )
 from kestrel_sovereign.a2a.native_sender import NativeProofPolicy
+from kestrel_sovereign.a2a.push_policy import NativePushPolicy
+from kestrel_sovereign.a2a.push_service import start_native_push_service
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import OutboundActorScopeError
@@ -56,8 +58,11 @@ class NativeHostingConfiguration:
 
     public_base_url: str
     discovery_routing_key: str | None = None
+    push: NativePushPolicy | None = None
 
     def __post_init__(self):
+        if self.push is not None and not isinstance(self.push, NativePushPolicy):
+            raise TypeError("Native hosting requires a validated push policy")
         native_http_interfaces(
             self.public_base_url,
             routing_key="configuration",
@@ -75,7 +80,7 @@ class NativeHostingConfiguration:
             if discovery is not None:
                 raise ValueError("A2A discovery requires KESTREL_BASE_URL")
             return None
-        return cls(base, discovery)
+        return cls(base, discovery, NativePushPolicy.from_environment(environment))
 
 
 class HostedNativeA2APublication:
@@ -104,6 +109,7 @@ class HostedNativeA2APublication:
         self._profile = profile
         self._binding: NativeA2AHTTP | None = None
         self._guard = None
+        self._push_service = None
 
     @classmethod
     async def prepare(cls, manager, registry, recipient, routing_key, configuration):
@@ -113,10 +119,31 @@ class HostedNativeA2APublication:
         )
         # Bad configuration, keys or skills refuse private onboarding, before
         # AgentManager installs any routing entry for this candidate.
+        publication._build_card(profile, preparing=True)
+        if configuration.push is not None:
+            publication._push_service = await start_native_push_service(
+                recipient.task_manager,
+                recipient.dispatcher.durable_store,
+                policy=configuration.push,
+                task_factory=recipient._track_runtime_task,
+            )
         publication._build_card(profile)
         return publication
 
-    def _build_card(self, profile: dict[str, str]) -> AgentCard:
+    def _build_card(
+        self, profile: dict[str, str], *, preparing: bool = False
+    ) -> AgentCard:
+        service = self.recipient.task_manager.push_service
+        if service is not None:
+            service.require_ready()
+        if not preparing and service is not self._push_service:
+            raise RuntimeError("Native publication lost its original push service")
+        if not preparing and (service is not None) != (
+            self.configuration.push is not None
+        ):
+            raise RuntimeError(
+                "Published push configuration differs from its bound service"
+            )
         return create_native_agent_card(
             identity=self.recipient.identity,
             scope=self.recipient.task_manager.task_store.scope,
@@ -127,6 +154,7 @@ class HostedNativeA2APublication:
             version=__version__,
             skills=self.recipient.task_manager.get_agent_skills(),
             peer_stop=True,
+            push_notifications=self.configuration.push is not None,
         )
 
     def publish(self) -> None:
@@ -146,7 +174,10 @@ class HostedNativeA2APublication:
         card = self._build_card(self._profile)
         binding = NativeA2AHTTP(
             NativeA2ARequestHandler(
-                self.recipient.task_manager, guard, card, peer_stop_target=self.recipient
+                self.recipient.task_manager,
+                guard,
+                card,
+                peer_stop_target=self.recipient,
             ),
             public_base_url=self.configuration.public_base_url,
             card_modifier=self.get_card,

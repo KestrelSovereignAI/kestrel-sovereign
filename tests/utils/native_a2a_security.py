@@ -38,6 +38,12 @@ NOW = 1_700_000_000
 EXTENSIONS = frozenset({SIGNED_SENDER_URI, RECIPIENT_POLICY_URI})
 
 
+@pytest_asyncio.fixture
+async def native_push_runtime():
+    """Wire tests opt into the real managed service explicitly."""
+    yield None
+
+
 @pytest.fixture(scope="module", name="native_signing")
 def signing():
     return signing_identity(SENDER)
