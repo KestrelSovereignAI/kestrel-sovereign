@@ -152,18 +152,17 @@ async def test_filter_stays_with_actual_pending_cleanup_owner(caplog):
     release, emitted = asyncio.Event(), asyncio.Event()
     before = list(logger.filters)
     error = RuntimeError(value.token)
-    with pytest.raises(RuntimeError) as caught:
-        with PushLogRedaction(value) as redaction:
+    with pytest.raises(RuntimeError) as caught, PushLogRedaction(value) as redaction:
 
-            async def cleanup():
-                await release.wait()
-                logger.info("original cleanup %s", value.token)
-                emitted.set()
+        async def cleanup():
+            await release.wait()
+            logger.info("original cleanup %s", value.token)
+            emitted.set()
 
-            owner = asyncio.create_task(cleanup())
-            resource = object()
-            error._kestrel_native_retirement_debts = ((resource, owner),)
-            raise error
+        owner = asyncio.create_task(cleanup())
+        resource = object()
+        error._kestrel_native_retirement_debts = ((resource, owner),)
+        raise error
     try:
         assert caught.value is error
         assert execution_cleanup_debts(error) == ((resource, owner),)
@@ -220,9 +219,8 @@ def test_partial_filter_registration_restores_context_and_bindings(caplog, monke
         raise error
 
     monkeypatch.setattr(caplog.handler, "addFilter", refuse)
-    with pytest.raises(RuntimeError) as caught:
-        with redaction:
-            pytest.fail("failed registration cannot admit the context")
+    with pytest.raises(RuntimeError) as caught, redaction:
+        pytest.fail("failed registration cannot admit the context")
     assert caught.value is error
     assert logger.filters == before
     assert not redaction._active.get()
