@@ -2541,7 +2541,14 @@ async def _wait_for_host_ingress_operation(
                 # The worker's child/RPC cancellation is a terminal worker
                 # result, not cancellation directed at this public caller.
                 break
-            except BaseException:  # noqa: BLE001 - discard worker traceback at boundary
+            except BaseException as error:  # noqa: BLE001 - retain failed observation of original owner
+                if deadline is not None and not operation.done():
+                    if admission is not None and admission.opening is None:
+                        admission.opening = error
+                    # A failed wait callback is not a terminal worker result.
+                    # Use the SAME bounded retirement path and retain the
+                    # accepted original; never project a result and abandon it.
+                    early_outcome = on_deadline()
                 break
     finally:
         if timer is not None:
@@ -12978,9 +12985,9 @@ class ProxyFeature(Feature):
             return await self._call_isolated_tool_owned(name, args)
 
     async def _call_isolated_tool_owned(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        from kestrel_sovereign.features.hosted_telegram_dispatch import record_scheduled_provenance
+        record_scheduled_provenance(self)
         context = _scheduled_tool_execution_context()
-        from kestrel_sovereign.features.hosted_telegram_dispatch import record_scheduled_context
-        record_scheduled_context(self, context)
         requested_at = asyncio.get_running_loop().time()
         experienced_wake = False
         # The gate keeps a selected client alive through the complete RPC.  It

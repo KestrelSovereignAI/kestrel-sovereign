@@ -97,6 +97,10 @@ class WireClient(_SDKWireClient):
     async def call_tool(self, name, arguments, **kwargs):
         return await self._rpc.call_tool(name, arguments, **kwargs)
 
+    @property
+    def supports_tool_execution_context(self):
+        return self._rpc.supports_tool_execution_context
+
 
 @asynccontextmanager
 async def sdk_host(tmp_path, monkeypatch, factory, *, timeout=30, expected_unknown=False, expected_denied=False):
@@ -508,4 +512,119 @@ async def test_deadline_is_bounded_but_original_authority_survives_until_physica
         finally:
             release.set()
             client.stop_release.set()
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_wait_callback_refusal_cannot_abandon_original_dispatch(tmp_path, monkeypatch):
+    class RefuseWaitCallback(asyncio.Task):
+        refused = False
+
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "_on_completion" and not self.refused:
+                self.refused = True
+                raise RuntimeError("controlled wait observation refusal")
+            return super().add_done_callback(callback, context=context)
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority, expected_denied=True) as (proxy, services, _, _):
+        loop = asyncio.get_running_loop()
+        previous = loop.get_task_factory()
+        observed = []
+
+        def factory(loop, coroutine, **kwargs):
+            if not observed and coroutine.cr_code.co_qualname == "create_owned_task.<locals>.run":
+                task = RefuseWaitCallback(coroutine, loop=loop, **kwargs)
+                observed.append(task)
+                return task
+            return (asyncio.Task(coroutine, loop=loop, **kwargs) if previous is None
+                    else previous(loop, coroutine, **kwargs))
+
+        loop.set_task_factory(factory)
+        try:
+            with pytest.raises(ExecutionAuthorityError):
+                await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+            assert len(observed) == 1 and observed[0].refused
+            assert services[0].sends == []
+            assert observed[0].done() or any(admission.admission.task is observed[0] for admission in proxy._host_ingress_admissions)
+        finally:
+            loop.set_task_factory(previous)
+            await asyncio.gather(*observed, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_provider_start_permanently_retains_unknown(tmp_path, monkeypatch):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority, expected_unknown=True) as (proxy, services, _, _):
+        service = services[0]
+        service.send_release.clear()
+        operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
+        try:
+            await asyncio.wait_for(service.send_entered.wait(), 1)
+            operation.cancel()
+            await asyncio.sleep(0)
+            service.send_release.set()
+            with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
+                await operation
+            with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
+                await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "no replay"})
+            assert len(service.sends) == 1
+        finally:
+            service.send_release.set()
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+def scheduled_scope():
+    from kestrel_sovereign.features.scheduler.runner import (
+        SchedulerExecution,
+        _SchedulerExecutionScope,
+    )
+
+    return _SchedulerExecutionScope(SchedulerExecution(
+        id="execution-1", schedule_id="schedule-1", agent_id="did:test:isolated-integration",
+        task_name="telegram_send", args={}, scheduled_for="2026-10-21T15:00:00+00:00",
+        idempotency_key="controlled-stable-effect", attempt=1, owner="controlled-owner",
+    ))
+
+
+@pytest.mark.asyncio
+async def test_scheduled_context_translation_refusal_stays_scheduler_failure(tmp_path, monkeypatch):
+    from kestrel_sovereign.features import isolated_runtime
+    from kestrel_sovereign.features.scheduler.runner import (
+        bind_scheduler_execution_scope,
+    )
+
+    def refused():
+        raise isolated_runtime.SchedulerExecutionContextUnavailable("controlled missing SDK context")
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, _):
+        monkeypatch.setattr(isolated_runtime, "_scheduled_tool_execution_context", refused)
+        with bind_scheduler_execution_scope(scheduled_scope()), pytest.raises(isolated_runtime.SchedulerExecutionContextUnavailable):
+            await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        assert services[0].sends == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_revocation_during_activation_prevents_actual_provider_dispatch(tmp_path, monkeypatch):
+    from kestrel_sovereign.features.isolated_runtime import (
+        SchedulerExecutionContextUnavailable,
+    )
+    from kestrel_sovereign.features.scheduler.runner import (
+        bind_scheduler_execution_scope,
+    )
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, _):
+        service, scope = services[0], scheduled_scope()
+        service.activation_release.clear()
+        with bind_scheduler_execution_scope(scope):
+            operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
+        try:
+            await asyncio.wait_for(service.activation_entered.wait(), 1)
+            scope.revoke()
+            service.activation_release.set()
+            with pytest.raises(SchedulerExecutionContextUnavailable):
+                await operation
+            assert service.sends == []
+        finally:
+            service.activation_release.set()
             await asyncio.gather(operation, return_exceptions=True)

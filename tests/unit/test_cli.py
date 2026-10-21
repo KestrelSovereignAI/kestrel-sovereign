@@ -828,8 +828,20 @@ class TestCmdTerminateReportsOnlyVerifiedTermination:
         Treating EADDRNOTAVAIL as "taken" rejects a start uvicorn would have
         completed, and reports an incomplete shutdown on a usable port.
         """
-        # TEST-NET-1: valid, resolvable, and never assigned to this host.
-        assert ProcessManager.is_port_in_use(9998, "192.0.2.1") is False
+        import errno
+        import socket
+        import sys
+
+        # Darwin assigns only configured loopback aliases, unlike Linux's
+        # whole 127/8 route. Use an unassigned loopback alias there: this tests
+        # the real kernel error without requiring a nonlocal bind in offline
+        # test environments. Other platforms retain TEST-NET-1.
+        host = "127.254.253.252" if sys.platform == "darwin" else "192.0.2.1"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            with pytest.raises(OSError) as unassignable:
+                probe.bind((host, 0))
+        assert unassignable.value.errno == errno.EADDRNOTAVAIL
+        assert ProcessManager.is_port_in_use(9998, host) is False
 
     def test_an_unresolvable_bind_address_is_not_called_occupied(self, monkeypatch):
         """A typo is a configuration fault, not another process holding a port.

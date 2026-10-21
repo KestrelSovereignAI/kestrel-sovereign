@@ -59,11 +59,17 @@ def is_hosted_send(proxy: Any, name: Any) -> bool:
     )
 
 
-def record_scheduled_context(proxy, context):
+def record_scheduled_provenance(proxy):
     admission = _active_dispatch.get()
     if (admission is not None and admission.proxy is proxy
         and admission.admission.task is asyncio.current_task()):
-        admission.scheduled_tool = context is not None
+        from kestrel_sovereign.features.scheduler.runner import (
+            capture_scheduler_execution_scope,
+        )
+
+        # The revocable scope is trusted provenance, even if translating it
+        # to SDK context subsequently fails or observes occurrence revocation.
+        admission.scheduled_tool = capture_scheduler_execution_scope() is not None
 
 
 def start_dispatch(proxy: Any, name: Any, arguments: Any):
@@ -150,7 +156,11 @@ async def wait_dispatch(owner):
             runtime._consume_host_ingress_operation(_task)
             runtime._finish_host_ingress_admission(admission, slot.take())
 
-        task.add_done_callback(harvest)
+        try:
+            task.add_done_callback(harvest)
+        except BaseException as opening:  # noqa: BLE001 - original remains rooted by its retained admission
+            if admission.opening is None:
+                admission.opening = opening
         return outcome
 
     outcome, cancellation = await runtime._wait_for_host_ingress_operation(
@@ -162,6 +172,11 @@ async def wait_dispatch(owner):
         outcome = runtime._HostIngressOutcome(
             runtime._HOST_INGRESS_CONTROL, commit_outcome="unknown",
         )
+        admission.native_error = ExecutionCommitOutcomeError("unknown")
+        admission.core_outcome = outcome
+        outcome = runtime._retain_host_ingress_public_outcome(proxy, outcome)
+        proxy._retain_execution_control(admission.native_error)
+        proxy._latch_terminal_lifecycle()
         cancellation = None
     return outcome, cancellation
 
@@ -235,6 +250,16 @@ async def dispatch_admitted(proxy, arguments, context):
                     admission.require_work(proxy.agent)
                     if proxy._client is not client:
                         raise RuntimeError("hosted Telegram child changed during dispatch")
+                    if context is not None:
+                        from kestrel_sovereign.features.scheduler.runner import (
+                            get_current_scheduler_execution,
+                        )
+
+                        # Host authority entry and activation suspend. The
+                        # original occurrence may have been revoked meanwhile.
+                        execution = get_current_scheduler_execution()
+                        if execution is None or execution.id != context.invocation_id:
+                            raise runtime.SchedulerExecutionContextUnavailable("scheduled hosted dispatch authority changed")
                     admission.provider_rpc_started = True
                     response = (
                         await client.call_tool("telegram_send", dict(arguments)) if context is None
