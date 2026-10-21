@@ -14,6 +14,37 @@ from tests.utils.tls import make_tls_contexts, tls_http_server
 
 
 @pytest.fixture
+def outbound_close_barrier(monkeypatch):
+    """Retain the real response stream's close until its test owner releases it."""
+    import asyncio
+
+    import httpx
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_init = httpx.AsyncClient.__init__
+
+    async def response_owner(response):
+        original_close = response.stream.aclose
+
+        async def close():
+            entered.set()
+            await release.wait()
+            await original_close()
+
+        response.stream.aclose = close
+
+    def client_owner(client, *args, **kwargs):
+        original_init(client, *args, **kwargs)
+        client.event_hooks["response"].append(response_owner)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", client_owner)
+    try:
+        yield SimpleNamespace(entered=entered, release=release)
+    finally:
+        release.set()
+
+
+@pytest.fixture
 def outbound_tls(tmp_path, monkeypatch, request):
     """Route only a validated public IP to a private real TLS peer."""
     hostname = "xn--strae-oqa.example"

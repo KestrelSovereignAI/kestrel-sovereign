@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-21
-**Scope:** 3260 tracked files (2431 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3262 tracked files (2433 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -128,7 +128,9 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/projections.py** — Read-only presentation of official native protocol values.
   - `def embedded_json_value(part)`; `def message_text(message)`; `def task_presentation(candidate)`
 - **kestrel_sovereign/a2a/push_outbox.py** — Native push subscriptions over the canonical durable signal consumer ledger.
-  - `class PushSubscription`; `class NativePushOutbox`
+  - `class PushSubscription`; `class PreparedPushConfig`; `class NativePushOutbox`
+- **kestrel_sovereign/a2a/push_service.py** — Managed publication and retirement of the native push resident worker.
+  - `class NativePushService`
 - **kestrel_sovereign/a2a/push_transport.py** — Native push POSTs with pinned egress and original HTTP resource retirement.
   - `class PushDeliveryRevoked`; `def push_headers(config)`; `async def validate_push_configuration(config)`; `class NativePushTransport`
 - **kestrel_sovereign/a2a/push_worker.py** — Owned native push execution, durable retries, and physical Delete retirement.
@@ -3452,10 +3454,12 @@ Repo entry points and standard project files.
   - `async def push_store(native_a2a_backend_factory, monkeypatch)`; `def config(task, config_id)`; `async def admit(store, configuration)`; `async def test_native_config_round_trip_encrypts_all_callback_material(push_store)`; `async def test_task_creator_authority_cannot_be_forged_by_another_principal(push_store, operation)`; `async def test_ciphertext_is_bound_to_every_ownership_column(push_store, field)`; `async def test_deletion_revokes_new_reads_and_retains_original_generation_until_retirement(push_store)`; `async def test_config_id_default_pagination_and_duplicate_refusal(push_store)`; `…`
 - **tests/unit/test_a2a_native_push_outbox.py** — Atomic encrypted registration and durable metadata-only native push fan-out.
   - `async def outbox(push_store)`; `def callback(task, config_id)`; `async def test_registration_commits_encrypted_config_consumer_and_initial_reference(outbox)`; `async def test_registration_is_atomic_when_its_enclosing_task_admission_rolls_back(outbox)`; `async def test_forwarding_and_journal_receipt_rollback_together(outbox)`; `async def test_lost_forward_receipt_ack_cannot_duplicate_native_deliveries(outbox)`; `async def test_unsafe_callback_is_refused_before_registration_or_initial_enqueue(outbox, url)`; `async def test_invalid_callback_header_refuses_before_any_registration(outbox, field)`; `…`
+- **tests/unit/test_a2a_native_push_service.py** — Original resident acceptance, startup failure, and service shutdown custody.
+  - `async def test_service_publishes_only_its_original_ready_worker_and_joins_shutdown(outbox)`; `async def test_failed_publication_keeps_and_joins_the_original_accepted_resident(outbox)`; `async def test_preacceptance_refusal_closes_the_fresh_operation_without_adopting_a_task(outbox)`; `async def test_original_worker_storage_failure_wakes_startup_without_a_false_ready_ack(outbox)`; `async def test_startup_cancellation_joins_the_original_resident_before_returning(outbox, monkeypatch)`; `async def test_waiting_for_readiness_without_an_accepted_owner_is_refused(outbox)`; `async def test_invalid_publication_result_still_retires_the_original_accepted_owner(outbox)`; `async def test_service_shutdown_joins_the_original_http_close_before_storage_release(outbox, outbound_tls, outbound_close_barrier, cancel_observer)`; `…`
 - **tests/unit/test_a2a_native_push_transport.py** — Real pinned TLS, standard push events and durable HTTP retirement receipts.
   - `async def configured(push_store, url)`; `async def test_cancel_during_admission_joins_original_commit_without_http(push_store, outbound_tls, monkeypatch)`; `async def test_push_sends_standard_stream_response_and_retires_real_https(push_store, outbound_tls, event_kind)`; `async def test_callback_http_failure_is_not_success_or_a_redirect_retry(push_store, outbound_tls, path, status)`; `async def test_callback_certificate_failure_retires_without_sending_credentials(push_store, outbound_tls)`; `async def test_callback_url_refusal_has_no_tcp_effect(push_store, url, monkeypatch)`; `async def test_deleted_generation_refuses_before_dns_or_https(push_store, outbound_tls)`; `async def test_invalid_callback_headers_refuse_before_delivery_admission(push_store, outbound_tls, fault)`; `…`
 - **tests/unit/test_a2a_native_push_worker.py** — Real HTTPS callbacks, durable ACK/retry, and original deletion ownership.
-  - `def worker(value)`; `async def register(value, task, url)`; `async def test_native_delivery_acknowledges_only_after_actual_https_and_retirement(outbox, outbound_tls)`; `async def test_http_failure_uses_the_existing_retry_ledger_without_secret_diagnostics(outbox, outbound_tls)`; `async def test_dispatch_gate_checks_the_original_delivery_lease_after_dns(outbox, outbound_tls, monkeypatch)`; `async def test_delete_physically_joins_original_response_close_before_ack(outbox, outbound_tls, monkeypatch)`; `async def test_remote_or_failed_physical_owner_blocks_delete_without_erasing_credentials(outbox)`; `async def test_task_cleanup_requires_config_deletion_even_before_the_first_http_attempt(outbox)`; `…`
+  - `def worker(value)`; `async def register(value, task, url)`; `async def test_native_delivery_acknowledges_only_after_actual_https_and_retirement(outbox, outbound_tls)`; `async def test_http_failure_uses_the_existing_retry_ledger_without_secret_diagnostics(outbox, outbound_tls)`; `async def test_dispatch_gate_checks_the_original_delivery_lease_after_dns(outbox, outbound_tls, monkeypatch)`; `async def test_delete_physically_joins_original_response_close_before_ack(outbox, outbound_tls, monkeypatch, outbound_close_barrier)`; `async def test_remote_or_failed_physical_owner_blocks_delete_without_erasing_credentials(outbox)`; `async def test_task_cleanup_requires_config_deletion_even_before_the_first_http_attempt(outbox)`; `…`
 - **tests/unit/test_a2a_native_question_store.py** — Real primary question correlation, native receipt authority and durable wake claims.
   - `async def questions(native_a2a_backend_factory)`; `def correlation(kind, question_id)`; `async def reserve(p, question_id)`; `def response(question, request)`; `async def acknowledge(p, dispatch, answer)`; `async def test_question_intent_precedes_delivery_and_keeps_local_lineage(questions)`; `async def test_question_intent_refuses_unbound_or_changed_dispatch(questions, tamper)`; `async def test_authorized_correlated_answer_commits_one_complete_wake(questions, taskless)`; `…`
 - **tests/unit/test_a2a_native_question_supervisor.py** — Real native ledgers, durable signal admissions and restarted question recovery.
@@ -5522,7 +5526,7 @@ Repo entry points and standard project files.
 - **tests/utils/original_failure.py** — Source identity and physical-retirement assertions shared by custody tests.
   - `class OriginalFailure`
 - **tests/utils/outbound_tls.py** — One verified public-origin TLS fixture for production GET and POST callers.
-  - `def outbound_tls(tmp_path, monkeypatch, request)`
+  - `def outbound_close_barrier(monkeypatch)`; `def outbound_tls(tmp_path, monkeypatch, request)`
 - **tests/utils/override_writers.py** — Name the operator as the writer of a model mandate a test pins (#2652).
   - `def as_operator()`
 - **tests/utils/parallel_support.py** — Parallel test execution support utilities.

@@ -909,10 +909,27 @@ receipt. A remote or failed owner leaves deletion pending with credentials
 retained; an expired lease cannot establish retirement. Active configurations
 also block task cleanup before their first HTTP request.
 
-These durable storage and delivery components are implemented. The handler
-continues to advertise push as unsupported until managed host lifetime, standard
-config operations and atomic inline admission are connected. No network request
-may hold a database transaction.
+`NativePushOutbox.prepare` validates a copied callback before task row locks and
+returns a frozen, secret-bearing `PreparedPushConfig`. Its one
+`register_prepared` path binds that value to the recipient/tenant and the
+server-admitted task ID without DNS inside the transaction. Ordinary config
+creation delegates through the same preparation and registration path.
+
+The optional push schema bundle is revision 1. Configuration, delivery-attempt
+and subscription DDL commit with its completion marker under the native schema
+lease. A completed boot skips data-table DDL. The shared encryption key must be
+available before any push schema write, including on a repeated boot.
+
+`NativePushService` retains the original resident task admission before its
+host publisher can return or fail. Startup waits for readiness while observing
+the original owner's failure. Refused publication closes the fresh coroutine;
+accepted publication failure joins that exact resident. Shutdown joins the
+original worker through observer cancellation and physical HTTP close.
+
+These components are implemented. The handler continues to advertise push as
+unsupported until TaskManager, managed host startup, standard config operations
+and atomic inline admission are connected. No network request may hold a
+database transaction.
 
 `prepare_native_task_input` copies the complete official request and hashes its
 canonical JSON before extracting inline callback credentials. Initial and

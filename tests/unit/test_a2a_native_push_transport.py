@@ -25,6 +25,9 @@ from tests.unit.test_a2a_native_push_config_store import (
     push_store as push_store,  # noqa: PLC0414 - pytest fixture re-export
 )
 from tests.utils.outbound_tls import (
+    outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - pytest fixture re-export
+)
+from tests.utils.outbound_tls import (
     outbound_tls as outbound_tls,  # noqa: PLC0414 - pytest fixture re-export
 )
 
@@ -287,31 +290,17 @@ async def test_revocation_after_dns_is_checked_again_at_actual_dispatch(
 
 @pytest.mark.parametrize("cancel_caller", [False, True])
 async def test_delete_and_delivery_ack_wait_for_original_response_close(
-    push_store, outbound_tls, monkeypatch, cancel_caller
+    push_store, outbound_tls, outbound_close_barrier, cancel_caller
 ):
     import asyncio
 
     transport, configuration, task = await configured(
         push_store, outbound_tls.url + "/callback"
     )
-    close_entered, release_close = asyncio.Event(), asyncio.Event()
-    native_init = httpx.AsyncClient.__init__
-
-    async def retain_physical_close(response):
-        native_close = response.stream.aclose
-
-        async def delayed_close():
-            close_entered.set()
-            await release_close.wait()
-            await native_close()
-
-        response.stream.aclose = delayed_close
-
-    def client_with_close_witness(client, *args, **kwargs):
-        native_init(client, *args, **kwargs)
-        client.event_hooks["response"].append(retain_physical_close)
-
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", client_with_close_witness)
+    close_entered, release_close = (
+        outbound_close_barrier.entered,
+        outbound_close_barrier.release,
+    )
     sending = asyncio.create_task(
         transport.send(configuration, task, executor_id="runtime")
     )

@@ -3,7 +3,6 @@
 import asyncio
 from datetime import timedelta
 
-import httpx
 import pytest
 
 from kestrel_sovereign.a2a.push_transport import NativePushTransport
@@ -16,6 +15,9 @@ from tests.unit.test_a2a_native_push_outbox import (
 )
 from tests.unit.test_a2a_native_push_outbox import (
     push_store as push_store,  # noqa: PLC0414 - pytest fixture dependency
+)
+from tests.utils.outbound_tls import (
+    outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - pytest fixture re-export
 )
 from tests.utils.outbound_tls import (
     outbound_tls as outbound_tls,  # noqa: PLC0414 - pytest fixture re-export
@@ -166,34 +168,19 @@ async def test_dispatch_gate_checks_the_original_delivery_lease_after_dns(
 
 @pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
 async def test_delete_physically_joins_original_response_close_before_ack(
-    outbox, outbound_tls, monkeypatch
+    outbox, outbound_tls, monkeypatch, outbound_close_barrier
 ):
     value, task = outbox
     runner, config = await register(value, task, outbound_tls.url + "/callback")
-    entered, release, revoked = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    original_init = httpx.AsyncClient.__init__
+    entered, release = outbound_close_barrier.entered, outbound_close_barrier.release
+    revoked = asyncio.Event()
     original_revoke = value.revoke
-
-    async def response_owner(response):
-        original_close = response.stream.aclose
-
-        async def close():
-            entered.set()
-            await release.wait()
-            await original_close()
-
-        response.stream.aclose = close
-
-    def client_owner(client, *args, **kwargs):
-        original_init(client, *args, **kwargs)
-        client.event_hooks["response"].append(response_owner)
 
     async def revoke(*args, **kwargs):
         result = await original_revoke(*args, **kwargs)
         revoked.set()
         return result
 
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", client_owner)
     monkeypatch.setattr(value, "revoke", revoke)
     sending = asyncio.create_task(runner.run_once())
     deleting = None
@@ -258,28 +245,11 @@ async def test_task_cleanup_requires_config_deletion_even_before_the_first_http_
 
 @pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
 async def test_caller_cancellation_waits_for_physical_retirement_and_preserves_the_lease(
-    outbox, outbound_tls, monkeypatch
+    outbox, outbound_tls, outbound_close_barrier
 ):
     value, task = outbox
     runner, _ = await register(value, task, outbound_tls.url + "/callback")
-    entered, release = asyncio.Event(), asyncio.Event()
-    original_init = httpx.AsyncClient.__init__
-
-    async def response_owner(response):
-        original_close = response.stream.aclose
-
-        async def close():
-            entered.set()
-            await release.wait()
-            await original_close()
-
-        response.stream.aclose = close
-
-    def client_owner(client, *args, **kwargs):
-        original_init(client, *args, **kwargs)
-        client.event_hooks["response"].append(response_owner)
-
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", client_owner)
+    entered, release = outbound_close_barrier.entered, outbound_close_barrier.release
     sending = asyncio.create_task(runner.run_once())
     try:
         await entered.wait()

@@ -186,6 +186,10 @@ class PushConfigStore(UnifiedStoreBase):
         # configuration writes and reads; there is no plaintext storage mode.
         return AEADCipher(get_agent_key(self.scope.recipient_id, "service-keys"))
 
+    def require_encryption_ready(self) -> None:
+        """Refuse service startup before any schema work when keys are absent."""
+        self._cipher()
+
     def _decode(self, row) -> PushConfiguration:
         task_id, config_id, creator_id, generation, ciphertext = row
         locator = TaskPushNotificationConfig(

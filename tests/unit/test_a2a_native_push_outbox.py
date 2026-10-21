@@ -15,7 +15,7 @@ from kestrel_sovereign.a2a.stores.unified.push_config_store import (
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
 from kestrel_sovereign.signals.durable import DurableSignalStore
-from kestrel_sovereign.storage.db.interface import TransactionError
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.unit.test_a2a_native_push_config_store import config
 from tests.unit.test_a2a_native_push_config_store import (
     push_store as push_store,  # noqa: PLC0414 - pytest fixture re-export
@@ -279,6 +279,106 @@ async def test_registration_validation_owns_an_immutable_callback_copy(
         await asyncio.gather(registration, return_exceptions=True)
 
 
+async def test_prepared_inline_registration_has_no_dns_inside_the_task_transaction(
+    outbox, monkeypatch
+):
+    from kestrel_sovereign.a2a import push_transport
+
+    value, task = outbox
+    native = callback(task)
+    native.task_id = ""
+    prepared = await value.prepare(native)
+    native.url = "https://127.0.0.1"
+    prepared.config.authentication.credentials = "mutated-reader"
+    assert "callback-secret" not in repr(prepared)
+
+    async def refuse_dns(*args, **kwargs):
+        raise AssertionError(
+            "Push registration attempted DNS inside its task transaction"
+        )
+
+    monkeypatch.setattr(push_transport, "assert_safe_url", refuse_dns)
+    async with value.write_transaction():
+        created = await value.register_prepared(
+            prepared, creator_id="did:creator", task_id=task.id
+        )
+    assert created.config.task_id == task.id
+    assert created.config.url == callback(task).url
+    assert created.config.authentication.credentials == "callback-secret"
+    assert (await value.subscriptions())[0].generation == created.generation
+
+
+async def test_prepared_registration_cannot_change_recipient_tenant_or_selected_task(
+    outbox,
+):
+    value, task = outbox
+    prepared = await value.prepare(callback(task))
+    foreign = NativePushOutbox(
+        PushConfigStore(
+            TaskStore(
+                value.backend,
+                scope=NativeRecipientScope("did:other", "tenant"),
+                owns_backend=False,
+            )
+        ),
+        value.signals,
+        retention_days=30,
+        lease_seconds=60,
+    )
+    with pytest.raises(PushConfigConflict, match="recipient scope"):
+        await foreign.register_prepared(prepared, creator_id="did:creator")
+    with pytest.raises(PushConfigConflict, match="another task"):
+        await value.register_prepared(
+            prepared, creator_id="did:creator", task_id="another-task"
+        )
+    assert await value.subscriptions() == []
+
+
+async def test_unbound_inline_registration_requires_the_server_admitted_task_id(outbox):
+    value, task = outbox
+    native = callback(task)
+    native.task_id = ""
+    prepared = await value.prepare(native)
+    with pytest.raises(PushConfigConflict, match="admitted task ID"):
+        await value.register_prepared(prepared, creator_id="did:creator")
+
+
+async def test_foreign_tenant_preparation_refuses_before_dns(outbox, monkeypatch):
+    from kestrel_sovereign.a2a import push_transport
+
+    value, task = outbox
+    native = callback(task)
+    native.tenant = "another-tenant"
+
+    async def refuse_dns(*args, **kwargs):
+        raise AssertionError("Another tenant reached callback DNS validation")
+
+    monkeypatch.setattr(push_transport, "assert_safe_url", refuse_dns)
+    with pytest.raises(PushConfigConflict, match="another tenant"):
+        await value.prepare(native)
+
+
+@pytest.mark.parametrize("bad", [None, {}, "private-config"])
+async def test_prepared_boundary_requires_native_values_and_prepared_handoffs(
+    outbox, bad
+):
+    value, _ = outbox
+    with pytest.raises(TypeError, match="official"):
+        await value.prepare(bad)
+    with pytest.raises(TypeError, match="prepared"):
+        await value.register_prepared(bad, creator_id="did:creator")
+
+
+@pytest.mark.parametrize("bad", ["", " ", True])
+async def test_inline_task_assignment_requires_a_concrete_server_id(outbox, bad):
+    value, task = outbox
+    native = callback(task)
+    native.task_id = ""
+    prepared = await value.prepare(native)
+    with pytest.raises(ValueError, match="admitted task ID"):
+        await value.register_prepared(prepared, creator_id="did:creator", task_id=bad)
+
+
 async def test_tenant_scopes_are_distinct_even_on_the_same_backend(outbox):
     value, task = outbox
     await value.register(callback(task), creator_id="did:creator")
@@ -315,3 +415,88 @@ async def test_invalid_delivery_policy_is_refused_before_storage(
             retention_days=retention,
             lease_seconds=lease,
         )
+
+
+async def test_push_schema_completion_covers_the_whole_atomic_bundle(
+    push_store, monkeypatch
+):
+    store, _ = push_store
+    signals = DurableSignalStore(store.backend)
+    await signals.initialize()
+    await store.backend.execute("DROP TABLE a2a_push_delivery_attempts")
+    await store.backend.execute("DROP TABLE a2a_push_configs")
+    original = store.backend.execute_script
+
+    async def refuse_subscription_ddl(script):
+        if "CREATE TABLE IF NOT EXISTS a2a_push_subscriptions" in script:
+            # Exercise real DDL followed by a real database error. The schema
+            # transaction must also roll back the earlier config/attempt DDL.
+            script += "; SELECT original_missing_subscription_ddl_function()"
+        return await original(script)
+
+    monkeypatch.setattr(store.backend, "execute_script", refuse_subscription_ddl)
+    value = NativePushOutbox(store, signals, retention_days=30, lease_seconds=60)
+    with pytest.raises((QueryError, TransactionError)):
+        await value.initialize()
+    for table in (
+        "a2a_push_configs",
+        "a2a_push_delivery_attempts",
+        "a2a_push_subscriptions",
+    ):
+        assert not await store.backend.table_exists(table)
+    assert (
+        await store.backend.fetch_one(
+            "SELECT revision FROM a2a_native_store_schema WHERE component = 'push'"
+        )
+        is None
+    )
+
+
+async def test_completed_push_boot_keeps_its_schema_lease_without_replaying_ddl(
+    outbox, monkeypatch
+):
+    from kestrel_sovereign.a2a.native_schema import NativeStoreSchema
+
+    value, _ = outbox
+    assert (
+        await value.backend.fetch_one(
+            "SELECT component, revision FROM a2a_native_store_schema WHERE component = 'push'"
+        )
+        == NativeStoreSchema.PUSH.value
+    )
+
+    async def refuse_data_ddl():
+        raise AssertionError("Completed push boot replayed data-table migration DDL")
+
+    monkeypatch.setattr(value.configurations, "initialize", refuse_data_ddl)
+    await value.initialize()
+
+
+async def test_missing_service_key_refuses_push_boot_before_any_schema_change(
+    push_store, monkeypatch
+):
+    from kestrel_sdk.security.exceptions import MasterKeyNotConfiguredError
+
+    from kestrel_sovereign.a2a.stores.unified import push_config_store
+
+    store, _ = push_store
+    signals = DurableSignalStore(store.backend)
+    await signals.initialize()
+    original = MasterKeyNotConfiguredError("original missing service key")
+
+    def unavailable_key(*args):
+        raise original
+
+    monkeypatch.setattr(push_config_store, "get_agent_key", unavailable_key)
+    with pytest.raises(MasterKeyNotConfiguredError) as caught:
+        await NativePushOutbox(
+            store, signals, retention_days=30, lease_seconds=60
+        ).initialize()
+    assert caught.value is original
+    assert not await store.backend.table_exists("a2a_push_subscriptions")
+    assert (
+        await store.backend.fetch_one(
+            "SELECT revision FROM a2a_native_store_schema WHERE component = 'push'"
+        )
+        is None
+    )
