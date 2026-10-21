@@ -23,6 +23,7 @@ from google.protobuf.json_format import MessageToJson
 from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx_async_transport
 
 from kestrel_sovereign._async_ownership import await_owned_operation
+from kestrel_sovereign.a2a.push_logging import PushLogRedaction
 from kestrel_sovereign.a2a.stores.unified.push_config_store import (
     PushConfigConflict,
     PushConfigStore,
@@ -79,9 +80,10 @@ async def validate_push_configuration(
     if not isinstance(config, TaskPushNotificationConfig):
         raise TypeError("Native push requires an official TaskPushNotificationConfig")
     config = TaskPushNotificationConfig.FromString(config.SerializeToString())
-    validate_proto_required_fields(config)
-    push_headers(config)
-    await assert_safe_url(config.url, allowed_schemes=("https",))
+    with PushLogRedaction(config):
+        validate_proto_required_fields(config)
+        push_headers(config)
+        await assert_safe_url(config.url, allowed_schemes=("https",))
     return config
 
 
@@ -121,85 +123,87 @@ class NativePushTransport:
         headers = push_headers(configuration.config)
         payload = MessageToJson(to_stream_response(event)).encode("utf-8")
         attempt = self.store.prepare_delivery(configuration, executor_id=executor_id)
-        admitted = None
-        original = None
-        try:
-            admission = await await_owned_operation(
-                self.store.admit_delivery(attempt),
-                retirement_resource=attempt,
-                retain_originals=True,
-                name="native-push-admit-http-attempt",
-            )
-            admitted = admission.result
-            error = execution_terminal_error(
-                admission.cancellation,
-                admission.error,
-                retain_originals=True,
-                prefer_cancellation=True,
-            )
-            if error is not None:
-                raise error
-            if not admitted:
-                raise PushDeliveryRevoked("Push configuration is no longer active")
-            validated = await assert_safe_url(
-                configuration.config.url, allowed_schemes=("https",)
-            )
+        with PushLogRedaction(configuration.config) as redaction:
+            admitted = None
+            original = None
+            try:
+                admission = await await_owned_operation(
+                    self.store.admit_delivery(attempt),
+                    retirement_resource=attempt,
+                    retain_originals=True,
+                    name="native-push-admit-http-attempt",
+                )
+                admitted = admission.result
+                error = execution_terminal_error(
+                    admission.cancellation,
+                    admission.error,
+                    retain_originals=True,
+                    prefer_cancellation=True,
+                )
+                if error is not None:
+                    raise error
+                if not admitted:
+                    raise PushDeliveryRevoked("Push configuration is no longer active")
+                validated = await assert_safe_url(
+                    configuration.config.url, allowed_schemes=("https",)
+                )
+                redaction.protect(str(httpx.URL(validated.url)))
 
-            async def authorize():
-                if not await self.store.delivery_is_current(attempt):
-                    raise PushDeliveryRevoked(
-                        "Push configuration was revoked before HTTP dispatch"
+                async def authorize():
+                    if not await self.store.delivery_is_current(attempt):
+                        raise PushDeliveryRevoked(
+                            "Push configuration was revoked before HTTP dispatch"
+                        )
+                    if before_dispatch is not None:
+                        await before_dispatch()
+
+                async with owned_native_http_client(
+                    httpx.AsyncClient(
+                        transport=pinned_httpx_async_transport(validated),
+                        timeout=httpx.Timeout(self.timeout),
+                        follow_redirects=False,
+                        trust_env=False,
                     )
-                if before_dispatch is not None:
-                    await before_dispatch()
-
-            async with owned_native_http_client(
-                httpx.AsyncClient(
-                    transport=pinned_httpx_async_transport(validated),
-                    timeout=httpx.Timeout(self.timeout),
-                    follow_redirects=False,
-                    trust_env=False,
+                ) as http:
+                    with bind_native_http_execution_admission(http, authorize):
+                        async with native_execution_response_owner(http):
+                            # Bound the whole exchange, including a slow header
+                            # producer; per-read socket deadlines alone do not.
+                            async with asyncio.timeout(self.timeout):
+                                response = await http.send(
+                                    http.build_request(
+                                        "POST",
+                                        validated.url,
+                                        content=payload,
+                                        headers=headers,
+                                    ),
+                                    stream=True,
+                                )
+                                response.raise_for_status()
+                            # The callback body is not a protocol response. The
+                            # native owner closes it without waiting for an
+                            # unbounded body or interpreting it as an A2A task.
+            except BaseException as error:  # noqa: BLE001 - original resource finalization
+                # This is a resource-finalization boundary: preserve cancellation,
+                # original execution control and failed physical cleanup alike.
+                original = error
+            if admitted is not False and not execution_cleanup_debts(original):
+                outcome = await await_owned_operation(
+                    self.store.retire_delivery(attempt),
+                    retirement_resource=attempt,
+                    retain_originals=True,
+                    name="native-push-retire-http-attempt",
                 )
-            ) as http:
-                with bind_native_http_execution_admission(http, authorize):
-                    async with native_execution_response_owner(http):
-                        # Bound the whole exchange, including a slow header
-                        # producer; per-read socket deadlines alone do not.
-                        async with asyncio.timeout(self.timeout):
-                            response = await http.send(
-                                http.build_request(
-                                    "POST",
-                                    validated.url,
-                                    content=payload,
-                                    headers=headers,
-                                ),
-                                stream=True,
-                            )
-                            response.raise_for_status()
-                        # The callback body is not a protocol response. The
-                        # native owner closes it without waiting for an
-                        # unbounded body or interpreting it as an A2A task.
-        except BaseException as error:  # noqa: BLE001 - original resource finalization
-            # This is a resource-finalization boundary: preserve cancellation,
-            # original execution control and failed physical cleanup alike.
-            original = error
-        if admitted is not False and not execution_cleanup_debts(original):
-            outcome = await await_owned_operation(
-                self.store.retire_delivery(attempt),
-                retirement_resource=attempt,
-                retain_originals=True,
-                name="native-push-retire-http-attempt",
-            )
-            original = execution_terminal_error(
-                original,
-                outcome.error,
-                outcome.cancellation,
-                retain_originals=True,
-            )
-            if original is None and outcome.result is not True:
-                original = PushConfigConflict(
-                    "Push delivery lost its original retirement record"
+                original = execution_terminal_error(
+                    original,
+                    outcome.error,
+                    outcome.cancellation,
+                    retain_originals=True,
                 )
-        if original is not None:
-            raise original
-        return attempt
+                if original is None and outcome.result is not True:
+                    original = PushConfigConflict(
+                        "Push delivery lost its original retirement record"
+                    )
+            if original is not None:
+                raise original
+            return attempt
