@@ -37,13 +37,13 @@ async def test_real_pg_sleep_episode_timestamp_binding_and_native_reader(native_
     """Exercise real persistence only: no sleep/reflection/provider invocation."""
     import re
     from datetime import datetime, timedelta, timezone
-    from kestrel_sovereign.storage.async_database import CORE_SCHEMA
+    from kestrel_sovereign.storage.async_database import core_schema_sql
     from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
     from kestrel_sovereign.storage.memory_models import MemoryEpisode
 
     backend, _, _ = native_pg
     db = AsyncDatabase(backend)
-    statements = re.findall(r"CREATE TABLE IF NOT EXISTS memory_episodes \([\s\S]*?\n\);", CORE_SCHEMA)
+    statements = re.findall(r"CREATE TABLE IF NOT EXISTS memory_episodes \([\s\S]*?\n\);", core_schema_sql("postgres"))
     assert len(statements) == 1
     await db.execute(statements[0])
     zone = timezone(timedelta(hours=offset))
