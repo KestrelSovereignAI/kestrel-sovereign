@@ -1149,6 +1149,7 @@ class SignalDispatcher:
         _durable_admission: asyncio.Future[DurableAdmissionResult] | None = None,
         _durable_delivery_consumer_id: Optional[str] = None,
         _durable_terminal_consumer_id: Optional[str] = None,
+        _durable_admission_fence: Any = None,
     ) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result
         (scheduler, heartbeat). Ordinary failures return `Status.FAILED`.
@@ -1209,6 +1210,7 @@ class SignalDispatcher:
                     durable_admission=staged_admission,
                     durable_delivery_consumer_id=_durable_delivery_consumer_id,
                     durable_terminal_consumer_id=_durable_terminal_consumer_id,
+                    durable_admission_fence=_durable_admission_fence,
                 )
                 if (
                     staged_admission is not None
@@ -1316,6 +1318,7 @@ class SignalDispatcher:
         *,
         source_event_id: Optional[str],
         consumer_id: str,
+        admission_fence: Any = None,
     ) -> SignalDispatchHandle:
         """Enqueue cursor-owning cognition behind one durable delivery lease.
 
@@ -1332,6 +1335,7 @@ class SignalDispatcher:
             source_event_id=source_event_id,
             _durable_admission=durable_admission,
             _durable_delivery_consumer_id=consumer_id,
+            _durable_admission_fence=admission_fence,
         )
         self._live_durable_cognition_event_ids.add(signal.id)
         task = self._agent._track_background_task(
@@ -1506,6 +1510,7 @@ class SignalDispatcher:
         *,
         source_event_id: Optional[str],
         consumer_id: str = DURABLE_TERMINAL_CONSUMER_ID,
+        admission_fence: Any = None,
     ) -> SignalDispatchHandle:
         """Persist a selected terminal ingress disposition without cognition."""
 
@@ -1517,6 +1522,7 @@ class SignalDispatcher:
             source_event_id=source_event_id,
             _durable_admission=durable_admission,
             _durable_terminal_consumer_id=consumer_id,
+            _durable_admission_fence=admission_fence,
         )
         task = self._agent._track_background_task(
             coro, name=f"durable_terminal:{consumer_id}:{signal.id}"
@@ -4082,6 +4088,7 @@ class SignalDispatcher:
         durable_admission: asyncio.Future[DurableAdmissionResult] | None = None,
         durable_delivery_consumer_id: Optional[str] = None,
         durable_terminal_consumer_id: Optional[str] = None,
+        durable_admission_fence: Any = None,
     ) -> SignalResult:
         # Step 1: validation
         registration = self._registry.get(signal.source)
@@ -4322,6 +4329,8 @@ class SignalDispatcher:
                     ),
                     "ingress_attestation": ingress_attestation,
                 }
+                if durable_admission_fence is not None:
+                    persistence_kwargs["admission_fence"] = durable_admission_fence
                 if durable_projection.payload_elided:
                     # Keep a local initial claimant outside the store's
                     # uncommitted-transaction window. The synchronous
@@ -4534,6 +4543,8 @@ class SignalDispatcher:
                                 signal.caller, event_id=persisted.event_id
                             )
                         ),
+                        **({"admission_fence": durable_admission_fence}
+                           if durable_admission_fence is not None else {}),
                     )
                     if not upgraded_legacy_delivery:
                         # ``False`` deliberately carries no admission meaning:

@@ -36,7 +36,9 @@ from kestrel_sovereign.stop import (
 )
 
 
-# A lease the HEALTHY steps of a test must never exhaust (#3330).
+# Short real leases for tests that deliberately exercise expiry (#3330).
+# Non-expiry scenarios use the production lease default rather than racing
+# ordinary SQLite admission against this test-only accelerated expiry window.
 #
 # Several tests below need a real SQLite round trip to finish inside the owner
 # lease before they reach the expiry they actually assert. At 30-40 ms that
@@ -635,7 +637,6 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
     first_db, second_db, store, replica_a, replica_b = await _shared_registries(
         tmp_path
     )
-    replica_a._owner_lease_seconds = _HEALTHY_LEASE_SECONDS
     agent = _ReplicaAgent("did:test:self-fenced-agent")
     replica_a.attach(agent)
     entered = asyncio.Event()
@@ -805,7 +806,6 @@ async def test_failed_reacquisition_stays_fenced_and_names_its_reason(tmp_path):
     registry = DistributedInvocationRegistry(
         store,
         poll_seconds=0.01,
-        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:failed-reacquisition")
     original_poll = store.poll_owner
@@ -909,11 +909,10 @@ async def test_fenced_generation_cannot_be_readmitted_by_successor(tmp_path):
     db = await AsyncDatabase.sqlite(str(tmp_path / "fenced-readmission.db"))
     store = DistributedInvocationStore(db)
     await store.ensure_schema()
-    registry = DistributedInvocationRegistry(
-        store,
-        poll_seconds=0.01,
-        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
-    )
+    # This exercises explicit epoch fencing, not wall-clock expiry. Keep the
+    # production owner lease so healthy SQLite admission reaches the actual
+    # stale-generation assertions; the short poll cadence is test-only.
+    registry = DistributedInvocationRegistry(store, poll_seconds=0.01)
     agent = _ReplicaAgent("did:test:fenced-readmission")
     try:
         assert await registry.register(agent, "fenced-turn", 1)
@@ -1082,7 +1081,6 @@ async def test_registry_close_abandons_each_owner_epoch_independently(
     registry = DistributedInvocationRegistry(
         store,
         poll_seconds=0.01,
-        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:independent-abandon")
     original_abandon_owner = store.abandon_owner
@@ -1158,7 +1156,6 @@ async def test_registry_close_hung_current_owner_cannot_starve_fenced_owner(
     registry = DistributedInvocationRegistry(
         store,
         poll_seconds=0.01,
-        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:hung-abandon")
     original_abandon_owner = store.abandon_owner

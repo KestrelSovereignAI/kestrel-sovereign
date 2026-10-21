@@ -1,11 +1,12 @@
 """Shared real TLS certificate and isolated HTTP server fixtures."""
-from contextlib import contextmanager
 import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
-from pathlib import Path
 import ssl
 import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from socketserver import TCPServer
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -13,11 +14,21 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 
+class _NumericLoopbackHTTPServer(ThreadingHTTPServer):
+    """Actual local TCP/TLS fixture without HTTPServer's reverse DNS lookup."""
+
+    def server_bind(self):
+        if self.server_address[0] != "127.0.0.1":
+            raise ValueError("TLS test server requires numeric IPv4 loopback")
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address
+
+
 def make_tls_contexts(directory: Path, hostname: str = "localhost", *, ip_addresses: tuple[str, ...] = ("127.0.0.1",)) -> tuple[ssl.SSLContext, ssl.SSLContext, Path]:
     """Make a short-lived TLS 1.3 certificate and a client that trusts it."""
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
@@ -67,7 +78,7 @@ def make_tls_contexts(directory: Path, hostname: str = "localhost", *, ip_addres
 @contextmanager
 def tls_http_server(context: ssl.SSLContext, handler: type[BaseHTTPRequestHandler]):
     """Own a loopback HTTPS server, bound to an OS-assigned private port."""
-    with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+    with _NumericLoopbackHTTPServer(("127.0.0.1", 0), handler) as server:
         server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()

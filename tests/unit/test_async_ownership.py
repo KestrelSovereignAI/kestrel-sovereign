@@ -129,6 +129,49 @@ async def test_borrowed_observation_withdraws_without_cancelling_or_joining_orig
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("allocation", ["completion", "shield"])
+async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation):
+    release, refused = asyncio.Event(), asyncio.Event()
+    failure = RuntimeError("controlled original completion allocation refusal")
+
+    async def original():
+        await release.wait()
+        return "original result"
+
+    source = create_owned_task(original(), retain_originals=True)
+    loop = asyncio.get_running_loop()
+    allocate = loop.create_future
+
+    def controlled_allocation():
+        frame = sys._getframe(1)
+        if allocation == "shield" and frame.f_code.co_name == "shield":
+            frame = frame.f_back
+        if (not refused.is_set() and frame.f_code.co_name == "await_owned_task"
+                and frame.f_locals.get("task") is source
+                and (allocation == "completion" or sys._getframe(1).f_code.co_name == "shield")):
+            refused.set()
+            raise failure
+        return allocate()
+
+    monkeypatch.setattr(loop, "create_future", controlled_allocation)
+    observer = asyncio.create_task(await_owned_task(source))
+    try:
+        await asyncio.wait_for(refused.wait(), 2)
+        await asyncio.sleep(0.02)
+        assert not observer.done(), "allocation refusal abandoned the original producer"
+        assert not source.done() and not source.cancelling()
+        release.set()
+        outcome = await observer
+        assert source.result() == "original result"
+        assert outcome.error is not None
+        assert "completion allocation refusal" in str(outcome.error)
+    finally:
+        release.set()
+        await asyncio.gather(observer, return_exceptions=True)
+        await await_owned_task(source)
+
+
+@pytest.mark.asyncio
 async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate():
     original = asyncio.CancelledError("original source cancellation")
     cause = OSError("original source cause")

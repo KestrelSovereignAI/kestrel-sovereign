@@ -12,6 +12,8 @@ from kestrel_sovereign.execution_custody import (
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from tests.integration.test_execution_authority_postgres import (
     GenerationFence,
+)
+from tests.integration.test_execution_authority_postgres import (
     native_pg as native_pg,
 )
 from tests.integration.test_execution_custody_review30_pg import lose_ack
@@ -19,6 +21,151 @@ from tests.unit.test_execution_custody_proxy_ingress import owner
 from tests.unit.test_execution_custody_review29 import retire
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+
+
+@pytest.mark.parametrize("privacy", ["normal", "ephemeral"])
+@pytest.mark.parametrize("denied", [False, True])
+async def test_native_signal_admission_fence_is_commit_only_not_consumer_custody(native_pg, privacy, denied):
+    """Use the original event transaction; release its constraint before action."""
+    from uuid import uuid4
+
+    from kestrel_sdk.signals import (
+        RedactionPolicy,
+        Signal,
+        SignalMode,
+        SourceRegistration,
+        Trust,
+    )
+
+    from kestrel_sovereign.execution_custody import current_execution_custody
+    from kestrel_sovereign.privacy import get_privacy_preset
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from tests.integration.test_durable_signal_backend_parity import (
+        _DispatcherAgent,
+        _finish_dispatcher,
+    )
+
+    backend, control, schema = native_pg
+    agent = _DispatcherAgent("did:test:commit-fence:" + uuid4().hex, get_privacy_preset(privacy))
+    registry = SourceRegistry()
+    calls = []
+
+    async def handler(payload):
+        assert not current_execution_custody(), "Finite admission scope leaked to consumer"
+        # A real independent generation writer must progress after admission
+        # commits. Consumer work is not incorrectly tied to the prior fence.
+        await asyncio.wait_for(control.execute(f'UPDATE "{schema}".authority SET generation=2 WHERE id=1'), 2)
+        await backend.execute("INSERT INTO effects VALUES (1, 'admitted action')")
+        calls.append(payload)
+        return {"handled": True}
+
+    registry.register(SourceRegistration(
+        name="authority.action", schema=lambda payload: payload,
+        default_mode=SignalMode.ACTION, allowed_modes=frozenset({SignalMode.ACTION}),
+        handler=handler, trust=Trust.TRUSTED,
+        log_redaction=RedactionPolicy(summarize=lambda _: "<controlled>"), retention_days=7,
+    ))
+    log = SignalLogStore(backend)
+    await log.initialize()
+    dispatcher = SignalDispatcher(agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=log)
+    await dispatcher.initialize_durable_delivery()
+    if denied:
+        await backend.execute("UPDATE authority SET generation=2 WHERE id=1")
+    signal = Signal(source="authority.action", kind="controlled", mode=SignalMode.ACTION,
+                    payload={"controlled": True}, target_agent=agent.did)
+    try:
+        if denied:
+            with pytest.raises(Exception, match="runtime generation changed"):
+                await dispatcher.dispatch_signal(signal, source_event_id=signal.id,
+                                                  _durable_admission_fence=GenerationFence())
+        else:
+            await dispatcher.dispatch_signal(signal, source_event_id=signal.id,
+                                             _durable_admission_fence=GenerationFence())
+        assert len(calls) == (0 if denied else 1)
+        assert await backend.fetch_val("SELECT count(*) FROM effects") == (0 if denied else 1)
+        events = dispatcher._durable_store.EVENTS
+        assert await backend.fetch_val(f"SELECT count(*) FROM {events} WHERE event_id=?", (signal.id,)) == (0 if denied else 1)
+    finally:
+        await _finish_dispatcher(agent, dispatcher)
+
+
+@pytest.mark.parametrize("denied", [False, True])
+async def test_legacy_delivery_creation_rechecks_original_admission_commit(native_pg, monkeypatch, denied):
+    """A duplicate event is not permission to create a new legacy delivery."""
+    from uuid import uuid4
+
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    from kestrel_sovereign.privacy import get_privacy_preset
+    from kestrel_sovereign.signals import (
+        DurableConsumerRegistration, OrderedLockManager, SignalDispatcher,
+        SignalLogStore, SourceRegistry,
+    )
+    from kestrel_sovereign.signals.sources.channels import (
+        DURABLE_COGNITION_CONSUMER_ID, DURABLE_COGNITION_MARKER,
+        DURABLE_COGNITION_MARKER_VALUE, build_channel_message_registration,
+    )
+    from tests.integration.test_durable_signal_backend_parity import (
+        _DispatcherAgent, _finish_dispatcher,
+    )
+    from tests.unit.test_durable_signal_delivery import _channel_signal
+
+    backend, control, schema = native_pg
+    agent = _DispatcherAgent("did:test:legacy-fence:" + uuid4().hex, get_privacy_preset("normal"))
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    log = SignalLogStore(backend)
+    await log.initialize()
+    dispatcher = SignalDispatcher(agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=log)
+    await dispatcher.initialize_durable_delivery()
+    store = dispatcher._durable_store
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID, source="channel.message", agent_id=agent.did,
+        correlation_selector=f"payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}",
+        max_attempts=0,
+    )
+    legacy = _channel_signal(agent.did, "original-legacy")
+    legacy.payload.pop(DURABLE_COGNITION_MARKER)
+    observed = []
+    try:
+        persisted = await store.persist_signal(legacy, agent_id=agent.did, source_event_id="telegram:update:legacy", retention_days=14)
+        await dispatcher.register_durable_consumer(consumer)
+        assert await dispatcher.list_durable_deliveries() == []
+        persist = store.persist_signal
+
+        async def after_original_event_commit(*args, **kwargs):
+            result = await persist(*args, **kwargs)
+            assert not result.created and result.event_id == persisted.event_id
+            # The first original transaction has really committed/released its
+            # SHARE row lock. An independent writer can now retire that scope.
+            if denied:
+                await asyncio.wait_for(control.execute(f'UPDATE "{schema}".authority SET generation=2 WHERE id=1'), 2)
+            observed.append(result.event_id)
+            return result
+
+        monkeypatch.setattr(store, "persist_signal", after_original_event_commit)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "original-legacy"), source_event_id="telegram:update:legacy",
+            consumer_id=consumer.consumer_id, admission_fence=GenerationFence(),
+        )
+        error = None
+        try:
+            await handle.wait()
+        except BaseException as caught:
+            error = caught
+        deliveries = await dispatcher.list_durable_deliveries()
+        assert len(deliveries) == (0 if denied else 1), "Legacy delivery bypassed original admission generation"
+        assert observed == [persisted.event_id]
+        if denied:
+            assert is_execution_control_error(error)
+            row = await backend.fetch_one(f"SELECT caller_identity FROM {store.EVENTS} WHERE event_id=?", (persisted.event_id,))
+            assert row == (None,), "Denied upgrade partially committed caller identity"
+    finally:
+        await _finish_dispatcher(agent, dispatcher)
 
 
 @pytest.mark.parametrize("cancelled", [False, True])

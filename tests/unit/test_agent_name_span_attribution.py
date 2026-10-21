@@ -130,8 +130,12 @@ class TestAgentStampsAndPropagates:
 
 
 @pytest.fixture
-def otel_llm_exporter():
+def otel_llm_exporter(monkeypatch):
     """Install an in-memory-exporter-backed ``KestrelTracer`` as the LLM tracer."""
+    # This fixture explicitly owns an in-memory exporter. A global deployment
+    # kill switch must not silently replace that exporter with a no-op tracer.
+    # No OTLP endpoint or network exporter is enabled here.
+    monkeypatch.setenv("OTEL_SDK_DISABLED", "false")
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -141,6 +145,7 @@ def otel_llm_exporter():
         yield exporter
     finally:
         telemetry.reset_kestrel_tracer()
+        provider.shutdown()
 
 
 class TestLlmSpanCarriesRealAgentName:

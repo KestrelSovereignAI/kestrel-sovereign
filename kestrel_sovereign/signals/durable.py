@@ -63,6 +63,25 @@ EXPIRED_INITIAL_HANDOFF_ERROR = "initial handoff expired before a worker claimed
 _COGNITION_ADMISSION_PENDING = "cognition admission pending"
 _SELECTOR_KEY = re.compile(r"^(?:payload\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*|session_id|kind)=(.+)$")
 _PERSISTED_PAYLOAD = object()
+
+
+def _with_admission_fence(method):
+    """Constrain ONLY the original event/delivery persistence transaction.
+
+    The fence is trusted host input, never signal payload or persisted policy.
+    Creating its finite native scope here prevents that scope from leaking
+    into the resident cognition task after the admission COMMIT has settled.
+    """
+    @wraps(method)
+    async def guarded(self, *args, **kwargs):
+        fence = kwargs.get("admission_fence")
+        if fence is None:
+            return await method(self, *args, **kwargs)
+        from kestrel_sovereign.execution_custody import bind_execution_custody
+
+        with bind_execution_custody(fence):
+            return await method(self, *args, **kwargs)
+    return guarded
 # Callers that own a managed dispatcher normally supply their configured
 # threshold explicitly.  Keep direct-store compatibility conservative: a
 # recently registered dispatcher must not lose a lease simply because a
@@ -3579,6 +3598,7 @@ class DurableSignalStore(UnifiedStoreBase):
             )
         return True
 
+    @_with_admission_fence
     async def persist_signal(
         self,
         signal: Signal,
@@ -3594,6 +3614,7 @@ class DurableSignalStore(UnifiedStoreBase):
         before_commit: Optional[Callable[[DurableEventPersistence], None]] = None,
         on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
         ingress_attestation: Optional[DurableIngressAttestation] = None,
+        admission_fence: Any = None,
     ) -> DurableEventPersistence:
         """Commit a persisted signal and all matching initial deliveries.
 
@@ -3630,6 +3651,10 @@ class DurableSignalStore(UnifiedStoreBase):
         ingress as the event's immutable ingress trust receipt, inserted in
         this same transaction. A duplicate source event keeps the receipt (or
         the absence of one) written with its original event.
+
+        ``admission_fence`` is an optional host-owned native transaction
+        validator. It is applied only while this method persists the event
+        and deliveries; no consumer or later cognition inherits its scope.
         """
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
@@ -3848,6 +3873,7 @@ class DurableSignalStore(UnifiedStoreBase):
         assert persistence is not None
         return persistence
 
+    @_with_admission_fence
     async def upgrade_legacy_delivery_for_redelivery(
         self,
         *,
@@ -3857,6 +3883,7 @@ class DurableSignalStore(UnifiedStoreBase):
         source_event_id: str,
         expected_signal: Signal,
         caller_identity_factory: Callable[[], str],
+        admission_fence: Any = None,
     ) -> bool:
         """Atomically add one delivery to a verified pre-consumer event.
 
@@ -3867,6 +3894,8 @@ class DurableSignalStore(UnifiedStoreBase):
         pre-upgrade schema, so it is sealed and the exact delivery is created
         in the same transaction.  Privacy-elided rows carry an integrity row
         and are refused here; their keyed-MAC retry path remains fail-closed.
+        A live host admission fence applies to this new delivery COMMIT too:
+        deduplicating an older event does not authorize a later upgrade.
         """
 
         self._require_nonempty("agent_id", agent_id)
