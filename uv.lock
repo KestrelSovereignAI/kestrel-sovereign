@@ -3173,7 +3173,7 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.53.39"
+version = "0.53.40"
 source = { editable = "." }
 dependencies = [
     { name = "a2a-sdk", extra = ["http-server", "signing"] },
