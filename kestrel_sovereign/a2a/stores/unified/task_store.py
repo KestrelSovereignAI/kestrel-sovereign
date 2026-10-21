@@ -43,6 +43,10 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
 from kestrel_sovereign.a2a.lifecycle import task_state_from_label as _native_state
 from kestrel_sovereign.a2a.lifecycle import task_state_label as _stored_state
+from kestrel_sovereign.a2a.native_input import (
+    NativeTaskInput,
+    prepare_native_task_input,
+)
 from kestrel_sovereign.a2a.outcomes import TaskOutcomeConflictError, merge_task_outcome
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.base import json_dumps, json_loads
@@ -76,6 +80,8 @@ _SNAPSHOT_COLUMNS = (
     _TASK_COLUMNS + ", (SELECT request_json FROM a2a_task_inputs AS native_input "
     "WHERE native_input.task_id = a2a_tasks.id AND native_input.input_revision = a2a_tasks.input_revision), "
     "(SELECT request_digest FROM a2a_task_inputs AS native_input WHERE native_input.task_id = a2a_tasks.id "
+    "AND native_input.input_revision = a2a_tasks.input_revision), "
+    "(SELECT wire_request_digest FROM a2a_task_inputs AS native_input WHERE native_input.task_id = a2a_tasks.id "
     "AND native_input.input_revision = a2a_tasks.input_revision)"
 )
 
@@ -127,17 +133,34 @@ class NativeTaskSnapshot:
     input_wake_eligible: bool = True
     input_request_json: str | None = None
     input_request_digest: str | None = None
+    input_wire_request_digest: str | None = None
 
     @property
     def input_request(self) -> SendMessageRequest | None:
         """Rebuild the immutable admitted request, verifying its stored digest."""
         if self.input_request_json is None:
-            if self.input_request_digest is not None:
+            if (
+                self.input_request_digest is not None
+                or self.input_wire_request_digest is not None
+            ):
                 raise TaskInputConflictError(
                     "Native input has a digest without its request"
                 )
             return None
         request = ParseDict(json_loads(self.input_request_json), SendMessageRequest())
+        if request.configuration.HasField("task_push_notification_config"):
+            raise TaskInputConflictError(
+                "Callback credentials are not executable task input"
+            )
+        wire_digest = self.input_wire_request_digest
+        if (
+            not isinstance(wire_digest, str)
+            or len(wire_digest) != 64
+            or any(char not in "0123456789abcdef" for char in wire_digest)
+        ):
+            raise TaskInputConflictError(
+                "Native input has no valid original wire request digest"
+            )
         digest = hashlib.sha256(
             request.SerializeToString(deterministic=True)
         ).hexdigest()
@@ -325,6 +348,7 @@ class TaskStore(UnifiedStoreBase):
                 task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
                 input_revision BIGINT NOT NULL CHECK (input_revision >= 0),
                 message_id TEXT NOT NULL, request_json TEXT NOT NULL, request_digest TEXT NOT NULL,
+                wire_request_digest TEXT NOT NULL CHECK (length(wire_request_digest) = 64),
                 PRIMARY KEY (task_id, input_revision), UNIQUE (task_id, message_id)
             )
         """)
@@ -952,15 +976,11 @@ class TaskStore(UnifiedStoreBase):
         return self._row_to_task(row)
 
     @staticmethod
-    def _input_payload(request: SendMessageRequest) -> tuple[str, str]:
-        if not isinstance(request, SendMessageRequest):
-            raise TypeError("Native task input requires an official SendMessageRequest")
-        validate_proto_required_fields(request)
-        if request.message.role != Role.ROLE_USER:
+    def _input_payload(request: SendMessageRequest) -> NativeTaskInput:
+        prepared = prepare_native_task_input(request)
+        if prepared.request.message.role != Role.ROLE_USER:
             raise TaskInputConflictError("Native task input requires a user message")
-        return MessageToJson(request), hashlib.sha256(
-            request.SerializeToString(deterministic=True)
-        ).hexdigest()
+        return prepared
 
     async def _write_input(
         self,
@@ -969,17 +989,19 @@ class TaskStore(UnifiedStoreBase):
         request_json: str,
         digest: str,
         message_id: str,
+        wire_digest: str,
     ) -> None:
         await self.backend.execute(
-            "INSERT INTO a2a_task_inputs (task_id, input_revision, message_id, request_json, request_digest) VALUES (?, ?, ?, ?, ?)",
-            (task_id, revision, message_id, request_json, digest),
+            "INSERT INTO a2a_task_inputs (task_id, input_revision, message_id, request_json, request_digest, wire_request_digest) VALUES (?, ?, ?, ?, ?, ?)",
+            (task_id, revision, message_id, request_json, digest, wire_digest),
         )
 
     async def record_initial_input(
         self, task: Task, request: SendMessageRequest, *, creator_agent_id: str
     ) -> None:
         """Record request0 in the manager's context/task admission transaction."""
-        encoded, digest = self._input_payload(request)
+        prepared = self._input_payload(request)
+        encoded, digest = prepared.request_json, prepared.execution_digest
         if (
             request.tenant != self.scope.tenant
             or request.message.task_id
@@ -1001,7 +1023,12 @@ class TaskStore(UnifiedStoreBase):
                 )
             else:
                 await self._write_input(
-                    task.id, 0, encoded, digest, request.message.message_id
+                    task.id,
+                    0,
+                    encoded,
+                    digest,
+                    request.message.message_id,
+                    prepared.wire_request_digest,
                 )
         if conflict is not None:
             raise conflict
@@ -1015,8 +1042,9 @@ class TaskStore(UnifiedStoreBase):
             QUESTION_CORRELATION_URI,
         )
 
-        encoded, digest = self._input_payload(request)
-        request = ParseDict(json_loads(encoded), SendMessageRequest())
+        prepared = self._input_payload(request)
+        encoded, digest = prepared.request_json, prepared.execution_digest
+        request = prepared.request
         if not isinstance(creator_agent_id, str) or not creator_agent_id.strip():
             raise ValueError("Task continuation requires a verified creator")
         if not request.message.task_id or request.tenant != self.scope.tenant:
@@ -1064,11 +1092,11 @@ class TaskStore(UnifiedStoreBase):
                         conflict = error
                     if conflict is None:
                         prior = await self.backend.fetch_one(
-                            "SELECT request_digest FROM a2a_task_inputs WHERE task_id = ? AND message_id = ?",
+                            "SELECT wire_request_digest FROM a2a_task_inputs WHERE task_id = ? AND message_id = ?",
                             (task.id, request.message.message_id),
                         )
                         if prior is not None:
-                            if prior != (digest,):
+                            if prior != (prepared.wire_request_digest,):
                                 conflict = TaskInputConflictError(
                                     "Message ID already belongs to another native request"
                                 )
@@ -1130,6 +1158,7 @@ class TaskStore(UnifiedStoreBase):
                                     encoded,
                                     digest,
                                     request.message.message_id,
+                                    prepared.wire_request_digest,
                                 )
                                 row = await self.backend.fetch_one(
                                     f"SELECT {_SNAPSHOT_COLUMNS} FROM a2a_tasks WHERE id = ? AND {_TASK_SCOPE}",
@@ -1169,6 +1198,7 @@ class TaskStore(UnifiedStoreBase):
             input_wake_eligible=bool(row[25]),
             input_request_json=row[26],
             input_request_digest=row[27],
+            input_wire_request_digest=row[28],
             ownership=ContextOwnership(
                 context_id=row[1],
                 tenant=row[22],

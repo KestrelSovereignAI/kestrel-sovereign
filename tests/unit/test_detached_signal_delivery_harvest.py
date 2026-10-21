@@ -34,6 +34,7 @@ from a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
 from google.protobuf.json_format import MessageToJson
 from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
 
+from kestrel_sovereign.a2a.native_input import native_request_digest
 from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     NativeTaskSnapshot,
@@ -119,6 +120,7 @@ def _task(task_id: str = "task-1", *, state=TaskState.TASK_STATE_COMPLETED):
                                    creator_agent_id="did:test:sender"),
         input_request_json=MessageToJson(request),
         input_request_digest=hashlib.sha256(request.SerializeToString(deterministic=True)).hexdigest(),
+        input_wire_request_digest=native_request_digest(request, "SendMessage"),
     )
 
 

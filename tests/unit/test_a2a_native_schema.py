@@ -206,3 +206,58 @@ async def test_manager_keeps_schema_lease_across_store_initializers(
         assert checked == [True]
     finally:
         await manager.close()
+
+
+async def test_previous_native_input_shape_is_refused_before_any_startup_write(
+    native_a2a_backend_factory,
+):
+    from kestrel_sovereign.a2a.native_schema import require_native_a2a_schema
+
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    try:
+        await backend.execute_script("""
+            CREATE TABLE a2a_protocol_schema (singleton INTEGER PRIMARY KEY, revision INTEGER);
+            INSERT INTO a2a_protocol_schema VALUES (1, 1);
+            CREATE TABLE a2a_task_inputs (task_id TEXT PRIMARY KEY, request_json TEXT, request_digest TEXT);
+            INSERT INTO a2a_task_inputs VALUES ('old-input', '{"private":"unchanged"}', 'old-digest')
+        """)
+        before = await backend.fetch_all("SELECT * FROM a2a_task_inputs")
+        with pytest.raises(NativeA2AMigrationRequired, match="input.*schema"):
+            await require_native_a2a_schema(backend)
+        assert await backend.fetch_all("SELECT * FROM a2a_task_inputs") == before
+        assert not await backend.table_exists("a2a_tasks")
+        assert not await backend.table_exists("a2a_native_store_schema")
+    finally:
+        await backend.close()
+
+
+async def test_pre_projection_core_bundle_revision_requires_offline_migration(
+    native_a2a_backend_factory,
+):
+    from kestrel_sovereign.a2a.native_schema import require_native_a2a_schema
+
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    manager = manager_for(
+        backend, NativeRecipientScope("did:recipient"), owns_backend=False
+    )
+    try:
+        await manager.initialize()
+        await backend.execute(
+            "UPDATE a2a_native_store_schema SET revision = 2 WHERE component = 'core'"
+        )
+        before = await backend.fetch_all(
+            "SELECT component, revision FROM a2a_native_store_schema"
+        )
+        with pytest.raises(NativeA2AMigrationRequired, match="schema revision"):
+            await require_native_a2a_schema(backend)
+        assert (
+            await backend.fetch_all(
+                "SELECT component, revision FROM a2a_native_store_schema"
+            )
+            == before
+        )
+    finally:
+        await manager.close()
+        await backend.close()

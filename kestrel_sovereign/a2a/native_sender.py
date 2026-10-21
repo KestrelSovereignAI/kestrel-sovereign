@@ -21,13 +21,14 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 import rfc8785
-from a2a.types import SendMessageRequest
-from a2a.utils.proto_utils import validate_proto_required_fields
-from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtoMessage
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from kestrel_sovereign.a2a.extensions import SIGNED_SENDER_URI
+from kestrel_sovereign.a2a.native_input import (
+    NativeSenderProofError,
+    native_request_digest,
+)
 from kestrel_sovereign.identity.hybrid_keypair import (
     HybridKeypair,
     sign_hybrid,
@@ -36,7 +37,9 @@ from kestrel_sovereign.identity.hybrid_keypair import (
 from kestrel_sovereign.security.crypto_suite import ALG_ED25519, ALG_ML_DSA_65
 from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
-Resolver = Callable[[str], Mapping[str, Any] | None | Awaitable[Mapping[str, Any] | None]]
+Resolver = Callable[
+    [str], Mapping[str, Any] | None | Awaitable[Mapping[str, Any] | None]
+]
 
 
 class ReplayNonceStore(Protocol):
@@ -52,7 +55,6 @@ class ReplayNonceStore(Protocol):
     ) -> bool:
         """Reserve ``(sender, nonce)``. Return False when already consumed."""
         ...
-
 
 
 def verification_document_fingerprint(
@@ -72,13 +74,8 @@ def verification_document_fingerprint(
     return hashlib.sha256(canonical).hexdigest()
 
 
-
 SENDER_PROOF_HEADER = "Kestrel-A2A-Sender-Proof"
 _BASE64URL = re.compile(r"[A-Za-z0-9_-]+\Z")
-
-
-class NativeSenderProofError(ValueError):
-    """The native sender proof cannot authenticate this request."""
 
 
 class NativeProofPolicy(BaseModel):
@@ -128,22 +125,6 @@ def _extension_set(extensions: Iterable[str]) -> list[str]:
     if SIGNED_SENDER_URI not in result:
         raise NativeSenderProofError("Signed sender extension was not activated")
     return result
-
-
-def native_request_digest(params: ProtoMessage, operation: str) -> str:
-    """Hash the complete native request for its actual SDK service operation."""
-    if not isinstance(params, ProtoMessage):
-        raise TypeError("Native A2A proof requires an official protobuf request")
-    methods = SendMessageRequest.DESCRIPTOR.file.services_by_name[
-        "A2AService"
-    ].methods_by_name
-    method = methods.get(operation)
-    if method is None or params.DESCRIPTOR is not method.input_type:
-        raise NativeSenderProofError(
-            "A2A operation does not match its native request type"
-        )
-    validate_proto_required_fields(params)
-    return hashlib.sha256(rfc8785.dumps(MessageToDict(params))).hexdigest()
 
 
 def _encode(value: bytes) -> str:

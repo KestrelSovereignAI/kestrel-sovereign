@@ -17,9 +17,30 @@ class NativeStoreSchema(Enum):
     payload encoding. A standalone TaskStore never proves the other stores.
     """
 
-    CORE = ("core", 2)
+    CORE = ("core", 3)
     MEMORY = ("memory", 1)
     FEEDBACK = ("feedback", 1)
+
+
+async def _require_native_input_schema(backend) -> None:
+    """An earlier native projection must not silently lose its wire identity."""
+    if not await backend.table_exists("a2a_task_inputs"):
+        return
+    if backend.backend_type == "sqlite":
+        row = await backend.fetch_one(
+            "SELECT 1 FROM pragma_table_info('a2a_task_inputs') WHERE name = 'wire_request_digest'"
+        )
+    elif backend.backend_type == "postgres":
+        row = await backend.fetch_one(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() "
+            "AND table_name = 'a2a_task_inputs' AND column_name = 'wire_request_digest'"
+        )
+    else:
+        raise ValueError("Native A2A requires a SQLite or PostgreSQL backend")
+    if row is None:
+        raise NativeA2AMigrationRequired(
+            "Stored native A2A input projection schema requires offline migration"
+        )
 
 
 async def _require_native_store_revisions(backend) -> bool:
@@ -83,6 +104,7 @@ async def require_native_a2a_schema(backend) -> None:
                 f"Draft A2A data remains in {table}; offline migration is required after draining and before native startup"
             )
     completed_stores = await _require_native_store_revisions(backend)
+    await _require_native_input_schema(backend)
     if await backend.table_exists("a2a_protocol_schema"):
         row = await backend.fetch_one(
             "SELECT revision FROM a2a_protocol_schema WHERE singleton = 1"

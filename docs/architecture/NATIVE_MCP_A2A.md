@@ -891,12 +891,19 @@ consumer ledger for fan-out, claims and retries. Notification payloads are read
 from the canonical authorized task, rather than duplicating task bodies in a
 second protocol store. No network request may hold a database transaction.
 
-Inline push credentials require a separate secret channel: after verifying the
-complete native request, persist the executable input without its callback
-secrets and retain the original request digest for replay/conflict checks. The
-callback configuration belongs only in encrypted configuration storage, never
-in cognition prompts or plaintext task-input JSON. This decomposition must
-commit with task admission and consumer registration before push is advertised.
+`prepare_native_task_input` copies the complete official request and hashes its
+canonical JSON before extracting inline callback credentials. Initial and
+continuation inputs persist only the callback-free executable projection and
+the original wire digest. Reusing a message ID with changed callback credentials
+conflicts even when its executable content is unchanged. Snapshot readers
+refuse callback material or a missing wire identity. The signing producer and
+task-input projection share one pure digest implementation, avoiding an
+agent/storage import cycle. Native core schema revision 3 requires an explicit
+offline migration from earlier input shapes.
+
+The transient callback projection still needs atomic encrypted registration
+with task admission and its durable consumer before push is advertised. Callback
+credentials must never enter cognition prompts or plaintext task-input JSON.
 Signing a card does not authorize arbitrary callback egress.
 
 ## Review, verification and release order
