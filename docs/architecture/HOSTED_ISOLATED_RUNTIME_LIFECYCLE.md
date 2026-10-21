@@ -65,6 +65,10 @@ physical-stop join obligation and reports its observation failure after joining.
 Authenticated admission outcomes use the same monotonic order as public
 outcomes: UNKNOWN cannot become a plain denial when confirmation loses custody.
 That uncertainty remains permanent even when the later denial is scope-local.
+The provider-start receipt belongs to the whole original RPC owner: later
+custody validation or tool-envelope failure cannot erase an effect that already
+occurred, even after successful host confirmation and authority exit. A lost
+post-send result stays UNKNOWN rather than becoming a retryable tool rejection.
 
 For hosted webhook admission, `admit_hosted_telegram_ingress(admission_fence=…)`
 accepts trusted host-only native transaction authority. It is propagated to

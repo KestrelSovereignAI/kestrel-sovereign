@@ -12758,6 +12758,27 @@ class ProxyFeature(Feature):
                 admission.cancellation if joined.error is not None or admission.native_error is not None else None,
                 retain_originals=True, isolate_control_originals=True,
             )
+            delivered = outcome_slot.outcome
+            if admission.provider_rpc_started and (
+                admission.native_error is not None
+                or delivered.status != _HOST_INGRESS_SUCCESS
+                or type(delivered.payload) is not dict
+                or delivered.payload.get("success") is not True
+            ):
+                # The effect belongs to this WHOLE original RPC, not only the
+                # authority factory body. Custody checks and envelope formation
+                # still run after that body exits. Losing the result anywhere
+                # after SDK dispatch cannot become rejection-before-send or a
+                # retryable tool-error envelope. This is Core's private effect
+                # receipt, never an attribute supplied by a foreign exception.
+                admission.native_error = execution_terminal_error(
+                    admission.native_error, ExecutionCommitOutcomeError("unknown"),
+                    retain_originals=True, isolate_control_originals=True,
+                )
+                admission.core_outcome = _merge_host_ingress_control(
+                    admission.core_outcome,
+                    _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome="unknown"),
+                )
             if admission.native_error is not None:
                 # Native classification is BACKEND phase data, not error attrs
                 # on a foreign transaction body or a caught facade exception.

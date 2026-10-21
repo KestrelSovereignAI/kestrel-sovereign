@@ -295,14 +295,6 @@ async def dispatch_admitted(proxy, arguments, context):
             failure = final
     if failure is not None:
         result = None
-        if admission is not None and admission.provider_rpc_started:
-            failure = runtime._HostIngressOutcome(runtime._HOST_INGRESS_CONTROL, commit_outcome="unknown")
-            # This classification comes from Core's actual provider-dispatch
-            # boundary, NOT control-shaped attributes on a foreign exception.
-            # Carry it through the existing native outcome lane rather than
-            # asking the untrusted RPC-error redactor to authenticate it.
-            admission.native_error = ExecutionCommitOutcomeError("unknown")
-            admission.core_outcome = runtime._merge_host_ingress_control(admission.core_outcome, failure)
     # Drop host/child/request-bearing references before detached projection.
     proxy = arguments = context = client = authority = factory = selected = payload = response = activated = admission = None
     if failure is not None:

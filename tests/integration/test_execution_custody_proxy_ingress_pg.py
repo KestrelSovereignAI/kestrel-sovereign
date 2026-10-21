@@ -94,6 +94,80 @@ async def test_native_signal_admission_fence_is_commit_only_not_consumer_custody
         await _finish_dispatcher(agent, dispatcher)
 
 
+@pytest.mark.parametrize("denied", [False, True])
+async def test_legacy_delivery_creation_rechecks_original_admission_commit(native_pg, monkeypatch, denied):
+    """A duplicate event is not permission to create a new legacy delivery."""
+    from uuid import uuid4
+
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    from kestrel_sovereign.privacy import get_privacy_preset
+    from kestrel_sovereign.signals import (
+        DurableConsumerRegistration, OrderedLockManager, SignalDispatcher,
+        SignalLogStore, SourceRegistry,
+    )
+    from kestrel_sovereign.signals.sources.channels import (
+        DURABLE_COGNITION_CONSUMER_ID, DURABLE_COGNITION_MARKER,
+        DURABLE_COGNITION_MARKER_VALUE, build_channel_message_registration,
+    )
+    from tests.integration.test_durable_signal_backend_parity import (
+        _DispatcherAgent, _finish_dispatcher,
+    )
+    from tests.unit.test_durable_signal_delivery import _channel_signal
+
+    backend, control, schema = native_pg
+    agent = _DispatcherAgent("did:test:legacy-fence:" + uuid4().hex, get_privacy_preset("normal"))
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    log = SignalLogStore(backend)
+    await log.initialize()
+    dispatcher = SignalDispatcher(agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=log)
+    await dispatcher.initialize_durable_delivery()
+    store = dispatcher._durable_store
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID, source="channel.message", agent_id=agent.did,
+        correlation_selector=f"payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}",
+        max_attempts=0,
+    )
+    legacy = _channel_signal(agent.did, "original-legacy")
+    legacy.payload.pop(DURABLE_COGNITION_MARKER)
+    observed = []
+    try:
+        persisted = await store.persist_signal(legacy, agent_id=agent.did, source_event_id="telegram:update:legacy", retention_days=14)
+        await dispatcher.register_durable_consumer(consumer)
+        assert await dispatcher.list_durable_deliveries() == []
+        persist = store.persist_signal
+
+        async def after_original_event_commit(*args, **kwargs):
+            result = await persist(*args, **kwargs)
+            assert not result.created and result.event_id == persisted.event_id
+            # The first original transaction has really committed/released its
+            # SHARE row lock. An independent writer can now retire that scope.
+            if denied:
+                await asyncio.wait_for(control.execute(f'UPDATE "{schema}".authority SET generation=2 WHERE id=1'), 2)
+            observed.append(result.event_id)
+            return result
+
+        monkeypatch.setattr(store, "persist_signal", after_original_event_commit)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "original-legacy"), source_event_id="telegram:update:legacy",
+            consumer_id=consumer.consumer_id, admission_fence=GenerationFence(),
+        )
+        error = None
+        try:
+            await handle.wait()
+        except BaseException as caught:
+            error = caught
+        deliveries = await dispatcher.list_durable_deliveries()
+        assert len(deliveries) == (0 if denied else 1), "Legacy delivery bypassed original admission generation"
+        assert observed == [persisted.event_id]
+        if denied:
+            assert is_execution_control_error(error)
+            row = await backend.fetch_one(f"SELECT caller_identity FROM {store.EVENTS} WHERE event_id=?", (persisted.event_id,))
+            assert row == (None,), "Denied upgrade partially committed caller identity"
+    finally:
+        await _finish_dispatcher(agent, dispatcher)
+
+
 @pytest.mark.parametrize("cancelled", [False, True])
 @pytest.mark.parametrize("route", ["deferred", "legacy", "ack", "retry"])
 async def test_native_commit_receipt_reaches_terminal_owner_after_worker_removal(

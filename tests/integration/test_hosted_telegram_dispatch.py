@@ -967,17 +967,26 @@ async def test_real_deadline_precedes_provider_even_if_activation_continuation_r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("confirmation_state", [None, "committed", "unknown"])
-async def test_confirmation_custody_denial_cannot_erase_unknown_send(tmp_path, monkeypatch, confirmation_state):
+@pytest.mark.parametrize("denial_phase", ["confirmation", "after-confirmation"])
+async def test_confirmation_custody_denial_cannot_erase_unknown_send(tmp_path, monkeypatch, confirmation_state, denial_phase):
     from kestrel_sovereign.execution_custody import (
         ConfirmedLeaseDeadline, ExecutionCommitOutcomeError,
         bind_execution_custody, require_execution_work,
     )
 
+    confirmed, exit_release = asyncio.Event(), asyncio.Event()
+
     def factory(binding, events):
         @asynccontextmanager
         async def authority(proxy, arguments):
-            yield HostedTelegramOutbound(binding)
-            require_execution_work(proxy.agent)
+            selected = HostedTelegramOutbound(binding)
+            yield selected
+            assert selected.response["message_id"] == "777"
+            if denial_phase == "confirmation":
+                require_execution_work(proxy.agent)
+            else:
+                confirmed.set()
+                await exit_release.wait()
         return authority
 
     async with sdk_host(tmp_path, monkeypatch, factory, expected_unknown=True) as (proxy, services, _, _):
@@ -1000,10 +1009,14 @@ async def test_confirmation_custody_denial_cannot_erase_unknown_send(tmp_path, m
             with bind_execution_custody(Fence()) as scope:
                 operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
                 await asyncio.wait_for(service.send_entered.wait(), 2)
+                if denial_phase == "after-confirmation":
+                    service.send_release.set()
+                    await asyncio.wait_for(confirmed.wait(), 2)
                 if confirmation_state is not None:
                     scope.preserve_commit_uncertainty(confirmation_state)
                 scope.revoke("original confirmation authority retired")
                 service.send_release.set()
+                exit_release.set()
                 with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
                     await operation
             with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
@@ -1013,5 +1026,22 @@ async def test_confirmation_custody_denial_cannot_erase_unknown_send(tmp_path, m
             assert any(item.core_outcome.commit_outcome == "unknown" for item in proxy._host_ingress_admissions)
         finally:
             service.send_release.set()
+            exit_release.set()
             if operation is not None:
                 await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_post_send_tool_envelope_failure_cannot_authorize_replay(tmp_path, monkeypatch):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority, expected_unknown=True) as (proxy, services, _, _):
+        def refuse_envelope(_name):
+            raise RuntimeError("controlled post-send envelope failure")
+
+        monkeypatch.setattr(proxy, "_maybe_emit_channel_link_part", refuse_envelope)
+        with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
+            await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
+            await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "no replay"})
+        assert len(services[0].sends) == 1
