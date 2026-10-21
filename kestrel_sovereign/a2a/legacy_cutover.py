@@ -26,8 +26,51 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextStore,
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore, _task_payload
+from kestrel_sovereign.signals.durable import DurableSignalStore, DurableSourceBoundary
+from kestrel_sovereign.signals.sources.a2a import SOURCE_NAME as COMPLETE_SOURCE
+from kestrel_sovereign.signals.sources.a2a_question_answered import (
+    SOURCE_NAME as QUESTION_SOURCE,
+)
+from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+    SOURCE_NAME as INPUT_SOURCE,
+)
+
+MIGRATION_PLAN_REVISION = 2
 
 _TABLES = ("a2a_tasks", "a2a_outbound_tasks", "pending_a2a_questions")
+_SIGNAL_SOURCES = (INPUT_SOURCE, COMPLETE_SOURCE, QUESTION_SOURCE)
+_SIGNAL_HISTORY_TABLES = (
+    (DurableSignalStore.EVENTS, "signal_events"),
+    (DurableSignalStore.DELIVERIES, "signal_deliveries"),
+    (DurableSignalStore.EVENT_INTEGRITY, "signal_integrity"),
+    (DurableSignalStore.INGRESS_TRUST_RECEIPTS, "signal_ingress"),
+)
+
+
+def _source_selection(name):
+    """Use one source predicate for reviewed snapshots and exact archives."""
+    if name not in dict(_SIGNAL_HISTORY_TABLES):
+        return "", ()
+    placeholders = ", ".join("?" for _ in _SIGNAL_SOURCES)
+    source_clause = f"source IN ({placeholders})"
+    if name == DurableSignalStore.EVENTS:
+        return f" WHERE {source_clause}", _SIGNAL_SOURCES
+    return (
+        f" WHERE event_id IN (SELECT event_id FROM {DurableSignalStore.EVENTS} WHERE {source_clause})",
+        _SIGNAL_SOURCES,
+    )
+
+
+def _archive_name(migration_id, table_name):
+    if table_name in dict(_SIGNAL_HISTORY_TABLES):
+        suffix = dict(_SIGNAL_HISTORY_TABLES)[table_name]
+    else:
+        suffix = table_name.removeprefix("a2a_").replace(
+            "pending_a2a_questions", "questions"
+        )
+    return f"a2a_legacy_{migration_id}_{suffix}"
+
+
 _TERMINAL = frozenset({"completed", "failed", "canceled", "rejected"})
 _QUESTION_ROUTE_FIELDS = ("agent_id", "task_id", "recipient_agent_id")
 # Only Core's known task fences are suspended, inside the exclusive transaction.
@@ -111,14 +154,18 @@ class LegacyMigrationPlan:
     source_digest: str
     tables: tuple[LegacyTable, ...]
     tasks: tuple[MigratedTask, ...]
+    signal_boundaries: tuple[DurableSourceBoundary, ...] = ()
 
     def review(self):
         """A concrete review artifact, with no database credentials or message text."""
         return {
-            "revision": 1,
+            "revision": MIGRATION_PLAN_REVISION,
             "migration_id": self.migration_id,
             "source_digest": self.source_digest,
             "tables": {table.name: len(table.rows) for table in self.tables},
+            "retired_signal_histories": [
+                boundary.to_dict() for boundary in self.signal_boundaries
+            ],
             "tasks": [
                 {
                     "task_id": item.task_id,
@@ -166,8 +213,10 @@ async def _table(backend, name):
             "WHERE n.nspname = current_schema() AND t.relname = ? AND NOT tr.tgisinternal ORDER BY 1, 2",
             (name, name, name, name, name),
         )
+    where, parameters = _source_selection(name)
     rows = await backend.fetch_all(
-        f"SELECT {', '.join(_ident(col) for col in columns)} FROM {_ident(name)}"
+        f"SELECT {', '.join(_ident(col) for col in columns)} FROM {_ident(name)}{where}",
+        parameters,
     )
     return LegacyTable(
         name,
@@ -193,6 +242,7 @@ async def prepare_legacy_migration(
         "a2a_native_questions",
         "a2a_native_question_wakes",
         "a2a_task_inputs",
+        "a2a_native_store_schema",
     ):
         if await backend.table_exists(target) and await backend.fetch_one(
             f"SELECT 1 FROM {target} LIMIT 1"
@@ -207,7 +257,46 @@ async def prepare_legacy_migration(
             if await backend.table_exists(name)
         ]
     )
+    if await backend.table_exists(DurableSignalStore.EVENTS):
+        tables += tuple(
+            [
+                await _table(backend, name)
+                for name, _ in _SIGNAL_HISTORY_TABLES
+                if await backend.table_exists(name)
+            ]
+        )
     records = {table.name: table.dictionaries() for table in tables}
+    signal_events = records.get(DurableSignalStore.EVENTS, [])
+    if signal_events and DurableSignalStore.DELIVERIES not in records:
+        raise LegacyTaskMigrationError(
+            "Durable signal storage is incomplete; finish its schema migration before cutover"
+        )
+    sequences = {}
+    for event in signal_events:
+        sequence = event.get("source_sequence")
+        if type(sequence) is not int or sequence < 1:
+            raise LegacyTaskMigrationError(
+                "Durable A2A history has no committed source sequence; finish its storage migration before cutover"
+            )
+        key = (event["agent_id"], event["source"])
+        sequences[key] = max(sequences.get(key, 0), sequence)
+    try:
+        signal_boundaries = tuple(
+            DurableSourceBoundary(
+                agent_id=agent, source=source, sequence=sequences[(agent, source)]
+            )
+            for agent, source in sorted(sequences)
+        )
+    except (TypeError, ValueError) as error:
+        raise LegacyTaskMigrationError(
+            "Durable A2A history has an invalid source boundary"
+        ) from error
+    signal_store = DurableSignalStore(backend)
+    for boundary in signal_boundaries:
+        if not await signal_store.source_history_is_drained(boundary):
+            raise LegacyTaskMigrationError(
+                "Owed durable A2A deliveries must drain before cutover"
+            )
     tasks = records.get("a2a_tasks", [])
     if set(ownership) != {row["id"] for row in tasks}:
         raise LegacyTaskMigrationError(
@@ -290,6 +379,7 @@ async def prepare_legacy_migration(
         hashlib.sha256(_encode(fingerprint).encode()).hexdigest(),
         tables,
         tuple(converted),
+        signal_boundaries,
     )
 
 
@@ -306,9 +396,23 @@ async def apply_legacy_migration(backend, plan: LegacyMigrationPlan):
     ):
         raise TypeError("Apply requires an exact prepared legacy migration plan")
     async with native_schema_write(backend):
+        signal_store = DurableSignalStore(backend)
+        # Acquire source handoffs before relation locks, in the same order as
+        # publishers/consumer registration, then fingerprint again under both.
+        for boundary in plan.signal_boundaries:
+            if (
+                not isinstance(boundary, DurableSourceBoundary)
+                or boundary.source not in _SIGNAL_SOURCES
+            ):
+                raise LegacyTaskMigrationError(
+                    "Migration contains an unknown durable source boundary"
+                )
+            await signal_store._lock_scope_handoff(
+                agent_id=boundary.agent_id, source=boundary.source
+            )
         if backend.backend_type == "postgres":
             for table in plan.tables:
-                if table.name not in _TABLES:
+                if table.name not in (*_TABLES, *dict(_SIGNAL_HISTORY_TABLES)):
                     raise LegacyTaskMigrationError(
                         "Migration contains an unknown source table"
                     )
@@ -332,9 +436,11 @@ async def apply_legacy_migration(backend, plan: LegacyMigrationPlan):
         """)
         archives = {}
         for table in current.tables:
-            archive = f"a2a_legacy_{plan.migration_id}_{table.name.removeprefix('a2a_').replace('pending_a2a_questions', 'questions')}"
+            archive = _archive_name(plan.migration_id, table.name)
+            where, parameters = _source_selection(table.name)
             await backend.execute(
-                f"CREATE TABLE {_ident(archive)} AS SELECT * FROM {_ident(table.name)}"
+                f"CREATE TABLE {_ident(archive)} AS SELECT * FROM {_ident(table.name)}{where}",
+                parameters,
             )
             archived = await backend.fetch_one(
                 f"SELECT COUNT(*) FROM {_ident(archive)}"
@@ -344,6 +450,26 @@ async def apply_legacy_migration(backend, plan: LegacyMigrationPlan):
                     "Legacy archive did not retain every source row"
                 )
             archives[table.name] = archive
+        signal_events = next(
+            (
+                table.dictionaries()
+                for table in current.tables
+                if table.name == DurableSignalStore.EVENTS
+            ),
+            [],
+        )
+        for boundary in current.signal_boundaries:
+            expected = sum(
+                event["agent_id"] == boundary.agent_id
+                and event["source"] == boundary.source
+                and event["source_sequence"] <= boundary.sequence
+                for event in signal_events
+            )
+            deleted = await signal_store.retire_source_history(boundary)
+            if deleted != expected:
+                raise LegacyTaskMigrationError(
+                    "Durable A2A history changed during retirement"
+                )
         if current.tasks:
             first = current.tasks[0].ownership
             tasks = TaskStore(
@@ -397,7 +523,7 @@ async def apply_legacy_migration(backend, plan: LegacyMigrationPlan):
                     )
             await tasks._install_canceled_terminal_fence()
         for table in current.tables:
-            if table.name != "a2a_tasks":
+            if table.name in _TABLES and table.name != "a2a_tasks":
                 await backend.execute(f"DELETE FROM {_ident(table.name)}")
         await backend.execute(
             "INSERT INTO a2a_legacy_migrations (migration_id, source_digest, review_json, catalog_json) VALUES (?, ?, ?, ?)",

@@ -8,6 +8,7 @@ from dataclasses import fields
 from pathlib import Path
 
 from kestrel_sovereign.a2a.legacy_cutover import (
+    MIGRATION_PLAN_REVISION,
     apply_legacy_migration,
     prepare_legacy_migration,
 )
@@ -15,6 +16,7 @@ from kestrel_sovereign.a2a.migrate_legacy import LegacyTaskMigrationError
 from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.multi_agent.liveness import serving_holder
+from kestrel_sovereign.signals.durable import DurableSourceBoundary
 from kestrel_sovereign.storage.db.interface import DatabaseError
 
 
@@ -101,12 +103,29 @@ def _plan_ownership(review):
     if (
         not isinstance(review, dict)
         or set(review)
-        != {"revision", "migration_id", "source_digest", "tables", "tasks"}
-        or review["revision"] != 1
+        != {
+            "revision",
+            "migration_id",
+            "source_digest",
+            "tables",
+            "tasks",
+            "retired_signal_histories",
+        }
+        or type(review["revision"]) is not int
+        or review["revision"] != MIGRATION_PLAN_REVISION
     ):
         raise ValueError("Unsupported reviewed A2A migration plan")
     if not isinstance(review["tasks"], list):
         raise ValueError("Reviewed migration tasks must be an array")
+    if not isinstance(review["retired_signal_histories"], list):
+        raise ValueError("Reviewed durable signal histories must be an array")
+    scopes = set()
+    for item in review["retired_signal_histories"]:
+        boundary = DurableSourceBoundary.from_dict(item)
+        scope = (boundary.agent_id, boundary.source)
+        if scope in scopes:
+            raise ValueError("Reviewed migration repeats a durable source history")
+        scopes.add(scope)
     owners = {}
     for task in review["tasks"]:
         if not isinstance(task, dict) or set(task) != {

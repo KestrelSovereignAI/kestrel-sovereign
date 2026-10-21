@@ -16,6 +16,12 @@ protocol. Resolve owed question wakes and confirm recipient settlement for
 expired questions. An unknown send or an unconfirmed expiry is not evidence
 that remote work stopped; the migration refuses those states.
 
+Drain every selected durable delivery for the old `a2a.task_submitted`,
+`a2a.task_complete` and `a2a.question_answered` sources. Pending, retrying,
+reserved or leased deliveries refuse preview. The preview also covers retained
+events that had no selected consumer; they must not be backfilled into the
+native runtime as new work.
+
 An old outbound `expired` stamp is accepted only for a question whose durable
 sender, task ID, and recipient exactly match an EXPIRED question with confirmed
 receiver settlement and no owed delivery. Missing identities or a different
@@ -62,7 +68,9 @@ kestrel migrate-a2a preview --postgres-dsn-env KESTREL_DATABASE_URL --owners own
 
 The preview writes a new private file. It contains the source fingerprint,
 table counts, reviewed ownership, migration ID, and hashes of the exact native
-conversions. It contains no message text or database credentials. Review this
+conversions, plus each retired agent/source sequence boundary. The current
+plan revision is 2; prepare a fresh preview for older plan files. It contains
+no message text or database credentials. Review this
 artifact alongside the provenance evidence and backup. Preview does not create
 native tables, alter task state, or settle questions.
  Preview also refuses
@@ -82,15 +90,21 @@ profile directory and the file's canonical target directory. Database locks
 are not a substitute for stopping writers that could reconnect.
 
 Apply rechecks source data and schema under the database write lease. It
-archives the original task, outbound, and question rows, retains the original
-catalog in `a2a_legacy_migrations`, converts terminal task payloads in place,
+archives the original task, outbound, question and selected A2A signal rows,
+including their delivery, integrity and ingress receipt records. It retains the
+original catalog in `a2a_legacy_migrations`, retires the archived A2A events
+through the canonical signal store, and converts terminal task payloads in place,
 reserves their reviewed native context ownership, and reinstalls task authority
 and terminal fences. Historical timestamps and cancellation audit columns are
 preserved. Missing native status timestamps remain absent.
 
 Historical tasks are excluded from cognition wake recovery. Old truncated
 outbound previews and settled question rows remain in archives; they do not
-become invented native dispatch receipts or new sends. The protocol revision
+become invented native dispatch receipts or new sends. Retired signal events
+cannot create deliveries when native consumers register. Source sequence and
+high-water records, consumer registrations and unrelated signal history remain
+intact. No retained event identity, integrity binding or ingress receipt is
+rewritten. The protocol revision
 is published last, in the same transaction. A failure rolls back conversion,
 schema changes, archives, and revision publication together.
 

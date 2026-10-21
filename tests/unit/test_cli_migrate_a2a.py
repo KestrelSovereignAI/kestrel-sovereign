@@ -196,3 +196,109 @@ async def test_symlink_database_cannot_hide_a_serving_host(
         assert hashlib.sha256(database.read_bytes()).hexdigest() == before
     finally:
         record.release()
+
+
+async def test_actual_cli_reviews_and_retires_old_signal_history_without_preview_writes(
+    draft,
+):
+    import hashlib
+
+    from kestrel_sovereign.signals.durable import DurableSignalStore
+    from tests.unit.test_a2a_legacy_signal_cutover import consumer, old_signal
+
+    database, _, plan = draft
+    backend = SQLiteBackend(str(database))
+    await backend.connect()
+    try:
+        store = DurableSignalStore(backend)
+        await store.initialize()
+        accepted = await store.persist_signal(
+            old_signal(),
+            agent_id="did:recipient",
+            source_event_id="historical",
+            retention_days=14,
+        )
+    finally:
+        await backend.close()
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    result = await preview(draft)
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+    review = json.loads(plan.read_text())
+    assert review["revision"] == 2 and len(review["retired_signal_histories"]) == 1
+    assert review["retired_signal_histories"][0]["sequence"] == accepted.source_sequence
+    assert "Historical input" not in result.stdout
+    result = await cli("apply", "--sqlite", database, "--plan", plan)
+    assert result.returncode == 0, result.stderr
+    backend = SQLiteBackend(str(database))
+    await backend.connect()
+    try:
+        store = DurableSignalStore(backend)
+        await store.register_consumer(consumer())
+        assert await store.list_deliveries(agent_id="did:recipient") == []
+        archives = json.loads(result.stdout)["archives"]
+        assert await backend.fetch_one(
+            f'SELECT event_id FROM "{archives[store.EVENTS]}"'
+        ) == (accepted.event_id,)
+    finally:
+        await backend.close()
+
+
+@pytest.mark.parametrize(
+    "invalid", ["old-revision", "non-array", "malformed-boundary", "duplicate-scope"]
+)
+async def test_actual_cli_refuses_unreviewed_or_invalid_signal_history_plan(
+    draft, invalid
+):
+    from kestrel_sovereign.signals.durable import DurableSourceBoundary
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
+
+    database, _, plan = draft
+    await preview(draft)
+    review = json.loads(plan.read_text())
+    if invalid == "old-revision":
+        review["revision"] = 1
+    elif invalid == "non-array":
+        review["retired_signal_histories"] = {}
+    elif invalid == "malformed-boundary":
+        review["retired_signal_histories"] = [{"sequence": -1}]
+    else:
+        boundary = DurableSourceBoundary("did:recipient", SOURCE_NAME, 1).to_dict()
+        review["retired_signal_histories"] = [boundary, boundary]
+    plan.write_text(json.dumps(review))
+    result = await cli("apply", "--sqlite", database, "--plan", plan)
+    assert result.returncode == 1
+    if invalid == "duplicate-scope":
+        assert "repeats a durable source history" in result.stderr
+    backend = SQLiteBackend(str(database))
+    await backend.connect()
+    try:
+        assert not await backend.table_exists("a2a_protocol_schema")
+        assert not await backend.table_exists("a2a_legacy_migrations")
+    finally:
+        await backend.close()
+
+
+@pytest.mark.parametrize(
+    "invalid", ["old-revision", "non-array", "boundary-version", "duplicate-scope"]
+)
+async def test_review_parser_rejects_invalid_history_contract_before_returning_owners(
+    draft, invalid
+):
+    from kestrel_sovereign.cli_migrate_a2a import _plan_ownership
+    from kestrel_sovereign.signals.durable import DurableSourceBoundary
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
+
+    await preview(draft)
+    review = json.loads(draft[2].read_text())
+    boundary = DurableSourceBoundary("did:recipient", SOURCE_NAME, 1).to_dict()
+    if invalid == "old-revision":
+        review["revision"] = 1
+    elif invalid == "non-array":
+        review["retired_signal_histories"] = {}
+    elif invalid == "boundary-version":
+        boundary["version"] = 99
+        review["retired_signal_histories"] = [boundary]
+    else:
+        review["retired_signal_histories"] = [boundary, boundary]
+    with pytest.raises(ValueError):
+        _plan_ownership(review)

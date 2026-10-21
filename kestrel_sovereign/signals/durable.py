@@ -18,9 +18,9 @@ import hashlib
 import json
 import re
 import secrets
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from contextlib import asynccontextmanager
 from functools import wraps
 from typing import (
     Any,
@@ -1104,7 +1104,9 @@ def _owns_retry_release_receipt(method):
     """
     @wraps(method)
     async def owned(self, **kwargs):
-        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
         if kwargs["consumer_id"] != DURABLE_COGNITION_CONSUMER_ID:
             return await method(self, **kwargs)
         key = (kwargs["agent_id"], kwargs["consumer_id"], kwargs["delivery_id"])
@@ -4269,7 +4271,9 @@ class DurableSignalStore(UnifiedStoreBase):
         )"""
 
     def _managed_retry_claim_params(self, executor_id: str, stale_before: datetime) -> tuple:
-        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
         return (DURABLE_COGNITION_CONSUMER_ID, executor_id, self.to_timestamp_param(stale_before))
 
     @staticmethod
@@ -4280,7 +4284,9 @@ class DurableSignalStore(UnifiedStoreBase):
         still require LEASED. Fixed native cleanup can settle this exact old
         token even when the release committed before its ACK was lost.
         """
-        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
         if terminal:
             return "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL"
         predicate = (
@@ -5396,6 +5402,58 @@ class DurableSignalStore(UnifiedStoreBase):
             tuple(params + [limit]),
         )
         return [self._row_to_delivery(row) for row in rows]
+
+    async def source_history_is_drained(
+        self, boundary: DurableSourceBoundary
+    ) -> bool:
+        """Inspect every selected delivery through one source boundary.
+
+        This operation is read-only, including during preview. Retirement
+        holds the source handoff transaction shared by registration, claims,
+        event persistence and provider redelivery before checking this state.
+        """
+        if not isinstance(boundary, DurableSourceBoundary):
+            raise TypeError("Source history requires a durable source boundary")
+        rows = await self._backend.fetch_all(
+            f"SELECT d.status FROM {self.DELIVERIES} d "
+            f"JOIN {self.EVENTS} e ON e.event_id = d.event_id "
+            "WHERE e.agent_id = ? AND e.source = ? AND e.source_sequence <= ?",
+            (boundary.agent_id, boundary.source, boundary.sequence),
+        )
+        return all(row[0] in _TERMINAL_STATUSES for row in rows)
+
+    async def retire_source_history(self, boundary: DurableSourceBoundary) -> int:
+        """Retire drained protocol history after its caller archives it.
+
+        This explicit offline operation leaves source counters, high-water
+        witnesses, consumer registrations and newer events intact. Event-owned
+        deliveries, integrity bindings and ingress receipts follow their normal
+        cascade, exactly as in retention. No event identity or receipt is edited.
+        """
+        if not isinstance(boundary, DurableSourceBoundary):
+            raise TypeError("Source retirement requires a durable source boundary")
+        refusal = None
+        deleted = 0
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(
+                agent_id=boundary.agent_id, source=boundary.source
+            )
+            sequence = await self._source_sequence_locked(
+                agent_id=boundary.agent_id, source=boundary.source
+            )
+            if boundary.sequence > sequence:
+                refusal = "Source retirement boundary is beyond committed history"
+            elif not await self.source_history_is_drained(boundary):
+                refusal = "Owed durable source deliveries must drain before retirement"
+            else:
+                deleted = await self._backend.execute(
+                    f"DELETE FROM {self.EVENTS} "
+                    "WHERE agent_id = ? AND source = ? AND source_sequence <= ?",
+                    (boundary.agent_id, boundary.source, boundary.sequence),
+                )
+        if refusal is not None:
+            raise ValueError(refusal)
+        return deleted
 
     async def purge_expired(
         self, *, agent_id: str, now: Optional[datetime] = None
