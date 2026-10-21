@@ -1,5 +1,7 @@
 """The real standalone server publishes after real agent boot and retires routes."""
 
+import asyncio
+
 import httpx
 import pytest
 from a2a.types import AgentCard
@@ -93,6 +95,38 @@ async def test_actual_single_lifespan_publishes_after_boot_and_withdraws_before_
                 "verificationMethod": agent.identity.new_verification_methods,
             },
         )
+        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign.features.restart_coordinator.feature import (
+            RestartCoordinatorFeature,
+        )
+
+        restart = RestartCoordinatorFeature(agent)
+        assert restart._agent_appears_idle()["idle"], (
+            "published native infrastructure must permit an idle restart"
+        )
+        # Runtime publication identifies residents by ownership, including
+        # services whose name is absent from the legacy bookkeeping allowlist.
+        resident = agent._track_runtime_task(
+            asyncio.Event().wait(), name="opaque-runtime-service"
+        )
+        work = None
+        try:
+            await asyncio.sleep(0)
+            assert restart._agent_appears_idle()["idle"], (
+                "runtime service ownership was mistaken for finite agent work"
+            )
+            work = agent._track_background_task(
+                asyncio.Event().wait(), name="opaque-runtime-service"
+            )
+            assert not restart._agent_appears_idle()["idle"], (
+                "ordinary work acquired a resident's infrastructure exemption"
+            )
+        finally:
+            for task in (work, resident):
+                if task is not None:
+                    task.cancel()
+                    outcome = await await_owned_task(task)
+                    assert isinstance(outcome.error, asyncio.CancelledError)
         backend = agent.task_manager.task_store.backend
     assert not publication.is_published
     assert backend._connection is None

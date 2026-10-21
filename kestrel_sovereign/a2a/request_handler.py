@@ -322,12 +322,13 @@ class NativeA2ARequestHandler(RequestHandler):
                 )
             from kestrel_sovereign.signals.sources.peer_stop import dispatch_peer_stop
 
-            receipt = await dispatch_peer_stop(
-                self._peer_stop_target,
-                actor_id=principal_id,
-                intent=claims.peer_stop,
-                causation_chain=claims.causation_chain,
-            )
+            async with self.guard.hold_authority(admitted):
+                receipt = await dispatch_peer_stop(
+                    self._peer_stop_target,
+                    actor_id=principal_id,
+                    intent=claims.peer_stop,
+                    causation_chain=claims.causation_chain,
+                )
             return Message(
                 message_id=uuid4().hex,
                 context_id=params.message.context_id or uuid4().hex,
@@ -353,12 +354,18 @@ class NativeA2ARequestHandler(RequestHandler):
         try:
             if params.message.task_id:
                 task = await self.manager.continue_task(
-                    params, creator_agent_id=principal_id
+                    params,
+                    creator_agent_id=principal_id,
+                    admission_fence=lambda: self.guard.hold_authority(admitted),
                 )
                 if task is None:
                     raise TaskNotFoundError()
                 return task
-            return await self.manager.create_task(params, creator_agent_id=principal_id)
+            return await self.manager.create_task(
+                params,
+                creator_agent_id=principal_id,
+                admission_fence=lambda: self.guard.hold_authority(admitted),
+            )
         except TaskInputUnsupportedError as error:
             raise UnsupportedOperationError(message=str(error)) from error
         except TaskInputConflictError as error:
@@ -412,7 +419,9 @@ class NativeA2ARequestHandler(RequestHandler):
         self, params: SendMessageRequest, context: ServerCallContext
     ) -> Task | Message:
         async with self.guard.admit(params, "SendMessage", context) as admitted:
-            task = await self._submit(admitted)
+            pass
+        task = await self._submit(admitted)
+        async with self.guard.hold_authority(admitted):
             if isinstance(task, Message):
                 return task
             if admitted.request.configuration.return_immediately:
@@ -457,7 +466,8 @@ class NativeA2ARequestHandler(RequestHandler):
                 raise UnsupportedOperationError(
                     message="Streaming is not advertised by this agent"
                 )
-            task = await self._submit(admitted)
+        task = await self._submit(admitted)
+        async with self.guard.hold_authority(admitted):
             if isinstance(task, Message):
                 yield task
                 return
@@ -503,9 +513,17 @@ class NativeA2ARequestHandler(RequestHandler):
             params, "CreateTaskPushNotificationConfig", context
         ) as (admitted, worker):
             await self._task(admitted.request.task_id, admitted.principal_id)
-            created = await worker.outbox.register(
-                admitted.request, creator_id=admitted.principal_id
+            config = TaskPushNotificationConfig.FromString(
+                admitted.request.SerializeToString()
             )
+        with _push_errors():
+            prepared = await worker.outbox.prepare(config)
+            async with self.guard.hold_authority(admitted):
+                if self._require_push() is not worker:
+                    raise RuntimeError("Push admission lost its original worker")
+                created = await worker.outbox.register_prepared(
+                    prepared, creator_id=admitted.principal_id
+                )
             return created.config
 
     async def on_get_task_push_notification_config(

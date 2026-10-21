@@ -966,6 +966,13 @@ runtime's unretired attempt remains an explicit internal refusal with credential
 retained for retirement. Peer Stop returns a Message and refuses inline task
 callbacks. No network request may hold a database transaction.
 
+Callback DNS runs after signed-sender and recipient authorization, with the
+host lifecycle lease released. New input, continuation input and explicit
+configuration creation reacquire the original request's authority for their
+finite commit. A withdrawn registration, changed principal or stopped push
+service refuses that commit. The immutable input projection is captured before
+DNS; callback credentials remain outside task-input storage.
+
 Callback-scoped log filters redact the URL, normalized HTTP URL, notification
 token and authentication credentials. Retained error messages and explicit or
 implicit exception ancestry are redacted without replacing the original
@@ -1018,7 +1025,10 @@ or task requests. Explicitly injected native session factories retain ownership.
 
 Real standalone lifespan tests exercise inception, agent initialization, signed
 discovery, push service startup and shutdown on isolated storage without a
-metered model call. Process-session tests drive the actual startup factory,
+metered model call. The runtime task publisher marks resident service ownership
+for the restart idle gate. Finite background work keeps its separate admission
+and still defers restart, even when it has the same name as a resident.
+Process-session tests drive the actual startup factory,
 SDK HTTP routes and durable creator/outbound rows over a loopback listener,
 including a proxy prefix and revoked roster. These are implementation checks;
 they do not establish deployment or foreign-framework acceptance.

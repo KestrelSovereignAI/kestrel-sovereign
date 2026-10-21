@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-21
-**Scope:** 3279 tracked files (2450 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3281 tracked files (2452 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3468,6 +3468,8 @@ Repo entry points and standard project files.
   - `def test_text_projection_ignores_other_parts_and_preserves_order_and_explicit_empty()`; `def test_text_projection_refuses_draft_or_duck_typed_messages()`; `def test_embedded_json_bytes_preserve_exact_values_and_explicit_null(value)`; `def test_embedded_json_bytes_fail_clearly_on_non_json_or_invalid_utf8(content)`; `def test_embedded_json_projection_does_not_fetch_urls_or_parse_untyped_bytes()`; `def test_embedded_json_projection_rejects_a_duck_typed_part()`
 - **tests/unit/test_a2a_native_publication.py** — Public native discovery requires explicit, validated host configuration.
   - `def test_operator_only_host_does_not_guess_a_public_peer_url()`; `def test_public_discovery_recipient_is_an_explicit_registration_key()`; `def test_invalid_discovery_configuration_refuses_publication(environment)`
+- **tests/unit/test_a2a_native_push_admission.py** — Callback validation releases topology ownership and rechecks before commit.
+  - `async def test_callback_dns_releases_host_lease_and_rechecks_original_authority(wire, monkeypatch, operation, policy_change)`; `async def test_callback_commit_retains_authority_until_original_sql_ack(wire, monkeypatch, operation)`; `async def test_unauthorized_callback_does_not_resolve_peer_supplied_dns(wire, monkeypatch)`
 - **tests/unit/test_a2a_native_push_config_store.py** — Native task authority, real AEAD storage and retryable push retirement.
   - `async def push_store(native_a2a_backend_factory, monkeypatch)`; `def config(task, config_id)`; `async def admit(store, configuration)`; `async def test_native_config_round_trip_encrypts_all_callback_material(push_store)`; `async def test_task_creator_authority_cannot_be_forged_by_another_principal(push_store, operation)`; `async def test_ciphertext_is_bound_to_every_ownership_column(push_store, field)`; `async def test_deletion_revokes_new_reads_and_retains_original_generation_until_retirement(push_store)`; `async def test_config_id_default_pagination_and_duplicate_refusal(push_store)`; `…`
 - **tests/unit/test_a2a_native_push_host.py** — Ready runtime publication, signed capability, and fail-closed host startup.
@@ -4190,6 +4192,8 @@ Repo entry points and standard project files.
   - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`; `def test_example_documents_both_memory_retrieval_floors()`
 - **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.
   - `def fake_tool()`; `def agent_with_tool(fake_tool)`; `class TestExecuteNamedToolGovernance`; `class TestExecuteNamedToolSubagentDispatch`
+- **tests/unit/test_execution_control_classification.py** — Direct-node classification shares the existing explicit-graph control contract.
+  - `def test_same_original_node_and_graph_classification(kind, mode)`; `async def test_direct_acknowledged_commit_retains_exact_original_receipt(group)`; `async def test_direct_native_retirement_keeps_actual_response_and_failed_close_owner()`; `def test_recursive_option_remains_keyword_only()`
 - **tests/unit/test_execution_custody.py** — Irrevocable native authority across copied contexts (#3569).
   - `class Authority`; `async def test_copied_child_cannot_regain_authority_after_scope_ends(retirement)`; `def test_nested_ancestor_revocation_is_not_masked_by_live_child()`; `async def test_foreign_turn_executor_rebinds_same_mutable_authority()`; `def test_repeated_revoke_never_changes_original_reason_or_revives()`; `async def test_native_dispatch_rechecks_after_awaited_permission_hook(boundary)`; `async def test_native_dispatch_rechecks_after_final_post_hook()`; `async def test_sqlite_connect_refuses_before_creating_path(tmp_path)`; `…`
 - **tests/unit/test_execution_custody_a2a_merge_native.py** — Original effect receipts survive native question recovery and service shutdown.

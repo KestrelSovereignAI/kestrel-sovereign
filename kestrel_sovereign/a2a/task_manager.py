@@ -12,7 +12,8 @@ This is the primary API for working with A2A tasks.
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from datetime import UTC, datetime
 from typing import (
     TYPE_CHECKING,
@@ -289,6 +290,27 @@ class TaskManager:
         if outbox.configurations.task_store is not self.task_store:
             raise ValueError("Task push service lost its canonical task store")
         return outbox, await outbox.prepare(callback) if callback is not None else None
+
+    @asynccontextmanager
+    async def _task_input_admission(
+        self,
+        outbox: NativePushOutbox | None,
+        admission_fence: Callable[[], AbstractAsyncContextManager[object]] | None,
+    ) -> AsyncIterator[None]:
+        """Recheck native authority after preparation, holding it only for commit.
+
+        Internal callers already own their admission. HTTP callers retain the
+        original verified receipt and supply its finite policy/topology fence.
+        Neither callback DNS nor post-commit projections hold that fence.
+        """
+        async with admission_fence() if admission_fence is not None else nullcontext():
+            if outbox is not None and (
+                self._push_service is None
+                or self._push_service.require_ready().outbox is not outbox
+            ):
+                raise RuntimeError("Task admission lost its original push service")
+            async with self.task_store.write_transaction():
+                yield
 
     @property
     def did(self) -> str:
@@ -1264,7 +1286,11 @@ class TaskManager:
             )
 
     async def continue_task(
-        self, params: SendMessageRequest, *, creator_agent_id: str
+        self,
+        params: SendMessageRequest,
+        *,
+        creator_agent_id: str,
+        admission_fence: Callable[[], AbstractAsyncContextManager[object]] | None = None,
     ) -> Task | None:
         """Admit a follow-up on the same creator-owned task and native context."""
         if not isinstance(params, SendMessageRequest):
@@ -1273,7 +1299,7 @@ class TaskManager:
         parse_message_metadata(MessageToDict(params.metadata))
         prepared_input = prepare_native_task_input(params)
         push_outbox, push_config = await self._prepare_task_push(prepared_input)
-        async with self.task_store.write_transaction():
+        async with self._task_input_admission(push_outbox, admission_fence):
             candidate, appended = await self.task_store.append_creator_input(
                 prepared_input, creator_agent_id=creator_agent_id
             )
@@ -1307,6 +1333,7 @@ class TaskManager:
         notify_submitted: bool = True,
         cognition_wake_eligible: bool = True,
         input_wake_eligible: bool = True,
+        admission_fence: Callable[[], AbstractAsyncContextManager[object]] | None = None,
     ) -> Task:
         """Admit a new native task after sender and recipient authorization.
 
@@ -1345,7 +1372,7 @@ class TaskManager:
         )
         # Reserve ownership and task in ONE backend transaction. A failed insert
         # cannot strand a context reservation or authorize another creator.
-        transaction = self.task_store.write_transaction()
+        transaction = self._task_input_admission(push_outbox, admission_fence)
         ownership_refusal = None
         admitted_snapshot = None
         async with transaction:

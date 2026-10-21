@@ -9490,6 +9490,8 @@ Expected Duration: {expected_duration}
         checks them again. Only then does this service run under the original
         runtime generation. Ordinary `_track_background_task` children retain
         all denying ancestors and never receive this handoff.
+        Resident ownership also identifies infrastructure to the idle restart
+        gate. Finite work admitted by a resident remains separately tracked.
 
         An explicit admission receipt retains the exact accepted Task if later
         publication raises; that caller must join it before releasing storage.
@@ -9524,6 +9526,7 @@ Expected Duration: {expected_duration}
                     # The exact accepted owner survives even if create_owned
                     # or a subsequent publication callback refuses to return.
                     admission.task._kestrel_started_at = time.monotonic()
+                    admission.task._kestrel_runtime_service = True
                     self._background_tasks.add(admission.task)
         except BaseException:
             # Canonical admission closes the refused resident wrapper. Its
@@ -9533,6 +9536,7 @@ Expected Duration: {expected_duration}
                 coro.close()
             raise
         task._kestrel_started_at = time.monotonic()
+        task._kestrel_runtime_service = True
         self._background_tasks.add(task)
 
         def completed(done):
