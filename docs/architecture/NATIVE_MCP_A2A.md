@@ -861,9 +861,43 @@ callers use native snapshots and the primary ledger.
 This maps safety coverage, not a conformance or deployment claim. The final
 release still requires the published dependencies and acceptance gates below.
 
-Push notifications require authenticated configuration changes, recipient-bound
-ownership and outbound URL validation against SSRF (including redirect/DNS
-changes). Signing a card does not authorize arbitrary callback egress.
+### Native push delivery
+
+Push configuration, HTTP request retirement and notification acknowledgement
+are separate facts. `PushConfigStore` binds callback credentials to the native
+task's creator, recipient and tenant. The shared AEAD service-key hierarchy
+protects the complete configuration, with its task, owner and generation in
+associated data. Reads return independent official protobuf values.
+
+`NativePushTransport` sends an official `StreamResponse` using the SDK's media
+type and version constants. It validates HTTPS egress, pins the approved IPs,
+verifies TLS and refuses redirects. Its native response/client owners retain
+physical close through cancellation. A total exchange deadline also bounds a
+peer that keeps making partial header progress inside each socket deadline.
+
+Deletion first revokes new admission, then waits for the admitted generation's
+actual HTTP owners to retire. An expired lease is not physical retirement.
+Unretired requests block both the deletion acknowledgement and task cleanup;
+confirmed deletion clears credentials and completed request rows atomically.
+The sender inventories its attempt before an admission COMMIT can become
+uncertain, so a lost acknowledgement before HTTP begins is recoverable without
+inventing a network request or replacing the original database outcome.
+
+These configuration/HTTP primitives are implemented; the handler continues to
+advertise push as unsupported until durable delivery and the standard config
+operations are wired together. The remaining integration must journal task
+change references in the task transaction and use the existing durable signal
+consumer ledger for fan-out, claims and retries. Notification payloads are read
+from the canonical authorized task, rather than duplicating task bodies in a
+second protocol store. No network request may hold a database transaction.
+
+Inline push credentials require a separate secret channel: after verifying the
+complete native request, persist the executable input without its callback
+secrets and retain the original request digest for replay/conflict checks. The
+callback configuration belongs only in encrypted configuration storage, never
+in cognition prompts or plaintext task-input JSON. This decomposition must
+commit with task admission and consumer registration before push is advertised.
+Signing a card does not authorize arbitrary callback egress.
 
 ## Review, verification and release order
 
