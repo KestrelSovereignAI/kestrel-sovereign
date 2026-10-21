@@ -267,6 +267,61 @@ def test_build_env_telemetry_operator_override(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Root-path support, read from the installed version (#3781)
+# ---------------------------------------------------------------------------
+
+
+def _installed_phoenix(monkeypatch, version):
+    """Report ``version`` for the Phoenix server distribution, and refuse to
+    import Phoenix at all: the probe must answer from metadata alone."""
+    import importlib.metadata
+
+    def fake_version(name):
+        assert name == "arize-phoenix"
+        if version is None:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return version
+
+    monkeypatch.setattr(importlib.metadata, "version", fake_version)
+    monkeypatch.setitem(sys.modules, "phoenix.config", None)
+
+
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    [
+        ("20.23.0", True),
+        ("4.1.0", True),
+        ("4.0.3", False),
+        (None, False),
+        ("not a version", False),
+    ],
+)
+def test_root_path_support_comes_from_the_installed_version(
+    monkeypatch, version, supported
+):
+    _installed_phoenix(monkeypatch, version)
+
+    assert ps.supports_host_root_path() is supported
+
+
+def test_start_resolves_root_path_without_importing_phoenix(tmp_path, monkeypatch):
+    """``import phoenix.config`` loads the Phoenix server: 5.7s or more per
+    boot, even when an already running Phoenix is adopted."""
+    _StubPopen.instances.clear()
+    _installed_phoenix(monkeypatch, "20.23.0")
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx")
+    sup._root_path_override = None
+
+    assert sup.start(wait_for_health=False) is True
+    assert sup.root_path == "/phoenix"
+    sup.stop()
+
+
+# ---------------------------------------------------------------------------
 # Subprocess lifecycle (stubbed process)
 # ---------------------------------------------------------------------------
 

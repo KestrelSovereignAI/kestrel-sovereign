@@ -3471,6 +3471,9 @@ async def test_cron_does_not_complete_same_process_executing_row(tmp_path):
 
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     await feat.initialize()
+    # The mock child never exits, so the dispatch watchdog would follow it
+    # for its whole window before ``drain_background_tasks`` returns.
+    feat._restart_dispatch_grace = 0
     created = await feat.request_restart(reason="ship")
     req_id = created.data["request"]["id"]
 
@@ -6162,6 +6165,112 @@ async def test_live_restart_child_leaves_the_row_executing(tmp_path):
     assert row.status == "executing"
     # Still tracked as in flight, so the reconciler leaves it alone too.
     assert req_id in feat._executing_since
+
+
+class _SlowFailingChild:
+    """A restart child that fails only after the host's whole stop deadline.
+
+    The realistic case: ``kestrel terminate`` signals the host, waits out the
+    stop deadline, sends a SIGKILL that does not take, and exits 1 with the
+    host still running. Each ``poll`` is one watchdog interval later on
+    ``clock``, so the child's lifetime is measured in the watchdog's own time.
+    """
+
+    pid = 4244
+
+    def __init__(self, clock, *, lifetime, interval, stderr_path):
+        self._clock = clock
+        self._exits_at = clock.time() + lifetime
+        self._interval = interval
+        self._kestrel_stderr_path = str(stderr_path)
+        self.returncode = None
+        self.polls = 0
+
+    def poll(self):
+        self.polls += 1
+        self._clock.advance(self._interval)
+        if self._clock.time() >= self._exits_at:
+            self.returncode = 1
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_child_that_fails_after_the_host_stop_deadline_is_caught(
+    tmp_path, monkeypatch,
+):
+    """The watch outlasts ``kestrel terminate``'s stop deadline (#3781).
+
+    A restart that cannot stop this host exits only after giving it
+    ``SERVER_TERMINATE_TIMEOUT_SECONDS`` and a SIGKILL. A watch that ends
+    sooner misses the failure, and the row sits ``executing`` until the
+    600s stranded-row sweep.
+    """
+    from types import SimpleNamespace as _Namespace
+
+    from kestrel_sovereign.features.restart_coordinator import feature as feature_mod
+    from kestrel_sovereign.multi_agent.process_manager import (
+        SERVER_TERMINATE_TIMEOUT_SECONDS,
+    )
+    from tests.utils.virtual_clock import VirtualClock
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    # The production window, not a test override: it is what is under test.
+    assert feat._restart_dispatch_grace == feature_mod.RESTART_DISPATCH_GRACE_SECONDS
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    # The watchdog's clock is virtual, so the child's minute of life costs
+    # nothing; its polls advance that clock one production interval each.
+    clock = VirtualClock(time.monotonic())
+    interval = feature_mod._DISPATCH_POLL_SECONDS
+    virtual_time = _Namespace(
+        **{name: getattr(time, name) for name in dir(time) if not name.startswith("_")}
+    )
+    virtual_time.monotonic = clock.time
+    monkeypatch.setattr(feature_mod, "time", virtual_time)
+    monkeypatch.setattr(feature_mod, "_DISPATCH_POLL_SECONDS", 0)
+
+    err_path = tmp_path / "restart.err"
+    err_path.write_text("host: PID 4100 is still running after SIGKILL\n")
+    child = _SlowFailingChild(
+        clock,
+        # The stop deadline, the SIGKILL settle, and the CLI's own start-up.
+        lifetime=SERVER_TERMINATE_TIMEOUT_SECONDS + 15,
+        interval=interval,
+        stderr_path=err_path,
+    )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        return_value=child,
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+
+    assert child.returncode == 1, "the watch ended before the child exited"
+    row = await get_request(backend, req_id)
+    assert row.status == "pending", "the late failure was not recovered"
+    assert "exited 1" in row.status_reason
+    assert "still running after SIGKILL" in row.status_reason
+
+
+def test_dispatch_watch_ends_before_the_stranded_row_sweep_begins():
+    """The watch and the sweep never both act on one dispatch.
+
+    A watch still running when the sweep returns the row to ``pending`` could
+    see its old child exit after the next tick re-dispatched the row, and
+    fail the new dispatch for it.
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        RESTART_DISPATCH_GRACE_SECONDS,
+        STALE_EXECUTING_SECONDS,
+    )
+    from kestrel_sovereign.multi_agent.process_manager import (
+        SERVER_TERMINATE_TIMEOUT_SECONDS,
+    )
+
+    assert SERVER_TERMINATE_TIMEOUT_SECONDS < RESTART_DISPATCH_GRACE_SECONDS
+    assert RESTART_DISPATCH_GRACE_SECONDS < STALE_EXECUTING_SECONDS
 
 
 @pytest.mark.asyncio
