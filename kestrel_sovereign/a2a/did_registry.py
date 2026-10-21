@@ -383,6 +383,16 @@ class ProcessA2ADidResolver:
             return signing_did
         return None
 
+    def signing_did_for_agent_id(self, agent_id: str) -> str | None:
+        """Select a peer's signing identity from immutable launcher evidence."""
+        if not isinstance(agent_id, str) or not agent_id:
+            return None
+        return next(
+            (did for did, stable_id in self._stable_agent_ids.items()
+             if stable_id == agent_id),
+            None,
+        )
+
 
 def install_process_a2a_did_resolver(
     agent: Any,

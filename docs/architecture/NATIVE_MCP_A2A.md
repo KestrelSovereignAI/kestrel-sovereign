@@ -410,9 +410,9 @@ configuration refuses publication.
 
 This is a private implementation candidate, exercised with unpublished SDK
 builds containing the reviewed signing and HTTP-authorization repairs. Push
-configuration, remaining draft-route retirement,
-released dependency adoption and full host interoperability remain acceptance
-work. The offline reviewed migration is implemented; it has not been run on
+delivery and draft-route retirement are implemented. Released dependency
+adoption, TCK and cross-framework interoperability remain acceptance work.
+The offline reviewed migration is implemented; it has not been run on
 operator data. The isolated HTTP tests do not establish release acceptance.
 
 The native task manager records the handler's admitted Task as its baseline.
@@ -993,15 +993,35 @@ callback egress.
 `NativeA2APublication` owns the common signed card, handler and SDK routes.
 Its host-owned guard factory supplies request authority and the matching
 lifecycle reader; the embedding host retains its writer during publication and
-withdrawal. The AgentManager embedding uses this contract. Standalone and
-launched-process bootstrap and outbound sessions remain an implementation
-gate, using this same wire implementation. `SingleAgentNativeAuthority` now
-provides the original-runtime and scoped-policy guard for that embedding. Its
+withdrawal. AgentManager and the standalone server's startup path use this
+contract after real agent READY. Standalone publication requires an explicit
+trusted DID resolver and a recipient-scoped peer directory/requester; a DID
+signature alone never grants access. A single agent uses its canonical stable
+DID as the routing key unless `KESTREL_A2A_DISCOVERY_AGENT` selects one.
+`SingleAgentNativeAuthority` provides the original-runtime and scoped-policy
+guard for that embedding. Its
 writer closes admission, joins current readers, and withdraws the exact route
 binding before the agent's task manager may close its primary storage. Replacing
-an agent field cannot erase the captured runtime's original revocation. This is
-an authority primitive, not a claim that the standalone server startup path is
-already connected.
+an agent field cannot erase the captured runtime's original revocation.
+
+Launcher-managed processes retain the explicit parent `KESTREL_HOST_URL` for
+authenticated roster reads. When `KESTREL_BASE_URL` is configured, the launcher
+sets each child's discovery key to its exact registration name. That public
+front door must route each child's native card and A2A paths to that child;
+neither its listen port nor the parent roster URL substitutes for the public
+origin. The process session resolves the peer's signing DID from immutable
+launcher-attested identity material and rechecks the live scoped roster before
+discovery and operations. It uses the same SDK session setup as AgentManager,
+verifies the signed card, and refuses an interface that changes the trusted
+origin, route or tenant. The roster credential never enters native discovery
+or task requests. Explicitly injected native session factories retain ownership.
+
+Real standalone lifespan tests exercise inception, agent initialization, signed
+discovery, push service startup and shutdown on isolated storage without a
+metered model call. Process-session tests drive the actual startup factory,
+SDK HTTP routes and durable creator/outbound rows over a loopback listener,
+including a proxy prefix and revoked roster. These are implementation checks;
+they do not establish deployment or foreign-framework acceptance.
 
 ## Review, verification and release order
 

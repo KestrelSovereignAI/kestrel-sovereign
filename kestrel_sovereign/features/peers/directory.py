@@ -200,6 +200,19 @@ class LocalHostPeerDirectory:
         # Operational messages use the host-supplied official SDK session.
         self._native_session_factory = native_session_factory
 
+    def bind_native_session_factory(self, factory) -> None:
+        """Bind the launcher's session owner once without changing roster origin."""
+        if not callable(factory):
+            raise PeerDirectoryConfigurationError("Native session factory must be callable")
+        if self._native_session_factory is not None:
+            raise PeerDirectoryConfigurationError("Native session factory is already bound")
+        self._native_session_factory = factory
+
+    @property
+    def has_native_session_factory(self) -> bool:
+        """Whether the embedding has already supplied its session authority."""
+        return self._native_session_factory is not None
+
     @asynccontextmanager
     async def open_a2a_session(self, requester: PeerRequester, peer: PeerIdentity):
         self._require_requester(requester)

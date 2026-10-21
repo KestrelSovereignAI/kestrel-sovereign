@@ -10,7 +10,8 @@ import httpx
 import pytest
 import pytest_asyncio
 from a2a.client import ClientConfig, ClientFactory
-from a2a.types import AgentSkill, GetTaskRequest
+from a2a.types import AgentCard, AgentSkill, GetTaskRequest
+from google.protobuf.json_format import ParseDict
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 
@@ -22,7 +23,10 @@ from kestrel_sovereign.a2a.native_publication import (
     NativeHostingConfiguration,
 )
 from kestrel_sovereign.a2a.native_routes import NativeA2AHTTPRegistry
-from kestrel_sovereign.a2a.native_standalone import SingleAgentNativeAuthority
+from kestrel_sovereign.a2a.native_standalone import (
+    SingleAgentNativeAuthority,
+    prepare_single_agent_native_publication,
+)
 from kestrel_sovereign.features.peers.directory import PeerRequester
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity
 from tests.utils.native_a2a import signing_identity
@@ -47,7 +51,7 @@ def single_identity():
 
 
 @pytest_asyncio.fixture
-async def single(native_request_admission, single_identity):
+async def single_candidate(native_request_admission, single_identity):
     a = native_request_admission
     ready = asyncio.Event()
     ready.set()
@@ -97,28 +101,30 @@ async def single(native_request_admission, single_identity):
         ],
         object(),
     )
-    owner = SingleAgentNativeAuthority(
-        recipient, "stable-single", proof_policy=a.guard.proof_policy, clock=lambda: NOW
+    return SimpleNamespace(
+        admission=a, recipient=recipient, app=Starlette(), document=single_identity[1]
     )
-    app = Starlette()
-    registry = NativeA2AHTTPRegistry(app)
+
+
+@pytest_asyncio.fixture
+async def single(single_candidate):
+    p = single_candidate
+    owner = SingleAgentNativeAuthority(
+        p.recipient,
+        "stable-single",
+        proof_policy=p.admission.guard.proof_policy,
+        clock=lambda: NOW,
+    )
     publication = await NativeA2APublication.prepare(
-        registry,
-        recipient,
+        NativeA2AHTTPRegistry(p.app),
+        p.recipient,
         "stable-single",
         NativeHostingConfiguration("http://single.native.test", "stable-single"),
         guard_factory=owner.create_guard,
     )
     await owner.publish(publication)
     try:
-        yield SimpleNamespace(
-            admission=a,
-            recipient=recipient,
-            owner=owner,
-            publication=publication,
-            app=app,
-            document=single_identity[1],
-        )
+        yield SimpleNamespace(**vars(p), owner=owner, publication=publication)
     finally:
         await owner.close()
 
@@ -509,3 +515,109 @@ async def test_runtime_publish_cannot_adopt_a_foreign_or_replacement_contract(
         with pytest.raises(ValueError if fault == "routing" else RuntimeError):
             await p.owner.publish(candidate)
     assert p.publication.is_published and len(p.app.routes) == 3
+
+
+@pytest.mark.parametrize("selected_key", [None, "Explicit Stable Key"])
+async def test_single_bootstrap_publishes_its_signed_discovery_and_exact_lifetime(
+    single_candidate, selected_key
+):
+    p = single_candidate
+    environment = {
+        "KESTREL_BASE_URL": "http://single.native.test",
+        "KESTREL_A2A_PUSH_ENABLED": "false",
+    }
+    if selected_key is not None:
+        environment["KESTREL_A2A_DISCOVERY_AGENT"] = selected_key
+    publication = await prepare_single_agent_native_publication(
+        p.app, p.recipient, environment, clock=lambda: NOW
+    )
+    owner = p.recipient._native_a2a_runtime_authority
+    try:
+        assert publication is p.recipient._native_a2a_publication
+        assert publication.routing_key == (
+            selected_key or p.admission.scope.recipient_id
+        )
+        assert publication.is_published
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(p.app), base_url="http://single.native.test"
+        ) as http:
+            response = await http.get("/.well-known/agent-card.json")
+        assert response.status_code == 200
+        verify_native_agent_card(
+            ParseDict(response.json(), AgentCard()),
+            signing_did=p.document["id"],
+            trusted_document=p.document,
+        )
+    finally:
+        await owner.close()
+    assert p.app.routes == [] and p.admission.backend.is_connected
+
+
+async def test_operator_only_single_boot_does_not_invent_a_peer_policy(
+    single_candidate,
+):
+    p = single_candidate
+    assert await prepare_single_agent_native_publication(p.app, object(), {}) is None
+    assert p.app.routes == [] and not hasattr(
+        p.recipient, "_native_a2a_runtime_authority"
+    )
+
+
+async def test_single_private_card_refusal_retires_authority_without_closing_callers_store(
+    single_candidate,
+):
+    p = single_candidate
+    p.recipient.identity = replace(p.recipient.identity, new_verification_methods=[])
+    with pytest.raises(ValueError):
+        await prepare_single_agent_native_publication(
+            p.app,
+            p.recipient,
+            {
+                "KESTREL_BASE_URL": "https://single.native.test",
+                "KESTREL_A2A_PUSH_ENABLED": "false",
+            },
+            clock=lambda: NOW,
+        )
+    owner = p.recipient._native_a2a_runtime_authority
+    with pytest.raises(HTTPException):
+        owner.require_current()
+    assert p.app.routes == [] and p.admission.backend.is_connected
+    await owner.close()
+
+
+async def test_single_bootstrap_cancellation_preserves_original_caller_and_retires_authority(
+    single_candidate,
+):
+    p = single_candidate
+    entered = asyncio.Event()
+
+    async def pending_profile():
+        entered.set()
+        await asyncio.Event().wait()
+
+    p.recipient.get_public_profile = pending_profile
+    starting = asyncio.create_task(
+        prepare_single_agent_native_publication(
+            p.app,
+            p.recipient,
+            {
+                "KESTREL_BASE_URL": "https://single.native.test",
+                "KESTREL_A2A_PUSH_ENABLED": "false",
+            },
+            clock=lambda: NOW,
+        )
+    )
+    try:
+        await entered.wait()
+        starting.cancel("original standalone bootstrap caller withdrew")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await starting
+        assert caught.value.args == ("original standalone bootstrap caller withdrew",)
+        with pytest.raises(HTTPException):
+            p.recipient._native_a2a_runtime_authority.require_current()
+        assert p.app.routes == [] and p.admission.backend.is_connected
+    finally:
+        if not starting.done():
+            starting.cancel()
+        await asyncio.gather(starting, return_exceptions=True)
+        await p.recipient._native_a2a_runtime_authority.close()

@@ -2,7 +2,10 @@
 
 import asyncio
 import inspect
+import time
 from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from starlette.exceptions import HTTPException
@@ -24,6 +27,7 @@ from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
 from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
+    execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
 )
@@ -255,3 +259,128 @@ class SingleAgentNativeAuthority:
                 if self._publication is not None:
                     self._publication.withdraw()
                 self._retired = True
+
+
+@asynccontextmanager
+async def open_process_native_peer_session(
+    owner: SingleAgentNativeAuthority, *, resolver, requester, peer, timeout
+):
+    """Use launcher-attested identity and live roster policy for process egress.
+
+    The configured public front door routes the launcher's stable per-agent
+    keys. The parent roster is a separate operator-authenticated discovery
+    origin; no operator credential crosses the native task transport.
+    """
+    from kestrel_sovereign.a2a.did_registry import ProcessA2ADidResolver
+    from kestrel_sovereign.a2a.native_publication import open_native_peer_session
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.a2a.task_manager import OutboundActorScopeError
+    from kestrel_sovereign.features.peers.directory import (
+        PeerAccessDeniedError,
+        PeerIdentity,
+    )
+
+    owner.require_current()
+    if (
+        not isinstance(resolver, ProcessA2ADidResolver)
+        or getattr(owner.recipient, "_a2a_process_did_resolver", None) is not resolver
+        or owner.resolver != resolver.resolve
+        or requester is not owner.requester
+        or not isinstance(peer, PeerIdentity)
+        or peer.agent_id == owner.scope.recipient_id
+    ):
+        raise PeerAccessDeniedError("Native process session has no trusted peer binding")
+    signing_did = resolver.signing_did_for_agent_id(peer.agent_id)
+    document = resolver.resolve(signing_did)
+    if signing_did is None or document is None:
+        raise PeerAccessDeniedError("Peer has no launcher-attested signing identity")
+    fingerprint = verification_document_fingerprint(document)
+    publication = owner._publication
+    try:
+        outbound = owner.manager.outbound_for_actor(requester.identity)
+        questions = owner.manager.questions_for_actor(requester.identity)
+    except OutboundActorScopeError as error:
+        raise PeerAccessDeniedError(str(error)) from error
+
+    async def authorize():
+        async with owner._lifecycle.read():
+            owner.require_current()
+            if (
+                owner.manager.outbound_store is not outbound
+                or owner.manager.question_store is not questions
+                or getattr(owner.recipient, "_a2a_process_did_resolver", None)
+                is not resolver
+                or resolver.signing_did_for_agent_id(peer.agent_id) != signing_did
+                or verification_document_fingerprint(resolver.resolve(signing_did))
+                != fingerprint
+            ):
+                raise PeerAccessDeniedError("Native process session identity changed")
+            current = await owner.router.resolve_peer_by_agent_id(
+                requester, peer.agent_id
+            )
+            owner.require_current()
+            if not isinstance(current, PeerIdentity) or (
+                current.agent_id, current.routing_key
+            ) != (peer.agent_id, peer.routing_key):
+                raise PeerAccessDeniedError("Peer is no longer in the current directory")
+
+    async with open_native_peer_session(
+        public_base_url=publication.configuration.public_base_url,
+        routing_key=peer.routing_key,
+        sender_identity=owner.identity,
+        signing_did=signing_did,
+        signing_document=document,
+        scope=NativeRecipientScope(peer.agent_id),
+        outbound=outbound,
+        questions=questions,
+        authorize=authorize,
+        timeout=timeout,
+    ) as session:
+        yield session
+
+
+async def prepare_single_agent_native_publication(
+    app,
+    recipient,
+    environment: Mapping[str, str],
+    *,
+    clock: Callable[[], float] = time.time,
+):
+    """Publish one ready runtime using an already installed explicit peer policy.
+
+    The server or embedding host owns resolver and policy installation. An
+    absent public base URL keeps operator-only startup independent of them.
+    A configured failure never silently changes capabilities or routing.
+    """
+    from kestrel_sovereign.a2a.native_publication import (
+        NativeA2APublication,
+        NativeHostingConfiguration,
+        native_publication_registry,
+    )
+
+    configuration = NativeHostingConfiguration.from_environment(environment)
+    if configuration is None:
+        return None
+    routing_key = configuration.discovery_routing_key
+    if routing_key is None:
+        routing_key = resolve_scoped_agent_did(recipient)
+        configuration = replace(configuration, discovery_routing_key=routing_key)
+    owner = SingleAgentNativeAuthority(
+        recipient, routing_key, proof_policy=NativeProofPolicy(), clock=clock
+    )
+    try:
+        publication = await NativeA2APublication.prepare(
+            native_publication_registry(app),
+            recipient,
+            routing_key,
+            configuration,
+            guard_factory=owner.create_guard,
+        )
+        await owner.publish(publication)
+        return publication
+    except BaseException as original:
+        try:
+            await owner.close()
+        except BaseException as retirement:  # noqa: BLE001 - retain original publication and retirement control
+            raise execution_terminal_error(original, retirement, retain_originals=True)
+        raise

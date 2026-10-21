@@ -1165,6 +1165,10 @@ class ProcessManager:
         env["PORT"] = str(config.port)
         env["KESTREL_SERVE_UI"] = "true" if standalone else "false"
         env["KESTREL_HOST_URL"] = f"http://localhost:{host_port}"
+        if env.get("KESTREL_BASE_URL") is not None:
+            # The configured public front door routes each child by the exact
+            # launcher name, rather than by display name or its signing DID.
+            env["KESTREL_A2A_DISCOVERY_AGENT"] = name
         # Unlike an in-process AgentManager, this process handoff cannot pass
         # constructor arguments. Carry the exact per-agent config rather than
         # asking the child to discover a project-global profile. Remove an

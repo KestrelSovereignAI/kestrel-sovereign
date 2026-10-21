@@ -16,6 +16,8 @@ NATIVE_IMPORT_TIMEOUT_SECONDS = 90
     [
         "import kestrel_sovereign.a2a.task_manager",
         "import kestrel_sovereign.a2a.native_host",
+        "import kestrel_sovereign.a2a.native_standalone",
+        "import kestrel_sovereign.a2a.native_publication",
         "import kestrel_sovereign.a2a.native_sender; import kestrel_sovereign.a2a.stores.unified.task_store",
         "import kestrel_sovereign.a2a.stores.unified.task_store; import kestrel_sovereign.a2a.native_sender",
     ],

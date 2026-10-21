@@ -1414,7 +1414,9 @@ def _hosted_peer_directory_context(
             # Never replace an explicitly injected user-scoped router with
             # global local-host discovery. Only the local directory client is
             # rebuilt from the active host config/auth state.
-            if not isinstance(router, LocalHostPeerDirectory):
+            if not isinstance(router, LocalHostPeerDirectory) or manager is None:
+                # A single-agent/process host already has an explicit directory
+                # origin. Keep that parent roster and its existing native factory.
                 return router, requester
 
         host_url = _active_local_peer_host_url(app)
@@ -1456,6 +1458,64 @@ def _hosted_peer_directory_context(
         getattr(agent, "peer_directory_router", None),
         getattr(agent, "peer_requester", None),
     )
+
+
+async def _onboard_single_agent_native(app: FastAPI, agent, environment=None):
+    """Bind the same native contract to one ready standalone/process runtime."""
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        install_a2a_inbound_sender_authorizer,
+        mark_a2a_inbound_scoped_policy,
+    )
+    from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
+    from kestrel_sovereign.a2a.native_standalone import (
+        prepare_single_agent_native_publication,
+    )
+
+    environment = dict(os.environ if environment is None else environment)
+    if NativeHostingConfiguration.from_environment(environment) is None:
+        return None
+    router, requester = _hosted_peer_directory_context(app, agent)
+    agent.peer_directory_router, agent.peer_requester = router, requester
+    mark_a2a_inbound_scoped_policy(agent, required=True)
+    if getattr(agent, "a2a_inbound_sender_authorizer", None) is None:
+        process_resolver = getattr(agent, "_a2a_process_did_resolver", None)
+        sender_id_resolver = (
+            process_resolver.directory_agent_id if process_resolver is not None
+            else lambda signing_did: signing_did
+        )
+        install_a2a_inbound_sender_authorizer(None, recipient=agent, sender_id_resolver=sender_id_resolver)
+    publication = await prepare_single_agent_native_publication(app, agent, environment)
+    from kestrel_sovereign.features.peers.directory import (
+        PEER_CONNECT_TIMEOUT,
+        PEER_READ_TIMEOUT,
+        LocalHostPeerDirectory,
+    )
+
+    process_resolver = getattr(agent, "_a2a_process_did_resolver", None)
+    if (process_resolver is not None and isinstance(router, LocalHostPeerDirectory)
+            and not router.has_native_session_factory):
+        import httpx
+
+        from kestrel_sovereign.a2a.native_standalone import (
+            open_process_native_peer_session,
+        )
+
+        owner = agent._native_a2a_runtime_authority
+
+        def session_factory(selected, peer):
+            return open_process_native_peer_session(
+                owner,
+                resolver=process_resolver,
+                requester=selected,
+                peer=peer,
+                timeout=httpx.Timeout(
+                    connect=PEER_CONNECT_TIMEOUT, read=PEER_READ_TIMEOUT,
+                    write=PEER_READ_TIMEOUT, pool=PEER_CONNECT_TIMEOUT,
+                ),
+            )
+
+        router.bind_native_session_factory(session_factory)
+    return publication
 
 
 async def _onboard_host_registered_agent(
@@ -3862,6 +3922,7 @@ async def _lifespan_startup(app: FastAPI):
             # inside KestrelAgent.initialize so every boot path — including
             # the multi-agent AgentManager path above — gets the same check.
             await app.state.agent.initialize()
+            await _onboard_single_agent_native(app, app.state.agent)
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
         except BaseException as e:
             from kestrel_sovereign.execution_custody import (

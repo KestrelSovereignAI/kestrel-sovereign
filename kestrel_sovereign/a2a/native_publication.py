@@ -223,6 +223,18 @@ class NativeA2APublication:
             return card
 
 
+def native_publication_registry(app: Starlette) -> NativeA2AHTTPRegistry:
+    """Own the one SDK route registry for this exact application."""
+    registry = getattr(app.state, "native_a2a_http", None)
+    if registry is None:
+        registry = NativeA2AHTTPRegistry(app)
+        app.state.native_a2a_http = registry
+    if not isinstance(registry, NativeA2AHTTPRegistry):
+        raise TypeError("Host native A2A routes require their published registry")
+    registry.require_application(app)
+    return registry
+
+
 async def prepare_hosted_native_publication(
     app: Starlette,
     manager: "AgentManager",
@@ -234,13 +246,7 @@ async def prepare_hosted_native_publication(
     configuration = NativeHostingConfiguration.from_environment(environment)
     if configuration is None:
         return None
-    registry = getattr(app.state, "native_a2a_http", None)
-    if registry is None:
-        registry = NativeA2AHTTPRegistry(app)
-        app.state.native_a2a_http = registry
-    if not isinstance(registry, NativeA2AHTTPRegistry):
-        raise TypeError("Host native A2A routes require their published registry")
-    registry.require_application(app)
+    registry = native_publication_registry(app)
     return await NativeA2APublication.prepare(
         registry,
         recipient,
@@ -361,6 +367,41 @@ async def open_hosted_native_peer_session(
                     "Native peer recipient registration changed"
                 )
 
+    async with open_native_peer_session(
+        public_base_url=publication.configuration.public_base_url,
+        routing_key=peer.routing_key,
+        sender_identity=sender_identity,
+        signing_did=recipient_identity.signing_did,
+        signing_document=signing_document,
+        scope=scope,
+        outbound=outbound,
+        questions=questions,
+        authorize=authorize,
+        timeout=timeout,
+    ) as session:
+        yield session
+
+
+@asynccontextmanager
+async def open_native_peer_session(
+    *,
+    public_base_url,
+    routing_key,
+    sender_identity,
+    signing_did,
+    signing_document,
+    scope,
+    outbound,
+    questions,
+    authorize,
+    timeout,
+):
+    """Discover and open the one SDK session under its embedding's authority.
+
+    The embedding supplies trusted routing, identity and durable stores. This
+    common path owns HTTP acquisition, card discovery, SDK setup and retirement
+    for in-process and separately hosted agents alike.
+    """
     await authorize()
     async with owned_native_http_client(
         httpx.AsyncClient(
@@ -375,8 +416,8 @@ async def open_hosted_native_peer_session(
             async with native_execution_response_owner(http):
                 card = await A2ACardResolver(
                     http,
-                    publication.configuration.public_base_url,
-                    agent_card_path=native_card_path(peer.routing_key),
+                    public_base_url,
+                    agent_card_path=native_card_path(routing_key),
                 ).get_agent_card()
         await authorize()
         interfaces = [
@@ -389,6 +430,13 @@ async def open_hosted_native_peer_session(
                 "Published peer has no unique native JSON-RPC interface"
             )
         interface = interfaces[0]
+        expected = native_http_interfaces(
+            public_base_url, routing_key=routing_key, scope=scope
+        )[0]
+        if interface != expected:
+            raise PeerUnavailableError(
+                "Signed peer interface differs from its trusted host route"
+            )
         signer = NativeSenderInterceptor.for_identity(
             sender_identity,
             recipient=scope,
@@ -399,7 +447,7 @@ async def open_hosted_native_peer_session(
         )
         session = NativePeerSession(
             card=card,
-            signing_did=recipient_identity.signing_did,
+            signing_did=signing_did,
             trusted_document=signing_document,
             recipient=scope,
             interface=interface,

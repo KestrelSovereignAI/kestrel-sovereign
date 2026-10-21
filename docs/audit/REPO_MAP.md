@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-21
-**Scope:** 3272 tracked files (2443 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3279 tracked files (2450 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -114,7 +114,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/native_input.py** — Canonical native request digests and callback-free task input.
   - `class NativeSenderProofError`; `def native_request_digest(params, operation)`; `class NativeTaskInput`; `def prepare_native_task_input(request)`
 - **kestrel_sovereign/a2a/native_publication.py** — Host-owned publication of one current recipient's signed native contract.
-  - `class NativeHostingConfiguration`; `class NativeA2APublication`; `async def prepare_hosted_native_publication(app, manager, routing_key, recipient, …)`; `async def open_hosted_native_peer_session(app, manager)`
+  - `class NativeHostingConfiguration`; `class NativeA2APublication`; `def native_publication_registry(app)`; `async def prepare_hosted_native_publication(app, manager, routing_key, recipient, …)`; `async def open_hosted_native_peer_session(app, manager)`; `async def open_native_peer_session()`
 - **kestrel_sovereign/a2a/native_routes.py** — One SDK route registration for dispatch, advertised URLs and peer admission.
   - `def native_route_prefix(routing_key)`; `def native_card_path(routing_key)`; `def native_http_interfaces(public_base_url)`; `class NativeA2AHTTP`; `class NativeA2AHTTPRegistry`
 - **kestrel_sovereign/a2a/native_schema.py** — Explicit stored-protocol boundary; runtime startup never converts draft data.
@@ -124,7 +124,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/native_sender.py** — Complete-request hybrid proofs for the A2A signed-sender-v1 extension.
   - `class ReplayNonceStore`; `def verification_document_fingerprint(did_document)`; `class NativeProofPolicy`; `class NativeVerifiedSender`; `def sign_native_request(keypair, params)`; `async def verify_native_request(headers, params)`
 - **kestrel_sovereign/a2a/native_standalone.py** — Original single-agent runtime authority over the shared native publication.
-  - `class SingleAgentNativeAuthority`
+  - `class SingleAgentNativeAuthority`; `async def open_process_native_peer_session(owner)`; `async def prepare_single_agent_native_publication(app, recipient, environment)`
 - **kestrel_sovereign/a2a/outcomes.py** — Merge an owned handler's changes without losing concurrent durable work.
   - `class TaskOutcomeConflictError`; `def merge_task_outcome(current, baseline, outcome)`
 - **kestrel_sovereign/a2a/projections.py** — Read-only presentation of official native protocol values.
@@ -619,6 +619,8 @@ Repo entry points and standard project files.
   - `def derive_overall_status(checks)`; `def worst_status()`; `async def check_database(db)`; `async def check_llm_service(agent)`; `async def check_memory_system(agent)`; `async def check_disk_space(threshold_mb)`; `async def check_context_budget(agent)`; `async def check_scheduler_liveness(agent, db)`; `…`
 - **kestrel_sovereign/features/health/feature.py** — Health Feature - periodic liveness probes.
   - `class HealthFeature`
+- **kestrel_sovereign/features/hosted_telegram_dispatch.py** — Host-authorized Telegram activation and send on one admitted child.
+  - `class HostedTelegramBinding`; `class HostedTelegramOutbound`; `def is_hosted_send(proxy, name)`; `def start_dispatch(proxy, name, arguments)`; `async def wait_dispatch(owner)`; `async def dispatch_admitted(proxy, arguments, context)`; `def validate_outbound_timeout(value)`
 - **kestrel_sovereign/features/identity/__init__.py** — Identity Feature: Agent tools for identity export, import, and verification.
 - **kestrel_sovereign/features/identity/feature.py** — Identity Feature: Agent tools for identity portability.
   - `class IdentityFeature`
@@ -1805,7 +1807,7 @@ Repo entry points and standard project files.
 - **scripts/sync_public_repo_files.py** — Synchronize public-repository mirrors of contributor-facing documents.
   - `def render_public_contributing()`; `def contributing_copy_is_current()`; `def sync_contributing_copy()`; `def main()`
 - **scripts/sync_session_to_agent.py** — Sync a Claude Code session transcript into a kestrel agent's memory.
-  - `def extract_messages(jsonl_path)`; `def content_hash(text)`; `def sync_to_agent(messages, db_path, agent_id)`; `def main()`
+  - `class OneSidedTranscriptError`; `def extract_messages(jsonl_path)`; `def require_both_sides(messages)`; `def content_hash(text)`; `def sync_to_agent(messages, db_path, agent_id)`; `def main()`
 - **scripts/test_runpod_e2e_companion.py** — E2E Test: RunPod LoRA Training Workflow
   - `class E2ETestRunner`; `def main()`
 - **scripts/train_luna_lora.py** — Train Luna's LoRA on the persistent RunPod pod.
@@ -1934,7 +1936,7 @@ Repo entry points and standard project files.
 - **docs/architecture/FEATURE_CLI_ADAPTERS.md** — Feature-Owned CLI Adapters — > Status: **Active**.
 - **docs/architecture/FILECOIN_WALLET.md** — Filecoin Wallet Integration — > **See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.
 - **docs/architecture/GITHUB_FEATURE_DESIGN.md** — GitHub Feature Design — > **Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package and is discovered through the `kestrel_sovereign.features` entry-poin…
-- **docs/architecture/HOSTED_ISOLATED_RUNTIME_LIFECYCLE.md** — Hosted isolated runtime lifecycle — Hosted applications can apply idle-retirement policy and receive sanitized process telemetry without reaching into `ProxyFeature` internals or managing a second subprocess lifecycle.
+- **docs/architecture/HOSTED_ISOLATED_RUNTIME_LIFECYCLE.md** — Hosted isolated runtime lifecycle — ## Hosted Telegram dispatch authority
 - **docs/architecture/INCREMENTAL_BACKUP.md** — Incremental Backup — Page-Aligned Content-Addressed Deltas for Active Agents — **Status (2026-06-27): Design spike for [#1842](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1842).** No implementation yet.
 - **docs/architecture/LLM_PROVIDER_CAPABILITIES.md** — LLM Provider Capabilities — Kestrel tracks adapter-level capabilities separately from per-model `ModelInfo`.
 - **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
@@ -2322,6 +2324,8 @@ Repo entry points and standard project files.
 - **tests/features/security/test_approval_queue.py** — Tests for the AWAITER_GONE terminal state in the approval queue (#2558).
   - `async def test_awaiter_cancelled_marks_request_awaiter_gone()`; `async def test_submit_decision_on_awaiter_gone_persists_and_reports()`; `async def test_submit_decision_on_awaiter_gone_once_scope_still_reports()`; `async def test_normal_approval_still_awaiter_gone_false()`; `async def test_late_approve_cancelled_during_persist_reports_awaiter_gone()`; `async def test_sweep_stale_reaps_awaiter_gone()`; `async def test_cancel_request_pops_awaiter_gone()`; `async def test_cancel_all_pops_awaiter_gone()`; `…`
 - **tests/fixtures/artifacts/publication-digest.json** — (configuration)
+- **tests/fixtures/hosted_telegram_dispatch_service.py** — Controlled external SDK process for host-dispatch lifecycle regressions.
+  - `class HostedDispatchService`
 - **tests/fixtures/memory_quality_eval.json** — (configuration)
 - **tests/fixtures/sdk_contribution_fixture.py** — Out-of-tree-style fixture: intentionally imports no Sovereign modules.
   - `class FixtureWaitProvider`; `class SDKFixtureFeature`; `class SDKFixtureHostFeature`
@@ -2458,6 +2462,8 @@ Repo entry points and standard project files.
   - `async def test_public_cancel_native_unknown_survives_real_reconciliation_and_later_control(native_pg, monkeypatch, later)`
 - **tests/integration/test_a2a_identity_original_control.py** — A2A identity/policy consumers preserve original PostgreSQL control.
   - `async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(native_memory_owners, tmp_path, door, kind)`
+- **tests/integration/test_a2a_native_single_lifespan.py** — The real standalone server publishes after real agent boot and retires routes.
+  - `async def test_actual_single_lifespan_publishes_after_boot_and_withdraws_before_close(tmp_path, monkeypatch, push)`
 - **tests/integration/test_access_log_redaction_live.py** — Real-Uvicorn access-log regression for SSE query credentials (#2429).
   - `def test_real_uvicorn_logs_redact_direct_and_multi_agent_sse_keys(monkeypatch)`
 - **tests/integration/test_accounting_original_denial.py** — Cancelled local SDK work keeps actual foreign native accounting denial.
@@ -2689,7 +2695,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_execution_authority_postgres.py** — Exact session death and transaction-bound generation fences (#3569).
   - `async def native_pg()`; `class GenerationFence`; `async def test_exact_advisory_session_loss_irrevocably_denies_other_connections(native_pg)`; `async def test_normal_retirement_invalidates_handle_without_loss_notification(native_pg)`; `async def test_unlock_loss_does_not_replace_original_cancellation(native_pg, monkeypatch)`; `async def test_lost_commit_acknowledgement_requires_reconciliation(native_pg, monkeypatch, explicit, scoped, …)`; `async def test_session_dies_while_acquiring_and_body_is_never_admitted(native_pg)`; `async def test_body_cancellation_retires_without_false_fatal_notification(native_pg)`; `…`
 - **tests/integration/test_execution_custody_proxy_ingress_pg.py** — Physical PostgreSQL COMMIT survives every proxy ingress/completion owner.
-  - `async def test_native_commit_receipt_reaches_terminal_owner_after_worker_removal(native_pg, monkeypatch, tmp_path, cancelled, …)`
+  - `async def test_native_signal_admission_fence_is_commit_only_not_consumer_custody(native_pg, privacy, denied)`; `async def test_legacy_delivery_creation_rechecks_original_admission_commit(native_pg, monkeypatch, denied)`; `async def test_native_commit_receipt_reaches_terminal_owner_after_worker_removal(native_pg, monkeypatch, tmp_path, cancelled, …)`
 - **tests/integration/test_execution_custody_review10_pg.py** — Native control terminalization uses the existing backend and exact lease CAS.
   - `async def test_native_cleanup_heartbeat_cannot_insert_revive_or_touch_successor(native_pg)`; `async def test_native_cognition_terminal_cas_never_revives_work_or_successor(native_pg, control)`; `async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretryable(native_pg, retained, carrier, outcome)`
 - **tests/integration/test_execution_custody_review12_pg.py** — Actual native cold-init resident liveness, without providers or new pools.
@@ -2826,6 +2832,8 @@ Repo entry points and standard project files.
   - `async def test_original_scheduler_stop_and_failed_storage_close_preserve_both_owners(native_pg, tmp_path, monkeypatch, refuse_storage)`
 - **tests/integration/test_host_startup_rollback_publication.py** — Actual empty-host startup must not publish after unsafe contribution rollback.
   - `async def test_actual_host_startup_rejects_retained_declarative_failure(tmp_path, monkeypatch)`
+- **tests/integration/test_hosted_telegram_dispatch.py** — Real SDK wire and SQLite ownership proof, not live provider acceptance.
+  - `class DispatchService`; `class WireClient`; `async def sdk_host(tmp_path, monkeypatch, factory)`; `def ordinary_authority(binding, events)`; `async def test_actual_sdk_first_send_prepares_before_send_and_confirms_before_release(tmp_path, monkeypatch)`; `async def test_missing_host_authority_never_uses_activated_legacy_send(tmp_path, monkeypatch)`; `async def test_refused_or_malformed_activation_never_calls_tool(tmp_path, monkeypatch, response)`; `async def test_actual_bridge_and_replacement_both_traverse_current_authority(tmp_path, monkeypatch)`; `…`
 - **tests/integration/test_http_private_request_admission.py** — Request extensions describe transport state; they never grant authority.
   - `async def test_request_observer_cannot_replace_private_native_admission(tmp_path, http, mutation)`
 - **tests/integration/test_identity_export_import.py** — Integration tests for Identity Export/Import functionality.
@@ -3454,6 +3462,8 @@ Repo entry points and standard project files.
   - `def test_package_import_does_not_load_private_sdk_protocol(first_import)`
 - **tests/unit/test_a2a_native_peer_stop.py** — Native SDK messages drive the real Stop policy and durable receipt rail.
   - `async def control(wire, rail, recipient_identity)`; `async def sender(control, recipient_identity)`; `def request()`; `async def receipt(control, params)`; `async def test_peer_stop_cannot_attach_a_callback_to_its_taskless_message(control, monkeypatch)`; `async def test_native_stop_returns_receipted_control_without_task_or_cognition(control, streaming)`; `async def test_native_stop_keeps_dispatcher_policy_refusals_receipted(control, changes)`; `async def test_native_stop_requires_current_recipient_authorization(control)`; `…`
+- **tests/unit/test_a2a_native_process_session.py** — Launcher-attested process peers use real HTTP and the shared SDK session.
+  - `async def process_peer(single_candidate, request)`; `async def test_process_startup_factory_reaches_native_tasks_and_durable_creator(process_peer)`; `async def test_process_session_rechecks_live_roster_after_discovery(process_peer)`; `async def test_process_session_cannot_spend_a_foreign_requester_or_resolver(process_peer)`; `async def test_process_session_requires_a_launcher_attested_peer_identity(process_peer)`; `async def test_signed_peer_card_cannot_redirect_the_trusted_process_route(process_peer)`
 - **tests/unit/test_a2a_native_projections.py** — Native oneof selection is preserved in text-only presentation.
   - `def test_text_projection_ignores_other_parts_and_preserves_order_and_explicit_empty()`; `def test_text_projection_refuses_draft_or_duck_typed_messages()`; `def test_embedded_json_bytes_preserve_exact_values_and_explicit_null(value)`; `def test_embedded_json_bytes_fail_clearly_on_non_json_or_invalid_utf8(content)`; `def test_embedded_json_projection_does_not_fetch_urls_or_parse_untyped_bytes()`; `def test_embedded_json_projection_rejects_a_duck_typed_part()`
 - **tests/unit/test_a2a_native_publication.py** — Public native discovery requires explicit, validated host configuration.
@@ -3502,8 +3512,10 @@ Repo entry points and standard project files.
   - `def identity()`; `def request_message()`; `def test_full_request_digest_uses_actual_protojson_presence(request_message)`; `def test_canonical_request_vector_retains_explicit_optional_zero()`; `def test_compact_claims_have_independent_ed25519_signature(identity, request_message)`; `async def test_shared_store_spends_nonce_across_independent_verifiers(identity, request_message, tmp_path)`; `async def test_every_native_payload_dimension_is_bound(identity, request_message, target)`; `async def test_route_operation_extension_and_clock_binding(identity, request_message, change, diagnostic)`; `…`
 - **tests/unit/test_a2a_native_shutdown.py** — Native primary storage and every service remain owned through shutdown.
   - `async def manager(native_a2a_backend_factory)`; `def observe_closes(manager, monkeypatch)`; `async def test_native_shutdown_closes_every_service_and_its_owned_primary(manager, monkeypatch)`; `async def test_failed_service_close_retains_its_owner_and_is_retried(manager, monkeypatch, store_name)`; `async def test_every_failed_service_is_named_and_original_error_is_preserved(manager, monkeypatch)`; `async def test_cancelled_drain_keeps_primary_and_all_services_for_retry(manager, monkeypatch)`; `async def test_shutdown_keeps_original_execution_receipt_while_closing_other_services(manager, monkeypatch)`; `async def test_sqlite_worker_retirement_is_owned_until_the_worker_exits(tmp_path, monkeypatch)`
+- **tests/unit/test_a2a_native_single_boot.py** — The actual server onboarding hook retains scoped standalone/process policy.
+  - `async def test_actual_single_onboarding_publishes_with_the_installed_scoped_policy(single_candidate)`; `async def test_operator_only_server_does_not_require_an_implicit_peer_identity(single_candidate)`; `async def test_process_onboarding_keeps_the_attested_signing_did_to_principal_mapping(single_candidate)`; `async def test_single_host_preserves_its_configured_parent_roster_and_native_factory(single_candidate)`; `async def test_process_onboarding_preserves_an_explicitly_owned_native_factory(single_candidate)`
 - **tests/unit/test_a2a_native_standalone.py** — Single runtime authority drives the same official SDK bindings and primary DB.
-  - `def single_identity()`; `async def single(native_request_admission, single_identity)`; `async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_manager(single, protocol)`; `async def test_retained_guard_refuses_replaced_runtime_authority(single, fault)`; `async def test_close_joins_original_readers_and_closes_admission_before_withdrawal(single)`; `async def test_another_runtime_owner_cannot_replace_the_original_generation(single)`; `async def test_agent_task_manager_close_joins_publication_before_any_primary_store_close(single, native_a2a_backend_factory)`; `async def test_unrecognized_publication_owner_cannot_discharge_storage(single)`; `…`
+  - `def single_identity()`; `async def single_candidate(native_request_admission, single_identity)`; `async def single(single_candidate)`; `async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_manager(single, protocol)`; `async def test_retained_guard_refuses_replaced_runtime_authority(single, fault)`; `async def test_close_joins_original_readers_and_closes_admission_before_withdrawal(single)`; `async def test_another_runtime_owner_cannot_replace_the_original_generation(single)`; `async def test_agent_task_manager_close_joins_publication_before_any_primary_store_close(single, native_a2a_backend_factory)`; `…`
 - **tests/unit/test_a2a_native_store_ownership.py** — Borrowed host storage stays open until its actual owner retires it.
   - `async def test_each_store_honors_the_configured_resource_owner(native_a2a_backend_factory, store_type, owns_backend)`; `def test_backend_ownership_cannot_be_a_truthy_configuration_string(value)`
 - **tests/unit/test_a2a_native_task_changes.py** — Original SQLite/PostgreSQL transactions journal every native task mutation.
@@ -3555,7 +3567,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_agent_manager.py** — Unit tests for the in-process AgentManager.
   - `async def test_signed_receipt_round_trip_preserves_integer_budget_signature()`; `def test_pending_signed_receipt_cannot_restore_governance(tmp_path)`; `def test_pending_receipt_marker_is_bound_by_parent_signature()`; `async def test_spawn_refuses_mandate_for_a_different_parent(tmp_path)`; `async def test_spawn_refuses_prebound_child_identity(tmp_path)`; `async def test_spawn_snapshots_mutable_mandate_before_admission_await(tmp_path)`; `async def test_spawn_revalidates_spawned_parent_before_child_inception(tmp_path)`; `async def test_cold_descendant_rereads_loaded_ancestor_receipt_before_publication(tmp_path)`; `…`
 - **tests/unit/test_agent_name_span_attribution.py** — Agent-name span attribution across every construction path (issue #2602).
-  - `class TestConstructionDisplayNameFloor`; `class TestAgentStampsAndPropagates`; `def otel_llm_exporter()`; `class TestLlmSpanCarriesRealAgentName`
+  - `class TestConstructionDisplayNameFloor`; `class TestAgentStampsAndPropagates`; `def otel_llm_exporter(monkeypatch)`; `class TestLlmSpanCarriesRealAgentName`
 - **tests/unit/test_agent_prefix_consolidation.py** — Regression tests for the /agent → /api/agent prefix consolidation (#871).
   - `def test_canonical_api_agent_prefix_serves_agent_routes()`; `def test_deprecated_agent_prefix_still_resolves(caplog)`; `def test_deprecation_log_dedupes_per_path_and_ua()`
 - **tests/unit/test_agent_runtime_endpoint_contracts.py** — Focused contract tests for agent runtime/status endpoints.
@@ -3591,7 +3603,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_associative_linker.py** — Unit tests for AssociativeLinker typed LinkedConcept return shape.
   - `class TestExtractAndLinkTypedReturn`; `class TestPersonNameCategorization`
 - **tests/unit/test_async_ownership.py** — Contract tests for cancellation-safe ownership and borrowed observation.
-  - `async def test_original_admission_cell_precedes_all_callback_publication(tmp_path, mode, eager)`; `async def test_borrowed_observation_withdraws_without_cancelling_or_joining_original()`; `async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate()`; `async def test_borrowed_observation_refuses_owning_or_forwarding_cancellation(mode)`; `async def test_native_original_policy_keeps_caused_cancellation_without_changing_default(retain_originals)`; `async def test_only_explicit_owned_iterator_sources_inherit_observation_lineage()`; `async def test_owned_task_result_is_retrieved()`; `async def test_owned_task_exception_retains_original_type()`; `…`
+  - `async def test_original_admission_cell_precedes_all_callback_publication(tmp_path, mode, eager)`; `async def test_borrowed_observation_withdraws_without_cancelling_or_joining_original()`; `async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation)`; `async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate()`; `async def test_borrowed_observation_refuses_owning_or_forwarding_cancellation(mode)`; `async def test_native_original_policy_keeps_caused_cancellation_without_changing_default(retain_originals)`; `async def test_only_explicit_owned_iterator_sources_inherit_observation_lineage()`; `async def test_owned_task_result_is_retrieved()`; `…`
 - **tests/unit/test_async_rag_store.py** — AsyncRAGStore writes: chunk content at rest (#2677), chunks without a vector (#3415).
   - `async def test_current_writer_persists_document_chunk_content_as_plaintext(tmp_path)`; `async def test_chunk_document_warns_about_chunks_stored_without_a_vector(tmp_path, caplog, outcome, stored_without, …)`; `async def test_chunk_document_is_quiet_when_nothing_was_left_unembedded(tmp_path, caplog, compute_embeddings)`
 - **tests/unit/test_async_rwlock.py** — Contracts for scheduler lifecycle reader/writer admission.
@@ -5037,7 +5049,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_scoped_did_other_tables.py** — The other-table self-scoped reads route through the shared DID guard (#3251).
   - `def test_wait_reconciler_binds_its_store_to_the_did_not_agent_id()`; `def test_wait_reconciler_refuses_to_construct_without_a_did(did)`; `async def test_notice_retention_sweep_scopes_the_store_by_the_did(monkeypatch)`; `async def test_notice_retention_sweep_refuses_without_a_did(monkeypatch, caplog)`; `async def test_reflection_hook_scopes_its_memory_read_by_the_did(monkeypatch, tmp_path)`; `async def test_reflection_hook_refuses_without_a_did_as_a_named_skip(monkeypatch)`; `async def test_scheduler_liveness_scopes_status_by_the_did(monkeypatch)`; `async def test_scheduler_liveness_names_a_missing_identity(monkeypatch)`; `…`
 - **tests/unit/test_scoped_peer_directory.py** — Scoped discovery and native-session admission, without the retired transport.
-  - `class ScopedDirectory`; `def feature_for(directory, scope)`; `def test_injected_directory_requires_the_authenticated_pair(missing)`; `async def test_duplicate_names_resolve_within_each_opaque_scope()`; `async def test_did_and_non_name_probes_are_refused_before_directory_lookup(probe)`; `async def test_retained_identity_ignores_name_reassignment_and_uses_current_route()`; `async def test_retained_resolution_refuses_invalid_or_substituted_identity(returned)`; `async def test_self_target_is_refused_by_stable_identity()`; `…`
+  - `class ScopedDirectory`; `def test_local_directory_binds_one_native_session_owner_without_changing_roster()`; `def feature_for(directory, scope)`; `def test_injected_directory_requires_the_authenticated_pair(missing)`; `async def test_duplicate_names_resolve_within_each_opaque_scope()`; `async def test_did_and_non_name_probes_are_refused_before_directory_lookup(probe)`; `async def test_retained_identity_ignores_name_reassignment_and_uses_current_route()`; `async def test_retained_resolution_refuses_invalid_or_substituted_identity(returned)`; `…`
 - **tests/unit/test_script_signer_fail_closed.py** — Fail-closed tests for ScriptSigner — Wave 0B (#914).
   - `def temp_db()`; `def script()`; `async def test_sign_without_keys_raises(temp_db, script)`; `async def test_sign_without_did_raises(temp_db, script)`; `async def test_sign_propagates_signing_failure(temp_db, script)`; `async def test_verify_rejects_hmac_prefix_even_when_math_verifies(temp_db, script)`; `async def test_verify_rejects_hmac_with_unsigned_default(temp_db, script)`; `async def test_verify_genuine_ecdsa_signature(temp_db, script)`; `…`
 - **tests/unit/test_script_signer_hybrid.py** — ScriptSigner hybrid-format tests — Quantum Hardening epic, signing-path follow-up to PR #999.
@@ -5358,6 +5370,8 @@ Repo entry points and standard project files.
   - `async def test_invalid_mode_returns_error_not_no_messages_found()`; `async def test_invalid_mode_echoes_request_in_data()`; `async def test_valid_mode_is_normalized_and_runs()`
 - **tests/unit/test_sync_preflight.py** — ``feature sync --preflight``: what a sync would certainly refuse, before it runs (#3702).
   - `def venv(monkeypatch, tmp_path)`; `def test_a_window_that_excludes_the_locked_version_is_a_conflict(venv, tmp_path)`; `def test_the_guarded_sync_refuses_exactly_what_the_preflight_names(venv, tmp_path, capsys)`; `def test_a_window_that_contains_the_locked_version_passes(venv, tmp_path, body)`; `def test_the_sync_installs_what_the_preflight_passes(venv, tmp_path)`; `def test_a_package_the_lock_does_not_pin_has_nothing_to_contradict(venv, tmp_path)`; `def test_a_locked_pre_release_is_inside_a_window_that_admits_it(monkeypatch, tmp_path)`; `def test_an_entry_held_on_its_checkout_is_not_a_window(venv, tmp_path)`; `…`
+- **tests/unit/test_sync_session_to_agent.py** — scripts/sync_session_to_agent.py imports both sides of a Claude Code session.
+  - `def test_extracts_the_users_turns_as_well_as_the_assistants(tmp_path)`; `def test_sync_stores_both_sides(tmp_path)`; `def test_one_sided_transcript_is_refused_before_anything_is_written(tmp_path, drop_one_side)`
 - **tests/unit/test_system_prompt_assembler.py** — Unit tests for the priority-ordered system-prompt assembler.
   - `def test_section_name_strips_md_and_uppercases()`; `def test_assemble_minimal_has_constitution_only()`; `def test_assemble_full_combination_clause_order()`; `def test_assemble_skips_heartbeat_md()`; `def test_assemble_skips_agents_when_anchored_supplies_it()`; `def test_anchored_doctrine_takes_precedence_for_every_bootstrap_name()`; `def test_assemble_includes_agents_from_bootstrap_when_no_anchor()`; `def test_soul_fence_uses_your_identity_label()`; `…`
 - **tests/unit/test_system_prompt_truthful_reporting.py** — Regression: the base system prompt must carry a GENERAL truthful-tool- reporting rule, not one quarantined to cryptographic data (#1925).

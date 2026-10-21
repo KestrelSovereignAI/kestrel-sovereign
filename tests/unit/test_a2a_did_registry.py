@@ -236,6 +236,9 @@ def test_process_registry_maps_signing_did_to_attested_stable_agent_id():
 
     assert resolver.directory_agent_id(DID_A) == stable_agent_id
     assert resolver.directory_agent_id("did:web:example.test:unknown") is None
+    assert resolver.signing_did_for_agent_id(stable_agent_id) == DID_A
+    assert resolver.signing_did_for_agent_id("unknown") is None
+    assert resolver.signing_did_for_agent_id(None) is None
     # The internal launcher binding is not part of the DID document passed to
     # the cryptographic envelope verifier.
     assert A2A_PEER_STABLE_AGENT_ID_FIELD not in resolver.resolve(DID_A)

@@ -47,6 +47,20 @@ class ScopedDirectory:
         return next((p for p in self.scoped(requester) if p.agent_id == identity), None)
 
 
+def test_local_directory_binds_one_native_session_owner_without_changing_roster():
+    router = LocalHostPeerDirectory("https://parent.test", transport_key="roster-only")
+    factory = lambda requester, peer: None
+    assert not router.has_native_session_factory
+    with pytest.raises(PeerDirectoryConfigurationError, match="callable"):
+        router.bind_native_session_factory(None)
+    router.bind_native_session_factory(factory)
+    assert router.has_native_session_factory and router._native_session_factory is factory
+    assert router._host_url == "https://parent.test"
+    assert router._headers()["X-Kestrel-A2A-Key"] == "roster-only"
+    with pytest.raises(PeerDirectoryConfigurationError, match="already bound"):
+        router.bind_native_session_factory(lambda requester, peer: None)
+
+
 def feature_for(directory, scope):
     agent = SimpleNamespace(did="did:caller", _agent_name="Caller")
     feature = PeersFeature(agent)
