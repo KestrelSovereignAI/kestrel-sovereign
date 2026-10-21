@@ -135,9 +135,12 @@ async def wait_dispatch(owner):
             else ExecutionAuthorityError("hosted Telegram dispatch deadline expired")
         )
         admission.native_error = error
-        admission.core_outcome = runtime._HostIngressOutcome(
-            runtime._HOST_INGRESS_CONTROL,
-            commit_outcome="unknown" if admission.provider_rpc_started else None,
+        admission.core_outcome = runtime._merge_host_ingress_control(
+            admission.core_outcome,
+            runtime._HostIngressOutcome(
+                runtime._HOST_INGRESS_CONTROL,
+                commit_outcome="unknown" if admission.provider_rpc_started else None,
+            ),
         )
         # Public projection is monotonic even while the original child stop
         # and authority interval are still settling in the retained owner.
@@ -174,7 +177,7 @@ async def wait_dispatch(owner):
             runtime._HOST_INGRESS_CONTROL, commit_outcome="unknown",
         )
         admission.native_error = ExecutionCommitOutcomeError("unknown")
-        admission.core_outcome = outcome
+        admission.core_outcome = runtime._merge_host_ingress_control(admission.core_outcome, outcome)
         outcome = runtime._retain_host_ingress_public_outcome(proxy, outcome)
         proxy._retain_execution_control(admission.native_error)
         proxy._latch_terminal_lifecycle()
@@ -299,7 +302,7 @@ async def dispatch_admitted(proxy, arguments, context):
             # Carry it through the existing native outcome lane rather than
             # asking the untrusted RPC-error redactor to authenticate it.
             admission.native_error = ExecutionCommitOutcomeError("unknown")
-            admission.core_outcome = failure
+            admission.core_outcome = runtime._merge_host_ingress_control(admission.core_outcome, failure)
     # Drop host/child/request-bearing references before detached projection.
     proxy = arguments = context = client = authority = factory = selected = payload = response = activated = admission = None
     if failure is not None:

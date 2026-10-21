@@ -862,7 +862,8 @@ async def test_foreign_control_shaped_callback_cannot_forge_native_provenance(tm
 
 
 @pytest.mark.asyncio
-async def test_retirement_observer_allocation_cannot_release_authority_before_stop(tmp_path, monkeypatch):
+@pytest.mark.parametrize("allocation", ["completion", "shield"])
+async def test_retirement_observer_allocation_cannot_release_authority_before_stop(tmp_path, monkeypatch, allocation):
     from contextlib import asynccontextmanager
     from kestrel_sovereign.features.hosted_telegram_dispatch import HostedTelegramOutbound
 
@@ -883,8 +884,12 @@ async def test_retirement_observer_allocation_cannot_release_authority_before_st
 
         def allocate():
             nonlocal refused
-            if (not refused and sys._getframe(1).f_code.co_name == 'await_owned_task'
-                    and sys._getframe(1).f_locals.get('task') is target and target is not None):
+            frame = sys._getframe(1)
+            if allocation == "shield" and frame.f_code.co_name == "shield":
+                frame = frame.f_back
+            if (not refused and frame.f_code.co_name == 'await_owned_task'
+                    and frame.f_locals.get('task') is target and target is not None
+                    and (allocation == "completion" or sys._getframe(1).f_code.co_name == "shield")):
                 refused = True
                 raise RuntimeError('controlled original retirement observation refusal')
             return original()
@@ -958,3 +963,55 @@ async def test_real_deadline_precedes_provider_even_if_activation_continuation_r
             if not release.done():
                 release.set_result(None)
             await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmation_state", [None, "committed", "unknown"])
+async def test_confirmation_custody_denial_cannot_erase_unknown_send(tmp_path, monkeypatch, confirmation_state):
+    from kestrel_sovereign.execution_custody import (
+        ConfirmedLeaseDeadline, ExecutionCommitOutcomeError,
+        bind_execution_custody, require_execution_work,
+    )
+
+    def factory(binding, events):
+        @asynccontextmanager
+        async def authority(proxy, arguments):
+            yield HostedTelegramOutbound(binding)
+            require_execution_work(proxy.agent)
+        return authority
+
+    async with sdk_host(tmp_path, monkeypatch, factory, expected_unknown=True) as (proxy, services, _, _):
+        deadline = ConfirmedLeaseDeadline()
+        assert deadline.confirm(asyncio.get_running_loop().time() + 30)
+
+        class Fence:
+            backend_type = "postgres"
+
+            def require_work(self):
+                deadline.require_work()
+
+            async def lock_and_validate(self, connection):
+                deadline.require_work()
+
+        service = services[0]
+        service.send_release.clear()
+        operation = None
+        try:
+            with bind_execution_custody(Fence()) as scope:
+                operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
+                await asyncio.wait_for(service.send_entered.wait(), 2)
+                if confirmation_state is not None:
+                    scope.preserve_commit_uncertainty(confirmation_state)
+                scope.revoke("original confirmation authority retired")
+                service.send_release.set()
+                with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
+                    await operation
+            with pytest.raises(ExecutionCommitOutcomeError, match="unknown"):
+                await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "no replay"})
+            assert len(service.sends) == 1
+            assert proxy._host_ingress_public_control.commit_outcome == "unknown"
+            assert any(item.core_outcome.commit_outcome == "unknown" for item in proxy._host_ingress_admissions)
+        finally:
+            service.send_release.set()
+            if operation is not None:
+                await asyncio.gather(operation, return_exceptions=True)

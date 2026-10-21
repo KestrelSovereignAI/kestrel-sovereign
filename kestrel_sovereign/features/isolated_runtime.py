@@ -2022,7 +2022,10 @@ class _HostIngressAdmission:
                 commit = ("unknown" if any(scope._uncertain_commit == "unknown" for scope in self.scopes)
                           else "committed" if any(scope._uncertain_commit == "committed" or scope._acknowledged_commits for scope in self.scopes)
                           else None)
-                self.core_outcome = _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome=commit)
+                self.core_outcome = _merge_host_ingress_control(
+                    self.core_outcome,
+                    _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome=commit),
+                )
                 self.core_denied_scopes = tuple(scope for scope in self.scopes if scope._denial is not None)
             raise
         # Irreversible native custody is authenticated BEFORE ordinary caller
@@ -2112,12 +2115,19 @@ def _finish_host_ingress_admission(admission, outcome):
     return outcome
 
 
-def _retain_host_ingress_public_outcome(proxy, outcome):
-    """Monotonic detached classification, not a raw-error history."""
-    prior = proxy._host_ingress_public_control
+def _merge_host_ingress_control(prior, outcome):
+    """One monotonic order for authenticated admission and public facts."""
     ranks = {None: 0, "committed": 1, "unknown": 2}
     if prior is None or ranks[outcome.commit_outcome] > ranks[prior.commit_outcome]:
-        proxy._host_ingress_public_control = outcome
+        return outcome
+    return prior
+
+
+def _retain_host_ingress_public_outcome(proxy, outcome):
+    """Monotonic detached classification, not a raw-error history."""
+    proxy._host_ingress_public_control = _merge_host_ingress_control(
+        proxy._host_ingress_public_control, outcome,
+    )
     return proxy._host_ingress_public_control
 
 
@@ -12767,9 +12777,9 @@ class ProxyFeature(Feature):
                         scope._uncertain_commit is None for scope in admission.scopes
                     )
                     scoped = bool(admission.core_denied_scopes) and stable_scopes
-                    localized = (not facts and scoped) or (
+                    localized = outcome.commit_outcome != "unknown" and ((not facts and scoped) or (
                         retired_ack and stable_scopes and (admission.core_outcome is None or scoped)
-                    )
+                    ))
                     if localized:
                         self._host_ingress_admissions.discard(admission)
                         outcome = self._host_ingress_public_control or outcome

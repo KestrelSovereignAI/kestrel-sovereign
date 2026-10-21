@@ -59,9 +59,12 @@ seals the proxy and starts the existing canonical terminal cleanup. The
 original dispatch retains its host context until accepted RPC work settles
 or the original child is positively retired. Bounded public observation does
 not acknowledge physical cleanup or permit replay of an ambiguous send.
-Allocation or callback-publication failure in the retirement observer does not
+Allocation, callback-publication, or shield-observation failure does not
 release host authority: the shared ownership helper retains the same original
 physical-stop join obligation and reports its observation failure after joining.
+Authenticated admission outcomes use the same monotonic order as public
+outcomes: UNKNOWN cannot become a plain denial when confirmation loses custody.
+That uncertainty remains permanent even when the later denial is scope-local.
 
 For hosted webhook admission, `admit_hosted_telegram_ingress(admission_fence=…)`
 accepts trusted host-only native transaction authority. It is propagated to

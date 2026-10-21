@@ -129,7 +129,8 @@ async def test_borrowed_observation_withdraws_without_cancelling_or_joining_orig
 
 
 @pytest.mark.asyncio
-async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch):
+@pytest.mark.parametrize("allocation", ["completion", "shield"])
+async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation):
     release, refused = asyncio.Event(), asyncio.Event()
     failure = RuntimeError("controlled original completion allocation refusal")
 
@@ -143,8 +144,11 @@ async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch
 
     def controlled_allocation():
         frame = sys._getframe(1)
+        if allocation == "shield" and frame.f_code.co_name == "shield":
+            frame = frame.f_back
         if (not refused.is_set() and frame.f_code.co_name == "await_owned_task"
-                and frame.f_locals.get("task") is source):
+                and frame.f_locals.get("task") is source
+                and (allocation == "completion" or sys._getframe(1).f_code.co_name == "shield")):
             refused.set()
             raise failure
         return allocate()

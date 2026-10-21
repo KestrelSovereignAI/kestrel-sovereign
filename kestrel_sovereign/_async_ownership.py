@@ -1073,6 +1073,12 @@ async def await_owned_task(
                             task.cancel()
                     except BaseException as failure:  # noqa: BLE001 - forwarding failure cannot abandon its owner
                         forwarding_error = failure
+            except BaseException as error:  # noqa: BLE001 - observing a producer never discharges its ownership
+                # Shield creates and publishes another plain observer Future.
+                # Its failure is observation debt, not physical completion.
+                # Reuse the existing positive-interval must-join path; borrowed
+                # observers may leave, but original owners must still join.
+                publication_errors.append(error)
     finally:
         if completion is not None:
             try:
