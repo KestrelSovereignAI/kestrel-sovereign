@@ -988,6 +988,7 @@ class ChannelFeature(Feature):
 
     async def handle_terminal_inbound(
         self, message: ChannelMessage, *, disposition: str, session_id: str | None = None,
+        admission_fence: Any = None,
     ) -> InboundAdmission:
         """Durably own a bounded Telegram terminal update without cognition."""
 
@@ -1040,6 +1041,7 @@ class ChannelFeature(Feature):
                 signal,
                 source_event_id=message.id,
                 consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+                **({"admission_fence": admission_fence} if admission_fence is not None else {}),
             )
             receipt = await handle.wait_for_durable_admission()
         except Exception as error:
@@ -1053,7 +1055,7 @@ class ChannelFeature(Feature):
             return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
         return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
 
-    async def handle_inbound(self, message: ChannelMessage) -> InboundAdmission:
+    async def handle_inbound(self, message: ChannelMessage, *, admission_fence: Any = None) -> InboundAdmission:
         """
         Process an inbound message from a channel adapter.
 
@@ -1109,7 +1111,16 @@ class ChannelFeature(Feature):
         message.agent_id = self._authoritative_agent_id
 
         # Log inbound message
-        await self._log_message(message, status="received")
+        if admission_fence is None:
+            await self._log_message(message, status="received")
+        else:
+            from kestrel_sovereign.execution_custody import bind_execution_custody
+
+            # Logging and event admission are separate original commits; each
+            # must serialize against revocation, without leaking a finite
+            # constraint into the resident cognition that follows.
+            with bind_execution_custody(admission_fence):
+                await self._log_message(message, status="received")
 
         durable_admission = False
         durable_cognition_attempted = False
@@ -1144,6 +1155,7 @@ class ChannelFeature(Feature):
                         signal,
                         source_event_id=message.id,
                         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                        **({"admission_fence": admission_fence} if admission_fence is not None else {}),
                     )
                 elif cursor_owning:
                     # Telegram polling owns a provider cursor. It has an

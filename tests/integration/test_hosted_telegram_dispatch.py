@@ -1,0 +1,511 @@
+"""Real SDK wire and SQLite ownership proof, not live provider acceptance."""
+
+import asyncio
+import json
+import sys
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+from kestrel_sdk.isolated_feature import (
+    IsolatedFeatureClient,
+    IsolatedFeatureService,
+    SubprocessIsolatedFeatureClient,
+    ToolMetadata,
+)
+
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
+from kestrel_sovereign.features.channels.route_ownership import (
+    ChannelRouteOwnershipStore,
+)
+from kestrel_sovereign.features.hosted_telegram_dispatch import (
+    HostedTelegramBinding,
+    HostedTelegramOutbound,
+)
+from kestrel_sovereign.features.isolated_runtime import (
+    HostedTelegramRouteAttestation,
+    ProxyChannelAdapter,
+    ProxyFeature,
+    set_hosted_telegram_route_attestation_resolver,
+)
+from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from tests.integration.test_isolated_feature_config_transition import (
+    _hosted_lifecycle_agent,
+    _QueueReader,
+    _QueueWriter,
+    _SDKWireClient,
+)
+
+
+class DispatchService(IsolatedFeatureService):
+    """Supported external protocol fixture, no mocked native host state."""
+
+    def __init__(self, events):
+        super().__init__(name="hosted-dispatch-wire", version="1")
+        self.events = events
+        self.activation_entered = asyncio.Event()
+        self.activation_release = asyncio.Event()
+        self.activation_release.set()
+        self.activation_response = {"status": "ok", "http_status": 200, "transport": "hosted"}
+        self.activated = False
+        self.sends = []
+        self.send_entered = asyncio.Event()
+        self.send_release = asyncio.Event()
+        self.send_release.set()
+        self.register_host_ingress("telegram-hosted-activate", self.activate)
+        self.register_tool(ToolMetadata(
+            name="telegram_send", description="Controlled protocol send",
+            input_schema={"type": "object", "properties": {
+                "to": {"type": "string"}, "message": {"type": "string"}},
+                "required": ["to", "message"]},
+        ), self.send)
+
+    async def activate(self, payload):
+        self.events.append("activate")
+        self.activation_entered.set()
+        await self.activation_release.wait()
+        self.activated = self.activation_response.get("status") == "ok"
+        return self.activation_response
+
+    async def send(self, arguments):
+        assert self.activated, "Unprepared child reached send"
+        self.events.append("send")
+        self.sends.append(arguments)
+        self.send_entered.set()
+        await self.send_release.wait()
+        return {"status": "ok", "confirmation": "Controlled send completed",
+                "message_id": "777", "to": arguments["to"]}
+
+
+class WireClient(_SDKWireClient):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.stop_calls = 0
+        self.wire_closed = asyncio.Event()
+        self.stop_release = asyncio.Event()
+        self.stop_release.set()
+
+    async def stop(self):
+        self.stop_calls += 1
+        await super().stop()
+        self.wire_closed.set()
+        await self.stop_release.wait()
+
+    async def call_tool(self, name, arguments, **kwargs):
+        return await self._rpc.call_tool(name, arguments, **kwargs)
+
+
+@asynccontextmanager
+async def sdk_host(tmp_path, monkeypatch, factory, *, timeout=30, expected_unknown=False, expected_denied=False):
+    backend = SQLiteBackend(str(tmp_path / "route.db"))
+    await backend.connect()
+    store = ChannelRouteOwnershipStore(backend)
+    events, services, tasks, clients = [], [], [], []
+
+    def client_factory(**kwargs):
+        host_reader, service_reader = _QueueReader(), _QueueReader()
+        service = DispatchService(events)
+        services.append(service)
+        tasks.append(asyncio.create_task(service.serve(service_reader, _QueueWriter(host_reader))))
+        rpc = IsolatedFeatureClient(host_reader, _QueueWriter(service_reader))
+        client = WireClient(rpc, dict(kwargs.get("config") or {}))
+        clients.append(client)
+        return client
+
+    agent = _hosted_lifecycle_agent(tmp_path)
+    binding = HostedTelegramBinding("tenant", agent.did, "123", "555", "g" * 43)
+    authority = factory(binding, events) if factory is not None else None
+    set_hosted_telegram_route_attestation_resolver(agent, lambda _: HostedTelegramRouteAttestation(
+        store, "123", outbound_authority=authority, outbound_timeout_seconds=timeout,
+    ))
+    monkeypatch.setenv("KESTREL_FEATURE_TELEGRAMFEATURE_BIN", "/bin/test-service")
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature", entry_point="test_pkg.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram", runtime="isolated-venv", service="test-service",
+    )
+    proxy = ProxyFeature(agent, runtime, client_factory=client_factory)
+    try:
+        await proxy.initialize()
+        assert proxy._hosted_telegram_startup_attested
+        yield proxy, services, clients, events
+    finally:
+        for service in services:
+            service.activation_release.set()
+            service.send_release.set()
+        for client in clients:
+            client.stop_release.set()
+        try:
+            try:
+                await proxy.shutdown()
+            except ExecutionAuthorityError as error:
+                from kestrel_sovereign.execution_custody import (
+                    ExecutionCommitOutcomeError,
+                    execution_commit_outcome,
+                )
+                if expected_unknown:
+                    assert type(error) is ExecutionCommitOutcomeError
+                    assert execution_commit_outcome(error) == "unknown"
+                else:
+                    assert expected_denied and type(error) is ExecutionAuthorityError
+                assert all(client.stopped for client in clients)
+                assert not proxy._terminal_retirement_clients
+        finally:
+            await KestrelAgent._shutdown_background_tasks(agent)
+            await asyncio.gather(*tasks)
+            await backend.close()
+
+
+def ordinary_authority(binding, events):
+    @asynccontextmanager
+    async def authority(proxy, arguments):
+        events.append("authority-enter")
+        selected = HostedTelegramOutbound(binding)
+        try:
+            yield selected
+        finally:
+            events.append("authority-exit")
+        assert selected.response["message_id"] == "777"
+    return authority
+
+
+@pytest.mark.asyncio
+async def test_actual_sdk_first_send_prepares_before_send_and_confirms_before_release(tmp_path, monkeypatch):
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, events):
+        assert services[0].activated is False
+        response = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        assert response["status"] == "ok" and response["message_id"] == "777"
+        assert events == ["authority-enter", "activate", "send", "authority-exit"]
+        assert services[0].sends == [{"to": "555", "message": "controlled"}]
+
+
+@pytest.mark.asyncio
+async def test_missing_host_authority_never_uses_activated_legacy_send(tmp_path, monkeypatch):
+    async with sdk_host(tmp_path, monkeypatch, None) as (proxy, services, _, events):
+        services[0].activated = True  # Negative control: persistent binding grants no host authority.
+        response = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        assert response["status"] == "error"
+        assert services[0].sends == [] and events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [
+    {"status": "error", "http_status": 200, "transport": "hosted"},
+    {"status": "ok", "http_status": True, "transport": "hosted"},
+    {"status": "ok", "http_status": 200},
+])
+async def test_refused_or_malformed_activation_never_calls_tool(tmp_path, monkeypatch, response):
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, events):
+        services[0].activation_response = response
+        result = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        assert result["status"] == "error"
+        assert services[0].sends == []
+        assert events == ["authority-enter", "activate", "authority-exit"]
+
+
+@pytest.mark.asyncio
+async def test_actual_bridge_and_replacement_both_traverse_current_authority(tmp_path, monkeypatch):
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, clients, events):
+        adapter = ProxyChannelAdapter(proxy, channel_type="telegram", send_tool="telegram_send")
+        first = await adapter.send_message("555", "first")
+        assert first.message_id == "777"
+        await proxy.reload()
+        assert clients[0].stopped and len(services) == 2
+        assert services[1].activated is False
+        second = await adapter.send_message("555", "second")
+        assert second.message_id == "777"
+        assert [len(service.sends) for service in services] == [1, 1]
+        assert events == ["authority-enter", "activate", "send", "authority-exit"] * 2
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_activation_drains_original_and_prohibits_send(tmp_path, monkeypatch):
+    @asynccontextmanager
+    async def suppressed(proxy, arguments):
+        try:
+            yield HostedTelegramOutbound(HostedTelegramBinding("tenant", proxy.agent.did, "123", "555", "g" * 43))
+        except asyncio.CancelledError:
+            pass  # Negative control: host context must not manufacture success.
+
+    async with sdk_host(tmp_path, monkeypatch, lambda *_: suppressed) as (proxy, services, clients, _):
+        service = services[0]
+        service.activation_release.clear()
+        task = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
+        reload_task = None
+        try:
+            await asyncio.wait_for(service.activation_entered.wait(), 1)
+            task.cancel()
+            await asyncio.sleep(0)
+            reload_task = asyncio.create_task(proxy.reload())
+            await asyncio.sleep(0.02)
+            assert not task.done() and not reload_task.done() and not clients[0].stopped
+            service.activation_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+            await asyncio.wait_for(reload_task, 1)
+            assert service.sends == []
+        finally:
+            service.activation_release.set()
+            for operation in (task, reload_task):
+                if operation is not None:
+                    if not operation.done():
+                        operation.cancel()
+                    await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_prior_message_is_not_reactivated_or_resent(tmp_path, monkeypatch):
+    def factory(binding, events):
+        @asynccontextmanager
+        async def authority(proxy, arguments):
+            selected = HostedTelegramOutbound(binding, prior_message_id="confirmed-original")
+            yield selected
+            assert selected.response is None  # No new provider response is invented.
+        return authority
+
+    async with sdk_host(tmp_path, monkeypatch, factory) as (proxy, services, _, events):
+        response = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        assert response["status"] == "ok" and response["message_id"] == "confirmed-original"
+        assert services[0].sends == [] and events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [{"chat_id": "different"}, {"agent_id": "did:other"}, {"bot_id": "000123"}])
+async def test_binding_must_match_exact_agent_bot_and_destination(tmp_path, monkeypatch, changed):
+    def factory(binding, events):
+        @asynccontextmanager
+        async def authority(proxy, arguments):
+            yield HostedTelegramOutbound(replace(binding, **changed))
+        return authority
+
+    async with sdk_host(tmp_path, monkeypatch, factory) as (proxy, services, _, events):
+        response = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        assert response["status"] == "error"
+        assert services[0].sends == [] and events == []
+
+
+@pytest.mark.asyncio
+async def test_public_argument_mutation_cannot_change_authorized_send(tmp_path, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    def factory(binding, events):
+        @asynccontextmanager
+        async def authority(proxy, arguments):
+            with pytest.raises(TypeError):
+                arguments["to"] = "different"
+            entered.set()
+            await release.wait()
+            yield HostedTelegramOutbound(binding)
+        return authority
+
+    async with sdk_host(tmp_path, monkeypatch, factory) as (proxy, services, _, _):
+        arguments = {"to": "555", "message": "original"}
+        operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", arguments))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            arguments.update(to="different", message="changed")
+            release.set()
+            assert (await operation)["status"] == "ok"
+            assert services[0].sends == [{"to": "555", "message": "original"}]
+        finally:
+            release.set()
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_production_subprocess_wrapper_prepares_each_actual_replacement_child(tmp_path, monkeypatch):
+    journal = tmp_path / "dispatch-journal.jsonl"
+    service_path = tmp_path / "hosted-dispatch-service"
+    fixture = Path(__file__).parents[1] / "fixtures" / "hosted_telegram_dispatch_service.py"
+    service_path.write_text(f"#!{sys.executable}\n" + fixture.read_text())
+    service_path.chmod(0o700)
+    monkeypatch.setenv("KESTREL_FEATURE_TELEGRAMFEATURE_BIN", str(service_path))
+    monkeypatch.setenv("HOSTED_DISPATCH_JOURNAL", str(journal))
+    backend = SQLiteBackend(str(tmp_path / "process-route.db"))
+    await backend.connect()
+    agent = _hosted_lifecycle_agent(tmp_path)
+    binding = HostedTelegramBinding("tenant", agent.did, "123", "555", "g" * 43)
+    confirmed = []
+
+    @asynccontextmanager
+    async def authority(proxy, arguments):
+        selected = HostedTelegramOutbound(binding)
+        yield selected
+        confirmed.append(selected.response["message_id"])
+
+    set_hosted_telegram_route_attestation_resolver(agent, lambda _: HostedTelegramRouteAttestation(
+        ChannelRouteOwnershipStore(backend), "123", outbound_authority=authority,
+    ))
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature", entry_point="test_pkg.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram", runtime="isolated-venv", service="test-service",
+    )
+    proxy = ProxyFeature(agent, runtime)
+    processes = []
+    try:
+        await proxy.initialize()
+        for index in range(2):
+            assert type(proxy._client) is SubprocessIsolatedFeatureClient
+            process = proxy._client.process
+            assert process is not None and process.returncode is None
+            processes.append(process)
+            response = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": f"message-{index}"})
+            assert response["status"] == "ok" and response["message_id"] == str(process.pid)
+            if index == 0:
+                await proxy.reload()
+                assert process.returncode is not None, "Original child must be physically reaped"
+        await proxy.shutdown()
+        assert all(process.returncode is not None for process in processes)
+        assert len({process.pid for process in processes}) == 2
+        entries = [json.loads(line) for line in journal.read_text().splitlines()]
+        assert [entry["kind"] for entry in entries] == ["started", "activate", "send"] * 2
+        assert confirmed == [str(process.pid) for process in processes]
+        for offset, process in zip((0, 3), processes):
+            assert all(entry["pid"] == process.pid for entry in entries[offset:offset + 3])
+            assert entries[offset + 1]["binding"] == {
+                "scope": {"tenant_id": "tenant", "agent_id": agent.did},
+                "bot_id": "123", "chat_id": "555", "activation_generation": "g" * 43,
+            }
+    finally:
+        try:
+            await proxy.shutdown()
+        finally:
+            await KestrelAgent._shutdown_background_tasks(agent)
+            for process in processes:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+            await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["construct", "enter", "exit"])
+async def test_host_callback_errors_do_not_expose_secret_text(tmp_path, monkeypatch, caplog, phase):
+    secret = "credential-shaped-host-secret-DO-NOT-EXPOSE"
+
+    def factory(binding, events):
+        @asynccontextmanager
+        async def context(proxy, arguments):
+            if phase == "enter":
+                raise RuntimeError(secret)
+            yield HostedTelegramOutbound(binding)
+            if phase == "exit":
+                raise RuntimeError(secret)
+
+        def authority(proxy, arguments):
+            if phase == "construct":
+                raise RuntimeError(secret)
+            return context(proxy, arguments)
+        return authority
+
+    async with sdk_host(tmp_path, monkeypatch, factory, expected_unknown=phase == "exit") as (proxy, services, _, _):
+        from kestrel_sovereign.execution_custody import (
+            ExecutionCommitOutcomeError,
+            execution_commit_outcome,
+        )
+
+        if phase == "exit":
+            with pytest.raises(ExecutionCommitOutcomeError) as unknown:
+                await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+            assert execution_commit_outcome(unknown.value) == "unknown"
+            assert secret not in str(unknown.value) + repr(unknown.value)
+            assert len(services[0].sends) == 1
+        else:
+            response = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+            assert response["status"] == "error" and secret not in repr(response)
+            assert services[0].sends == []
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_authority_does_not_exit_on_stream_failure_before_original_stop_completes(tmp_path, monkeypatch):
+    exited = asyncio.Event()
+
+    def factory(binding, events):
+        @asynccontextmanager
+        async def authority(proxy, arguments):
+            try:
+                yield HostedTelegramOutbound(binding)
+            finally:
+                exited.set()
+        return authority
+
+    async with sdk_host(tmp_path, monkeypatch, factory) as (proxy, services, clients, _):
+        service, client = services[0], clients[0]
+        service.activation_release.clear()
+        client.stop_release.clear()
+        operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
+        shutdown = None
+        try:
+            await asyncio.wait_for(service.activation_entered.wait(), 1)
+            shutdown = asyncio.create_task(proxy.shutdown())
+            await asyncio.wait_for(client.wire_closed.wait(), 1)
+            await asyncio.sleep(0.02)
+            assert not exited.is_set(), "Host authority released before original stop completion"
+            assert not operation.done() and not shutdown.done()
+            assert client.stop_calls == 1
+            client.stop_release.set()
+            # No provider RPC was admitted; the original activation failed.
+            response = await asyncio.wait_for(operation, 2)
+            assert response["status"] == "error"
+            await asyncio.wait_for(shutdown, 2)
+            assert exited.is_set() and client.stop_calls == 1
+        finally:
+            service.activation_release.set()
+            client.stop_release.set()
+            for task in (operation, shutdown):
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["activation", "provider"])
+async def test_deadline_is_bounded_but_original_authority_survives_until_physical_stop(tmp_path, monkeypatch, phase):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionAuthorityError,
+        ExecutionCommitOutcomeError,
+        execution_commit_outcome,
+    )
+
+    exited = asyncio.Event()
+
+    def factory(binding, events):
+        @asynccontextmanager
+        async def authority(proxy, arguments):
+            try:
+                yield HostedTelegramOutbound(binding)
+            finally:
+                exited.set()
+        return authority
+
+    async with sdk_host(tmp_path, monkeypatch, factory, timeout=0.1,
+                        expected_unknown=phase == "provider", expected_denied=phase == "activation") as (proxy, services, clients, _):
+        service, client = services[0], clients[0]
+        release = service.activation_release if phase == "activation" else service.send_release
+        entered = service.activation_entered if phase == "activation" else service.send_entered
+        release.clear()
+        client.stop_release.clear()
+        operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            expected = ExecutionAuthorityError if phase == "activation" else ExecutionCommitOutcomeError
+            with pytest.raises(expected) as denied:
+                await asyncio.wait_for(asyncio.shield(operation), 2)
+            assert execution_commit_outcome(denied.value) == (None if phase == "activation" else "unknown")
+            await asyncio.wait_for(client.wire_closed.wait(), 1)
+            assert not exited.is_set(), "Deadline released authority before original physical stop"
+            assert client.stop_calls == 1
+            assert any(not admission.admission.task.done() for admission in proxy._host_ingress_admissions)
+            client.stop_release.set()
+            await asyncio.wait_for(exited.wait(), 2)
+            assert len(service.sends) == (0 if phase == "activation" else 1)
+            # A deadline seals this facade. No automatic second provider RPC.
+            with pytest.raises(expected):
+                await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "do not replay"})
+            assert len(service.sends) == (0 if phase == "activation" else 1)
+        finally:
+            release.set()
+            client.stop_release.set()
+            await asyncio.gather(operation, return_exceptions=True)

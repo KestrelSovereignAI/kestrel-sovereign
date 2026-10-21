@@ -17,6 +17,51 @@ privacy: public
 
 # Hosted isolated runtime lifecycle
 
+## Hosted Telegram dispatch authority
+
+`HostedTelegramRouteAttestation` suppresses standalone polling after Core's
+native bot-ownership claim. It does not authorize outbound effects. Embedding
+hosts provide its `outbound_authority` async-context factory; an attested
+Telegram proxy with no such factory refuses `telegram_send`. Standalone,
+unattested Telegram behavior is unchanged.
+
+The factory receives the exact proxy and a detached, immutable argument map.
+It must acquire fresh route authority and yield `HostedTelegramOutbound` with
+an exact `HostedTelegramBinding` (tenant, agent DID, canonical bot, target chat,
+activation generation). Core holds its existing traffic admission through
+factory entry, private `telegram-hosted-activate`, send on the same child, and
+factory exit. Direct tools and the channel bridge share this boundary. The
+host must validate its current runtime owner, active route, generation and
+absence of transitions under the original physical database authority session.
+No cached binding or process readiness marker substitutes for that authority.
+
+All host operations must use the same lock order: Core traffic gate, then
+route authority. A scheduled delivery must reserve and confirm within this
+factory, not hold route authority while calling Core. A host may yield an
+already-confirmed `prior_message_id` to avoid replay; otherwise Core fills
+`selected.response` with the actual detached SDK response before context exit,
+so confirmation can commit before the host releases authority. A prior ID is
+not a new provider receipt. Ordinary callback errors have secret-free public
+projection; hosts must not log their own credential-bearing exceptions.
+
+`outbound_timeout_seconds` is finite, positive and at most 300 (default 30).
+Caller withdrawal prevents a later send after activation; an already-started
+provider call is conservatively unknown if it does not confirm. A deadline
+seals the proxy and starts the existing canonical terminal cleanup. The
+original dispatch retains its host context until accepted RPC work settles
+or the original child is positively retired. Bounded public observation does
+not acknowledge physical cleanup or permit replay of an ambiguous send.
+
+For hosted webhook admission, `admit_hosted_telegram_ingress(admission_fence=…)`
+accepts trusted host-only native transaction authority. It is propagated to
+the original message-log and durable event/delivery commits, never serialized
+into a signal or inherited as finite authority by resident cognition. The
+host's fence must validate on the **same commit connection** and fail closed
+on route/generation loss. This does not replace care-acknowledgement authority
+or grant permission to hold a second database checkout through cognition.
+
+## General lifecycle policy
+
 Hosted applications can apply idle-retirement policy and receive sanitized
 process telemetry without reaching into `ProxyFeature` internals or managing a
 second subprocess lifecycle.
