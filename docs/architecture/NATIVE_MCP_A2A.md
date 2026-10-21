@@ -602,6 +602,15 @@ sender is never reconciled as a crashed submission. Unknown sends or cancellatio
 attempts are observed without replay. `KESTREL_A2A_QUESTION_POLL_SECONDS` configures
 the observation interval (positive finite seconds, default 1).
 
+Question read, deadline and wake polling share `DatabasePollRetryPolicy` with
+the push resident. Its default budget is three attempts per pass; successful
+passes reset that budget. `KESTREL_A2A_QUESTION_DATABASE_RETRY_ATTEMPTS` configures
+the question budget, with the observation interval between attempts. Only
+recognized native database contention and availability errors qualify. Permanent
+SQL failures, untyped database wrappers, original authority loss, acknowledged
+or uncertain commits and native cleanup debt remain failures. Recovery retains
+the same resident owners and never replays an original peer send.
+
 Wakes retain deterministic sender-scoped event IDs across restart. The outbox
 advances only on a canonical durable signal admission receipt; the dispatcher
 owns cognition and retry after that commit. Deadline and late-answer waves are
@@ -953,10 +962,17 @@ it does not silently downgrade the capability. Embeddings supply an explicit
 `NativePushPolicy`; operator-hosted publication enables its default policy when
 `KESTREL_BASE_URL` is set. `KESTREL_A2A_PUSH_ENABLED=false` explicitly disables
 push. The `KESTREL_A2A_PUSH_` settings `RETENTION_DAYS`, `LEASE_SECONDS`,
-`TIMEOUT_SECONDS`, `POLL_SECONDS`, `RENEWAL_SECONDS`, `RETRY_SECONDS`, and
-`BATCH_SIZE` override the one policy's defaults. Values must be positive integers,
+`TIMEOUT_SECONDS`, `POLL_SECONDS`, `RENEWAL_SECONDS`, `RETRY_SECONDS`, `BATCH_SIZE`,
+and `DATABASE_RETRY_ATTEMPTS` override the one policy's defaults. Values must be positive integers,
 and renewal must precede lease expiration. Required encryption is checked before
 push schema initialization.
+
+Push database polling uses that finite attempt budget and `RETRY_SECONDS`
+between attempts. Initialization remains strict and never publishes a failed
+startup as ready. An ordinary fully retired worker failure stays on the original
+Task and still refuses `require_ready`; shutdown logs it and may release primary
+storage. Observer cancellation, original commit evidence and physical cleanup
+debt still refuse storage release until their original owners settle.
 
 Both official HTTP bindings expose standard Create/Get/List/Delete push
 configuration operations under the same signed request and task-creator policy

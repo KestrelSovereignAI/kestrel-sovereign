@@ -16,6 +16,7 @@ from kestrel_sovereign.a2a.push_worker import (
 )
 from kestrel_sovereign.signals.durable import ACKNOWLEDGED, FAILED, LEASED, RETRY
 from kestrel_sovereign.storage.db.interface import QueryError
+from kestrel_sovereign.storage.db.polling import DatabasePollRetryPolicy
 from tests.unit.test_a2a_native_push_outbox import callback
 from tests.unit.test_a2a_native_push_outbox import (
     outbox as outbox,  # noqa: PLC0414 - pytest fixture re-export
@@ -32,7 +33,7 @@ from tests.utils.outbound_tls import (
 )
 
 
-def worker(value):
+def worker(value, *, database_retry_policy=None):
     return NativePushWorker(
         value,
         NativePushTransport(value.configurations, timeout=timedelta(seconds=5)),
@@ -40,7 +41,16 @@ def worker(value):
         renewal_interval=timedelta(milliseconds=20),
         retry_delay=timedelta(seconds=1),
         batch_size=10,
+        database_retry_policy=database_retry_policy,
     )
+
+
+async def test_worker_uses_its_explicit_typed_database_retry_budget(outbox):
+    value, _ = outbox
+    policy = DatabasePollRetryPolicy(max_attempts=4)
+    assert worker(value, database_retry_policy=policy).database_retry_policy is policy
+    with pytest.raises(TypeError, match="database retry policy"):
+        worker(value, database_retry_policy=True)
 
 
 async def register(value, task, url):

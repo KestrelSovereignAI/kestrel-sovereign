@@ -3,12 +3,14 @@
 import asyncio
 from dataclasses import replace
 
+import httpx
 import pytest
 import pytest_asyncio
 from kestrel_sdk.security.exceptions import MasterKeyNotConfiguredError
 
 from kestrel_sovereign.a2a.native_card import verify_native_agent_card
 from kestrel_sovereign.a2a.native_publication import prepare_hosted_native_publication
+from kestrel_sovereign.a2a.native_routes import native_card_path
 from kestrel_sovereign.a2a.push_policy import NativePushPolicy
 from kestrel_sovereign.signals import (
     OrderedLockManager,
@@ -16,6 +18,7 @@ from kestrel_sovereign.signals import (
     SignalLogStore,
     SourceRegistry,
 )
+from kestrel_sovereign.storage.db.interface import DatabaseError
 from tests.unit.test_a2a_native_host import (
     hosted as hosted,  # noqa: PLC0414 - fixture dependency
 )
@@ -25,7 +28,9 @@ from tests.unit.test_a2a_native_host import (
 from tests.unit.test_a2a_native_host import (
     publication as publication,  # noqa: PLC0414 - fixture re-export
 )
+from tests.unit.test_a2a_native_resident_database import _wait_for_original_recovery
 from tests.unit.test_durable_callback_runtime_context import resident_dispatcher
+from tests.utils.database_query_faults import prepare_transient_database_query_fault
 from tests.utils.native_push import configure_push_test_key
 
 
@@ -127,6 +132,69 @@ async def test_host_preparation_waits_for_actual_runtime_ready_boundary(
     finally:
         p.runtime._runtime_publication_ready.set()
         await asyncio.gather(preparing, return_exceptions=True)
+
+
+async def test_transient_journal_read_preserves_original_signed_publication(
+    push_host, monkeypatch
+):
+    p = push_host
+    backend = p.manager.task_store.backend
+    fail_query = await prepare_transient_database_query_fault(backend)
+    with pytest.raises(DatabaseError) as failed:
+        await fail_query()
+    original_error = failed.value
+    native = await prepare_hosted_native_publication(
+        p.app,
+        p.host,
+        "registered-agent",
+        p.recipient,
+        {
+            "KESTREL_BASE_URL": "https://native.test",
+            "KESTREL_A2A_PUSH_RETRY_SECONDS": "1",
+        },
+    )
+    p.recipient._native_a2a_publication = native
+    async with p.host.a2a_lifecycle_lease():
+        p.host._register_agent("registered-agent", p.recipient)
+    service = p.manager.push_service
+    owner = service.task
+    original_pending = service.worker.outbox.changes.pending
+    failures = []
+    recovered = asyncio.Event()
+
+    async def pending(*, limit):
+        if not failures:
+            failures.append(original_error)
+            raise original_error
+        result = await original_pending(limit=limit)
+        recovered.set()
+        return result
+
+    monkeypatch.setattr(service.worker.outbox.changes, "pending", pending)
+    try:
+        await _wait_for_original_recovery(owner, recovered)
+        assert service.task is owner and len(failures) == 1
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=p.app), base_url="https://native.test"
+        ) as http:
+            response = await http.get(native_card_path("registered-agent"))
+        assert response.status_code == 200
+        from a2a.types import AgentCard
+        from google.protobuf.json_format import ParseDict
+
+        card = ParseDict(response.json(), AgentCard())
+        assert card.capabilities.push_notifications
+        verify_native_agent_card(
+            card,
+            signing_did=p.recipient.identity.signing_did,
+            trusted_document={
+                "id": p.recipient.identity.signing_did,
+                "verificationMethod": p.recipient.identity.new_verification_methods,
+            },
+        )
+    finally:
+        async with p.host.a2a_lifecycle_lease():
+            native.withdraw()
 
 
 async def test_missing_encryption_refuses_host_publication_before_push_schema(

@@ -28,6 +28,7 @@ from kestrel_sovereign.signals.sources.a2a_question_answered import (
     DURABLE_COGNITION_CONSUMER_ID,
     build_signal_for_question_answered,
 )
+from kestrel_sovereign.storage.db.polling import DatabasePollRetryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class NativeQuestionSupervisor:
         interval: float,
         is_current,
         max_interval: float | None = None,
+        database_retry_policy: DatabasePollRetryPolicy | None = None,
         clock=monotonic,
     ):
         if not isinstance(store, NativeQuestionStore):
@@ -83,6 +85,11 @@ class NativeQuestionSupervisor:
         self.open_dispatch = open_dispatch
         self.dispatcher = dispatcher
         self.interval = interval
+        if database_retry_policy is not None and not isinstance(
+            database_retry_policy, DatabasePollRetryPolicy
+        ):
+            raise TypeError("Question polling requires its database retry policy")
+        self.database_retry_policy = database_retry_policy or DatabasePollRetryPolicy()
         self._changed = asyncio.Event()
 
     def notify(self) -> None:
@@ -99,14 +106,25 @@ class NativeQuestionSupervisor:
 
     async def _read_loop(self) -> None:
         while True:
-            await self._read_pass()
+            await self.database_retry_policy.run(
+                self._read_pass,
+                retry_seconds=self.interval,
+                label="native-question-read",
+            )
             await asyncio.sleep(self.interval)
+
+    async def _deadline_iteration(self) -> None:
+        await self._deadline_pass()
+        await self.handoff_wakes()
 
     async def _deadline_loop(self) -> None:
         while True:
             self._changed.clear()
-            await self._deadline_pass()
-            await self.handoff_wakes()
+            await self.database_retry_policy.run(
+                self._deadline_iteration,
+                retry_seconds=self.interval,
+                label="native-question-deadline",
+            )
             try:
                 await asyncio.wait_for(self._changed.wait(), timeout=self.interval)
             except TimeoutError:

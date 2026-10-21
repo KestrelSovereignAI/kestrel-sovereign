@@ -63,7 +63,9 @@ async def test_canonical_startup_uses_actual_runtime_ready_publisher(outbox):
     runtime._execution_custody = (
         None  # standalone owner; this test performs real database work
     )
-    policy = NativePushPolicy(timeout_seconds=7, batch_size=13)
+    policy = NativePushPolicy(
+        timeout_seconds=7, batch_size=13, database_retry_attempts=7
+    )
     try:
         service = await start_native_push_service(
             manager,
@@ -77,6 +79,7 @@ async def test_canonical_startup_uses_actual_runtime_ready_publisher(outbox):
         assert service.worker.outbox.signals is value.signals
         assert service.worker.outbox.configurations.task_store is manager.task_store
         assert service.worker.transport.timeout == 7 and service.worker.batch_size == 13
+        assert service.worker.database_retry_policy.max_attempts == 7
         with pytest.raises(RuntimeError, match="replace"):
             await start_native_push_service(
                 manager,
@@ -285,6 +288,11 @@ async def test_genuine_journal_commit_ack_failure_keeps_its_original_control(
         assert execution_commit_outcome(caught.value) == "unknown"
         assert any(error is original for error in _explicit_control_chain(caught.value))
         assert service.task.done() and not service.worker.ready
+        with pytest.raises((ExecutionCommitOutcomeError, BaseExceptionGroup)) as closing:
+            await service.close()
+        assert is_execution_control_error(closing.value)
+        assert execution_commit_outcome(closing.value) == "unknown"
+        assert any(error is original for error in _explicit_control_chain(closing.value))
     finally:
         await asyncio.gather(service.close(), return_exceptions=True)
 

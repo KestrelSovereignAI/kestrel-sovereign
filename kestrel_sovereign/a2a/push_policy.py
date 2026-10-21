@@ -3,6 +3,8 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
+from kestrel_sovereign.storage.db.polling import DatabasePollRetryPolicy
+
 
 @dataclass(frozen=True)
 class NativePushPolicy:
@@ -15,6 +17,7 @@ class NativePushPolicy:
     renewal_seconds: int = 20
     retry_seconds: int = 5
     batch_size: int = 50
+    database_retry_attempts: int = DatabasePollRetryPolicy().max_attempts
 
     def __post_init__(self):
         for field in fields(self):

@@ -2067,7 +2067,7 @@ async def test_peer_session_allows_queued_topology_writer_before_card_discovery(
 
 
 async def test_dead_question_resident_refuses_new_sends_before_delivery(
-    local_native_peer,
+    local_native_peer, monkeypatch,
 ):
     from kestrel_sdk.tools.result import ToolResultStatus
 
@@ -2075,6 +2075,7 @@ async def test_dead_question_resident_refuses_new_sends_before_delivery(
     from tests.unit.test_a2a_native_question_supervisor import dispatcher_for
 
     p = local_native_peer
+    monkeypatch.setenv("KESTREL_A2A_QUESTION_DATABASE_RETRY_ATTEMPTS", "7")
     state = SimpleNamespace(backend=p.backend, store=p.sender_manager.question_store)
     agent, dispatcher = await dispatcher_for(state)
     p.sender.dispatcher = dispatcher
@@ -2086,6 +2087,7 @@ async def test_dead_question_resident_refuses_new_sends_before_delivery(
     try:
         await feature.post_all_features_loaded(p.sender)
         owner = feature._question_supervisor_task
+        assert feature._question_supervisor.database_retry_policy.max_attempts == 7
         owner.cancel()
         await asyncio.gather(owner, return_exceptions=True)
         result = await feature.send_a2a_question(

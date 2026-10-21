@@ -1,6 +1,7 @@
 """Managed publication and retirement of the native push resident worker."""
 
 import asyncio
+import logging
 from collections.abc import Callable
 from datetime import timedelta
 
@@ -16,6 +17,7 @@ from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
 )
+from kestrel_sovereign.storage.db.polling import DatabasePollRetryPolicy
 
 
 class PushServiceUnavailable(RuntimeError):
@@ -49,6 +51,9 @@ async def start_native_push_service(
         renewal_interval=timedelta(seconds=policy.renewal_seconds),
         retry_delay=timedelta(seconds=policy.retry_seconds),
         batch_size=policy.batch_size,
+        database_retry_policy=DatabasePollRetryPolicy(
+            max_attempts=policy.database_retry_attempts
+        ),
     )
     service = NativePushService(worker, task_factory=task_factory)
     await service.start()
@@ -164,7 +169,13 @@ class NativePushService:
             raise
 
     async def close(self) -> None:
-        """Cancel and physically join the original resident before storage closes."""
+        """Prove retirement, preserving historical work failure on its owner.
+
+        Ordinary work failure is diagnostic history, not a live storage owner.
+        require_ready still raises that same original error. Observer withdrawal
+        and original authority/commit/native cleanup evidence still control this
+        retirement boundary and cannot release the primary stores.
+        """
         task = self.task
         if task is None:
             return
@@ -173,11 +184,16 @@ class NativePushService:
             task.cancel("native push service shutdown")
         outcome = await await_owned_task(task)
         error = outcome.error
-        if (
-            self._stop_requested
-            and isinstance(error, asyncio.CancelledError)
-            and not is_execution_control_error(error)
+        if isinstance(error, (Exception, asyncio.CancelledError)) and (
+            not is_execution_control_error(error)
         ):
+            if not (
+                self._stop_requested and isinstance(error, asyncio.CancelledError)
+            ):
+                logging.getLogger(__name__).error(
+                    "Native push resident retired after work failure: error=%s",
+                    type(error).__name__,
+                )
             error = None
         error = execution_terminal_error(
             outcome.cancellation, error, retain_originals=True, prefer_cancellation=True

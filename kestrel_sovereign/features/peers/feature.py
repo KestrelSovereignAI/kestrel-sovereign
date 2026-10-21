@@ -1443,12 +1443,22 @@ class PeersFeature(Feature):
                 "Native question durable consumer is not registered"
             )
         interval = float(os.environ.get("KESTREL_A2A_QUESTION_POLL_SECONDS", "1"))
+        from kestrel_sovereign.storage.db.polling import DatabasePollRetryPolicy
+
         supervisor = NativeQuestionSupervisor(
             store=store,
             open_dispatch=self._open_native_dispatch,
             dispatcher=agent.dispatcher,
             interval=interval,
             max_interval=float(os.environ.get("KESTREL_A2A_QUESTION_MAX_POLL_SECONDS", "60")),
+            database_retry_policy=DatabasePollRetryPolicy(
+                max_attempts=int(
+                    os.environ.get(
+                        "KESTREL_A2A_QUESTION_DATABASE_RETRY_ATTEMPTS",
+                        DatabasePollRetryPolicy().max_attempts,
+                    )
+                )
+            ),
             is_current=lambda: (
                 vars(self).get("_question_supervisor") is supervisor
                 and self._native_question_store() is store

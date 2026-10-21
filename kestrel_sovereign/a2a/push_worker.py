@@ -25,6 +25,7 @@ from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
 )
 from kestrel_sovereign.signals.durable import DurableDelivery
+from kestrel_sovereign.storage.db.polling import DatabasePollRetryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ class NativePushWorker:
         renewal_interval: timedelta,
         retry_delay: timedelta,
         batch_size: int,
+        database_retry_policy: DatabasePollRetryPolicy | None = None,
     ):
         if not isinstance(outbox, NativePushOutbox) or not isinstance(
             transport, NativePushTransport
@@ -89,6 +91,11 @@ class NativePushWorker:
         self.renewal_interval = renewal_interval.total_seconds()
         self.retry_delay = retry_delay
         self.batch_size = batch_size
+        if database_retry_policy is not None and not isinstance(
+            database_retry_policy, DatabasePollRetryPolicy
+        ):
+            raise TypeError("Push polling requires its database retry policy")
+        self.database_retry_policy = database_retry_policy or DatabasePollRetryPolicy()
         self.executor_id = "a2a.push:" + uuid4().hex
         self._active: dict[asyncio.Task, _DeliveryRun] = {}
         self._running = False
@@ -111,7 +118,11 @@ class NativePushWorker:
             )
             self.started.set()
             while True:
-                await self.run_once()
+                await self.database_retry_policy.run(
+                    self.run_once,
+                    retry_seconds=self.retry_delay.total_seconds(),
+                    label="native-push",
+                )
                 await asyncio.sleep(self.poll_interval)
         finally:
             self._running = False
