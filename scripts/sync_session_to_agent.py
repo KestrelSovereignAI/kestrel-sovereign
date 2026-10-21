@@ -2,16 +2,17 @@
 """
 Sync a Claude Code session transcript into a kestrel agent's memory.
 
-Extracts human/assistant messages from a .jsonl session file,
-deduplicates against what's already in the agent's database,
-and inserts new messages as [SESSION SYNC] tagged entries.
+Extracts the user's and the assistant's text turns from a .jsonl session
+file, deduplicates against what's already in the agent's database,
+and inserts new messages as [SESSION SYNC] tagged entries. A transcript
+that yields turns from only one side is refused before anything is written.
 
 Usage:
     python scripts/sync_session_to_agent.py <session_jsonl> <agent_db_path>
 
-    # Sync this session into Meridian:
+    # Sync a session into Meridian:
     python scripts/sync_session_to_agent.py \
-        ~/.claude/projects/-Volumes-data2-projects-kestrel-sovereign/e837ea2c-71aa-4e3e-be7c-2ab570b8623d.jsonl \
+        ~/.claude/projects/-Volumes-data2-projects-kestrel-sovereign/<session-id>.jsonl \
         agent_data/meridian/kestrel_prime.db
 """
 
@@ -19,14 +20,44 @@ import json
 import hashlib
 import sqlite3
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 from kestrel_sovereign.storage.conversation_created_at import canonical_created_at
 
+# The entry types that are conversation turns. Each one is also the role the
+# turn is stored under. Every other entry type (attachment, system,
+# api-request-blob, ...) is harness bookkeeping. api-request-blob entries also
+# carry a ``message.role``, but they repeat turns already recorded, so the role
+# is read from the entry's ``type`` and never from ``message.role``.
+TURN_TYPES = ("user", "assistant")
+
+# A user-typed entry the user did not write: injected context (``isMeta``) or
+# the summary that replaces history at compaction (``isCompactSummary``).
+NOT_TYPED_BY_THE_USER = ("isMeta", "isCompactSummary")
+
+
+class OneSidedTranscriptError(ValueError):
+    """The transcript yielded turns from only one side of the conversation."""
+
+
+def _text_of(content) -> str:
+    """The text of a message: a bare string, or the concatenation of its text blocks."""
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "")
+        for block in content or []
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
 
 def extract_messages(jsonl_path: str) -> list[dict]:
-    """Extract human/assistant messages from Claude Code JSONL."""
+    """Extract the user's and the assistant's text turns from a Claude Code JSONL.
+
+    Tool calls and tool results carry no text block, so they drop out here.
+    """
     messages = []
     with open(jsonl_path, "r") as f:
         for line in f:
@@ -38,37 +69,38 @@ def extract_messages(jsonl_path: str) -> list[dict]:
             except json.JSONDecodeError:
                 continue
 
-            msg_type = entry.get("type", "")
-
-            # Human messages
-            if msg_type == "human":
-                content = ""
-                for block in entry.get("message", {}).get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        content += block.get("text", "")
-                    elif isinstance(block, str):
-                        content += block
-                if content.strip():
-                    messages.append({
-                        "role": "user",
-                        "content": content.strip(),
-                        "timestamp": entry.get("timestamp", ""),
-                    })
-
-            # Assistant messages
-            elif msg_type == "assistant":
-                content = ""
-                for block in entry.get("message", {}).get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        content += block.get("text", "")
-                if content.strip():
-                    messages.append({
-                        "role": "assistant",
-                        "content": content.strip(),
-                        "timestamp": entry.get("timestamp", ""),
-                    })
+            role = entry.get("type")
+            if role not in TURN_TYPES or any(entry.get(flag) for flag in NOT_TYPED_BY_THE_USER):
+                continue
+            message = entry.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = _text_of(message.get("content")).strip()
+            if content:
+                messages.append({
+                    "role": role,
+                    "content": content,
+                    "timestamp": entry.get("timestamp", ""),
+                })
 
     return messages
+
+
+def require_both_sides(messages: list[dict]) -> None:
+    """Refuse a transcript with no turns from one of its two sides.
+
+    A conversation always has both, so a missing side means the extractor
+    misread the transcript. Importing anyway produced the Apr 2026 birth-session
+    import: every one of the user's turns silently missing, reported as success.
+    """
+    counts = Counter(m["role"] for m in messages)
+    missing = [role for role in TURN_TYPES if not counts[role]]
+    if missing:
+        raise OneSidedTranscriptError(
+            f"transcript yielded no {' or '.join(missing)} turns "
+            f"(user={counts['user']}, assistant={counts['assistant']}); "
+            "refusing to import a one-sided conversation"
+        )
 
 
 def content_hash(text: str) -> str:
@@ -78,6 +110,7 @@ def content_hash(text: str) -> str:
 
 def sync_to_agent(messages: list[dict], db_path: str, agent_id: str = None) -> dict:
     """Insert new messages into agent's conversation_history, deduplicating."""
+    require_both_sides(messages)
     db = sqlite3.connect(db_path)
 
     # Get agent_id if not provided
@@ -174,10 +207,15 @@ def main():
 
     print(f"Extracting messages from {jsonl_path}...")
     messages = extract_messages(jsonl_path)
-    print(f"Found {len(messages)} human/assistant messages")
+    counts = Counter(m["role"] for m in messages)
+    print(f"Found {counts['user']} user and {counts['assistant']} assistant messages")
 
     print(f"Syncing to {db_path}...")
-    result = sync_to_agent(messages, db_path)
+    try:
+        result = sync_to_agent(messages, db_path)
+    except OneSidedTranscriptError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
     print(f"Inserted: {result['inserted']}, Skipped (dupes): {result['skipped']}, Total in DB: {result['total']}")
 
 
