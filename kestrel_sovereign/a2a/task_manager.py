@@ -527,7 +527,11 @@ class TaskManager:
             metadata=metadata,
         )
         task = await self.create_task(
-            request, creator_agent_id=authority_agent_id, notify_submitted=False
+            request,
+            creator_agent_id=authority_agent_id,
+            notify_submitted=False,
+            cognition_wake_eligible=not sync,
+            input_wake_eligible=False,
         )
         baseline = Task.FromString(task.SerializeToString())
         if denied_reason is not None:
@@ -1137,7 +1141,11 @@ class TaskManager:
     def _announce_submitted_input(self, candidate: NativeTaskSnapshot) -> None:
         """Publish a committed input snapshot through the canonical owner hook."""
         candidate.require_recipient(self.did)
-        if self._on_task_submitted is None:
+        if (
+            not candidate.cognition_wake_eligible
+            or not candidate.input_wake_eligible
+            or self._on_task_submitted is None
+        ):
             return
         try:
             self._on_task_submitted(candidate)
@@ -1183,6 +1191,8 @@ class TaskManager:
         *,
         creator_agent_id: str,
         notify_submitted: bool = True,
+        cognition_wake_eligible: bool = True,
+        input_wake_eligible: bool = True,
     ) -> Task:
         """Admit a new native task after sender and recipient authorization.
 
@@ -1239,6 +1249,8 @@ class TaskManager:
                     task,
                     creator_agent_id=creator_agent_id,
                     recipient_agent_id=self.task_store.scope.recipient_id,
+                    cognition_wake_eligible=cognition_wake_eligible,
+                    input_wake_eligible=input_wake_eligible,
                 )
                 await self.task_store.record_initial_input(
                     task,
@@ -2122,12 +2134,13 @@ class TaskManager:
                 raise RuntimeError(
                     "Committed task completion has no authoritative wake snapshot"
                 )
-            try:
-                self._on_task_complete(candidate)
-            except Exception as error:
-                if is_execution_control_error(error):
-                    raise
-                logger.exception("Task completion callback failed for %s", task.id)
+            if candidate.cognition_wake_eligible:
+                try:
+                    self._on_task_complete(candidate)
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
+                    logger.exception("Task completion callback failed for %s", task.id)
         # A handler can return artifacts in its final Task without calling the
         # incremental artifact API. Publish those durable values before the
         # status that closes the stream. Replacements use the standard ID rule

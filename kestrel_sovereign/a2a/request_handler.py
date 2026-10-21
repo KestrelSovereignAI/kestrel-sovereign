@@ -51,7 +51,7 @@ from kestrel_sovereign.a2a.native_security import (
 from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnershipError
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskInputConflictError,
-    TaskInputTerminalError,
+    TaskInputUnsupportedError,
 )
 from kestrel_sovereign.a2a.task_manager import (
     TaskCancellationAuthorizationError,
@@ -201,7 +201,7 @@ class NativeA2ARequestHandler(RequestHandler):
                     raise TaskNotFoundError()
                 return task
             return await self.manager.create_task(params, creator_agent_id=principal_id)
-        except TaskInputTerminalError as error:
+        except TaskInputUnsupportedError as error:
             raise UnsupportedOperationError(message=str(error)) from error
         except TaskInputConflictError as error:
             raise InvalidParamsError(message=str(error)) from error

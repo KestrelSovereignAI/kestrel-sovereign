@@ -319,6 +319,7 @@ class EventManagerMixin:
                     snapshot is None
                     or snapshot.state not in {"submitted", "working"}
                     or not snapshot.cognition_wake_eligible
+                    or not snapshot.input_wake_eligible
                     or snapshot.input_revision != input_revision
                 ):
                     return
@@ -379,6 +380,7 @@ class EventManagerMixin:
                                 "working",
                             }
                             or not snapshot.cognition_wake_eligible
+                            or not snapshot.input_wake_eligible
                             or snapshot.input_revision != input_revision
                         ):
                             dispatch_task = getattr(handle, "task", None)
@@ -651,10 +653,15 @@ class EventManagerMixin:
                 else None
             )
         task = candidate.task
+        if not candidate.cognition_wake_eligible:
+            return DurableCognitionWithdrawal(
+                "The authoritative A2A task is not eligible for cognition"
+            )
 
         if source == "a2a.task_submitted":
             if (
                 not candidate.cognition_wake_eligible
+                or not candidate.input_wake_eligible
                 or candidate.input_revision != expected_input_revision
             ):
                 return DurableCognitionWithdrawal(
@@ -822,6 +829,17 @@ class EventManagerMixin:
         can no longer leave a stale local wake free to execute.
         """
 
+        if getattr(signal, "source", None) == "a2a.task_complete":
+            payload = getattr(signal, "payload", None)
+            task_id = payload.get("task_id") if isinstance(payload, dict) else None
+            if not isinstance(task_id, str) or not task_id:
+                return "a2a.task_complete has no concrete durable task id"
+            snapshot = await self.task_manager.get_task_cancellation_snapshot(
+                task_id, recipient_agent_id=self.did
+            )
+            if snapshot is None or not snapshot.cognition_wake_eligible:
+                return "The authoritative A2A task is not eligible for cognition"
+            return None
         if getattr(signal, "source", None) != "a2a.task_submitted":
             return None
         payload = getattr(signal, "payload", None)
@@ -837,6 +855,7 @@ class EventManagerMixin:
             return f"A2A task {task_id!r} no longer exists"
         if (
             not snapshot.cognition_wake_eligible
+            or not snapshot.input_wake_eligible
             or snapshot.input_revision != payload.get("input_revision")
         ):
             return f"A2A task {task_id!r} input was superseded or is not executable"
@@ -876,6 +895,7 @@ class EventManagerMixin:
                 return f"A2A task {task_id!r} no longer exists"
             if (
                 not snapshot.cognition_wake_eligible
+                or not snapshot.input_wake_eligible
                 or snapshot.input_revision != payload.get("input_revision")
             ):
                 return f"A2A task {task_id!r} input was superseded or is not executable"

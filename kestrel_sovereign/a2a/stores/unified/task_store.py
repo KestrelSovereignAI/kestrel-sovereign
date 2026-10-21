@@ -67,7 +67,7 @@ _TASK_COLUMNS = (
     "metadata, created_at, updated_at, creator_agent_id, recipient_agent_id, "
     "canceled_by, cancel_reason, cancel_previous_status, cancel_operation_id, "
     "terminal_operation_id, lifecycle_revision, lifecycle_updated_at, "
-    "status_timestamp_seconds, status_timestamp_nanos, tenant, input_revision, cognition_wake_eligible"
+    "status_timestamp_seconds, status_timestamp_nanos, tenant, input_revision, cognition_wake_eligible, input_wake_eligible"
 )
 
 
@@ -84,7 +84,11 @@ class TaskInputConflictError(ValueError):
     """An input would alter an existing request or cross a context boundary."""
 
 
-class TaskInputTerminalError(TaskInputConflictError):
+class TaskInputUnsupportedError(TaskInputConflictError):
+    """This task cannot execute subsequent incoming cognition."""
+
+
+class TaskInputTerminalError(TaskInputUnsupportedError):
     """A terminal task cannot accept a subsequent message."""
 
 
@@ -104,6 +108,7 @@ class TaskCancellationSnapshot:
     actor_agent_id: str | None
     input_revision: int = 0
     cognition_wake_eligible: bool = True
+    input_wake_eligible: bool = True
 
 
 @dataclass(frozen=True)
@@ -119,6 +124,7 @@ class NativeTaskSnapshot:
     ownership: ContextOwnership
     input_revision: int = 0
     cognition_wake_eligible: bool = True
+    input_wake_eligible: bool = True
     input_request_json: str | None = None
     input_request_digest: str | None = None
 
@@ -177,7 +183,9 @@ class NativeTaskSnapshot:
             or self.input_revision < 0
         ):
             raise ValueError("Task wake requires a non-negative input revision")
-        if not isinstance(self.cognition_wake_eligible, bool):
+        if not isinstance(self.cognition_wake_eligible, bool) or not isinstance(
+            self.input_wake_eligible, bool
+        ):
             raise TypeError(
                 "Task wake eligibility requires server-owned boolean policy"
             )
@@ -307,7 +315,8 @@ class TaskStore(UnifiedStoreBase):
                 status_timestamp_nanos INTEGER,
                 tenant TEXT NOT NULL DEFAULT '',
                 cognition_wake_eligible INTEGER NOT NULL DEFAULT 1 CHECK (cognition_wake_eligible IN (0,1)),
-                input_revision BIGINT NOT NULL DEFAULT 0 CHECK (input_revision >= 0)
+                input_revision BIGINT NOT NULL DEFAULT 0 CHECK (input_revision >= 0),
+                input_wake_eligible INTEGER NOT NULL DEFAULT 1 CHECK (input_wake_eligible IN (0,1))
             )
         """)
 
@@ -342,7 +351,7 @@ class TaskStore(UnifiedStoreBase):
         row = await self._backend.fetch_one("""
             SELECT
                 (
-                    SELECT COUNT(*) = 14
+                    SELECT COUNT(*) = 15
                     FROM information_schema.columns
                     WHERE table_schema = current_schema()
                       AND table_name = 'a2a_tasks'
@@ -360,7 +369,8 @@ class TaskStore(UnifiedStoreBase):
                           'status_timestamp_nanos',
                           'tenant',
                           'cognition_wake_eligible',
-                          'input_revision'
+                          'input_revision',
+                          'input_wake_eligible'
                       )
                 )
                 AND EXISTS (
@@ -416,6 +426,10 @@ class TaskStore(UnifiedStoreBase):
             ("status_timestamp_nanos", "INTEGER"),
             ("tenant", "TEXT NOT NULL DEFAULT ''"),
             ("input_revision", "BIGINT NOT NULL DEFAULT 0 CHECK (input_revision >= 0)"),
+            (
+                "input_wake_eligible",
+                "INTEGER NOT NULL DEFAULT 1 CHECK (input_wake_eligible IN (0,1))",
+            ),
             (
                 "cognition_wake_eligible",
                 "INTEGER NOT NULL DEFAULT 1 CHECK (cognition_wake_eligible IN (0,1))",
@@ -657,7 +671,10 @@ class TaskStore(UnifiedStoreBase):
         revision = payload.get("input_revision")
         if type(revision) is not int or revision < 0:
             raise ValueError("Task mutation requires its admitted input revision")
-        return " AND input_revision = ? AND cognition_wake_eligible = 1", (revision,)
+        return (
+            " AND input_revision = ? AND cognition_wake_eligible = 1 AND input_wake_eligible = 1",
+            (revision,),
+        )
 
     async def save_recipient_lifecycle(
         self,
@@ -840,11 +857,20 @@ class TaskStore(UnifiedStoreBase):
         *,
         creator_agent_id: str,
         recipient_agent_id: str,
+        cognition_wake_eligible: bool = True,
+        input_wake_eligible: bool = True,
     ) -> None:
-        """Insert one new task and reject an occupied caller-supplied ID."""
+        """Insert one new task with explicit server-owned wake policy."""
 
         if not isinstance(task, Task):
             raise TypeError("TaskStore accepts only official A2A protobuf tasks")
+        if (
+            type(cognition_wake_eligible) is not bool
+            or type(input_wake_eligible) is not bool
+        ):
+            raise TypeError(
+                "Task wake eligibility requires server-owned boolean policy"
+            )
         if recipient_agent_id != self.scope.recipient_id:
             raise TaskMutationAuthorizationError(
                 "Task recipient does not match the selected store"
@@ -868,9 +894,10 @@ class TaskStore(UnifiedStoreBase):
                 (id, session_id, user_id, task_type, status, message, artifacts,
                  history, metadata, updated_at, lifecycle_updated_at,
                  creator_agent_id, recipient_agent_id,
-                 status_timestamp_seconds, status_timestamp_nanos, tenant)
+                 status_timestamp_seconds, status_timestamp_nanos, tenant,
+                 cognition_wake_eligible, input_wake_eligible)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()},
-                        {self.now_sql()}, ?, ?, ?, ?, ?)
+                        {self.now_sql()}, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (id) DO NOTHING
                 """,
                 (
@@ -888,6 +915,8 @@ class TaskStore(UnifiedStoreBase):
                     timestamp_seconds,
                     timestamp_nanos,
                     self.scope.tenant,
+                    int(cognition_wake_eligible),
+                    int(input_wake_eligible),
                 ),
             )
         except QueryError as insert_error:
@@ -1007,6 +1036,13 @@ class TaskStore(UnifiedStoreBase):
                 if task.status.state in TERMINAL_STATES:
                     conflict = TaskInputTerminalError(
                         "A terminal task cannot accept additional messages"
+                    )
+                elif (
+                    not current.cognition_wake_eligible
+                    or not current.input_wake_eligible
+                ):
+                    conflict = TaskInputUnsupportedError(
+                        "This task does not accept incoming cognition inputs"
                     )
                 elif (
                     request.message.context_id
@@ -1130,8 +1166,9 @@ class TaskStore(UnifiedStoreBase):
             lifecycle_revision=row[18],
             input_revision=row[23],
             cognition_wake_eligible=bool(row[24]),
-            input_request_json=row[25],
-            input_request_digest=row[26],
+            input_wake_eligible=bool(row[25]),
+            input_request_json=row[26],
+            input_request_digest=row[27],
             ownership=ContextOwnership(
                 context_id=row[1],
                 tenant=row[22],
@@ -1211,7 +1248,7 @@ class TaskStore(UnifiedStoreBase):
             raise ValueError("Cancellation snapshot requires a concrete recipient")
 
         row = await self._backend.fetch_one(
-            "SELECT status, canceled_by, input_revision, cognition_wake_eligible FROM a2a_tasks "
+            "SELECT status, canceled_by, input_revision, cognition_wake_eligible, input_wake_eligible FROM a2a_tasks "
             f"WHERE id = ? AND {_TASK_SCOPE} AND recipient_agent_id = ?",
             (task_id, *self._scope_parameters, recipient_agent_id),
         )
@@ -1222,6 +1259,7 @@ class TaskStore(UnifiedStoreBase):
             actor_agent_id=row[1],
             input_revision=row[2],
             cognition_wake_eligible=bool(row[3]),
+            input_wake_eligible=bool(row[4]),
         )
 
     async def get_cancellation_operation_id(self, task_id: str) -> str | None:
@@ -1826,6 +1864,7 @@ class TaskStore(UnifiedStoreBase):
               AND (
                     (
                         status IN ('submitted', 'working')
+                        AND input_wake_eligible = 1
                         AND {changed_predicate}
                     )
                     OR (

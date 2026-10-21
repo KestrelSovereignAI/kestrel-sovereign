@@ -50,8 +50,7 @@ PROMPT_TEMPLATE = (
     # install — every COGNITION wake-up using this source raised
     # FileNotFoundError in ``_render_prompt`` and the recipient agent
     # was never woken.
-    Path(__file__).resolve().parents[2]
-    / "prompts" / "signals" / "a2a_task_complete.md"
+    Path(__file__).resolve().parents[2] / "prompts" / "signals" / "a2a_task_complete.md"
 )
 METADATA_KEY = CAUSATION_URI
 
@@ -162,20 +161,33 @@ def build_a2a_task_complete_registration() -> SourceRegistration:
 # ---------------------------------------------------------------------------
 
 
-def build_signal_for_completed_task(candidate: NativeTaskSnapshot, target_agent: str) -> Signal:
+def build_signal_for_completed_task(
+    candidate: NativeTaskSnapshot, target_agent: str
+) -> Signal:
     """Build a terminal wake from the native row and its durable principals."""
     candidate = require_native_task_snapshot(candidate, target_agent)
     task = candidate.task
+    if not candidate.cognition_wake_eligible:
+        raise ValueError("This task is not eligible for a cognition wake")
     if task.status.state not in TERMINAL_STATES:
         raise ValueError("Task completion wake requires a terminal native task")
     chain = deserialize_causation_chain(MessageToDict(task.metadata))
     state = task_state_label(task.status.state)
     return Signal(
-        source=SOURCE_NAME, kind="terminal", mode=SignalMode.COGNITION,
-        payload={"task_id": task.id, "task_state": state, "result_summary": _summarize_task_result(task)},
-        target_agent=target_agent, caller=candidate.ownership.creator_agent_id,
-        visibility=Visibility.INTERNAL, urgency=Urgency.NORMAL,
-        origin_trust=Trust.TRUSTED, dedupe_key=f"{task.id}:{state}",
+        source=SOURCE_NAME,
+        kind="terminal",
+        mode=SignalMode.COGNITION,
+        payload={
+            "task_id": task.id,
+            "task_state": state,
+            "result_summary": _summarize_task_result(task),
+        },
+        target_agent=target_agent,
+        caller=candidate.ownership.creator_agent_id,
+        visibility=Visibility.INTERNAL,
+        urgency=Urgency.NORMAL,
+        origin_trust=Trust.TRUSTED,
+        dedupe_key=f"{task.id}:{state}",
         causation_chain=list(chain),
     )
 

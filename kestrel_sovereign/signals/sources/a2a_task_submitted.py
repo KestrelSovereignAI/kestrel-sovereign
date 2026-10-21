@@ -175,7 +175,7 @@ def build_signal_for_submitted_task(
     """Wake the admitted recipient using ownership facts outside peer metadata."""
     candidate = require_native_task_snapshot(candidate, target_agent)
     task = candidate.task
-    if not candidate.cognition_wake_eligible:
+    if not candidate.cognition_wake_eligible or not candidate.input_wake_eligible:
         raise ValueError("This task is not eligible for a cognition wake")
     if task.status.state not in {
         TaskState.TASK_STATE_SUBMITTED,

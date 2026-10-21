@@ -27,9 +27,11 @@ and open gates are recorded in [the spike report](NATIVE_PROTOCOL_SPIKES.md).
 Use the published [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
 and [A2A 1.0.1 specification](https://a2a-protocol.org/v1.0.1/specification/),
 the latest released A2A revision checked on 2026-10-19.
-Use official Python SDKs at every network boundary. MCP was tested at 2.3.0;
-the native A2A migration and signed-card gate use the public `a2a-sdk` 1.2.3
-release, rechecked on 2026-10-20. Exact versions belong in dependency locks,
+Use official Python SDKs at every network boundary. MCP was tested at 2.3.0.
+The native A2A migration currently uses a private `a2a-sdk` 2.0 development
+candidate with the signed-card, HTTP authorization and response-decoding fixes;
+public dependency acceptance remains a release gate. Earlier spike evidence
+used public 1.2.3, rechecked on 2026-10-20. Exact versions belong in dependency locks,
 and dependency ranges must admit the releases we actually test. Old dependency
 caps are subject to migration, not reasons to downgrade the protocol target.
 
@@ -526,6 +528,14 @@ never changes those facts or the signal's trust.
 
 Immediate callbacks, restart reads and privacy-elided signal rehydration use
 the same snapshot. Reject missing principals and a recipient/context mismatch.
+
+Wake eligibility is server-owned durable policy, independent of peer metadata.
+Incoming requests permit input and completion cognition. Local synchronous
+skills permit neither; their caller already receives the result. Local
+asynchronous skills permit completion cognition only. Restart reconciliation,
+signal builders, privacy rehydration and execution guards honor the same policy,
+and local skill tasks reject subsequent incoming messages. Recovery does not
+replay a physical local tool invocation after process loss.
 Peer context IDs map to a host-chat projection that includes recipient and
 tenant; a peer cannot select an existing human chat session by naming it.
 
