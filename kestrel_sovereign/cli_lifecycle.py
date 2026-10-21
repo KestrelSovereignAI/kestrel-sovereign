@@ -38,6 +38,7 @@ from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 from kestrel_sovereign.multi_agent.liveness import AgentHolder
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    SERVER_KILL_GRACE_SECONDS,
     SERVER_TERMINATE_TIMEOUT_SECONDS,
     PidStatus,
     ProcessManager,
@@ -551,8 +552,8 @@ def cmd_terminate(args) -> int:
             print(f"   Terminating {args.name} (PID: {ap.pid})...")
             if not pm.terminate_agent(args.name):
                 print(
-                    f"   {args.name}: PID {ap.pid} is still running after "
-                    f"SIGKILL — not reporting {args.name} as terminated"
+                    f"   {args.name}: PID {ap.pid} {ap.stop_failure} — not "
+                    f"reporting {args.name} as terminated"
                 )
                 return 1
             # The tracked PID being gone does not mean the port is free: a
@@ -596,9 +597,7 @@ def cmd_terminate(args) -> int:
         if ap and ap.pid:
             print(f"   Terminating {name} (PID: {ap.pid})...")
             if not pm.terminate_agent(name):
-                print(
-                    f"   {name}: PID {ap.pid} is still running after SIGKILL"
-                )
+                print(f"   {name}: PID {ap.pid} {ap.stop_failure}")
                 unterminated.append(name)
             elif ProcessManager.is_port_in_use(cfg.port, multi_agent.host.bind):
                 _report_port_still_held(name, cfg.port)
@@ -644,7 +643,7 @@ def cmd_terminate(args) -> int:
                 "complete"
             )
             pm.kill_process(host_pid, force=True, started_at=started_at)
-            time.sleep(0.5)
+            time.sleep(SERVER_KILL_GRACE_SECONDS)
         # Two independent facts, both required before claiming a stop: the
         # process is gone, and the port it served is free. Neither implies the
         # other — a host that failed to bind leaves the port free while still

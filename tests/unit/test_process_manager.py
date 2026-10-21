@@ -1557,6 +1557,69 @@ class TestTerminateAgent:
         # clearing it would strand a live agent with nothing pointing at it.
         assert ap.pid_file.exists()
         assert ap.pid == 99999
+        assert ap.stop_failure == "is still running after SIGKILL"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="the start-time refusal is checked against a real POSIX child",
+    )
+    def test_a_refused_stop_signal_is_reported_without_waiting(self, pm, project_dir):
+        """A signal that never reached the agent started no shutdown (#3781).
+
+        Waiting out the stop deadline for it turned a refusal into a minute's
+        delay per agent before the same failure was reported. The refusal is
+        the real one: the recorded start time does not match the live process
+        holding the number, so ``kill_process`` withholds both signals.
+        """
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"]
+        )
+        try:
+            live_start = ProcessManager.process_start_time(child.pid)
+            assert live_start is not None
+            ap = pm.register_agent("claw", LocalAgentConfig(
+                data_dir=Path("agent_data/claw"), port=8801,
+            ))
+            ap.pid = child.pid
+            # Recorded long before the live process began: its number was reused.
+            ap.started_at = live_start - 3600
+            ProcessManager.write_pid(ap.pid_file, child.pid)
+
+            with patch.object(ProcessManager, "wait_for_exit") as wait:
+                result = pm.terminate_agent("claw")
+            still_alive = child.poll() is None
+        finally:
+            child.kill()
+            child.wait()
+
+        assert result is False
+        wait.assert_not_called()
+        assert still_alive, "a process the stop could not identify was signalled"
+        assert ap.stop_failure == "could not be signalled and is still running"
+        assert ap.pid_file.exists()
+        assert ap.pid == child.pid
+
+    def test_a_refused_signal_to_an_agent_that_already_exited_is_a_stop(
+        self, pm, project_dir
+    ):
+        """The agent exited between the liveness check and the signal."""
+        ap = pm.register_agent("claw", LocalAgentConfig(
+            data_dir=Path("agent_data/claw"), port=8801,
+        ))
+        ap.pid = 99999
+        ProcessManager.write_pid(ap.pid_file, 99999)
+
+        with patch.object(ProcessManager, "is_process_running",
+                          side_effect=[True, False]), \
+             patch.object(ProcessManager, "kill_process", return_value=False), \
+             patch.object(ProcessManager, "wait_for_exit") as wait:
+            result = pm.terminate_agent("claw")
+
+        assert result is True
+        wait.assert_not_called()
+        assert not ap.pid_file.exists()
+        assert ap.pid is None
+        assert ap.stop_failure is None
 
     def test_terminate_all_names_the_agents_that_survived(self, pm, project_dir):
         """terminate_all reports which agents outlived it rather than dropping it."""
@@ -2449,6 +2512,32 @@ class TestLogRotation:
 
         assert log.read_text() == "new lifetime\n"
         assert (tmp_path / "host.log.1").read_text().startswith("previous lifetime")
+
+    def test_a_log_that_cannot_be_rotated_does_not_stop_the_launch(
+        self, pm, tmp_path, caplog
+    ):
+        """On Windows a viewer can hold the log open without delete sharing,
+        and the rename is refused. The launch appends to the log instead."""
+        log = self._sized(
+            tmp_path / "agent.log",
+            process_manager.LOG_ROTATION_MAX_BYTES,
+            "previous lifetime\n",
+        )
+        refused = PermissionError(13, "The process cannot access the file")
+        with patch.object(process_manager.os, "replace", side_effect=refused), \
+             patch.object(subprocess, "Popen", return_value=MagicMock(pid=1)) as popen, \
+             patch("threading.Thread"), \
+             caplog.at_level("WARNING", logger=process_manager.__name__):
+            pm._spawn(
+                cmd=["python", "-c", "pass"],
+                env={},
+                log_file=log,
+                pid_file=tmp_path / "agent.pid",
+            )
+
+        popen.assert_called_once()
+        assert log.read_text().startswith("previous lifetime")
+        assert f"Could not rotate {log}" in caplog.text
 
     def test_piped_launch_rotates_a_full_log_too(self, pm, tmp_path):
         log = self._sized(

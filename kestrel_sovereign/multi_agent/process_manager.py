@@ -88,6 +88,11 @@ SERVER_GRACEFUL_SHUTDOWN_SECONDS = 5
 #: shutdown costs only the time it takes.
 SERVER_TERMINATE_TIMEOUT_SECONDS = 60.0
 
+#: How long a stop that had to send SIGKILL waits before it judges whether the
+#: process is gone. A server's whole stop therefore lasts at most
+#: ``SERVER_TERMINATE_TIMEOUT_SECONDS`` plus this.
+SERVER_KILL_GRACE_SECONDS = 0.5
+
 #: A log a detached server writes to is rotated at launch once it reaches this
 #: size. The child holds the file for its whole life, so launch is the one
 #: point a rotation cannot lose its lines (#3781).
@@ -142,6 +147,22 @@ def rotate_log_file(
             os.replace(generation(n), generation(n + 1))
     os.replace(log_file, generation(1))
     return True
+
+
+def _rotate_launch_log(log_file: Path) -> None:
+    """Rotate ``log_file`` before a launch opens it; a refusal skips only that.
+
+    Rotation is housekeeping, not part of serving. A log that cannot be moved
+    aside (on Windows, a viewer holding it open without delete sharing) is
+    appended to as before, and says so, rather than failing the launch.
+    """
+    try:
+        rotate_log_file(log_file)
+    except OSError as exc:
+        logger.warning(
+            "Could not rotate %s before launch; appending to it: %s",
+            log_file, exc,
+        )
 
 
 def _open_detached_log(log_file: Path) -> int:
@@ -310,6 +331,11 @@ class AgentProcess:
     #: the agent paths signalled whatever held the number, while the host path
     #: was already protected (#2995).
     started_at: Optional[float] = None
+    #: Why the last stop left ``pid`` running, phrased to follow the PID:
+    #: "is still running after SIGKILL", or "could not be signalled and is
+    #: still running" when the stop signal never reached it. None once a stop
+    #: succeeds.
+    stop_failure: Optional[str] = None
 
 
 class ProcessManager:
@@ -860,7 +886,7 @@ class ProcessManager:
         block-buffering rationale).
         """
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        rotate_log_file(log_file)
+        _rotate_launch_log(log_file)
         child_env = dict(env)
         child_env.setdefault("PYTHONUNBUFFERED", "1")
 
@@ -917,7 +943,7 @@ class ProcessManager:
         never block the host from shutting down.
         """
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        rotate_log_file(log_file)
+        _rotate_launch_log(log_file)
         # Force unbuffered stdout in the CHILD process so the pump sees
         # runtime log lines (single-line WARNINGs, exception tracebacks)
         # immediately. Without this, Python detects its stdout isn't a
@@ -1362,7 +1388,9 @@ class ProcessManager:
 
         Returns:
             True only once the agent is confirmed gone (or was never running).
-            False if it is still running after SIGKILL.
+            False if it is still running: after SIGKILL, or because the stop
+            signal could not reach it. ``AgentProcess.stop_failure`` says
+            which.
 
         Termination is reported on the strength of the postcondition, never on the
         strength of having sent a signal: ``kill_process`` cannot signal a
@@ -1393,18 +1421,23 @@ class ProcessManager:
             if ap.pid_file:
                 self.clear_pid(ap.pid_file)
             ap.pid = None
+            ap.stop_failure = None
             return True
 
         logger.info(f"Terminating agent '{name}' (PID {ap.pid})...")
-        self.kill_process(ap.pid, force=False, started_at=ap.started_at)
+        signalled = self.kill_process(ap.pid, force=False, started_at=ap.started_at)
 
-        # Force kill if graceful shutdown did not finish in time
-        if not self.wait_for_exit(ap.pid, timeout):
+        # Force kill if graceful shutdown did not finish in time. A stop
+        # signal that never reached the agent (another uid, or a number the
+        # recorded process no longer holds) started no shutdown to wait for,
+        # and a SIGKILL would be refused the same way: waiting out the whole
+        # deadline would only delay saying so (#3781).
+        if signalled and not self.wait_for_exit(ap.pid, timeout):
             logger.warning(
                 f"Agent '{name}' did not terminate gracefully, sending SIGKILL"
             )
             self.kill_process(ap.pid, force=True, started_at=ap.started_at)
-            time.sleep(0.5)
+            time.sleep(SERVER_KILL_GRACE_SECONDS)
 
         # Reap before judging. ``start_agent`` spawns agents with
         # ``subprocess.Popen``, so this process is their parent, and a killed
@@ -1415,8 +1448,13 @@ class ProcessManager:
         self._reap_if_child(ap.pid)
 
         if self.is_process_running(ap.pid):
+            ap.stop_failure = (
+                "is still running after SIGKILL"
+                if signalled
+                else "could not be signalled and is still running"
+            )
             logger.error(
-                f"Agent '{name}' (PID {ap.pid}) is still running after SIGKILL; "
+                f"Agent '{name}' (PID {ap.pid}) {ap.stop_failure}; "
                 "leaving the PID file in place"
             )
             return False
@@ -1424,6 +1462,7 @@ class ProcessManager:
         if ap.pid_file:
             self.clear_pid(ap.pid_file)
         ap.pid = None
+        ap.stop_failure = None
         logger.info(f"Agent '{name}' terminated")
         return True
 
@@ -1480,8 +1519,8 @@ class ProcessManager:
             timeout: Seconds to wait per agent for graceful shutdown.
 
         Returns:
-            The names of agents still running after SIGKILL, in the order they
-            were attempted. Empty when every agent stopped. Returned rather
+            The names of agents still running after their stop, in the order
+            they were attempted. Empty when every agent stopped. Returned rather
             than discarded so a caller cannot report a clean shutdown over the
             top of an agent that outlived it.
         """

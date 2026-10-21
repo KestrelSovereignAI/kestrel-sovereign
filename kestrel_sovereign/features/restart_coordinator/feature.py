@@ -48,6 +48,10 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
     resolve_scoped_agent_did,
 )
+from kestrel_sovereign.multi_agent.process_manager import (
+    SERVER_KILL_GRACE_SECONDS,
+    SERVER_TERMINATE_TIMEOUT_SECONDS,
+)
 from kestrel_sovereign.storage.database_clock import database_clock
 from kestrel_sovereign.storage.db.interface import TransactionError
 
@@ -160,13 +164,21 @@ STALE_EXECUTING_SECONDS = 600
 # works stops this process, and its shutdown cancels the watch with the rest of
 # the feature's tasks. The deadline only bounds a child that hangs.
 #
-# It must outlast the restart's own stop. A child that cannot stop this host
-# exits only after ``kestrel terminate`` has waited out the host's full stop
-# deadline (``SERVER_TERMINATE_TIMEOUT_SECONDS``) and sent SIGKILL, so a shorter
-# watch misses the failure and leaves the row ``executing`` until the
-# stranded-row sweep (#3781). It is half that sweep's window so the two never
-# act on one dispatch: past it, the sweep owns the row.
-RESTART_DISPATCH_GRACE_SECONDS = STALE_EXECUTING_SECONDS // 2
+# It is the restart's own stop of this host: ``kestrel terminate`` waits
+# ``SERVER_TERMINATE_TIMEOUT_SECONDS`` for it to exit, sends SIGKILL, and
+# waits ``SERVER_KILL_GRACE_SECONDS`` more before it judges. Derived from
+# those, not set beside them, so a longer stop cannot silently outlast the
+# watch and leave a failed restart's row ``executing`` until the stranded-row
+# sweep (#3781). The window starts at dispatch, before the child's start-up
+# and constitution check, and that offset is no gap: a child refused before
+# its stop signal reaches this host exits within seconds, and once the signal
+# arrives this host is stopping, so its shutdown or the SIGKILL ends the watch.
+#
+# This is the in-process host's stop. A fleet of standalone agents is stopped
+# one deadline after another before the host, which can outlast it (#3791).
+RESTART_DISPATCH_GRACE_SECONDS = (
+    SERVER_TERMINATE_TIMEOUT_SECONDS + SERVER_KILL_GRACE_SECONDS
+)
 
 # Per-process boot identifier (#1796). Generated once at import, so it is
 # stable for the lifetime of THIS host process and differs from any prior

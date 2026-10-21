@@ -997,6 +997,55 @@ class TestCmdTerminateReportsOnlyVerifiedTermination:
             "the number can be reused and signalled by the next command"
         )
 
+    @pytest.mark.parametrize("named", [True, False])
+    def test_an_agent_the_signal_never_reached_is_reported_as_such(
+        self, multi_agent_env, capsys, named
+    ):
+        """A standalone agent's refused signal is said, not called a SIGKILL.
+
+        ``terminate_agent`` used to wait out the stop deadline after a refused
+        signal and then report the agent "still running after SIGKILL", a
+        signal it never sent (#3781).
+        """
+        import subprocess as _subprocess
+        import sys as _sys
+
+        _repoint_ports(multi_agent_env, host=_free_port(), claw=_free_port(),
+                       testbot=_free_port())
+        agent = _subprocess.Popen(
+            [_sys.executable, "-c", "import time; time.sleep(300)"]
+        )
+        try:
+            ProcessManager.write_pid(
+                ProcessManager.agent_pid_file(
+                    (multi_agent_env / "agent_data" / "claw").resolve()
+                ),
+                agent.pid,
+            )
+            args = build_parser().parse_args(
+                ["terminate", "claw"] if named else ["terminate"]
+            )
+            with patch.object(ProcessManager, "kill_process",
+                              return_value=False) as kill, \
+                 patch.object(ProcessManager, "wait_for_exit") as wait, \
+                 patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env):
+                rc = cmd_terminate(args)
+            assert agent.poll() is None
+        finally:
+            agent.kill()
+            agent.wait()
+
+        output = capsys.readouterr().out
+        assert rc == 1, output
+        kill.assert_called_once()
+        wait.assert_not_called()
+        assert (
+            f"claw: PID {agent.pid} could not be signalled and is still running"
+            in output
+        )
+        assert "SIGKILL" not in output
+
 
 @contextmanager
 def _running_host(env, *, ignore_sigterm=False):
@@ -1147,7 +1196,6 @@ class TestCmdTerminateInProcessHost:
         assert rc == 0, output
         assert "sending SIGKILL; its shutdown did not complete" in output
         assert "MultiAgent terminated" in output
-
 
     def test_a_host_the_signal_never_reached_is_not_waited_for(
         self, multi_agent_env, capsys

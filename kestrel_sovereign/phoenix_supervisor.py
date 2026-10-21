@@ -284,8 +284,16 @@ def supports_host_root_path() -> bool:
     ``/phoenix`` prefix instead (see :meth:`PhoenixSupervisor.upstream_url`).
     """
     try:
-        installed = Version(importlib.metadata.version(PHOENIX_SERVER_DISTRIBUTION))
-    except (importlib.metadata.PackageNotFoundError, InvalidVersion):
+        recorded = importlib.metadata.version(PHOENIX_SERVER_DISTRIBUTION)
+    except (importlib.metadata.PackageNotFoundError, KeyError):
+        # KeyError: a damaged install whose metadata has no Version field, on
+        # a Python that raises for a missing field rather than returning None.
+        return False
+    if recorded is None:
+        return False
+    try:
+        installed = Version(recorded)
+    except InvalidVersion:
         return False
     return installed >= PHOENIX_HOST_ROOT_PATH_SINCE
 

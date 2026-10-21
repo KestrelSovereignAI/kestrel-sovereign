@@ -304,6 +304,37 @@ def test_root_path_support_comes_from_the_installed_version(
     assert ps.supports_host_root_path() is supported
 
 
+def test_a_damaged_install_without_a_version_reads_as_unsupported(
+    tmp_path, monkeypatch
+):
+    """Metadata with no Version field, as a half-removed install leaves it.
+
+    ``importlib.metadata.version`` returns None for it (or raises KeyError on
+    a Python that refuses missing fields), which must not escape Phoenix's
+    start as a TypeError.
+    """
+    dist_info = tmp_path / "arize_phoenix-1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: arize-phoenix\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(sys.modules, "phoenix.config", None)
+
+    assert ps.supports_host_root_path() is False
+
+
+def test_a_missing_version_field_that_raises_reads_as_unsupported(monkeypatch):
+    import importlib.metadata
+
+    def missing_field(name):
+        raise KeyError("Version")
+
+    monkeypatch.setattr(importlib.metadata, "version", missing_field)
+
+    assert ps.supports_host_root_path() is False
+
+
 def test_start_resolves_root_path_without_importing_phoenix(tmp_path, monkeypatch):
     """``import phoenix.config`` loads the Phoenix server: 5.7s or more per
     boot, even when an already running Phoenix is adopted."""
