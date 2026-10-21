@@ -436,6 +436,39 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [
+        "kestrel_sovereign/a2a/agent_card.py",
+        "kestrel_sovereign/a2a/transport_auth.py",
+        "kestrel_sovereign/a2a/types.py",
+        "kestrel_sovereign/features/keys/feature.py",
+        "kestrel_sovereign/multi_agent/route_name.py",
+        "kestrel_sovereign/security/agent_encryption.py",
+        "kestrel_sovereign/security/service_key_storage.py",
+        "kestrel_sovereign/storage/async_pending_a2a_question_store.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/NATIVE_MCP_A2A.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "draft",
+      "title": "Native MCP and A2A interoperability",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/NATIVE_PROTOCOL_SPIKES.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "draft",
+      "title": "Native protocol Phase 0 evidence",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [],
       "findings": [],
       "missing_code_refs": [],
@@ -679,6 +712,20 @@
       "render": "archive",
       "status": "historical",
       "title": "VastAI LoRA Training Architecture",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
+        "AGENTS.md"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/VISUAL_COMPUTER_USE.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "design-of-record",
+      "title": "Visual computer use and durable artifacts",
       "type": "Architecture Spec"
     },
     {
@@ -1223,7 +1270,9 @@
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/security/key_rotation.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
@@ -2056,6 +2105,7 @@
         "tests/integration/test_compute_security_integration.py",
         "tests/integration/test_core_only_boot.py",
         "tests/integration/test_identity_export_import.py",
+        "tests/integration/test_mcp_permission_boundary.py",
         "tests/integration/test_sovereignty_e2e.py",
         "tests/integration/test_storage_backend_parity.py",
         "tests/unit/test_agent_backend_routing_contracts.py",
@@ -3938,6 +3988,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/development/EXECUTION_CUSTODY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Transaction-bound hosted execution custody",
+      "type": "Developer Guide"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/development/README.md",
       "privacy": "internal",
       "render": "internal",
@@ -4522,6 +4584,78 @@
       "type": "Release Note"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.28.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.28",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.31.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.31",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.32.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.32",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.33.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.33",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.34.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.34",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.35.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.35",
+      "type": "Release Note"
+    },
+    {
       "existing_code_refs": [
         "scripts/ci/throughput_report.py",
         "tests/unit/test_host_features.py"
@@ -4725,7 +4859,9 @@
       "type": "User Guide"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/security/key_rotation.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],

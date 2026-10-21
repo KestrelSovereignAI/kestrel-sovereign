@@ -3,6 +3,8 @@ import logging
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
+
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.security.narration_check import (
     analyze_narration,
     check_escalation_attribution,
@@ -155,6 +157,8 @@ class ResponseAuditHook(Hook):
                 tool_results=input.tool_results,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Response audit failed: {e}")
             # Even with the LLM audit unavailable, a clean-cut
             # narration violation still fires the audit machinery.
@@ -357,4 +361,6 @@ class ResponseAuditHook(Hook):
                     "source": "response_audit",
                 })
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"Audit anchor notification failed: {e}")

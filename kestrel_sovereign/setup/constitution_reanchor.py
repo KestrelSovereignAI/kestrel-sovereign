@@ -106,6 +106,10 @@ from kestrel_sovereign.constitution.trust_root import (
     load_sovereign_trust_root,
 )
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
+from kestrel_sovereign.execution_custody import (
+    execution_commit_outcome,
+    is_execution_control_error,
+)
 
 if TYPE_CHECKING:
     from kestrel_sovereign.cli_embeddings import AgentEmbeddingResolution
@@ -626,6 +630,8 @@ async def reanchor_constitution(
             governance_preflight,
         ) = await _read_agent_anchor(target)
     except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
+        if is_execution_control_error(exc):
+            raise
         logger.exception("Could not read the anchor from %s", target.describe())
         return _result(
             old_hash=None,
@@ -686,6 +692,8 @@ async def reanchor_constitution(
                 governance_preflight,
             ) = await _read_agent_anchor(target)
         except Exception as exc:  # noqa: BLE001 — surfaced to the operator
+            if is_execution_control_error(exc):
+                raise
             logger.exception("Could not read the anchor at %s", target.describe())
             return _result(
                 old_hash=None,
@@ -868,6 +876,8 @@ async def reanchor_constitution(
         try:
             custody_pending = await _initial_anchor_custody_pending(target)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             return _result(old_hash=old_hash, new_hash=new_hash, error=f"Cannot inspect initial-anchor custody: {exc}. Nothing was written.")
 
     if (
@@ -991,11 +1001,21 @@ async def reanchor_constitution(
             governance_preflight=governance_preflight,
         )
     except Exception as exc:  # noqa: BLE001 — surface the underlying error verbatim
+        if is_execution_control_error(exc):
+            # Keep the exact committed/unknown receipt AND its retained native
+            # owner. A printable error result cannot carry lifecycle custody.
+            raise
+
+        outcome = execution_commit_outcome(exc)
         logger.exception(
             "Reanchor against %s failed; backup: %s",
             target.describe(), backup_path or "(none)",
         )
         recovery = (
+            f" Transaction outcome is {outcome}; do not retry the write. "
+            "Reload and reconcile the durable anchor before resuming work."
+            if outcome is not None
+            else
             f" DB backup at {backup_path}"
             if backup_path is not None
             else " The write was one transaction and rolled back; no file "
@@ -1578,20 +1598,10 @@ async def _agent_embedding(
     from kestrel_sovereign.cli_embeddings import resolve_agent_embedding
 
     resolution = await resolve_agent_embedding(db, agent_did)
-    try:
+    # Resolution owns a private service before its first awaited config read;
+    # the SAME owner spans this committed repair and its physical retirement.
+    async with resolution.lifetime(committed_on_success=True):
         yield resolution
-    finally:
-        if resolution.llm_service is not None:
-            try:
-                await resolution.llm_service.close()
-            except Exception:  # noqa: BLE001 — cleanup after the outcome is decided
-                # This runs after the caller's transaction has committed or
-                # rolled back. Raising here would report a committed reanchor
-                # as failed, or replace the error that rolled one back.
-                logger.warning(
-                    "Could not close the embedding LLM service after the "
-                    "reanchor of %s.", agent_did, exc_info=True,
-                )
 
 
 async def _reindex_constitution_rag(

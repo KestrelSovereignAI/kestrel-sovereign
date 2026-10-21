@@ -21,6 +21,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .context_builder import ContextBuilder, _count_tool_schema_tokens
 from .context_stages import (
     ContextAssembly,
@@ -1217,15 +1219,12 @@ class ContextManager:
             return self._render_context_plan(plan)
 
         if plan.memory_access_ids and self.memory_retriever is not None:
-            try:
-                await self.memory_retriever.record_accesses(
-                    plan.memory_access_ids, self.agent_id
-                )
-            except Exception as exc:
-                logger.warning("Memory access bookkeeping failed: %s", exc)
-                plan.warnings.append(
-                    f"Memory access bookkeeping unavailable: {exc}"
-                )
+            # update_access already handles ordinary availability failures.
+            # Admission/ownership failure here is not an optional write miss:
+            # do not publish a context whose accepted owners failed to settle.
+            await self.memory_retriever.record_accesses(
+                plan.memory_access_ids, self.agent_id
+            )
 
         span = plan.salvage_requirement
         if span is not None:
@@ -1735,6 +1734,8 @@ class ContextManager:
                 session_id=session_id,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Memory retrieval failed: {e}")
             return SectionResult(
                 name="memories",
@@ -1780,6 +1781,8 @@ class ContextManager:
                 **rag_kwargs,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"RAG retrieval failed: {e}")
             return SectionResult(
                 name="rag",

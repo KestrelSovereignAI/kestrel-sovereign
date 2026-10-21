@@ -29,6 +29,7 @@ from typing import ClassVar, Optional
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.result import ToolResultStatus
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.waits.engine import (
     TERMINAL_EVENT_AT_KEY,
     TERMINAL_EVENT_DETAIL_KEY,
@@ -119,7 +120,9 @@ class A2AWaitable:
             # A duplicate historical route is affirmatively unsafe, not a
             # no-record legacy case — refuse to arm a watch on it.
             return False
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             return None
         if row is None:
             # Not a tracked outbound dispatch of ours.
@@ -146,6 +149,8 @@ class A2AWaitable:
                 data={"task_id": handle, "state": "ambiguous"},
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             # Audit store unreadable right now — stay pending rather than
             # inventing a terminal failure for a possibly-live peer task.
             return WaitStatus(
@@ -192,6 +197,8 @@ class A2AWaitable:
         try:
             result = await feature.get_peer_task_result(recipient, handle)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             return WaitStatus(
                 Outcome.PENDING,
                 f"a2a task {handle[:8]} peer fetch raised: {exc}",

@@ -57,6 +57,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, FrozenSet, Optional
 
+from kestrel_sdk.signals import SignalHandle
+from kestrel_sovereign._async_ownership import owned_task_error
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -103,6 +110,23 @@ def _outcome(
     )
 
 
+def _raise_delivery_control(error: BaseException, handle: Any = None) -> None:
+    """Preserve the actual dispatch's first receipt before retry classification.
+
+    A tracked SDK task's completion callback may already have harvested its
+    original cancellation. Awaiting the same task can then yield a fresh,
+    cause-free cancellation; use the shared original evidence, not that proxy.
+    Legacy handles still preserve control carried by their own raised error.
+    """
+    retained = None
+    task = getattr(handle, "task", None) if isinstance(handle, SignalHandle) else None
+    if isinstance(task, asyncio.Task) and task.done():
+        retained = owned_task_error(task)
+    terminal = execution_terminal_error(error, retained)
+    if terminal is not None and is_execution_control_error(terminal):
+        raise terminal
+
+
 async def await_terminal_delivery(
     handle: Any,
     *,
@@ -111,15 +135,20 @@ async def await_terminal_delivery(
 ) -> DeliveryOutcome:
     """Await one dispatch to a terminal state and classify it.
 
-    Never raises for a *signal* outcome — ``FAILED`` and every ``DROPPED_*``
-    come back as a non-delivered :class:`DeliveryOutcome` so the caller can
+    Never raises for an ordinary *signal* outcome — ``FAILED`` and every
+    ``DROPPED_*`` come back as a non-delivered :class:`DeliveryOutcome` so the caller can
     retain its checkpoint and keep going.
+
+    Explicit execution-control evidence is not ordinary non-delivery. It
+    propagates unchanged and must not restore a checkpoint for automatic replay.
 
     Cancellation is split, because the two cases mean opposite things:
 
     * **The dispatch task was cancelled** (agent shutdown reaped it, the
       handle was cancelled) — reported as ``dispatch_cancelled`` and not
       delivered. This caller is healthy and must still run its retain path.
+      Execution-control evidence always takes precedence over this ordinary
+      cancellation classification.
     * **This caller is being cancelled** — re-raised. Swallowing it would
       turn a shutdown into a silent normal return.
 
@@ -145,7 +174,8 @@ async def await_terminal_delivery(
 
     try:
         result = await waiter()
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancellation:
+        _raise_delivery_control(cancellation, handle)
         current = asyncio.current_task()
         if current is not None and current.cancelling():
             # We are the one being cancelled — propagate.
@@ -157,6 +187,7 @@ async def await_terminal_delivery(
             error="signal dispatch task was cancelled",
         )
     except Exception as e:  # noqa: BLE001 - a broken wait is not a delivery
+        _raise_delivery_control(e, handle)
         logger.warning("%s: awaiting signal delivery raised: %s", label, e)
         return _outcome(
             STATUS_TOOLING_ERROR, delivered_statuses, error=f"{type(e).__name__}: {e}"
@@ -192,6 +223,10 @@ def supervise_terminal_delivery(
     """Spawn a feature-owned task that awaits ``handle`` and settles the
     checkpoint, for producers that cannot await inline.
 
+    Explicit execution control bypasses both ordinary non-delivery and
+    shutdown restoration. The owner retains that receipt for reconciliation.
+    Local in-flight bookkeeping still settles without replacing the receipt.
+
     ``on_delivered`` runs only on a terminal delivered status — that is the
     *only* place a durable checkpoint may advance. ``on_undelivered`` runs for
     every other terminal state (``FAILED``, any ``DROPPED_*``, a cancelled
@@ -209,7 +244,7 @@ def supervise_terminal_delivery(
     while the agent's global reap set still covers full shutdown.
     """
 
-    async def _await_and_settle() -> None:
+    async def _settle_delivery() -> None:
         try:
             outcome = await await_terminal_delivery(
                 handle, label=label, delivered_statuses=delivered_statuses
@@ -226,7 +261,8 @@ def supervise_terminal_delivery(
             )
             if on_undelivered is not None:
                 await on_undelivered(outcome)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            _raise_delivery_control(cancellation, handle)
             # This supervisor is being cancelled — feature shutdown, soft
             # disable, or boot rollback. Awaiting the handle cancels the
             # dispatch with it, so the wake will never land.
@@ -249,9 +285,20 @@ def supervise_terminal_delivery(
                     _outcome(STATUS_SUPERVISOR_CANCELLED, delivered_statuses)
                 )
             raise
+
+    async def _await_and_settle() -> None:
+        body_error = None
+        try:
+            await _settle_delivery()
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
             if on_settled is not None:
-                on_settled()
+                try:
+                    on_settled()
+                except BaseException as cleanup_error:
+                    raise execution_terminal_error(body_error, cleanup_error)
 
     return feature._track_owned_background_task(_await_and_settle(), name=task_name)
 
@@ -281,6 +328,7 @@ def harvest_detached_delivery(
         try:
             handle = await enqueue()
         except Exception as e:  # noqa: BLE001 - mirrors the pre-harvest posture
+            _raise_delivery_control(e)
             logger.warning("%s: enqueue_signal raised: %s", label, e, exc_info=True)
             return
         outcome = await await_terminal_delivery(

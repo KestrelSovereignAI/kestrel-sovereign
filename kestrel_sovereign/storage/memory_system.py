@@ -38,6 +38,7 @@ from .associative_linker import AssociativeLinker
 from .memory_retriever import MemoryRetriever
 from kestrel_sovereign.llm.decisions.config import parse_decision_selector
 from kestrel_sovereign.llm.provider_policy import config_provenance
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .memory_answerability import (
     AnswerabilityGate,
@@ -1000,6 +1001,8 @@ class MemorySystem:
                 reason="forgetting",
             )
         except Exception as e:  # noqa: BLE001 - forgetting must not fail consolidation
+            if is_execution_control_error(e):
+                raise
             logger.warning("forgetting: episode deletion tier failed: %s", e)
             return 0
 

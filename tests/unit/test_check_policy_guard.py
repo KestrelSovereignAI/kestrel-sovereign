@@ -81,7 +81,8 @@ def _walk_methods(cls: type):
 
 
 def _is_generation_method(member) -> bool:
-    return inspect.iscoroutinefunction(member) or inspect.isasyncgenfunction(member)
+    original = inspect.unwrap(member)
+    return inspect.iscoroutinefunction(original) or inspect.isasyncgenfunction(original)
 
 
 def _collect_generation_entry_points():

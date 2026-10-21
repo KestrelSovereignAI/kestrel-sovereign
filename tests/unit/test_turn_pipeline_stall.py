@@ -21,7 +21,7 @@ from contextlib import suppress
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock
 
-import httpx
+import httpx2
 import openai
 import pytest
 
@@ -57,7 +57,7 @@ HANG_GUARD = 30
 #: A request the endpoint never answers.
 HANG = object()
 
-Reply = Callable[[Dict[str, Any]], httpx.Response]
+Reply = Callable[[Dict[str, Any]], httpx2.Response]
 
 
 def _sse_event(event: Dict[str, Any]) -> bytes:
@@ -86,9 +86,9 @@ _USAGE_CHUNK = {
 def _answer(content: str) -> Reply:
     """A finished reply, streamed or not as the request asked."""
 
-    def reply(body: Dict[str, Any]) -> httpx.Response:
+    def reply(body: Dict[str, Any]) -> httpx2.Response:
         if body.get("stream"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
                 content=_sse([
@@ -97,7 +97,7 @@ def _answer(content: str) -> Reply:
                     _USAGE_CHUNK,
                 ]),
             )
-        return httpx.Response(200, json={
+        return httpx2.Response(200, json={
             "id": "gen-1", "object": "chat.completion", "created": 0,
             "model": MODEL,
             "choices": [{
@@ -125,7 +125,7 @@ class _OpenRouter:
         self.cancelled = 0
         self.stalled = asyncio.Event()
 
-    async def handle(self, request: httpx.Request) -> httpx.Response:
+    async def handle(self, request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
         self.requests.append(body)
         reply = self._replies[min(len(self.requests), len(self._replies)) - 1]
@@ -159,7 +159,7 @@ def _on_the_incident_route(
     provider["client"] = openai.AsyncOpenAI(
         api_key="sk-or-test", base_url="https://openrouter.test/api/v1",
         max_retries=0, timeout=client_timeout,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(endpoint.handle)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(endpoint.handle)),
     )
     assert not provider["is_local"]
     monkeypatch.setattr(service, "providers", [provider])
@@ -502,8 +502,8 @@ async def test_a_stream_progressing_past_the_bound_is_not_cut(tmp_path, monkeypa
                 yield _sse_event(_USAGE_CHUNK)
                 yield b"data: [DONE]\n\n"
 
-            def slow(_body: Dict[str, Any]) -> httpx.Response:
-                return httpx.Response(
+            def slow(_body: Dict[str, Any]) -> httpx2.Response:
+                return httpx2.Response(
                     200, headers={"content-type": "text/event-stream"},
                     content=slow_body(),
                 )
@@ -664,6 +664,7 @@ async def _hierarchical_compact_tool(agent) -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expiry_stage", ["accepted", "before-discovery", "before-endpoint"])
 @pytest.mark.parametrize(
     ("invoke", "cheap_model", "succeeded"),
     [
@@ -680,12 +681,13 @@ async def _hierarchical_compact_tool(agent) -> str:
     ids=["summarize-command", "hierarchical-compact-tool", "query-command"],
 )
 async def test_a_stalled_context_summary_call_fails_and_frees_the_turn(
-    tmp_path, monkeypatch, caplog, recorded_bounds, invoke, cheap_model, succeeded,
+    tmp_path, monkeypatch, caplog, recorded_bounds, invoke, cheap_model, succeeded, expiry_stage,
 ):
-    """The context tools that call a model run inside a turn and hold its
-    CONVERSATION lock. A silent provider is abandoned on the bound: the tool
-    fails naming the timeout, the request is cancelled, no stored row is
-    written or changed, and the next turn is answered."""
+    """Context deadlines free the turn before or after provider admission.
+
+    An accepted silent request is actually cancelled; an expiry in discovery
+    never invents a request. Both preserve rows and let the next turn answer.
+    """
     caplog.set_level(logging.WARNING)
     async with _agent(tmp_path, features={"ContextFeature"}) as agent:
         for index in range(6):
@@ -696,24 +698,71 @@ async def test_a_stalled_context_summary_call_fails_and_frees_the_turn(
                 "assistant", f"Answer {index}", session_id="s1",
             )
         before = await _stored_rows(agent)
-        endpoint = _OpenRouter(HANG, _answer("Noted."))
+        endpoint = (_OpenRouter(HANG, _answer("Noted.")) if expiry_stage == "accepted"
+                    else _OpenRouter(_answer("Noted.")))
+        preparation_entered, preparation_release = asyncio.Event(), asyncio.Event()
+        preparation_withdrawals = []
+        if expiry_stage == "before-endpoint":
+            actual_endpoint = endpoint.handle
+
+            async def delayed_endpoint(request):
+                preparation_entered.set()
+                try:
+                    await preparation_release.wait()
+                except asyncio.CancelledError as withdrawal:
+                    preparation_withdrawals.append(withdrawal)
+                    raise
+                return await actual_endpoint(request)
+
+            monkeypatch.setattr(endpoint, "handle", delayed_endpoint)
         _on_the_incident_route(agent, monkeypatch, endpoint, client_timeout=TURN_BOUND)
         monkeypatch.setattr(
             agent.llm_service, "get_cheap_model_selector", lambda: cheap_model,
         )
+        if expiry_stage == "before-discovery":
+            actual_discovery = agent.llm_service._ensure_models_discovered
+
+            async def delayed_discovery(*args, **kwargs):
+                preparation_entered.set()
+                try:
+                    await preparation_release.wait()
+                except asyncio.CancelledError as withdrawal:
+                    preparation_withdrawals.append(withdrawal)
+                    raise
+                return await actual_discovery(*args, **kwargs)
+
+            monkeypatch.setattr(agent.llm_service, "_ensure_models_discovered", delayed_discovery)
 
         loop = asyncio.get_running_loop()
-        started = loop.time()
-        result = await asyncio.wait_for(invoke(agent), HANG_GUARD)
-        elapsed = loop.time() - started
+        with pinned_loop_clock() as clock:
+            started = loop.time()
+            task = asyncio.create_task(invoke(agent))
+            try:
+                admission = endpoint.stalled if expiry_stage == "accepted" else preparation_entered
+                await await_within_hang_guard(admission.wait(), step=f"context summary {expiry_stage} admission")
+                clock.advance(TURN_BOUND + 0.1)
+                result = await await_within_hang_guard(task, step="context summary deadline settlement")
+                elapsed = loop.time() - started
+            finally:
+                preparation_release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
         assert succeeded not in result
         assert "produced nothing" in result, result
         assert recorded_bounds == [(TURN_BOUND, cheap_model)]
         assert TURN_BOUND <= elapsed < TURN_BOUND + 10
-        assert endpoint.cancelled == 1
+        assert endpoint.cancelled == (1 if expiry_stage == "accepted" else 0)
+        assert bool(endpoint.requests) is (expiry_stage == "accepted")
         assert _conversation_holder(agent) is None
-        _assert_logged_the_stuck_route(caplog)
+        if expiry_stage != "before-discovery":
+            _assert_logged_the_stuck_route(caplog)
+        else:
+            [warning] = _abandoned_warnings(caplog)
+            assert "no provider attempt had started" in warning
+            assert ROUTE not in warning and MODEL not in warning
+        assert len(preparation_withdrawals) == (0 if expiry_stage == "accepted" else 1)
         assert await _stored_rows(agent) == before
 
         _restore_the_bound(monkeypatch)

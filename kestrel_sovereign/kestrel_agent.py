@@ -1,51 +1,20 @@
-import logging
-import json
-import os
 import asyncio
 import contextlib
 import hashlib
 import inspect
+import json
+import logging
 import math
+import os
+import re
 import sys
 import time
-from dataclasses import dataclass, replace as _replace_dataclass
-from uuid import uuid4
-from kestrel_sovereign.audit_time import utc_now_iso
-from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
-from kestrel_sovereign.storage.privacy_wrapper import (
-    DurablePersistenceGate,
-    DurablePersistenceGateSharedLock,
-    ReentrantTransitionLock,
-    EphemeralPurgeReport,
-    StorePurgeResult,
-    PurgeOutcome,
-    PRIVACY_TRANSITION_RETRY_MESSAGE,
-    PrivacyViolationError,
-)
-from kestrel_sovereign.security.encryption import DecryptionError
-from kestrel_sovereign.security.assertion_tenant_resolver import (
-    _resolve_authenticated_agent_assertion_capability,
-)
-from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.llm.adapter import LLMResponse
-from kestrel_sovereign.llm.invocation_context import (
-    LLMInvocationContext,
-    turn_invocation_scope,
-)
-from kestrel_sovereign.config import (
-    SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
-    SEMANTIC_CAPABILITIES_CONFIG_ENV,
-    SEMANTIC_INFERENCE_CONFIG_ENV,
-    SEMANTIC_MAINTENANCE_CONFIG_ENV,
-    SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
-    TRUSTED_AGENTS_DIR,
-)
-from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping, Callable
-import re
+from dataclasses import dataclass
+from dataclasses import replace as _replace_dataclass
 from pathlib import Path, PurePath
-from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
-from kestrel_sovereign.features.privacy import PrivacyAgent
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
+from uuid import uuid4
+
 from kestrel_sovereign.agent.model_preference import resolve_replayed_model_preference
 from kestrel_sovereign.llm.provider_policy import (
     OverrideProvenance,
@@ -64,6 +33,15 @@ from kestrel_sovereign.agent.privacy_state import (
     transition_origin,
     write_privacy_state,
 )
+from kestrel_sovereign.audit_time import utc_now_iso
+from kestrel_sovereign.config import (
+    SEMANTIC_CAPABILITIES_CONFIG_ENV,
+    SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
+    SEMANTIC_INFERENCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
+    TRUSTED_AGENTS_DIR,
+)
 from kestrel_sovereign.features import (
     MandatoryFeatureReadinessError,
     discover_features,
@@ -71,24 +49,53 @@ from kestrel_sovereign.features import (
 )
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.config_validation import validate_feature_config
+from kestrel_sovereign.features.privacy import PrivacyAgent
+from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
+from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.invocation_context import (
+    LLMInvocationContext,
+    turn_invocation_scope,
+)
+from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
+from kestrel_sovereign.security.assertion_tenant_resolver import (
+    _resolve_authenticated_agent_assertion_capability,
+)
+from kestrel_sovereign.security.encryption import DecryptionError
+from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    DurablePersistenceGate,
+    DurablePersistenceGateSharedLock,
+    EphemeralPurgeReport,
+    PrivacyViolationError,
+    PurgeOutcome,
+    ReentrantTransitionLock,
+    StorePurgeResult,
+)
 
 
 class HostFeatureConfigError(RuntimeError):
     """The host could not read the feature configuration it was asked to apply."""
-from kestrel_sovereign.command_handler import CommandHandler
-from kestrel_sovereign.command_policy import (
-    BOOTSTRAP_ALLOWED_COMMANDS,
-    bypasses_turn_queue,
-    prefixed_command_token,
+
+
+class _BackgroundShutdownControl(RuntimeError):
+    """Private strongest-source/fact inventory, not completed-worker history."""
+
+from kestrel_sdk.hooks.base import HookEvent, HookInput
+
+from kestrel_sovereign.a2a.stores import (
+    SQLiteFeedbackStore,
+    SQLiteMemoryService,
+    SQLiteObservabilityStore,
+    SQLiteSessionService,
+    SQLiteTaskStore,
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager
-from kestrel_sovereign.a2a.stores import (
-    SQLiteTaskStore, SQLiteSessionService, SQLiteObservabilityStore,
-    SQLiteFeedbackStore, SQLiteMemoryService
-)
+
 # PostgreSQL stores imported conditionally when pg_pool is available
 from kestrel_sovereign.agent import ContextBuilder, ContextManager
-from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
+from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.boot import (
     AgentBootError,
     BootContext,
@@ -96,6 +103,12 @@ from kestrel_sovereign.agent.boot import (
     BootPhaseState,
     run_boot_sequence,
 )
+from kestrel_sovereign.agent.constitution import (
+    ConstitutionMixin,
+    SafeModeCause,
+    safe_mode_cognition_block,
+)
+from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.custody import (
     FEATURE_OWNER,
     STANDALONE_HOLD_CONTEXT,
@@ -104,43 +117,59 @@ from kestrel_sovereign.agent.custody import (
     feature_resource_name,
     reported_outcome,
 )
-from kestrel_sovereign.spawn.mandate import (
-    PersistedSpawnMandateExpiredError,
-    SpawnMandate,
-    remaining_spawn_ttl_seconds,
+from kestrel_sovereign.agent.event_manager import EventManagerMixin
+from kestrel_sovereign.agent.invocation import (
+    bind_async_invocation,
+    mark_current_invocation_effect_checkpointed,
 )
+from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
-from kestrel_sovereign.agent.constitution import (
-    ConstitutionMixin,
-    SafeModeCause,
-    safe_mode_cognition_block,
-)
-from kestrel_sovereign.agent.streaming import (
-    StreamingMixin,
-    resolve_turn_invocation_context,
-    _snapshot_post_response_hooks,
-)
-from kestrel_sovereign.agent.backup import BackupMixin
-from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.agent.orchestrator_engine import (
     ContextStats,
     LLMCallWatchdog,
     OrchestratorEngineMixin,
 )
-from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
-from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
-from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
-from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
     RequestLifecycleMixin,
 )
+from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.agent.streaming import (
+    StreamingMixin,
+    _snapshot_post_response_hooks,
+    resolve_turn_invocation_context,
+)
+from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
+from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
-from kestrel_sovereign.agent.invocation import (
-    bind_async_invocation,
-    mark_current_invocation_effect_checkpointed,
+from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
+from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
+from kestrel_sovereign.command_handler import CommandHandler
+from kestrel_sovereign.command_policy import (
+    BOOTSTRAP_ALLOWED_COMMANDS,
+    bypasses_turn_queue,
+    prefixed_command_token,
+)
+from kestrel_sovereign.execution_custody import (
+    _explicit_control_chain,
+    execution_native_source_error,
+    execution_terminal_error,
+    execution_work_operation,
+    is_execution_control_error,
+)
+from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
+from kestrel_sovereign.security.input_guardrails import (
+    append_security_addendum,
+    check_prompt_injection,
+    extract_raw_user_content,
+    wrap_user_input,
 )
 from kestrel_sovereign.signals import OrderedLockManager
+from kestrel_sovereign.spawn.mandate import (
+    PersistedSpawnMandateExpiredError,
+    SpawnMandate,
+    remaining_spawn_ttl_seconds,
+)
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.storage.db.interface import DatabaseError
 from kestrel_sovereign.storage.turn_provenance import (
@@ -148,16 +177,6 @@ from kestrel_sovereign.storage.turn_provenance import (
     turn_opener_metadata,
     wake_reply_metadata,
 )
-from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
-from kestrel_sdk.hooks.base import HookEvent, HookInput
-from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
-from kestrel_sovereign.security.input_guardrails import (
-    wrap_user_input,
-    extract_raw_user_content,
-    check_prompt_injection,
-    append_security_addendum,
-)
-from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -169,12 +188,13 @@ from kestrel_sovereign.telemetry import (
 
 if TYPE_CHECKING:
     from kestrel_sovereign.a2a.agent_card import AgentCard
+    from kestrel_sovereign.execution_custody import ExecutionCustody
     from kestrel_sovereign.features.peers.directory import (
         PeerDirectoryRouter,
         PeerRequester,
     )
-    from kestrel_sovereign.knowledge.inference import InferenceLimits, InferenceProfile
     from kestrel_sovereign.knowledge.capabilities import SemanticRuntimeCapabilities
+    from kestrel_sovereign.knowledge.inference import InferenceLimits, InferenceProfile
     from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceLimits
     from kestrel_sovereign.storage import GraphNode
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
@@ -339,6 +359,8 @@ async def _build_lighthouse_provider(
     except NotImplementedError:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logging.warning(f"LighthouseProvider init failed: {e}")
         return None, f"{type(e).__name__}: {e}", storage_permitted
 
@@ -462,6 +484,10 @@ def _raise_unexpected_lifecycle_exception_group(
 
     _expected, unexpected = error.split((asyncio.CancelledError, Exception))
     if unexpected is not None:
+        if is_execution_control_error(error):
+            # Propagate process-control leaves without filtering away an
+            # independent original native source from this finite envelope.
+            raise error
         raise unexpected
 
 
@@ -476,8 +502,91 @@ def _dispatcher_release_outcome(result: object) -> ReleaseOutcome:
     return reported_outcome(result)
 
 
+def require_feature_lifecycle_integrity(agent: object) -> None:
+    """A failed original generation cannot grant a new activation or READY."""
+    if getattr(agent, "_feature_lifecycle_integrity_uncertain", False) is True:
+        control = vars(agent).get("_feature_lifecycle_control")
+        if control is not None:
+            from kestrel_sovereign.execution_custody import retained_execution_error
+            raise retained_execution_error(control)
+        raise RuntimeError("feature lifecycle integrity requires verified repair")
+
+
+def _retain_feature_lifecycle_safe_mode(agent: object, reason: str, *errors) -> None:
+    """Synchronous fail-closed state, including context refresh without await.
+
+    The async lifecycle owner persists this state separately. Neither a failed
+    persistence attempt nor a synchronous caller can reopen native uncertainty.
+    Only native originals enter the shared latch; caller withdrawal is finite.
+    """
+    agent._feature_lifecycle_integrity_uncertain = True
+    agent._feature_lifecycle_repair_verified = False
+    agent._safe_mode = True
+    agent._safe_mode_reason = reason
+    agent._safe_mode_cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+    agent._feature_lifecycle_control = execution_native_source_error(
+        vars(agent).get("_feature_lifecycle_control"), *errors,
+    )
+
+
+async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors, features=()) -> None:
+    """One fail-closed transition for activation, restoration and config repair.
+
+    Native control belongs to the original generation, not a later attempt to
+    reconstruct it. Ordinary foreign feature/config exceptions are not copied
+    into a public cause. Persistence failure cannot clear the in-memory latch.
+    """
+    cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+    _retain_feature_lifecycle_safe_mode(agent, reason, *errors)
+    controls = [error for error in errors if is_execution_control_error(error)]
+    withdrawals = [error for error in errors if isinstance(error, asyncio.CancelledError)
+                   and not is_execution_control_error(error)]
+    quarantine = getattr(agent, "_quarantine_feature_contributions", None)
+    for feature in features:
+        feature.enabled = False
+        if callable(quarantine):
+            try:
+                quarantine(feature)
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
+                if is_execution_control_error(error):
+                    controls.append(error)
+                elif isinstance(error, asyncio.CancelledError):
+                    withdrawals.append(error)
+                elif isinstance(error, BaseExceptionGroup):
+                    _raise_unexpected_lifecycle_exception_group(error)
+    try:
+        enter = getattr(agent, "enter_safe_mode", None)
+        if callable(enter):
+            result = enter(reason, cause=cause)
+            if inspect.isawaitable(result):
+                await result
+    except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
+        if is_execution_control_error(error):
+            controls.append(error)
+        elif isinstance(error, asyncio.CancelledError):
+            withdrawals.append(error)
+        elif isinstance(error, BaseExceptionGroup):
+            _raise_unexpected_lifecycle_exception_group(error)
+    finally:
+        _retain_feature_lifecycle_safe_mode(agent, reason, *controls)
+    withdrawals.extend(
+        error for control in controls for error in _explicit_control_chain(control)
+        if isinstance(error, asyncio.CancelledError)
+        and not is_execution_control_error(error)
+        and all(error is not prior for prior in withdrawals)
+    )
+    terminal = execution_terminal_error(
+        agent._feature_lifecycle_control, *withdrawals, retain_originals=True,
+        isolate_control_originals=True,
+    )
+    if terminal is not None:
+        raise terminal
+
+
 async def await_lifecycle_task_completion(
     task: "asyncio.Future[object]",
+    *,
+    withdrawals: list[BaseException] | None = None,
 ) -> tuple[bool, BaseException | None]:
     """Drive one lifecycle task to a terminal state despite caller cancellation.
 
@@ -487,70 +596,106 @@ async def await_lifecycle_task_completion(
     cancellation of the joiner, while the second item reports the task's
     terminal outcome without confusing a task-cancellation with a fresh
     cancellation of the lifecycle owner.
+
+    Finite lifecycle boundaries may supply a caller-local withdrawal list.
+    It receives the SAME original observation, not a reconstructed exception;
+    it must never be installed on a shared writer/manager history latch.
     """
-    # A ``CancelledError`` raised by ``shield(task)`` is ambiguous when both
-    # tasks are cancelled in the same loop turn: it can report the owned task's
-    # terminal cancellation, this joiner's cancellation, or both.  Only the
-    # joiner itself can authoritatively tell us whether its cancellation was
-    # requested.  Do not infer that from the owned task's terminal state.
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    # The completion-only waiter never consumes the task's first cancellation
+    # exception. That first retrieval may carry irreversible control evidence.
     joiner = asyncio.current_task()
     cancelled = bool(joiner is not None and joiner.cancelling())
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if joiner is not None and joiner.cancelling():
-                cancelled = True
-        except BaseExceptionGroup as error:
-            # A lifecycle owner can deliberately retain cancellation and an
-            # ordinary cleanup failure in one group.  Like an Exception, that
-            # is the owned task's terminal outcome, not a reason to abandon
-            # later cleanup owners that the caller must still join.
-            # Process-control exceptions are not lifecycle failure data.
-            # Preserve their grouping and propagate them immediately.
-            _raise_unexpected_lifecycle_exception_group(error)
-            assert task.done()
-        except Exception:
-            # ``shield`` re-raises the owned task's terminal exception into
-            # this joiner.  The lifecycle contract returns that outcome as
-            # data so a staged owner can drain every later resource before it
-            # reports or aggregates the failure.  It is terminal at this
-            # point; fetch it below exactly once from the task itself.
-            assert task.done()
-
-    if task.cancelled():
-        return cancelled, asyncio.CancelledError()
-    failure = task.exception()
+    outcome = await await_owned_task(task)
+    if withdrawals is not None and outcome.cancellation is not None:
+        if all(prior is not outcome.cancellation for prior in withdrawals):
+            withdrawals.append(outcome.cancellation)
+    cancelled = cancelled or outcome.cancellation is not None
+    failure = outcome.error
+    if any(error is not None and is_execution_control_error(error)
+           for error in (failure, outcome.cancellation)):
+        from kestrel_sovereign.execution_custody import execution_finite_error
+        failure = execution_finite_error(failure, outcome.cancellation)
     if isinstance(failure, BaseExceptionGroup):
         # A task can already be terminal when this helper is entered, in which
         # case the loop above never observes its raised group.
         _raise_unexpected_lifecycle_exception_group(failure)
+    elif failure is not None and not isinstance(failure, (Exception, asyncio.CancelledError)):
+        raise failure
     return cancelled, failure
 
 
-async def await_agent_shutdown_completion(agent: object) -> bool:
-    """Join an agent's deferred durable cleanup without dropping it on cancel.
+async def await_agent_shutdown_completion(
+    agent: object, *, prior_error: BaseException | None = None,
+    withdrawals: list[BaseException] | None = None,
+    finite_errors: list[BaseException] | None = None,
+) -> bool:
+    """Join the actual shutdown waiter and any accepted-but-unreturned owner.
 
-    ``KestrelAgent.shutdown`` may transfer dispatcher release and shared
-    storage close to a continuation after its bounded user-facing shutdown
-    budget expires.  The lifecycle caller that reported that timeout remains
-    responsible for joining the continuation before its event loop exits.
-
-    Returns whether this *join* observed cancellation.  Callers choose whether
-    to re-raise after cleanup; either way the continuation has already reached
-    a terminal result, so no SQLite worker or runtime owner is orphaned.
+    An outer multi-owner boundary can collect unreduced finite originals.
+    Otherwise retain the existing ordinary terminal-selection contract.
     """
-    waiter = getattr(agent, "wait_for_shutdown_completion", None)
-    if not callable(waiter):
-        return False
-    completion = waiter()
-    if not inspect.isawaitable(completion):
-        return False
+    from kestrel_sovereign._async_ownership import (
+        OwnedTaskAdmission, create_owned_task, owned_task_join_ancestors,
+        pending_owned_retirement_error,
+    )
+    from kestrel_sovereign.execution_custody import execution_finite_error
 
-    task = asyncio.ensure_future(completion)
-    cancelled, failure = await await_lifecycle_task_completion(task)
+    cancelled = False
+    errors = [prior_error] if prior_error is not None else []
+    observed = withdrawals if withdrawals is not None else []
+    async def join_original(task):
+        nonlocal cancelled
+        try:
+            join_cancelled, failure = await await_lifecycle_task_completion(task, withdrawals=observed)
+        except BaseException as error:
+            # An unexpected control leaf is terminal evidence, not permission
+            # to skip independent owners or discard an earlier admission error.
+            errors.append(error)
+        else:
+            cancelled = cancelled or join_cancelled
+            if failure is not None:
+                errors.append(failure)
+    waiter = getattr(agent, "wait_for_shutdown_completion", None)
+    if callable(waiter):
+        admission, task, creation_failed = OwnedTaskAdmission(), None, False
+        try:
+            completion = waiter()
+            if inspect.isawaitable(completion):
+                if isinstance(completion, asyncio.Future):
+                    task = completion
+                else:
+                    try:
+                        task = create_owned_task(completion, retain_originals=True, admission=admission)
+                    except BaseException as opening:
+                        creation_failed = True
+                        task = admission.task
+                        errors.append(opening)
+                if task is not None:
+                    await join_original(task)
+        except BaseException as error:
+            errors.append(error)
+        if creation_failed:
+            # The receipt's gate can refuse the new waiter before entry. That
+            # does not retire an ALREADY existing Agent continuation. Join the
+            # original directly, never allocate a replacement cleanup attempt.
+            continuation = vars(agent).get("_durable_shutdown_continuation")
+            if isinstance(continuation, asyncio.Future) and continuation is not task:
+                if continuation is asyncio.current_task() or continuation in owned_task_join_ancestors():
+                    debt = pending_owned_retirement_error(agent, (continuation,), message="original shutdown continuation still owns reentrant cleanup")
+                    if debt is not None:
+                        errors.append(debt)
+                else:
+                    await join_original(continuation)
+    if finite_errors is not None:
+        finite_errors.extend(errors)
+        finite_errors.extend(value for value in observed if all(value is not old for old in finite_errors))
+        return cancelled
+    failure = execution_finite_error(*errors, *observed, retain_originals=True, isolate_control_originals=True)
     if failure is not None:
-        raise failure
+        if not isinstance(failure, asyncio.CancelledError) or is_execution_control_error(failure):
+            raise failure
     return cancelled
 
 
@@ -924,6 +1069,7 @@ class KestrelAgent(
         database_url: Optional[str] = None,
         db_backend: Optional[str] = None,
         shared_postgres_advisory_backend: Optional["PostgresBackend"] = None,
+        execution_custody: Optional["ExecutionCustody"] = None,
         allowed_features: Optional[set] = None,
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
@@ -1065,6 +1211,18 @@ class KestrelAgent(
                 complete maintenance snapshot for the active capability.
         """
         self.did = did
+        from kestrel_sovereign.execution_custody import (
+            ExecutionCustody,
+            require_execution_work,
+        )
+
+        if execution_custody is not None and not isinstance(execution_custody, ExecutionCustody):
+            raise TypeError("execution_custody must be Core ExecutionCustody")
+        self._execution_custody = execution_custody
+        require_execution_work(self)
+        # Resident services belong to the immutable runtime, not the short
+        # scheduler/request admission that happened to cause its cold boot.
+        self._runtime_publication_ready = asyncio.Event()
         # Production launchers bind the fleet control store before initialize.
         # Direct construction remains supported for embedding/tests; only an
         # explicit binding activates the durable turn-start admission seam.
@@ -1082,6 +1240,8 @@ class KestrelAgent(
         effective_db_backend = db_backend or os.environ.get(
             "KESTREL_DB_BACKEND", "sqlite"
         )
+        if execution_custody is not None and effective_db_backend.lower() != "postgres":
+            raise ValueError("custody-bound hosted runtime requires PostgreSQL")
         if type(isolated_runtime_hosted) is not bool:
             raise TypeError("isolated_runtime_hosted must be a bool")
         if isolated_feature_data_dir is not None and (
@@ -1119,8 +1279,8 @@ class KestrelAgent(
             # feature, rather than deriving mutable placement from database
             # storage (which PostgreSQL-backed hosted agents deliberately lack).
             from kestrel_sovereign.features.isolated_runtime import (
-                resolve_legacy_isolated_runtime_root,
                 resolve_isolated_runtime_namespace,
+                resolve_legacy_isolated_runtime_root,
             )
 
             runtime_scope = resolve_isolated_runtime_namespace(
@@ -1260,6 +1420,11 @@ class KestrelAgent(
         # incremental maintenance pass and never selects a profile itself.
         # Managed agents receive this from their LocalAgentConfig; direct
         # agents retain the existing per-agent TOML control surface below.
+        from kestrel_sovereign.knowledge.capabilities import (
+            SemanticCapabilityConfigurationError,
+            SemanticRuntimeCapabilities,
+            semantic_capabilities_from_config,
+        )
         from kestrel_sovereign.knowledge.inference import (
             InferenceError,
             InferenceLimits,
@@ -1269,11 +1434,6 @@ class KestrelAgent(
             SemanticMaintenanceLimits,
             maintenance_allows_prior_verified_snapshot,
             maintenance_limits_from_config,
-        )
-        from kestrel_sovereign.knowledge.capabilities import (
-            SemanticCapabilityConfigurationError,
-            SemanticRuntimeCapabilities,
-            semantic_capabilities_from_config,
         )
 
         if semantic_inference_limits is not None and not isinstance(
@@ -1698,6 +1858,9 @@ class KestrelAgent(
         ] = None
         self._host_authority_boot_expired = False
 
+        self._llm_service_needs_native_usage = (
+            llm_service is None and self._execution_custody is not None
+        )
         self.llm_service = llm_service or LLMService()
         from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
         self.operator_signal_producer = OperatorSignalProducer(self)
@@ -1712,7 +1875,21 @@ class KestrelAgent(
         # surface. Real LLMService instances always have attach_to_agent;
         # the invariant is enforced for them and silently waived for fakes.
         if hasattr(self.llm_service, "attach_to_agent"):
-            self.llm_service.attach_to_agent(did)
+            # Resolve the canonical type independently of the replaceable
+            # construction factory (hosts/tests may supply a callable there).
+            from kestrel_sovereign.llm.service import LLMService as NativeLLMService
+
+            if isinstance(self.llm_service, NativeLLMService):
+                self.llm_service.attach_to_agent(did, execution_custody=self._execution_custody)
+                # AgentManager supplies a service before native storage exists.
+                # It needs the same original-session usage executor as a
+                # directly constructed service, not a later SQLAlchemy pool.
+                self._llm_service_needs_native_usage = bool(
+                    self._execution_custody is not None
+                    and self.llm_service._usage_db is None
+                )
+            else:
+                self.llm_service.attach_to_agent(did)
         # Mirror the construction-time display name onto the LLMService so LLM
         # spans are attributed from the very first call — including the genesis
         # audit and feature-init calls that run inside initialize() before the
@@ -2236,7 +2413,7 @@ class KestrelAgent(
         from kestrel_sovereign.services.payer_resolver import load_policy_from_toml
         return load_policy_from_toml()
 
-    async def _resolve_host_db(self):
+    async def _resolve_host_db(self, *, required=True):
         """The host-level AsyncDatabase holding HostKeyStorage masters.
 
         Prefers an injected host db (multi-tenant embedding, #1649); otherwise
@@ -2246,8 +2423,54 @@ class KestrelAgent(
         """
         if self._injected_host_db is not None:
             return self._injected_host_db
+        if not required:
+            return None
+        existing = vars(self).get("_resolved_local_host_db")
+        if existing is not None:
+            return existing
         from kestrel_sovereign.services.payer_resolver import open_host_db
-        return await open_host_db(storage_path=self.storage_path)
+        from kestrel_sovereign.storage.async_database import (
+            DatabaseInitializationCleanupError,
+        )
+        try:
+            db = await open_host_db(storage_path=self.storage_path)
+        except DatabaseInitializationCleanupError as error:
+            # The factory could not prove native retirement. Adopt its actual
+            # database before rollback can yield or forget the birth result.
+            db = error.retirement_owner
+            if db is not None:
+                self._resolved_local_host_db = db
+                self._resource_custody().acquire("host_key_database")
+                ctx = vars(self).get("_boot_context")
+                if ctx is not None:
+                    ctx.on_rollback("host_key_database", self._close_local_host_db)
+            self._remember_shutdown_control(error)
+            raise
+        if db is not None:
+            self._resolved_local_host_db = db
+            self._resource_custody().acquire("host_key_database")
+            ctx = vars(self).get("_boot_context")
+            if ctx is not None:
+                ctx.on_rollback("host_key_database", self._close_local_host_db)
+        return db
+
+    async def _close_local_host_db(self):
+        from kestrel_sovereign.storage.async_database import _close_owned_database
+
+        db = vars(self).get("_resolved_local_host_db")
+        if db is not None:
+            await _close_owned_database(db)
+            self._resolved_local_host_db = None
+        return ReleaseOutcome.RELEASED
+
+    async def _payer_host_db(self, spec):
+        from kestrel_sdk.payer_policy import PayerKind
+
+        return await self._resolve_host_db(required=spec.kind in {
+            PayerKind.HOST_MASTER_PROVISIONED,
+            PayerKind.USER_MASTER_PROVISIONED,
+            PayerKind.SPONSOR,
+        })
 
     async def _load_or_promote_soul_resource(
         self, agent_data_dir: Optional[str]
@@ -2258,6 +2481,8 @@ class KestrelAgent(
             if loaded:
                 return
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logging.warning("Canonical SOUL resource load failed: %s", exc)
 
         if not agent_data_dir:
@@ -2299,6 +2524,8 @@ class KestrelAgent(
             await self.context_builder.load_canonical_soul_resource()
             logging.info("Promoted SOUL.md seed into canonical private resource")
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logging.warning("SOUL.md seed promotion failed: %s", exc)
 
     async def _maybe_refresh_user_byok_resolver(self, user_passphrase: str | None) -> None:
@@ -2323,7 +2550,7 @@ class KestrelAgent(
 
         # Re-resolve with the passphrase
         from kestrel_sovereign.services.payer_resolver import FoundationPayerResolver
-        host_db = await self._resolve_host_db()
+        host_db = await self._payer_host_db(policy.llm)
         resolver = FoundationPayerResolver(
             policy,
             db=self._raw_storage.db if self._raw_storage else None,
@@ -2356,6 +2583,7 @@ class KestrelAgent(
                 else self._explicit_advisory_dsn
             ),
             advisory_backend=self._shared_postgres_advisory_backend,
+            execution_custody=getattr(self, "_execution_custody", None),
         )
 
     async def initialize(self) -> None:
@@ -2382,17 +2610,34 @@ class KestrelAgent(
                 "back; construct a fresh agent (or shutdown() this one) before "
                 "retrying — a partial-state retry is refused."
             )
+        from kestrel_sovereign.execution_custody import retire_process_runtime_custody
+
         ctx = BootContext(
             logger_=logging.getLogger(__name__),
             custody=self._resource_custody(),
+            before_rollback=lambda: retire_process_runtime_custody(
+                getattr(self, "_execution_custody", None)
+            ),
         )
         self._boot_context = ctx
 
         def _set_state(new_state: BootPhaseState) -> None:
+            if new_state is BootPhaseState.READY:
+                from kestrel_sovereign.execution_custody import require_execution_work
+                require_execution_work(self)
             self._boot_state = new_state
+            ready = getattr(self, "_runtime_publication_ready", None)
+            if isinstance(ready, asyncio.Event):
+                if new_state is BootPhaseState.READY:
+                    ready.set()
+                else:
+                    ready.clear()
 
         try:
-            await run_boot_sequence(self._boot_phases(), ctx, _set_state)
+            from kestrel_sovereign.execution_custody import bind_execution_runtime
+
+            with bind_execution_runtime(self):
+                await run_boot_sequence(self._boot_phases(), ctx, _set_state)
         except asyncio.CancelledError as exc:
             if self._host_authority_boot_expired:
                 raise PersistedSpawnMandateExpiredError(
@@ -2504,11 +2749,11 @@ class KestrelAgent(
             # this standalone-manager lookup because their injected preflight
             # owns the manager's exact base directory and performs the full
             # check.
+            from kestrel_sovereign.multi_agent.config import LocalAgentConfig
             from kestrel_sovereign.spawn.authority_registry import (
                 SpawnAuthorityRegistry,
                 spawn_authority_host_base_dir,
             )
-            from kestrel_sovereign.multi_agent.config import LocalAgentConfig
 
             registry = SpawnAuthorityRegistry(
                 spawn_authority_host_base_dir(self.storage_path)
@@ -2702,7 +2947,7 @@ class KestrelAgent(
         # The agent closes its LLM service at shutdown, and boot may start
         # provider clients with it from here on (#3522).
         if self.llm_service is not None and hasattr(self.llm_service, "close"):
-            self._resource_custody().acquire("llm_service")
+            ctx.on_rollback("llm_service", self._boot_teardown_llm)
         # Cold-start restore from Lighthouse if DB doesn't exist (ephemeral environments)
         if (
             os.environ.get("LIGHTHOUSE_API_KEY")
@@ -2729,8 +2974,12 @@ class KestrelAgent(
                 else:
                     logging.info("Cold-start: no Lighthouse snapshot found, starting fresh")
             except (ImportError, AttributeError, TypeError, ConnectionError) as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"Cold-start restore from Lighthouse failed: {e}")
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"Cold-start restore from Lighthouse failed: {e}", exc_info=True)
 
         # Assertion authority is minted only after this agent boot path has
@@ -2762,8 +3011,15 @@ class KestrelAgent(
                 )
                 logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
+                postgres_backend: Any = "postgres"
+                if getattr(self, "_execution_custody", None) is not None:
+                    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+                    postgres_backend = PostgresBackend(
+                        self._database_url, execution_custody=self._execution_custody,
+                    )
                 self._raw_storage = AsyncStorage(
-                    backend="postgres",
+                    backend=postgres_backend,
                     dsn=self._database_url,
                     agent_id=self.did,
                     llm_service=self.llm_service,
@@ -2795,6 +3051,17 @@ class KestrelAgent(
         ctx.on_rollback("background_tasks", self._boot_teardown_background_tasks)
         await self._raw_storage.initialize()
 
+        if getattr(self, "_llm_service_needs_native_usage", False):
+            # A directly supplied pool/DSN is not represented by process env.
+            # Reuse the now-initialized, custody-bound native agent database
+            # before embeddings, boot audits or any provider/accounting call.
+            # It remains storage-owned: LLM retirement must not close it.
+            from kestrel_sovereign.llm.service import LLMService as NativeLLMService
+
+            if isinstance(self.llm_service, NativeLLMService):
+                self.llm_service._init_usage_tracking(usage_db=self._raw_storage.db)
+            self._llm_service_needs_native_usage = False
+
         # The privacy mode is durable (#3554): every state holder below is
         # built in the mode this agent last recorded.
         await self._restore_recorded_privacy_mode()
@@ -2825,6 +3092,8 @@ class KestrelAgent(
             early_agent_node = await self.storage.get_node(self.agent_id)
             identity_lookup_succeeded = True
         except Exception as exc:  # noqa: BLE001
+            if is_execution_control_error(exc):
+                raise
             logging.warning(
                 "Could not load agent identity node for sync policy: %s",
                 exc,
@@ -2858,6 +3127,8 @@ class KestrelAgent(
                     getattr(self._raw_storage, "db", None)
                 )
         except Exception as exc:  # noqa: BLE001
+            if is_execution_control_error(exc):
+                raise
             logging.debug("Embedding-space pin hydration skipped: %s", exc)
 
         if early_agent_node is not None:
@@ -2936,25 +3207,31 @@ class KestrelAgent(
             # minting a new one every cold start. Resolve it (injected host
             # db, else the on-disk ``host.db``) so standalone/SQLite
             # deployments — not just multi-tenant embeddings — get the reuse.
-            await finalize_providers(host_db=await self._resolve_host_db())
+            registry = getattr(self.llm_service, "provider_registry", None)
+            needed = bool(getattr(registry, "_deferred_openrouter_routes", ()))
+            await finalize_providers(host_db=await self._resolve_host_db(required=needed))
 
 
     async def _boot_phase_a2a_observability_signals(self, ctx: BootContext) -> None:
         """Phase 2 — A2A stores, observability, and the signal spine. TaskManager + its stores, the observability/feedback sinks, the enablement store, the SignalDispatcher/registries, and the core (always-on) signal sources."""
         # Initialize TaskManager for A2A unified routing
         # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
-        if self._db_backend.lower() == "postgres" and self.pg_pool:
-            # PostgreSQL mode: use PostgreSQL stores with existing pool
+        if self._db_backend.lower() == "postgres":
+            # Reuse storage's guarded native backend in both shared-pool and
+            # DSN-only modes; wrappers must not drop its retained generation.
+            pg_backend = self._raw_storage._backend
             from kestrel_sovereign.a2a.stores.postgres import (
-                PostgresTaskStore, PostgresSessionService,
-                PostgresMemoryService, PostgresObservabilityStore,
-                PostgresFeedbackStore
+                PostgresFeedbackStore,
+                PostgresMemoryService,
+                PostgresObservabilityStore,
+                PostgresSessionService,
+                PostgresTaskStore,
             )
-            task_store = PostgresTaskStore(self.pg_pool)
-            session_service = PostgresSessionService(self.pg_pool)
-            observability_store = PostgresObservabilityStore(self.pg_pool)
-            memory_service = PostgresMemoryService(self.pg_pool)
-            feedback_store = PostgresFeedbackStore(self.pg_pool)
+            task_store = PostgresTaskStore(backend=pg_backend)
+            session_service = PostgresSessionService(backend=pg_backend)
+            observability_store = PostgresObservabilityStore(backend=pg_backend)
+            memory_service = PostgresMemoryService(backend=pg_backend)
+            feedback_store = PostgresFeedbackStore(backend=pg_backend)
             logging.info(f"Using PostgreSQL A2A stores for agent {self.did}")
         else:
             # SQLite mode: use SQLite stores with file path
@@ -3058,6 +3335,8 @@ class KestrelAgent(
             await store.initialize()
             self._feature_enablement_store = store
         except Exception as e:  # noqa: BLE001 - never block init on this
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "FeatureEnablementStore unavailable; enablement deltas "
                 "disabled (features still load from the bootstrap allowlist): %s",
@@ -3130,17 +3409,14 @@ class KestrelAgent(
         from kestrel_sovereign.signals.sources.a2a import (
             build_a2a_task_complete_registration,
         )
+        from kestrel_sovereign.signals.sources.a2a_question_answered import (
+            build_a2a_question_answered_registration,
+        )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             build_a2a_task_submitted_registration,
         )
         from kestrel_sovereign.signals.sources.peer_stop import (
             build_peer_stop_registration,
-        )
-        from kestrel_sovereign.signals.sources.wallet import (
-            build_stripe_deposit_registration,
-        )
-        from kestrel_sovereign.signals.sources.a2a_question_answered import (
-            build_a2a_question_answered_registration,
         )
         from kestrel_sovereign.signals.sources.wait import (
             build_wait_complete_registration,
@@ -3150,6 +3426,9 @@ class KestrelAgent(
         )
         from kestrel_sovereign.signals.sources.queue_drained import (
             build_queue_drained_registration,
+        )
+        from kestrel_sovereign.signals.sources.wallet import (
+            build_stripe_deposit_registration,
         )
         from kestrel_sovereign.signals.sources.workflow_rescue import (
             build_workflow_rescue_registrations,
@@ -3293,7 +3572,6 @@ class KestrelAgent(
                 remote_policy_decision.reason,
             )
         else:
-
             async def _resolve_storage():
                 from kestrel_sovereign.storage.providers.lighthouse_provider import (
                     resolve_lighthouse_storage,
@@ -3305,11 +3583,13 @@ class KestrelAgent(
                 # None and the resolver falls back to the agent's db (which has
                 # no host_service_keys rows → 'no host master' for delegated
                 # kinds). See #1649.
+                _policy = self._resolve_payer_policy()
+                _host_db = await self._payer_host_db(_policy.storage)
                 return await resolve_lighthouse_storage(
                     self.did,
-                    policy=self._resolve_payer_policy(),
+                    policy=_policy,
                     db=self._raw_storage.db if self._raw_storage else None,
-                    host_db=await self._resolve_host_db(),
+                    host_db=_host_db,
                     wallet_private_key=self._private_key,
                 )
 
@@ -3387,6 +3667,8 @@ class KestrelAgent(
                     self._sync_service = None
 
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"Sync service init failed: {e}", exc_info=True)
                 self._sync_service = None
         elif not self._sync_enabled:
@@ -3554,7 +3836,9 @@ class KestrelAgent(
         if not shortfall:
             return
         if shortfall.identity:
-            from kestrel_sovereign.identity.birth_record import assert_birth_replay_custody
+            from kestrel_sovereign.identity.birth_record import (
+                assert_birth_replay_custody,
+            )
 
             try:
                 await assert_birth_replay_custody(runtime_db, self.agent_id)
@@ -3563,107 +3847,120 @@ class KestrelAgent(
                     "birth_record", cause_type="BirthRecordReplayRefused"
                 ) from exc
 
-        anchor_db = None
-        copy_committed = False
-        try:
-            # Opening the anchor brings its schema up to date, exactly as a
-            # SQLite host would at every boot. Its birth record is only read.
-            anchor_db = await AsyncDatabase.sqlite(str(anchor))
-            if not await anchor_holds_birth_record(
-                anchor_db=anchor_db, agent_did=self.agent_id
-            ):
-                # Nothing to copy. The verdict is decided by WHAT is short, not
-                # by whether an anchor happens to exist — identical damage must
-                # not boot on one host and refuse on another.
+        from kestrel_sovereign.execution_custody import _host_identity_anchor_access
+
+        with _host_identity_anchor_access(anchor):
+            anchor_db = None
+            copy_committed = False
+            try:
+                # Opening the anchor brings its schema up to date, exactly as a
+                # SQLite host would at every boot. Its birth record is only read.
+                anchor_db = await AsyncDatabase.sqlite(str(anchor))
+                if not await anchor_holds_birth_record(
+                    anchor_db=anchor_db, agent_did=self.agent_id
+                ):
+                    # Nothing to copy. The verdict is decided by WHAT is short, not
+                    # by whether an anchor happens to exist — identical damage must
+                    # not boot on one host and refuse on another.
+                    logging.warning(
+                        "Birth record for %s is incomplete in the runtime database "
+                        "(%s) and the local anchor %s holds no record to repair it "
+                        "from.",
+                        self.agent_id, shortfall.describe(), anchor,
+                    )
+                    self._record_birth_record_shortfall(shortfall)
+                    return
+
+                # The shortfall drives the repair; this comparison is for the
+                # operator, naming which rows the anchor can supply. Gating on it
+                # instead would silently skip the one condition only the runtime
+                # check detects — a governing edge whose node is unreadable.
+                divergence = await diagnose_birth_record(
+                    runtime_db=runtime_db,
+                    anchor_db=anchor_db,
+                    agent_did=self.agent_id,
+                )
                 logging.warning(
                     "Birth record for %s is incomplete in the runtime database "
-                    "(%s) and the local anchor %s holds no record to repair it "
-                    "from.",
-                    self.agent_id, shortfall.describe(), anchor,
+                    "(%s); against the local anchor %s: %s. Replicating "
+                    "(backend=%s).",
+                    self.agent_id,
+                    shortfall.describe(),
+                    anchor,
+                    divergence.describe() or "no rows missing",
+                    self._db_backend,
                 )
-                self._record_birth_record_shortfall(shortfall)
-                return
+                result = await replicate_birth_record(
+                    runtime_db=runtime_db,
+                    anchor_db=anchor_db,
+                    agent_did=self.agent_id,
+                )
+                copy_committed = True
+                logging.info(
+                    "Replicated birth record for %s into the runtime database: %s",
+                    self.agent_id,
+                    result.describe(),
+                )
 
-            # The shortfall drives the repair; this comparison is for the
-            # operator, naming which rows the anchor can supply. Gating on it
-            # instead would silently skip the one condition only the runtime
-            # check detects — a governing edge whose node is unreadable.
-            divergence = await diagnose_birth_record(
-                runtime_db=runtime_db,
-                anchor_db=anchor_db,
-                agent_did=self.agent_id,
-            )
-            logging.warning(
-                "Birth record for %s is incomplete in the runtime database "
-                "(%s); against the local anchor %s: %s. Replicating "
-                "(backend=%s).",
-                self.agent_id,
-                shortfall.describe(),
-                anchor,
-                divergence.describe() or "no rows missing",
-                self._db_backend,
-            )
-            result = await replicate_birth_record(
-                runtime_db=runtime_db,
-                anchor_db=anchor_db,
-                agent_did=self.agent_id,
-            )
-            copy_committed = True
-            logging.info(
-                "Replicated birth record for %s into the runtime database: %s",
-                self.agent_id,
-                result.describe(),
-            )
+                # Verify rather than assume. A pass that reports success but left
+                # the record incomplete is precisely the failure this whole cluster
+                # of issues is about — a durable claim nobody observed.
+                #
+                # Asked of the runtime alone, deliberately: the question is whether
+                # this agent can now be who it is, not whether it matches a frozen
+                # snapshot. Re-comparing against the anchor would refuse forever
+                # over differences replication correctly declines to make — a
+                # reanchored constitution, chunks already indexed here.
+                remaining = await diagnose_runtime_birth_record(
+                    runtime_db=runtime_db, agent_did=self.agent_id,
+                )
+                self._record_birth_record_shortfall(remaining)
+            except IdentityReadinessError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if is_execution_control_error(exc):
+                    raise
+                # A failed copy is judged by the same rule as a completed one: what
+                # is the runtime database actually short of? Every raise site in
+                # replicate_birth_record is an ANCHOR-integrity problem — an
+                # unwitnessed edge, a file row with no bytes, the anchor failing to
+                # open — and so is a transient fault mid-copy. Refusing on all of
+                # them unconditionally would brick an agent whose own identity is
+                # intact and which boots on origin/main today, and would tell its
+                # operator to "re-incept against this backend", which for a dropped
+                # connection is destructive advice.
+                #
+                # ``shortfall`` is the pre-replication diagnosis, so it describes
+                # the runtime as this pass found it. Identity gaps still refuse.
+                logging.error(
+                    "Could not replicate the birth record for %s from %s into the "
+                    "configured runtime database (backend=%s): %s",
+                    self.agent_id, anchor, self._db_backend, exc, exc_info=True,
+                )
+                # ``shortfall`` is the pre-replication diagnosis. It is exact for a
+                # raise inside the copy's transaction, which rolled back; for one
+                # after the commit it can name something already repaired, so
+                # re-diagnose when the copy is known to have landed.
+                verdict = shortfall
+                if copy_committed:
+                    try:
+                        verdict = await diagnose_runtime_birth_record(
+                            runtime_db=runtime_db, agent_did=self.agent_id,
+                        )
+                    except Exception as error:  # noqa: BLE001 - keep the older, safe verdict
+                        if is_execution_control_error(error):
+                            raise
+                        pass
+                self._record_birth_record_shortfall(verdict, retryable=True)
+            finally:
+                if anchor_db is not None:
+                    import sys
 
-            # Verify rather than assume. A pass that reports success but left
-            # the record incomplete is precisely the failure this whole cluster
-            # of issues is about — a durable claim nobody observed.
-            #
-            # Asked of the runtime alone, deliberately: the question is whether
-            # this agent can now be who it is, not whether it matches a frozen
-            # snapshot. Re-comparing against the anchor would refuse forever
-            # over differences replication correctly declines to make — a
-            # reanchored constitution, chunks already indexed here.
-            remaining = await diagnose_runtime_birth_record(
-                runtime_db=runtime_db, agent_did=self.agent_id,
-            )
-            self._record_birth_record_shortfall(remaining)
-        except IdentityReadinessError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            # A failed copy is judged by the same rule as a completed one: what
-            # is the runtime database actually short of? Every raise site in
-            # replicate_birth_record is an ANCHOR-integrity problem — an
-            # unwitnessed edge, a file row with no bytes, the anchor failing to
-            # open — and so is a transient fault mid-copy. Refusing on all of
-            # them unconditionally would brick an agent whose own identity is
-            # intact and which boots on origin/main today, and would tell its
-            # operator to "re-incept against this backend", which for a dropped
-            # connection is destructive advice.
-            #
-            # ``shortfall`` is the pre-replication diagnosis, so it describes
-            # the runtime as this pass found it. Identity gaps still refuse.
-            logging.error(
-                "Could not replicate the birth record for %s from %s into the "
-                "configured runtime database (backend=%s): %s",
-                self.agent_id, anchor, self._db_backend, exc, exc_info=True,
-            )
-            # ``shortfall`` is the pre-replication diagnosis. It is exact for a
-            # raise inside the copy's transaction, which rolled back; for one
-            # after the commit it can name something already repaired, so
-            # re-diagnose when the copy is known to have landed.
-            verdict = shortfall
-            if copy_committed:
-                try:
-                    verdict = await diagnose_runtime_birth_record(
-                        runtime_db=runtime_db, agent_did=self.agent_id,
+                    from kestrel_sovereign.storage.async_database import (
+                        _close_owned_database,
                     )
-                except Exception:  # noqa: BLE001 - keep the older, safe verdict
-                    pass
-            self._record_birth_record_shortfall(verdict, retryable=True)
-        finally:
-            if anchor_db is not None:
-                await anchor_db.close()
+
+                    await _close_owned_database(anchor_db, sys.exception())
 
     def _record_birth_record_shortfall(self, divergence, *, retryable=False) -> None:
         """Decide the verdict on WHAT is short, and leave a trace either way.
@@ -3770,6 +4067,8 @@ class KestrelAgent(
             if not ok:
                 logging.warning("Constitution overlay not trusted: %s", msg)
         except Exception as e:  # noqa: BLE001 - never block init on this
+            if is_execution_control_error(e):
+                raise
             logging.warning("Constitution overlay verification errored: %s", e)
             self.constitution_overlay_verified = False
 
@@ -3828,9 +4127,17 @@ class KestrelAgent(
             for feature in discovered_features
             if feature.name not in disabled_features
         )
-        prepared_contributions = self._prepare_feature_contribution_transition(
-            enabled_discovered_features
-        )
+        try:
+            prepared_contributions = self._prepare_feature_contribution_transition(
+                enabled_discovered_features
+            )
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_error:
+            if is_execution_control_error(preparation_error):
+                await enter_feature_lifecycle_safe_mode(
+                    self, "Startup feature preflight reported unresolved native control",
+                    preparation_error, features=enabled_discovered_features,
+                )
+            raise
         self._record_contribution_rejections(prepared_contributions)
         for feature, prepared_item in prepared_contributions.activatable(
             enabled_discovered_features
@@ -3849,6 +4156,8 @@ class KestrelAgent(
             try:
                 await feature.post_all_features_loaded(self)
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
                 if type(feature).__name__ in MANDATORY_FEATURES:
@@ -3873,7 +4182,7 @@ class KestrelAgent(
 
         # Fire SESSION_START hook
         if self.hooks_manager:
-            from kestrel_sdk.hooks.base import HookInput, HookEvent
+            from kestrel_sdk.hooks.base import HookEvent, HookInput
             hook_input = HookInput(
                 session_id="agent_init",
                 hook_event_name=HookEvent.SESSION_START.value,
@@ -3937,6 +4246,7 @@ class KestrelAgent(
         #                 a today-shippable contract).
         try:
             from kestrel_sdk.payer_policy import ResourceClass
+
             from kestrel_sovereign.services.payer_resolver import (
                 FoundationPayerResolver,
             )
@@ -3944,7 +4254,7 @@ class KestrelAgent(
             # Injected policy/host-db (multi-tenant embedding) override the
             # standalone kestrel.toml / on-disk host.db. See #1649.
             _llm_policy = self._resolve_payer_policy()
-            _llm_host_db = await self._resolve_host_db()
+            _llm_host_db = await self._payer_host_db(_llm_policy.llm)
             _llm_resolver = FoundationPayerResolver(
                 _llm_policy,
                 db=self._raw_storage.db if self._raw_storage else None,
@@ -3988,6 +4298,8 @@ class KestrelAgent(
                         f"Could not activate agent OpenRouter key: {e}"
                     )
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logging.warning(
                         f"Could not activate agent OpenRouter key: {e}",
                         exc_info=True,
@@ -3998,6 +4310,8 @@ class KestrelAgent(
             # agent.
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Fail-closed for known policy/provisioning errors:
             # PayerPolicyError (e.g., HOST_MASTER_PROVISIONED but
             # no master configured) and OpenRouterProvisioningError
@@ -4197,11 +4511,10 @@ class KestrelAgent(
         # Registers the heartbeat source with the dispatcher so its
         # ticks route through the signal pipeline (Phase 3 of #889).
         from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner
+        from kestrel_sovereign.signals import RegistrationPolicy
         from kestrel_sovereign.signals.sources.heartbeat import (
             build_heartbeat_registration,
         )
-
-        from kestrel_sovereign.signals import RegistrationPolicy
 
         self._heartbeat_config = HeartbeatConfig.from_config()
         _heartbeat_reg = build_heartbeat_registration(
@@ -4236,6 +4549,8 @@ class KestrelAgent(
         )
         from kestrel_sovereign.signals.sources.system_resumed import (
             SOURCE_NAME as RESUME_SOURCE_NAME,
+        )
+        from kestrel_sovereign.signals.sources.system_resumed import (
             build_system_resumed_registration,
         )
 
@@ -4276,6 +4591,7 @@ class KestrelAgent(
             on_resume=_on_resume,
             tick_seconds=self._resume_monitor_config.tick_seconds,
             threshold_seconds=self._resume_monitor_config.threshold_seconds,
+            task_factory=self._track_runtime_task,
         )
         if self._resume_monitor_config.enabled:
             await self.resume_monitor.start()
@@ -4295,6 +4611,8 @@ class KestrelAgent(
                 await self.context_manager.start_salvage_worker()
                 ctx.on_rollback("salvage_worker", self._boot_teardown_salvage)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"failed to start salvage worker: {e}")
 
         # Reattach the complete spawn mandate and its enforcement (#2137,
@@ -4364,6 +4682,7 @@ class KestrelAgent(
         # the agent, opens the gate, then completes this same hook pass.
         await self._run_or_defer_agent_ready_hooks()
 
+    @execution_work_operation
     async def _notify_agent_ready_hooks(self) -> None:
         """Run the best-effort ready-phase hook once services are usable."""
 
@@ -4374,6 +4693,11 @@ class KestrelAgent(
             try:
                 await ready_hook(self)
             except (Exception, asyncio.CancelledError) as e:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(e):
+                    raise
                 # Ready hooks are explicitly best-effort.  A hook can await a
                 # child task that was independently cancelled; on modern
                 # Python that outcome is a BaseException and used to cancel
@@ -4393,6 +4717,7 @@ class KestrelAgent(
                     getattr(feature, "name", type(feature).__name__), e,
                 )
 
+    @execution_work_operation
     async def _run_or_defer_agent_ready_hooks(self) -> None:
         """Run ready hooks now, or defer them behind host policy publication."""
 
@@ -4424,6 +4749,7 @@ class KestrelAgent(
             )
         self._agent_readiness_host_owned = True
 
+    @execution_work_operation
     async def complete_deferred_agent_readiness(self) -> None:
         """Complete the server-deferred ready hooks after host publication."""
 
@@ -4472,6 +4798,36 @@ class KestrelAgent(
     # to retry. The rollback driver logs failures and continues with
     # independent resources.
     # ------------------------------------------------------------------
+    async def _boot_teardown_llm(self) -> ReleaseOutcome:
+        """Join the original provider owners before retiring borrowed storage."""
+        if getattr(self, "dispatcher", None) is not None:
+            return ReleaseOutcome.RETAINED
+        service = getattr(self, "llm_service", None)
+        if service is None or not callable(getattr(service, "close", None)):
+            return ReleaseOutcome.RELEASED
+        from kestrel_sovereign.llm.service import LLMService as NativeLLMService
+        if isinstance(service, NativeLLMService):
+            from kestrel_sovereign.execution_custody import current_execution_custody
+            from kestrel_sovereign.llm.lifecycle import retire_unpublished_llm
+            await retire_unpublished_llm(
+                vars(self).setdefault("_boot_llm_retirement_owners", {}),
+                "llm_service", service, current_execution_custody(self),
+                join_native=True,
+            )
+            return ReleaseOutcome.RELEASED
+        # Non-native injected services still own one joined close and must
+        # report RETAINED/UNKNOWN truthfully rather than losing their result.
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            raise_owned_outcome,
+        )
+        task = vars(self).get("_boot_llm_close_task")
+        if task is None:
+            task = asyncio.create_task(service.close(), name="boot:llm-close")
+            self._boot_llm_close_task = task
+        outcome = await await_owned_task(task)
+        return reported_outcome(raise_owned_outcome(outcome, operation="boot LLM close"))
+
     async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
         # Dispatcher teardown owns a runtime-owner release against this very
@@ -4491,12 +4847,23 @@ class KestrelAgent(
                     "dispatcher teardown is still incomplete"
                 )
             return ReleaseOutcome.RETAINED
+        custody = self._resource_custody()
+        if custody.is_held("llm_service"):
+            llm_outcome = await self._boot_teardown_llm()
+            # The serving-record audit remains conservative for uncertified
+            # owners. Its UNKNOWN does not undo this native owner's physical
+            # writer/provider join; storage may retire only after that join.
+            custody.settle("llm_service", llm_outcome)
+            if llm_outcome is not ReleaseOutcome.RELEASED:
+                return ReleaseOutcome.RETAINED
         raw = self._raw_storage
+        if raw is not None and hasattr(raw, "close"):
+            outcome = reported_outcome(await raw.close())
+            if outcome is not ReleaseOutcome.RELEASED:
+                return outcome
         self._raw_storage = None
         self.storage = None
         self.privacy_agent = None
-        if raw is not None and hasattr(raw, "close"):
-            return reported_outcome(await raw.close())
         return ReleaseOutcome.RELEASED
 
     async def _boot_teardown_background_tasks(self) -> ReleaseOutcome:
@@ -4554,14 +4921,18 @@ class KestrelAgent(
             try:
                 delivered = await dispatcher.shutdown_durable_delivery()
                 break
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as failure:
+                if is_execution_control_error(failure):
+                    raise
                 # BootContext guarantees a complete rollback, but this
                 # particular step owns the dispatcher-to-storage ordering.
                 # Do not let repeated cancellation leave its owner release
                 # alive while the next rollback action closes SQLite.
                 cancelled = True
                 continue
-            except Exception:
+            except Exception as failure:
+                if is_execution_control_error(failure):
+                    raise
                 if retried_failure:
                     raise
                 # Durable teardown is intentionally retryable.  A failure can
@@ -4625,13 +4996,16 @@ class KestrelAgent(
         loaded = list(self.features.items())
         unloaded = self._unreleased_features_not_loaded()
         failed: list = []
+        control_errors: list[BaseException] = []
         for name, feature in [*reversed(unloaded), *reversed(loaded)]:
             label = name or type(feature).__name__
             try:
                 reported = reported_outcome(
                     await self._unregister_feature_runtime(feature)
                 )
-            except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            except BaseException as exc:  # finish every independent feature
+                if is_execution_control_error(exc) or not isinstance(exc, Exception):
+                    control_errors.append(exc)
                 logging.warning(
                     "boot rollback: feature '%s' teardown failed: %s",
                     label,
@@ -4651,6 +5025,10 @@ class KestrelAgent(
             for name, feature in loaded
             if any(feature is held for held in failed)
         }
+        if control_errors:
+            terminal = execution_terminal_error(*control_errors)
+            assert terminal is not None
+            raise terminal
         return ReleaseOutcome.RETAINED if failed else ReleaseOutcome.RELEASED
 
     async def _boot_teardown_memory(self) -> ReleaseOutcome:
@@ -5095,7 +5473,7 @@ class KestrelAgent(
             await self.prepare_and_refresh_all_feature_context_clauses(
                 fail_closed=True
             )
-        except (Exception, asyncio.CancelledError) as suppression_exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as suppression_exc:
             logging.critical(
                 "Feature context suppression during privacy transition "
                 "reported %s; entering Safe Mode",
@@ -5105,19 +5483,10 @@ class KestrelAgent(
                 "Feature context suppression failed during a privacy transition; "
                 "cognition is blocked until lifecycle integrity is restored"
             )
-            self._feature_lifecycle_integrity_uncertain = True
-            self._feature_lifecycle_repair_verified = False
-            try:
-                await self.enter_safe_mode(
-                    safe_mode_reason,
-                    cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
-                )
-            except (Exception, asyncio.CancelledError):
-                self._safe_mode = True
-                self._safe_mode_reason = safe_mode_reason
-                self._safe_mode_cause = (
-                    SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
-                )
+            await enter_feature_lifecycle_safe_mode(
+                self, safe_mode_reason,
+                suppression_exc if is_execution_control_error(suppression_exc) else None,
+            )
             raise RuntimeError(
                 "feature context could not be suppressed during privacy transition"
             ) from None
@@ -5347,6 +5716,8 @@ class KestrelAgent(
                 provenance=provenance or self._privacy_mandate_provenance(preference),
             )
         except Exception as exc:  # noqa: BLE001 - the caller refuses the transition
+            if is_execution_control_error(exc):
+                raise
             logging.error(
                 "Could not persist the model mandate %s (%s: %s)",
                 dict(preference),
@@ -5368,6 +5739,8 @@ class KestrelAgent(
         try:
             await write_privacy_state(db, self.agent_id, state)
         except Exception as exc:  # noqa: BLE001 - the caller refuses the transition
+            if is_execution_control_error(exc):
+                raise
             logging.error(
                 "Could not record privacy mode %s (%s: %s)",
                 state.mode.value,
@@ -5396,6 +5769,8 @@ class KestrelAgent(
                 db, self.agent_id, initial_mode=self._privacy_mode
             )
         except Exception as exc:  # noqa: BLE001 - the caller refuses the transition
+            if is_execution_control_error(exc):
+                raise
             logging.error(
                 "Could not read the recorded privacy mode (%s: %s); refusing the "
                 "privacy transition",
@@ -5591,6 +5966,8 @@ class KestrelAgent(
         try:
             voice_switched = await vf.on_privacy_mode_changed()
         except Exception as ve:
+            if is_execution_control_error(ve):
+                raise
             logging.warning("Voice auto-switch failed: %s", ve)
 
         if config.allows_cloud_llm() and hasattr(vf, "biometric_warning"):
@@ -5617,12 +5994,28 @@ class KestrelAgent(
         * A real leak (rows destroyed from a content store) writes the existing
           ``leak_purged`` audit.
 
-        Never raises — losing an audit breadcrumb is preferable to crashing the
-        transition/shutdown, but a failure is always surfaced (report + audit).
+        Ordinary availability failures remain reports. Native control outcomes
+        survive independent audit settlement as their original carriers.
         """
+        primary_error = None
         try:
-            report = await self.storage.purge_ephemeral_session(reason=reason)
-        except Exception as e:
+            from kestrel_sovereign.execution_custody import (
+                ExecutionCustody,
+                ProcessRuntimeExecutionFence,
+            )
+            scope = getattr(self, "_execution_custody", None)
+            native = getattr(getattr(self.storage, "_storage", None), "_backend", None)
+            if (reason == "ephemeral-agent-shutdown" and isinstance(scope, ExecutionCustody)
+                    and isinstance(scope.fence, ProcessRuntimeExecutionFence) and scope.fence._retired
+                    and getattr(native, "backend_type", None) == "postgres"):
+                report = await native.purge_retired_ephemeral_session(self.storage, reason=reason)
+            else:
+                report = await self.storage.purge_ephemeral_session(reason=reason)
+        except BaseException as e:
+            if is_execution_control_error(e):
+                primary_error = e
+            elif not isinstance(e, Exception):
+                raise
             logging.error(
                 "ephemeral hard-purge raised; treating as an UNCERTIFIED purge "
                 "(required sweeps unknown, session must be treated as leaked): "
@@ -5633,18 +6026,17 @@ class KestrelAgent(
                 for store in ("conversation_history", "graph_nodes", "channel_messages")
             )
 
-        if report.required_sweep_failed:
-            await self._record_ephemeral_purge_failure_audit(
-                reason=reason, report=report,
-            )
-        elif report.leaked_rows > 0:
-            # A genuine privacy leak means data reached tables EPHEMERAL must
-            # never write. The observability sink is allowed to hold content-free
-            # metric rows during an ephemeral stint (F076), so its swept counts
-            # are reported in the breakdown but do NOT trip the leak audit.
-            await self._record_ephemeral_leak_audit(
-                reason=reason, breakdown=dict(report),
-            )
+        audit_error = None
+        try:
+            if report.required_sweep_failed:
+                await self._record_ephemeral_purge_failure_audit(reason=reason, report=report)
+            elif report.leaked_rows > 0:
+                await self._record_ephemeral_leak_audit(reason=reason, breakdown=dict(report))
+        except BaseException as error:
+            audit_error = error
+        terminal = execution_terminal_error(primary_error, audit_error)
+        if terminal is not None:
+            raise terminal
         return report
 
     async def _purge_ephemeral_on_shutdown(self, *, timeout: float) -> None:
@@ -5679,7 +6071,9 @@ class KestrelAgent(
             )
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             logging.error(
                 "ephemeral hard-purge during shutdown TIMED OUT after %.2fs — "
                 "the EPHEMERAL no-trace contract could not be certified before "
@@ -5693,6 +6087,8 @@ class KestrelAgent(
             )
             return
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(
                 "ephemeral hard-purge during shutdown FAILED: %s — the EPHEMERAL "
                 "no-trace contract could not be certified before exit", e,
@@ -5741,7 +6137,9 @@ class KestrelAgent(
             )
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as control_error:
+            if is_execution_control_error(control_error):
+                raise
             logging.error(
                 "[ephemeral-purge] SECURITY: shutdown purge-failure audit could "
                 "NOT be written within the remaining %.2fs of the shutdown budget "
@@ -5770,7 +6168,9 @@ class KestrelAgent(
             permission_store = (
                 getattr(feature, "permission_store", None) if feature else None
             )
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             permission_store = None
 
         if permission_store is None:
@@ -5794,6 +6194,8 @@ class KestrelAgent(
                 }),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "[ephemeral-purge] audit write failed: %s "
                 "(breakdown=%s, reason=%s)",
@@ -5826,7 +6228,9 @@ class KestrelAgent(
             permission_store = (
                 getattr(feature, "permission_store", None) if feature else None
             )
-        except Exception:
+        except Exception as control_error:
+            if is_execution_control_error(control_error):
+                raise
             permission_store = None
 
         failed_stores: list = []
@@ -5835,7 +6239,9 @@ class KestrelAgent(
             try:
                 failed_stores = [r.store for r in report.failed_stores]
                 breakdown = dict(report)
-            except Exception:  # noqa: BLE001 - never let report introspection block the audit
+            except Exception as control_error:  # noqa: BLE001 - never let report introspection block the audit
+                if is_execution_control_error(control_error):
+                    raise
                 pass
 
         if permission_store is None:
@@ -5862,6 +6268,8 @@ class KestrelAgent(
                 }),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(
                 "[ephemeral-purge] SECURITY: purge-failure audit write failed: "
                 "%s (reason=%s failed_stores=%s failure=%s)",
@@ -5887,6 +6295,8 @@ class KestrelAgent(
         try:
             deltas = await self.get_enablement_deltas("feature")
         except Exception as e:  # noqa: BLE001 - never block init on this
+            if is_execution_control_error(e):
+                raise
             logging.warning("Could not read feature enablement deltas: %s", e)
             return set(bootstrap)
         # The same rule the writer enforces (kestrel-sovereign#3234): a
@@ -6107,12 +6517,17 @@ class KestrelAgent(
         :meth:`prepare_and_refresh_all_feature_context_clauses` instead.
         """
 
+        require_feature_lifecycle_integrity(self)
         runtime = getattr(self, "feature_contribution_runtime", None)
         if runtime is None:
             return ()
         try:
             return runtime.refresh_all_context_clauses()
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            if is_execution_control_error(exc) and not fail_closed:
+                _retain_feature_lifecycle_safe_mode(self, "Feature context refresh reported native control", exc)
+            if isinstance(exc, (asyncio.CancelledError, BaseExceptionGroup)) and not is_execution_control_error(exc):
+                raise
             if not fail_closed:
                 raise
             return self._suppress_failed_feature_context_refresh(runtime, exc)
@@ -6124,6 +6539,7 @@ class KestrelAgent(
     ):
         """Prepare async feature state, then atomically republish all clauses."""
 
+        require_feature_lifecycle_integrity(self)
         runtime = getattr(self, "feature_contribution_runtime", None)
         if runtime is None:
             return ()
@@ -6132,15 +6548,22 @@ class KestrelAgent(
         except asyncio.CancelledError as exc:
             if fail_closed:
                 self._suppress_failed_feature_context_refresh(runtime, exc)
+            if is_execution_control_error(exc):
+                _retain_feature_lifecycle_safe_mode(self, "Feature context preparation reported native control", exc)
             raise
-        except Exception as exc:
+        except (Exception, BaseExceptionGroup) as exc:
+            if is_execution_control_error(exc) and not fail_closed:
+                _retain_feature_lifecycle_safe_mode(self, "Feature context preparation reported native control", exc)
+            if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception) and not is_execution_control_error(exc):
+                raise
             if not fail_closed:
                 raise
             return self._suppress_failed_feature_context_refresh(runtime, exc)
 
-    @staticmethod
-    def _suppress_failed_feature_context_refresh(runtime, exc):
+    def _suppress_failed_feature_context_refresh(self, runtime, exc):
         """Replace all feature clauses with empty bodies after refresh failure."""
+
+        from kestrel_sovereign.execution_custody import retained_execution_error
 
         # Do not log the exception or its chained feature-code cause: an
         # out-of-tree hook or renderer may have included private bytes there.
@@ -6149,7 +6572,25 @@ class KestrelAgent(
             "suppressing contributed context (%s)",
             type(exc).__name__,
         )
-        return runtime.suppress_all_context_clauses()
+        native = exc if is_execution_control_error(exc) else None
+        if native is not None:
+            _retain_feature_lifecycle_safe_mode(self, "Feature context suppression follows native uncertainty", native)
+        try:
+            result = runtime.suppress_all_context_clauses()
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as cleanup:
+            if native is None and not is_execution_control_error(cleanup):
+                raise
+            controls = (native, cleanup if is_execution_control_error(cleanup)
+                        or isinstance(cleanup, asyncio.CancelledError) else
+                        RuntimeError("feature context suppression did not complete"))
+            _retain_feature_lifecycle_safe_mode(self, "Feature context suppression reported native control", *controls)
+            raise execution_terminal_error(
+                *controls, exc if isinstance(exc, asyncio.CancelledError) else None,
+                retain_originals=True, isolate_control_originals=True,
+            ) from None
+        if native is not None:
+            raise retained_execution_error(native)
+        return result
 
     def _record_contribution_rejections(self, transition) -> None:
         """Log and RETAIN the features refused activation.
@@ -6214,6 +6655,11 @@ class KestrelAgent(
                 features
             )
         except FeatureContributionCollectionError as exc:
+            if is_execution_control_error(exc):
+                _retain_feature_lifecycle_safe_mode(
+                    self, "Feature contribution preflight reported native uncertainty", exc,
+                )
+                raise
             feature_class_name = type(exc.feature).__name__
             cause = exc.__cause__
             if feature_class_name in MANDATORY_FEATURES:
@@ -6231,8 +6677,16 @@ class KestrelAgent(
             if cause is None:  # Defensive: collection failures always chain.
                 raise
             raise cause.with_traceback(cause.__traceback__) from cause.__cause__
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            if is_execution_control_error(exc):
+                _retain_feature_lifecycle_safe_mode(
+                    self, "Feature contribution preflight reported native uncertainty", exc,
+                )
+            raise
 
-    async def _shutdown_failed_feature(self, feature: Feature) -> None:
+    async def _shutdown_failed_feature(
+        self, feature: Feature, *, opening: BaseException | None = None,
+    ) -> None:
         """Drain EVERY registration of a feature whose registration failed mid-way.
 
         ``_register_feature`` wires a feature up in stages — ``initialize()``
@@ -6254,9 +6708,10 @@ class KestrelAgent(
         in ``self.features`` so it drains every registration (``on_disable`` →
         ``shutdown`` → hooks → A2A → dynamic tools, each independent and run
         unconditionally) BEFORE it is dropped — the exact inverse of the wiring
-        ``_register_feature`` performs. It is best-effort here: a teardown error
-        is logged, never raised, so the ORIGINAL registration failure (or its
-        ``MandatoryFeatureReadinessError`` wrap) is what surfaces to the caller.
+        ``_register_feature`` performs. Ordinary teardown failures are logged
+        without replacing the registration failure. Native execution control
+        instead latches lifecycle SafeMode and preserves both originals; it
+        must not be hidden by an ordinary readiness wrapper.
         Every teardown step is idempotent, so it is safe even when the feature
         only got as far as ``initialize()`` (never added to ``self.features``) or
         a stage left nothing to undo. ``unload=True`` drops the instance from
@@ -6266,13 +6721,31 @@ class KestrelAgent(
         and retry, until a teardown of it succeeds (#3522).
         """
         name = getattr(feature, "name", None)
+        cleanup = None
         try:
             await self._unregister_feature_runtime(feature, unload=True)
-        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            cleanup = exc
+        controls = tuple(error for error in (opening, cleanup)
+                         if is_execution_control_error(error))
+        if controls:
+            withdrawals = tuple(error for result in (opening, cleanup)
+                                for error in _explicit_control_chain(result)
+                                if isinstance(error, asyncio.CancelledError)
+                                and not is_execution_control_error(error))
+            await enter_feature_lifecycle_safe_mode(
+                self, "Startup feature rollback reported unresolved native control",
+                *controls, *withdrawals, features=(feature,),
+            )
+        if isinstance(cleanup, asyncio.CancelledError):
+            raise cleanup
+        if isinstance(cleanup, BaseExceptionGroup) and not isinstance(cleanup, Exception):
+            raise cleanup
+        if cleanup is not None:
             logging.warning(
-                "boot rollback: failed feature '%s' teardown errored: %s",
+                "boot rollback: failed feature '%s' teardown reported %s",
                 name or type(feature).__name__,
-                exc,
+                type(cleanup).__name__,
             )
 
     async def _apply_host_feature_config(self, feature: Feature) -> None:
@@ -6508,18 +6981,27 @@ class KestrelAgent(
 
         feature_class_name = type(feature).__name__
         mandatory = feature_class_name in MANDATORY_FEATURES
+        require_feature_lifecycle_integrity(self)
         if prepared_contributions is None:
-            prepared_contributions = self._prepare_feature_contribution_transition(
-                (feature,)
-            ).only()
+            try:
+                prepared_contributions = self._prepare_feature_contribution_transition(
+                    (feature,)
+                ).only()
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_error:
+                if is_execution_control_error(preparation_error):
+                    await enter_feature_lifecycle_safe_mode(
+                        self, "Feature activation preflight reported unresolved native control",
+                        preparation_error, features=(feature,),
+                    )
+                raise
         # Held from before initialize(), which may start workers or child
         # processes, until a teardown's release is confirmed (#3522).
         self._hold_feature(feature)
         try:
             await feature.initialize()
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "initialization",
@@ -6528,16 +7010,15 @@ class KestrelAgent(
             raise
         try:
             await self._apply_host_feature_config(feature)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             # CancelledError is a BaseException, so the handler below never
             # sees it. initialize() has already run at this point and the
             # feature is not yet in self.features, so boot rollback cannot
             # find it — its tasks and signal sources would outlive the failed
             # boot. Tear down, then let the cancellation continue.
-            with contextlib.suppress(Exception):
-                await self._shutdown_failed_feature(feature)
+            await self._shutdown_failed_feature(feature, opening=exc)
             raise
-        except Exception as exc:
+        except (Exception, BaseExceptionGroup) as exc:
             # Deliberately fatal to this feature. A rejected block does NOT
             # leave the feature unconfigured — a feature that validates before
             # replacing its active config (Talon does) keeps running its
@@ -6546,7 +7027,7 @@ class KestrelAgent(
             # and believes they replaced. Silent divergence between declared
             # and running configuration is the whole subject of #3008; it must
             # not be reintroduced by its own fix.
-            await self._shutdown_failed_feature(feature)
+            await self._shutdown_failed_feature(feature, opening=exc)
             logging.error(
                 "Feature '%s' rejected the configuration declared in %s: %s. "
                 "The feature is NOT loaded, so it cannot run with settings "
@@ -6563,9 +7044,9 @@ class KestrelAgent(
             self._ensure_feature_contribution_runtime().activate(
                 prepared_contributions
             )
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "contribution registration",
@@ -6576,9 +7057,9 @@ class KestrelAgent(
         # Auto-register hooks from get_hooks() with the agent's HooksManager
         try:
             self._wire_feature_hooks(feature)
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "registration",
@@ -6589,9 +7070,9 @@ class KestrelAgent(
         # Call on_enable lifecycle hook
         try:
             await feature.on_enable()
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "enablement",
@@ -6601,9 +7082,9 @@ class KestrelAgent(
 
         try:
             self._wire_feature_a2a(feature)
-        except Exception as exc:
-            await self._shutdown_failed_feature(feature)
-            if mandatory:
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            await self._shutdown_failed_feature(feature, opening=exc)
+            if mandatory and isinstance(exc, Exception):
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
                     "registration",
@@ -6744,10 +7225,19 @@ class KestrelAgent(
         :meth:`_register_feature` (which additionally handles first-load
         discovery and the mandatory-feature readiness contract).
         """
+        require_feature_lifecycle_integrity(self)
         if prepared_contributions is None:
-            prepared_contributions = self._prepare_feature_contribution_transition(
-                (feature,)
-            ).only()
+            try:
+                prepared_contributions = self._prepare_feature_contribution_transition(
+                    (feature,)
+                ).only()
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as preparation_error:
+                if is_execution_control_error(preparation_error):
+                    await enter_feature_lifecycle_safe_mode(
+                        self, "Feature activation preflight reported unresolved native control",
+                        preparation_error, features=(feature,),
+                    )
+                raise
         self._hold_feature(feature)
         try:
             # An isolated re-enable starts from a terminal proxy with no live
@@ -6789,7 +7279,7 @@ class KestrelAgent(
             feature.enabled = True
             bump_registry_generation(self)
             self._cached_features_prompt = self._build_features_prompt_section()
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as activation_error:
             # Atomic activation: undo whatever partially registered so a failed
             # enable can't strand hooks / sources / tools. Soft teardown keeps
             # the instance loaded (re-enable-able). If exact-inverse drift makes
@@ -6797,9 +7287,17 @@ class KestrelAgent(
             # ORIGINAL activation error is allowed to surface; otherwise a
             # disabled feature can keep contributing prompt bytes.
             quarantine_error = None
+            controls = [activation_error] if is_execution_control_error(activation_error) else []
+            withdrawals = [error for error in _explicit_control_chain(activation_error)
+                           if isinstance(error, asyncio.CancelledError)]
             try:
                 await self._unregister_feature_runtime(feature, unload=False)
-            except (Exception, asyncio.CancelledError) as cleanup_exc:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as cleanup_exc:
+                if is_execution_control_error(cleanup_exc):
+                    controls.append(cleanup_exc)
+                withdrawals.extend(error for error in _explicit_control_chain(cleanup_exc)
+                                   if isinstance(error, asyncio.CancelledError)
+                                   and all(error is not prior for prior in withdrawals))
                 logging.warning(
                     "Cleanup after failed activation of feature '%s' reported %s; "
                     "quarantining surviving contributions",
@@ -6808,31 +7306,21 @@ class KestrelAgent(
                 )
                 try:
                     self._quarantine_feature_contributions(feature)
-                except (Exception, asyncio.CancelledError):
+                except (Exception, asyncio.CancelledError, BaseExceptionGroup) as quarantine_exc:
+                    if is_execution_control_error(quarantine_exc):
+                        controls.append(quarantine_exc)
+                    withdrawals.extend(error for error in _explicit_control_chain(quarantine_exc)
+                                       if isinstance(error, asyncio.CancelledError)
+                                       and all(error is not prior for prior in withdrawals))
                     quarantine_error = RuntimeError(
                         "failed activation contributions could not be quarantined"
                     )
-            if quarantine_error is not None:
+            if quarantine_error is not None or controls:
                 safe_mode_reason = (
                     "Feature activation contribution quarantine failed; "
                     "cognition is blocked until lifecycle integrity is restored"
                 )
-                self._feature_lifecycle_integrity_uncertain = True
-                self._feature_lifecycle_repair_verified = False
-                try:
-                    await self.enter_safe_mode(
-                        safe_mode_reason,
-                        cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
-                    )
-                except (Exception, asyncio.CancelledError):
-                    # Safe Mode persistence is best-effort here, but the
-                    # in-memory cognition latch is not. A second failure must
-                    # not reopen prompts over an untrusted feature generation.
-                    self._safe_mode = True
-                    self._safe_mode_reason = safe_mode_reason
-                    self._safe_mode_cause = (
-                        SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
-                    )
+                await enter_feature_lifecycle_safe_mode(self, safe_mode_reason, *controls, *withdrawals)
                 # Do not retain a third-party cleanup/quarantine exception as a
                 # printable cause; either may contain feature configuration.
                 raise quarantine_error from None
@@ -6850,6 +7338,7 @@ class KestrelAgent(
         feature generation.
         """
 
+        require_feature_lifecycle_integrity(self)
         ready_hook = getattr(feature, "on_agent_ready", None)
         if ready_hook is not None:
             try:
@@ -6860,7 +7349,12 @@ class KestrelAgent(
                 # closed instead of observing a half-published generation.
                 with self.committed_feature_transition_cognition():
                     await ready_hook(self)
-            except (Exception, asyncio.CancelledError) as exc:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+                if is_execution_control_error(exc):
+                    await enter_feature_lifecycle_safe_mode(
+                        self, "Feature READY hook reported unresolved native control", exc,
+                        features=(feature,),
+                    )
                 # A hook may await a child task that was cancelled on its own;
                 # ready hooks remain best-effort in that case.  Cancellation of
                 # this transition task itself is different: swallowing it would
@@ -6909,8 +7403,9 @@ class KestrelAgent(
         UNCONDITIONALLY even if an earlier one raises (#2522 P2): a failing
         ``on_disable`` must not leave the feature's shutdown / hooks / A2A /
         tools / dropped-from-``features`` cleanup un-run. Errors are collected
-        and the first is re-raised *after* all cleanup so callers still see the
-        failure. It does NOT enforce the mandatory-feature guard — that is a
+        and original control evidence takes precedence over ordinary errors
+        *after* all cleanup so callers still see the failure. It does NOT
+        enforce the mandatory-feature guard — that is a
         caller policy (runtime disable refuses; boot rollback must tear mandatory
         features down too).
 
@@ -6932,13 +7427,23 @@ class KestrelAgent(
         feature_tool_name = getattr(feature, "tool_name", feature_key)
         errors: List[BaseException] = []
 
+        def retain_failure(error):
+            if (
+                isinstance(error, BaseExceptionGroup)
+                and not isinstance(error, Exception)
+                and not is_execution_control_error(error)
+            ):
+                raise error
+            errors.append(error)
+            self._remember_shutdown_control(error)
+
         # Declarative contributions are exact lifecycle capabilities. Remove
         # them independently even when the feature's imperative hooks fail.
         try:
             runtime = self._ensure_feature_contribution_runtime()
             runtime.deactivate(feature)
-        except (Exception, asyncio.CancelledError) as exc:
-            errors.append(exc)
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            retain_failure(exc)
             logging.exception(
                 "Feature '%s' SDK contribution teardown failed; "
                 "continuing with the remaining cleanup",
@@ -6949,8 +7454,8 @@ class KestrelAgent(
         # every teardown step below, so its failure must not skip them.
         try:
             await feature.on_disable()
-        except (Exception, asyncio.CancelledError) as exc:
-            errors.append(exc)
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            retain_failure(exc)
             logging.exception(
                 "Feature '%s' on_disable() failed during teardown; "
                 "continuing with the remaining cleanup",
@@ -6961,8 +7466,8 @@ class KestrelAgent(
         reported = ReleaseOutcome.RELEASED
         try:
             reported = reported_outcome(await feature.shutdown())
-        except (Exception, asyncio.CancelledError) as exc:
-            errors.append(exc)
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            retain_failure(exc)
             logging.exception(
                 "Feature '%s' shutdown() failed during teardown; "
                 "continuing with the remaining cleanup",
@@ -6978,8 +7483,8 @@ class KestrelAgent(
                         f"Auto-unregistered hook '{hook.name}' from feature "
                         f"'{feature_key}'"
                     )
-            except (Exception, asyncio.CancelledError) as exc:
-                errors.append(exc)
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+                retain_failure(exc)
                 logging.exception(
                     "Feature '%s' hook unregistration failed during teardown; "
                     "continuing with the remaining cleanup",
@@ -6989,7 +7494,11 @@ class KestrelAgent(
         if self.task_manager:
             try:
                 self.task_manager.unregister_agent(feature.get_agent_card().name)
-            except (Exception, asyncio.CancelledError) as exc:
+            except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+                if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception) and not is_execution_control_error(exc):
+                    raise
+                if is_execution_control_error(exc):
+                    retain_failure(exc)
                 logging.warning(
                     "Failed to unregister feature '%s' from task manager: %s",
                     feature_key,
@@ -7011,8 +7520,8 @@ class KestrelAgent(
                 self._tool_context_hidden_features.discard(feature.__class__.__name__)
             if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
                 self._tool_context_hidden_tools.difference_update(to_remove)
-        except (Exception, asyncio.CancelledError) as exc:
-            errors.append(exc)
+        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
+            retain_failure(exc)
             logging.exception(
                 "Feature '%s' dynamic-tool teardown failed; "
                 "continuing with the remaining cleanup",
@@ -7047,7 +7556,9 @@ class KestrelAgent(
 
         # Surface the failure only AFTER every independent cleanup step ran.
         if errors:
-            raise errors[0]
+            raise execution_terminal_error(
+                *errors, retain_originals=True, isolate_control_originals=True,
+            )
         return reported
 
     def _hold_feature(self, feature: "Feature") -> None:
@@ -7228,6 +7739,8 @@ Expected Duration: {expected_duration}
             try:
                 wake_up_msg = await self.bootstrap_service.generate_wake_up_message()
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.error(f"[BOOTSTRAP] Failed to generate wake-up message: {e}")
                 # Fall through to normal processing rather than getting stuck
                 return None
@@ -7253,7 +7766,7 @@ Expected Duration: {expected_duration}
                 wake_up_msg, session_id=session_id, wake_reply=wake_reply,
             )
 
-            logging.info(f"[BOOTSTRAP] Agent waking up - entering discovery mode")
+            logging.info("[BOOTSTRAP] Agent waking up - entering discovery mode")
             return wake_up_msg
 
         elif state == BootstrapState.DISCOVERY:
@@ -7304,6 +7817,8 @@ Expected Duration: {expected_duration}
                         if h.get("role") and h.get("content")
                     ]
                 except Exception as fetch_exc:
+                    if is_execution_control_error(fetch_exc):
+                        raise
                     logging.debug(
                         f"[BOOTSTRAP] Could not fetch prior conversation for "
                         f"discovery context: {fetch_exc}"
@@ -7316,6 +7831,8 @@ Expected Duration: {expected_duration}
                     invocation_context=invocation_context,
                 )
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logging.warning(
                     f"[BOOTSTRAP] Discovery LLM call failed ({exc}); "
                     f"auto-completing bootstrap so the user's message "
@@ -7324,6 +7841,8 @@ Expected Duration: {expected_duration}
                 try:
                     await self.bootstrap_service.skip_discovery()
                 except Exception as skip_exc:
+                    if is_execution_control_error(skip_exc):
+                        raise
                     logging.error(f"[BOOTSTRAP] Failed to auto-complete after discovery error: {skip_exc}")
                 return None
 
@@ -7356,9 +7875,13 @@ Expected Duration: {expected_duration}
                             avatar_result = await visual_identity.generate_avatar(user_input)
                             completion_msg += f"\n\n{avatar_result}"
                         except (ConnectionError, TimeoutError, ValueError, KeyError, AttributeError) as e:
+                            if is_execution_control_error(e):
+                                raise
                             logging.warning(f"Failed to generate avatar: {e}")
                             completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
                         except Exception as e:
+                            if is_execution_control_error(e):
+                                raise
                             logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                             completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
 
@@ -7372,7 +7895,7 @@ Expected Duration: {expected_duration}
                         loaded = await self.context_builder.load_canonical_soul_resource()
                         if not loaded:
                             self.context_builder._load_soul_md()
-                    logging.info(f"[BOOTSTRAP] Discovery complete with avatar")
+                    logging.info("[BOOTSTRAP] Discovery complete with avatar")
                     return completion_msg
                 else:
                     # Discovery complete without avatar
@@ -7387,10 +7910,10 @@ Expected Duration: {expected_duration}
                         loaded = await self.context_builder.load_canonical_soul_resource()
                         if not loaded:
                             self.context_builder._load_soul_md()
-                    logging.info(f"[BOOTSTRAP] Discovery complete")
+                    logging.info("[BOOTSTRAP] Discovery complete")
                     return completion_msg
 
-            logging.info(f"[BOOTSTRAP] Discovery continuing...")
+            logging.info("[BOOTSTRAP] Discovery continuing...")
             return response
 
         elif state == BootstrapState.AVATAR:
@@ -7408,10 +7931,14 @@ Expected Duration: {expected_duration}
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                         return f"Avatar generated!\n\n{avatar_result}\n\nI'm ready to help. What would you like to work on?"
                     except (ConnectionError, TimeoutError, ValueError, KeyError, AttributeError) as e:
+                        if is_execution_control_error(e):
+                            raise
                         logging.warning(f"Failed to generate avatar: {e}")
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                         return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
                     except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
                         logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                         return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
@@ -7942,7 +8469,9 @@ Expected Duration: {expected_duration}
             return None
         try:
             return await self.storage.find_signal_wake_reply_id(signal_id)
-        except DatabaseError:
+        except DatabaseError as error:
+            if is_execution_control_error(error):
+                raise
             logging.warning(
                 "Could not read back the stored reply to signal %s", signal_id,
                 exc_info=True,
@@ -7965,8 +8494,9 @@ Expected Duration: {expected_duration}
         survives — observable and recoverable — instead of codex doing it
         invisibly.
 
-        Best-effort: any failure logs and leaves the turn to proceed
-        normally (codex's own auto-compaction remains the backstop).
+        Ordinary availability failures log and leave the turn to proceed
+        (codex's own auto-compaction remains the backstop). Original native
+        control is not availability: it must stop this pre-turn gate.
         """
         if not session_id:
             return
@@ -8000,7 +8530,9 @@ Expected Duration: {expected_duration}
                 force=True,
                 session_id=session_id,
             )
-        except Exception as e:  # noqa: BLE001 - never break a turn
+        except Exception as e:  # noqa: BLE001 - ordinary availability is optional
+            if is_execution_control_error(e):
+                raise
             logging.warning(
                 "openai:plan auto-compaction failed at %.1f%% occupancy: %s",
                 pct, e, exc_info=True,
@@ -8917,23 +9449,119 @@ Expected Duration: {expected_duration}
         )
         return serialize_chain_for_metadata(chain)
 
-    def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
+    def _track_background_task(self, coro, *, name: str, admission=None) -> asyncio.Task:
         """Start agent-owned background work and remove it when complete."""
-        task = asyncio.create_task(coro, name=name)
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
+
+        # Keep create_task's fresh-coroutine contract: an already accepted
+        # borrowed Task must not be adopted as this agent's background child.
+        if not asyncio.iscoroutine(coro):
+            raise TypeError("agent background publication requires a fresh coroutine")
+        receipt = admission if admission is not None else OwnedTaskAdmission()
+        try:
+            task = create_owned_task(coro, name=name, admission=receipt)
+        finally:
+            if receipt.task is not None:
+                receipt.task._kestrel_started_at = time.monotonic()
+                self._background_tasks.add(receipt.task)
         # ``asyncio.Task`` carries no creation time, and age is what separates
         # "busy" from "wedged" when something inspects this set — the restart
         # coordinator's idle gate reports it so an operator can tell a task
         # that appeared once from one stuck for hours (#2665). Stamped at the
         # single chokepoint that owns the set, so nothing has to maintain a
         # parallel map that could outlive the task.
-        task._kestrel_started_at = time.monotonic()  # type: ignore[attr-defined]
+        def completed(done):
+            self._finish_background_task(done)
+        task.add_done_callback(completed)
+        return task
+
+    def _finish_background_task(self, done) -> None:
+        """Idempotently harvest the exact accepted owner, callback or drain."""
+        if done not in self._background_tasks:
+            return
+        from kestrel_sovereign._async_ownership import owned_task_error
+        self._remember_shutdown_control(owned_task_error(done), retain_originals=False)
+        self._background_tasks.discard(done)
+
+    def _runtime_owner_context(self):
+        """Original resident context; also used by lifecycle-owned timers.
+
+        Durable owner heartbeat may run before READY to protect admitted boot
+        work. Resident effect loops use `_track_runtime_task`'s READY barrier.
+        """
+        from contextvars import Context
+
+        from kestrel_sovereign.execution_custody import (
+            _CURRENT_CUSTODY,
+            ExecutionAuthorityError,
+            ExecutionCustody,
+            current_execution_custody,
+            require_execution_work,
+        )
+        require_execution_work(self)
+        scope = self._execution_custody
+        if current_execution_custody() and not isinstance(scope, ExecutionCustody):
+            raise ExecutionAuthorityError("resident handoff requires original runtime custody")
+        context = Context()
+        if isinstance(scope, ExecutionCustody):
+            context.run(_CURRENT_CUSTODY.set, (scope,))
+        return context
+
+    def _track_runtime_task(self, coro, *, name: str) -> asyncio.Task:
+        """Publish an explicit first-party resident owner, never an effect child.
+
+        Creation requires every current admission to be live; READY publication
+        checks them again. Only then does this service run under the original
+        runtime generation. Ordinary `_track_background_task` children retain
+        all denying ancestors and never receive this handoff.
+        """
+        from kestrel_sovereign.execution_custody import require_execution_work
+        try:
+            context = self._runtime_owner_context()
+        except BaseException:
+            coro.close()
+            raise
+        ready = self._runtime_publication_ready
+        started = False
+
+        async def resident():
+            nonlocal started
+            await ready.wait()
+            require_execution_work(self)
+            started = True
+            return await coro
+
+        # Do not inherit a cognition turn's caller, Hold grant or cleanup flag.
+        # This context carries the SAME irreversible original runtime object;
+        # it does not mint a replacement admission or refresh a generation.
+        from kestrel_sovereign._async_ownership import create_owned_task
+        try:
+            task = create_owned_task(resident(), name=name, context=context)
+        except BaseException:
+            # Canonical admission closes the refused resident wrapper. Its
+            # submitted operation has not entered (READY remains separate),
+            # so this original publisher must close that fresh coroutine too.
+            coro.close()
+            raise
+        task._kestrel_started_at = time.monotonic()
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+
+        def completed(done):
+            from kestrel_sovereign._async_ownership import owned_task_error
+            self._remember_shutdown_control(
+                owned_task_error(done), retain_originals=False,
+            )
+            self._background_tasks.discard(done)
+            if not started:
+                coro.close()
+
+        task.add_done_callback(completed)
         return task
 
     async def _shutdown_background_tasks(self) -> None:
         tasks = set(self._background_tasks)
         if not tasks:
+            self._raise_shutdown_control()
             return
 
         for task in tasks:
@@ -8941,7 +9569,27 @@ Expected Duration: {expected_duration}
                 task.cancel()
 
         await asyncio.gather(*tasks, return_exceptions=True)
+        from kestrel_sovereign._async_ownership import owned_task_error
+        for task in tasks:
+            self._remember_shutdown_control(owned_task_error(task))
         self._background_tasks.clear()
+        self._raise_shutdown_control()
+
+    def _has_pending_llm_storage_dependents(self) -> bool:
+        service = getattr(self, "llm_service", None)
+        predicate = getattr(type(service), "has_pending_close_owners", None)
+        return bool(callable(predicate) and predicate(service))
+
+    async def _join_llm_storage_dependents(self) -> None:
+        service = getattr(self, "llm_service", None)
+        waiter = getattr(type(service), "wait_for_close_completion", None)
+        if callable(waiter):
+            try:
+                await waiter(service)
+            except BaseException as failure:
+                self._remember_shutdown_control(failure)
+                if not is_execution_control_error(failure) or self._has_pending_llm_storage_dependents():
+                    raise
 
     async def _complete_durable_shutdown_continuation(
         self,
@@ -8962,20 +9610,53 @@ Expected Duration: {expected_duration}
         """
         custody = self._resource_custody()
 
+        async def release_llm() -> ReleaseOutcome:
+            await self._join_llm_storage_dependents()
+            service = getattr(self, "llm_service", None)
+            if service is not None and callable(getattr(service, "close", None)):
+                for attempt in range(2):
+                    try:
+                        outcome = reported_outcome(await service.close())
+                        if outcome is not ReleaseOutcome.RELEASED:
+                            raise RuntimeError("LLM release incomplete; borrowed storage retained")
+                    except BaseException as failure:
+                        self._remember_shutdown_control(failure)
+                        if is_execution_control_error(failure) and self._has_pending_llm_storage_dependents():
+                            # A control-bearing failed native close still owns
+                            # transport/storage resources. Preserve its receipt
+                            # and custody instead of reporting physical release.
+                            raise
+                        if not is_execution_control_error(failure):
+                            if attempt == 0 and self._has_pending_llm_storage_dependents():
+                                # A bounded close retained exact native tasks.
+                                # Join them, then ask the idempotent close for
+                                # its settled disposition; never replace them.
+                                await self._join_llm_storage_dependents()
+                                continue
+                            raise
+                    break
+            # close() itself is bounded and may have started a retained native
+            # client close. The explicit continuation must join that owner too.
+            await self._join_llm_storage_dependents()
+            return ReleaseOutcome.RELEASED
+
         async def release_dispatcher() -> ReleaseOutcome:
             delivered = await dispatcher.shutdown_durable_delivery()
             wait_for_owner_release = getattr(
                 dispatcher, "wait_for_durable_shutdown_release", None
             )
             if not callable(wait_for_owner_release):
-                return _dispatcher_release_outcome(delivered)
-            # A fenced first call is expected here: the wait is what ends it.
-            waited = reported_outcome(await wait_for_owner_release())
-            if isinstance(delivered, ReleaseOutcome) and (
-                delivered is not ReleaseOutcome.RELEASED
-            ):
-                return delivered
-            return waited
+                outcome = _dispatcher_release_outcome(delivered)
+            else:
+                # A fenced first call is expected here: the wait ends it.
+                outcome = reported_outcome(await wait_for_owner_release())
+                if isinstance(delivered, ReleaseOutcome) and (
+                    delivered is not ReleaseOutcome.RELEASED
+                ):
+                    outcome = delivered
+            if outcome is not ReleaseOutcome.RELEASED:
+                raise RuntimeError("durable dispatcher release incomplete; borrowed storage retained")
+            return outcome
 
         async def close_storage() -> ReleaseOutcome:
             precloses = ReleaseOutcome.RELEASED
@@ -8986,8 +9667,22 @@ Expected Duration: {expected_duration}
                 closed = reported_outcome(await storage.close())
             return closed if precloses is ReleaseOutcome.RELEASED else precloses
 
-        await custody.release("signal_dispatcher", release_dispatcher)
+        if dispatcher is not None and hasattr(dispatcher, "shutdown_durable_delivery"):
+            await custody.release("signal_dispatcher", release_dispatcher)
+        # A rollback may have retained an LLM which has not been closed yet.
+        # Dispatcher/cognition retirement precedes that actual close; joining
+        # an empty writer set is not proof of provider retirement. Both native
+        # LLM settlement and close precede every borrowed storage release.
+        await custody.release("llm_service", release_llm)
+        if vars(self).get("_resolved_local_host_db") is not None:
+            async def release_host_db() -> ReleaseOutcome:
+                await self._close_local_host_db()
+                return ReleaseOutcome.RELEASED
+            await custody.release("host_key_database", release_host_db)
         await custody.release("storage", close_storage)
+        # A completed physical cleanup owner is not cancelled by an earlier
+        # observer withdrawal. Public completion reports that retained receipt.
+        self._raise_shutdown_control(control_only=True)
         self._release_serving_record()
 
     async def _ensure_durable_shutdown_continuation(self, dispatcher) -> asyncio.Task:
@@ -9015,11 +9710,75 @@ Expected Duration: {expected_duration}
             # Always retrieve an unjoined failure.  The task remains retained
             # for a later lifecycle retry, rather than disappearing as an
             # unobserved "Task exception was never retrieved" warning.
-            continuation.add_done_callback(
-                lambda task: None if task.cancelled() else task.exception()
-            )
+            def retain_terminal(task):
+                from kestrel_sovereign._async_ownership import owned_task_error
+                failure = owned_task_error(task)
+                self._remember_shutdown_control(failure)
+            continuation.add_done_callback(retain_terminal)
             self._durable_shutdown_continuation = continuation
             return continuation
+
+    def _remember_shutdown_control(
+        self, error: BaseException | None, *, retain_originals: bool = True,
+        retain_cancellation: bool = False,
+    ) -> None:
+        """Retain all original terminal evidence in this agent's lifetime.
+
+        This is a terminal-control inventory, not ordinary background history:
+        non-control failures are still ignored unless cancellation is opted in.
+        Lifecycle entries preserve existing and incoming original carriers;
+        unbounded background publishers explicitly keep one strongest receipt.
+        """
+        if error is None or (
+            not is_execution_control_error(error)
+            and not (retain_cancellation and isinstance(error, asyncio.CancelledError))
+        ):
+            return
+        # A late, stronger background receipt must not replace original
+        # finite native close/admission evidence. Conversely, aggregating
+        # every completed worker into that finite inventory retains an
+        # unbounded history. Keep the two ownership classes separately and
+        # project them without mutating either original carrier.
+        channel = ("_shutdown_lifecycle_control" if retain_originals
+                   else "_shutdown_background_control")
+        if not retain_cancellation:
+            # Ordinary finite observer C is not a native source. Explicit
+            # shutdown-owned cancellation keeps its separate opt-in contract.
+            error = execution_native_source_error(error)
+        previous = vars(self).get(channel)
+        if not retain_originals:
+            # Strongest selection merges native metadata. Only PRIVATE
+            # carriers may be selected for those writes; their explicit cause
+            # retains one strongest source, not every completed worker.
+            def private_source(source):
+                if source is None or type(source) is _BackgroundShutdownControl:
+                    return source
+                carrier = _BackgroundShutdownControl("background native control")
+                carrier.__cause__ = source
+                return carrier
+
+            previous, error = private_source(previous), private_source(error)
+        setattr(self, channel, execution_terminal_error(
+            previous, error, retain_originals=retain_originals,
+            isolate_control_originals=retain_originals,
+        ))
+        lifecycle = vars(self).get("_shutdown_lifecycle_control")
+        background = vars(self).get("_shutdown_background_control")
+        self._shutdown_control = (
+            BaseExceptionGroup("agent terminal ownership evidence", [lifecycle, background])
+            if lifecycle is not None and background is not None
+            and background not in tuple(_explicit_control_chain(lifecycle))
+            else lifecycle if lifecycle is not None else background
+        )
+
+    def _raise_shutdown_control(self, *, control_only: bool = False) -> None:
+        terminal = execution_terminal_error(
+            vars(self).get("_shutdown_control"), retain_originals=True,
+        )
+        if terminal is not None and (
+            not control_only or is_execution_control_error(terminal)
+        ):
+            raise terminal
 
     async def wait_for_shutdown_completion(self) -> None:
         """Join deferred durable cleanup before releasing this agent.
@@ -9029,16 +9788,62 @@ Expected Duration: {expected_duration}
         joins the agent-owned continuation that performs the only permitted
         subsequent storage close.  ``shield`` preserves the work if an outer
         lifecycle wait is cancelled; a later owner can join the same task.
+        Original native snapshot/stop Tasks retained by a finite observer guard
+        are likewise joined before their terminal control is reported.
         """
         retried_failure = False
+        finite_outcomes: list[BaseException] = []
+
+        def raise_finite_control(*, control_only=False):
+            terminal = execution_terminal_error(
+                vars(self).get("_shutdown_control"), *finite_outcomes,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if terminal is not None and (
+                not control_only or is_execution_control_error(terminal)
+            ):
+                raise terminal
         while True:
+            # A finite tail guard may stop observing an original native close,
+            # but cannot destroy that owner's coroutine/join. Explicit shutdown
+            # completion joins those retained Tasks, without cancelling them or
+            # waiting on this caller or its actual must-join ancestors.
+            from kestrel_sovereign._async_ownership import (
+                await_owned_task,
+                owned_task_join_ancestors,
+            )
+            from kestrel_sovereign.execution_custody import execution_cleanup_debts
+
+            current = asyncio.current_task()
+            ancestors = owned_task_join_ancestors(current)
+            pending = {
+                owner for _resource, owner in execution_cleanup_debts(
+                    vars(self).get("_shutdown_control")
+                )
+                if isinstance(owner, asyncio.Future) and not owner.done()
+                and owner is not current and owner not in ancestors
+            }
+            if pending:
+                for owner in pending:
+                    outcome = await await_owned_task(owner)
+                    if outcome.error is not None:
+                        finite_outcomes.append(outcome.error)
+                    if outcome.cancellation is not None:
+                        finite_outcomes.append(outcome.cancellation)
+                    self._remember_shutdown_control(outcome.error)
+                continue  # Harvest any native child debt published by that owner.
             continuation = self._durable_shutdown_continuation
             if continuation is None:
+                raise_finite_control()
                 return
             try:
                 await asyncio.shield(continuation)
+                raise_finite_control()
                 return
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
+                finite_outcomes.append(cancellation)
+                self._remember_shutdown_control(cancellation)
+                raise_finite_control(control_only=True)
                 # A continuation can itself be cancelled (for example while
                 # releasing the runtime owner).  That is a retryable cleanup
                 # failure.  A cancellation of *this* waiter, on the other
@@ -9048,6 +9853,13 @@ Expected Duration: {expected_duration}
                     raise
                 failure: BaseException = asyncio.CancelledError()
             except Exception as exc:
+                # The one existing retry can resolve an ordinary observer
+                # failure. Do not turn that repaired availability error into
+                # a new terminal failure after storage physically closes.
+                if is_execution_control_error(exc):
+                    finite_outcomes.append(exc)
+                self._remember_shutdown_control(exc)
+                raise_finite_control(control_only=True)
                 failure = exc
 
             if retried_failure:
@@ -9095,12 +9907,19 @@ Expected Duration: {expected_duration}
             raise TypeError("shutdown reaper handoff requires an asyncio future")
 
         async def reap() -> None:
-            _cancelled, failure = await await_lifecycle_task_completion(shutdown_task)
-            if failure is not None and not isinstance(
-                failure, asyncio.CancelledError
-            ):
-                raise failure
-            await self.wait_for_shutdown_completion()
+            originals, withdrawals = [], []
+            try:
+                _cancelled, failure = await await_lifecycle_task_completion(shutdown_task, withdrawals=withdrawals)
+            except BaseException as error:
+                failure = error
+            if failure is not None:
+                originals.append(failure)
+            await await_agent_shutdown_completion(self, withdrawals=withdrawals, finite_errors=originals)
+            from kestrel_sovereign.execution_custody import execution_finite_error
+            terminal = execution_finite_error(*originals, *withdrawals,
+                                               retain_originals=True, isolate_control_originals=True)
+            if terminal is not None and (not isinstance(terminal, asyncio.CancelledError) or is_execution_control_error(terminal)):
+                raise terminal
 
         return asyncio.create_task(
             reap(), name=f"agent_shutdown_quarantine_reaper:{self.did}"
@@ -9148,7 +9967,10 @@ Expected Duration: {expected_duration}
         Creates a new Kestrel agent identity and stores it in the trusted agents directory.
         This is a simplified, local version of the "Genesis Factory" concept.
         """
-        from kestrel_sovereign.inception_service import generate_kestrel_identity, save_kestrel_identity
+        from kestrel_sovereign.inception_service import (
+            generate_kestrel_identity,
+            save_kestrel_identity,
+        )
         from kestrel_sovereign.storage import GraphNode
 
         # Generate a new identity
@@ -9235,7 +10057,11 @@ Expected Duration: {expected_duration}
         Generate an AgentCard for this agent (for A2A discovery).
         Returns agent identity, capabilities, and available skills.
         """
-        from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentProvider
+        from kestrel_sovereign.a2a.agent_card import (
+            AgentCapabilities,
+            AgentCard,
+            AgentProvider,
+        )
 
         # Get agent name from storage node if available
         agent_name = "Kestrel Agent"
@@ -9287,6 +10113,7 @@ Expected Duration: {expected_duration}
 
     async def _close_standalone_hold_context(
         self,
+        *, withdrawals: list[BaseException] | None = None,
     ) -> tuple[bool, BaseException | None]:
         """Join closure of a standalone helper's agent-owned Hold context."""
 
@@ -9300,12 +10127,25 @@ Expected Duration: {expected_duration}
         if task is None:
             from kestrel_sovereign.hold import close_bound_host_context
 
-            task = asyncio.create_task(
-                close_bound_host_context(context),
-                name="agent_shutdown:standalone_hold_context",
+            # The context already registers and joins each original resource
+            # closer through cancellation. A second all-resource Task adds a
+            # refusal point before that inventory can even be entered.
+            cancelled, failure = False, None
+            try:
+                await close_bound_host_context(context)
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
+                    cancelled = True
+                    if withdrawals is not None:
+                        withdrawals.append(error)
+                else:
+                    failure = execution_terminal_error(error, retain_originals=True)
+        else:
+            # Join an already accepted owner from a previous lifecycle call;
+            # never replace it with a fresh observer or cancel its native work.
+            cancelled, failure = await await_lifecycle_task_completion(
+                task, withdrawals=withdrawals,
             )
-            self._standalone_hold_context_close_task = task
-        cancelled, failure = await await_lifecycle_task_completion(task)
         if failure is None:
             self._standalone_hold_context = None
         # A failed close remains retryable on a later shutdown call; a terminal
@@ -9349,6 +10189,18 @@ Expected Duration: {expected_duration}
         goes on, and its resource stays held. The serving record is removed
         only once custody holds nothing.
         """
+        finite_outcomes: list[BaseException] = []
+
+        def remember_finite(error):
+            # Shared agent state owns source-only facts. This invocation still
+            # owes its finite caller every actual delivered withdrawal.
+            if error is not None and (
+                is_execution_control_error(error)
+                or isinstance(error, asyncio.CancelledError)
+            ) and all(error is not prior for prior in finite_outcomes):
+                finite_outcomes.append(error)
+            self._remember_shutdown_control(error)
+
         loop = asyncio.get_running_loop()
         dispatcher = getattr(self, "dispatcher", None)
         inherited_durable_admission = getattr(
@@ -9365,6 +10217,12 @@ Expected Duration: {expected_duration}
             raise RuntimeError(
                 "Cannot shut down an agent from a live durable signal operation"
             )
+        from kestrel_sovereign.execution_custody import (
+            retire_process_runtime_custody,
+        )
+        # Borrowed tenant/shared host authority must never be retired by
+        # shutting down one agent. Deny local children before any await.
+        retire_process_runtime_custody(getattr(self, "_execution_custody", None))
         storage_close_timeout = _minimum_storage_close_timeout(self.storage)
         # A feature may lazily create a file-backed SQLAlchemy factory during
         # its shutdown.  Reserve that backend-declared *potential* close
@@ -9419,6 +10277,7 @@ Expected Duration: {expected_duration}
         has_mcp = bool(self.mcp_agent and hasattr(self.mcp_agent, "shutdown"))
         has_llm = bool(self.llm_service and hasattr(self.llm_service, "close"))
         has_task_mgr = bool(self.task_manager and hasattr(self.task_manager, "close"))
+        has_host_db = vars(self).get("_resolved_local_host_db") is not None
 
         pending_ops = (
             int(has_ephemeral)
@@ -9430,6 +10289,7 @@ Expected Duration: {expected_duration}
             + int(has_mcp)
             + int(has_llm)
             + int(has_task_mgr)
+            + int(has_host_db)
         )
 
         def _step_budget() -> float:
@@ -9476,14 +10336,95 @@ Expected Duration: {expected_duration}
 
             async def step() -> ReleaseOutcome:
                 nonlocal reported
-                reported = reported_outcome(
-                    await asyncio.wait_for(operation(), timeout=budget)
+                from kestrel_sovereign._async_ownership import (
+                    OwnedTaskAdmission, await_owned_task, create_owned_task,
                 )
+
+                admission = OwnedTaskAdmission()
+                admitted = False
+                step_deadline = loop.time() + budget
+                deadline_expired = False
+                requested = False
+                deadline_handle = None
+
+                def request_interrupt(task, *, expired=False):
+                    nonlocal requested, deadline_expired
+                    if task.done():
+                        return
+                    deadline_expired = deadline_expired or expired
+                    if not task.cancelling():
+                        requested = True
+                        task.cancel()
+
+                def expire_step(task):
+                    request_interrupt(task, expired=True)
+
+                try:
+                    task = create_owned_task(
+                        operation(), retain_originals=True, admission=admission,
+                    )
+                    admitted = True
+                    # Queue the accepted Task BEFORE its deadline callback.
+                    # Even an expired slice permits that original first turn;
+                    # wait_for(coroutine, 0) never enters the body at all. Keep
+                    # the pre-admission absolute deadline, not a renewed slice.
+                    deadline_handle = loop.call_at(
+                        step_deadline, expire_step, task,
+                    )
+                    # Do not await the child directly through wait_for: every
+                    # repeated caller cancellation would interrupt its native
+                    # unwind again. The original deadline and first withdrawal
+                    # share ONE cancellation request; the join remains owned.
+                    outcome = await await_owned_task(
+                        task, cancel_on_caller_cancellation=request_interrupt,
+                    )
+                    child_error = outcome.error
+                    if (requested and isinstance(child_error, asyncio.CancelledError)
+                        and not is_execution_control_error(child_error)):
+                        child_error = None
+                    terminal = execution_terminal_error(
+                        child_error, outcome.cancellation,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    if terminal is not None:
+                        raise terminal
+                    if deadline_expired:
+                        raise TimeoutError()
+                    result = outcome.result
+                except BaseException as opening:
+                    task = admission.task
+                    if task is None:
+                        raise
+                    # Publication-failed start gates already own their exact
+                    # failure. Only an admitted operation may receive our
+                    # cancellation, and never a second native unwind interrupt.
+                    if admitted:
+                        request_interrupt(task)
+                    outcome = await await_owned_task(task)
+                    child_error = outcome.error
+                    if (requested
+                        and isinstance(child_error, asyncio.CancelledError)
+                        and not is_execution_control_error(child_error)):
+                        # This is the deadline's own cooperative interrupt,
+                        # not another independent native control receipt.
+                        child_error = None
+                    terminal = execution_terminal_error(
+                        opening, child_error, outcome.cancellation,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    raise terminal
+                finally:
+                    if deadline_handle is not None:
+                        deadline_handle.cancel()
+                reported = reported_outcome(result)
                 return reported
 
             try:
                 await custody.release(resource, step)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
+                if is_execution_control_error(cancellation):
+                    remember_finite(cancellation)
+                    return reported
                 # Whole-agent shutdown is being cancelled. Stop the sweep and
                 # propagate to the durable tail via ``finally``.
                 logging.warning(
@@ -9492,13 +10433,22 @@ Expected Duration: {expected_duration}
                     label,
                 )
                 raise
-            except asyncio.TimeoutError:
+            except BaseExceptionGroup as failure:
+                if is_execution_control_error(failure):
+                    remember_finite(failure)
+                elif isinstance(failure, Exception):
+                    logging.warning("Error during %s shutdown: %s", label, failure, exc_info=True)
+                else:
+                    raise
+            except asyncio.TimeoutError as timeout:
+                remember_finite(timeout)
                 logging.warning(
                     "%s shutdown exceeded %.2fs; abandoning and continuing sweep",
                     label,
                     budget,
                 )
             except Exception as e:
+                remember_finite(e)
                 logging.warning(
                     "Error during %s shutdown: %s", label, e, exc_info=True
                 )
@@ -9643,6 +10593,14 @@ Expected Duration: {expected_duration}
                     _step_budget(),
                 )
 
+            if has_host_db:
+                host_db_budget = _step_budget()
+                if not self._has_pending_llm_storage_dependents():
+                    await _release_within(
+                        "host_key_database", "Host key database",
+                        self._close_local_host_db, host_db_budget,
+                    )
+
             # Close TaskManager stores (critical for preventing thread leaks)
             if self.task_manager and hasattr(self.task_manager, 'close'):
                 await _release_within(
@@ -9651,7 +10609,8 @@ Expected Duration: {expected_duration}
                     self.task_manager.close,
                     _step_budget(),
                 )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            remember_finite(cancellation)
             shutdown_cancelled = True
         finally:
             # Re-read the actual cache at the tail boundary.  The original
@@ -9670,11 +10629,17 @@ Expected Duration: {expected_duration}
             # cancellation cannot make the outer wait_for / CLI "forcing exit"
             # branch unreachable. Returns whether cancellation was observed
             # and whether any step degraded (abandoned/errored).
-            tail_cancelled, tail_degraded = await self._run_durable_shutdown_tail(
-                tail_reserve,
-                storage_close_timeout=storage_close_timeout,
-                storage_preclose_timeout=storage_preclose_timeout,
-            )
+            try:
+                tail_cancelled, tail_degraded = await self._run_durable_shutdown_tail(
+                    tail_reserve,
+                    storage_close_timeout=storage_close_timeout,
+                    storage_preclose_timeout=storage_preclose_timeout,
+                )
+            except BaseException as tail_failure:
+                if not is_execution_control_error(tail_failure):
+                    raise
+                remember_finite(tail_failure)
+                tail_cancelled, tail_degraded = False, True
             if tail_cancelled:
                 shutdown_cancelled = True
 
@@ -9688,12 +10653,19 @@ Expected Duration: {expected_duration}
         dispatcher_owner_fenced = bool(
             getattr(dispatcher, "durable_shutdown_owner_fenced", False)
         )
-        if not shutdown_cancelled and not dispatcher_owner_fenced:
+        llm_owner_fenced = self._has_pending_llm_storage_dependents()
+        if not shutdown_cancelled and not dispatcher_owner_fenced and not llm_owner_fenced:
             try:
                 await self.wait_for_shutdown_completion()
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
+                remember_finite(cancellation)
                 shutdown_cancelled = True
-        elif dispatcher_owner_fenced:
+            except (Exception, BaseExceptionGroup) as failure:
+                remember_finite(failure)
+                if not is_execution_control_error(failure):
+                    raise
+                tail_degraded = True
+        elif dispatcher_owner_fenced or llm_owner_fenced:
             # The continuation owns storage close after the hostile cognition
             # task settles. Returning degraded keeps shutdown bounded without
             # making that live task peer-reclaimable in this process.
@@ -9707,9 +10679,14 @@ Expected Duration: {expected_duration}
             # is still running.
             tail_degraded = True
 
-        context_cancelled, context_failure = await self._close_standalone_hold_context()
+        context_withdrawals: list[BaseException] = []
+        context_cancelled, context_failure = await self._close_standalone_hold_context(
+            withdrawals=context_withdrawals,
+        )
+        finite_outcomes.extend(context_withdrawals)
         shutdown_cancelled = shutdown_cancelled or context_cancelled
         if context_failure is not None:
+            remember_finite(context_failure)
             tail_degraded = True
             logging.warning(
                 "Standalone Hold context shutdown failed: %s",
@@ -9721,6 +10698,14 @@ Expected Duration: {expected_duration}
                 ),
             )
 
+        # Physical retirement still runs for every owner. Its completion does
+        # not turn an unresolved COMMIT/authority receipt into successful Stop.
+        finite_terminal = execution_terminal_error(
+            vars(self).get("_shutdown_control"), *finite_outcomes,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        if finite_terminal is not None:
+            raise finite_terminal
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer
             # asyncio.wait_for surfaces the timeout/cancellation. Report the
@@ -9835,6 +10820,18 @@ Expected Duration: {expected_duration}
         loop = asyncio.get_running_loop()
 
         state = {"cancelled": False, "degraded": False}
+        admission_failures: list[BaseException] = []
+
+        def tail_result(degraded=None):
+            # Independent tail steps get their attempt before an admission
+            # fault is surfaced. Early ownership-transfer returns still report
+            # that same failure, never silently convert it into degraded success.
+            if admission_failures:
+                raise execution_terminal_error(
+                    vars(self).get("_shutdown_control"), *admission_failures,
+                    retain_originals=True, isolate_control_originals=True,
+                )
+            return state["cancelled"], state["degraded"] if degraded is None else degraded
 
         # Count the tail steps that will actually run so each fair-divides the
         # live remaining tail budget (with a nonzero floor per step).
@@ -9849,6 +10846,16 @@ Expected Duration: {expected_duration}
         run_storage = hasattr(self.storage, "close")
         if storage_close_timeout is None:
             storage_close_timeout = _minimum_storage_close_timeout(self.storage)
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        # Native storage owns physical backend retirement even when its close
+        # reservation is zero (PostgreSQL). A cancelled observer must retain
+        # that original owner, never close the coroutine joining its backend.
+        native_storage_resource = (
+            self.storage
+            if isinstance(getattr(self.storage, "db", None), AsyncDatabase)
+            else None
+        )
         if storage_preclose_timeout is None:
             storage_preclose_timeout = max(
                 _minimum_storage_potential_preclose_timeout(self.storage),
@@ -9918,10 +10925,15 @@ Expected Duration: {expected_duration}
             defer_failure_report: bool = False,
         ) -> str:
             """Read a completed task's outcome, recording degradation."""
-            if task.cancelled():
+            from kestrel_sovereign._async_ownership import owned_task_error
+
+            exc = owned_task_error(task)
+            self._remember_shutdown_control(
+                exc, retain_originals=True, retain_cancellation=True,
+            )
+            if isinstance(exc, asyncio.CancelledError):
                 state["cancelled"] = True
                 return "cancelled"
-            exc = task.exception()
             if exc is None:
                 return "ok"
             if not defer_failure_report:
@@ -9934,29 +10946,54 @@ Expected Duration: {expected_duration}
                 state["degraded"] = True
             return "error"
 
-        def _abandon(task) -> None:
-            """Force-terminate an over-guard / cancelled tail step.
+        def _abandon(task, *, retirement_resource=None) -> None:
+            """Stop observing a tail step without dropping its native owners.
 
-            ``task.cancel()`` alone is not enough: a step that suppresses
-            ``CancelledError`` keeps running forever and would hang a graceful
-            event-loop teardown that awaits every still-pending task (and, in
-            production, leak past process exit). Closing the underlying
-            coroutine throws ``GeneratorExit`` — a ``BaseException`` the step
-            cannot swallow with ``except CancelledError`` — so the frame is
-            guaranteed to unwind. A done callback retrieves the resulting
-            exception so it is never surfaced as "exception never retrieved".
+            Native retirement keeps its exact original Task and eventual
+            evidence. It is never coroutine-closed while joining an accepted
+            physical closer. The legacy hard-stop fallback below applies only
+            to steps without that explicit native-retirement contract.
+
+            Legacy steps that suppress cancellation get their existing Python
+            coroutine-close attempt. That is not a native retirement ACK and
+            cannot stand in for joining an accepted physical closer. A done
+            callback harvests the legacy task's eventual exception too.
             """
             task.cancel()  # cooperative first; unblocks well-behaved steps
+            if retirement_resource is not None:
+                from kestrel_sovereign._async_ownership import (
+                    owned_task_error,
+                    pending_owned_retirement_error,
+                )
+
+                retained = pending_owned_retirement_error(
+                    retirement_resource, (task,),
+                    message="original native shutdown owner exceeded its observer guard",
+                )
+                self._remember_shutdown_control(retained, retain_originals=True)
+
+                def retain_native_terminal(completed):
+                    self._remember_shutdown_control(execution_terminal_error(
+                        vars(self).get("_shutdown_control"), retained,
+                        owned_task_error(completed), retain_originals=True,
+                    ))
+
+                task.add_done_callback(retain_native_terminal)
+                return  # NEVER close the coroutine joining its native closer.
             coro = task.get_coro()
             if coro is not None:
                 try:
-                    coro.close()  # hard stop — GeneratorExit cannot be suppressed
-                except Exception:
-                    pass
+                    coro.close()  # legacy Python-frame unwind, not a native ACK
+                except Exception as failure:
+                    self._remember_shutdown_control(failure)
             # Retrieve the eventual exception once the task reconciles to done.
-            task.add_done_callback(
-                lambda t: None if t.cancelled() else t.exception()
-            )
+            def retain_terminal(completed):
+                try:
+                    failure = completed.exception()
+                except asyncio.CancelledError as cancellation:
+                    failure = cancellation
+                self._remember_shutdown_control(failure)
+            task.add_done_callback(retain_terminal)
 
         async def _bounded(
             coro,
@@ -9965,34 +11002,67 @@ Expected Duration: {expected_duration}
             *,
             shielded: bool = False,
             defer_failure_report: bool = False,
+            retirement_resource=None,
         ):
             """Run one tail step bounded by ``guard``.
 
             The coroutine is scheduled as a task and awaited only up to
             ``guard`` via ``asyncio.wait`` — which, unlike ``asyncio.wait_for``,
             does NOT wait for the task's cancellation to complete on timeout.
-            If the step exceeds the guard it is CANCELLED, hard-terminated, and
-            ABANDONED (never awaited), so a step that hangs *or suppresses
-            cancellation* cannot stall the tail beyond ``guard`` (the outer
-            ``wait_for`` / CLI "forcing exit" branch stays reachable) nor leak
-            past it. When ``shielded`` the underlying task keeps running if the
+            At the guard, the tail stops waiting and records degradation; it
+            does not renew the observer budget. Legacy steps keep their old
+            cancellation/frame-unwind fallback. Native-retirement steps retain
+            their original Task and eventual physical-close evidence instead.
+            When ``shielded`` the underlying task keeps running if the
             tail's own await is cancelled externally (used for
             ``force_snapshot`` so cancellation neither aborts it nor skips the
-            following ``stop()``); it is still bounded by ``guard``.
+            following ``stop()``); it is still bounded by ``guard``. An explicit
+            retirement resource retains the Task past that observation bound;
+            completion remains owned and a later completion waiter joins it.
             """
             # Every guard and any cancellation grace shares the one live tail
             # deadline.  In particular, an externally-cancelled shielded
             # close must not receive a fresh full guard after the deadline.
             guard = min(max(0.0, guard), max(0.0, tail_deadline - loop.time()))
-            task = asyncio.ensure_future(coro)
+            if retirement_resource is None:
+                task = asyncio.ensure_future(coro)
+            else:
+                from kestrel_sovereign._async_ownership import (
+                    OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
+                )
+
+                admission = OwnedTaskAdmission()
+                try:
+                    task = create_owned_task(
+                        coro, retirement_resource=retirement_resource,
+                        retain_originals=True, admission=admission,
+                    )
+                except BaseException as failure:
+                    accepted = admission.task
+                    outcome = await await_owned_task(accepted) if accepted is not None else None
+                    terminal = execution_terminal_error(
+                        owned_task_admission_error(retirement_resource, admission, failure),
+                        outcome.error if outcome is not None else None,
+                        outcome.cancellation if outcome is not None else None,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    if outcome is not None and outcome.cancellation is not None:
+                        state["cancelled"] = True
+                    self._remember_shutdown_control(terminal)
+                    admission_failures.append(terminal)
+                    state["degraded"] = True
+                    return "error"
             try:
                 done, _pending = await asyncio.wait({task}, timeout=guard)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as withdrawal:
                 # The tail's own await was cancelled externally. ``asyncio.wait``
                 # does not cancel its futures, so a shielded task is still
                 # running — give it a bounded chance to finish so data-critical
                 # steps are not aborted, then propagate via state["cancelled"].
                 state["cancelled"] = True
+                self._remember_shutdown_control(
+                    withdrawal, retain_originals=True, retain_cancellation=True,
+                )
                 if shielded:
                     cancellation_grace = min(
                         guard, max(0.0, tail_deadline - loop.time())
@@ -10001,8 +11071,11 @@ Expected Duration: {expected_duration}
                         done, _pending = await asyncio.wait(
                             {task}, timeout=cancellation_grace
                         )
-                    except asyncio.CancelledError:
-                        _abandon(task)
+                    except asyncio.CancelledError as withdrawal:
+                        self._remember_shutdown_control(
+                            withdrawal, retain_originals=True, retain_cancellation=True,
+                        )
+                        _abandon(task, retirement_resource=retirement_resource)
                         if not defer_failure_report:
                             state["degraded"] = True
                         return "abandoned"
@@ -10012,17 +11085,17 @@ Expected Duration: {expected_duration}
                             label,
                             defer_failure_report=defer_failure_report,
                         )
-                    _abandon(task)
+                    _abandon(task, retirement_resource=retirement_resource)
                     if not defer_failure_report:
                         state["degraded"] = True
                     return "abandoned"
-                _abandon(task)  # do NOT await — may suppress cancel
+                _abandon(task, retirement_resource=retirement_resource)
                 return "cancelled"
 
             if task not in done:
                 # Exceeded the guard. Hard-terminate but do NOT await — the step
                 # may suppress cancellation and would otherwise hang us.
-                _abandon(task)
+                _abandon(task, retirement_resource=retirement_resource)
                 if not defer_failure_report:
                     logging.warning(
                         "Durable shutdown step '%s' exceeded %.2fs; abandoned "
@@ -10116,6 +11189,7 @@ Expected Duration: {expected_duration}
                 _step_guard(),
                 "sync-snapshot",
                 shielded=True,
+                retirement_resource=sync_service,
             )
             # Always attempt stop() — even if the snapshot was abandoned or
             # cancellation was observed — so the sync worker is released.
@@ -10132,6 +11206,7 @@ Expected Duration: {expected_duration}
                 custody.release("sync_service", release_sync),
                 _step_guard(),
                 "sync-stop",
+                retirement_resource=sync_service,
             )
             if status == "ok":
                 logging.info("Sync service: final snapshot flushed")
@@ -10148,7 +11223,7 @@ Expected Duration: {expected_duration}
                 continuation = await self._ensure_durable_shutdown_continuation(
                     dispatcher
                 )
-            return state["cancelled"], state["degraded"]
+            return tail_result()
 
         if run_dispatcher and not dispatcher_shutdown_complete:
             await self._ensure_durable_shutdown_continuation(dispatcher)
@@ -10157,7 +11232,14 @@ Expected Duration: {expected_duration}
                 "tail guard; an agent-owned continuation will close storage "
                 "after owner release."
             )
-            return state["cancelled"], state["degraded"]
+            return tail_result()
+
+        if self._has_pending_llm_storage_dependents():
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+            # The finite shutdown boundary hands off to an explicit lifecycle
+            # join. Neither SQLAlchemy nor primary storage may close early.
+            return tail_result(True)
+        await self._join_llm_storage_dependents()
 
         # Dispose an optional cached SQLAlchemy engine as its own bounded
         # phase.  Otherwise a slow engine disposal can consume the guard that
@@ -10176,7 +11258,9 @@ Expected Duration: {expected_duration}
                     max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
                 ),
                 "storage-sqla-pre-close",
-                shielded=storage_preclose_timeout > 0.0,
+                shielded=(storage_preclose_timeout > 0.0 or
+                          native_storage_resource is not None),
+                retirement_resource=native_storage_resource,
                 # The primary SQLite backend owns an independent worker.  It
                 # must receive its reserved close chance before a pre-close
                 # timeout/error is reported as degraded.
@@ -10185,7 +11269,8 @@ Expected Duration: {expected_duration}
 
         # Close storage — SQLite gets its declared worker-exit reservation and
         # keeps running through an external cancellation until that bounded
-        # contract completes.  Other backends retain the existing behavior.
+        # contract completes. Native backends also retain their physical close
+        # owner through observer withdrawal; legacy custom stores are unchanged.
         if run_storage:
             storage = self.storage
 
@@ -10202,7 +11287,9 @@ Expected Duration: {expected_duration}
                 custody.release("storage", close_storage),
                 _step_guard(storage_close_timeout),
                 "storage-close",
-                shielded=storage_close_timeout > 0.0,
+                shielded=(storage_close_timeout > 0.0 or
+                          native_storage_resource is not None),
+                retirement_resource=native_storage_resource,
             )
 
         if storage_preclose_status in {"error", "abandoned"}:
@@ -10214,4 +11301,4 @@ Expected Duration: {expected_duration}
             )
             state["degraded"] = True
 
-        return state["cancelled"], state["degraded"]
+        return tail_result()

@@ -14,6 +14,7 @@ from typing import List
 
 import pytest
 
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.sovereign_adapter import (
     TARGET_DB_PATH_REMOVAL_RELEASE,
     SovereignStorageAdapter,
@@ -72,18 +73,22 @@ async def test_non_none_target_db_path_is_refused_before_any_io(target):
     assert "s3cret" not in str(excinfo.value)
 
 
-async def test_omitted_keyword_does_not_warn(recwarn):
-    transport = _NoFetch()
-    adapter = SovereignStorageAdapter(
-        _UntouchableDatabase(), user_secret="secret",
-        filecoin_adapter=transport, agent_id="a",
-    )
-
-    # An ordinary call proceeds to the package fetch, its first I/O.
-    with pytest.raises(RuntimeError, match="Failed to fetch"):
-        await adapter.import_agent("bafy-fetch-attempted")
-
-    assert transport.calls
+async def test_omitted_keyword_does_not_warn(recwarn, tmp_path):
+    # The omitted keyword admits the ordinary import path. Unlike an explicit
+    # unsupported destination, it owns an actual audit write even on rejection;
+    # an untouchable database would be a second, unrelated failure, not a
+    # transport/refusal proof. Use real SQLite and archive validation instead.
+    db = await AsyncDatabase.sqlite(str(tmp_path / "omitted-destination.db"))
+    try:
+        adapter = SovereignStorageAdapter(
+            db, user_secret="secret", filecoin_adapter=object(), agent_id="a",
+        )
+        result = await adapter.import_agent(b"owned invalid CAR fixture")
+        assert not result.success and result.status == "rejected"
+        rows = await adapter.get_import_log()
+        assert len(rows) == 1 and rows[0]["status"] == "rejected"
+    finally:
+        await db.close()
     assert not [w for w in recwarn if "target_db_path" in str(w.message)]
 
 

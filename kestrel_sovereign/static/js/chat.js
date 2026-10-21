@@ -4,6 +4,7 @@
  */
 
 import API from './api.js';
+import { artifactPartRenderer } from './artifact_panel.mjs';
 import { state, AGENT_COMMANDS, Modal, Toast, getOrCreateChatPane, escapeHtml, getOverlayRoot } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import bus from './ui-ext/bus.js';
@@ -691,6 +692,8 @@ export function registerCoreParts() {
     registerPartRenderer('notice', noticePartRenderer);
     registerPartRenderer('channel_link', channelLinkPartRenderer);
     registerPartRenderer('todo', todoPartRenderer);
+    registerPartRenderer('artifact', (data, context) => artifactPartRenderer(data,
+        { ...context, workspaceRoot: getOverlayRoot() }, deps().api));
 }
 
 // ============================================================================
@@ -1692,10 +1695,22 @@ function takeStagedAttachments(pane) {
     return staged;
 }
 
-export function initAttachmentComposer() {
+function refreshChatElements() {
+    // mount() can reactivate an already-wired surface after another root.
+    // Refresh references even then, without repeating listeners/pane bootstrap.
+    chatContainer = el('chat-container');
+    messageInput = el('message-input');
+    sendButton = el('send-button');
+    modelSelector = el('model-selector');
+    thinkingIndicator = el('thinking-indicator');
+    composerModeToggle = el('composer-mode-toggle');
     attachButton = el('attach-button');
     attachInput = el('attach-input');
     attachTray = el('attachment-tray');
+}
+
+export function initAttachmentComposer() {
+    refreshChatElements();
     attachButton?.addEventListener('click', () => attachInput?.click());
     attachInput?.addEventListener('change', () => {
         if (attachInput.files) handleComposerFiles(attachInput.files, false);
@@ -1725,17 +1740,12 @@ export function initChat() {
     // doubled every listener below. The marker sits on the #chat-container
     // being wired, so the same DOM reached through another root is still
     // recognised, and replaced chat markup is wired afresh.
-    if (el('chat-container')?.dataset.kestrelChatMounted) return;
+    refreshChatElements();
+    if (chatContainer?.dataset.kestrelChatMounted) return;
     // #1914: wire the console's core typed-part renderers so component bubbles
     // (notice today; todo via #1894, citations, …) render in the standalone
     // sovereign console, not only in Frinz-style embedders.
     registerCoreParts();
-    chatContainer = el('chat-container');
-    messageInput = el('message-input');
-    sendButton = el('send-button');
-    modelSelector = el('model-selector');
-    thinkingIndicator = el('thinking-indicator');
-    composerModeToggle = el('composer-mode-toggle');
 
     // Initial-pane migration: HTML ships welcome content baked into
     // #chat-container. Move that content into a pane element so the

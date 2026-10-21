@@ -599,6 +599,7 @@ class FoundationPayerResolver:
         )
         from kestrel_sovereign.features.llm_keys.openrouter_provisioning import (
             OpenRouterProvisioningService,
+            _run_provisioning_lifecycle,
         )
 
         # Idempotent: skip if agent already has an OpenRouter key.
@@ -622,10 +623,11 @@ class FoundationPayerResolver:
         # past create_agent_key so we can revoke if the local persist
         # fails.
         provisioning = OpenRouterProvisioningService(management_key=master_key)
-        try:
-            # Per-agent monthly cap from the policy spec; default $100/mo
-            # mirrors the deprecated provision_agent_openrouter.py default.
-            limit_usd = float(spec.monthly_cap_usd) if spec.monthly_cap_usd is not None else 100.0
+        # Per-agent monthly cap from the policy spec; default $100/mo mirrors
+        # the deprecated provision_agent_openrouter.py default.
+        limit_usd = float(spec.monthly_cap_usd) if spec.monthly_cap_usd is not None else 100.0
+
+        async def mint_and_persist():
             key_info = await provisioning.create_agent_key(
                 agent_name=agent_did,
                 limit_usd=limit_usd,
@@ -654,6 +656,9 @@ class FoundationPayerResolver:
                 try:
                     await provisioning.delete_key(key_info.key_hash)
                 except Exception as revoke_err:
+                    from kestrel_sovereign.execution_custody import is_execution_control_error
+                    if is_execution_control_error(revoke_err):
+                        raise
                     # Revoke failed — the remote key is now orphaned.
                     # Surface clearly so an operator can clean up via
                     # scripts/manage_openrouter_keys.py delete --hash ...
@@ -669,7 +674,8 @@ class FoundationPayerResolver:
                     f"PayerResolver: graph_nodes row for agent "
                     f"{agent_did[:30]}... disappeared mid-mint. Remote "
                     "child key revoked (or revoke logged for manual "
-                    "cleanup). No local state was changed; retry is safe."
+                    "cleanup). No local credential was stored; reconcile "
+                    "remote child-key state before retry."
                 )
 
             # Persist locally. Subsequent use_agent_key calls find it via
@@ -683,8 +689,11 @@ class FoundationPayerResolver:
                 api_key=key_info.key,
                 reactivate_inactive=True,
             )
-        finally:
-            await provisioning.close()
+            return key_info
+
+        # Persist/revoke and the original awaited close share one admission.
+        # A late close cannot erase body control or disclose an enabled payer.
+        key_info = await _run_provisioning_lifecycle(provisioning, mint_and_persist)
 
         logger.info(
             f"PayerResolver: minted OpenRouter child key for agent "
@@ -860,6 +869,13 @@ async def open_host_db(
 
     if host_db_path is None:
         return None
+    from kestrel_sovereign.execution_custody import current_execution_custody
+
+    if current_execution_custody():
+        from kestrel_sovereign.services.process_host_database import (
+            open_process_host_database,
+        )
+        return await open_process_host_database(str(host_db_path), cold_read=cold_read)
     if cold_read:
         return await AsyncDatabase.sqlite(
             str(host_db_path),

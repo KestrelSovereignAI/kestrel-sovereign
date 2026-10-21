@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
+from kestrel_sovereign.execution_custody import owned_native_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +160,7 @@ async def refresh_anthropic_token(
     if http_client is not None:
         resp = await _post(http_client)
     else:
-        async with httpx.AsyncClient() as c:
+        async with owned_native_http_client(httpx.AsyncClient()) as c:
             resp = await _post(c)
 
     if resp.status_code >= 400:

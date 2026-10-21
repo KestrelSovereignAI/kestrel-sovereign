@@ -36,7 +36,7 @@ from typing import Awaitable, Callable, Collection, Dict, Optional, Tuple
 #: ``sync_service``, ``heartbeat_runner``, ``resume_monitor``,
 #: ``salvage_worker``, ``background_tasks``) needs its close shown truthful
 #: the same way first.
-TRUTHFUL_CLOSE_OWNERS: frozenset[str] = frozenset({"task_manager"})
+TRUTHFUL_CLOSE_OWNERS: frozenset[str] = frozenset({"task_manager", "host_key_database"})
 
 #: The owner of every per-feature resource.
 FEATURE_OWNER = "feature"

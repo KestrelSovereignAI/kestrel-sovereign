@@ -5,20 +5,24 @@ Extracts command parsing and dispatch logic from the main agent,
 making the agent class cleaner and commands easier to test.
 """
 
-import logging
 import inspect
-from typing import Optional, Dict, Any, Callable
+import logging
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Callable, Dict, Optional
 
+from kestrel_sovereign.command_policy import (
+    RECOVERY_COMMANDS as CANONICAL_RECOVERY_COMMANDS,
+)
+from kestrel_sovereign.command_policy import (
+    SOVEREIGN_COMMANDS as CANONICAL_SOVEREIGN_COMMANDS,
+)
+from kestrel_sovereign.command_policy import (
+    requires_sovereign_authority,
+)
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_scoped_agent_did,
-)
-from kestrel_sovereign.command_policy import (
-    RECOVERY_COMMANDS as CANONICAL_RECOVERY_COMMANDS,
-    SOVEREIGN_COMMANDS as CANONICAL_SOVEREIGN_COMMANDS,
-    requires_sovereign_authority,
 )
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import (
@@ -873,4 +877,7 @@ class CommandHandler:
             else:
                 return f"Heartbeat error: {result.reason or result.message}"
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             return f"Heartbeat failed: {e}"

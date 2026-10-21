@@ -3746,7 +3746,9 @@ class AsyncAssertionStore:
         tenant_id, _ = self._require_scope()
         withdrawn = set(input_revision_ids)
         rows = await self._database.fetchall(
-            "SELECT r.revision_id, r.assertion_mapping "
+            "SELECT r.revision_id, r.lineage_kind, "
+            "CASE WHEN r.lineage_kind = 'direct' THEN NULL "
+            "ELSE r.assertion_mapping END "
             "FROM semantic_assertions a "
             "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
             "  AND r.revision_id = a.current_revision_id "
@@ -3757,14 +3759,16 @@ class AsyncAssertionStore:
             "ORDER BY r.revision_id ASC",
             (tenant_id, AssertionStatus.ACTIVE.value),
         )
-        current = {
-            str(revision_id): Assertion.from_mapping(json.loads(mapping))
-            for revision_id, mapping in rows
-        }
+        # Canonically accepted direct facts contribute only their eligible
+        # current IDs to the grounding set. Rebuilding every direct Assertion
+        # on each retraction makes a page of independent withdrawals quadratic
+        # in expensive mapping validation. Only inferred revisions participate
+        # in dependency planning; keep validating those complete mappings.
+        current_ids = {str(revision_id) for revision_id, _, _ in rows}
         inferred = {
-            revision_id: assertion
-            for revision_id, assertion in current.items()
-            if isinstance(assertion.lineage, DerivedLineage)
+            str(revision_id): Assertion.from_mapping(json.loads(mapping))
+            for revision_id, lineage_kind, mapping in rows
+            if lineage_kind != "direct"
         }
 
         # The canonical lineage is a compatibility fallback only for inferred
@@ -3801,9 +3805,8 @@ class AsyncAssertionStore:
 
         grounded = {
             revision_id
-            for revision_id, assertion in current.items()
-            if revision_id not in withdrawn
-            and not isinstance(assertion.lineage, DerivedLineage)
+            for revision_id in current_ids
+            if revision_id not in withdrawn and revision_id not in inferred
         }
         grounded_derivations: set[str] = set()
         changed = True

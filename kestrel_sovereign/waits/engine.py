@@ -27,6 +27,9 @@ from typing import Dict, List, Optional, Tuple
 
 from kestrel_sdk.tools import Outcome, ToolResult, Waitable
 
+from kestrel_sovereign.callbacks import invoke_host_callback
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 logger = logging.getLogger(__name__)
 
 # Held-turn ceiling for a handle wait. A handle wait polls (cheap) rather
@@ -196,8 +199,10 @@ async def run_wait_loop(
     start = time.monotonic()
     while True:
         try:
-            status = await provider.poll(handle)
+            status = await invoke_host_callback(provider.poll, handle)
         except Exception as exc:  # provider bug or transport failure
+            if is_execution_control_error(exc):
+                raise
             logger.exception("wait provider %s.poll(%r) raised", provider.kind, handle)
             return ToolResult.failed(
                 f"wait on {label} failed: {exc}",

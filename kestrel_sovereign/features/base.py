@@ -6,13 +6,25 @@ import logging
 import os
 import re
 import time
-from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Type as Type,
+    Union,
+    runtime_checkable,
+)
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
-from abc import ABC, abstractmethod
-from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
-from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from abc import ABC as ABC, abstractmethod
+
 # Import the A2A types from the SDK directly rather than the
 # ``kestrel_sovereign.a2a`` re-export package. Importing the sovereign a2a
 # package runs its ``__init__`` which eagerly pulls in task_manager/task_worker
@@ -23,15 +35,23 @@ from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 # the half-built module and raises a circular ImportError that silently disables
 # provider embeddings (#1792). The sovereign modules are pure re-exports of
 # these same SDK symbols, so importing them from the SDK is equivalent.
-from kestrel_sdk.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
-from kestrel_sdk.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
+from kestrel_sdk.a2a.agent_card import AgentCapabilities, AgentCard, AgentSkill
+from kestrel_sdk.a2a.types import (
+    Artifact,
+    DataPart,
+    Message,
+    Task,
+    TaskState,
+    TaskStatus,
+    TextPart,
+)
 
 # The SDK Feature is the canonical base class for feature packages.
 # Sovereign's richer Feature inherits from it so extracted packages that
 # subclass kestrel_sdk.features.base.Feature are also recognized as
 # kestrel_sovereign.features.base.Feature at runtime (issubclass passes).
 from kestrel_sdk.features.base import Feature as _SdkFeature
-from kestrel_sdk.features.ui import UIContributions
+
 # One source of truth for tool-schema generation: the @tool decorator and its
 # docstring parser live in the SDK. Sovereign re-exports them (not a second
 # copy) so both in-tree and external features share the SDK's annotation
@@ -39,7 +59,17 @@ from kestrel_sdk.features.ui import UIContributions
 # real JSON types instead of silently degrading to "string" (review finding
 # F003). The two former in-tree copies were verified behaviourally identical to
 # these across every feature docstring in the tree before removal.
-from kestrel_sdk.features.base import tool, parse_docstring_params
+from kestrel_sdk.features.base import parse_docstring_params as parse_docstring_params, tool as tool
+from kestrel_sdk.features.ui import UIContributions
+from kestrel_sdk.tools.base import AgentTool, ToolCategory as ToolCategory, ToolParameter as ToolParameter, ToolSchema
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    execution_work_operation,
+    is_execution_control_error,
+    require_execution_work,
+)
 from kestrel_sovereign.turn_completion import (
     confirm_unfinished,
     settle_repaired_content,
@@ -317,6 +347,7 @@ class Feature(_SdkFeature):
 
     def __init__(self, agent):
         self.agent = agent
+        self._execution_custody = getattr(agent, "_execution_custody", None)
         self.name = self.__class__.__name__
         self.disabled_skills: set = set()
 
@@ -402,6 +433,7 @@ class Feature(_SdkFeature):
             return response
         # The pattern is usually a finished answer's plan; confirm it first
         # when the decision check is on (#3527).
+        require_execution_work(self.agent)
         if not await confirm_unfinished(
             self.agent.llm_service, content, request=request, session_id=session_id,
         ):
@@ -411,6 +443,7 @@ class Feature(_SdkFeature):
             "[SUBAGENT %s] Model signaled continuation without tool_calls; issuing one repair turn",
             self.name,
         )
+        require_execution_work(self.agent)
         repaired = await self.agent.llm_service.generate_with_messages(
             messages=self._append_missing_tool_call_repair(messages, content),
             tools=tools if tools else None,
@@ -418,6 +451,7 @@ class Feature(_SdkFeature):
             model_override=model_override,
             invocation_context=_subagent_turn_identity(session_id),
         )
+        require_execution_work(self.agent)
         # A repair that neither calls a tool nor ran one inline either confirms
         # the message was the subagent's answer (keep it, followed by anything
         # the repair adds) or is a new answer. Settled on the response itself,
@@ -464,10 +498,22 @@ class Feature(_SdkFeature):
         safe. Overrides that do their own teardown should call
         ``await super().shutdown()``.
         """
-        await self._unregister_owned_signal_sources()
-        await self._unregister_owned_wait_providers()
-        await self._cancel_owned_background_tasks()
-        await self._unregister_owned_sleep_hooks()
+        failures = []
+        for release in (
+            self._unregister_owned_signal_sources,
+            self._unregister_owned_wait_providers,
+            self._cancel_owned_background_tasks,
+            self._unregister_owned_sleep_hooks,
+        ):
+            try:
+                await release()
+            except BaseException as error:
+                if not is_execution_control_error(error) and not isinstance(error, asyncio.CancelledError):
+                    raise
+                failures.append(error)
+        if failures:
+            from kestrel_sovereign.execution_custody import execution_terminal_error
+            raise execution_terminal_error(*failures, retain_originals=True, isolate_control_originals=True)
 
     # ------------------------------------------------------------------
     # Signal-source ownership (#2522 P2)
@@ -854,7 +900,9 @@ class Feature(_SdkFeature):
     # FULL agent shutdown, so without feature ownership a disabled feature's
     # loop keeps running against a torn-down feature.
     # ------------------------------------------------------------------
-    def _track_owned_background_task(self, coro, *, name: str) -> asyncio.Task:
+    def _track_owned_background_task(
+        self, coro, *, name: str, _resident_owner: bool = False, admission=None,
+    ) -> asyncio.Task:
         """Start an agent-owned background task AND record it for feature
         teardown (#2522 P1).
 
@@ -866,7 +914,12 @@ class Feature(_SdkFeature):
         :meth:`_register_signal_sources` / :meth:`_register_wait_provider`.
         """
         agent = getattr(self, "agent", None)
-        track = getattr(agent, "_track_background_task", None)
+        runtime_track = getattr(type(agent), "_track_runtime_task", None)
+        track = (
+            agent._track_runtime_task
+            if _resident_owner and callable(runtime_track)
+            else getattr(agent, "_track_background_task", None)
+        )
         if not callable(track):
             # The agent owns background-task lifecycle; a feature can't safely
             # start an unreaped task. Fail loudly rather than leak the coroutine.
@@ -876,24 +929,53 @@ class Feature(_SdkFeature):
                 "has no _track_background_task; cannot own background task "
                 f"'{name}'"
             )
-        task = track(coro, name=name)
         owned = getattr(self, "_owned_background_tasks", None)
         if owned is None:
             owned = []
             self._owned_background_tasks = owned
-        owned.append(task)
+        options = {"admission": admission} if admission is not None else {}
+        try:
+            task = track(coro, name=name, **options)
+        finally:
+            if admission is not None and admission.task is not None:
+                owned.append(admission.task)
+        if admission is None:
+            owned.append(task)
         # Self-clean on completion so repeated / unbounded spawners (Peers'
         # per-question supervisors, RestartCoordinator's per-restart ack) don't
         # accumulate finished-task refs here — the mirror of the agent's global
         # set auto-discard. ``_owned`` binds THIS list, so a late callback firing
         # after :meth:`_cancel_owned_background_tasks` rebinds the attribute is a
         # harmless no-op rather than touching the fresh list (#2522 P1/P2).
-        task.add_done_callback(
-            lambda finished, _owned=owned: (
-                _owned.remove(finished) if finished in _owned else None
-            )
-        )
+        def completed(finished, _owned=owned):
+            from kestrel_sovereign._async_ownership import owned_task_error
+            self._remember_background_control(owned_task_error(finished))
+            if finished in _owned:
+                _owned.remove(finished)
+        task.add_done_callback(completed)
         return task
+
+    def _remember_background_control(self, error: BaseException | None) -> None:
+        from kestrel_sovereign.execution_custody import execution_cleanup_debts
+        if error is None or not (is_execution_control_error(error) or execution_cleanup_debts(error)):
+            return
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        self._owned_background_control = execution_terminal_error(
+            vars(self).get("_owned_background_control"), error,
+        )
+
+    def _track_owned_runtime_task(self, coro, *, name: str) -> asyncio.Task:
+        """Own an explicit resident service through READY and feature teardown.
+
+        Only first-party lifecycle publication uses this handoff. Ordinary
+        effect children continue using `_track_owned_background_task` and keep
+        every caller admission. Core's resident tracker validates creation and
+        carries the same irreversible runtime generation, never a replacement.
+        Legacy standalone agents retain their existing background-task scope.
+        """
+        return self._track_owned_background_task(
+            coro, name=name, _resident_owner=True,
+        )
 
     async def _cancel_owned_background_tasks(self) -> None:
         """Cancel exactly the background tasks this feature started (#2522 P1).
@@ -905,15 +987,45 @@ class Feature(_SdkFeature):
         cancelled task from its global set, so this does not leave a dangling
         reference there.
         """
-        tasks = getattr(self, "_owned_background_tasks", None)
-        if not tasks:
-            return
+        owned = getattr(self, "_owned_background_tasks", ()) or ()
+        current = asyncio.current_task()
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
+        reentrant = owned_task_join_ancestors(current) | {current}
+        tasks = tuple(task for task in owned if task not in reentrant)
         pending = [task for task in tasks if not task.done()]
         for task in pending:
             task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        self._owned_background_tasks = []
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+        )
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        cancellations, observations = [], []
+        joined = []
+        for task in tasks:
+            if task is current or task in owned_task_join_ancestors(current):
+                continue
+            outcome = await await_owned_task(task)
+            self._remember_background_control(outcome.error)
+            if is_execution_control_error(outcome.error):
+                observations.append(outcome.error)
+            joined.append(task)
+            if outcome.cancellation is not None:
+                cancellations.append(outcome.cancellation)
+        # Reentrant shutdown can originate in one of these actual Tasks. It
+        # cannot cancel/join itself or its actual waiting callers. Keep their
+        # ORIGINAL list/root so existing
+        # completion callback removes it only when it physically finishes; do
+        # not publish a fresh list that strands that callback's ownership.
+        if isinstance(owned, list):
+            for task in joined:
+                if task in owned:
+                    owned.remove(task)
+        terminal = execution_terminal_error(
+            vars(self).get("_owned_background_control"), *observations, *cancellations,
+            retain_originals=True, isolate_control_originals=True,
+        )
+        if terminal is not None:
+            raise terminal
 
     # ------------------------------------------------------------------
     # Sleep-hook ownership (#2522 P1)
@@ -1106,8 +1218,8 @@ class Feature(_SdkFeature):
                 if isinstance(disabled, list):
                     self.disabled_skills = set(disabled)
                 return config
-        except Exception:
-            if raise_on_error:
+        except Exception as error:
+            if is_execution_control_error(error) or raise_on_error:
                 raise
             logger.warning("Failed to load persisted config for %s", self.name)
         return None
@@ -1132,7 +1244,9 @@ class Feature(_SdkFeature):
         if callable(allows):
             try:
                 permitted = bool(allows())
-            except Exception:  # noqa: BLE001 - never let a policy probe block boot
+            except Exception as error:  # noqa: BLE001 - ordinary policy failure denies
+                if is_execution_control_error(error):
+                    raise
                 permitted = False
             if not permitted:
                 logger.debug(
@@ -1151,6 +1265,8 @@ class Feature(_SdkFeature):
             )
             await storage.add_node(node)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to persist config for {self.name}: {e}")
 
     # =========================================================================
@@ -1295,6 +1411,8 @@ class Feature(_SdkFeature):
             return task
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Feature {self.name} task handling failed: {e}")
             task.status = TaskStatus(
                 state=TaskState.FAILED,
@@ -1549,6 +1667,7 @@ class Feature(_SdkFeature):
                 )
                 if feature_tools else None
             )
+            require_execution_work(self.agent)
             response = await self.agent.llm_service.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -1561,6 +1680,7 @@ class Feature(_SdkFeature):
                 # so it carries no provider-continuation meaning to collide with.
                 session_id=turn_session_id,
             )
+            require_execution_work(self.agent)
 
             # Log what we got back
             if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -1595,9 +1715,14 @@ class Feature(_SdkFeature):
             envelope: Dict[str, Any] = {"success": True, "result": result}
             if subagent_parts:
                 envelope["parts"] = subagent_parts
+            require_execution_work(self.agent)
             return envelope
 
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Feature {self.name} subagent execution failed: {e}")
             err_envelope: Dict[str, Any] = {"success": False, "error": str(e)}
             # Parts emitted before the failure (e.g. a *_pending card) still
@@ -1679,7 +1804,8 @@ class Feature(_SdkFeature):
 
         async def _exec(name: str, args: Dict[str, Any]):
             with turn_scope.bind():
-                return await self._execute_subagent_tool(
+                require_execution_work(self.agent)
+                result = await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
                     tools_by_name={
@@ -1689,6 +1815,8 @@ class Feature(_SdkFeature):
                     parts_sink=parts_sink,
                     session_id=session_id,
                 )
+                require_execution_work(self.agent)
+                return result
         return _exec
 
     async def _execute_subagent_tool(
@@ -1780,7 +1908,9 @@ class Feature(_SdkFeature):
             effective_args = args
             if hooks_manager is not None:
                 from kestrel_sdk.hooks.base import (
-                    HookEvent, HookInput, PermissionDecision,
+                    HookEvent,
+                    HookInput,
+                    PermissionDecision,
                 )
                 hook_input = HookInput(
                     session_id=hook_session_id,
@@ -1851,10 +1981,21 @@ class Feature(_SdkFeature):
                 # ``updated_input`` override) — see the comment block
                 # before the DENY/ASK branch.
 
+            require_execution_work(self.agent)
             exec_start = time.time()
             try:
                 result = await selected_tool.execute(**effective_args)
+                from kestrel_sovereign.agent.invocation import (
+                    mark_current_invocation_effect_completed,
+                )
+
+                mark_current_invocation_effect_completed(None)
+                require_execution_work(self.agent)
+            except ExecutionAuthorityError:
+                raise
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
                     tool_name, e,
@@ -1892,6 +2033,7 @@ class Feature(_SdkFeature):
                 await hooks_manager.execute_hooks_parallel(
                     HookEvent.POST_TOOL_USE, post_hook_input,
                 )
+            require_execution_work(self.agent)
             return _shape(effective_args, serialized)
 
     def _compose_subagent_runtime_tools(
@@ -2224,6 +2366,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             # turns don't hit the same "requires a tool_executor"
             # provider error the initial subagent call avoided
             # (codex round 1 P2 on #1461 follow-up).
+            require_execution_work(self.agent)
             response = await self.agent.llm_service.generate_with_messages(
                 messages=messages,
                 tools=tools if tools else None,
@@ -2234,6 +2377,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 # share its provider thread (:func:`_subagent_turn_identity`).
                 invocation_context=_subagent_turn_identity(session_id),
             )
+            require_execution_work(self.agent)
 
             effective_model = (
                 model_override or getattr(response, "model", None) or effective_model
@@ -2301,6 +2445,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         self.func = func
                         self._schema_data = schema_data
                         self.agent_skill = agent_skill
+                        self._execution_custody = getattr(func.__self__.agent, "_execution_custody", None)
 
                     @property
                     def name(self) -> str:
@@ -2316,6 +2461,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             command_prefix=self._schema_data.get("command_prefix")
                         )
 
+                    @execution_work_operation
                     async def execute(self, **kwargs) -> Dict[str, Any]:
                         # #2641: bind a "tool result under construction"
                         # buffer for the duration of the wrapped call.
@@ -2330,9 +2476,22 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             tool_result_parts_buffer,
                         )
                         with tool_result_parts_buffer() as pending_parts:
+                            require_execution_work(self.func.__self__.agent)
                             try:
                                 result = await self.func(**kwargs)
+                                # Preserve effect evidence at the actual method
+                                # return, before a post-return denial can stop
+                                # the orchestrator from observing completion.
+                                from kestrel_sovereign.agent.invocation import (
+                                    mark_current_invocation_effect_completed,
+                                )
+                                mark_current_invocation_effect_completed(None)
+                                require_execution_work(self.func.__self__.agent)
+                            except ExecutionAuthorityError:
+                                raise
                             except Exception as e:
+                                if is_execution_control_error(e):
+                                    raise
                                 logger.error(f"Error executing tool {self.name}: {e}")
                                 response: Dict[str, Any] = {
                                     "success": False,

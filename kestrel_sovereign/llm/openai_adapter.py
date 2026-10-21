@@ -73,6 +73,11 @@ from .output_ceiling import (
     output_limit_cut_notice,
 )
 from .retry import with_retry
+from kestrel_sovereign.execution_custody import (
+    owned_native_http_client,
+    native_execution_response_owner, native_sdk_operation,
+    close_native_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -360,10 +365,13 @@ class OpenAIAdapter(LLMAdapter):
         root = str(root).rstrip("/")
         url = f"{root}/models" if root.endswith("/v1") else f"{root}/v1/models"
         try:
-            async with httpx.AsyncClient(timeout=timeout) as http:
+            async with owned_native_http_client(httpx.AsyncClient(timeout=timeout)) as http:
+                retain_native_execution_http_client_close(http)
                 response = await http.get(url)
             return response.status_code < 500
-        except httpx.HTTPError:
+        except httpx.HTTPError as error:
+            if is_execution_control_error(error):
+                raise
             return False
 
     @staticmethod
@@ -387,6 +395,7 @@ class OpenAIAdapter(LLMAdapter):
             model=getattr(response, "model", None),
         )
 
+    @native_sdk_operation
     async def aembed(
         self,
         client: openai.AsyncOpenAI,
@@ -397,6 +406,7 @@ class OpenAIAdapter(LLMAdapter):
         usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         create_kwargs: Dict[str, Any] = {
             "model": model or self.DEFAULT_EMBEDDING_MODEL,
             "input": text,
@@ -417,6 +427,7 @@ class OpenAIAdapter(LLMAdapter):
         embedding = getattr(data[0], "embedding", None)
         return list(embedding) if embedding is not None else None
 
+    @native_sdk_operation
     async def aembed_batch(
         self,
         client: openai.AsyncOpenAI,
@@ -427,6 +438,7 @@ class OpenAIAdapter(LLMAdapter):
         usage_sink: Optional[ReportedUsage] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         if not texts:
             return []
         create_kwargs: Dict[str, Any] = {
@@ -479,6 +491,7 @@ class OpenAIAdapter(LLMAdapter):
             caller_budget=caller_budget,
         )
 
+    @native_sdk_operation
     async def get_response(
         self,
         client: openai.AsyncOpenAI,
@@ -504,6 +517,7 @@ class OpenAIAdapter(LLMAdapter):
         Returns:
             LLMResponse with content and/or tool calls
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -636,6 +650,8 @@ class OpenAIAdapter(LLMAdapter):
             logger.error(f"OpenAI API error: {e}")
             raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"OpenAI adapter failed: {e}", exc_info=True)
             raise
 
@@ -666,6 +682,7 @@ class OpenAIAdapter(LLMAdapter):
         Yields:
             Text chunks as they arrive
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -710,33 +727,46 @@ class OpenAIAdapter(LLMAdapter):
             )
 
             logger.info(f"Starting OpenAI stream for model: {model}")
+            async def acquire_stream(**request):
+                async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
+                    acquired = await client.chat.completions.create(**request)
+                    # The returned SDK stream now owns the same response;
+                    # failed SDK entry instead retires every hidden handle.
+                    responses.handles.clear()
+                    return acquired
+
             stream = await with_retry(
-                client.chat.completions.create,
+                acquire_stream,
                 model=model,
                 messages=normalized_messages,
                 stream=True,
+                acquired_result_cleanup=close_native_execution_stream,
                 **extra_kwargs
             )
+
+            from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
+            retain_native_execution_stream_close(stream, self)
 
             splitter = _ThinkingContentSplitter(provider=self.name)
             chunk_count = 0
             finish_reason = None
-            async for chunk in stream:
-                # #3357: every chunk is the provider still answering, whether
-                # or not it yields anything.
-                report_call_progress()
-                # #3355: the finish reason rides on the last choice chunk.
-                finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
-                delta = chunk.choices[0].delta
-                reasoning_content = getattr(delta, "reasoning_content", None)
-                if isinstance(reasoning_content, str) and reasoning_content:
-                    yield ThinkingDelta(reasoning_content, provider=self.name)
-                content_delta = getattr(delta, "content", None)
-                if isinstance(content_delta, str) and content_delta:
-                    for item in splitter.feed(content_delta):
-                        if isinstance(item, str):
-                            chunk_count += 1
-                        yield item
+            try:
+                async for chunk in stream:
+                    report_call_progress()
+                    # #3355: the finish reason rides on the last choice chunk.
+                    finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
+                    delta = chunk.choices[0].delta
+                    reasoning_content = getattr(delta, "reasoning_content", None)
+                    if isinstance(reasoning_content, str) and reasoning_content:
+                        yield ThinkingDelta(reasoning_content, provider=self.name)
+                    content_delta = getattr(delta, "content", None)
+                    if isinstance(content_delta, str) and content_delta:
+                        for item in splitter.feed(content_delta):
+                            if isinstance(item, str):
+                                chunk_count += 1
+                            yield item
+            finally:
+                await close_native_execution_stream(stream, self)
 
             for item in splitter.flush():
                 if isinstance(item, str):
@@ -804,6 +834,7 @@ class OpenAIAdapter(LLMAdapter):
                             result = execute_tool(tc)
                             # Continue conversation with tool results
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -850,13 +881,23 @@ class OpenAIAdapter(LLMAdapter):
             extra_kwargs["stream_options"] = {"include_usage": True}
 
             logger.info(f"Starting OpenAI stream with tools for model: {model}")
+            async def acquire_stream(**request):
+                async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
+                    acquired = await client.chat.completions.create(**request)
+                    responses.handles.clear()
+                    return acquired
+
             stream = await with_retry(
-                client.chat.completions.create,
+                acquire_stream,
                 model=model,
                 messages=normalized_messages,
                 stream=True,
+                acquired_result_cleanup=close_native_execution_stream,
                 **extra_kwargs
             )
+
+            from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
+            retain_native_execution_stream_close(stream, self)
 
             # Accumulator for tool calls - keyed by index
             # Each tool call arrives in chunks with the same index
@@ -873,103 +914,104 @@ class OpenAIAdapter(LLMAdapter):
             call_cost = None
             finish_reason = None
 
-            async for chunk in stream:
-                # #3357: every chunk is the provider still answering, including
-                # the tool-call argument deltas below, which yield nothing.
-                report_call_progress()
-                # Extract usage from final chunk (OpenAI sends it with stream_options)
-                if hasattr(chunk, 'usage') and chunk.usage:
-                    (
-                        input_tokens,
-                        output_tokens,
-                        total_tokens,
-                        cache_creation_input_tokens,
-                        cache_read_input_tokens,
-                    ) = _normalized_openai_usage(chunk.usage)
-                    # OpenRouter reports exact per-call cost on the usage-only
-                    # final chunk when ``usage: {include: true}`` was sent
-                    # (kestrel #1806). Stash it for the terminal response.
-                    _cost = getattr(chunk.usage, 'cost', None)
-                    if _cost is None:
-                        _extra = getattr(chunk.usage, 'model_extra', None)
-                        if isinstance(_extra, dict):
-                            _cost = _extra.get('cost')
-                    if _cost is not None:
-                        try:
-                            call_cost = float(_cost)
-                        except (TypeError, ValueError):
-                            call_cost = None
+            try:
+                async for chunk in stream:
+                    report_call_progress()
+                    # Extract usage from final chunk (OpenAI sends it with stream_options)
+                    if hasattr(chunk, 'usage') and chunk.usage:
+                        (
+                            input_tokens,
+                            output_tokens,
+                            total_tokens,
+                            cache_creation_input_tokens,
+                            cache_read_input_tokens,
+                        ) = _normalized_openai_usage(chunk.usage)
+                        # OpenRouter reports exact per-call cost on the usage-only
+                        # final chunk when ``usage: {include: true}`` was sent
+                        # (kestrel #1806). Stash it for the terminal response.
+                        _cost = getattr(chunk.usage, 'cost', None)
+                        if _cost is None:
+                            _extra = getattr(chunk.usage, 'model_extra', None)
+                            if isinstance(_extra, dict):
+                                _cost = _extra.get('cost')
+                        if _cost is not None:
+                            try:
+                                call_cost = float(_cost)
+                            except (TypeError, ValueError):
+                                call_cost = None
 
-                # Skip chunks with no choices (like the final usage-only chunk)
-                if not chunk.choices:
-                    continue
+                    # Skip chunks with no choices (like the final usage-only chunk)
+                    if not chunk.choices:
+                        continue
 
-                # #3355: the finish reason rides on the last choice chunk.
-                finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
-                delta = chunk.choices[0].delta
+                    # #3355: the finish reason rides on the last choice chunk.
+                    finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
+                    delta = chunk.choices[0].delta
 
-                # Handle text content - yield immediately for real-time streaming
-                delta_reasoning_content = getattr(delta, "reasoning_content", None)
-                if isinstance(delta_reasoning_content, str) and delta_reasoning_content:
-                    reasoning_content += delta_reasoning_content
-                    yield ThinkingDelta(delta_reasoning_content, provider=self.name)
+                    # Handle text content - yield immediately for real-time streaming
+                    delta_reasoning_content = getattr(delta, "reasoning_content", None)
+                    if isinstance(delta_reasoning_content, str) and delta_reasoning_content:
+                        reasoning_content += delta_reasoning_content
+                        yield ThinkingDelta(delta_reasoning_content, provider=self.name)
 
-                content_delta = getattr(delta, "content", None)
-                if isinstance(content_delta, str) and content_delta:
-                    for item in splitter.feed(content_delta):
-                        if isinstance(item, str):
-                            chunk_count += 1
-                            text_content += item
-                        yield item
+                    content_delta = getattr(delta, "content", None)
+                    if isinstance(content_delta, str) and content_delta:
+                        for item in splitter.feed(content_delta):
+                            if isinstance(item, str):
+                                chunk_count += 1
+                                text_content += item
+                            yield item
 
-                # Handle tool call deltas - accumulate by index
-                if hasattr(delta, 'tool_calls') and delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
+                    # Handle tool call deltas - accumulate by index
+                    if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
 
-                        # Initialize accumulator for this tool call if
-                        # needed AND emit the SDK 0.7.0 ToolCallStarted
-                        # marker — exactly once per distinct index, on
-                        # the first delta for that index. OpenAI's
-                        # first delta typically carries id and name (in
-                        # the same fragment that introduces the index),
-                        # but the contract permits None for either when
-                        # the provider stream hasn't surfaced them yet.
-                        # We capture whatever's on this delta and emit
-                        # ``None`` for any field that arrives empty —
-                        # the final LLMResponse is the source of truth
-                        # for the assembled call.
-                        is_new_call = idx not in tool_calls_accumulator
-                        if is_new_call:
-                            tool_calls_accumulator[idx] = {
-                                "id": "",
-                                "name": "",
-                                "arguments": ""
-                            }
+                            # Initialize accumulator for this tool call if
+                            # needed AND emit the SDK 0.7.0 ToolCallStarted
+                            # marker — exactly once per distinct index, on
+                            # the first delta for that index. OpenAI's
+                            # first delta typically carries id and name (in
+                            # the same fragment that introduces the index),
+                            # but the contract permits None for either when
+                            # the provider stream hasn't surfaced them yet.
+                            # We capture whatever's on this delta and emit
+                            # ``None`` for any field that arrives empty —
+                            # the final LLMResponse is the source of truth
+                            # for the assembled call.
+                            is_new_call = idx not in tool_calls_accumulator
+                            if is_new_call:
+                                tool_calls_accumulator[idx] = {
+                                    "id": "",
+                                    "name": "",
+                                    "arguments": ""
+                                }
 
-                        # Accumulate id (usually comes in first chunk)
-                        if tc_delta.id:
-                            tool_calls_accumulator[idx]["id"] += tc_delta.id
+                            # Accumulate id (usually comes in first chunk)
+                            if tc_delta.id:
+                                tool_calls_accumulator[idx]["id"] += tc_delta.id
 
-                        # Accumulate function name (usually comes in first chunk)
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tool_calls_accumulator[idx]["name"] += tc_delta.function.name
-                            # Accumulate arguments (comes in multiple chunks)
-                            if tc_delta.function.arguments:
-                                tool_calls_accumulator[idx]["arguments"] += tc_delta.function.arguments
+                            # Accumulate function name (usually comes in first chunk)
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tool_calls_accumulator[idx]["name"] += tc_delta.function.name
+                                # Accumulate arguments (comes in multiple chunks)
+                                if tc_delta.function.arguments:
+                                    tool_calls_accumulator[idx]["arguments"] += tc_delta.function.arguments
 
-                        if is_new_call:
-                            # Emit ToolCallStarted only after we've
-                            # absorbed the first delta's id/name so the
-                            # marker carries them when present rather
-                            # than always being ``(None, None)``.
-                            current = tool_calls_accumulator[idx]
-                            yield ToolCallStarted(
-                                index=idx,
-                                id=current["id"] or None,
-                                name=current["name"] or None,
-                            )
+                            if is_new_call:
+                                # Emit ToolCallStarted only after we've
+                                # absorbed the first delta's id/name so the
+                                # marker carries them when present rather
+                                # than always being ``(None, None)``.
+                                current = tool_calls_accumulator[idx]
+                                yield ToolCallStarted(
+                                    index=idx,
+                                    id=current["id"] or None,
+                                    name=current["name"] or None,
+                                )
+            finally:
+                await close_native_execution_stream(stream, self)
 
             logger.info(f"Stream completed. Text chunks: {chunk_count}, Tool calls: {len(tool_calls_accumulator)}")
 
@@ -1101,12 +1143,14 @@ class OpenAIAdapter(LLMAdapter):
             "total_tokens": total,
         }
 
+    @native_sdk_operation
     async def batch_submit(
         self,
         client: Any,
         requests: List[Any],
         **kwargs: Any,
     ) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         lines = []
         for index, request in enumerate(requests):
             body = self._batch_request_body(request)
@@ -1142,11 +1186,15 @@ class OpenAIAdapter(LLMAdapter):
         batch = await with_retry(client.batches.create, **batch_kwargs)
         return self._batch_handle(batch)
 
+    @native_sdk_operation
     async def batch_poll(self, client: Any, handle: Any, **kwargs: Any) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         batch = await with_retry(client.batches.retrieve, getattr(handle, "id", handle))
         return self._batch_handle(batch)
 
+    @native_sdk_operation
     async def batch_results(self, client: Any, handle: Any, **kwargs: Any) -> List[Any]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         raw_handle = getattr(handle, "raw", None) or handle
         output_file_id = (
             getattr(raw_handle, "output_file_id", None)
@@ -1195,10 +1243,13 @@ class OpenAIAdapter(LLMAdapter):
                 )
         return results
 
+    @native_sdk_operation
     async def batch_cancel(self, client: Any, handle: Any, **kwargs: Any) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         batch = await with_retry(client.batches.cancel, getattr(handle, "id", handle))
         return self._batch_handle(batch)
 
+    @native_sdk_operation
     async def file_upload(
         self,
         client: Any,
@@ -1207,6 +1258,7 @@ class OpenAIAdapter(LLMAdapter):
         purpose: Optional[str] = None,
         **kwargs: Any,
     ) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         uploaded = await with_retry(
             client.files.create,
             file=file,
@@ -1214,15 +1266,21 @@ class OpenAIAdapter(LLMAdapter):
         )
         return self._file_ref(uploaded)
 
+    @native_sdk_operation
     async def file_list(self, client: Any, **kwargs: Any) -> List[Any]:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.list, **kwargs)
         return [self._file_ref(item) for item in getattr(response, "data", [])]
 
+    @native_sdk_operation
     async def file_get(self, client: Any, file_id: str, **kwargs: Any) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.retrieve, file_id)
         return self._file_ref(response)
 
+    @native_sdk_operation
     async def file_delete(self, client: Any, file_id: str, **kwargs: Any) -> bool:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         response = await with_retry(client.files.delete, file_id)
         return bool(getattr(response, "deleted", False) or getattr(response, "id", None))
 
@@ -1338,6 +1396,7 @@ class OpenAIAdapter(LLMAdapter):
                     out[key] = value
         return out
 
+    @native_sdk_operation
     async def raw_request(
         self,
         client: Any,
@@ -1348,6 +1407,7 @@ class OpenAIAdapter(LLMAdapter):
         path: Optional[str] = None,
         **kwargs: Any,
     ) -> Any:
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         target: Any = client
         for part in operation.split("."):
             target = getattr(target, part)
@@ -1361,6 +1421,7 @@ class OpenAIAdapter(LLMAdapter):
             return RawResponse(operation=operation, data=data, raw=data)
         return {"operation": operation, "data": data, "raw": data}
 
+    @native_sdk_operation
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from OpenAI API (or any OpenAI-compatible
         endpoint the route was initialized against).
@@ -1383,6 +1444,8 @@ class OpenAIAdapter(LLMAdapter):
         Returns:
             List of ModelInfo objects.
         """
+        temporary_client = None
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         try:
             if client is None:
                 # Legacy fallback. Modern callers always pass the route
@@ -1400,7 +1463,9 @@ class OpenAIAdapter(LLMAdapter):
                     "OpenAIAdapter.list_models called with client=None — "
                     "rebuilding from OPENAI_API_KEY (canonical OpenAI only)"
                 )
-                client = openai.AsyncOpenAI(api_key=api_key)
+                client = openai.AsyncOpenAI(api_key=api_key, max_retries=0)
+                temporary_client = client
+                retain_native_execution_http_client_close(getattr(client, "_client", None))
 
             response = await client.models.list()
 
@@ -1424,16 +1489,27 @@ class OpenAIAdapter(LLMAdapter):
 
         except openai.RateLimitError as e:
             logger.error(f"OpenAI rate limit exceeded while listing models: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except openai.APIConnectionError as e:
             logger.error(f"OpenAI connection error while listing models: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except openai.APIError as e:
             logger.error(f"OpenAI API error while listing models: {e}")
+            if is_execution_control_error(e):
+                raise
             return []
         except Exception as e:
             logger.error(f"Failed to list OpenAI models: {e}", exc_info=True)
+            if is_execution_control_error(e):
+                raise
             return []
+        finally:
+            if temporary_client is not None:
+                await close_native_execution_stream(temporary_client)
 
     #: Substrings that mark an OpenAI ``/v1/models`` id as an embedding model.
     #: OpenAI's model list carries no category, so discovery filters by id.
@@ -1446,6 +1522,7 @@ class OpenAIAdapter(LLMAdapter):
     #: omits embedding models, so it needs a dedicated call.
     derives_embeddings_from_chat_listing: bool = True
 
+    @native_sdk_operation
     async def list_embedding_models(
         self, client: Any = None, chat_models: Any = None
     ) -> List["EmbeddingModelInfo"]:
@@ -1466,6 +1543,7 @@ class OpenAIAdapter(LLMAdapter):
         once; failures propagate so the discovery layer can decide whether they
         are loud (route claims embedding support) or expected-unsupported.
         """
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         provider = getattr(self, "name", "openai") or "openai"
 
         if chat_models is not None:
@@ -1473,6 +1551,7 @@ class OpenAIAdapter(LLMAdapter):
                 (getattr(m, "id", m) for m in chat_models), provider
             )
 
+        temporary_client = None
         if client is None:
             api_key = os.environ.get("OPENAI_API_KEY")
             if not api_key:
@@ -1481,12 +1560,18 @@ class OpenAIAdapter(LLMAdapter):
                     "and no OPENAI_API_KEY; returning empty list"
                 )
                 return []
-            client = openai.AsyncOpenAI(api_key=api_key)
+            client = openai.AsyncOpenAI(api_key=api_key, max_retries=0)
+            temporary_client = client
+            retain_native_execution_http_client_close(getattr(client, "_client", None))
 
-        response = await client.models.list()
-        return self._embedding_models_from_ids(
-            (model.id for model in response.data), provider
-        )
+        try:
+            response = await client.models.list()
+            return self._embedding_models_from_ids(
+                (model.id for model in response.data), provider
+            )
+        finally:
+            if temporary_client is not None:
+                await close_native_execution_stream(temporary_client)
 
     def _embedding_models_from_ids(
         self, ids: Any, provider: str

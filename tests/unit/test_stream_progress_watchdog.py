@@ -31,8 +31,10 @@ import asyncio
 import json
 from typing import Any, AsyncIterator, List, Optional, Tuple
 
+from tests.utils.anthropic_client import anthropic_model_record
+
 import anthropic
-import httpx
+import httpx2
 import openai
 import pytest
 from anthropic.types import (
@@ -184,7 +186,7 @@ class _ScriptedProvider:
         self.clock = clock
         self.script = script
         self.sent: List[Tuple[float, Any]] = []
-        self.requests: List[httpx.Request] = []
+        self.requests: List[httpx2.Request] = []
         self.cancelled_at: Optional[float] = None
 
     async def _wait(self, seconds: float) -> None:
@@ -222,20 +224,18 @@ def _sdk_client(route: str, provider: _ScriptedProvider) -> anthropic.AsyncAnthr
         async for frame in provider.frames():
             yield _sse(frame)
 
-    async def handle(request: httpx.Request) -> httpx.Response:
+    async def handle(request: httpx2.Request) -> httpx2.Response:
         if request.method == "GET":
             # The Models API record the adapter reads the output ceiling from.
-            return httpx.Response(200, json={
-                "id": MODEL, "type": "model", "display_name": MODEL,
-                "created_at": "2026-01-01T00:00:00Z",
-                "max_input_tokens": 1_000_000, "max_tokens": 128_000,
-            })
+            return httpx2.Response(200, json=anthropic_model_record(
+                MODEL, max_tokens=128_000,
+            ).model_dump(mode="json"))
         provider.requests.append(request)
-        return httpx.Response(
+        return httpx2.Response(
             200, headers={"content-type": "text/event-stream"}, content=body(),
         )
 
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     if route == "plan":
         client = anthropic.AsyncAnthropic(
             auth_token="sk-ant-oat01-test", http_client=http_client, max_retries=0,
@@ -275,11 +275,7 @@ class _EventStream:
 class _EventClient:
     def __init__(self, provider: _ScriptedProvider) -> None:
         async def retrieve(model_id: str, **_: Any) -> Any:
-            return anthropic.types.ModelInfo(
-                id=model_id, type="model", display_name=model_id,
-                created_at="2026-01-01T00:00:00Z",
-                max_input_tokens=1_000_000, max_tokens=128_000,
-            )
+            return anthropic_model_record(model_id, max_tokens=128_000)
 
         self.messages = type("Messages", (), {
             "stream": staticmethod(lambda **_: _EventStream(provider)),
@@ -653,15 +649,15 @@ def _openai_client(provider: _ScriptedProvider) -> openai.AsyncOpenAI:
             yield f"data: {json.dumps(chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
 
-    async def handle(request: httpx.Request) -> httpx.Response:
+    async def handle(request: httpx2.Request) -> httpx2.Response:
         provider.requests.append(request)
-        return httpx.Response(
+        return httpx2.Response(
             200, headers={"content-type": "text/event-stream"}, content=body(),
         )
 
     return openai.AsyncOpenAI(
         api_key="sk-test", max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handle)),
     )
 
 

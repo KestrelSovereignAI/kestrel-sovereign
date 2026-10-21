@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from fastapi.routing import iter_route_contexts
 
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.endpoints.host_stop import router
@@ -322,7 +323,7 @@ def test_server_mounts_host_stop_and_implementation_has_no_process_lifecycle():
     from kestrel_sovereign.endpoints import host_stop
     from kestrel_sovereign.rate_limit import limiter
 
-    paths = {getattr(route, "path", None) for route in server.app.routes}
+    paths = {getattr(route, "path", None) for route in iter_route_contexts(server.app.routes)}
     assert "/api/host/stop" in paths
     assert "/api/host/stop/status" in paths
     endpoint_key = (

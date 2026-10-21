@@ -207,3 +207,47 @@ test('a mount that fails partway leaves its surface unmarked, so a retry complet
     assert.equal(state.mountedChatAgent, 'retry-agent');
     assert.equal(chatContainer.getAttribute('data-kestrel-chat-mounted'), 'true');
 });
+
+test('remounting an existing surface after another one rebinds cached DOM without rewiring', async () => {
+    document.getElementById('retry-host').remove();
+    const first = freshChatHost('remount-first', 'first surface');
+    first.insertAdjacentHTML('beforeend', '<div id="thinking-indicator"></div>'
+        + '<button id="composer-mode-toggle"></button>');
+    chat.mount(first, { deps: chatDeps('remount-a') });
+    const firstViewport = first.querySelector('#chat-container');
+    first.remove();
+    const second = freshChatHost('remount-second', 'second surface');
+    second.insertAdjacentHTML('beforeend', '<div id="thinking-indicator"></div>'
+        + '<button id="composer-mode-toggle"></button>');
+    chat.mount(second, { deps: chatDeps('remount-b') });
+    const secondViewport = second.querySelector('#chat-container');
+    const secondPane = state.chatPanes.get('remount-b').element;
+    second.remove();
+    document.body.appendChild(first);
+    const added = mountRecording(first, 'remount-a');
+    assert.deepEqual(added, [], 'cached reference refresh must not duplicate listeners');
+    const firstPane = state.chatPanes.get('remount-a');
+    firstPane.composerMode = 'queue';
+    chat.updateComposerModeToggle();
+    assert.equal(first.querySelector('#composer-mode-toggle').dataset.mode, 'queue');
+    assert.equal(second.querySelector('#composer-mode-toggle').dataset.mode, 'interrupt');
+    state.waitingAgents.add('remount-a');
+    try {
+        chat.updateThinkingIndicator();
+        assert.equal(first.querySelector('#thinking-indicator').style.display, 'flex');
+        assert.notEqual(second.querySelector('#thinking-indicator').style.display, 'flex');
+        first.querySelector('#message-input').value = 'queue from reactivated surface';
+        second.querySelector('#message-input').value = 'must remain untouched';
+        await chat.sendMessage();
+        assert.equal(firstPane.queuedMessage, 'queue from reactivated surface');
+        assert.equal(first.querySelector('#message-input').value, '');
+        assert.equal(second.querySelector('#message-input').value, 'must remain untouched');
+        assert.equal(eventSourcesOpened, 0, 'queueing uses no live provider or stream');
+    } finally {
+        state.waitingAgents.delete('remount-a');
+    }
+    chat.mountChatPane('remount-target');
+    assert.equal(firstViewport.children[0], state.chatPanes.get('remount-target').element,
+        'the reactivated surface, not the detached previous one, owns the new pane');
+    assert.equal(secondViewport.children[0], secondPane, 'inactive surface stays untouched');
+});

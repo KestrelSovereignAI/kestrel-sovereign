@@ -6,6 +6,7 @@ Extracted from ContextManager to improve modularity and maintainability.
 """
 
 import logging
+from kestrel_sovereign.execution_custody import is_execution_control_error
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
@@ -68,12 +69,18 @@ class ConversationManager:
                 logger.warning("No conversation history method available")
                 return []
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Storage connection error while fetching conversation history: {e}", exc_info=True)
             return []
         except (KeyError, ValueError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Data error while fetching conversation history: {e}", exc_info=True)
             return []
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to get conversation history: {e}", exc_info=True)
             return []
 
@@ -333,6 +340,8 @@ SUMMARY:"""
             }
 
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Network error during session compaction: {e}", exc_info=True)
             return {
                 "success": False,
@@ -340,6 +349,8 @@ SUMMARY:"""
                 "message_count": message_count
             }
         except (KeyError, ValueError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Data error during session compaction: {e}", exc_info=True)
             return {
                 "success": False,
@@ -347,6 +358,8 @@ SUMMARY:"""
                 "message_count": message_count
             }
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Session compaction failed: {e}", exc_info=True)
             return {
                 "success": False,
@@ -419,7 +432,9 @@ SUMMARY:"""
             try:
                 message_ids = [int(x.strip()) for x in criteria.split(",")]
                 return await conv_store.get_messages_by_ids(message_ids)
-            except ValueError:
+            except ValueError as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.error(f"Invalid message IDs: {criteria}")
                 return []
 
@@ -429,7 +444,9 @@ SUMMARY:"""
                 n = int(criteria)
                 all_messages = await conv_store.get_full_history_with_ids()
                 return all_messages[-n:] if len(all_messages) >= n else all_messages
-            except ValueError:
+            except ValueError as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.error(f"Invalid count: {criteria}")
                 return []
 
@@ -912,12 +929,18 @@ SUMMARY:"""
             }
 
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Network error during message summarization: {e}", exc_info=True)
             return {"success": False, "error": f"Network error: {str(e)}"}
         except (KeyError, ValueError, TypeError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Data error during message summarization: {e}", exc_info=True)
             return {"success": False, "error": f"Data error: {str(e)}"}
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Summarization failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 

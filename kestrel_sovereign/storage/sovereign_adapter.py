@@ -9,7 +9,6 @@ This adapter implements the "Convergent Sharding" protocol:
 """
 
 import abc
-import asyncio
 import contextlib
 import enum
 import functools
@@ -18,6 +17,7 @@ import logging
 import hashlib
 import hmac
 import os
+import re
 import warnings
 from typing import (
     TYPE_CHECKING, AsyncContextManager, Callable, Dict, Iterable, List,
@@ -393,9 +393,30 @@ class ConvergentEncryptor:
 class SovereignStorageAdapter:
     """
     V2 Adapter for Sharded, Deduplicated, Encrypted Storage.
+
+    CAR conversation fields are logical data inside CAR encryption; restoring
+    re-encodes them using the destination store's existing at-rest policy.
+    Legacy at-rest envelopes require the actual destination key and are never
+    guessed or imported as unreadable ciphertext.
+
+    ``import_log_table`` selects one Core-owned append-only journal. Hosts with
+    an unrelated ``agent_import_log`` must explicitly select another namespace;
+    incompatible schemas and unacknowledged audit writes fail closed.
     """
 
-    def __init__(self, db: AsyncDatabase, user_secret: str, filecoin_adapter: Optional["FilecoinAdapter"] = None, agent_id: str = ""):
+    def __init__(self, db: AsyncDatabase, user_secret: str, filecoin_adapter: Optional["FilecoinAdapter"] = None, agent_id: str = "", *, import_log_table: str = "agent_import_log"):
+        if not isinstance(import_log_table, str):
+            raise TypeError("import_log_table must be a simple SQL identifier")
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,39}", import_log_table):
+            raise ValueError("import_log_table must be a simple SQL identifier (lowercase, at most 40 characters)")
+        self._import_log_table = import_log_table
+        self._import_log_sql = f'"{import_log_table}"'
+        self._import_log_index_base = "import_log" if import_log_table == "agent_import_log" else import_log_table
+        self._import_log_columns = (
+            "id", "agent_did", "source_did", "host_agent_id", "package_hash",
+            "continuity_score", "status", "reject_reason", "manifest_version",
+            "messages_restored", "shards_restored", "source_cid", "grant_id", "created_at",
+        )
         self.db = db
         self.agent_id = agent_id
         self.encryptor = ConvergentEncryptor(user_secret)
@@ -432,21 +453,30 @@ class SovereignStorageAdapter:
         rows that have already been split. Legacy rows (rendered_content
         NULL) restore as-is and get lazily split on next read.
         """
+        from kestrel_sovereign.security.encryption import remove_enc_flag
+        from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+
+        conversation_store = AsyncConversationStore(self.db, agent_id=self.agent_id)
         rows = await self.db.fetchall(
-            "SELECT role, content, metadata, id, rendered_content "
+            "SELECT role, content, metadata, id, rendered_content, model, provider "
             "FROM conversation_history WHERE agent_id = ? ORDER BY id ASC",
             (self.agent_id,)
         )
-        return [
-            {
+        conversations = []
+        for row in rows:
+            meta = json.loads(row[2]) if row[2] else {}
+            conversations.append({
                 "role": row[0],
-                "content": row[1],
-                "metadata": json.loads(row[2]) if row[2] else {},
+                "content": conversation_store.decrypt_stored_content(row[1], meta),
+                "metadata": remove_enc_flag(meta) or {},
                 "id": row[3],
-                "rendered_content": row[4],
-            }
-            for row in rows
-        ]
+                "rendered_content": (
+                    conversation_store.decrypt_stored_content(row[4], meta) if row[4] is not None else None
+                ),
+                "model": row[5],
+                "provider": row[6],
+            })
+        return conversations
 
     async def _shard_conversations(self) -> Dict[str, List[Dict]]:
         """
@@ -507,12 +537,12 @@ class SovereignStorageAdapter:
         return cid
 
     async def _download_content(self, cid: str) -> bytes:
-        """Download content by CID (handles local- fallback)."""
-        return await asyncio.to_thread(
+        """Join content retrieval before the original storage owner can retire."""
+        return await run_blocking_operation(functools.partial(
             self.adapter.retrieve_content,
-            content_hash=cid.replace("local-", ""),
+            content_hash=cid.removeprefix("local-"),
             ipfs_cid=cid if not cid.startswith("local-") else None,
-        )
+        ))
 
     def _encrypt_keyring(self, keyring: Dict[str, str]) -> bytes:
         """Encrypt the keyring dict and return nonce+ciphertext."""
@@ -769,12 +799,16 @@ class SovereignStorageAdapter:
                 source_cid = str(package)
                 car_bytes = await self._download_content(source_cid)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             await self._log_import_attempt(
                 agent_did="", source_did=source_did or "",
                 package_hash="", continuity_score=0.0, status="error",
                 reject_reason=f"package_fetch_failed: {e}",
                 messages_restored=0, shards_restored=0,
                 manifest_version="", source_cid=source_cid,
+                failure=e,
             )
             raise RuntimeError(f"Failed to fetch sovereignty package: {e}")
 
@@ -939,6 +973,25 @@ class SovereignStorageAdapter:
                 )
                 all_conversations.extend(json.loads(shard_json.decode("utf-8")))
 
+            from kestrel_sovereign.security.encryption import remove_enc_flag
+            from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+
+            conversation_store = AsyncConversationStore(self.db, agent_id=self.agent_id)
+            prepared_conversations = []
+            for msg in sorted(all_conversations, key=lambda m: m.get("id", 0)):
+                source_metadata = msg.get("metadata") or {}
+                # New CARs carry logical fields under CAR encryption. A legacy
+                # at-rest envelope is accepted only if THIS destination store
+                # can authenticate it; never guess another tenant's key.
+                content = conversation_store.decrypt_stored_content(msg["content"], source_metadata)
+                rendered = msg.get("rendered_content")
+                if rendered is not None:
+                    rendered = conversation_store.decrypt_stored_content(rendered, source_metadata)
+                fields = conversation_store.prepare_storage_fields(
+                    content, rendered, remove_enc_flag(source_metadata),
+                )
+                prepared_conversations.append((msg, fields))
+
             # Atomic restore (#1725): wrap the destructive DELETE + row-by-row
             # reinsert in ONE transaction so a crash mid-restore rolls back
             # instead of leaving the agent's conversation history permanently
@@ -949,12 +1002,12 @@ class SovereignStorageAdapter:
                     "DELETE FROM conversation_history WHERE agent_id = ?",
                     (self.agent_id,),
                 )
-                for msg in sorted(all_conversations, key=lambda m: m.get("id", 0)):
-                    metadata_json = json.dumps(msg.get("metadata", {}))
+                for msg, fields in prepared_conversations:
+                    metadata_json = json.dumps(fields.metadata)
                     # rendered_content (#1402) restored if present; older
                     # backups (no key) default to NULL and get lazily split
                     # by AsyncConversationStore on first read.
-                    rendered = msg.get("rendered_content")
+                    rendered = fields.rendered_content
                     model = msg.get("model")
                     provider = msg.get("provider")
                     # Preserve the ORIGINAL timestamp (#1725) from
@@ -976,7 +1029,7 @@ class SovereignStorageAdapter:
                             "provider, metadata, session_id, created_at) "
                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (
-                                self.agent_id, msg["role"], msg["content"],
+                                self.agent_id, msg["role"], fields.content,
                                 rendered, model, provider, metadata_json,
                                 session_id, created_at,
                             ),
@@ -988,7 +1041,7 @@ class SovereignStorageAdapter:
                             f"provider, metadata, session_id, created_at) "
                             f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, {self._now_sql()})",
                             (
-                                self.agent_id, msg["role"], msg["content"],
+                                self.agent_id, msg["role"], fields.content,
                                 rendered, model, provider, metadata_json,
                                 session_id,
                             ),
@@ -1036,6 +1089,7 @@ class SovereignStorageAdapter:
                 messages_restored=0, shards_restored=0,
                 manifest_version=manifest_version, source_cid=source_cid,
                 grant_id=consent_grant_id,
+                failure=e,
             )
             raise
 
@@ -1256,12 +1310,13 @@ class SovereignStorageAdapter:
             return None, f"external_ref_malformed_link: {e}"
 
         try:
-            payload = await asyncio.to_thread(
-                self.adapter.retrieve_content,
-                content_hash=cid_str,
-                ipfs_cid=cid_str,
-            )
+            # The same hook owns archive and linked-asset retrieval. A host's
+            # bounded/provenance-aware override must apply to both paths.
+            payload = await self._download_content(cid_str)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             return None, f"external_ref_fetch_failed: {e}"
 
         if not isinstance(payload, (bytes, bytearray)):
@@ -1285,7 +1340,7 @@ class SovereignStorageAdapter:
     async def _ensure_import_log(self) -> None:
         await self.db.execute(
             f"""
-            CREATE TABLE IF NOT EXISTS agent_import_log (
+            CREATE TABLE IF NOT EXISTS {self._import_log_sql} (
                 id {self._import_log_pk()},
                 agent_did TEXT NOT NULL,
                 source_did TEXT NOT NULL,
@@ -1303,23 +1358,22 @@ class SovereignStorageAdapter:
             )
             """
         )
-        await self.db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_import_log_agent ON agent_import_log(agent_did)"
-        )
-        await self.db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_import_log_source ON agent_import_log(source_did)"
-        )
-        # Additive migration for DBs created before #1379 introduced
-        # the grant_id column. Both backends tolerate ADD COLUMN IF NOT
-        # EXISTS, but SQLite older than 3.35 doesn't — so feature-check.
-        try:
-            await self.db.execute(
-                "ALTER TABLE agent_import_log ADD COLUMN grant_id TEXT"
+        from kestrel_sovereign.storage.db import QueryError
+
+        missing = [column for column in self._import_log_columns
+                   if column != "grant_id" and not await self.db.column_exists(self._import_log_table, column)]
+        if missing:
+            raise QueryError(
+                f"Sovereign import journal {self._import_log_table!r} has an incompatible schema "
+                f"(missing {', '.join(missing)}); configure a separate import_log_table"
             )
-        except Exception:
-            # Column already exists (or backend refuses) — both are
-            # benign for an additive migration.
-            pass
+        await self.db.migrate_columns_once(self._import_log_table, [("grant_id", "TEXT")])
+        await self.db.execute(
+            f'CREATE INDEX IF NOT EXISTS "idx_{self._import_log_index_base}_agent" ON {self._import_log_sql}(agent_did)'
+        )
+        await self.db.execute(
+            f'CREATE INDEX IF NOT EXISTS "idx_{self._import_log_index_base}_source" ON {self._import_log_sql}(source_did)'
+        )
 
     async def _log_import_attempt(
         self, *, agent_did: str, source_did: str, package_hash: str,
@@ -1327,18 +1381,19 @@ class SovereignStorageAdapter:
         messages_restored: int, shards_restored: int,
         manifest_version: str, source_cid: Optional[str],
         grant_id: Optional[str] = None,
+        failure: BaseException | None = None,
     ) -> None:
         """Append exactly one row per import attempt.
 
         Append-only — there is deliberately no UPDATE/DELETE path. A
-        failure to write the audit row must never mask the import
-        outcome, so write failures are logged and swallowed.
+        success requires an acknowledged audit write. Schema/write/native
+        control errors propagate; no logged false-success path exists.
         """
         try:
             await self._ensure_import_log()
-            await self.db.execute(
-                """
-                INSERT INTO agent_import_log
+            inserted = await self.db.execute(
+                f"""
+                INSERT INTO {self._import_log_sql}
                   (agent_did, source_did, host_agent_id, package_hash,
                    continuity_score, status, reject_reason, manifest_version,
                    messages_restored, shards_restored, source_cid, grant_id)
@@ -1348,29 +1403,32 @@ class SovereignStorageAdapter:
                  continuity_score, status, reject_reason, manifest_version,
                  messages_restored, shards_restored, source_cid, grant_id),
             )
-        except Exception as e:
-            self.logger.error(f"Failed to write agent_import_log row: {e}")
+            if inserted != 1:
+                from kestrel_sovereign.storage.db import QueryError
+
+                raise QueryError("Sovereign import audit INSERT was not acknowledged as exactly one row")
+        except BaseException as audit_error:
+            if failure is None:
+                raise
+            from kestrel_sovereign.execution_custody import execution_finite_error
+
+            raise execution_finite_error(failure, audit_error, retain_originals=True)
 
     async def get_import_log(
         self, agent_did: Optional[str] = None, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """Read the append-only import log (newest first)."""
         await self._ensure_import_log()
-        cols = [
-            "id", "agent_did", "source_did", "host_agent_id", "package_hash",
-            "continuity_score", "status", "reject_reason", "manifest_version",
-            "messages_restored", "shards_restored", "source_cid", "grant_id",
-            "created_at",
-        ]
+        cols = self._import_log_columns
         col_sql = ", ".join(cols)
         if agent_did is None:
             rows = await self.db.fetchall(
-                f"SELECT {col_sql} FROM agent_import_log ORDER BY id DESC LIMIT ?",
+                f"SELECT {col_sql} FROM {self._import_log_sql} ORDER BY id DESC LIMIT ?",
                 (limit,),
             )
         else:
             rows = await self.db.fetchall(
-                f"SELECT {col_sql} FROM agent_import_log WHERE agent_did = ? ORDER BY id DESC LIMIT ?",
+                f"SELECT {col_sql} FROM {self._import_log_sql} WHERE agent_did = ? ORDER BY id DESC LIMIT ?",
                 (agent_did, limit),
             )
         return [dict(zip(cols, r)) for r in rows]

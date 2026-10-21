@@ -12,6 +12,7 @@ from typing import ClassVar, Optional
 
 from kestrel_sdk.tools import Outcome, WaitStatus
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_scoped_agent_did,
@@ -44,8 +45,8 @@ class TaskWaitable:
         and emit a false terminal ``wait.complete`` failure.
 
         Returns ``None`` (unverifiable → caller fails open) when no task
-        manager is wired or the lookup raises, so a transient backend hiccup
-        never blocks an otherwise-valid watch.
+        manager is wired or an ordinary lookup fails. Native execution-control
+        evidence is never unverifiable ownership: it propagates unchanged.
 
         An agent with no usable DID owns nothing (``False``), and that is
         decided before the catch-all: resolved inside it, the guard's
@@ -65,7 +66,9 @@ class TaskWaitable:
                 handle,
                 recipient_agent_id,
             )
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             return None
         return task is not None
 

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from fastapi.routing import iter_route_contexts
 
 from kestrel_sovereign.auth import AuthMethod, CallerContext, CallerRole
 
@@ -4700,7 +4701,7 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         app = _make_app(_make_agent())
         gated = {
             (route.path, method)
-            for route in app.routes
+            for route in iter_route_contexts(app.routes)
             for method in getattr(route, "methods", ()) or ()
             if any(
                 dependency.dependency is require_sovereign_host_lifecycle

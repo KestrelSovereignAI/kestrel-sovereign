@@ -103,32 +103,25 @@ async def test_openrouter_embedding_discovery_no_key_returns_empty(monkeypatch):
 
 # --- Ollama /api/show capability facet ---------------------------------------
 
-async def test_ollama_embedding_discovery_filters_by_capability():
+async def test_ollama_embedding_discovery_filters_by_capability(monkeypatch):
     adapter = OllamaAdapter()
-
-    list_result = SimpleNamespace(models=[
-        SimpleNamespace(model="nomic-embed-text:latest"),
-        SimpleNamespace(model="llama3.2:3b"),
-        SimpleNamespace(model="qwen3-embedding:0.6b"),
-    ])
-
-    async def _show(name):
-        caps = ["embedding"] if "embed" in name else ["completion", "tools"]
-        return {"capabilities": caps}
-
-    fake_client = SimpleNamespace(
-        list=AsyncMock(return_value=list_result),
-        show=_show,
-    )
-
-    with patch("kestrel_sovereign.llm.ollama_adapter.OLLAMA_AVAILABLE", True), \
-         patch("kestrel_sovereign.llm.ollama_adapter.ollama") as mock_ollama:
-        mock_ollama.AsyncClient.return_value = fake_client
-        models = await adapter.list_embedding_models()
+    import json
+    import ollama
+    def transport(request):
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"model": name} for name in
+                ("nomic-embed-text:latest", "llama3.2:3b", "qwen3-embedding:0.6b")]})
+        assert request.url.path == "/api/show"
+        name = json.loads(request.content)["model"]
+        return httpx.Response(200, json={"model_info": {}, "capabilities": ["embedding"] if "embed" in name else ["completion", "tools"]})
+    native_client = ollama.AsyncClient(transport=httpx.MockTransport(transport))
+    monkeypatch.setattr(ollama, "AsyncClient", lambda: native_client)
+    models = await adapter.list_embedding_models()
 
     ids = {m.id for m in models}
     assert ids == {"nomic-embed-text:latest", "qwen3-embedding:0.6b"}
     assert all(m.provider == "ollama" for m in models)
+    assert native_client._client.is_closed
 
 
 async def test_ollama_embedding_discovery_uses_provided_client():

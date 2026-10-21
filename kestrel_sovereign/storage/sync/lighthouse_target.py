@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+from kestrel_sovereign.execution_custody import (
+    close_native_execution_stream,
+    is_execution_control_error,
+)
 from kestrel_sovereign.storage.car_builder import (
     CARReader,
     single_raw_block_car_prefix,
@@ -172,7 +176,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                     }
                     await self._upload_manifest(client, new_manifest)
                 finally:
-                    await client.close()
+                    await close_native_execution_stream(client, retain_originals=True)
 
             return SyncResult(
                 success=True,
@@ -184,6 +188,8 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             )
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # ``str(e)`` is empty for an httpx timeout, and 880 empty
             # "Failed to sync" lines hid an 18-day outage (#3189): the type
             # is the diagnosis, so it travels with the message.
@@ -636,7 +642,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 "skipped_missing_id": skipped_missing_id,
             }
         finally:
-            await client.close()
+            await close_native_execution_stream(client, retain_originals=True)
 
     async def health_check(self) -> bool:
         """Check Lighthouse API connectivity."""

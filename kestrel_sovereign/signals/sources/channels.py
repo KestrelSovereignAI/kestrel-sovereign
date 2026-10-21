@@ -29,9 +29,11 @@ DURABLE_COGNITION_MARKER_VALUE = "channel-v1"
 # feature-instance detail: durable redelivery recovery must be able to name
 # this exact consumer without broadening delivery to other subscriptions.
 DURABLE_COGNITION_CONSUMER_ID = "core.channel-cognition-v1"
-# A malformed Telegram record has a canonical bot/update identity but no safe
-# content to route to cognition. Its selected delivery is completed as a
-# durable terminal receipt before the provider cursor can advance.
+# A non-cognitive Telegram disposition (malformed transport input or an
+# authenticated care-only acknowledgement) retains its canonical bot/update
+# identity. Its selected delivery is completed as a durable terminal receipt
+# before the provider cursor advances. Valid care content is sanitized and
+# remains available to already-registered workflow observers, not cognition.
 DURABLE_TERMINAL_MARKER = "_durable_terminal"
 DURABLE_TERMINAL_MARKER_VALUE = "channel-terminal-v1"
 DURABLE_TERMINAL_CONSUMER_ID = "core.channel-terminal-v1"

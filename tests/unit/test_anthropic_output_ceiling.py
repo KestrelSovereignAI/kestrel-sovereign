@@ -148,25 +148,25 @@ async def test_discovered_ceiling_is_used_without_another_lookup():
 async def test_api_key_discovery_seeds_the_ceiling_too(monkeypatch):
     """The API-key route discovers over plain HTTP; what it learns is used
     the same way as the plan route's discovery."""
-    import httpx
+    import httpx2
 
-    real_async_client = httpx.AsyncClient
+    real_async_client = httpx2.AsyncClient
 
-    def models_endpoint(request: httpx.Request) -> httpx.Response:
+    def models_endpoint(request: httpx2.Request) -> httpx2.Response:
         assert request.url.path == "/v1/models"
-        return httpx.Response(200, json={"data": [
+        return httpx2.Response(200, json={"data": [
             {"id": "claude-opus-5", "type": "model", "display_name": "Opus",
              "created_at": "2026-01-01T00:00:00Z", "max_tokens": 128_000},
         ]})
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setattr(
-        httpx, "AsyncClient",
-        lambda **kw: real_async_client(transport=httpx.MockTransport(models_endpoint), **kw),
+        httpx2, "AsyncClient",
+        lambda **kw: real_async_client(transport=httpx2.MockTransport(models_endpoint), **kw),
     )
     adapter = AnthropicAdapter()
     await adapter.list_models()
-    monkeypatch.setattr(httpx, "AsyncClient", real_async_client)
+    monkeypatch.setattr(httpx2, "AsyncClient", real_async_client)
 
     client = anthropic_client(_message([_text("ok")], stop_reason="end_turn"))
     await adapter.get_response(client=client, model="claude-opus-5", messages=USER)
@@ -649,27 +649,6 @@ def _wire_events(text: str, *, stop_reason: str) -> List[Dict[str, Any]]:
     ]
 
 
-def _sdk_http_library():
-    """The HTTP library the installed Anthropic SDK is built on.
-
-    The 0.x SDK is built on ``httpx``; 1.x moved to ``httpx2`` and rejects an
-    ``httpx`` client. The SDK's own ``DefaultAsyncHttpxClient`` subclasses
-    whichever one it uses, so its base class names the library — the test
-    serves its fake HTTP through that library on either SDK major version.
-    """
-    import importlib
-
-    import anthropic
-
-    for base in anthropic.DefaultAsyncHttpxClient.__mro__:
-        root = base.__module__.split(".")[0]
-        if root in ("httpx", "httpx2"):
-            return importlib.import_module(root)
-    raise AssertionError(
-        "anthropic.DefaultAsyncHttpxClient is not built on httpx or httpx2"
-    )
-
-
 def _real_sdk_client(stop_reason: str, text: str = "Question 1: yes"):
     """A real ``anthropic.AsyncAnthropic`` whose HTTP is served locally: the
     Models API record for claude-opus-5, and a streamed message."""
@@ -677,30 +656,28 @@ def _real_sdk_client(stop_reason: str, text: str = "Question 1: yes"):
 
     import anthropic
 
-    httpx = _sdk_http_library()
+    import httpx2
     requests: List[Any] = []
 
     def handler(request):
         requests.append(request)
         if request.method == "GET" and request.url.path == "/v1/models/claude-opus-5":
-            return httpx.Response(200, json={
-                "id": "claude-opus-5", "type": "model", "display_name": "Claude Opus 5",
-                "created_at": "2026-01-01T00:00:00Z",
-                "max_input_tokens": 1_000_000, "max_tokens": 128_000,
-            })
+            return httpx2.Response(200, json=anthropic_model_record(
+                "claude-opus-5", max_tokens=128_000,
+            ).model_dump(mode="json"))
         if request.method == "POST" and request.url.path == "/v1/messages":
             assert json.loads(request.content)["stream"] is True
-            return httpx.Response(
+            return httpx2.Response(
                 200, content=_sse(_wire_events(text, stop_reason=stop_reason)),
                 headers={"content-type": "text/event-stream"},
             )
-        return httpx.Response(404, json={"type": "error", "error": {
+        return httpx2.Response(404, json={"type": "error", "error": {
             "type": "not_found_error", "message": request.url.path}})
 
     client = anthropic.AsyncAnthropic(
         api_key="test-key",
         http_client=anthropic.DefaultAsyncHttpxClient(
-            transport=httpx.MockTransport(handler),
+            transport=httpx2.MockTransport(handler),
         ),
         max_retries=0,
     )
@@ -852,3 +829,43 @@ async def test_streamed_turn_cut_on_a_tool_call_persists_what_was_shown():
     rows = [row for row in persisted if row["role"] == "assistant"]
     assert len(rows) == 1
     assert rows[0]["content"] == shown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["get_response", "get_streaming_response", "get_streaming_response_with_tools"])
+@pytest.mark.parametrize("parameter", ["temperature", "top_p", "top_k"])
+@pytest.mark.parametrize("origin", ["kwargs", "raw"])
+@pytest.mark.parametrize("value", [0.5, None])
+async def test_removed_sampling_parameters_fail_before_contacting_anthropic(method, parameter, origin, value):
+    from kestrel_sdk.llm import RequestOptions
+
+    client = anthropic_client(_message([_text("unused")], stop_reason="end_turn"))
+    adapter = AnthropicAdapter()
+    options = (
+        {parameter: value} if origin == "kwargs"
+        else {"request_options": RequestOptions(raw={parameter: value})}
+    )
+    with pytest.raises(ValueError, match=parameter):
+        result = getattr(adapter, method)(
+            client=client, model="claude-opus-5", messages=USER,
+            **options,
+        )
+        if method == "get_response":
+            await result
+        else:
+            async for _ in result:
+                pass
+    client.messages.stream.assert_not_called()
+    client.models.retrieve.assert_not_awaited()
+
+
+@pytest.mark.parametrize("parameter", ["temperature", "top_p", "top_k"])
+def test_request_option_validation_precedes_raw_parameter_merge(parameter):
+    from kestrel_sdk.llm import RequestOptions
+
+    params = {"model": "claude-opus-5"}
+    with pytest.raises(ValueError, match=parameter):
+        AnthropicAdapter().apply_request_options(
+            params, RequestOptions(raw={parameter: None}), model=params["model"],
+        )
+    assert params == {"model": "claude-opus-5"}

@@ -34,6 +34,32 @@
 import { Events, makeEvent } from './events.js';
 import { createVoiceCapture } from './capture.js';
 import { createVoicePlayback } from './playback.js';
+import { FRAMED_OUTPUT_PROFILE, requireFramedBootstrap, createFramedProtocol } from './framed.js';
+import { createStartupSettlement } from './startup.js';
+
+export async function readToolBatchResponse(response, calls) {
+  // Only acknowledged results may become function outputs. A failed request,
+  // unreadable body or missing call is not evidence that the effect failed.
+  const body = await response.json();
+  if (!response.ok) {
+    const error = new Error(body?.error?.message || `tool dispatch HTTP ${response.status}`);
+    error.code = body?.error?.code || 'execution_outcome_unknown';
+    throw error;
+  }
+  const requested = new Set(calls.map((call) => call.call_id));
+  const results = body?.results;
+  if (requested.size !== calls.length || !Array.isArray(results) || results.length !== calls.length) {
+    throw new Error('Tool acknowledgement is incomplete; reconcile before continuing.');
+  }
+  const acknowledged = new Set();
+  for (const result of results) {
+    if (!requested.has(result.call_id) || acknowledged.has(result.call_id) || !Object.hasOwn(result, 'result')) {
+      throw new Error('Tool acknowledgement is invalid; reconcile before continuing.');
+    }
+    acknowledged.add(result.call_id);
+  }
+  return results;
+}
 
 // GA WebRTC endpoint.  The Beta path was ``/v1/realtime`` (with the
 // model as a query string), but OpenAI's GA Realtime moved WebRTC SDP
@@ -43,13 +69,15 @@ import { createVoicePlayback } from './playback.js';
 // HTTP 400".  See kestrel-voice-openai#16 (Beta -> GA migration).
 const REALTIME_SDP_URL = 'https://api.openai.com/v1/realtime/calls';
 
-export function buildRealtimeToolsSessionUpdate(tools = []) {
+export function buildRealtimeSessionUpdate(fields = {}, sessionType = '') {
   return {
     type: 'session.update',
-    session: {
-      tools: Array.isArray(tools) ? tools : [],
-    },
+    session: { ...(sessionType ? { type: sessionType } : {}), ...fields },
   };
+}
+
+export function buildRealtimeToolsSessionUpdate(tools = [], { sessionType = '' } = {}) {
+  return buildRealtimeSessionUpdate({ tools: Array.isArray(tools) ? tools : [] }, sessionType);
 }
 
 export function bytesToBase64(bytes) {
@@ -156,7 +184,7 @@ export async function waitForPlaybackIdle(playbackController, timeoutMs = 2000) 
 
 export function responseAllowsToolDispatch(raw = {}) {
   const status = String(raw.response?.status ?? raw.status ?? '').toLowerCase();
-  return !['cancelled', 'canceled', 'failed', 'incomplete'].includes(status);
+  return status === 'completed';
 }
 
 
@@ -176,9 +204,14 @@ export async function createRealtimeClient({
   getAuthHeaders = () => ({}),
   sessionRequestInit = {},
   sessionRequestBody = {},
+  responseStartTimeoutMs = 30000,
+  outputProfile = FRAMED_OUTPUT_PROFILE,
 } = {}) {
   if (typeof onEvent !== 'function') {
     throw new Error('createRealtimeClient requires an onEvent callback');
+  }
+  if (!Number.isFinite(responseStartTimeoutMs) || responseStartTimeoutMs <= 0) {
+    throw new Error('responseStartTimeoutMs must be finite and positive');
   }
 
   let session = null;    // { session_id, model, voice, client_secret }
@@ -189,36 +222,84 @@ export async function createRealtimeClient({
   let audioSink = null;  // <audio> element for remote playback
   let capture = null;    // PCM capture for WebSocket transports
   let playback = null;   // PCM playback for WebSocket transports
+  let framed = null;     // explicit response-framing protocol on original WS
   let inputMuted = false;
   let outputMuted = false;
   let closed = false;
+  let closeOwner = null;
+  const startupAbort = new AbortController();
+  const startupSettlement = createStartupSettlement();
+  let captureResetPending = false;
+
+  async function requireOpen() {
+    if (!closed) return;
+    // Permission prompts cannot be aborted. Retire a late native acquisition
+    // even if the original close owner has already finished.
+    await retireAcquired();
+    throw new Error('Realtime client retired during startup');
+  }
   const persistedTurnIds = new Set();  // item_ids already sent to /transcript
   const pendingPersists = new Set();   // in-flight /transcript POST promises
   let pendingToolEvents = [];          // tool cards to attach to next assistant turn
-  let pendingToolCalls = [];           // collected until response.done
+  const pendingToolCalls = new Map();  // arguments keyed by ORIGINAL response
+  const cancelledResponses = new Set();
+  let activeResponseId = '';
+  let responseGeneration = 0;
+  let responseAdmissionOpen = true;
+  const pendingInputClears = [];
+  let freshInputGeneration = null;
+  let speechInputItemId = '';
+  let typedInputGeneration = null;
+  let responseStartTimer = null;
   const userTranscriptTracker = createUserTranscriptTracker();
   let earlyAudioChunks = [];
   let earlyAudioBytes = 0;
   const maxEarlyAudioBytes = 24000 * 2 * 2; // two seconds of mono PCM16
+  if (outputProfile) {
+    framed = createFramedProtocol({ getSession: () => session,
+      send: message => sendJSON(message, { required: true }),
+      resetCapture: () => {
+        captureResetPending = true;
+        if (capture) { capture.reset(); captureResetPending = false; }
+      },
+      timeoutMs: responseStartTimeoutMs,
+      fail: error => {
+        void close(error);
+        onEvent(makeEvent(Events.ERROR, { message: error.message, code: 'FRAMED_PROTOCOL_FAILED', fatal: true }));
+      },
+      onReady: actual => onEvent(makeEvent(Events.SESSION_READY, {
+        session_id: actual.id, model: session.model, path: 'realtime',
+      })),
+    });
+  }
 
   /**
    * Send a JSON control message through the data channel.
    * Swallows send errors when the channel is closing — barge-in races are
    * common and we don't want to promote them to UI errors.
    */
-  function sendJSON(msg) {
+  function sendJSON(msg, { required = false } = {}) {
     const channelOpen = dc && dc.readyState === 'open';
     const socketOpen = ws && ws.readyState === WebSocket.OPEN;
-    if (!channelOpen && !socketOpen) return;
+    if (!channelOpen && !socketOpen) {
+      if (required) {
+        const error = new Error('Original voice transport is not open.');
+        if (framed) void close(error);
+        throw error;
+      }
+      return;
+    }
     try {
       const payload = JSON.stringify(msg);
       if (channelOpen) dc.send(payload);
       else ws.send(payload);
     } catch (err) {
+      if (framed) void close(err);
+      if (required) throw err;
       if (!closed) {
         onEvent(makeEvent(Events.ERROR, {
           message: `data channel send failed: ${err.message}`,
-          fatal: false,
+          fatal: !!framed,
         }));
       }
     }
@@ -273,17 +354,22 @@ export async function createRealtimeClient({
           }),
         }),
       )
-      .then((resp) => {
+      .then(async (resp) => {
         // fetch() only rejects on network failure — an HTTP 401/404/500
         // still resolves. Without this check a failed persist would look
         // like success and the turn would be silently dropped from history.
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const acknowledgement = await resp.json();
+        if (!acknowledgement || typeof acknowledgement.persisted !== 'boolean') {
+          throw new Error('Transcript acknowledgement uncertain; reconcile before continuing.');
+        }
       })
-      .catch((err) => {
+      .catch(async (err) => {
         if (!closed) {
+          await close(err);
           onEvent(makeEvent(Events.ERROR, {
             message: `transcript persist failed: ${err.message}`,
-            fatal: false,
+            fatal: true,
           }));
         }
       });
@@ -322,7 +408,39 @@ export async function createRealtimeClient({
    * values so the UI shell never sees undefined text.
    */
   function handleProviderEvent(raw) {
+    if (closed) return;
+    if (framed && !framed.accept(raw)) return;
+    const responseId = raw.response?.id ?? raw.response_id ?? '';
+    // Input/session events are not output-response cancellation casualties.
+    // A cancelled response cannot publish late audio, text, or completion.
+    if (responseId && cancelledResponses.has(responseId)) return;
     switch (raw.type) {
+      case 'response.created':
+        if (!responseId) break;
+        if (!framed) {
+          const supplied = raw.response?.metadata?.kestrel_input_generation;
+          if (typedInputGeneration !== null ? supplied !== typedInputGeneration : supplied !== undefined) {
+            // A new local turn or audio-clear ACK does not identify a delayed
+            // response. Client-requested output must echo its original input
+            // correlation; this is routing evidence, never tool authority.
+            cancelledResponses.add(responseId);
+            break;
+          }
+          if (typedInputGeneration !== null) {
+            clearTimeout(responseStartTimer);
+            responseStartTimer = null;
+            responseAdmissionOpen = true;
+          }
+        }
+        if (framed) responseAdmissionOpen = true;
+        if (!responseAdmissionOpen) {
+          cancelledResponses.add(responseId);
+          break;
+        }
+        activeResponseId = responseId;
+        responseGeneration += 1;
+        onEvent(makeEvent(Events.SPEAKING_STARTED, {}));
+        break;
       case 'session.created':
         onEvent(makeEvent(Events.SESSION_READY, {
           session_id: raw.session?.id ?? session?.session_id ?? '',
@@ -334,9 +452,12 @@ export async function createRealtimeClient({
       case 'input_audio_buffer.speech_started':
         // A barge-in abandons the prior response. Completed arguments from
         // that interrupted response must not execute or bleed into the next.
-        pendingToolCalls = [];
+        // Server VAD already detected this fresh audio. Retire old output,
+        // not the microphone buffer containing the new utterance.
+        abandonResponse({ clearInput: false });
+        framed?.speechStarted(raw.item_id);
+        speechInputItemId = raw.item_id ?? '';
         userTranscriptTracker.speechStarted();
-        playback?.flush?.();
         onEvent(makeEvent(Events.LISTENING_STARTED, {}));
         break;
       case 'input_audio_buffer.speech_stopped':
@@ -344,7 +465,17 @@ export async function createRealtimeClient({
         onEvent(makeEvent(Events.LISTENING_STOPPED, {}));
         break;
       case 'input_audio_buffer.committed':
+        framed?.committed(raw.item_id);
+        // An old buffered commit can arrive after cancellation but before
+        // the ordered clear acknowledgement. It cannot authorize output.
+        if (typedInputGeneration === null && freshInputGeneration === responseGeneration
+            && (!speechInputItemId || speechInputItemId === raw.item_id)) responseAdmissionOpen = true;
         userTranscriptTracker.committed(raw.item_id ?? '');
+        break;
+      case 'input_audio_buffer.cleared':
+        if (pendingInputClears.length && pendingInputClears.shift() === responseGeneration) {
+          freshInputGeneration = responseGeneration;
+        }
         break;
 
       case 'conversation.item.input_audio_transcription.delta': {
@@ -399,9 +530,6 @@ export async function createRealtimeClient({
         break;
       }
 
-      case 'response.created':
-        onEvent(makeEvent(Events.SPEAKING_STARTED, {}));
-        break;
       // GA renamed audio-transcript events to the `output_audio_transcript`
       // namespace; the text-modality stream is `output_text`. Without these
       // the agent's spoken reply never reaches the chat window because the
@@ -423,32 +551,38 @@ export async function createRealtimeClient({
         break;
       case 'response.done':
         playback?.endOfStream?.();
-        if (pendingToolCalls.length && responseAllowsToolDispatch(raw)) {
-          const calls = pendingToolCalls;
-          pendingToolCalls = [];
+        { const responseId = raw.response?.id ?? raw.response_id;
+        const calls = pendingToolCalls.get(responseId) || [];
+        pendingToolCalls.delete(responseId);
+        framed?.completed(calls, responseAllowsToolDispatch(raw));
+        if (responseAdmissionOpen && calls.length && responseAllowsToolDispatch(raw) && !cancelledResponses.has(responseId)) {
           onEvent(makeEvent(Events.TOOL_CALL_BATCH_REQUESTED, {
-            batch_id: raw.response?.id ?? raw.response_id ?? '',
+            batch_id: responseId,
+            response_generation: responseGeneration,
             calls,
           }));
-        } else {
-          pendingToolCalls = [];
-        }
+        } }
         onEvent(makeEvent(Events.SPEAKING_STOPPED, {}));
         onEvent(makeEvent(Events.RESPONSE_DONE, {}));
         break;
 
       case 'response.function_call_arguments.done': {
+        const responseId = raw.response_id;
+        if (!responseAdmissionOpen || !responseId || cancelledResponses.has(responseId)) break;
+        if (!activeResponseId) activeResponseId = responseId;
         let args = {};
         try {
           args = raw.arguments ? JSON.parse(raw.arguments) : {};
         } catch (_err) {
           args = { _raw: raw.arguments ?? '' };
         }
-        pendingToolCalls.push({
+        const calls = pendingToolCalls.get(responseId) || [];
+        calls.push({
           call_id: raw.call_id ?? '',
           name: raw.name ?? '',
           arguments: args,
         });
+        pendingToolCalls.set(responseId, calls);
         break;
       }
 
@@ -468,10 +602,12 @@ export async function createRealtimeClient({
   }
 
   async function startWebRTC() {
+    await requireOpen();
     pc = new RTCPeerConnection();
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    await requireOpen();
     for (const track of micStream.getTracks()) pc.addTrack(track, micStream);
 
     audioSink = document.createElement('audio');
@@ -491,13 +627,15 @@ export async function createRealtimeClient({
       }
     };
     dc.onclose = () => {
-      if (!closed) onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'data_channel_closed' }));
+      if (!closed) void close();
     };
     pc.onconnectionstatechange = () => {
       if (closed || !pc) return;
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        const error = new Error(`RTC connection ${pc.connectionState}`);
+        void close(error);
         onEvent(makeEvent(Events.ERROR, {
-          message: `RTC connection ${pc.connectionState}`,
+          message: error.message,
           code: `rtc_${pc.connectionState}`,
           fatal: true,
         }));
@@ -505,25 +643,52 @@ export async function createRealtimeClient({
     };
 
     const offer = await pc.createOffer();
+    await requireOpen();
     await pc.setLocalDescription(offer);
+    await requireOpen();
     const sdpResp = await fetch(resolveRealtimeSDPEndpoint(session), {
       method: 'POST',
       body: offer.sdp,
+      signal: startupAbort.signal,
       headers: {
         'Authorization': `Bearer ${session.client_secret.value}`,
         'Content-Type': 'application/sdp',
       },
     });
+    await requireOpen();
     if (!sdpResp.ok) throw new Error(`SDP exchange failed: HTTP ${sdpResp.status}`);
-    await pc.setRemoteDescription({ type: 'answer', sdp: await sdpResp.text() });
+    const answer = await sdpResp.text();
+    await requireOpen();
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+    await requireOpen();
   }
 
   async function startWebSocket() {
-    capture = await createVoiceCapture({ targetSampleRate: 24000 });
-    playback = await createVoicePlayback({ sampleRate: 24000 });
+    capture = await createVoiceCapture({ targetSampleRate: 24000, onAcquire: owner => {
+      capture = owner;
+      if (closed) { void owner.destroy(); return; }
+      if (captureResetPending) { owner.reset(); captureResetPending = false; }
+    } });
+    await requireOpen();
+    playback = await createVoicePlayback({ sampleRate: 24000, onError: error => {
+      if (closed) return;
+      void close(error);
+      onEvent(makeEvent(Events.ERROR, {
+        message: error.message, code: 'AUDIO_OUTPUT_CONTROL_FAILED', fatal: true,
+      }));
+    }, onAcquire: owner => {
+      playback = owner;
+      if (closed) void owner.destroy();
+    } });
+    await requireOpen();
     playback.setMuted?.(outputMuted);
     capture.onchunk((pcm) => {
       if (inputMuted || closed) return;
+      if (framed) {
+        try { framed.audio(bytesToBase64(pcm), pcm.byteLength); }
+        catch (error) { void close(error); onEvent(makeEvent(Events.ERROR, { message: error.message, fatal: true })); }
+        return;
+      }
       if (ws?.readyState === WebSocket.OPEN) {
         sendJSON({ type: 'input_audio_buffer.append', audio: bytesToBase64(pcm) });
         return;
@@ -538,18 +703,21 @@ export async function createRealtimeClient({
 
     const subprotocols = session.vendor === 'xai'
       ? [`xai-client-secret.${session.client_secret.value}`]
-      : [];
+      : framed ? ['realtime', `openai-insecure-api-key.${session.client_secret.value}`] : [];
     ws = new WebSocket(session.endpoint, subprotocols);
     ws.onmessage = (ev) => {
       try { handleProviderEvent(JSON.parse(ev.data)); }
       catch (err) {
+        if (framed) void close(err);
         onEvent(makeEvent(Events.ERROR, {
-          message: `Malformed realtime event: ${err.message}`, fatal: false,
+          message: `Malformed realtime event: ${err.message}`, fatal: !!framed,
         }));
       }
     };
     await new Promise((resolve, reject) => {
       ws.onopen = () => {
+        if (closed) { reject(new Error('Realtime client retired during startup')); return; }
+        if (framed) { framed.start().then(resolve, reject); return; }
         if (session.session_config && Object.keys(session.session_config).length) {
           sendJSON({ type: 'session.update', session: session.session_config });
         }
@@ -561,14 +729,18 @@ export async function createRealtimeClient({
         resolve();
       };
       ws.onerror = () => reject(new Error(`${session.provider || 'Realtime'} WebSocket failed`));
+      ws.onclose = () => reject(new Error('Realtime WebSocket closed during startup'));
     });
+    await requireOpen();
     ws.onclose = () => {
-      if (!closed) onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'websocket_closed' }));
+      if (!closed) void close();
     };
     ws.onerror = () => {
       if (!closed) {
+        const error = new Error(`${session.provider || 'Realtime'} WebSocket error`);
+        void close(error);
         onEvent(makeEvent(Events.ERROR, {
-          message: `${session.provider || 'Realtime'} WebSocket error`,
+          message: error.message,
           code: 'websocket_error',
           fatal: true,
         }));
@@ -576,8 +748,12 @@ export async function createRealtimeClient({
     };
   }
 
-  async function start() {
+  function start() { return startupSettlement.run(startNative); }
+
+  async function startNative() {
+    await requireOpen();
     if (session) throw new Error('Realtime client already started');
+    try {
 
     // 1. Mint session from backend. Auth headers come from `getAuthHeaders`
     // so the voice UI shell can wire in `API.applyAuth({})` (which honors
@@ -585,36 +761,45 @@ export async function createRealtimeClient({
     // other Kestrel endpoint authenticates. Without this the request gets a
     // 401 against any server with auth enabled.
     const authHeaders = (await getAuthHeaders()) || {};
+    await requireOpen();
     const resp = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders,
       },
-      body: JSON.stringify(sessionRequestBody),
       ...sessionRequestInit,
+      body: JSON.stringify({ ...sessionRequestBody, output_profile: outputProfile }),
+      signal: startupAbort.signal,
     });
+    await requireOpen();
     if (resp.status === 409) {
       // Resolver rejected realtime — caller should fall back to pipeline.
       const body = await resp.json();
       const err = new Error(body.reason || 'Realtime unavailable');
-      err.code = 'REALTIME_UNAVAILABLE';
-      err.fallback = body;  // { path, fallback_tts, fallback_stt, reason }
+      err.code = outputProfile ? 'REALTIME_PROFILE_UNAVAILABLE' : 'REALTIME_UNAVAILABLE';
+      if (!outputProfile) err.fallback = body;
       throw err;
     }
     if (!resp.ok) {
-      throw new Error(`Session mint failed: HTTP ${resp.status}`);
+      const failure = await resp.json();
+      throw new Error(typeof failure?.detail === 'string' ? failure.detail : `Session mint failed: HTTP ${resp.status}`);
     }
     session = await resp.json();
+    await requireOpen();
+    if (outputProfile) requireFramedBootstrap(session, outputProfile);
 
     if (session.transport === 'websocket') await startWebSocket();
     else if (session.transport === 'webrtc' || !session.transport) await startWebRTC();
     else throw new Error(`Unsupported realtime transport: ${session.transport}`);
+    } catch (error) {
+      await close(error);
+      await retireAcquired();
+      throw error;
+    }
   }
 
-  async function close() {
-    if (closed) return;
-    closed = true;
+  async function retireAcquired() {
     try { dc?.close(); } catch (_) {}
     try { ws?.close(); } catch (_) {}
     try {
@@ -631,11 +816,37 @@ export async function createRealtimeClient({
         audioSink.srcObject = null;
       }
     } catch (_) {}
-    onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
+  }
+
+  function close(error) {
+    if (closeOwner) return closeOwner;
+    closed = true;
+    const originalClose = startupSettlement.close(error);
+    framed?.close(originalClose);
+    clearTimeout(responseStartTimer);
+    responseStartTimer = null;
+    startupAbort.abort();
+    closeOwner = retireAcquired().then(() => {
+      onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'client_close' }));
+    });
+    return closeOwner;
   }
 
   /** Queue a text message into the conversation (without speaking it aloud). */
   function sendText(text) {
+    if (closed) throw new Error('Original voice transport is closed.');
+    abandonResponse({ clearInput: false });
+    if (framed) {
+      framed.clearInput(() => {
+        sendJSON({ type: 'conversation.item.create', item: {
+          type: 'message', role: 'user', content: [{ type: 'input_text', text }],
+        } }, { required: true });
+        framed.request();
+        persistTurn('user', text);
+      });
+      return;
+    }
+    typedInputGeneration = crypto.randomUUID();
     sendJSON({
       type: 'conversation.item.create',
       item: {
@@ -643,8 +854,8 @@ export async function createRealtimeClient({
         role: 'user',
         content: [{ type: 'input_text', text }],
       },
-    });
-    sendJSON({ type: 'response.create' });
+    }, { required: true });
+    requestResponse();
     // Typed turns don't produce an input_audio_transcription.completed event,
     // so persist the user side here or backend history would be one-sided
     // (assistant reply only). The assistant turn still persists via
@@ -653,10 +864,57 @@ export async function createRealtimeClient({
   }
 
   /** Barge-in: abort the in-flight agent response. */
-  function cancelResponse() {
-    pendingToolCalls = [];
-    sendJSON({ type: 'response.cancel' });
+  function abandonResponse({ clearInput = true } = {}) {
+    // Fence the actual PCM sink for EVERY abandonment, including typed
+    // replacement. JSON filtering alone cannot retire already queued audio.
     playback?.flush?.();
+    if (framed) {
+      framed.abandon();
+      framed.requestCancel();
+    }
+    clearTimeout(responseStartTimer);
+    responseStartTimer = null;
+    typedInputGeneration = null;
+    speechInputItemId = '';
+    responseAdmissionOpen = false;
+    responseGeneration += 1;
+    freshInputGeneration = clearInput ? null : responseGeneration;
+    if (clearInput) {
+      if (framed) framed.clearInput();
+      else {
+        pendingInputClears.push(responseGeneration);
+        sendJSON({ type: 'input_audio_buffer.clear' });
+      }
+    }
+    if (activeResponseId) cancelledResponses.add(activeResponseId);
+    for (const id of pendingToolCalls.keys()) cancelledResponses.add(id);
+    pendingToolCalls.clear();
+  }
+
+  function cancelResponse() {
+    if (closed) return;
+    abandonResponse();
+    if (!framed) sendJSON({ type: 'response.cancel' });
+  }
+
+  function requestResponse() {
+    if (framed) { framed.request(); return; }
+    const original = typedInputGeneration;
+    sendJSON(original === null ? { type: 'response.create' } : {
+      type: 'response.create',
+      response: { metadata: { kestrel_input_generation: original } },
+    }, { required: true });
+    if (original !== null) {
+      clearTimeout(responseStartTimer);
+      responseStartTimer = setTimeout(() => {
+        if (closed || typedInputGeneration !== original) return;
+        onEvent(makeEvent(Events.ERROR, {
+          message: 'Realtime provider did not acknowledge the original typed response correlation.',
+          code: 'RESPONSE_CORRELATION_UNCONFIRMED', fatal: true,
+        }));
+        close();
+      }, responseStartTimeoutMs);
+    }
   }
 
   /**
@@ -665,10 +923,7 @@ export async function createRealtimeClient({
    * directives composed from canonical tags.
    */
   function updateInstructions(instructions) {
-    sendJSON({
-      type: 'session.update',
-      session: { instructions },
-    });
+    sendJSON(buildRealtimeSessionUpdate({ instructions }, framed ? 'realtime' : ''));
   }
 
   /**
@@ -677,7 +932,7 @@ export async function createRealtimeClient({
    * browser only forwards it over the existing data channel.
    */
   function updateTools(tools) {
-    sendJSON(buildRealtimeToolsSessionUpdate(tools));
+    sendJSON(buildRealtimeToolsSessionUpdate(tools, { sessionType: framed ? 'realtime' : '' }));
   }
 
   /**
@@ -686,21 +941,30 @@ export async function createRealtimeClient({
    */
   async function commitToolResults(results = []) {
     if (!results.length) return;
-    for (const { call_id: callId, result } of results) {
-      sendJSON({
-        type: 'conversation.item.create',
-        item: {
-          type: 'function_call_output',
-          call_id: callId,
-          output: JSON.stringify(result),
-        },
-      });
+    const originalGeneration = responseGeneration;
+    try {
+      framed?.reserveToolResults(results);
+      for (const { call_id: callId, result } of results) {
+        sendJSON({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify(result),
+          },
+        }, { required: true });
+      }
+      // xAI can finish delivering response audio before the browser has played
+      // it. Waiting here prevents the post-tool response from overlapping the
+      // prior response; WebRTC providers resolve immediately.
+      await waitForPlaybackIdle(playback);
+      if (closed || originalGeneration !== responseGeneration) return;
+      responseAdmissionOpen = true;
+      requestResponse();
+    } catch (error) {
+      await close(error);
+      throw error;
     }
-    // xAI can finish delivering response audio before the browser has played
-    // it. Waiting here prevents the post-tool response from overlapping the
-    // prior response; WebRTC providers resolve immediately.
-    await waitForPlaybackIdle(playback);
-    sendJSON({ type: 'response.create' });
   }
 
   async function commitToolResult(callId, result) {
@@ -740,6 +1004,7 @@ export async function createRealtimeClient({
   return {
     path: 'realtime',
     start,
+    whenStartupSettled: startupSettlement.whenSettled,
     close,
     sendText,
     cancelResponse,
@@ -758,11 +1023,12 @@ export async function createRealtimeClient({
     },
     /** Live mic stream — lets the UI attach an AnalyserNode for a real level meter. */
     get micStream() {
-      return micStream;
+      return micStream ?? capture?.micStream ?? null;
     },
     /** Currently-active session bundle (null before start()). */
     get session() {
       return session;
     },
+    get responseGeneration() { return responseGeneration; },
   };
 }

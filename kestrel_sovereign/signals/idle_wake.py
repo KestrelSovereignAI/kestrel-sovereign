@@ -16,24 +16,32 @@ What idle means
 ---------------
 The agent is idle when every one of these holds:
 
-* no Talon job is in flight: a job the ``talon`` wait provider's
-  ``active_handles()`` holds that its read-only ``finished_runs()`` does not
-  report finished. ``finished_runs()`` vouches that the registry was read
-  whole; a finished job missing from ``active_handles()`` makes the read
-  unknown. ``poll()`` is never called: it reaps and pushes;
+* no Talon job is in flight in the agent's Talon lane: the lane's ``talon``
+  wait provider's read-only ``finished_runs()`` reports the registry read
+  whole (``complete``) and lists no job in its ``unfinished`` key. Both come
+  from one read, so a ``complete`` report vouches for that list. A report
+  without the key is unknown: kestrel-feature-talon reports unfinished jobs
+  from 0.2.14 (``UNFINISHED_JOBS_REQUIREMENT``), and through an older
+  provider the detector never fires. ``active_handles()`` is never the list
+  of running jobs: it reads the registry a second time and answers with what
+  it remembers when it cannot. ``poll()`` is never called: it reaps and
+  pushes;
 * no wait watch is armed (on a kind whose provider is loaded: a watch nothing
   can poll never fires, and must not hold the agent quiet forever);
 * no restart request the agent filed is pending, approved, updating or
   executing;
 * no wake is waiting to be delivered: a wait-ledger wake in flight or parked
   until a provider-advised time, a restart wake not yet delivered, a durable
-  A2A or channel cognition delivery, a scheduled ``self_followup``, or a turn
-  running right now.
+  A2A or channel cognition delivery, a ``self_followup`` the scheduler has not
+  finished (scheduled, or claimed and awaiting its turn or crash recovery), or
+  a turn running right now.
 
 A state that cannot be read (an unreadable Talon registry, a Talon provider
-too old to report one, a failing query, a volatile privacy mode in which
-operator turns leave no record, an unreadable Hold state, a Hold) is not idle.
-The detector fails closed: it does not fire, and says why in its cron result.
+that does not report its unfinished jobs, a Talon dispatcher that is not
+running on this host, a failing query, a volatile privacy mode in which
+operator turns leave no record, an unreadable Hold state, a Hold) is not
+idle. The detector fails closed: it does not fire, and says why in its cron
+result.
 
 The wake fires once the agent has been idle for ``idle_minutes`` as observed
 by the detector. It vouches only for stretches it watched: a gap between two
@@ -43,13 +51,42 @@ scheduler runs an occurrence a little late or skips one, so consecutive
 evaluations are never exactly one interval apart, and a threshold of one
 interval must still be reachable.
 
+Whose Talon registry
+--------------------
+An agent's Talon work does not always run on that agent. A host can name one
+agent as its only Talon dispatcher (``[talon.policy] dispatcher`` in
+kestrel-feature-talon 0.2.14): every other agent sends that agent a work
+order (an A2A task) and the dispatcher's Talon runs it. The selecting
+agent's own registry then stays empty while the dispatcher's lane is busy
+(#3758), so reading it would report Talon idle mid-run. The detector reads
+the dispatcher's registry instead, and never the selecting agent's own. It
+takes the dispatcher from ``[talon.policy] dispatcher`` in its kestrel.toml,
+the file a fleet host's Talon ``config_path`` names; it reads that one key of
+Talon's policy and nothing else of Talon's configuration. A host whose Talon
+reads its policy from another file names the dispatcher in ``[idle_wake]
+talon_dispatcher``. Named in both places, they must agree. A blank name, or
+two that disagree, is a configuration error and the wake does not fire. The dispatcher's
+registry holds every run its Talon started, whoever ordered it, so "no job
+in flight" means the host's Talon lane is free, and a job dispatched there
+for anyone ends the stretch. The work order itself is covered by the wait
+ledger when the orchestrator arms an ``a2a:`` watch on the order it sends,
+as it must until a sender is woken by its peer's completion (#3755): an
+order still awaiting its report is then an armed watch.
+
+The dispatcher is found through the host's agent manager, so it must be an
+agent of the same host; one that is not running here, or loads no Talon, is
+unknown and the wake does not fire. Its registry is only read: nothing is
+written to the dispatcher. With no dispatcher named, or one naming the agent
+itself, the agent's own registry is its lane, as on a host with no
+dispatcher policy, where each agent runs its own Talon work.
+
 One wake per idle stretch
 -------------------------
 After the wake is delivered the stretch is spent. It does not fire again
 until something starts new work or a person or peer turns up:
 
-* a Talon job is dispatched (its job id appears, whether it is still running
-  or already finished);
+* a Talon job is dispatched in the agent's Talon lane (its job id appears,
+  whether it is still running or already finished);
 * a watch is armed (seen armed at an evaluation), or a wake is delivered
   (a delivered wake means a watch was armed or a job dispatched since);
 * a restart request is filed, including one the agent files itself;
@@ -59,7 +96,8 @@ Each of those starts a new stretch, and the idle clock starts again when the
 agent next looks idle. Only new evidence counts: a job id or restart request
 that was not in the previous reading, or a wake delivered later than the
 newest one read. Evidence that disappears (a pruned job, a deleted row) is not
-new work, and a source read for the first time is a baseline, not news. A
+new work, and a source read for the first time is a baseline, not news, as
+is a Talon lane that moved to another agent's registry. A
 wake still being delivered, or a turn in progress, restarts the idle clock but
 does not start a new stretch, so the triage turn's own delivery can never
 re-arm it. The marker is persisted (``idle_wake_state``), so a restart neither
@@ -70,28 +108,64 @@ A delivered or coalesced wake spends the stretch, and so does a cooperative
 Stop of the triage turn, which the dispatcher reports as coalesced. A failed
 one is retried on later ticks, at most :data:`MAX_WAKE_ATTEMPTS` times per
 stretch, each attempt under its own durable source event id and dedupe key.
+A dispatch that ends in execution-custody evidence (an unknown commit
+outcome, revoked authority), including a cancellation caused by it, is
+neither: whether its turn ran is decided by the reply it stored.
 
-Who owns a wake
----------------
-Every replica sharing the agent's database runs the cron, and the scheduler
-does not pin consecutive occurrences to one of them. So the pending wake is
-recorded with its owner, the process that enqueued it, and a lease the owner
-renews every :data:`OWNER_HEARTBEAT_INTERVAL` while the wake's dispatch runs.
-When the dispatch ends the owner settles the wake at once, so its outcome is
-in the row before any replica's next evaluation. Another replica that finds
-the wake pending under a live lease treats it as a turn in progress: the agent
-is busy, and nothing is dispatched. Only when the lease has not been renewed
-for :data:`OWNER_STALE_AFTER` (its owner stopped) is the wake recovered: it
-counts as delivered when its turn stored a reply, is retried when the lookup
-finds none, and stays pending while the lookup cannot be made. A process that
-finds its own wake pending with no dispatch of its own behind it recovers it
-the same way at once.
+The evaluation runs inside a cron occurrence, but the wake outlives it. Its
+enqueue, its dispatch and turn, and its settlement run as the agent runtime's
+work, handed over by the evaluation, and so does the lease heartbeat. On
+PostgreSQL a scheduler occurrence's execution admission retires when the
+occurrence returns, and work started as its child would be refused from then
+on.
+
+One process runs the detector
+-----------------------------
+The detector sees only its own process: whether a turn is running is
+process-local state, and so is a wake's dispatch. A second process could not
+see the first one's turns, and could declare the agent idle while an operator
+turn runs there. So one process at a time runs the detector, the one holding
+its lease (``owner`` in ``idle_wake_state``). The first evaluation takes the
+lease and starts a heartbeat that renews it every
+:data:`OWNER_HEARTBEAT_INTERVAL` for as long as the process lives. An
+evaluation on any other process finds the lease live and does nothing at all:
+it observes nothing, writes nothing and dispatches nothing (verdict
+``not_owner``). A lease not renewed for :data:`OWNER_STALE_AFTER` is taken
+over by the next evaluation that finds it so. A restarted process is a new
+owner, so after a restart the detector resumes once the old lease lapses.
+
+A lapsed lease normally means its process stopped, but it can also belong to
+a live process whose renewals failed (its database unreachable, its event
+loop stalled). The owner guards itself against that: an evaluation that finds
+its own lease lapsed renews it before going on, and the owner fires only when
+it confirmed its lease within :data:`LEASE_CONFIRMED_WITHIN` (verdict
+``lease_unconfirmed`` otherwise). What it cannot guard is a wake it already
+enqueued: if its renewals keep failing past the staleness while that triage
+turn runs, another process takes the lease over and may retry the wake.
+
+A wake belongs to the process that enqueued it, which settles it as soon as
+its dispatch ends. A wake still pending when its owner's lease is taken over
+is presumed to have gone down with that process: the new owner counts it as
+delivered when its turn stored a reply, retries it when the lookup finds none,
+and leaves it pending while the lookup cannot be made.
+
+So two processes that overlap briefly, as in a rolling restart, never both
+evaluate or both dispatch. The owner still cannot see a turn running in the
+other process; it sees only that turn's opening row, and only when an operator
+or a peer opened it. A deployment that runs one agent on more than one replica
+at once must keep ``[idle_wake]`` off (the default): the owner does not
+observe turns running on the other replicas, and the cron occurrences that
+land on them are skipped, so the owner's own evaluations may come too far
+apart to see an idle stretch through.
 
 Every write to ``idle_wake_state`` is a compare-and-set on the row's
-revision, so two evaluations racing on different replicas cannot both claim
-the stretch's wake, and an evaluation working from an older reading cannot
-undo a settled wake. The loser drops its write; the next evaluation reads
-afresh.
+revision. A takeover also requires the holder and heartbeat it read, and
+advances the revision. So two processes taking a lapsed lease at once cannot
+both win, a takeover racing the owner's renewal loses to it, the old owner
+cannot write from a reading older than the takeover, and an evaluation
+working from an older reading cannot undo a settled wake. The loser drops its
+write; the next evaluation reads afresh. A renewal moves only the heartbeat,
+so it never invalidates the owner's own evaluation in progress.
 
 Binding
 -------
@@ -115,12 +189,19 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_task_error
 from kestrel_sovereign.config import load_section
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 logger = logging.getLogger(__name__)
 
 #: The kestrel.toml section the detector reads.
 CONFIG_SECTION = "idle_wake"
+#: The kestrel.toml section holding Talon's operator policy, whose
+#: ``dispatcher`` names the host's only Talon dispatcher (kestrel-feature-talon
+#: 0.2.14). The detector reads only that one key, to know whose registry is
+#: this agent's Talon lane.
+TALON_CONFIG_SECTION = "talon"
 
 #: The built-in cron task that runs one evaluation.
 TASK_NAME = "idle_wake"
@@ -147,20 +228,30 @@ MAX_OBSERVATION_GAP = timedelta(minutes=2 * CRON_INTERVAL_MINUTES + 2)
 #: Wake attempts per idle stretch before the stretch is given up.
 MAX_WAKE_ATTEMPTS = 3
 
-#: How often the process that enqueued a wake renews its lease on it while
-#: the wake's dispatch runs.
+#: How often the process running the detector renews its lease.
 OWNER_HEARTBEAT_INTERVAL = timedelta(seconds=30)
 #: A lease not renewed for this long belongs to a process that stopped. It is
 #: the dispatcher's runtime-owner staleness, and like it compares the owner's
-#: clock with the reader's: replicas' clocks must agree to well within it.
+#: clock with the reader's: processes' clocks must agree to well within it.
 OWNER_STALE_AFTER = timedelta(minutes=2)
-#: Times an owner tries to settle its finished wake when another evaluation
-#: wrote the row first. If every try loses, the owner's next evaluation
-#: settles it, or a replica recovers it once the lease is stale.
+#: An owner fires only when it confirmed its lease this recently. Half the
+#: staleness leaves the claim and the enqueue well inside the lease, so no
+#: other process can take it over between them.
+LEASE_CONFIRMED_WITHIN = OWNER_STALE_AFTER / 2
+#: The name of the task renewing the lease. It runs for the life of the
+#: process, so the restart coordinator's idle gate counts it as bookkeeping,
+#: not work (``_INFRA_TASK_PREFIXES``).
+OWNER_HEARTBEAT_TASK_PREFIX = "idle_wake_owner_heartbeat:"
+#: The name of the task that owns one wake: it hands the wake to the
+#: dispatcher and settles it when its dispatch ends. Like the heartbeat it
+#: belongs to the agent's runtime, not to the cron occurrence that fired it.
+TRIAGE_TASK_PREFIX = "idle_wake_triage:"
+#: Times an owner tries to settle its finished wake when another write to the
+#: row came first. If every try loses, the owner's next evaluation settles it.
 SETTLE_TRIES = 3
 
-#: A pending wake whose owner stopped (or lost its dispatch) before settling
-#: it, but whose turn stored its reply: it was delivered.
+#: A pending wake whose owner stopped before settling it, but whose turn
+#: stored its reply: it was delivered.
 REPLIED_BEFORE_RESTART = "replied_before_restart"
 #: Dispatcher statuses that spend the stretch. ``coalesced`` means an
 #: equivalent wake for this exact attempt was already accepted, or the triage
@@ -168,8 +259,8 @@ REPLIED_BEFORE_RESTART = "replied_before_restart"
 _SPENT_STATUSES = frozenset({"ok", "coalesced", REPLIED_BEFORE_RESTART})
 #: Statuses no retry can change.
 _HARD_FAIL_STATUSES = frozenset({"dropped_validation", "dropped_cycle"})
-#: A pending wake whose owner stopped (or lost its dispatch) and whose turn
-#: stored no reply: it never finished, so it is retried.
+#: A pending wake whose owner stopped and whose turn stored no reply: it never
+#: finished, so it is retried.
 LOST_AT_RESTART = "lost_at_restart"
 
 #: Restart request states in which the agent is waiting on its restart.
@@ -177,6 +268,9 @@ RESTART_WORK_STATUSES = frozenset({"pending", "approved", "updating", "executing
 
 #: Wake sources whose turn was opened by a peer agent.
 A2A_SOURCE_PREFIX = "a2a."
+
+#: How a report names the agent's own Talon registry as the lane it read.
+OWN_TALON_REGISTRY = "self"
 
 #: Conversation rows read per evaluation to find newly opened turns.
 CONVERSATION_SCAN_ROWS = 200
@@ -191,10 +285,20 @@ CHAIN_SESSION_SCAN_ROWS = 20
 
 @dataclass(frozen=True)
 class IdleWakeConfig:
-    """``[idle_wake]`` as it applies to one agent."""
+    """``[idle_wake]`` as it applies to one agent.
+
+    ``talon_dispatcher`` is the ``agent_name`` of the agent that runs this
+    agent's Talon work, the agent ``[talon.policy] dispatcher`` names; the
+    detector reads that agent's Talon registry (see :meth:`IdleWakeDetector.
+    _talon_lane`). ``None`` means the agent runs its own. ``config_error``
+    says why the configuration could not be read as written; the detector
+    then never reads the agent as idle.
+    """
 
     enabled: bool = False
     idle_minutes: int = DEFAULT_IDLE_MINUTES
+    talon_dispatcher: Optional[str] = None
+    config_error: Optional[str] = None
 
 
 def _agent_names(agent: Any) -> set:
@@ -207,7 +311,9 @@ def _agent_names(agent: Any) -> set:
 
 
 def load_idle_wake_config(
-    agent: Any, section: Optional[Dict[str, Any]] = None
+    agent: Any,
+    section: Optional[Dict[str, Any]] = None,
+    talon_section: Optional[Dict[str, Any]] = None,
 ) -> IdleWakeConfig:
     """Read ``[idle_wake]`` for ``agent``.
 
@@ -216,8 +322,21 @@ def load_idle_wake_config(
     host runs, as ``[preturn_state]`` does. ``idle_minutes`` defaults to
     :data:`DEFAULT_IDLE_MINUTES`; a value that is not an integer of at least
     :data:`MIN_IDLE_MINUTES` is refused with a warning and the default used.
+
+    ``talon_dispatcher`` names the agent whose Talon registry holds this
+    agent's runs. Unset, it is the agent ``[talon.policy] dispatcher`` names
+    in the same kestrel.toml (``talon_section``, read from the file when not
+    passed), the file a fleet host's Talon ``config_path`` names. A
+    host whose Talon reads its policy from another file sets
+    ``talon_dispatcher`` itself. Set in both places, they must name the same
+    agent. A blank or non-string value in either, or two that disagree, is a
+    configuration error, not "absent": reading the agent's own empty
+    registry in the dispatcher's place would report Talon idle while the
+    dispatcher's lane runs.
     """
     cfg = load_section(CONFIG_SECTION) if section is None else section
+    if talon_section is None:
+        talon_section = load_section(TALON_CONFIG_SECTION)
     if not isinstance(cfg, dict) or cfg.get("enabled") is not True:
         return IdleWakeConfig()
     agents = cfg.get("agents") or []
@@ -233,7 +352,60 @@ def load_idle_wake_config(
             raw, MIN_IDLE_MINUTES, DEFAULT_IDLE_MINUTES,
         )
         raw = DEFAULT_IDLE_MINUTES
-    return IdleWakeConfig(enabled=True, idle_minutes=raw)
+    dispatcher, config_error = _talon_dispatcher(cfg, talon_section)
+    if config_error:
+        logger.warning(
+            "[idle_wake] %s; the detector will not read the agent as idle "
+            "until its Talon dispatcher is named consistently",
+            config_error,
+        )
+    return IdleWakeConfig(
+        enabled=True,
+        idle_minutes=raw,
+        talon_dispatcher=dispatcher,
+        config_error=config_error,
+    )
+
+
+def _agent_name_value(value: Any) -> Tuple[Optional[str], bool]:
+    """``(name, valid)`` for an agent-name setting: absent is ``(None, True)``."""
+    if value is None:
+        return None, True
+    if isinstance(value, str) and value.strip():
+        return value.strip(), True
+    return None, False
+
+
+def _talon_dispatcher(
+    cfg: Dict[str, Any], talon_section: Optional[Dict[str, Any]]
+) -> Tuple[Optional[str], Optional[str]]:
+    """The agent running this agent's Talon work, or why it is not known.
+
+    ``[idle_wake] talon_dispatcher`` and ``[talon.policy] dispatcher`` (see
+    :func:`load_idle_wake_config`). Returns ``(dispatcher, config_error)``.
+    """
+    explicit_raw = cfg.get("talon_dispatcher")
+    explicit, valid = _agent_name_value(explicit_raw)
+    if not valid:
+        return None, f"talon_dispatcher = {explicit_raw!r} is not an agent name"
+    talon = talon_section if isinstance(talon_section, dict) else {}
+    policy_table = talon.get("policy")
+    if policy_table is not None and not isinstance(policy_table, dict):
+        return None, f"[talon] policy = {policy_table!r} is not a table"
+    policy_raw = (policy_table or {}).get("dispatcher")
+    policy, valid = _agent_name_value(policy_raw)
+    if not valid:
+        return None, (
+            f"[talon.policy] dispatcher = {policy_raw!r} is not an agent name"
+        )
+    if explicit is None:
+        return policy, None
+    if policy is not None and explicit.casefold() != policy.casefold():
+        return None, (
+            f"talon_dispatcher = {explicit!r}, but [talon.policy] dispatcher "
+            f"= {policy!r}"
+        )
+    return explicit, None
 
 
 # ---------------------------------------------------------------------------
@@ -272,11 +444,10 @@ class IdleWakeState:
     delivery time. ``conversation_cursor`` is the newest conversation row
     already examined.
 
-    ``pending_signal_id`` is the wake enqueued and not yet settled,
-    ``pending_owner`` the process that enqueued it, and
-    ``pending_heartbeat_at`` when that process last renewed its lease on it.
-    ``revision`` is the row's revision as read (``0``: no row yet); every
-    write is conditional on it.
+    ``owner`` is the process running the detector and ``owner_heartbeat_at``
+    when it last renewed its lease. ``pending_signal_id`` is the wake that
+    owner enqueued and has not settled yet. ``revision`` is the row's revision
+    as read (``0``: no row yet); every write is conditional on it.
     """
 
     idle_since: Optional[str] = None
@@ -285,8 +456,8 @@ class IdleWakeState:
     fired_status: Optional[str] = None
     attempts: int = 0
     pending_signal_id: Optional[str] = None
-    pending_owner: Optional[str] = None
-    pending_heartbeat_at: Optional[str] = None
+    owner: Optional[str] = None
+    owner_heartbeat_at: Optional[str] = None
     evidence: Dict[str, Any] = field(default_factory=dict)
     conversation_cursor: Optional[int] = None
     last_wake_status: Optional[str] = None
@@ -315,8 +486,8 @@ class IdleWakeStateStore:
                 fired_status         TEXT,
                 attempts             INTEGER NOT NULL DEFAULT 0,
                 pending_signal_id    TEXT,
-                pending_owner        TEXT,
-                pending_heartbeat_at TEXT,
+                owner                TEXT,
+                owner_heartbeat_at   TEXT,
                 evidence             TEXT,
                 conversation_cursor  INTEGER,
                 last_wake_status     TEXT,
@@ -333,8 +504,8 @@ class IdleWakeStateStore:
         row = await self._db.fetchone(
             """
             SELECT idle_since, last_evaluated_at, fired_at, fired_status,
-                   attempts, pending_signal_id, pending_owner,
-                   pending_heartbeat_at, evidence, conversation_cursor,
+                   attempts, pending_signal_id, owner,
+                   owner_heartbeat_at, evidence, conversation_cursor,
                    last_wake_status, last_wake_error, revision
             FROM idle_wake_state WHERE agent_id = ?
             """,
@@ -357,8 +528,8 @@ class IdleWakeStateStore:
             fired_status=row[3],
             attempts=int(row[4] or 0),
             pending_signal_id=row[5],
-            pending_owner=row[6],
-            pending_heartbeat_at=row[7],
+            owner=row[6],
+            owner_heartbeat_at=row[7],
             evidence=evidence,
             conversation_cursor=int(row[9]) if row[9] is not None else None,
             last_wake_status=row[10],
@@ -370,77 +541,115 @@ class IdleWakeStateStore:
         """Write ``state`` if the row is still at the revision it was read at.
 
         Returns the state as written, its revision advanced, or ``None`` when
-        another writer got there first: an evaluation on another replica, or
-        the owner of the pending wake renewing or settling it. That write
-        stands; the caller drops its own.
+        another write got there first: the owner settling its wake, or
+        another process taking a lapsed lease. That write stands; the caller
+        drops its own. The lease is not written here; only
+        :meth:`take_lease` and :meth:`renew` write it, so a save can neither
+        hand the lease on nor wind its heartbeat back.
         """
-        await self._ensure_table()
-        values = (
-            state.idle_since,
-            state.last_evaluated_at,
-            state.fired_at,
-            state.fired_status,
-            int(state.attempts),
-            state.pending_signal_id,
-            state.pending_owner,
-            state.pending_heartbeat_at,
-            json.dumps(state.evidence, sort_keys=True),
-            state.conversation_cursor,
-            state.last_wake_status,
-            state.last_wake_error,
-            _iso(datetime.now(timezone.utc)),
-        )
-        if state.revision == 0:
-            written = await self._db.execute(
-                """
-                INSERT INTO idle_wake_state
-                    (idle_since, last_evaluated_at, fired_at, fired_status,
-                     attempts, pending_signal_id, pending_owner,
-                     pending_heartbeat_at, evidence, conversation_cursor,
-                     last_wake_status, last_wake_error, updated_at,
-                     agent_id, revision)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(agent_id) DO NOTHING
-                """,
-                values + (self._agent_id,),
-            )
-        else:
-            written = await self._db.execute(
-                """
-                UPDATE idle_wake_state SET
-                    idle_since = ?, last_evaluated_at = ?, fired_at = ?,
-                    fired_status = ?, attempts = ?, pending_signal_id = ?,
-                    pending_owner = ?, pending_heartbeat_at = ?, evidence = ?,
-                    conversation_cursor = ?, last_wake_status = ?,
-                    last_wake_error = ?, updated_at = ?,
-                    revision = revision + 1
-                WHERE agent_id = ? AND revision = ?
-                """,
-                values + (self._agent_id, state.revision),
-            )
-        if written != 1:
-            return None
-        return replace(state, revision=state.revision + 1)
-
-    async def renew(self, signal_id: str, owner: str, heartbeat_at: str) -> bool:
-        """Renew ``owner``'s lease on the pending wake ``signal_id``.
-
-        ``False`` when the wake is no longer pending under that owner: it was
-        settled, or recovered elsewhere after the lease went stale. A renewal
-        advances the revision, so an evaluation that read the lease before it
-        cannot then act on the older reading. One that repeats the stored
-        heartbeat changes nothing and leaves the revision alone.
-        """
+        if state.revision < 1:
+            raise ValueError("idle_wake_state: take_lease() creates the row")
         await self._ensure_table()
         written = await self._db.execute(
             """
             UPDATE idle_wake_state SET
-                revision = CASE WHEN pending_heartbeat_at = ?
-                                THEN revision ELSE revision + 1 END,
-                pending_heartbeat_at = ?
-            WHERE agent_id = ? AND pending_signal_id = ? AND pending_owner = ?
+                idle_since = ?, last_evaluated_at = ?, fired_at = ?,
+                fired_status = ?, attempts = ?, pending_signal_id = ?,
+                evidence = ?, conversation_cursor = ?, last_wake_status = ?,
+                last_wake_error = ?, updated_at = ?,
+                revision = revision + 1
+            WHERE agent_id = ? AND revision = ?
             """,
-            (heartbeat_at, heartbeat_at, self._agent_id, signal_id, owner),
+            (
+                state.idle_since,
+                state.last_evaluated_at,
+                state.fired_at,
+                state.fired_status,
+                int(state.attempts),
+                state.pending_signal_id,
+                json.dumps(state.evidence, sort_keys=True),
+                state.conversation_cursor,
+                state.last_wake_status,
+                state.last_wake_error,
+                _iso(datetime.now(timezone.utc)),
+                self._agent_id,
+                state.revision,
+            ),
+        )
+        if written != 1:
+            return None
+        return replace(state, revision=state.revision + 1)
+
+    async def take_lease(
+        self, state: IdleWakeState, owner: str, heartbeat_at: str
+    ) -> Optional[IdleWakeState]:
+        """Make ``owner`` the detector's owner, if the lease is still exactly
+        as ``state`` read it.
+
+        That is the same holder and the same heartbeat: a renewal since the
+        read means the holder is alive, and the takeover loses to it. Taking
+        the lease advances the revision, so the previous owner's writes from
+        older readings fail. ``None`` when the takeover lost.
+        """
+        await self._ensure_table()
+        now = _iso(datetime.now(timezone.utc))
+        if state.revision == 0:
+            written = await self._db.execute(
+                """
+                INSERT INTO idle_wake_state
+                    (agent_id, owner, owner_heartbeat_at, updated_at, revision)
+                VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(agent_id) DO NOTHING
+                """,
+                (self._agent_id, owner, heartbeat_at, now),
+            )
+        else:
+            held_by = "owner IS NULL" if state.owner is None else "owner = ?"
+            renewed_at = (
+                "owner_heartbeat_at IS NULL"
+                if state.owner_heartbeat_at is None
+                else "owner_heartbeat_at = ?"
+            )
+            written = await self._db.execute(
+                f"""
+                UPDATE idle_wake_state SET
+                    owner = ?, owner_heartbeat_at = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE agent_id = ? AND revision = ? AND {held_by}
+                      AND {renewed_at}
+                """,
+                (owner, heartbeat_at, now, self._agent_id, state.revision)
+                + tuple(
+                    value
+                    for value in (state.owner, state.owner_heartbeat_at)
+                    if value is not None
+                ),
+            )
+        if written != 1:
+            return None
+        return replace(
+            state,
+            owner=owner,
+            owner_heartbeat_at=heartbeat_at,
+            revision=state.revision + 1,
+        )
+
+    async def renew(self, owner: str, heartbeat_at: str) -> bool:
+        """Renew ``owner``'s lease on the detector.
+
+        ``False`` when ``owner`` no longer holds it: another process took it
+        over after it lapsed. A renewal moves only the heartbeat, not the
+        revision, so it never invalidates the owner's own evaluation in
+        progress; a takeover racing it is refused because the heartbeat it
+        read is gone.
+        """
+        await self._ensure_table()
+        written = await self._db.execute(
+            """
+            UPDATE idle_wake_state SET owner_heartbeat_at = ?
+            WHERE agent_id = ? AND owner = ?
+            """,
+            (heartbeat_at, self._agent_id, owner),
         )
         return written == 1
 
@@ -467,6 +676,9 @@ class Observation:
     evidence: Dict[str, Any] = field(default_factory=dict)
     activity: List[str] = field(default_factory=list)
     conversation_cursor: Optional[int] = None
+    #: Whose Talon registry was read: :data:`OWN_TALON_REGISTRY`, the
+    #: dispatcher's name, or ``None`` when none was.
+    talon_registry: Optional[str] = None
 
     @property
     def idle(self) -> bool:
@@ -489,26 +701,104 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def _dispatch_outcome(handle: Any) -> Tuple[str, Optional[str]]:
-    """The settled status of a finished wake dispatch, and its error."""
-    try:
-        result = handle.task.result()
-    except asyncio.CancelledError:
+def _refusal_outcome(
+    error: Optional[BaseException],
+) -> Tuple[Optional[str], Optional[str]]:
+    """How a wake that never reached the dispatcher ended: ``error`` is what
+    stopped its hand-over. Nothing started, so any of these is retried.
+
+    ``None`` for execution-custody evidence, as for a dispatch (see
+    :func:`_dispatch_outcome`): the reply lookup then finds no reply and the
+    wake is retried as lost.
+    """
+    if error is None:
+        return "dispatcher_raised", "the wake was never handed to the dispatcher"
+    if is_execution_control_error(error):
+        return None, f"dispatch_outcome_unknown: {_describe(error)}"
+    if isinstance(error, asyncio.CancelledError):
         return "dispatch_cancelled", None
-    except Exception as exc:  # noqa: BLE001 - the dispatch raised
-        return "dispatcher_raised", _describe(exc)
+    return "dispatcher_raised", _describe(error)
+
+
+def _dispatch_outcome(task: asyncio.Future) -> Tuple[Optional[str], Optional[str]]:
+    """The settled status of a finished wake dispatch, and its error.
+
+    ``None`` when the dispatch ended in execution-custody evidence (an
+    unknown commit outcome, revoked authority): whether its turn ran is not
+    known from the dispatch, so it is not settled as a failure to retry. Its
+    turn's stored reply decides it (:meth:`IdleWakeDetector._reply_outcome`).
+
+    The evidence is read through :func:`owned_task_error`, never
+    ``task.result()``. A dispatch cancelled with custody evidence as its
+    cause is that evidence, not a cancellation to retry, and asyncio hands a
+    cancelled task's original exception only to the first reader: the
+    agent's own completion callback reads it before this does.
+    """
+    error = owned_task_error(task)
+    if error is None:
+        result = task.result()
+    elif is_execution_control_error(error):
+        return None, f"dispatch_outcome_unknown: {_describe(error)}"
+    elif isinstance(error, asyncio.CancelledError):
+        return "dispatch_cancelled", None
+    else:
+        return "dispatcher_raised", _describe(error)
     status = getattr(getattr(result, "status", None), "value", None)
     if not isinstance(status, str):
         return "tooling_error", f"dispatch returned no usable status: {result!r}"
     return status, getattr(result, "error", None) or None
 
 
+@dataclass(eq=False)
+class _OwnedWake:
+    """A wake this process fired, held by its triage task.
+
+    ``task`` is the triage task (:meth:`IdleWakeDetector._run_wake`).
+    ``handed_over`` resolves once the dispatcher accepted the wake or refused
+    it. ``dispatch`` is the dispatch task once accepted, even when
+    ``enqueue_signal`` raised after accepting it (``enqueue_error``).
+    ``enqueue_error_seen`` says the evaluation that fired the wake read that
+    error, so the triage task need not raise it again.
+    """
+
+    handed_over: asyncio.Future
+    task: Optional[asyncio.Task] = None
+    dispatch: Optional[asyncio.Future] = None
+    enqueue_error: Optional[BaseException] = None
+    enqueue_error_seen: bool = False
+
+    def done(self) -> bool:
+        """Whether nothing of this wake is running any more."""
+        return (self.task is None or self.task.done()) and (
+            self.dispatch is None or self.dispatch.done()
+        )
+
+    def outcome(self) -> Tuple[Optional[str], Optional[str]]:
+        """How the finished wake ended (see :func:`_dispatch_outcome`)."""
+        if self.dispatch is not None:
+            return _dispatch_outcome(self.dispatch)
+        error = self.enqueue_error
+        if error is None and self.task is not None and self.task.done():
+            # Stopped before it reached the dispatcher: cancelled, or refused
+            # by the runtime it was handed to.
+            error = owned_task_error(self.task)
+        return _refusal_outcome(error)
+
+
 class IdleWakeDetector:
     """One agent's idle detector, held on ``agent._idle_wake_detector``.
 
-    It owns the wakes it enqueues: it keeps their in-memory dispatch handles
-    and, while each dispatch runs, the task that renews its lease and settles
-    it when the dispatch ends.
+    It evaluates only while the database says this process holds the
+    detector's lease, which a heartbeat task renews for the life of the
+    process, and it fires only while it has recently confirmed that lease. It
+    owns the wakes it fires: each has a triage task that hands it to the
+    dispatcher and settles it when its dispatch ends, and the detector keeps
+    each wake's in-memory record until it is settled.
+
+    The heartbeat and the triage tasks outlive the cron occurrence whose
+    evaluation started them, so they are handed to the agent's runtime
+    (:meth:`_track_resident`) rather than started as children of the
+    occurrence.
     """
 
     def __init__(
@@ -536,10 +826,14 @@ class IdleWakeDetector:
             raise RuntimeError("idle wake: the agent has no database")
         self._state_store = IdleWakeStateStore(self._db, self._agent_id)
         self._wait_store = WaitSignalStore(self._db, self._agent_id)
-        # This process, as the owner of the wakes it enqueues. A restarted
+        # This process, as the holder of the detector's lease. A restarted
         # process is a new owner: it cannot renew the old one's lease.
         self._owner = f"idle-wake:{secrets.token_urlsafe(12)}"
         self._heartbeat_seconds = heartbeat_interval.total_seconds()
+        self._heartbeat: Optional[asyncio.Task] = None
+        # When this process last confirmed its lease (took or renewed it),
+        # by its own clock.
+        self._confirmed_at: Optional[datetime] = None
         self._pending: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
 
@@ -553,9 +847,18 @@ class IdleWakeDetector:
     ) -> Dict[str, Any]:
         """Run one evaluation and return a JSON-able report of it."""
         if not config.enabled:
+            self.stand_down()
             return {"skipped": "disabled", "fired": False}
         async with self._lock:
             return await self._tick(config, pending_followups)
+
+    def stand_down(self) -> None:
+        """Stop renewing the lease: the detector was disabled. It lapses
+        after :data:`OWNER_STALE_AFTER`; wakes already enqueued still settle.
+        Nothing is written, so a disabled detector touches no state."""
+        if self._heartbeat is not None and not self._heartbeat.done():
+            self._heartbeat.cancel()
+        self._heartbeat = None
 
     async def _tick(
         self,
@@ -569,26 +872,59 @@ class IdleWakeDetector:
             "fired": False,
         }
 
+        # --- The lease: one process runs the detector --------------------
+        if state.owner != self._owner:
+            if state.owner is not None and not self._lease_stale(state, now):
+                # Another live process runs the detector. This one cannot see
+                # that one's turns, so it does not evaluate at all.
+                report.update(
+                    verdict="not_owner",
+                    owner_heartbeat_at=state.owner_heartbeat_at,
+                )
+                return report
+            previous, renewed = state.owner, state.owner_heartbeat_at
+            acquired = await self._state_store.take_lease(
+                state, self._owner, _iso(now)
+            )
+            if acquired is None:
+                report.update(verdict="state_conflict", superseded="take_lease")
+                return report
+            state = acquired
+            self._confirm(now)
+            if previous is not None:
+                logger.info(
+                    "idle wake: took over the detector; %s last renewed its "
+                    "lease at %s", previous, renewed,
+                )
+                report["took_over"] = True
+        elif self._lease_stale(state, now):
+            # This process's own renewals have not landed for a while, so
+            # another may be about to take the lease over. Renew it before
+            # going on; a renewal that finds it taken stops here.
+            if not await self._renew():
+                report.update(verdict="state_conflict", superseded="renew")
+                return report
+            state = replace(state, owner_heartbeat_at=_iso(now))
+            report["renewed_lapsed_lease"] = True
+        self._start_heartbeat()
+
         # --- A wake enqueued earlier and not settled yet ----------------
         if state.pending_signal_id:
             signal_id = state.pending_signal_id
-            ours = state.pending_owner == self._owner
-            handle = self._pending.get(signal_id) if ours else None
-            if handle is not None and not handle.task.done():
+            wake = self._pending.get(signal_id)
+            if wake is not None and not wake.done():
                 # The triage turn is running here: the agent is busy, and
                 # the stretch's own wake must not start a new one.
-                return await self._wake_in_flight(state, now, report, "wake_in_flight")
-            if not ours and not self._lease_stale(state, now):
-                # Another live process enqueued it, and its triage turn may
-                # be running there. Only that process can say how it ended.
-                return await self._wake_in_flight(
-                    state, now, report, "wake_in_flight_elsewhere"
-                )
-            if handle is not None:
+                return await self._wake_in_flight(state, now, report)
+            if wake is not None:
                 # Settling it when the dispatch ended failed; settle it now.
-                status, error = _dispatch_outcome(handle)
+                status, error = wake.outcome()
+                if status is None:
+                    # Its outcome is unknown: its turn's reply decides it.
+                    status, error = await self._reply_outcome(signal_id)
             else:
-                # Its owner stopped, or this process lost its dispatch.
+                # Enqueued by an earlier owner, whose lease lapsed: the
+                # wake's dispatch stopped with that process.
                 status, error = await self._reply_outcome(signal_id)
             if status is None:
                 return await self._commit(
@@ -609,12 +945,13 @@ class IdleWakeDetector:
             self._pending.pop(signal_id, None)
             report["harvested"] = {"status": status, "wake_error": error or ""}
 
-        observation = await self._observe(state, pending_followups)
+        observation = await self._observe(state, config, pending_followups)
         report.update(
             work=observation.work,
             deliveries=observation.deliveries,
             unknown=observation.unknown,
             activity=observation.activity,
+            talon_registry=observation.talon_registry,
         )
 
         # --- Transition --------------------------------------------------
@@ -682,8 +1019,8 @@ class IdleWakeDetector:
         """Write ``state`` and finish ``report`` with ``verdict``.
 
         A lost compare-and-set reports ``state_conflict`` instead: another
-        evaluation, or the owner of the pending wake, wrote the row since it
-        was read, and its write stands. The next evaluation reads afresh.
+        write landed since the row was read (a process taking over a lapsed
+        lease), and it stands. The next evaluation reads afresh.
         """
         if await self._state_store.save(state) is None:
             report.update(verdict="state_conflict", superseded=verdict)
@@ -696,23 +1033,108 @@ class IdleWakeDetector:
         state: IdleWakeState,
         now: datetime,
         report: Dict[str, Any],
-        verdict: str,
     ) -> Dict[str, Any]:
         """The agent is busy with the stretch's own wake. The idle clock
         restarts; the stretch, and its attempt count, go on."""
         return await self._commit(
             replace(state, idle_since=None, last_evaluated_at=_iso(now)),
             report,
-            verdict,
+            "wake_in_flight",
             signal_id=state.pending_signal_id,
-            lease_heartbeat_at=state.pending_heartbeat_at,
         )
 
     @staticmethod
     def _lease_stale(state: IdleWakeState, now: datetime) -> bool:
-        """Whether the pending wake's owner has stopped renewing its lease."""
-        heartbeat = _parse(state.pending_heartbeat_at)
+        """Whether the detector's owner has stopped renewing its lease."""
+        heartbeat = _parse(state.owner_heartbeat_at)
         return heartbeat is None or now - heartbeat > OWNER_STALE_AFTER
+
+    def _confirm(self, at: datetime) -> None:
+        """Record that this process held its lease at ``at``."""
+        if self._confirmed_at is None or at > self._confirmed_at:
+            self._confirmed_at = at
+
+    async def _renew(self) -> bool:
+        """Renew this process's lease now. ``False``: another process holds
+        it."""
+        at = self._clock()
+        held = await self._state_store.renew(self._owner, _iso(at))
+        if held:
+            self._confirm(at)
+        return held
+
+    def _start_heartbeat(self) -> None:
+        """Keep this process's lease renewed, unless that is already so."""
+        if self._heartbeat is not None and not self._heartbeat.done():
+            return
+        self._heartbeat = self._track_resident(
+            self._hold_lease(),
+            name=f"{OWNER_HEARTBEAT_TASK_PREFIX}{self._owner}",
+        )
+
+    def _track_resident(self, coro: Any, *, name: str) -> asyncio.Task:
+        """Start ``coro`` as the agent runtime's work, not the occurrence's.
+
+        Evaluations run inside a cron occurrence, and what they start (the
+        heartbeat, a wake's triage task, and through it the wake's dispatch
+        and turn) runs on after the occurrence returns. On PostgreSQL a
+        scheduler occurrence carries its own execution admission, which
+        retires as it returns, and a task started as its child carries that
+        admission too: every write it made afterwards would be refused.
+        ``_track_runtime_task`` hands the task over instead. It refuses
+        unless every admission held now is live, and then runs the task under
+        the agent's own runtime admission alone, once the agent is ready. An
+        agent without that hand-over (a host predating #3570, a test double)
+        runs it as ordinary background work.
+        """
+        if callable(getattr(type(self._agent), "_track_runtime_task", None)):
+            return self._agent._track_runtime_task(coro, name=name)
+        return self._agent._track_background_task(coro, name=name)
+
+    async def _hold_lease(self) -> None:
+        """Renew the lease every heartbeat interval while the process lives.
+
+        It does not wait for the evaluation lock, so a slow evaluation (a
+        large Talon registry, a contended database) cannot hold renewals back
+        until the lease lapses. A renewal that fails is retried at the next
+        interval rather than ending the heartbeat: a lease left to lapse while
+        this process lives would let another one start evaluating, blind to
+        the turns running here. A renewal that finds the lease taken ends it:
+        this process evaluates nothing more unless that lease lapses in turn.
+
+        Execution-custody evidence is not a failed renewal: a renewal
+        cancelled while it commits ends in an unknown commit outcome, not in
+        ``CancelledError``. That, and any failure while the task is being
+        cancelled, ends the heartbeat, as does a renewal that returns while
+        the task is being cancelled; going round again would leave a shutdown
+        waiting on a loop that swallowed its cancellation.
+        """
+        while True:
+            await asyncio.sleep(self._heartbeat_seconds)
+            try:
+                held = await self._renew()
+            except Exception as exc:  # noqa: BLE001 - retried next interval
+                task = asyncio.current_task()
+                if is_execution_control_error(exc) or (
+                    task is not None and task.cancelling()
+                ):
+                    raise
+                logger.warning(
+                    "idle wake: could not renew the detector's lease: %s",
+                    _describe(exc),
+                )
+                continue
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                # The renewal absorbed this task's cancellation and returned.
+                raise asyncio.CancelledError
+            if not held:
+                logger.warning(
+                    "idle wake: another process took over the detector after "
+                    "this one's lease lapsed; this process stops evaluating "
+                    "while that one's lease is live"
+                )
+                return
 
     # ------------------------------------------------------------------
 
@@ -743,36 +1165,73 @@ class IdleWakeDetector:
             attempt=attempt,
             session_id=session_id,
         )
+        confirmed = self._confirmed_at
+        unconfirmed_for = (
+            self._clock() - confirmed if confirmed is not None else None
+        )
+        if unconfirmed_for is None or unconfirmed_for > LEASE_CONFIRMED_WITHIN:
+            # Renewals are failing: another process may take the lease over
+            # at any moment, and would read this wake as lost. Fire once the
+            # lease is confirmed again.
+            return await self._commit(
+                state,
+                report,
+                "lease_unconfirmed",
+                lease_confirmed_at=_iso(confirmed) if confirmed else None,
+            )
         # The claim, durable before the enqueue: a crash between the two is a
         # lost wake that is recovered and retried, never an unrecorded one.
-        # Its compare-and-set is what keeps two replicas from both firing.
+        # Its compare-and-set fails if the lease was taken since it was read.
         claimed = await self._state_store.save(
-            replace(
-                state,
-                attempts=attempt,
-                pending_signal_id=signal.id,
-                pending_owner=self._owner,
-                pending_heartbeat_at=_iso(now),
-            )
+            replace(state, attempts=attempt, pending_signal_id=signal.id)
         )
         if claimed is None:
             report.update(verdict="state_conflict", superseded="fired")
             return report
         state = claimed
+        wake = _OwnedWake(handed_over=asyncio.get_running_loop().create_future())
         try:
-            handle = await dispatcher.enqueue_signal(
-                signal, source_event_id=f"idle:{period}#{attempt}"
+            wake.task = self._track_resident(
+                self._run_wake(wake, dispatcher, signal, f"idle:{period}#{attempt}"),
+                name=f"{TRIAGE_TASK_PREFIX}{signal.id}",
             )
         except Exception as exc:  # noqa: BLE001 - recorded and retried
-            logger.warning("idle wake: enqueue_signal raised: %s", exc)
-            settled = self._settle(state, "dispatcher_raised", _describe(exc), now)
-            report.update(wake_error=_describe(exc), fired_at=settled.fired_at)
-            return await self._commit(settled, report, "dispatch_error")
-        self._pending[signal.id] = handle
-        self._agent._track_background_task(
-            self._keep_lease(signal.id, handle),
-            name=f"idle_wake_lease:{signal.id}",
+            # The runtime refused the hand-over: nothing started.
+            if is_execution_control_error(exc):
+                # The claim stays recorded; the next evaluation finds no
+                # reply and retries it.
+                raise
+            return await self._refused(state, report, exc, now)
+        self._pending[signal.id] = wake
+        # Wait for the hand-over, not for the turn. Should this evaluation
+        # be cancelled meanwhile, the triage task still owns the wake: it is
+        # recorded, so the next evaluation finds it running, not lost.
+        await asyncio.wait(
+            {wake.handed_over, wake.task}, return_when=asyncio.FIRST_COMPLETED
         )
+        error = wake.enqueue_error
+        wake.enqueue_error_seen = True
+        if wake.dispatch is None:
+            # Nothing started: refused by the dispatcher, or the triage task
+            # stopped before it reached it.
+            self._pending.pop(signal.id, None)
+            if error is None and wake.task.done():
+                error = owned_task_error(wake.task)
+            if error is not None and is_execution_control_error(error):
+                # As above: the claim stays recorded and is retried.
+                raise error
+            return await self._refused(state, report, error, now)
+        if error is not None:
+            # The agent accepted the dispatch, then failed to hand it back:
+            # it runs, so it is this process's wake, settled when it ends.
+            # Retrying it now could start a second triage turn.
+            logger.warning(
+                "idle wake: enqueue_signal raised after accepting %s; "
+                "settling it from its dispatch: %s", signal.id, _describe(error),
+            )
+            report["wake_error"] = _describe(error)
+            if is_execution_control_error(error):
+                raise error
         logger.info(
             "idle wake: agent idle since %s; enqueued queue.drained %s "
             "(attempt %d, session %s)",
@@ -787,57 +1246,85 @@ class IdleWakeDetector:
         )
         return report
 
-    async def _keep_lease(self, signal_id: str, handle: Any) -> None:
-        """Renew this process's lease on its wake while the dispatch runs,
-        then settle the wake.
+    async def _refused(
+        self,
+        state: IdleWakeState,
+        report: Dict[str, Any],
+        error: Optional[BaseException],
+        now: datetime,
+    ) -> Dict[str, Any]:
+        """Settle a wake that never reached the dispatcher, as one attempt."""
+        status, detail = _refusal_outcome(error)
+        logger.warning("idle wake: the wake was not handed over: %s", detail or status)
+        settled = self._settle(state, status, detail, now)
+        report.update(wake_error=detail or status, fired_at=settled.fired_at)
+        return await self._commit(settled, report, "dispatch_error")
 
-        The lease is what tells another replica that the triage turn may
-        still be running. A renewal that fails is retried at the next
-        interval rather than ending the watch: a lease left to go stale while
-        the turn runs would let another replica dispatch the wake again.
+    async def _run_wake(
+        self,
+        wake: _OwnedWake,
+        dispatcher: Any,
+        signal: Any,
+        source_event_id: str,
+    ) -> None:
+        """The triage task: own one wake from the agent's runtime.
+
+        It hands the wake to the dispatcher here, so the dispatch, and the
+        triage turn it runs, are the runtime's work as well
+        (:meth:`_track_resident`). Then it settles the wake as soon as the
+        dispatch ends, so the outcome is in the row before the next
+        evaluation reads it.
+
+        What ``enqueue_signal`` raised is the evaluation's to report, and it
+        reads it under the detector's lock. Execution-custody evidence the
+        evaluation never read (it was cancelled while waiting) is raised here
+        once the wake is settled, so the agent's own harvest keeps it.
         """
-        while not handle.task.done():
-            await asyncio.wait({handle.task}, timeout=self._heartbeat_seconds)
-            if handle.task.done():
-                break
-            try:
-                held = await self._state_store.renew(
-                    signal_id, self._owner, _iso(self._clock())
-                )
-            except Exception as exc:  # noqa: BLE001 - retried next interval
-                logger.warning(
-                    "idle wake: could not renew the lease on %s: %s",
-                    signal_id, _describe(exc),
-                )
-                continue
-            if not held:
-                # Recovered elsewhere after the lease went stale, although
-                # the dispatch is still running here.
-                logger.warning(
-                    "idle wake: lost the lease on %s while its dispatch runs; "
-                    "another replica may have dispatched the wake again",
-                    signal_id,
-                )
-                self._pending.pop(signal_id, None)
-                return
+        admission = OwnedTaskAdmission()
+        try:
+            handle = await dispatcher.enqueue_signal(
+                signal, source_event_id=source_event_id, admission=admission
+            )
+        except Exception as exc:  # noqa: BLE001 - the evaluation reports it
+            wake.enqueue_error = exc
+        else:
+            wake.dispatch = handle.task
+        finally:
+            if wake.dispatch is None and admission.task is not None:
+                # Accepted, then not handed back: it runs.
+                wake.dispatch = admission.task
+            if not wake.handed_over.done():
+                wake.handed_over.set_result(None)
+        if wake.dispatch is not None:
+            await asyncio.wait({wake.dispatch})
         async with self._lock:
-            await self._settle_own(signal_id, handle)
+            if wake.dispatch is not None:
+                await self._settle_own(signal.id, wake)
+            unread = None if wake.enqueue_error_seen else wake.enqueue_error
+        if unread is not None and is_execution_control_error(unread):
+            raise unread
 
-    async def _settle_own(self, signal_id: str, handle: Any) -> None:
+    async def _settle_own(self, signal_id: str, wake: _OwnedWake) -> None:
         """Record the outcome of this process's own finished wake."""
-        status, error = _dispatch_outcome(handle)
+        status, error = wake.outcome()
+        if status is None:
+            # Its outcome is unknown: the next evaluation decides it from its
+            # turn's reply.
+            return
         for _ in range(SETTLE_TRIES):
             try:
                 state = await self._state_store.load()
                 if (
                     state.pending_signal_id != signal_id
-                    or state.pending_owner != self._owner
+                    or state.owner != self._owner
                 ):
-                    break  # already settled, or recovered elsewhere
+                    break  # already settled, or the lease was taken over
                 settled = self._settle(state, status, error, self._clock())
                 if await self._state_store.save(settled) is not None:
                     break
             except Exception as exc:  # noqa: BLE001 - an evaluation settles it
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "idle wake: could not settle %s (%s); the next evaluation "
                     "will: %s", signal_id, status, _describe(exc),
@@ -854,7 +1341,7 @@ class IdleWakeDetector:
     async def _reply_outcome(
         self, signal_id: str
     ) -> Tuple[Optional[str], Optional[str]]:
-        """How a wake whose dispatch no live process holds ended.
+        """How a wake whose owner stopped before settling it ended.
 
         Its turn either stored the reply stamped with this wake's id (#3655)
         or never finished; only the second is retried. ``None`` means
@@ -872,6 +1359,8 @@ class IdleWakeDetector:
         try:
             reply_id = await store.find_signal_wake_reply_id(signal_id)
         except Exception as exc:  # noqa: BLE001 - undecided, not lost
+            if is_execution_control_error(exc):
+                raise
             return None, f"reply_lookup_failed: {_describe(exc)}"
         if reply_id is not None:
             return REPLIED_BEFORE_RESTART, None
@@ -905,8 +1394,6 @@ class IdleWakeDetector:
         return replace(
             state,
             pending_signal_id=None,
-            pending_owner=None,
-            pending_heartbeat_at=None,
             fired_at=fired_at,
             fired_status=fired_status,
             last_wake_status=status,
@@ -918,14 +1405,18 @@ class IdleWakeDetector:
     async def _observe(
         self,
         state: IdleWakeState,
+        config: IdleWakeConfig,
         pending_followups: Optional[Callable[[], Awaitable[int]]],
     ) -> Observation:
         obs = Observation()
+        if config.config_error:
+            obs.unknown.append(f"idle_wake_misconfigured: {config.config_error}")
         await self._observe_privacy_and_hold(obs)
         await self._observe_conversation(state, obs)
         await self._observe_wait_ledger(obs)
         await self._observe_restarts(obs)
         await self._observe_durable_deliveries(obs)
+        # This process's turns only; see "One process runs the detector".
         live_turn = getattr(self._agent, "_live_turn_id", None)
         if isinstance(live_turn, str) and live_turn:
             obs.deliveries.append("turn_in_progress")
@@ -933,15 +1424,17 @@ class IdleWakeDetector:
             try:
                 count = await pending_followups()
             except Exception as exc:  # noqa: BLE001 - fail closed
+                if is_execution_control_error(exc):
+                    raise
                 obs.unknown.append(f"self_followup_unreadable: {_describe(exc)}")
             else:
                 if count:
-                    obs.deliveries.append(f"self_followup_scheduled:{count}")
+                    obs.deliveries.append(f"self_followup_pending:{count}")
         # The Talon read is the expensive one (it reads every finished job's
         # log). Skip it when the agent is already known not to be idle; its
         # evidence then stays where it was and is compared next time.
         if obs.idle:
-            await self._observe_talon(obs)
+            await self._observe_talon(obs, config)
         self._detect_activity(state, obs)
         return obs
 
@@ -958,6 +1451,8 @@ class IdleWakeDetector:
         try:
             hold = await get_effective_hold_state(self._agent)
         except Exception as exc:  # noqa: BLE001 - fail closed
+            if is_execution_control_error(exc):
+                raise
             obs.unknown.append(f"hold_state_unreadable: {_describe(exc)}")
         else:
             if hold is not None and hold.held:
@@ -988,6 +1483,8 @@ class IdleWakeDetector:
                 state.conversation_cursor, limit=CONVERSATION_SCAN_ROWS
             )
         except Exception as exc:  # noqa: BLE001 - fail closed
+            if is_execution_control_error(exc):
+                raise
             obs.unknown.append(f"conversation_unreadable: {_describe(exc)}")
             return
         for row_id, metadata in rows:
@@ -1017,6 +1514,8 @@ class IdleWakeDetector:
             parked = await self._wait_store.list_parked()
             latest = await self._wait_store.list_latest_delivered(limit=1)
         except Exception as exc:  # noqa: BLE001 - fail closed
+            if is_execution_control_error(exc):
+                raise
             obs.unknown.append(f"wait_ledger_unreadable: {_describe(exc)}")
             return
         obs.work.extend(
@@ -1045,6 +1544,8 @@ class IdleWakeDetector:
                 self._db, agent_id=self._agent_id
             )
         except Exception as exc:  # noqa: BLE001 - fail closed
+            if is_execution_control_error(exc):
+                raise
             obs.unknown.append(f"restart_requests_unreadable: {_describe(exc)}")
             return
         obs.work.extend(
@@ -1093,6 +1594,8 @@ class IdleWakeDetector:
                     limit=1,
                 )
             except Exception as exc:  # noqa: BLE001 - fail closed
+                if is_execution_control_error(exc):
+                    raise
                 obs.unknown.append(
                     f"durable_deliveries_unreadable:{consumer_id}: {_describe(exc)}"
                 )
@@ -1100,57 +1603,137 @@ class IdleWakeDetector:
             if rows:
                 obs.deliveries.append(f"durable_delivery_pending:{consumer_id}")
 
-    async def _observe_talon(self, obs: Observation) -> None:
+    def _talon_lane(
+        self, config: IdleWakeConfig
+    ) -> Tuple[Optional[str], Any, Optional[str]]:
+        """Whose Talon registry holds this agent's runs, and its provider.
+
+        Returns ``(registry, provider, unknown)``. ``registry`` names whose
+        registry it is (:data:`OWN_TALON_REGISTRY`, or the dispatcher's
+        name), ``provider`` is that agent's ``talon`` wait provider, and
+        ``unknown`` says why the lane cannot be read.
+
+        With no dispatcher named (``config.talon_dispatcher``, taken from
+        ``[talon.policy] dispatcher`` when unset), or one naming this agent, the agent
+        runs its own Talon work and its own provider is the lane; without one
+        it runs no Talon, so there is nothing to read (``(None, None,
+        None)``). Otherwise the work runs on the dispatcher (#3758): a
+        non-dispatcher's own registry stays empty while the dispatcher's
+        lane is busy, so it is never read in the dispatcher's place. The
+        dispatcher must be an agent of this host, found through the host's
+        agent manager; one that is not loaded here, or runs no Talon, is
+        unknown, not idle.
+        """
         from kestrel_sovereign.features.strategic_memory.run_history import (
-            FINISHED_RUNS_METHOD,
-            FINISHED_RUNS_REQUIREMENT,
             TALON_WAIT_KIND,
         )
 
-        registry = getattr(self._agent, "wait_registry", None)
+        dispatcher = config.talon_dispatcher
+        if dispatcher is None or dispatcher.casefold() in {
+            name.casefold() for name in _agent_names(self._agent)
+        }:
+            registry = getattr(self._agent, "wait_registry", None)
+            provider = registry.get(TALON_WAIT_KIND) if registry is not None else None
+            if provider is None:
+                return None, None, None
+            return OWN_TALON_REGISTRY, provider, None
+        manager = getattr(self._agent, "_agent_manager", None)
+        get_agent = getattr(manager, "get_agent", None)
+        if not callable(get_agent):
+            return dispatcher, None, (
+                f"talon_dispatcher_unreachable: {dispatcher} is not an agent "
+                f"of this host"
+            )
+        try:
+            hosted = get_agent(dispatcher)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            if is_execution_control_error(exc):
+                raise
+            return dispatcher, None, (
+                f"talon_dispatcher_unreachable: {dispatcher}: {_describe(exc)}"
+            )
+        if hosted is None:
+            return dispatcher, None, (
+                f"talon_dispatcher_unreachable: {dispatcher} is not running on "
+                f"this host"
+            )
+        registry = getattr(hosted, "wait_registry", None)
         provider = registry.get(TALON_WAIT_KIND) if registry is not None else None
+        if provider is None:
+            return dispatcher, None, (
+                f"talon_dispatcher_has_no_talon: {dispatcher} has no "
+                f"{TALON_WAIT_KIND!r} wait provider"
+            )
+        return dispatcher, provider, None
+
+    async def _observe_talon(self, obs: Observation, config: IdleWakeConfig) -> None:
+        """Whether a Talon job is running in this agent's Talon lane.
+
+        Read once per evaluation through the lane provider's read-only
+        ``finished_runs()``, never ``poll()`` (it reaps and pushes) or
+        ``active_handles()`` (see :data:`~kestrel_sovereign.features.
+        strategic_memory.run_history.UNFINISHED_JOBS_KEY`). Nothing is
+        written to the lane's agent.
+        """
+        from kestrel_sovereign.features.strategic_memory.run_history import (
+            FINISHED_RUNS_METHOD,
+            UNFINISHED_JOBS_KEY,
+            UNFINISHED_JOBS_REQUIREMENT,
+        )
+
+        lane, provider, unknown = self._talon_lane(config)
+        obs.talon_registry = lane
+        if unknown is not None:
+            obs.unknown.append(unknown)
+            return
         if provider is None:
             # No Talon on this agent: no jobs, nothing read.
             return
         read = getattr(provider, FINISHED_RUNS_METHOD, None)
         if not callable(read):
-            # ``active_handles()`` alone cannot tell an empty registry from
-            # an unreadable one (see run_history), so there is no safe read.
             obs.unknown.append(
-                f"talon_provider_outdated: requires {FINISHED_RUNS_REQUIREMENT}"
+                f"talon_provider_outdated: no {FINISHED_RUNS_METHOD}() "
+                f"(needs {UNFINISHED_JOBS_REQUIREMENT})"
             )
             return
         try:
             report = await read()
-            if not isinstance(report, dict) or report.get("complete") is not True:
-                reason = report.get("reason") if isinstance(report, dict) else None
-                obs.unknown.append(
-                    f"talon_registry_unreadable: {reason or 'incomplete'}"
-                )
-                return
-            runs = report.get("runs")
-            if not isinstance(runs, list):
-                obs.unknown.append("talon_registry_unreadable: no list of runs")
-                return
-            finished = {
-                str(run["job_id"])
-                for run in runs
-                if isinstance(run, dict) and isinstance(run.get("job_id"), str)
-            }
-            # Every job the coordinator holds, terminal or not; the ones it
-            # did not report finished are still running.
-            known = {str(h) for h in await provider.active_handles()}
         except Exception as exc:  # noqa: BLE001 - fail closed
+            if is_execution_control_error(exc):
+                raise
             obs.unknown.append(f"talon_registry_unreadable: {_describe(exc)}")
             return
-        if finished - known:
-            # ``active_handles()`` answers from memory and cannot say it failed
-            # to read the registry. Missing a job the registry reported
-            # finished means it may be missing running ones too.
-            obs.unknown.append("talon_registry_inconsistent")
+        if not isinstance(report, dict) or report.get("complete") is not True:
+            reason = report.get("reason") if isinstance(report, dict) else None
+            obs.unknown.append(f"talon_registry_unreadable: {reason or 'incomplete'}")
             return
-        obs.work.extend(f"talon_job:{job}" for job in sorted(known - finished))
-        obs.evidence["talon"] = _short_ids(known | finished)
+        if UNFINISHED_JOBS_KEY not in report:
+            # The running jobs must come from the read ``complete`` vouches
+            # for. ``active_handles()`` reads the registry again and cannot
+            # say that read failed (see run_history.UNFINISHED_JOBS_KEY).
+            obs.unknown.append(
+                f"talon_provider_outdated: {FINISHED_RUNS_METHOD}() lists no "
+                f"{UNFINISHED_JOBS_KEY!r} jobs (needs {UNFINISHED_JOBS_REQUIREMENT})"
+            )
+            return
+        runs = report.get("runs")
+        unfinished = report.get(UNFINISHED_JOBS_KEY)
+        if not isinstance(runs, list) or not isinstance(unfinished, list):
+            obs.unknown.append("talon_registry_unreadable: a list is missing")
+            return
+        # Every entry is a record naming its job: ``{"job_id", ...}``. An entry
+        # that names none could hide a job still running.
+        jobs = [
+            entry.get("job_id") if isinstance(entry, dict) else None
+            for entry in [*runs, *unfinished]
+        ]
+        if not all(isinstance(job, str) and job.strip() for job in jobs):
+            obs.unknown.append("talon_registry_unreadable: an entry names no job")
+            return
+        running = sorted({job for job in jobs[len(runs):]})
+        obs.work.extend(f"talon_job:{job}" for job in running)
+        obs.evidence["talon"] = _short_ids(jobs)
+        obs.evidence["talon_registry"] = lane
 
     @staticmethod
     def _detect_activity(state: IdleWakeState, obs: Observation) -> None:
@@ -1167,6 +1750,13 @@ class IdleWakeDetector:
         ):
             current = obs.evidence.get(source)
             previous = state.evidence.get(source)
+            if source == "talon" and "talon" in obs.evidence and (
+                obs.evidence.get("talon_registry")
+                != state.evidence.get("talon_registry")
+            ):
+                # The lane moved to another agent's registry (or this is the
+                # first read naming one): its jobs are a baseline, not news.
+                continue
             if isinstance(current, list) and isinstance(previous, list):
                 if set(current) - set(previous):
                     obs.activity.append(name)
@@ -1203,6 +1793,8 @@ class IdleWakeDetector:
                 if session:
                     return session
         except Exception as exc:  # noqa: BLE001 - an unbound wake still wakes
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "idle wake: could not resolve the chain session; the wake "
                 "starts a fresh one: %s", exc,
@@ -1219,14 +1811,17 @@ async def run_idle_wake(
     """Run one idle evaluation for ``agent``: the ``idle_wake`` cron handler.
 
     Builds and caches the agent's detector on ``agent._idle_wake_detector``.
-    ``pending_followups`` counts the agent's scheduled ``self_followup``
-    wakes; the scheduler owns that table, so it supplies the count.
+    ``pending_followups`` counts the agent's ``self_followup`` wakes the
+    scheduler has not finished; the scheduler owns that table, so it supplies
+    the count.
     """
     if config is None:
         config = load_idle_wake_config(agent)
-    if not config.enabled:
-        return {"skipped": "disabled", "fired": False}
     detector = getattr(agent, "_idle_wake_detector", None)
+    if not config.enabled:
+        if detector is not None:
+            detector.stand_down()
+        return {"skipped": "disabled", "fired": False}
     if detector is None:
         detector = IdleWakeDetector(agent)
         agent._idle_wake_detector = detector

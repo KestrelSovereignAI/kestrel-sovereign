@@ -871,7 +871,8 @@ role = "technical_reviewer"
 # watch, no restart request it filed still pending/approved/updating/
 # executing, and no wake waiting to be delivered (an in-flight or parked wait
 # wake, an undelivered restart wake, a durable A2A or channel delivery, a
-# scheduled self_followup, or a turn in progress).
+# self_followup the scheduler has not finished, whether scheduled or claimed,
+# or a turn in progress).
 #
 # It fires at most once per idle stretch. It does not fire again until a
 # Talon job is dispatched, a watch is armed, a restart request is filed, or
@@ -879,24 +880,49 @@ role = "technical_reviewer"
 # binds to the agent's most recent chain session (the session its newest
 # delivered wait wake was registered from), else a fresh session; it never
 # falls back to an operator's open chat. It dispatches nothing: the agent
-# triages and decides. Replicas sharing the agent's database each run the
-# cron; the wake is claimed in the database and leased by the replica that
-# dispatched it, so they still start at most one triage turn per stretch.
-# Their clocks must agree to well within two minutes (the lease's staleness).
+# triages and decides.
+#
+# One process runs the detector: the one holding its lease, which it renews
+# every 30 seconds while it lives. Another process sharing the agent's
+# database skips its evaluations, and takes the lease over only once it has
+# gone two minutes without renewal (normally because its process stopped).
+# So an overlap, as in a rolling restart, never runs two detectors at once,
+# and their clocks must agree to well within those two minutes. The detector
+# cannot see turns running in another process. Keep it off for an agent
+# served by more than one replica at a time: the owner would not see the
+# other replicas' turns, and the cron occurrences that land on them are
+# skipped.
+#
+# "No Talon job in flight" is read from the agent's Talon lane. When the
+# host names one agent as its only Talon dispatcher (`[talon.policy]
+# dispatcher`, kestrel-feature-talon >= 0.2.14), every other agent's Talon
+# work runs on that agent, so its own job registry stays empty while the
+# dispatcher's lane is busy (#3758). The detector then reads the
+# dispatcher's registry, never the selecting agent's own. It takes the
+# dispatcher from `[talon.policy] dispatcher` in this file; a host whose
+# Talon reads its policy from another file sets `talon_dispatcher` here
+# instead. Set in both, they must name the same agent, or the wake does not
+# fire. The dispatcher must run on this host; one that is not running here,
+# or loads no Talon, keeps the wake from firing. With no dispatcher named (or
+# one naming the agent itself) the agent's own registry is read, as on a host
+# where each agent runs its own Talon work. A work order sent to the
+# dispatcher is covered by the `a2a:` watch the orchestrator arms on it.
 #
 # Off by default. Opt-in per agent: with `agents` set, only the named agents
-# (or DIDs) are enabled; without it, every agent on this host is. Requires
-# kestrel-feature-talon>=0.2.10 when Talon is installed (its read-only
-# finished_runs()); an older Talon, an unreadable job registry, a Hold, or a
-# volatile privacy mode keeps the wake from firing, and the cron result says
-# why (`!schedule history`). Enabling takes effect at the next restart, which
-# seeds the cron; disabling stops the wake at the next tick and removes the
-# cron at the next restart.
+# (or DIDs) are enabled; without it, every agent on this host is. With Talon
+# in the lane, the wake needs kestrel-feature-talon >= 0.2.14, whose
+# read-only finished_runs() report lists its unfinished jobs (`unfinished`);
+# through an older Talon it does not fire. That, an unreadable job registry,
+# an unreachable dispatcher, a Hold, or a volatile privacy mode keeps the
+# wake from firing, and the cron result says why (`!schedule history`).
+# Enabling takes effect at the next restart, which seeds the cron; disabling
+# stops the wake at the next tick and removes the cron at the next restart.
 #
 # [idle_wake]
 # enabled = true
 # agents = ["Emma"]
-# idle_minutes = 30   # minimum 5
+# idle_minutes = 30           # minimum 5
+# talon_dispatcher = "Claw"   # only when [talon.policy] is not in this file
 
 
 # ---------------------------------------------------------------------------

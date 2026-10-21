@@ -25,9 +25,14 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.config import load_section, parse_duration
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.heartbeat_response import classify_heartbeat_response
 
 _UTC = timezone.utc
@@ -183,7 +188,11 @@ class HeartbeatRunner:
         self._ensure_heartbeat_file()
 
         self._running = True
-        self._task = asyncio.create_task(self._loop())
+        tracker = getattr(self.agent, "_track_runtime_task", None)
+        if callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            self._task = tracker(self._loop(), name="heartbeat-runtime")
+        else:
+            self._task = create_owned_task(self._loop())
         logger.info(
             f"Heartbeat started: interval={self.config.interval_seconds}s, "
             f"target={self.config.target}"
@@ -192,13 +201,21 @@ class HeartbeatRunner:
     async def stop(self) -> None:
         """Stop the heartbeat loop."""
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        terminal = getattr(self, "_worker_control", None)
+        if self._task:
+            if not self._task.done():
+                self._task.cancel()
+            outcome = await await_owned_task(self._task)
+            terminal = execution_terminal_error(
+                terminal,
+                outcome.error if outcome.error is not None and is_execution_control_error(outcome.error) else None,
+                outcome.cancellation,
+            )
         self._task = None
+        if terminal is not None:
+            if is_execution_control_error(terminal):
+                self._worker_control = terminal
+            raise terminal
         logger.info("Heartbeat stopped")
 
     async def run_once(self) -> HeartbeatResult:
@@ -239,7 +256,9 @@ class HeartbeatRunner:
         self._pre_sleep_wall = time.time()
         try:
             await asyncio.sleep(self.config.interval_seconds)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                raise
             return
 
         while self._running:
@@ -254,15 +273,21 @@ class HeartbeatRunner:
                     f"Heartbeat tick: status={result.status}, "
                     f"duration={result.duration_ms}ms"
                 )
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 break
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Heartbeat tick error: {e}", exc_info=True)
 
             self._pre_sleep_wall = time.time()
             try:
                 await asyncio.sleep(self.config.interval_seconds)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 break
 
     def _note_sleep_elapsed(self) -> None:
@@ -321,6 +346,7 @@ class HeartbeatRunner:
             Urgency,
             Visibility,
         )
+
         from kestrel_sovereign.signals.sources.heartbeat import SOURCE_NAME
 
         start_time = time.monotonic()
@@ -343,6 +369,8 @@ class HeartbeatRunner:
             duration_ms = int((time.monotonic() - start_time) * 1000)
             result = self._translate_result(sig_result, timestamp, duration_ms)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             duration_ms = int((time.monotonic() - start_time) * 1000)
             result = HeartbeatResult(
                 status="error",
@@ -437,6 +465,8 @@ class HeartbeatRunner:
             content = filepath.read_text(encoding="utf-8")
             return content if content.strip() else None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to read {filepath}: {e}")
             return None
 
@@ -454,6 +484,8 @@ class HeartbeatRunner:
             filepath.write_text(DEFAULT_HEARTBEAT_TEMPLATE, encoding="utf-8")
             logger.info(f"Created default {self.config.heartbeat_file} at {filepath}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to create default heartbeat file: {e}")
 
     def _get_agent_data_dir(self) -> Optional[Path]:

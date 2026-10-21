@@ -16,9 +16,14 @@ import hashlib
 import json
 import logging
 import math
+import sys
 from time import monotonic
 from typing import TYPE_CHECKING, Mapping, Sequence
 from uuid import uuid4
+
+from kestrel_sovereign.execution_custody import (
+    close_native_execution_stream, execution_terminal_error, is_execution_control_error,
+)
 
 from kestrel_sovereign.storage.async_assertion_store import (
     AssertionChange,
@@ -389,7 +394,9 @@ class SemanticMaintenanceService:
         initial = await self._event_checkpoint(source_checkpoint)
         try:
             capability_versions = self._capability_versions()
-        except SemanticMaintenanceError:
+        except SemanticMaintenanceError as error:
+            if is_execution_control_error(error):
+                raise
             # Do not let a stale capability digest turn an unavailable or
             # unverifiable validation profile into an apparent no-op.  There
             # is no trustworthy profile key under which to persist this
@@ -430,6 +437,7 @@ class SemanticMaintenanceService:
         repair_mode: str | None = None
         repair_scan_complete = False
         repair_reconcile_cursor: str | None = None
+        body_error = None
         try:
             # State is only trustworthy once this worker holds the tenant's
             # cross-process lease.  A former holder must never pick up an old
@@ -1120,7 +1128,10 @@ class SemanticMaintenanceService:
                 ),
             )
             return result
-        except _MaintenanceBudgetExceeded:
+        except _MaintenanceBudgetExceeded as error:
+            body_error = error
+            if is_execution_control_error(error):
+                raise
             result = self._result(
                 run_id=run_id or f"budget:{initial.generation}",
                 status=SemanticMaintenanceStatus.PARTIAL,
@@ -1172,7 +1183,10 @@ class SemanticMaintenanceService:
             else:
                 await self._record_run_if_current(result, profile_key, lease)
             return result
-        except MaintenanceLeaseLostError:
+        except MaintenanceLeaseLostError as error:
+            body_error = error
+            if is_execution_control_error(error):
+                raise
             result = self._result(
                 run_id=run_id or f"failed:{initial.generation}",
                 status=SemanticMaintenanceStatus.FAILED,
@@ -1186,6 +1200,9 @@ class SemanticMaintenanceService:
             await self._record_run_if_current(result, profile_key, lease)
             return result
         except Exception as error:
+            body_error = error
+            if is_execution_control_error(error):
+                raise
             logger.exception(
                 "semantic maintenance failed",
                 extra={"semantic_maintenance_tenant_id": self._assertions.tenant_id},
@@ -1203,7 +1220,37 @@ class SemanticMaintenanceService:
             await self._record_run_if_current(result, profile_key, lease)
             return result
         finally:
-            await self._release_lease(lease)
+            # The exact holder/token release is a physical epilogue, not a
+            # replacement worker. Join it under cleanup-only custody while
+            # keeping body, native-close and observer control independent.
+            opening = sys.exception()
+            try:
+                if body_error is not None and opening is not None and opening is not body_error:
+                    # A failed diagnostic belongs beside its original worker
+                    # failure, not in its implicit context or shared graph.
+                    raise execution_terminal_error(
+                        body_error, opening, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
+            finally:
+                try:
+                    await close_native_execution_stream(
+                        lease, self._database.backend, close_operation=self._release_lease,
+                    )
+                except BaseException as retirement:
+                    if body_error is None:
+                        raise
+                    # A handled worker is no longer sys.exception() when its
+                    # successful diagnostic prepares a status return. Keep it
+                    # beside failed retirement without changing that status on
+                    # success or appending cleanup to the shared worker graph.
+                    raise execution_terminal_error(
+                        BaseExceptionGroup(
+                            "original maintenance worker and retirement",
+                            [body_error, retirement],
+                        ),
+                        retain_originals=True, isolate_control_originals=True,
+                    )
 
     async def rebuild(self) -> SemanticMaintenanceResult:
         """Run the explicit, page-oriented semantic repair path under one lease."""
@@ -1259,7 +1306,9 @@ class SemanticMaintenanceService:
                 )
         try:
             profile_key = _digest(self._capability_versions())
-        except SemanticMaintenanceError:
+        except SemanticMaintenanceError as error:
+            if is_execution_control_error(error):
+                raise
             return SemanticMaintenanceTrainingReadiness(
                 False,
                 "semantic_maintenance_capability_unavailable",
@@ -1793,6 +1842,8 @@ class SemanticMaintenanceService:
                     ),
                 )
         except TransactionError as error:
+            if is_execution_control_error(error):
+                raise
             if isinstance(error.__cause__, MaintenanceLeaseLostError):
                 raise error.__cause__ from error
             if isinstance(error.__cause__, _MaintenanceBudgetExceeded):
@@ -1899,6 +1950,8 @@ class SemanticMaintenanceService:
         try:
             await self._record_run(result, profile_key, lease)
         except SemanticMaintenanceError as error:
+            if is_execution_control_error(error):
+                raise
             if str(error) == "semantic_maintenance_lease_lost":
                 return False
             raise

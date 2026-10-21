@@ -37,7 +37,7 @@ attempt as they found it.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import Context, ContextVar
 from typing import (
     Any,
     AsyncIterator,
@@ -120,6 +120,20 @@ _ATTEMPT_LISTENER: ContextVar[Optional[Callable[[str, str], None]]] = ContextVar
 _ATTEMPT_BOUND: ContextVar[Optional[AttemptBound]] = ContextVar(
     "kestrel_llm_call_attempt_bound", default=None,
 )
+
+
+def inherit_call_progress(context: Context) -> None:
+    """Pin one observation scope on a previously unbound lazy source context.
+
+    Sources can be constructed before the watchdog's first pull. Authority,
+    turn and privacy bindings stay those captured at construction; a consumer
+    cannot replace an already-pinned call listener with its own.
+    """
+    variables = (_LISTENER, _ATTEMPT_LISTENER, _ATTEMPT_BOUND)
+    if any(context.get(variable) is not None for variable in variables):
+        return
+    for variable in variables:
+        context.run(variable.set, variable.get())
 
 
 def report_call_progress() -> None:

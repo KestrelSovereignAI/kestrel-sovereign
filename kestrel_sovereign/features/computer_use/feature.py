@@ -5,7 +5,9 @@ Every tool call runs through the same sequence:
 1. **Readiness** — feature enabled in ``kestrel.toml``, backend constructed.
 2. **Privacy** — ``PrivacyConfig.computer_access`` must be ``True``.
 3. **Constitution** — the operation's capability name must be present in
-   the agent's Amendment IX grants.
+   the agent's Amendment IX grants. ``shell`` then also needs a backend
+   that can execute: ``backend = "none"`` serves the file tools only and
+   refuses here, before any path, policy or approval step.
 4. **Path safety** — only structural checks (``..`` traversal, NUL bytes).
    Allow-list / deny-list membership is **not** a safety concern; it is
    a policy decision that may legitimately produce ``REQUIRE_APPROVAL``.
@@ -57,6 +59,7 @@ from .backends import (
     CapabilityBlocked,
     CaptureTarget,
     DockerSandboxBackend,
+    FilesystemOnlyBackend,
     LocalSandboxBackend,
     SandboxBackend,
 )
@@ -193,6 +196,9 @@ def shell_syntax_refusal(
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
+# The only accepted ``[features.computer_use].backend`` values; anything else
+# leaves the feature unready (#3760).
+_BACKEND_NAMES = frozenset({"docker", "local", "none"})
 # Auto-approved binaries skip the ApprovalQueue (#1694). The default
 # list is deliberately narrow: only inert read-only tools where the
 # argv shape can't be turned into arbitrary host work via flags or
@@ -413,9 +419,22 @@ class ComputerUseFeature(Feature):
 
         granted = self._granted_capabilities()
         backend_name = self._cfg.get("backend", "docker")
+        if not isinstance(backend_name, str) or backend_name not in _BACKEND_NAMES:
+            # Never read an unrecognised value as the default: a mistyped
+            # "none" would otherwise build a backend that can execute (#3760).
+            self._init_refusal = (
+                f"backend refused init: unknown backend {backend_name!r}; "
+                f"expected one of {', '.join(sorted(_BACKEND_NAMES))}"
+            )
+            logger.error("ComputerUseFeature: %s", self._init_refusal)
+            return
         try:
             if backend_name == "local":
                 self._backend = LocalSandboxBackend(granted)
+            elif backend_name == "none":
+                # File tools only. Needs no shell grant because it cannot
+                # execute; see backends/filesystem_only.py.
+                self._backend = FilesystemOnlyBackend()
             else:
                 # ``max_output_bytes`` bounds the copy of each stream the
                 # executor keeps in memory, and with it the inline text of an
@@ -434,9 +453,17 @@ class ComputerUseFeature(Feature):
                     ),
                 )
         except CapabilityBlocked as exc:
-            logger.warning("ComputerUseFeature: backend refused init: %s", exc)
+            refusal = f"backend refused init: {exc}"
+            if not granted & {"shell_execution_sandboxed", "shell_execution_host"}:
+                # Both shell backends need a shell grant. Without one, the
+                # file tools are only reachable through backend = "none".
+                refusal += (
+                    '; an agent with no shell grant needs backend = "none" '
+                    "for the file tools"
+                )
+            logger.warning("ComputerUseFeature: %s", refusal)
             self._backend = None
-            self._init_refusal = f"backend refused init: {exc}"
+            self._init_refusal = refusal
             return
 
         logger.info(
@@ -719,6 +746,7 @@ class ComputerUseFeature(Feature):
         argv: Optional[list[str]] = None,
         cwd_arg: Optional[str] = None,
         pre_approval: Optional[_PreApprovalHook] = None,
+        exec_required: bool = False,
     ) -> _GateOutcome:
         """Run the full gate sequence and audit on every refusal.
 
@@ -773,6 +801,20 @@ class ComputerUseFeature(Feature):
                 f"constitution:Amendment IX missing grant '{capability}'",
             )
         allowed_by.append("constitution")
+
+        # 2.5 Execution. backend = "none" cannot run a command. Checked after
+        # the constitution, so a caller without the grant still learns only
+        # that, and before path, policy and approval, so nobody is asked to
+        # approve a command that cannot run.
+        if exec_required and not gated_backend.supports_exec:
+            await self._audit_denied(
+                tool_name, payload, allowed_by + ["denied:readiness:no_exec"]
+            )
+            return _GateOutcome(
+                False,
+                allowed_by,
+                f"readiness:backend '{gated_backend.name}' has no shell execution",
+            )
 
         # 3. Path safety + 4. Policy (filesystem ops)
         if path_arg is not None:
@@ -1534,6 +1576,7 @@ class ComputerUseFeature(Feature):
             # guard (#1694 codex review P1). Argv-list inputs are
             # trusted; raw strings get the metacharacter check.
             argv=command,
+            exec_required=True,
         )
         if not outcome:
             return ToolResult.failed(error=outcome.denied_reason)

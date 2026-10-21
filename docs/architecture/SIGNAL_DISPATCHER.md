@@ -101,6 +101,8 @@ async def template_artifact_handler(template_path: Path) -> ArtifactHandler:
 | Cron `memory_consolidate` | ARTIFACT (likely) | Feature owner confirms during migration |
 | Cron `training_cycle` | ACTION | Long-running ops |
 | Cron `strategy_reconcile_blockers` | ACTION | Resolves strategy-ledger blockers whose GitHub issue closed; seeded daily before `morning_signal` with `apply: yes` (#3537) |
+| Cron `idle_wake` | ACTION | Idle detector, every 5 minutes; seeded only for agents opted in through `[idle_wake]`. Emits `queue.drained` (#3664) |
+| `queue.drained` | COGNITION | One triage turn per idle stretch once the work queue has drained: no Talon job in the agent's Talon lane (the `[talon.policy] dispatcher` agent's registry when the host names one, #3758), armed watch, pending restart or undelivered wake. Off by default (#3664) |
 | A2A task complete | COGNITION | Bird decides "what now" |
 | Stripe `deposit_complete` | COGNITION | Bird may want to act |
 | Approval grant/deny | **not a signal** | Gate release on paused turn — hook system |
@@ -480,6 +482,16 @@ committed after deactivation create no delivery. Stale ACK/NACK/release or
 initial-reservation capabilities cannot recreate work. Re-registration cannot
 change an inactive consumer back to active; a new workflow wait needs a new
 consumer ID.
+
+#### Cognition terminalizer admission
+
+Failure to admit an exact-token cleanup Task is not an ACK or permission to
+replay cognition. Canonical admission closes the unstarted coroutine and keeps
+the actual immutable delivery snapshot as explicit retirement debt. The existing
+cleanup registry retains one bounded source-control receipt across repeated
+unadmitted attempts; each caller separately receives its actual allocation error
+with the original native receipt. A later admitted cleanup must settle the same
+delivery/token through its real CAS, without reviving ordinary runtime work.
 
 #### Resuming on a wait handle instead of holding a turn
 

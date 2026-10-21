@@ -115,8 +115,12 @@ class _WaitingAgent(TurnLifecycleMixin, OrchestratorEngineMixin, EventManagerMix
             self._active_session_id = session_id
             return await work()
 
-    def _track_background_task(self, coro, *, name: str):
+    def _track_background_task(self, coro, *, name: str, admission=None):
         task = asyncio.create_task(coro, name=name)
+        if admission is not None:
+            # The dispatcher's runtime-owner heartbeat passes an admission
+            # receipt, as the agent's own tracker records (#3570).
+            admission.task = task
         self.background_tasks.append(task)
         return task
 

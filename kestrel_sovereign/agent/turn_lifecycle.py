@@ -826,6 +826,7 @@ class TurnLifecycleMixin:
             ResourceLock.CONVERSATION
         ):
             async with transition_lock:
+                await transition_lock.join_owned_native_work()
                 async with persistence_gate.exclusive():
                     yield
             return
@@ -833,6 +834,7 @@ class TurnLifecycleMixin:
         label = f"{getattr(self, 'agent_name', None) or 'agent'} privacy-transition"
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
             async with transition_lock:
+                await transition_lock.join_owned_native_work()
                 async with persistence_gate.exclusive():
                     yield
 

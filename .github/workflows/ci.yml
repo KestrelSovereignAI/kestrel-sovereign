@@ -333,6 +333,141 @@ jobs:
         run: uv run python run_tests.py --kestrel --skip-check --validate-only
         timeout-minutes: 5
 
+  # Native custody must work on the declared minimum Python, not only 3.13's
+  # task-preserving wait_for implementation. No provider credentials or calls.
+  minimum-python-custody:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    if: needs.lint-and-imports.outputs.run_expensive != 'false'
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+      - name: Install the locked minimum-version host
+        run: uv sync --python 3.11 --locked
+      - name: Check native minimum-version custody
+        run: >-
+          uv run --python 3.11 --no-sync python -m pytest
+          -p pytest_asyncio.plugin -p pytest_timeout -p kestrel_sovereign.testing.fixtures
+          tests/integration/test_wait_resident_custody_pg.py
+          tests/unit/test_a2a_question_expiry_settlement.py
+          tests/unit/test_agent_manager.py tests/unit/test_audit_read_back_own_writes.py
+          tests/unit/test_execution_custody_production_routes.py
+          tests/unit/test_execution_custody_review49_native.py tests/unit/test_spawn_feature.py
+          -k "wait_resident_outlives or crash_while_the_late_wake_is_in_flight or spawn_receipt_wait_cannot_outlive or deeply_nested_value_never_raises or public_stream_rename_retains_privacy or native_fanout_physically_joins_stronger_late_sibling or terminate_child_preserves_active_cancellation_group"
+          -q --tb=short -o addopts='' --timeout=60 --session-timeout=600
+        env:
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          AWS_EC2_METADATA_DISABLED: "true"
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          OPENROUTER_MANAGEMENT_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          TAVILY_API_KEY: ""
+          REPLICATE_API_TOKEN: ""
+          RUNPOD_API_KEY: ""
+          XAI_API_KEY: ""
+
+  # Keep the optional tracing stack compatible with the native MCP SDK.
+  native-mcp-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Install the locked host and Phoenix dependency set
+        run: uv sync --python ${{ matrix.python-version }} --locked --extra phoenix
+      - name: Import the native SDK and tracing integrations together
+        run: uv run --no-sync python -c "from mcp import Client; import phoenix, pydantic_ai, openai"
+      - name: Check tracing, native router lifecycle and provider behavior
+        run: >-
+          uv run --no-sync python -m pytest
+          tests/unit/test_phoenix_supervisor.py tests/unit/test_phoenix_assets_redirect.py
+          tests/unit/test_server_auth.py tests/unit/test_openai_cache_usage.py
+          tests/unit/test_openai_thinking_channel.py tests/unit/test_openai_plan_autocompact.py
+          tests/unit/test_feature_route_lifecycle_gate.py tests/unit/test_bridge_router_mounted.py
+          tests/unit/test_anthropic_output_ceiling.py
+          tests/unit/test_host_features.py tests/unit/test_stream_progress_watchdog.py
+          tests/unit/test_provider_registry_no_sdk_retries.py -q
+      - name: Verify live Phoenix UI assets through the host proxy
+        run: uv run --no-sync python -m pytest tests/integration/test_phoenix_runtime.py -q
+
+  mcp-permission-seam:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Install the host and released MCP feature
+        run: uv sync --python 3.14 --locked --extra mcp-integration
+      - name: Exercise installed MCP permissions against real Docker and HTTPS peers
+        # budget-basis(mcp): slowest-pass=2.6 worst-runner-ratio=1.85 samples=19 longest-test=180
+        # Eight historical three-case Docker passes include cold bytecode and
+        # public installs; slowest 114.60s, rounded up. Six expanded native
+        # Docker/HTTPS campaigns passed in 46.73s (six cases) and 48.42s (eight
+        # cases), then 47.64s (nine cases), 64.78s (twelve cases), 71.13s
+        # (thirteen cases), and 97.27s (fifteen cases) using private candidate
+        # wheels before public-floor promotion. Independent review added two
+        # complete fifteen-case runs (117.00s and 123.03s); the genuine public
+        # 0.7.0 install passed all fifteen in 133.42s (136.26s process wall time).
+        # A further independent public-install review passed all fifteen twice:
+        # 146.82s/151s cold and 132.82s/135s restored (pytest/process wall time).
+        # These are at least nineteen complete local runs; the slowest
+        # process wall time rounds up to 2.6 minutes.
+        # The ratio is the integration tier's observed runner spread. Its
+        # conftest also enforces the 180s per-test ceiling on these tests.
+        run: >-
+          uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
+          -q --timeout=120 --session-timeout=480
+        timeout-minutes: 12
+
   # Unit tests (no services needed)
   unit-tests:
     runs-on: ubuntu-latest
@@ -395,12 +530,28 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Run unit tests
-        # ``-n auto`` parallelizes across runner cores via pytest-xdist
-        # (already a dev dep). Note that ``auto`` resolves to **2 workers**
-        # on the standard GitHub-hosted runner, not the 16 an earlier
-        # revision of this comment assumed. Runner sizing is tracked in
-        # #2795. The PYTHONHASHSEED env at the workflow level keeps
-        # parametrize ordering deterministic across workers.
+        # ``-n logical``, not ``-n auto``. The standard public-repo runner
+        # has 4 vCPUs (2 cores x 2 threads), and xdist's ``auto`` counts
+        # physical cores through psutil, so it started only 2 workers.
+        # ``logical`` counts vCPUs, so it follows the runner if its size
+        # changes. Measured on one commit, each beside an unchanged 2-worker
+        # job in the same workflow run (docs/research/DEVELOPMENT_THROUGHPUT.md, E1):
+        #
+        #   workers      summed test time   wall    failures beyond baseline
+        #   2 (auto)     41.5 min           21.7    -
+        #   4 (logical)  49.3 min           14.1    none
+        #   8            62.3 min           10.2    none; 2 on its next run
+        #
+        # Why not 8, although the suite mostly waits and 8 was faster: 8
+        # workers on 4 vCPUs oversubscribe the CPU, and the slowest tests
+        # sit close to their limits. On the 8-worker PR run (#3670),
+        # test_paging_survives_tombstones_filling_whole_pages (27.7 s at 2
+        # workers, 41 s at 4) crossed the 60 s per-test timeout, and the
+        # 50 ms graph-index benchmark measured 55 ms. More workers than vCPUs
+        # waits on those tests getting faster (#3276, #3672). Each worker
+        # gets its own PostgreSQL database (TEST_POSTGRES_URL below). The
+        # PYTHONHASHSEED env at the workflow level keeps parametrize
+        # ordering deterministic across workers.
         #
         # No ``-m "not bench"`` here, deliberately — but only because the
         # tier's one benchmark
@@ -413,7 +564,7 @@ jobs:
         # TestIndexUsage::test_agent_status_query_uses_index. The only tests
         # that fail are the by-name existence checks in TestJsonPathIndexes.
         # See #2798. The integration tier does exclude benchmarks; below.
-        # No -x. Under -n auto this suite has a tail of load-sensitive tests
+        # No -x. Under xdist this suite has a tail of load-sensitive tests
         # (#3276): repeated runs on ONE unchanged commit fail a different 1-3
         # each time, all passing serially. With -x the run stopped at whichever
         # test lost the race, so the reported failure was rarely the real
@@ -421,7 +572,7 @@ jobs:
         # tripped first. --maxfail bounds a truly broken tree without hiding
         # the set. Reading a red run now means reading every failure, which is
         # what tells you flake from regression.
-        run: uv run pytest tests/unit/ -n auto -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
+        run: uv run pytest tests/unit/ -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
         # Budgeted the way the integration tier below is (#3212), because the
         # unit tier hit the same wall for the same reason (#3330). 10 min was
         # too tight, then 20 was: at 44e77ec5 the push run passed the step in
@@ -448,7 +599,8 @@ jobs:
         # exceed. 35 + 5, plus teardown, is why the runner backstop is 45.
         #
         # This does not mask a hang. Per-test `--timeout=60` catches those in
-        # a minute; the wall clock only decides how much passing work is
+        # a minute, and tests/shared/hang_backstop.py ends one it cannot
+        # (#3669); the wall clock only decides how much passing work is
         # thrown away. Runner sizing — the real fix — stays in #2795.
         #
         # budget-basis(unit): slowest-pass=13.8 worst-runner-ratio=2.3 samples=51 longest-test=300
@@ -696,7 +848,7 @@ jobs:
         # thresholds are the least trustworthy thing to assert on a shared
         # runner. It still runs weekly via weekly-analysis.yml, which
         # invokes run_tests.py with no marker filter.
-        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 --session-timeout=2700 -m "not docker_mcp and not cloud_resource and not bench"
+        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 --session-timeout=2700 -m "not native_postgres and not docker_mcp and not mcp_integration and not cloud_resource and not bench"
         # 20 was too tight, then 30 was too tight, each for the same reason
         # 10 was too tight on the unit tier above: they started killing
         # PASSING runs. #3212 is the third instance, and the repetition is
@@ -765,6 +917,84 @@ jobs:
           RUNPOD_API_KEY: ""
           XAI_API_KEY: ""
           GITHUB_PAT: ${{ secrets.GH_PAT }}
+
+  # Native fixture consumers own disposable schemas and must not silently skip
+  # when the generic integration job provides DATABASE_URL but not the explicit
+  # TEST_POSTGRES_URL they read (#3675). Separate parallel lane: no duplicate
+  # execution and no extension of the existing integration timeout. This is a
+  # required reusable release-CI job as well as a PR job. The shared failed-unit
+  # run cancellation above also reaches this lane.
+  native-postgres-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    if: >-
+      (github.event_name != 'push' || github.ref != 'refs/heads/main')
+      && needs.lint-and-imports.outputs.run_expensive != 'false'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run required native PostgreSQL tests
+        # Initial bounded lane, not a fabricated runner-speed measurement.
+        # Reuses integration's 45-minute pytest deadline and 50-minute step
+        # backstop (180s maximum marked case + epilogue). Exact-head CI must
+        # establish the new lane's actual timing; no historical skip counts
+        # are represented as passes. Collection uses the canonical native_pg
+        # dependency marker before pytest's -m deselection.
+        run: uv run pytest tests/integration/ -p pytest_asyncio.plugin -p pytest_timeout -o addopts='' -v --tb=short -x --timeout=120 --session-timeout=2700 -m "native_postgres and not docker_mcp and not mcp_integration and not cloud_resource and not bench"
+        timeout-minutes: 50
+        env:
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          EMAIL_DRY_RUN: "true"
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          TAVILY_API_KEY: ""
+          REPLICATE_API_TOKEN: ""
+          RUNPOD_API_KEY: ""
+          XAI_API_KEY: ""
 
   # Offline LLM adapter tests (live credential-gated cases intentionally skip).
   #
@@ -905,6 +1135,10 @@ jobs:
       - name: Install the Chromium browser
         run: npx playwright install --with-deps chromium
         timeout-minutes: 5
+
+      - name: Verify offline native voice transport custody
+        run: node --test tests/js/test_voice_native_custody.cjs
+        timeout-minutes: 3
 
       - name: Run the Console smoke against a fresh isolated instance
         run: uv run kestrel demo smoke --home "$RUNNER_TEMP/kestrel-console-smoke" --port "$SMOKE_PORT"

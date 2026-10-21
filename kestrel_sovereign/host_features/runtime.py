@@ -15,10 +15,14 @@ import re
 from typing import Any, List
 
 from fastapi import FastAPI
+from fastapi.routing import iter_route_contexts
 from fastapi.staticfiles import StaticFiles
-
 from kestrel_sdk.features.host_base import HostFeature
 
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.features.contribution_runtime import (
     FeatureContributionCollectionError,
     FeatureContributionRuntime,
@@ -28,6 +32,11 @@ from kestrel_sovereign.operator import OperatorRuntimeRegistry
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
 
+from .context import (
+    _host_close_owners,
+    _retain_host_cleanup_failure,
+    _retained_host_cleanup_error,
+)
 from .start_order import order_host_features_for_start
 from .ui import compute_host_ui_manifest, host_feature_static_mounts
 
@@ -96,7 +105,7 @@ def mount_host_feature_routers(app: FastAPI, features: List[HostFeature]) -> Lis
             continue
         new_routes = app.routes[before:]
         added.extend(new_routes)
-        for route in new_routes:
+        for route in iter_route_contexts(new_routes):
             route_path = getattr(route, "path", None)
             if route_path:
                 prefixes.add(_route_prefix(route_path))
@@ -131,7 +140,10 @@ def mount_host_feature_ui(app: FastAPI, features: List[HostFeature]) -> List[Any
     app.state._host_feature_ui_mounts = added
     app.state.host_ui_manifest = compute_host_ui_manifest(features)
     if added:
-        logger.info("Mounted host feature UI dirs: %s", ", ".join(m for m, _ in host_feature_static_mounts(features)))
+        logger.info(
+            "Mounted host feature UI dirs: %s",
+            ", ".join(m for m, _ in host_feature_static_mounts(features)),
+        )
     return added
 
 
@@ -187,6 +199,11 @@ async def start_host_features(
     Typed collection failures likewise remain fatal at this host boundary;
     their sanitized wrapper crosses intact with the original failure chained.
     """
+    # A stopped contribution is not proof that its native hook retired. Do not
+    # activate a new epoch over the original context's unresolved receipt.
+    prior_failure = _retained_host_cleanup_error(ctx)
+    if prior_failure is not None:
+        raise prior_failure
     runtime = _host_contribution_runtime(ctx)
     transition = runtime.prepare_transition(features)
     for rejection in transition.rejected:
@@ -220,12 +237,14 @@ async def start_host_features(
     ):
         try:
             runtime.activate(prepared_item)
-        except Exception as exc:
+        except BaseException as exc:
             # A declarative commit failure is not an optional imperative
             # lifecycle failure. Reverse the already-started prefix and reject
             # the transition so callers cannot serve a partially-active set.
-            await _rollback_started_host_features(started, ctx, runtime)
+            cleanup = await _rollback_started_host_features(started, ctx, runtime)
             ctx.started_host_features = previously_started
+            if _host_control_failure(exc) or cleanup:
+                raise execution_terminal_error(exc, *cleanup, retain_originals=True, isolate_control_originals=True)
             if isinstance(exc, FeatureContributionCollectionError):
                 raise
             raise FeatureContributionRuntimeError(
@@ -234,7 +253,7 @@ async def start_host_features(
             ) from exc
         try:
             await feature.on_host_start(ctx)
-        except Exception as exc:  # noqa: BLE001 - isolate a reversible failure
+        except BaseException as exc:  # ordinary failures alone remain optional
             # ERROR, and recorded where health reads it. A feature dropped here
             # is dropped WHOLE -- no router, no panel, no service -- and every
             # downstream consumer then sees an empty list rather than an error.
@@ -244,38 +263,30 @@ async def start_host_features(
             # operator run plane. A start-hook failure is the same fact as a
             # contribution rejection -- the feature is not loaded -- so it goes
             # through the same door rather than getting a second one.
+            cleanup = await _retire_host_features(
+                [feature], ctx, runtime, deactivate_first=True
+            )
+            if _host_control_failure(exc, *cleanup) or cleanup:
+                cleanup += await _rollback_started_host_features(started, ctx, runtime)
+                ctx.started_host_features = previously_started
+                raise execution_terminal_error(exc, *cleanup, retain_originals=True, isolate_control_originals=True)
             logger.error(
                 "Host feature %s did not start — %s",
                 _host_feature_name(feature),
                 exc,
             )
-            _record_host_feature_rejection(
-                ctx, feature, f"on_host_start failed: {exc}"
-            )
-            try:
-                runtime.deactivate(feature)
-            except Exception:  # noqa: BLE001 - unsafe rollback cannot be hidden
-                logger.exception(
-                    "Host feature %s contribution rollback failed", feature
-                )
-                raise
-            try:
-                await feature.on_host_stop(ctx)
-            except Exception:  # noqa: BLE001 - partial imperative cleanup
-                logger.exception(
-                    "Host feature %s partial-start cleanup failed", feature
-                )
+            _record_host_feature_rejection(ctx, feature, f"on_host_start failed: {exc}")
             continue
         started.append(feature)
     try:
         runtime.setup_step_registry.ordered()
-    except Exception:
+    except BaseException as exc:
         # A failed member may have been the target of another member's hard
         # setup ordering constraint. That leaves no valid partial host set, so
         # reverse every successfully started member before reporting failure.
-        await _rollback_started_host_features(started, ctx, runtime)
+        cleanup = await _rollback_started_host_features(started, ctx, runtime)
         ctx.started_host_features = previously_started
-        raise
+        raise execution_terminal_error(exc, *cleanup, retain_originals=True, isolate_control_originals=True)
     ctx.started_host_features = (*previously_started, *started)
     started_ids = {id(feature) for feature in started}
     return [feature for feature in features if id(feature) in started_ids]
@@ -313,24 +324,74 @@ def _record_host_feature_rejection(ctx: Any, feature: Any, reason: str) -> None:
     )
 
 
+def _host_control_failure(*errors: BaseException) -> bool:
+    return any(
+        not isinstance(error, Exception) or is_execution_control_error(error)
+        for error in errors
+    )
+
+
+async def _retire_host_features(features, ctx, runtime, *, deactivate_first=False):
+    """Join each original hook and unregister every peer before propagation.
+
+    Ordinary imperative stop failures retain the historical logged/optional
+    contract. Native control and unsafe declarative rollback failures are
+    returned as ORIGINAL carriers, never consumed as warning strings.
+    """
+    owners = _host_close_owners(ctx)
+    finite_errors = []
+    for feature in features:
+
+        async def stop():
+            if ("host-feature-stop", id(feature)) in owners:
+                return
+            try:
+                await feature.on_host_stop(ctx)
+            except BaseException as error:
+                logger.warning("Host feature %s stop failed: %s", feature, error)
+                if _host_control_failure(error):
+                    finite_errors.append(error)
+                    # Retain the original resource/error BEFORE deactivation
+                    # can remove its contribution and a repeat can skip it.
+                    _retain_host_cleanup_failure(
+                        ctx, feature, error, operation="host-feature-stop"
+                    )
+
+        def deactivate():
+            if runtime is None or ("host-feature-deactivate", id(feature)) in owners:
+                return
+            try:
+                runtime.deactivate(feature)
+            except BaseException as error:
+                logger.warning(
+                    "Host feature %s declarative teardown failed: %s", feature, error
+                )
+                finite_errors.append(error)
+                _retain_host_cleanup_failure(
+                    ctx, feature, error, operation="host-feature-deactivate"
+                )
+
+        if deactivate_first:
+            deactivate()
+        await stop()
+        if not deactivate_first:
+            deactivate()
+    # Do this AFTER every independent peer, including when none are active on
+    # a repeat. Never replay an uncertain original hook merely to recover it.
+    failure = execution_terminal_error(
+        _retained_host_cleanup_error(ctx), *finite_errors,
+        retain_originals=True, isolate_control_originals=True,
+    )
+    return [] if failure is None else [failure]
+
+
 async def _rollback_started_host_features(
     features: List[HostFeature],
     ctx: Any,
     runtime: FeatureContributionRuntime,
-) -> None:
-    """Best-effort cleanup of a rejected prospective host transition."""
-
-    for feature in reversed(features):
-        try:
-            await feature.on_host_stop(ctx)
-        except Exception:  # noqa: BLE001 - continue exact declarative cleanup
-            logger.exception("Host feature %s rollback stop failed", feature)
-        try:
-            runtime.deactivate(feature)
-        except Exception:  # noqa: BLE001 - continue cleaning remaining owners
-            logger.exception(
-                "Host feature %s declarative rollback failed", feature
-            )
+) -> list[BaseException]:
+    """Retire the rejected prefix, retaining every native control carrier."""
+    return await _retire_host_features(reversed(features), ctx, runtime)
 
 
 async def stop_host_features(features: List[HostFeature], ctx: Any) -> None:
@@ -348,33 +409,24 @@ async def stop_host_features(features: List[HostFeature], ctx: Any) -> None:
     }
     # Latest start first; a feature with no recorded start keeps the reverse of
     # the order it was requested in.
-    for _, feature in sorted(
-        enumerate(requested),
-        key=lambda item: (started_at.get(id(item[1]), -1), item[0]),
-        reverse=True,
-    ):
-        if runtime is not None and not runtime.is_active(feature):
-            continue
-        try:
-            await feature.on_host_stop(ctx)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Host feature %s on_host_stop failed: %s", feature, exc)
-        finally:
-            if runtime is not None:
-                try:
-                    runtime.deactivate(feature)
-                except Exception as exc:  # noqa: BLE001 - continue stopping peers
-                    logger.warning(
-                        "Host feature %s contribution teardown failed: %s",
-                        feature,
-                        exc,
-                    )
+    ordered = [
+        feature
+        for _, feature in sorted(
+            enumerate(requested),
+            key=lambda item: (started_at.get(id(item[1]), -1), item[0]),
+            reverse=True,
+        )
+        if runtime is None or runtime.is_active(feature)
+    ]
+    errors = await _retire_host_features(ordered, ctx, runtime)
     removed_ids = {id(feature) for feature in requested}
     ctx.started_host_features = tuple(
         feature
         for feature in getattr(ctx, "started_host_features", ())
         if id(feature) not in removed_ids
     )
+    if errors:
+        raise execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
 
 
 __all__ = [

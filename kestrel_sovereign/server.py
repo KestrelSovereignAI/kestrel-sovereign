@@ -11,12 +11,13 @@ import secrets
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
+from dataclasses import dataclass, field as dataclass_field, fields
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Security, status
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.routing import APIRoute, APIWebSocketRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute, RouteContext, iter_route_contexts
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -33,6 +34,8 @@ from kestrel_sovereign.kestrel_agent import (
 )
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.llm.lifecycle import drain_unpublished_llm_owners, retire_unpublished_llm
+from kestrel_sovereign.execution_custody import execution_finite_error, execution_observation_error, is_execution_control_error
 from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
@@ -170,6 +173,23 @@ SSE_PATHS = {
 # dedicated PostgreSQL connection keeps this evidence lane independent without
 # consuming the host's operational/advisory pool budget a second time.
 STOP_RECEIPT_POSTGRES_POOL_SIZE = 1
+
+
+def _standalone_runtime_execution_custody(name, did, config):
+    """Declare the built-in host's original PG runtime, not its wake claim.
+
+    Tenant hosts (including Frinz) install their own immutable generation
+    factory. The built-in server has process-owned runtimes, not tenant rows.
+    SQLite retains its existing unbound semantics.
+    """
+    if os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower() != "postgres":
+        return None
+    if not os.environ.get("KESTREL_DATABASE_URL"):
+        return None
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody, ProcessRuntimeExecutionFence,
+    )
+    return ExecutionCustody(ProcessRuntimeExecutionFence(agent_id=did))
 
 
 def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
@@ -723,63 +743,20 @@ def _resolve_route_agent(scope, mount_agent):
     return state.get("agent") or mount_agent
 
 
-def _feature_router_route_selector(router, route_index: int) -> tuple:
-    """Describe one child route without retaining its instance-bound callable.
+def _current_feature_router(feature, signature: tuple):
+    """Resolve the live router only while its complete mounted shape matches.
 
-    ``FastAPI.include_router`` copies a route's endpoint at mount time.  That
-    is fine for module-level handlers, but is wrong for a per-agent feature
-    whose route closes over ``self``: a route first mounted for Alice would
-    otherwise call Alice's feature when a request is addressed to Bob.  Keep
-    only structural coordinates here and resolve Bob's current child route at
-    request time.
+    FastAPI preserves included routers. Its public traversal provides the
+    effective paths, including nested prefixes, without depending on the
+    framework's private inclusion nodes or retaining a tenant's endpoints.
     """
-
-    routes = tuple(getattr(router, "routes", ()) or ())
-    if route_index < 0 or route_index >= len(routes):
-        raise IndexError("feature router child route index is out of range")
-    route = routes[route_index]
-    return (
-        getattr(router, "prefix", ""),
-        route_index,
-        type(route).__name__,
-        getattr(route, "path", None),
-        tuple(sorted(getattr(route, "methods", ()) or ())),
-    )
-
-
-def _current_feature_router_route(feature, selector: tuple):
-    """Resolve the request target's current matching child route, or ``None``.
-
-    A replacement feature is eligible only if it still exposes exactly the
-    router shape that was mounted.  Returning ``None`` on removal/reload shape
-    drift is intentionally fail-closed: the old captured callable must never
-    serve a request merely because a similarly named feature was once loaded.
-    """
-
     get_router = getattr(feature, "get_router", None)
     if not callable(get_router):
         return None
-    try:
-        router = get_router()
-    except Exception:  # noqa: BLE001 - optional feature boundary
-        logger.warning("Failed to resolve current router from feature", exc_info=True)
+    router = get_router()
+    if router is None or _feature_router_signature("", router) != signature:
         return None
-    if router is None:
-        return None
-    prefix, index, route_type, path, methods = selector
-    routes = tuple(getattr(router, "routes", ()) or ())
-    if index >= len(routes):
-        return None
-    current = routes[index]
-    if (
-        getattr(router, "prefix", "") != prefix
-        or type(current).__name__ != route_type
-        or getattr(current, "path", None) != path
-        or tuple(sorted(getattr(current, "methods", ()) or ())) != methods
-        or not callable(getattr(current, "app", None))
-    ):
-        return None
-    return current
+    return router
 
 
 def _stable_agent_did(agent) -> Optional[str]:
@@ -800,8 +777,8 @@ def _stable_agent_did(agent) -> Optional[str]:
         return None
 
 
-def _live_feature_route(agent, feature_name: str, selector: tuple):
-    """The current child route ``agent`` serves for one mounted shape, or None.
+def _live_feature_router(agent, feature_name: str, signature: tuple):
+    """The current router ``agent`` serves for one mounted router shape, or None.
 
     One check for "this agent still serves this route": the feature is
     present, enabled, and exposes the mounted shape now. The owner
@@ -813,29 +790,29 @@ def _live_feature_route(agent, feature_name: str, selector: tuple):
     feature = features.get(feature_name) if hasattr(features, "get") else None
     if feature is None or not bool(getattr(feature, "enabled", True)):
         return None
-    return _current_feature_router_route(feature, selector)
+    return _current_feature_router(feature, signature)
 
 
 def _resolve_live_route_agent(
     app: FastAPI,
     scope,
     mount_agent,
-    feature_name: str,
-    selector: tuple,
 ):
-    """Resolve a live owner for one physically shared feature route.
+    """Resolve the explicit or original owner of a shared feature route.
 
     Request-scoped routing is authoritative.  For unprefixed routes, retain
     the original mount owner while it is managed — the same object, or the
     same agent reloaded under a new object (readiness rollback then retry,
     DELETE then re-create, a scheduler cold wake): the manager keeps one
     routing name per DID, so the DID is the owner's stable identity and the
-    object is not.  If that owner is gone, the route may rebind only when
-    exactly one managed agent still serves it: an unprefixed address names
-    no agent, so with two or more candidates the executor would be chosen
-    by ``list_agents()`` order, invisible to the caller (#3240, the shape of
-    #3216). Refuse instead; the agent-prefixed form stays the unambiguous
-    address.
+    object is not. If the owner is gone, the unprefixed address is unbound.
+    Only an explicit agent URL may select a different agent. Never inspect an
+    unrelated plugin to silently reassign an address whose owner disappeared.
+
+    This deliberately withdraws the one-survivor rebinding rule from
+    #3240/#3216: withdrawing an agent must not transfer its address to another
+    identity. A broken live owner's router contract raises a server error;
+    it is not reported as an absent route or used to choose another owner.
     """
 
     state = scope.get("state") or {}
@@ -868,13 +845,6 @@ def _resolve_live_route_agent(
         ]
         if len(reloaded) == 1:
             return reloaded[0]
-    survivors = [
-        candidate
-        for candidate in managed_agents
-        if _live_feature_route(candidate, feature_name, selector) is not None
-    ]
-    if len(survivors) == 1:
-        return survivors[0]
     return None
 
 
@@ -887,217 +857,137 @@ async def _feature_route_gone_response(scope, receive, send) -> None:
     await Response(status_code=404)(scope, receive, send)
 
 
-def _feature_route_host_dependencies(route, initial_current) -> tuple:
-    """Keep dependencies added by the app while a feature route hot-reloads.
-
-    ``include_router`` concatenates the app/router dependencies before the
-    source route's own dependencies. Strip that initial source suffix so a
-    request can use the selected feature's current router dependencies without
-    retaining a stale sibling feature's closure.
-    """
-
-    mounted = tuple(getattr(route, "dependencies", ()) or ())
-    initial = tuple(getattr(initial_current, "dependencies", ()) or ())
-    if not initial or len(mounted) < len(initial):
-        return mounted
-    if all(left == right for left, right in zip(mounted[-len(initial):], initial)):
-        return mounted[:-len(initial)]
-    # An unusual custom router did not preserve FastAPI's normal suffix
-    # identity. Keep the app-bound dependencies rather than dropping a host
-    # authorization dependency.
-    return mounted
-
-
-def _app_bound_current_feature_route_app(
-    app: FastAPI,
-    mounted_route,
-    current_route,
-    host_dependencies: tuple,
-):
-    """Build a current-feature route with FastAPI's app-owned execution seam.
-
-    The mounted copy carries host dependencies and the app's
-    ``dependency_overrides`` provider; the current child supplies the
-    request-target feature's endpoint and per-router dependencies. Rebuilding
-    the tiny route wrapper per request deliberately avoids retaining a stale
-    bound feature across a reload or a multi-agent request.
-    """
-
-    dependencies = [
-        *host_dependencies,
-        *(getattr(current_route, "dependencies", ()) or ()),
-    ]
-    if isinstance(mounted_route, APIRoute) and isinstance(current_route, APIRoute):
-        rebound = type(mounted_route)(
-            path=mounted_route.path,
-            endpoint=current_route.endpoint,
-            response_model=current_route.response_model,
-            status_code=current_route.status_code,
-            tags=current_route.tags,
-            dependencies=dependencies,
-            summary=current_route.summary,
-            description=current_route.description,
-            response_description=current_route.response_description,
-            responses=current_route.responses,
-            deprecated=current_route.deprecated,
-            methods=mounted_route.methods,
-            operation_id=current_route.operation_id,
-            response_model_include=current_route.response_model_include,
-            response_model_exclude=current_route.response_model_exclude,
-            response_model_by_alias=current_route.response_model_by_alias,
-            response_model_exclude_unset=current_route.response_model_exclude_unset,
-            response_model_exclude_defaults=current_route.response_model_exclude_defaults,
-            response_model_exclude_none=current_route.response_model_exclude_none,
-            include_in_schema=mounted_route.include_in_schema,
-            response_class=current_route.response_class,
-            name=current_route.name,
-            dependency_overrides_provider=app,
-            callbacks=current_route.callbacks,
-            openapi_extra=current_route.openapi_extra,
-            generate_unique_id_function=current_route.generate_unique_id_function,
-            strict_content_type=current_route.strict_content_type,
-        )
-        return rebound.app
-    if isinstance(mounted_route, APIWebSocketRoute) and isinstance(
-        current_route, APIWebSocketRoute
-    ):
-        rebound = APIWebSocketRoute(
-            path=mounted_route.path,
-            endpoint=current_route.endpoint,
-            name=current_route.name,
-            dependencies=dependencies,
-            dependency_overrides_provider=app,
-        )
-        return rebound.app
-    if isinstance(mounted_route, StarletteRoute) and isinstance(
-        current_route, StarletteRoute
-    ):
-        rebound = StarletteRoute(
-            path=mounted_route.path,
-            endpoint=current_route.endpoint,
-            methods=mounted_route.methods,
-            name=current_route.name,
-            include_in_schema=mounted_route.include_in_schema,
-        )
-        return rebound.app
-    if isinstance(mounted_route, StarletteWebSocketRoute) and isinstance(
-        current_route, StarletteWebSocketRoute
-    ):
-        rebound = StarletteWebSocketRoute(
-            path=mounted_route.path,
-            endpoint=current_route.endpoint,
-            name=current_route.name,
-        )
-        return rebound.app
-    return None
-
-
-def _gate_feature_route(
-    app: FastAPI,
-    route,
-    feature_name: str,
-    mount_agent,
-    selector: tuple,
-    initial_current,
-) -> None:
-    """Wrap ``route`` so it only serves while its owning feature is live-enabled.
-
-    Feature routers are mounted ONCE at startup, but features can be
-    soft-disabled or removed at runtime. Rather than unmount/remount (which
-    risks duplicate routes on re-enable and drift from the enable/disable
-    lifecycle), the route stays physically mounted and this gate rejects the
-    request at match time when the owning feature is currently disabled or
-    gone (kestrel-sovereign#2522). Re-enabling the feature flips the gate back
-    on with no route churn. Only the feature-contributed routes are gated;
-    core/server routes are never touched.
-
-    The gate lives at ``route.matches()`` rather than ``route.app``: Starlette
-    otherwise produces a 405 for a wrong-method request before it calls the
-    app, and a WebSocket route would receive an invalid HTTP ``JSONResponse``.
-    Returning :class:`starlette.routing.Match.NONE` removes a disabled route
-    from both HTTP and WebSocket matching before either protocol is handled.
-
-    Starlette's own match runs first. The live-owner and live-route checks
-    — which call ``feature.get_router()`` and, for a withdrawn mount owner,
-    scan every managed agent — run only for a request whose path this
-    route matches at all (#3253). Every request that reached the end of the
-    route table used to pay one router construction per gated feature
-    route, matching or not — every 404 (twice, via the trailing-slash
-    retry) and every request Starlette could only match PARTIAL; a request
-    a core route matched FULL never got this far. A path match with the
-    wrong method (``Match.PARTIAL``) still consults the gate, so a
-    disabled feature answers NONE there too, never 405.
-    """
-    original_matches = route.matches
-    host_dependencies = _feature_route_host_dependencies(route, initial_current)
-
-    def _gated_matches(scope):
-        matched = original_matches(scope)
-        if matched[0] is Match.NONE:
-            return matched
-        agent = _resolve_live_route_agent(
-            app, scope, mount_agent, feature_name, selector
-        )
-        # Dynamic feature routes stay physically mounted so a live feature can
-        # be disabled/re-enabled without route churn.  When their mount owner
-        # has been DELETEd, however, an unprefixed request must not keep using
-        # that stale captured object while a scheduler races to cold-wake it.
-        # Request-scoped routes still work for another currently managed agent
-        # that exposes the same feature.
-        if agent is None:
-            return Match.NONE, {}
-        if _live_feature_route(agent, feature_name, selector) is None:
-            return Match.NONE, {}
-        return matched
-
-    route.matches = _gated_matches
-    # Do not call the copied ``route.app`` directly: it retains the first
-    # feature's bound endpoint. Do not call ``current.app`` either: that source
-    # child bypasses the app's dependency overrides and host dependencies.
-    # Rebind the current endpoint through a fresh app-owned FastAPI route.
-    async def _dispatch_current_feature_route(scope, receive, send):
-        agent = _resolve_live_route_agent(
-            app, scope, mount_agent, feature_name, selector
-        )
-        if agent is None:
-            await _feature_route_gone_response(scope, receive, send)
-            return
-        current = _live_feature_route(agent, feature_name, selector)
-        if current is None:
-            await _feature_route_gone_response(scope, receive, send)
-            return
-        current_app = _app_bound_current_feature_route_app(
-            app,
-            route,
-            current,
-            host_dependencies,
-        )
-        if current_app is None:
-            await _feature_route_gone_response(scope, receive, send)
-            return
-        await current_app(scope, receive, send)
-
-    route.app = _dispatch_current_feature_route
+def _feature_route_shape(context) -> tuple:
+    """The canonical effective shape for a native HTTP/WebSocket leaf."""
+    return (
+        type(context.original_route).__name__,
+        context.path,
+        tuple(sorted(context.methods or ())),
+    )
 
 
 def _feature_router_signature(feature_name: str, router) -> tuple:
-    """Return a stable de-duplication key for one feature router.
-
-    Cold agent registration can happen after the startup mount pass.  Router
-    objects are freshly constructed by many features, so object identity is
-    not sufficient to avoid duplicate FastAPI routes; use the exposed route
-    shape instead.  The feature name keeps intentionally distinct features
-    from being conflated merely because they happen to share a path.
-    """
+    """Identify an entire native router, with effective nested route paths."""
+    if not isinstance(router, APIRouter):
+        raise TypeError("Feature.get_router() must return a FastAPI APIRouter or None")
     routes = tuple(
-        (
-            type(route).__name__,
-            getattr(route, "path", None),
-            tuple(sorted(getattr(route, "methods", ()) or ())),
-        )
-        for route in getattr(router, "routes", ())
+        _feature_route_shape(context)
+        for context in iter_route_contexts(router.routes)
     )
-    return (feature_name, getattr(router, "prefix", ""), routes)
+    return (feature_name, router.prefix, routes)
+
+
+class _LiveFeatureRouter(APIRouter):
+    """Match a fixed API shape and dispatch through its current agent's router.
+
+    FastAPI owns inclusion, dependencies, WebSockets, and route metadata. The
+    host only gates the feature lifecycle and selects the current owner. A
+    native parent keeps the app's dependency overrides and mount-time host
+    dependencies; a replacement router always receives a new binding.
+    """
+
+    def __init__(self, app: FastAPI, router, feature_name: str, mount_agent):
+        super().__init__()
+        supported = (APIRoute, APIWebSocketRoute, StarletteRoute, StarletteWebSocketRoute)
+        if any(
+            not isinstance(context.original_route, supported)
+            for context in iter_route_contexts(router.routes)
+        ):
+            raise TypeError("Feature routers must expose HTTP or WebSocket routes")
+        # FastAPI serves frontend() fallbacks outside normal matches()/handle().
+        # Its native low-priority traversal includes nested router fallbacks;
+        # none may bypass the per-agent lifecycle boundary. Feature UI belongs
+        # to the host's typed UI contribution contract instead.
+        if next(router._iter_low_priority_routes(), None) is not None:
+            raise TypeError("Feature frontend() routes must use get_ui_contributions()")
+        self.include_router(router)
+        self._bindings: dict[int, tuple[APIRouter, APIRouter]] = {}
+        self._host_app = app
+        self._feature_name = feature_name
+        self._mount_agent = mount_agent
+        self._signature = _feature_router_signature("", router)
+        parent = app.router
+        self._host_options = {
+            "dependencies": list(parent.dependencies),
+            "dependency_overrides_provider": app,
+            "tags": list(parent.tags),
+            "responses": dict(parent.responses),
+            "callbacks": list(parent.callbacks),
+            "deprecated": parent.deprecated,
+            "include_in_schema": parent.include_in_schema,
+            "default_response_class": parent.default_response_class,
+            "generate_unique_id_function": parent.generate_unique_id_function,
+            "strict_content_type": parent.strict_content_type,
+        }
+
+    @property
+    def registration_key(self) -> tuple:
+        """The exact shared mount this lifecycle owns, including feature name."""
+        return (self._feature_name, *self._signature[1:])
+
+    def _current_router(self, scope):
+        agent = _resolve_live_route_agent(
+            self._host_app, scope, self._mount_agent,
+        )
+        router = _live_feature_router(agent, self._feature_name, self._signature)
+        return (agent, router) if router is not None else None
+
+    async def handle(self, scope, receive, send):
+        # A feature can disappear after matching, before dispatch.
+        current = self._current_router(scope)
+        if current is None:
+            await _feature_route_gone_response(scope, receive, send)
+            return
+        agent, source = current
+        # Keep one native binding per live agent. Alternating tenants reuse
+        # their own handlers; fresh factories still replace their own binding.
+        # Prune withdrawn agents so churn cannot retain an unbounded fleet.
+        agent_key = id(agent)
+        live_keys = {id(current_agent) for current_agent in _iter_current_agents(self._host_app)}
+        live_keys.add(agent_key)
+        for retired in self._bindings.keys() - live_keys:
+            del self._bindings[retired]
+        binding = self._bindings.get(agent_key)
+        if binding is None or binding[0] is not source:
+            bound = APIRouter(**self._host_options)
+            bound.include_router(source)
+            binding = (source, bound)
+            self._bindings[agent_key] = binding
+        await binding[1].handle(scope, receive, send)
+
+
+@dataclass(frozen=True)
+class _LiveFeatureRoute(RouteContext):
+    """A fixed native API context whose match and dispatch share a live gate.
+
+    Include the source through FastAPI first, retaining its complete native
+    metadata. Publish only the resulting API leaf contexts to the
+    host; later source-router mutations cannot publish ungated frontend groups.
+    """
+
+    native: RouteContext = dataclass_field(kw_only=True, repr=False, compare=False)
+    lifecycle: _LiveFeatureRouter = dataclass_field(kw_only=True, repr=False, compare=False)
+
+    @classmethod
+    def bind(cls, native: RouteContext, lifecycle: _LiveFeatureRouter):
+        # Forward the public dataclass as a whole, including FastAPI's opaque
+        # effective context. Never reconstruct route/dependency metadata here.
+        values = {
+            item.name: getattr(native, item.name)
+            for item in fields(RouteContext) if item.init
+        }
+        return cls(**values, native=native, lifecycle=lifecycle)
+
+    def matches(self, scope):
+        matched = self.native.matches(scope)
+        if matched[0] is Match.NONE:
+            return matched
+        if self.lifecycle._current_router(scope) is None:
+            return Match.NONE, {}
+        return matched
+
+    async def handle(self, scope, receive, send):
+        await self.lifecycle.handle(scope, receive, send)
 
 
 def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
@@ -1108,7 +998,7 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     it in the FastAPI app. This allows feature packages (voice, spawn,
     observability, etc.) to contribute HTTP endpoints dynamically.
 
-    Each contributed route is wrapped by :func:`_gate_feature_route` so that
+    Each contributed router is wrapped by :class:`_LiveFeatureRouter` so that
     disabling or removing the owning feature at runtime makes its routes 404
     without unmounting them — the Bridge router, for instance, stops serving
     the moment its feature is disabled and resumes on re-enable, with no
@@ -1134,6 +1024,7 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
             if _is_webhook_receiver(getattr(feature, "receiver", None)):
                 continue
             routes_before_include: Optional[int] = None
+            native_registration_before: Optional[tuple] = None
             try:
                 router = feature.get_router()
                 if router is None:
@@ -1142,39 +1033,28 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 if router_key in mounted_keys:
                     continue
                 routes_before_include = len(app.routes)
-                app.include_router(router)
-                # Gate exactly the routes this feature just contributed so a
-                # runtime disable/remove makes them 404 (never a core route).
-                selectors = tuple(
-                    (_feature_router_route_selector(router, index), candidate)
-                    for index, candidate in enumerate(
-                        tuple(getattr(router, "routes", ()) or ())
-                    )
-                    if hasattr(candidate, "app")
+                lifecycle = _LiveFeatureRouter(app, router, name, agent)
+                native_registration_before = (
+                    list(app.router.on_startup), list(app.router.on_shutdown),
+                    app.router.lifespan_context,
                 )
-                added = tuple(
-                    candidate
-                    for candidate in app.routes[routes_before_include:]
-                    if hasattr(candidate, "app")
-                )
-                if len(added) != len(selectors):
-                    raise RuntimeError(
-                        "Feature router mount did not preserve child-route shape"
-                    )
-                for added_route, (selector, initial_current) in zip(added, selectors):
-                    _gate_feature_route(
-                        app, added_route, name, agent, selector, initial_current
-                    )
+                app.include_router(lifecycle)
+                contexts = list(iter_route_contexts(app.routes[routes_before_include:]))
+                app.routes[routes_before_include:] = [
+                    _LiveFeatureRoute.bind(context, lifecycle) for context in contexts
+                ]
                 mounted_keys.add(router_key)
                 mounted.append(name)
             except Exception as exc:
                 if routes_before_include is not None:
-                    # ``include_router`` can copy ordinary routes before it
-                    # reaches a child it cannot preserve (for example a
-                    # mounted sub-application). Treat validation as an atomic
-                    # mount: never leave those partial, ungated routes in the
-                    # app or let a later retry add duplicates.
+                    # Treat router validation/inclusion as an atomic mount:
+                    # never retain a partial, ungated feature contribution.
                     del app.routes[routes_before_include:]
+                if native_registration_before is not None:
+                    startup, shutdown, lifespan = native_registration_before
+                    app.router.on_startup[:] = startup
+                    app.router.on_shutdown[:] = shutdown
+                    app.router.lifespan_context = lifespan
                 logger.warning("Failed to mount router from feature %s: %s", name, exc)
 
     if agents is None:
@@ -1681,7 +1561,9 @@ async def _onboard_host_registered_agent(
                     router = feature.get_router()
                 except Exception:
                     continue
-                if router is not None:
+                # An invalid contribution was refused at mount time and
+                # cannot own a shared physical mount during rollback.
+                if isinstance(router, APIRouter):
                     key = _feature_router_signature(feature_name, router)
                     if key in owned_router_keys:
                         shared_router_keys.add(key)
@@ -1711,7 +1593,10 @@ async def _onboard_host_registered_agent(
                 id(route)
                 for route in app.routes
                 if id(route) in owned_feature_route_ids
-                and "webhook" in str(getattr(route, "path", "")).lower()
+                and any(
+                    "webhook" in str(context.path).lower()
+                    for context in iter_route_contexts([route])
+                )
             )
 
         removable_route_ids = owned_route_ids - preserved_route_ids
@@ -1860,20 +1745,11 @@ async def _onboard_host_registered_agent(
         if id(route) in owned_feature_route_ids
     ]
     for key in owned_router_keys:
-        _feature_name, _prefix, route_shapes = key
-        # APIRouter stores its prefix in every child route's ``path`` already;
-        # ``include_router`` copies that exact path into the app.  The stable
-        # signature is therefore also the physical mounted shape.
-        expected_shapes = set(route_shapes)
         owned_router_route_ids[key] = {
             id(route)
             for route in owned_feature_routes
-            if (
-                type(route).__name__,
-                getattr(route, "path", None),
-                tuple(sorted(getattr(route, "methods", ()) or ())),
-            )
-            in expected_shapes
+            if isinstance(route, _LiveFeatureRoute)
+            and route.lifecycle.registration_key == key
         }
     owned_ui_mount_ids.update(
         id(route)
@@ -2096,9 +1972,17 @@ async def _supervise_phoenix_startup(app, supervisor) -> None:
         )
 
 
-async def _shutdown_single_agent(agent: KestrelAgent) -> None:
+async def _shutdown_single_agent(agent: KestrelAgent, *, finite_errors: list[BaseException] | None = None) -> bool | None:
     """Bound user-visible shutdown while retaining ownership of its tail."""
     cancelled = False
+    failures, withdrawals = [], []
+    # Failed initialization may already have handed native cleanup to the
+    # Agent. Join that exact owner before a fresh shutdown can touch providers.
+    if isinstance(getattr(agent, "_durable_shutdown_continuation", None), asyncio.Future):
+        try:
+            cancelled = await await_agent_shutdown_completion(agent, withdrawals=withdrawals, finite_errors=failures)
+        except BaseException as error:
+            failures.append(error)
     try:
         await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
         logger.info("Agent shutdown complete.")
@@ -2107,14 +1991,23 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
             "Agent shutdown timed out (%ss); waiting for durable cleanup",
             SHUTDOWN_TIMEOUT,
         )
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
         cancelled = True
+        failures.append(error)
         logger.debug("Agent shutdown cancelled")
-    except Exception as e:
-        logger.warning(f"Error during agent shutdown: {e}")
-    cancelled = await await_agent_shutdown_completion(agent) or cancelled
+    except BaseException as error:
+        failures.append(error)
+        logger.warning("Error during agent shutdown (%s)", type(error).__name__)
+    cancelled = await await_agent_shutdown_completion(agent, withdrawals=withdrawals, finite_errors=failures) or cancelled
+    if finite_errors is not None:
+        finite_errors.extend(failures)
+        finite_errors.extend(withdrawals)
+        return not failures and not cancelled
+    failure = execution_finite_error(*failures, *withdrawals)
+    if failure is not None and (not isinstance(failure, asyncio.CancelledError) or is_execution_control_error(failure)):
+        raise failure
     if cancelled:
-        raise asyncio.CancelledError()
+        raise failure if isinstance(failure, asyncio.CancelledError) else withdrawals[-1] if withdrawals else asyncio.CancelledError()
 
 
 def _attach_stop_runtime(app: FastAPI, agent) -> None:
@@ -2210,16 +2103,17 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
         app.state.stop_receipt_store = store
         app.state.peer_stop_circuit = circuit
         app.state.distributed_invocation_registry = distributed_stop
-    except (Exception, asyncio.CancelledError) as error:
+    except BaseException as error:
         cleanup_cancelled = isinstance(error, asyncio.CancelledError)
         cleanup_failures: list[BaseException] = []
+        withdrawals = []
         if distributed_stop is not None:
             close_registry = asyncio.create_task(
                 distributed_stop.close(),
                 name="stop_receipts_startup:close_registry",
             )
             cancelled, failure = await await_lifecycle_task_completion(
-                close_registry
+                close_registry, withdrawals=withdrawals,
             )
             cleanup_cancelled = cleanup_cancelled or cancelled
             if failure is not None:
@@ -2229,7 +2123,7 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
                 db.close(),
                 name="stop_receipts_startup:close_database",
             )
-            cancelled, failure = await await_lifecycle_task_completion(close_db)
+            cancelled, failure = await await_lifecycle_task_completion(close_db, withdrawals=withdrawals)
             cleanup_cancelled = cleanup_cancelled or cancelled
             if failure is not None:
                 cleanup_failures.append(failure)
@@ -2239,6 +2133,11 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
                 "Durable Stop startup cleanup also failed: "
                 f"{type(failure).__name__}: {failure}"
             )
+        terminal = execution_finite_error(error, *cleanup_failures, *withdrawals)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
+        if not isinstance(error, (Exception, asyncio.CancelledError)):
+            raise
         if cleanup_cancelled:
             cancellation = (
                 error
@@ -2266,9 +2165,10 @@ async def _shutdown_stop_receipts(app: FastAPI) -> None:
     # Keep this primitive safe for focused tests and recovery callers that do
     # not drive the full ordered server teardown.
     registry = getattr(app.state, "distributed_invocation_registry", None)
-    app.state.distributed_invocation_registry = None
     if registry is not None:
         await registry.close()
+        if getattr(app.state, "distributed_invocation_registry", None) is registry:
+            app.state.distributed_invocation_registry = None
     db = getattr(app.state, "stop_receipt_db", None)
     # Teardown retires a failed startup too. Left behind, its error would make
     # an app reused without its lifespan answer 503 for a failure that belongs
@@ -2276,18 +2176,20 @@ async def _shutdown_stop_receipts(app: FastAPI) -> None:
     app.state.stop_receipt_store_error = ""
     app.state.stop_receipt_store = None
     app.state.peer_stop_circuit = None
-    app.state.stop_receipt_db = None
     if db is not None:
         await db.close()
+        if getattr(app.state, "stop_receipt_db", None) is db:
+            app.state.stop_receipt_db = None
 
 
 async def _shutdown_distributed_invocations(app: FastAPI) -> None:
     """Retire this process's ownership rows after agents finish cleanup."""
 
     registry = getattr(app.state, "distributed_invocation_registry", None)
-    app.state.distributed_invocation_registry = None
     if registry is not None:
         await registry.close()
+        if getattr(app.state, "distributed_invocation_registry", None) is registry:
+            app.state.distributed_invocation_registry = None
 
 
 async def _shutdown_stop_cleanup(app: FastAPI) -> None:
@@ -2300,13 +2202,12 @@ async def _shutdown_stop_cleanup(app: FastAPI) -> None:
         return
     if not isinstance(registry, StopCleanupRegistry):
         raise TypeError("app Stop cleanup registry has an invalid type")
-    try:
-        await registry.drain()
-    finally:
+    await registry.drain()
+    if getattr(app.state, "stop_cleanup_registry", None) is registry:
         app.state.stop_cleanup_registry = None
 
 
-async def _shutdown_phoenix(app: FastAPI) -> bool:
+async def _shutdown_phoenix(app: FastAPI, *, withdrawals=None, finite_errors=None) -> bool:
     """Release all server-owned Phoenix work before lifespan teardown returns.
 
     The supervisor task and its proxy client are server-owned resources.  A
@@ -2316,25 +2217,36 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
     re-raise cancellation only after this teardown is complete.
     """
     cancelled = False
+    failures = []
+    withdrawals = [] if withdrawals is None else withdrawals
+    join_originals = [] if finite_errors is None else finite_errors
+
+    async def observe_original(task, label):
+        nonlocal cancelled
+        try:
+            join_cancelled, failure = await await_lifecycle_task_completion(
+                task, withdrawals=withdrawals,
+            )
+        except BaseException as error:
+            join_cancelled, failure = False, error
+        cancelled = cancelled or join_cancelled
+        if failure is not None:
+            join_originals.append(failure)
+            if (is_execution_control_error(failure)
+                    or not isinstance(failure, (Exception, asyncio.CancelledError))):
+                failures.append(failure)
+            if not isinstance(failure, asyncio.CancelledError):
+                logger.warning(
+                    "Phoenix %s failed during shutdown: %s", label, failure,
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                )
 
     phoenix_task = getattr(app.state, "phoenix_task", None)
     if phoenix_task is not None:
         if not phoenix_task.done():
             phoenix_task.cancel()
-        try:
-            join_cancelled, failure = await await_lifecycle_task_completion(
-                phoenix_task
-            )
-            cancelled = cancelled or join_cancelled
-            if failure is not None and not isinstance(
-                failure, asyncio.CancelledError
-            ):
-                logger.warning(
-                    "Phoenix supervision task failed during shutdown: %s",
-                    failure,
-                    exc_info=(type(failure), failure, failure.__traceback__),
-                )
-        finally:
+        await observe_original(phoenix_task, "supervision task")
+        if phoenix_task.done():
             app.state.phoenix_task = None
 
     # ``phoenix_task`` can finish immediately when it is cancelled while its
@@ -2344,52 +2256,103 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
     # after teardown has returned.
     phoenix_start_task = getattr(app.state, "phoenix_start_task", None)
     if phoenix_start_task is not None:
-        try:
-            join_cancelled, failure = await await_lifecycle_task_completion(
-                phoenix_start_task
-            )
-            cancelled = cancelled or join_cancelled
-            if failure is not None and not isinstance(
-                failure, asyncio.CancelledError
-            ):
-                logger.warning(
-                    "Phoenix startup worker failed during shutdown: %s",
-                    failure,
-                    exc_info=(type(failure), failure, failure.__traceback__),
-                )
-        finally:
-            if getattr(app.state, "phoenix_start_task", None) is phoenix_start_task:
-                app.state.phoenix_start_task = None
+        await observe_original(phoenix_start_task, "startup worker")
+        if phoenix_start_task.done() and getattr(app.state, "phoenix_start_task", None) is phoenix_start_task:
+            app.state.phoenix_start_task = None
 
     phoenix = getattr(app.state, "phoenix", None)
     if phoenix is None:
+        terminal = execution_observation_error(*failures, *join_originals, *withdrawals) if failures else None
+        if terminal is not None:
+            raise terminal
         return cancelled
 
+    from kestrel_sovereign._async_ownership import (
+        OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
+        owned_task_error,
+    )
+    from kestrel_sovereign.execution_custody import execution_native_source_error
+
+    close_task = getattr(app.state, "phoenix_proxy_close_task", None)
+    close_failure = getattr(app.state, "phoenix_proxy_close_error", None)
+    resource = getattr(app.state, "phoenix_proxy_close_resource", None)
+    previous_supervisor = getattr(app.state, "phoenix_proxy_close_supervisor", None)
+    stop_failure = None
     try:
-        close_task = asyncio.create_task(phoenix.aclose())
-        close_cancelled, close_failure = await await_lifecycle_task_completion(
-            close_task
-        )
-        cancelled = cancelled or close_cancelled
-        if close_failure is not None:
-            logger.warning(
-                "Error closing Phoenix proxy client: %s",
-                close_failure,
-                exc_info=(
-                    type(close_failure),
-                    close_failure,
-                    close_failure.__traceback__,
-                ),
+        if (close_task is not None or close_failure is not None) and previous_supervisor is not phoenix:
+            mismatch = _unstarted_lifespan_phase_error(
+                RuntimeError("previous Phoenix supervisor must retire before replacement"),
+                tuple(original for original in (previous_supervisor or resource, phoenix) if original is not None),
             )
-    except Exception as exc:  # noqa: BLE001 - stop still must reap the child
-        logger.warning("Error closing Phoenix proxy client: %s", exc)
+            close_failure = execution_finite_error(
+                close_failure, mismatch, retain_originals=True, isolate_control_originals=True,
+            )
+            raise close_failure
+        if close_task is None and close_failure is None:
+            app.state.phoenix_proxy_close_supervisor = phoenix
+            resource = getattr(phoenix, "_client", None)
+            if resource is None:
+                resource = phoenix
+            app.state.phoenix_proxy_close_resource = resource
+            admission = OwnedTaskAdmission()
+            try:
+                close_task = create_owned_task(
+                    phoenix.aclose(), name="server_phoenix:original_proxy_close",
+                    retain_originals=True, retirement_resource=resource,
+                    admission=admission,
+                )
+                app.state.phoenix_proxy_close_task = close_task
+            except BaseException as error:
+                close_task = admission.task
+                app.state.phoenix_proxy_close_task = close_task
+                close_failure = owned_task_admission_error(resource, admission, error)
+        if close_task is not None:
+            outcome = await await_owned_task(close_task)
+            cancelled = cancelled or outcome.cancellation is not None
+            if outcome.cancellation is not None:
+                withdrawals.append(outcome.cancellation)
+            if outcome.error is not None:
+                failures.append(outcome.error)
+            physical = owned_task_error(close_task)
+            close_failure = execution_finite_error(
+                close_failure, execution_native_source_error(physical) or physical,
+                retain_originals=True,
+                isolate_control_originals=True,
+            )
+        if close_failure is not None:
+            from kestrel_sovereign.execution_custody import execution_cleanup_debts
+            if not any(value is resource and owner is close_task
+                       for value, owner in execution_cleanup_debts(close_failure)):
+                debt = RuntimeError("original Phoenix proxy retirement failed")
+                debt.__cause__ = execution_native_source_error(close_failure) or close_failure
+                debt._kestrel_native_retirement_debts = ((resource, close_task),)
+                close_failure = execution_finite_error(
+                    close_failure, debt, retain_originals=True, isolate_control_originals=True,
+                )
+            app.state.phoenix_proxy_close_error = close_failure
+            failures.append(close_failure)
     finally:
         try:
             phoenix.stop()
-        except Exception as exc:  # noqa: BLE001 - complete state teardown
-            logger.warning("Error stopping Phoenix: %s", exc)
-        app.state.phoenix = None
+        except BaseException as error:
+            # stop() runs synchronously in this ORIGINAL owner, so this Task
+            # (not an unaccepted replacement) witnessed the failed retirement.
+            debt = RuntimeError("original Phoenix process stop failed")
+            debt.__cause__ = execution_native_source_error(error) or error
+            debt._kestrel_native_retirement_debts = ((phoenix, asyncio.current_task()),)
+            stop_failure = execution_finite_error(
+                error, debt, retain_originals=True, isolate_control_originals=True,
+            )
+            failures.append(stop_failure)
+        if close_failure is None and stop_failure is None:
+            app.state.phoenix = None
+            app.state.phoenix_proxy_close_task = None
+            app.state.phoenix_proxy_close_resource = None
+            app.state.phoenix_proxy_close_supervisor = None
 
+    terminal = execution_observation_error(*failures, *join_originals, *withdrawals) if failures else None
+    if terminal is not None:
+        raise terminal
     return cancelled
 
 
@@ -2399,26 +2362,34 @@ async def _shutdown_host_features(app: FastAPI) -> None:
 
     host_features = getattr(app.state, "host_features", []) or []
     host_context = getattr(app.state, "host_context", None)
+    failures = []
     try:
         if host_features and host_context is not None:
             await _hf.stop_host_features(host_features, host_context)
-    except Exception as exc:  # noqa: BLE001 - preserve the existing best effort
+    except BaseException as exc:
         logger.warning("Host feature shutdown failed: %s", exc)
-    finally:
-        # Router/UI state must not outlive a failed feature shutdown. Each
-        # following cleanup is in a ``finally`` so one bad unmount cannot leave
-        # the host context's independently-owned resources live.
+        if not isinstance(exc, Exception) or is_execution_control_error(exc):
+            failures.append(exc)
+    # Do not let either the stop catch or a later independent unmount/context
+    # close replace the original native receipt. Each original cleanup still
+    # runs, and its own failure is propagated only after the entire drain.
+    for unmount in (_hf.unmount_host_features, _unmount_feature_routers, _unmount_feature_ui_assets):
         try:
-            _hf.unmount_host_features(app)
-        finally:
-            try:
-                _unmount_feature_routers(app)
-            finally:
-                try:
-                    _unmount_feature_ui_assets(app)
-                finally:
-                    if host_context is not None:
-                        await _hf.close_host_context(host_context)
+            unmount(app)
+        except BaseException as exc:
+            failures.append(exc)
+    if host_context is not None:
+        try:
+            await _hf.close_host_context(host_context)
+        except BaseException as exc:
+            failures.append(exc)
+    failure = execution_observation_error(*failures)
+    if failure is not None:
+        raise failure
+    if getattr(app.state, "host_context", None) is host_context:
+        app.state.host_context = None
+    if getattr(app.state, "host_features", None) is host_features:
+        app.state.host_features = []
 
 
 _SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV = (
@@ -2485,11 +2456,9 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
     try:
         await backend.connect()
     except BaseException as startup_failure:
-        cleanup = asyncio.create_task(
-            backend.close(), name="shared_agent_postgres_startup_cleanup"
-        )
-        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
-            cleanup
+        cleanup_cancelled, cleanup_failure, _, cleanup_withdrawal = await _run_lifespan_shutdown_phase(
+            "shared_agent_postgres_startup_cleanup", backend.close,
+            resources=(backend,),
         )
         if cleanup_failure is None:
             app.state.shared_agent_postgres_backend = None
@@ -2498,6 +2467,10 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
                 "Shared PostgreSQL startup cleanup also failed: "
                 f"{type(cleanup_failure).__name__}"
             )
+        terminal = execution_finite_error(startup_failure, cleanup_failure, cleanup_withdrawal,
+                                           retain_originals=True, isolate_control_originals=True)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
         if cleanup_cancelled and not isinstance(
             startup_failure, asyncio.CancelledError
         ):
@@ -2515,6 +2488,8 @@ async def _shutdown_shared_agent_postgres_backend(app: FastAPI) -> None:
     if (
         getattr(app.state, "agent_manager", None) is not None
         or getattr(app.state, "startup_cleanup_agent_manager", None) is not None
+        or getattr(app.state, "startup_cleanup_agent", None) is not None
+        or getattr(app.state, "unpublished_llm_owners", None)
     ):
         raise RuntimeError(
             "refusing to close shared PostgreSQL pools while an agent manager "
@@ -2620,12 +2595,14 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
         # A transient bootstrap pool is invisible to ordinary server teardown,
         # so this helper remains its cancellation-safe lifecycle owner until it
         # is terminal.  Do not allow a repeated cancellation to strand it.
-        close_task = asyncio.create_task(
-            storage.close(), name="host_scheduler_protocol_preflight_close"
+        close_cancelled, close_failure, _, close_withdrawal = await _run_lifespan_shutdown_phase(
+            "host_scheduler_protocol_preflight_close", storage.close,
+            resources=(storage,),
         )
-        close_cancelled, close_failure = await await_lifecycle_task_completion(
-            close_task
-        )
+        terminal = execution_finite_error(preflight_failure, close_failure, close_withdrawal,
+                                           retain_originals=True, isolate_control_originals=True)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
         if close_failure is not None:
             if not isinstance(close_failure, asyncio.CancelledError):
                 logger.warning(
@@ -2793,12 +2770,9 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
         if callable(configure_registration):
             configure_registration(_register_runtime_scheduler_tenant)
     except BaseException as startup_failure:
-        cleanup = asyncio.create_task(
-            _shutdown_host_scheduler(app),
-            name="host_scheduler_startup_cleanup",
-        )
-        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
-            cleanup
+        cleanup_cancelled, cleanup_failure, _, cleanup_withdrawal = await _run_lifespan_shutdown_phase(
+            "host_scheduler_startup_cleanup", lambda: _shutdown_host_scheduler(app),
+            resources=tuple(owner for owner in (storage, runner) if owner is not None),
         )
         if cleanup_failure is not None and not isinstance(
             cleanup_failure, asyncio.CancelledError
@@ -2813,6 +2787,10 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
                     cleanup_failure.__traceback__,
                 ),
             )
+        terminal = execution_finite_error(startup_failure, cleanup_failure, cleanup_withdrawal,
+                                           retain_originals=True, isolate_control_originals=True)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
         if cleanup_cancelled and not isinstance(
             startup_failure, asyncio.CancelledError
         ):
@@ -2830,22 +2808,35 @@ async def _shutdown_host_scheduler(app: FastAPI) -> None:
     runner = getattr(app.state, "host_scheduler_runner", None)
     storage = getattr(app.state, "host_scheduler_storage", None)
     manager = getattr(app.state, "agent_manager", None)
+    failures = []
     if manager is not None:
         configure_registration = getattr(
             manager, "set_scheduler_tenant_registration_hook", None
         )
         if callable(configure_registration):
-            configure_registration(None)
-    try:
-        if runner is not None:
-            await runner.stop()
-    finally:
+            try:
+                configure_registration(None)
+            except BaseException as error:
+                failures.append(error)
+    # The runner's stop owns physical joins. Attempt storage retirement too,
+    # but neither a later close failure nor state cleanup may erase its exact
+    # native receipt or a failed original owner's strong application reference.
+    for attribute, resource, method in (
+        ("host_scheduler_runner", runner, "stop"),
+        ("host_scheduler_storage", storage, "close"),
+    ):
+        if resource is None:
+            continue
         try:
-            if storage is not None:
-                await storage.close()
-        finally:
-            app.state.host_scheduler_runner = None
-            app.state.host_scheduler_storage = None
+            await getattr(resource, method)()
+        except BaseException as error:
+            failures.append(error)
+        else:
+            if getattr(app.state, attribute, None) is resource:
+                setattr(app.state, attribute, None)
+    terminal = execution_observation_error(*failures)
+    if terminal is not None:
+        raise terminal
 
 
 async def _shutdown_server_agents(app: FastAPI) -> None:
@@ -2856,8 +2847,9 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
     for candidate in (manager, cleanup_manager):
         if candidate is not None and all(candidate is not known for known in managers):
             managers.append(candidate)
-    if managers:
-        for owned_manager in managers:
+    failures = []
+    for owned_manager in managers:
+        try:
             await owned_manager.shutdown_all()
             if getattr(app.state, "agent_manager", None) is owned_manager:
                 app.state.agent_manager = None
@@ -2866,19 +2858,34 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
                 is owned_manager
             ):
                 app.state.startup_cleanup_agent_manager = None
+        except BaseException as error:
+            failures.append(error)
+    if managers and not failures:
         logger.info("All agents shutdown complete.")
-        return
-
-    agent = getattr(app.state, "agent", None)
-    if agent is not None:
-        await _shutdown_single_agent(agent)
+    owned_agents = []
+    for attribute in ("agent", "startup_cleanup_agent"):
+        agent = getattr(app.state, attribute, None)
+        if agent is not None and all(agent is not known for known in owned_agents):
+            owned_agents.append(agent)
+            try:
+                completed = await _shutdown_single_agent(agent, finite_errors=failures)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                if completed and getattr(app.state, attribute, None) is agent:
+                    setattr(app.state, attribute, None)
+    terminal = execution_observation_error(*failures)
+    if terminal is not None:
+        raise terminal
 
 
 def _split_lifecycle_cancellation(
     failure: BaseException | None,
 ) -> tuple[bool, BaseException | None]:
     """Separate cancellation leaves while preserving every ordinary failure."""
-
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    if failure is not None and is_execution_control_error(failure):
+        return False, failure
     if isinstance(failure, asyncio.CancelledError):
         return True, None
     if isinstance(failure, BaseExceptionGroup):
@@ -2887,7 +2894,9 @@ def _split_lifecycle_cancellation(
     return False, failure
 
 
-async def _rollback_startup_agent_manager(manager) -> bool:
+async def _rollback_startup_agent_manager(
+    manager, *, original_failure: BaseException | None = None,
+) -> bool:
     """Drain a partially-started multi-agent manager before dropping it.
 
     Host scheduler startup happens after agents have been loaded.  Its failure
@@ -2895,12 +2904,20 @@ async def _rollback_startup_agent_manager(manager) -> bool:
     own dispatchers or storage.  Keep the cleanup task alive through repeated
     cancellation and return whether the startup caller was cancelled.
     """
-    rollback = asyncio.create_task(
-        manager.shutdown_all(), name="server_startup:rollback_agents"
+    cancelled, failure, _, withdrawal = await _run_lifespan_shutdown_phase(
+        "server_startup:rollback_agents", manager.shutdown_all,
+        resources=(manager,),
     )
-    cancelled, failure = await await_lifecycle_task_completion(rollback)
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
+    terminal = execution_finite_error(
+        original_failure, failure, withdrawal, retain_originals=True,
+        prefer_cancellation=True, isolate_control_originals=True,
+    )
+    if terminal is not None and (is_execution_control_error(terminal) or (
+        original_failure is not None and withdrawal is not None
+    )):
+        raise terminal
     if failure is not None:
         logger.warning(
             "Multi-agent startup rollback did not fully shut down loaded agents: %s",
@@ -2918,18 +2935,50 @@ async def _rollback_startup_agent_manager(manager) -> bool:
 async def _run_lifespan_shutdown_phase(
     name: str,
     operation,
-) -> tuple[bool, BaseException | None, object | None]:
-    """Own one teardown phase through repeated cancellation.
+    *,
+    resources=(),
+) -> tuple[bool, BaseException | None, object | None, BaseException | None]:
+    """Own one teardown phase, including partial startup, through cancellation.
 
     Each phase receives a distinct task.  A cancellation of the lifespan task
     therefore records cancellation but cannot stop the next independently
-    owned phase from releasing its resources.
+    owned phase from releasing its resources. Startup epilogues use this same
+    admission boundary: a refused cleanup retains its actual original resource
+    and closes the unstarted coroutine, never reporting successful retirement.
     """
-    phase_task = asyncio.create_task(operation(), name=f"server_shutdown:{name}")
-    cancelled, failure = await await_lifecycle_task_completion(phase_task)
-    task_had_failure = failure is not None
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
+
+    phase_task = None
+    admission = OwnedTaskAdmission()
+    withdrawal = None
+    task_had_failure = True
+    try:
+        phase_task = create_owned_task(
+            operation(), name=f"server_shutdown:{name}", retain_originals=True,
+            admission=admission,
+        )
+    except BaseException as error:
+        # The receipt gate prevents entry, but acceptance is not absence.
+        # Join that actual accepted Task before independent phases proceed.
+        phase_task = admission.task
+        outcome = await await_owned_task(phase_task) if phase_task is not None else None
+        withdrawal = outcome.cancellation if outcome is not None else None
+        cancelled = withdrawal is not None
+        failure = _unstarted_lifespan_phase_error(error, resources, owner=phase_task)
+        failure = execution_finite_error(failure, outcome.error if outcome is not None else None, withdrawal,
+                                         retain_originals=True, isolate_control_originals=True)
+    else:
+        caller = asyncio.current_task()
+        cancelled = bool(caller is not None and caller.cancelling())
+        outcome = await await_owned_task(phase_task)
+        cancelled = cancelled or outcome.cancellation is not None
+        failure, withdrawal = outcome.error, outcome.cancellation
+        task_had_failure = owned_task_error(phase_task) is not None
+    original_phase_failure = failure
     failure_cancelled, failure = _split_lifecycle_cancellation(failure)
     cancelled = cancelled or failure_cancelled
+    if failure_cancelled:
+        withdrawal = execution_observation_error(withdrawal, original_phase_failure)
     if failure is not None:
         logger.warning(
             "Server shutdown phase %r failed: %s",
@@ -2938,23 +2987,109 @@ async def _run_lifespan_shutdown_phase(
             exc_info=(type(failure), failure, failure.__traceback__),
         )
     result = None
-    if not task_had_failure:
+    if not task_had_failure and phase_task is not None:
         result = phase_task.result()
-    return cancelled, failure, result
+    # Preserve the actual original withdrawal separately from physical child
+    # success. A caller's native body receipt may only be known one level out.
+    return cancelled, failure, result, withdrawal
 
 
-async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException | None]:
+def _unstarted_lifespan_phase_error(error: BaseException, resources, *, owner=None) -> BaseException:
+    """Retain original resources whose phase could not safely enter."""
+    if not resources:
+        return error
+    debt = RuntimeError("original server phase admission did not retire its resources")
+    debt.__cause__ = error
+    debt._kestrel_native_retirement_debts = tuple((resource, owner) for resource in resources)
+    return debt
+
+
+def _lifespan_shutdown_phase_resources(app: FastAPI, name: str | None = None) -> tuple:
+    """Snapshot original owners immediately before a phase's Task admission.
+
+    A refused coordinator has not entered any closer. These strong references
+    describe unstarted retirement, not physical ACKs. Existing app ownership
+    remains untouched, so recovery can still reach those original resources.
+    """
+    attributes = {
+        "host-scheduler": ("host_scheduler_runner", "host_scheduler_storage"),
+        "stop-cleanup": ("stop_cleanup_registry",),
+        "unpublished-providers": (),
+        "agents": ("agent_manager", "startup_cleanup_agent_manager", "agent", "startup_cleanup_agent"),
+        "host-features": (),
+        "distributed-stop-invocations": ("distributed_invocation_registry",),
+        "stop-receipts": ("distributed_invocation_registry", "stop_receipt_db"),
+        "shared-agent-postgres": ("shared_agent_postgres_backend",),
+        "phoenix": ("phoenix", "phoenix_task", "phoenix_start_task",
+                    "phoenix_proxy_close_task", "phoenix_proxy_close_resource",
+                    "phoenix_proxy_close_supervisor"),
+    }
+    resources = []
+    for phase in attributes if name is None else (name,):
+        resources.extend(getattr(app.state, attribute, None) for attribute in attributes[phase])
+        if phase == "unpublished-providers":
+            resources.extend(owner.provider for owner in (getattr(app.state, "unpublished_llm_owners", {}) or {}).values())
+        elif phase == "host-features":
+            resources.extend(getattr(app.state, "host_features", ()) or ())
+            context = getattr(app.state, "host_context", None)
+            if context is not None:
+                resources.extend(getattr(context, attribute, None) for attribute in (
+                    "session_factory", "hold_evidence_db", "hold_db", "db",
+                ))
+    original = []
+    for resource in resources:
+        if resource is not None and all(resource is not known for known in original):
+            original.append(resource)
+    return tuple(original)
+
+
+def _require_retired_server_resources(app: FastAPI) -> None:
+    """Reject a new lifespan BEFORE any old ownership field can be reset."""
+    previous = execution_finite_error(
+        getattr(app.state, "_lifespan_teardown_error", None),
+        getattr(app.state, "phoenix_proxy_close_error", None), retain_originals=True,
+    )
+    if _lifespan_shutdown_phase_resources(app) or previous is not None:
+        raise RuntimeError(
+            "previous server lifecycle resources must retire before restart"
+        ) from previous
+
+
+async def _shutdown_server_resources(
+    app: FastAPI, *, original_failure: BaseException | None = None,
+) -> tuple[bool, BaseException | None]:
     """Drain every server-owned teardown phase before reporting an outcome."""
+    from kestrel_sovereign.execution_custody import execution_finite_error
     logger.info("Server shutting down...")
     cancelled = False
     first_failure: BaseException | None = None
+    failures = []
+    failed_phases = set()
+    # Continue INDEPENDENT drains, not consumers' still-live dependencies.
+    # In particular an unretired scheduler can still wake agents, and agents
+    # still require their Hold context and Stop evidence until they retire.
+    prerequisites = {
+        "host-scheduler": (),
+        "stop-cleanup": ("host-scheduler",),
+        "unpublished-providers": ("host-scheduler",),
+        "agents": ("host-scheduler", "stop-cleanup"),
+        "host-features": ("host-scheduler", "agents"),
+        "distributed-stop-invocations": ("host-scheduler", "stop-cleanup", "agents"),
+        "stop-receipts": ("host-scheduler", "stop-cleanup", "agents", "distributed-stop-invocations"),
+        "shared-agent-postgres": ("host-scheduler", "stop-cleanup", "agents", "unpublished-providers"),
+        "phoenix": (),
+    }
 
+    withdrawals, finite_originals = [], []
     for name, operation in (
         ("host-scheduler", lambda: _shutdown_host_scheduler(app)),
         # The scheduler is now drained, so no cold wake can remount host
         # surfaces while teardown proceeds. Finish application-owned Stop
         # tails before their agent instances are released.
         ("stop-cleanup", lambda: _shutdown_stop_cleanup(app)),
+        ("unpublished-providers", lambda: drain_unpublished_llm_owners(
+            getattr(app.state, "unpublished_llm_owners", {}),
+        )),
         ("agents", lambda: _shutdown_server_agents(app)),
         # HostContext owns the fleet Hold store. Agent heartbeats, signals and
         # feature cleanup may still enter the universal turn seam until agent
@@ -2971,23 +3106,43 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
             "shared-agent-postgres",
             lambda: _shutdown_shared_agent_postgres_backend(app),
         ),
-        ("phoenix", lambda: _shutdown_phoenix(app)),
+        ("phoenix", lambda: _shutdown_phoenix(app, withdrawals=withdrawals, finite_errors=finite_originals)),
     ):
-        phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
-            name, operation
-        )
+        resources = _lifespan_shutdown_phase_resources(app, name)
+        blocked_by = tuple(prerequisite for prerequisite in prerequisites[name]
+                           if prerequisite in failed_phases)
+        if resources and blocked_by:
+            # Do not create even a coordinator for a dependent close. The
+            # original app references and explicit unstarted debt remain live.
+            failure = _unstarted_lifespan_phase_error(
+                RuntimeError(f"Server shutdown phase {name!r} retains resources: "
+                             f"unretired prerequisites {blocked_by!r}"), resources,
+            )
+            phase_cancelled, result, withdrawal = False, None, None
+        else:
+            phase_cancelled, failure, result, withdrawal = await _run_lifespan_shutdown_phase(
+                name, operation, resources=resources,
+            )
+        if withdrawal is not None:
+            withdrawals.append(withdrawal)
         cancelled = cancelled or phase_cancelled
         if result is True:
             # ``_shutdown_phoenix`` records cancellation that it observed while
             # joining its app-owned work.
             cancelled = True
-        if (
-            failure is not None
-            and not isinstance(failure, asyncio.CancelledError)
-            and first_failure is None
-        ):
-            first_failure = failure
+        if failure is not None:
+            failed_phases.add(name)
+            failures.append(failure)
 
+    if any(is_execution_control_error(error) for error in (original_failure, *failures, *finite_originals)):
+        first_failure = execution_finite_error(
+            original_failure, *failures, *finite_originals, *withdrawals, retain_originals=True,
+            isolate_control_originals=True,
+        )
+    else:
+        first_failure = execution_finite_error(*failures, retain_originals=True,
+                                               isolate_control_originals=True)
+    app.state._lifespan_teardown_error = first_failure
     return cancelled, first_failure
 
 
@@ -3001,7 +3156,12 @@ async def _lifespan_teardown_owner(app: FastAPI):
         body_failure = exc
         raise
     finally:
-        cancelled, teardown_failure = await _shutdown_server_resources(app)
+        cancelled, teardown_failure = await _shutdown_server_resources(app, original_failure=body_failure)
+        from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
+        terminal = execution_finite_error(body_failure, teardown_failure, retain_originals=True,
+                                           isolate_control_originals=True)
+        if terminal is not None and is_execution_control_error(terminal):
+            raise terminal
         # Preserve the original failure from startup/request lifespan body.  On
         # a normal exit, however, cleanup must make a terminal agent failure
         # visible only after Phoenix and every other phase have been drained.
@@ -3032,6 +3192,10 @@ async def _build_host_control_context(app: FastAPI, host_config) -> object:
 @asynccontextmanager
 async def _lifespan_startup(app: FastAPI):
     """Initialize server resources; outer lifespan ownership handles teardown."""
+    _require_retired_server_resources(app)
+    if (getattr(app.state, "unpublished_llm_owners", None)
+            or getattr(app.state, "startup_cleanup_agent", None)):
+        raise RuntimeError("unpublished provider/agent cleanup must retire before server restart")
     logger.info("Server starting up...")
     _set_startup_error(app, None)
     app.state.mandatory_feature_failures = []
@@ -3041,6 +3205,7 @@ async def _lifespan_startup(app: FastAPI):
     # On a failed rollback this private owner remains reachable only to
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
+    app.state.startup_cleanup_agent = None
     app.state.host_features = []
     app.state.host_context = None
     app.state.host_ui_manifest = []
@@ -3185,6 +3350,7 @@ async def _lifespan_startup(app: FastAPI):
             _apply_platform_host_port(config, os.environ)
             manager = AgentManager(
                 base_data_dir=multi_agent_runtime_base,
+                execution_custody_factory=_standalone_runtime_execution_custody,
                 startup_config_path=(
                     multi_agent_path if multi_agent_path.exists() else None
                 ),
@@ -3544,19 +3710,34 @@ async def _lifespan_startup(app: FastAPI):
             # runner only in that topology; SQLite installations retain the
             # longstanding agent-scoped runner and never share schedule rows.
             await _start_host_scheduler(app, manager, config)
-        except Exception as e:
+        except BaseException as e:
             rollback_cancelled = False
             rollback_complete = manager is None
+            rollback_failure = None
             if manager is not None:
-                rollback_cancelled = await _rollback_startup_agent_manager(manager)
+                try:
+                    rollback_cancelled = await _rollback_startup_agent_manager(manager, original_failure=e)
+                except BaseException as error:
+                    rollback_failure = error
                 rollback_complete = not manager.list_agents()
-                if not rollback_complete:
-                    # Preserve the manager for the outer lifespan teardown to
-                    # retry, but never leave it on the public routing surface:
-                    # a startup error dominates readiness and these agents may
-                    # still be draining their own cleanup.
-                    app.state.startup_cleanup_agent_manager = manager
-                    app.state.agent_manager = None
+            terminal = execution_finite_error(
+                e, rollback_failure, retain_originals=True,
+                isolate_control_originals=True,
+            )
+            if manager is not None and (not rollback_complete or (
+                terminal is not None and is_execution_control_error(terminal)
+            )):
+                # Keep the actual manager for outer teardown, never public
+                # routing. Compose once without mutating the original startup
+                # receipt or dropping the original rollback-admission failure.
+                app.state.startup_cleanup_agent_manager = manager
+                app.state.agent_manager = None
+            if terminal is not None and is_execution_control_error(terminal):
+                raise terminal
+            if not isinstance(e, Exception):
+                raise
+            if rollback_failure is not None:
+                raise rollback_failure
             identity_record = _identity_readiness_failure_record("default", e)
             if identity_record is not None:
                 logger.error(
@@ -3582,6 +3763,9 @@ async def _lifespan_startup(app: FastAPI):
         # --- Single-agent mode (original behavior) ---
         app.state.agent_manager = None
         llm_service = None
+        execution_custody = None
+        constructed_agent = None
+        captured = ()
         try:
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
@@ -3605,7 +3789,17 @@ async def _lifespan_startup(app: FastAPI):
             verify_identity_isolation(agent_did)
             host_context = await _build_host_control_context(app, None)
 
-            llm_service = LLMService()
+            execution_custody = _standalone_runtime_execution_custody(
+                "default", agent_did, None,
+            )
+            from kestrel_sovereign.execution_custody import bind_execution_custody_snapshot
+
+            captured = () if execution_custody is None else (execution_custody,)
+            # Single-agent mode owns the same original process lifetime as
+            # AgentManager. Validate it and ambient admission before clients
+            # can be constructed; the agent retains this exact object.
+            with bind_execution_custody_snapshot(captured):
+                llm_service = LLMService()
             if db_backend.lower() == "postgres" and database_url:
                 app.state.agent = KestrelAgent(
                     did=agent_did,
@@ -3613,6 +3807,7 @@ async def _lifespan_startup(app: FastAPI):
                     llm_service=llm_service,
                     database_url=database_url,
                     db_backend="postgres",
+                    execution_custody=execution_custody,
                 )
             else:
                 app.state.agent = KestrelAgent(
@@ -3621,6 +3816,8 @@ async def _lifespan_startup(app: FastAPI):
                     llm_service=llm_service,
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
+
+            constructed_agent = app.state.agent
 
             app.state.agent._hold_store = host_context.hold_store
 
@@ -3637,8 +3834,42 @@ async def _lifespan_startup(app: FastAPI):
             # the multi-agent AgentManager path above — gets the same check.
             await app.state.agent.initialize()
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
-        except Exception as e:
+        except BaseException as e:
+            from kestrel_sovereign.execution_custody import retire_process_runtime_custody
+
+            # Failed birth must deny surviving provider children BEFORE the
+            # first cleanup await, including cancellation during initialize.
+            retire_process_runtime_custody(execution_custody)
+            if constructed_agent is not None:
+                # Initialization owns more than its provider: rollback may
+                # retain cognition, storage, or a joinable native continuation.
+                # Withdraw routing but keep the actual Agent for host teardown.
+                app.state.startup_cleanup_agent = constructed_agent
+                if is_execution_control_error(e):
+                    constructed_agent._remember_shutdown_control(e)
             app.state.agent = None
+            cleanup_cancelled = False
+            if llm_service is not None and constructed_agent is None:
+                owners = getattr(app.state, "unpublished_llm_owners", None)
+                if owners is None:
+                    owners = app.state.unpublished_llm_owners = {}
+                close_error = None
+                try:
+                    await retire_unpublished_llm(owners, "default", llm_service, captured)
+                except BaseException as error:
+                    close_error = error
+                if close_error is not None:
+                    terminal = execution_finite_error(e, close_error)
+                    if terminal is not None and is_execution_control_error(terminal):
+                        raise terminal
+                    if isinstance(close_error, asyncio.CancelledError):
+                        cleanup_cancelled = True
+                    logger.warning(
+                        "Could not close LLM service after failed single-agent startup (cause_type=%s)",
+                        type(close_error).__name__,
+                    )
+            if not isinstance(e, Exception):
+                raise
             mandatory_record = _mandatory_feature_failure_record("default", e)
             identity_record = _identity_readiness_failure_record("default", e)
             if identity_record is not None:
@@ -3649,20 +3880,13 @@ async def _lifespan_startup(app: FastAPI):
                     identity_record["cause_type"],
                 )
                 app.state.identity_readiness_failures = [identity_record]
-                if llm_service is not None:
-                    try:
-                        await llm_service.close()
-                    except Exception as close_error:  # noqa: BLE001
-                        logger.warning(
-                            "Could not close LLM service after blocked identity "
-                            "startup (cause_type=%s)",
-                            type(close_error).__name__,
-                        )
             else:
                 logger.error(f"Error during startup: {e}", exc_info=True)
             if mandatory_record is not None:
                 app.state.mandatory_feature_failures = [mandatory_record]
             _set_startup_error(app, e)
+            if cleanup_cancelled:
+                raise asyncio.CancelledError()
 
     # Per-feature static asset mounts (#2043). Done BEFORE router mounting so the
     # feature routers stay the trailing block _unmount_feature_routers deletes.
@@ -3784,16 +4008,31 @@ async def _lifespan_startup(app: FastAPI):
             app.state.host_context = ctx
             logger.info("Host features initialized: 0")
     except BaseException as exc:  # noqa: BLE001 - close unpublished context
-        fatal = isinstance(
+        from kestrel_sovereign.host_features.context import (
+            _retained_host_cleanup_error,
+        )
+
+        # Terminal selection may preserve an ordinary opening error ahead of
+        # unsafe declarative rollback. Consult the SAME retained inventory,
+        # not only that error's type, before publishing host policy/readiness.
+        retained_cleanup = (
+            None
+            if candidate_ctx is None
+            else _retained_host_cleanup_error(candidate_ctx)
+        )
+        failures = [exc] if retained_cleanup is None else [exc, retained_cleanup]
+        fatal = retained_cleanup is not None or isinstance(
             exc,
             (ContributionContractError, FeatureContributionRuntimeError),
-        ) or not isinstance(exc, Exception)
+        ) or not isinstance(exc, Exception) or is_execution_control_error(exc)
         if not fatal:
             logger.warning("Host feature initialization failed: %s", exc)
         try:
             if candidate_ctx is not None and candidate_started:
                 await _hf.stop_host_features(candidate_started, candidate_ctx)
-        finally:
+        except BaseException as cleanup_error:
+            failures.append(cleanup_error)
+        try:
             # A future replacement context might still fail before publication;
             # close only that unpublished candidate. The boot Hold context is
             # published before agents start and remains teardown-owned even when
@@ -3807,10 +4046,12 @@ async def _lifespan_startup(app: FastAPI):
                 )
 
                 await close_host_context_resources(candidate_ctx)
-        if fatal:
+        except BaseException as cleanup_error:
+            failures.append(cleanup_error)
+        if fatal or len(failures) > 1:
             # Complete prospective-set rejection is a startup failure, not an
             # optional-feature warning. Prior valid state remains visible.
-            raise
+            raise execution_finite_error(*failures, retain_originals=True)
 
     # No cognition turn may cross startup with the agent-only clause view.
     # This includes overdue standalone schedules armed from on_agent_ready and
@@ -3863,6 +4104,9 @@ async def _complete_deferred_agent_readiness(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup and cancellation-safe teardown for the server."""
+    # Rejected entry must not install another teardown owner over resources
+    # still owned by a previous lifecycle. Recovery drains them explicitly.
+    _require_retired_server_resources(app)
     async with _lifespan_teardown_owner(app):
         async with _lifespan_startup(app):
             yield
@@ -4965,6 +5209,27 @@ async def _agent_health_result(agent) -> dict:
     return {"status": overall, "checks": checks}
 
 
+async def _fleet_agent_health_results(agents) -> list:
+    """Join actual probes, retaining control instead of diagnostic text.
+
+    Ordinary probe failures remain per-agent diagnostics. Original control
+    and cancellation must first join accepted sibling probes and then escape.
+    Returning cause-bearing cancellation through asyncio.gather would erase
+    that carrier; canonical original Task ownership preserves it instead.
+    """
+    from kestrel_sovereign._async_ownership import gather_owned
+
+    async def inspect_agent(agent):
+        try:
+            return await _agent_detailed_health(agent)
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            return error
+
+    return await gather_owned(inspect_agent(agent) for agent in agents)
+
+
 def _roll_up_fleet_status(agent_statuses: list) -> str:
     """Three-state rollup over a managed fleet's per-agent statuses (#2698).
 
@@ -5054,7 +5319,9 @@ async def health_detailed(request: Request):
     if agent:
         try:
             result = await _agent_detailed_health(agent)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             if not scheduler_unavailable:
                 raise
             logger.warning(
@@ -5089,13 +5356,8 @@ async def health_detailed(request: Request):
     # total outage while managed agents serve traffic (#2698).
     managed = manager.list_agents() if manager is not None else {}
     if managed:
-        import asyncio
-
         names = list(managed.keys())
-        results = await asyncio.gather(
-            *(_agent_detailed_health(a) for a in managed.values()),
-            return_exceptions=True,
-        )
+        results = await _fleet_agent_health_results(managed.values())
         breakdown: dict = {}
         for name, res in zip(names, results):
             if isinstance(res, BaseException):

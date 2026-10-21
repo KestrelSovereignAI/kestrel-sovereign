@@ -8,7 +8,6 @@ NO mock-returns-mock tests - each test verifies real logic.
 import pytest
 import asyncio
 import contextlib
-import inspect
 import os
 import sys
 import threading
@@ -1504,10 +1503,17 @@ class TestLifecycle:
         # a large interval means the loop parks in its first sleep and is
         # torn down purely by HealthFeature.shutdown()'s cancel path.
         health = HealthFeature(agent)
+        health._agent_id = agent.did
         health._interval_seconds = 3600
         health._running = False
         health._background_task = None
+        # This fixture bypasses normal initialize(). Publish the same READY
+        # barrier before asserting shutdown of a genuinely resident loop.
+        health._health_persist_tasks = set()
+        health._health_persist_control = None
+        agent._runtime_publication_ready.set()
         health._start_background_loop()
+        await asyncio.sleep(0)
         assert health._background_task is not None
         assert not health._background_task.done()
 
@@ -1936,15 +1942,17 @@ class TestLifecycle:
                 await backend.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("continuation_failure", ["none", "cancel", "error"])
     async def test_cancelled_agent_shutdown_continuation_closes_storage_without_retry(
-        self, tmp_path
+        self, tmp_path, continuation_failure
     ):
         """A cancelled outer shutdown leaves one owned completion path.
 
         The caller invokes shutdown exactly once.  Once its bounded wrapper
         times out, the agent's continuation must join dispatcher release and
         close storage itself; no test-only dispatcher/agent retry may mask a
-        leaked SQLite worker.
+        leaked SQLite worker. A withdrawn cleanup observer may be retried, but
+        it must join the same dispatcher owner and close storage only once.
         """
         from kestrel_sovereign.signals import (
             OrderedLockManager,
@@ -1993,10 +2001,29 @@ class TestLifecycle:
         agent._sync_service = None
         agent.storage = _Storage()
 
+        if continuation_failure == "error":
+            original_completion = agent._complete_durable_shutdown_continuation
+            completion_attempts = 0
+
+            async def fail_first_completion(*args):
+                nonlocal completion_attempts
+                completion_attempts += 1
+                if completion_attempts == 1:
+                    # Forward the actual dispatcher join before the declared
+                    # ordinary observer callback fault; no fake native ACK.
+                    await dispatcher.wait_for_durable_shutdown_release()
+                    raise RuntimeError("original cleanup observer callback failed")
+                return await original_completion(*args)
+
+            agent._complete_durable_shutdown_continuation = fail_first_completion
+
+        shutdown = asyncio.create_task(agent.shutdown())
         try:
+            # Enter the actual tail before starting the outer observer clock;
+            # otherwise this tests prefix versus tail timing by accident.
+            await asyncio.wait_for(release_entered.wait(), timeout=3.0)
             with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(agent.shutdown(), timeout=0.05)
-            await asyncio.wait_for(release_entered.wait(), timeout=1.0)
+                await asyncio.wait_for(shutdown, timeout=0.05)
 
             # The outer agent shutdown is gone, but its shielded dispatcher
             # cleanup remains live. Storage must stay untouched until the
@@ -2005,20 +2032,43 @@ class TestLifecycle:
             assert dispatcher._durable_shutdown_completion is not None
             assert not dispatcher._durable_shutdown_completion.done()
             assert agent._durable_shutdown_continuation is not None
+            original_continuation = agent._durable_shutdown_continuation
+            original_withdrawal = agent._shutdown_control
+            assert isinstance(original_withdrawal, asyncio.CancelledError)
+            if continuation_failure == "cancel":
+                original_continuation.cancel("withdraw original cleanup observer")
+                await asyncio.gather(original_continuation, return_exceptions=True)
 
             allow_release.set()
-            await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=1.0)
+            with pytest.raises(asyncio.CancelledError) as observed:
+                await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=3.0)
+            assert observed.value is original_withdrawal
             assert storage_close_attempts == ["closed"]
             assert dispatcher._durable_shutdown_completion.done()
+            assert agent._durable_shutdown_continuation.done()
+            assert not agent._durable_shutdown_continuation.cancelled(), (
+                "physical completion must not become a cancelled owner merely "
+                "because the Agent retains an earlier observer withdrawal"
+            )
+            with pytest.raises(asyncio.CancelledError) as repeated:
+                await agent.wait_for_shutdown_completion()
+            assert repeated.value is original_withdrawal
+            assert storage_close_attempts == ["closed"]
         finally:
             allow_release.set()
             dispatcher._durable_store.release_initial_reservations = original_release
-            if agent._durable_shutdown_continuation is not None:
-                await agent.wait_for_shutdown_completion()
-            elif not dispatcher._durable_shutdown:
+            try:
+                if not shutdown.done():
+                    shutdown.cancel()
+                await asyncio.gather(shutdown, return_exceptions=True)
                 await dispatcher.shutdown_durable_delivery()
-            if backend._connection is not None:
-                await backend.close()
+                if agent._durable_shutdown_continuation is not None:
+                    await asyncio.gather(
+                        agent._durable_shutdown_continuation, return_exceptions=True
+                    )
+            finally:
+                if backend._connection is not None:
+                    await backend.close()
 
     @pytest.mark.asyncio
     async def test_boot_rollback_retries_owner_release_before_storage_close(
@@ -2282,8 +2332,9 @@ class TestLifecycle:
         mock_storage.close.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix_overrun", [False, True])
     async def test_hung_early_feature_does_not_starve_later_feature_or_storage(
-        self, tmp_path
+        self, tmp_path, prefix_overrun, monkeypatch,
     ):
         """Coherent deadline composition under the production outer wait_for (#2409).
 
@@ -2307,6 +2358,12 @@ class TestLifecycle:
 
         async def _never_returns():
             hung_started.set()
+            if prefix_overrun:
+                # A bounded, CPU-idle scheduling gap reproduces the CI clock
+                # overrun without stress processes or background busy loops.
+                # The later fast step must still receive a scheduling turn.
+                import time
+                time.sleep(0.7)
             await asyncio.Event().wait()
 
         async def _late_shutdown():
@@ -2326,6 +2383,30 @@ class TestLifecycle:
         mock_storage.close = AsyncMock()
         agent.storage = mock_storage
 
+        loop = asyncio.get_running_loop()
+        actual_call_at = loop.call_at
+        previous_factory = loop.get_task_factory()
+        admission_ends = []
+        def observe_admission(loop, coroutine, **kwargs):
+            frame = getattr(coroutine, "cr_frame", None)
+            operation = frame.f_locals.get("operation", coroutine) if frame is not None else coroutine
+            if prefix_overrun and getattr(operation, "cr_code", None) is _never_returns.__code__:
+                import time
+                time.sleep(0.35)
+                admission_ends.append(loop.time())
+            return previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
+        monkeypatch.setattr(loop, "_task_factory", observe_admission)
+        charged = []
+        def observe_timeout(when, callback, *args, context=None):
+            if getattr(callback, "__name__", "") == "expire_step" and args:
+                coroutine = args[0].get_coro()
+                frame = getattr(coroutine, "cr_frame", None)
+                operation = frame.f_locals.get("operation", coroutine) if frame is not None else coroutine
+                if getattr(operation, "cr_code", None) is _never_returns.__code__:
+                    charged.append(when)
+            return actual_call_at(when, callback, *args, context=context)
+        monkeypatch.setattr(loop, "call_at", observe_timeout)
+
         # Shrink the internal budget so the test is fast, but keep the shape
         # identical to production: the internal budget is composed BELOW the
         # outer wait_for deadline, and each feature fair-divides it.
@@ -2344,6 +2425,9 @@ class TestLifecycle:
         assert hung_started.is_set()
         # The hung early feature did not starve the later feature...
         assert late_started.is_set()
+        assert len(charged) == 1
+        if prefix_overrun:
+            assert len(admission_ends) == 1 and charged[0] < admission_ends[0], "Task admission renewed the exhausted shutdown budget"
         # ...nor the durable storage close.
         mock_storage.close.assert_called_once()
 
@@ -2896,11 +2980,11 @@ class TestLifecycle:
             ) as workers, patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.12,
+                1.0,
             ), patch(
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
-                0.50,
+                3.0,
             ), patch(
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
@@ -2909,7 +2993,13 @@ class TestLifecycle:
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
                 0.01,
-            ):
+            ), patch.object(
+                agent, "_run_durable_shutdown_tail",
+                wraps=agent._run_durable_shutdown_tail,
+            ) as tail:
+                # Healthy worker scheduling is not a 130ms performance
+                # contract. Measure the composed reservations directly while
+                # retaining native blocked-worker and physical-join probes.
                 shutdown_task = asyncio.create_task(agent.shutdown())
                 await wait_for_lifecycle_checkpoint(
                     factory_created.wait(),
@@ -2934,15 +3024,21 @@ class TestLifecycle:
                 # the primary backend's subsequent worker close.
                 await asyncio.sleep(0.03)
                 assert not shutdown_task.done()
+                assert tail.call_args.kwargs["storage_close_timeout"] >= 1.0
+                assert tail.call_args.kwargs["storage_preclose_timeout"] >= 1.0
+                assert tail.call_args.args[0] >= (
+                    tail.call_args.kwargs["storage_close_timeout"]
+                    + tail.call_args.kwargs["storage_preclose_timeout"]
+                )
 
                 release_worker.set()
-                await asyncio.wait_for(shutdown_task, timeout=1.0)
+                await asyncio.wait_for(shutdown_task, timeout=4.0)
                 assert not factory_worker.is_alive()
                 assert not primary_worker.is_alive()
         finally:
             release_worker.set()
             if shutdown_task is not None and not shutdown_task.done():
-                await asyncio.wait_for(shutdown_task, timeout=1.0)
+                await asyncio.wait_for(shutdown_task, timeout=4.0)
             if factory_worker is not None:
                 factory_worker.join(timeout=1.0)
             primary_worker.join(timeout=1.0)

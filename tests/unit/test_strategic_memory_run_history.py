@@ -8,6 +8,7 @@ from packaging.requirements import Requirement
 
 from kestrel_sovereign.features.strategic_memory.run_history import (
     FINISHED_RUNS_REQUIREMENT,
+    UNFINISHED_JOBS_REQUIREMENT,
     RunHistory,
     RunHistoryUnreadable,
     TalonProviderOutdated,
@@ -319,6 +320,19 @@ def test_the_requirement_is_the_first_release_with_finished_runs():
     assert requirement.name == "kestrel-feature-talon"
     assert not requirement.specifier.contains("0.2.9")
     assert requirement.specifier.contains("0.2.10")
+    assert requirement.specifier.contains("0.3.0")
+
+
+def test_the_unfinished_jobs_floor_is_the_first_release_that_lists_them():
+    """``finished_runs()`` lists ``unfinished`` from kestrel-feature-talon
+    0.2.14 (feature-talon #55, merged as #56); 0.2.13 leaves running jobs
+    out. The idle detector (#3664) names this floor when it refuses an older
+    provider."""
+    requirement = Requirement(UNFINISHED_JOBS_REQUIREMENT)
+
+    assert requirement.name == "kestrel-feature-talon"
+    assert not requirement.specifier.contains("0.2.13")
+    assert requirement.specifier.contains("0.2.14")
     assert requirement.specifier.contains("0.3.0")
 
 

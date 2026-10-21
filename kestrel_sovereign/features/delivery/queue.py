@@ -29,6 +29,14 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
+from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
+    owned_task_join_ancestors,
+    pending_owned_retirement_error,
+)
 from kestrel_sovereign.features.delivery.models import (
     DeliveryResult,
     DeliveryStatus,
@@ -192,6 +200,8 @@ class DeliveryQueue:
         poll_interval: int = POLL_INTERVAL_SECONDS,
         batch_size: int = BATCH_SIZE,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        runtime_task_factory=None,
+        delivery_task_factory=None,
     ):
         """
         Args:
@@ -211,8 +221,12 @@ class DeliveryQueue:
         self._poll_interval = poll_interval
         self._batch_size = batch_size
         self._max_retries = max_retries
+        self._runtime_task_factory = runtime_task_factory
+        self._delivery_task_factory = delivery_task_factory
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._stop_requested = asyncio.Event()
+        self._loop_entered = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -220,10 +234,28 @@ class DeliveryQueue:
 
     async def start(self):
         """Create DB tables and launch the background worker."""
+        if self._task is not None:
+            terminal = execution_terminal_error(
+                getattr(self, "_worker_control", None),
+                owned_task_error(self._task) if self._task.done() else None,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if terminal is not None and is_execution_control_error(terminal):
+                raise terminal
+            if not self._task.done():
+                raise pending_owned_retirement_error(
+                    self, (self._task,),
+                    message="original delivery worker must settle before restart",
+                )
         await self._ensure_tables()
         await self._reclaim_in_flight()
+        self._stop_requested.clear()
+        self._loop_entered = False
         self._running = True
-        self._task = asyncio.create_task(self._loop(), name="delivery-queue-worker")
+        factory = self._runtime_task_factory or create_owned_task
+        self._task = factory(
+            self._loop(), name="delivery-queue-worker"
+        )
         logger.info(
             "DeliveryQueue started (poll every %ds, batch %d, max_retries %d)",
             self._poll_interval,
@@ -234,12 +266,38 @@ class DeliveryQueue:
     async def stop(self):
         """Gracefully stop the background worker."""
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        self._stop_requested.set()
+        terminal = getattr(self, "_worker_control", None)
+        if self._task:
+            if self._task is asyncio.current_task() or self._task in owned_task_join_ancestors():
+                # A delivery callback cannot join the worker waiting on its
+                # own result. Request cooperative stop, retain the SAME owner,
+                # and report pending retirement rather than a successful ACK.
+                raise execution_terminal_error(
+                    terminal,
+                    pending_owned_retirement_error(
+                        self, (self._task,),
+                        message="delivery descendant cannot retire its waiting worker",
+                    ),
+                    retain_originals=True, isolate_control_originals=True,
+                )
+            if not self._loop_entered and not self._task.done():
+                # The production factory may still be awaiting agent READY.
+                # No loop query/effect has been admitted, and that barrier
+                # cannot observe this queue's cooperative stop event. There
+                # is no await between the entry check and cancellation.
+                self._task.cancel()
+            # Stop future polls, not a finite query/COMMIT already accepted by
+            # this resident or its original delivery child. Caller cancellation
+            # is replayed only after the original worker physically joins.
+            outcome = await await_owned_task(self._task)
+            terminal = execution_terminal_error(terminal,
+                outcome.error if outcome.error is not None and is_execution_control_error(outcome.error) else None,
+                outcome.cancellation)
+        if terminal is not None:
+            if is_execution_control_error(terminal):
+                self._worker_control = terminal
+            raise terminal
         logger.info("DeliveryQueue stopped")
 
     async def _reclaim_in_flight(self) -> int:
@@ -1190,8 +1248,18 @@ class DeliveryQueue:
 
         processed = 0
         for row in rows:
+            if asyncio.current_task() is self._task and self._stop_requested.is_set():
+                break
             entry = self._row_to_entry(row)
-            await self._attempt_delivery(entry)
+            # The child retains ordinary work custody, including its finite
+            # native status acknowledgement. A cancelled polling parent cannot
+            # cancel that ACK and manufacture uncertainty on the shared runtime.
+            factory = self._delivery_task_factory or create_owned_task
+            child = factory(self._attempt_delivery(entry), name=f"delivery-attempt:{entry.id}")
+            outcome = await await_owned_task(child)
+            terminal = execution_terminal_error(outcome.error, outcome.cancellation)
+            if terminal is not None:
+                raise terminal
             processed += 1
 
         return processed
@@ -1670,6 +1738,7 @@ class DeliveryQueue:
 
     async def _loop(self):
         """Background poll loop."""
+        self._loop_entered = True
         while self._running:
             try:
                 processed = await self.process_pending()
@@ -1677,12 +1746,14 @@ class DeliveryQueue:
                     logger.debug("Delivery worker processed %d messages", processed)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception("DeliveryQueue worker tick error")
             try:
-                await asyncio.sleep(self._poll_interval)
-            except asyncio.CancelledError:
-                raise
+                await asyncio.wait_for(self._stop_requested.wait(), self._poll_interval)
+            except asyncio.TimeoutError:
+                pass
 
     # ------------------------------------------------------------------
     # Delivery attempt
@@ -1707,6 +1778,8 @@ class DeliveryQueue:
                     entry.channel_type, entry.recipient, entry.content,
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 result = DeliveryResult(success=False, error=str(e))
         elif self._allow_noop_delivery:
             result = DeliveryResult(

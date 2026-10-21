@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sovereign.agent.operator_signals import (
     SOURCE_AUTO_MODE,
@@ -51,7 +52,8 @@ AGENT_DID = "did:test:operator-notice-lifecycle"
 # ---------------------------------------------------------------------------
 
 
-async def _audit_db(tmp_path):
+@pytest_asyncio.fixture
+async def audit_db(tmp_path):
     """A real AsyncDatabase built by the real production schema path.
 
     Deliberately ``_init_schema`` rather than hand-applying this table's DDL.
@@ -61,10 +63,19 @@ async def _audit_db(tmp_path):
     table's statements would pass while the fleet failed to start.
     """
     backend = SQLiteBackend(str(tmp_path / "operator-notice.db"))
-    await backend.connect()
     db = AsyncDatabase(backend)
-    await db._init_schema()
-    return db
+    try:
+        await backend.connect()
+        await db._init_schema()
+        yield db
+    finally:
+        connection = backend._connection
+        worker = getattr(connection, "_thread", connection)
+        await db.close()
+        assert backend._connection is None
+        assert worker is None or not worker.is_alive(), (
+            "original operator-notice SQLite worker outlived its fixture"
+        )
 
 
 class _InlineRoute:
@@ -276,9 +287,9 @@ def test_core_schema_statements_are_executable():
 
 
 @pytest.mark.asyncio
-async def test_init_schema_creates_the_operator_notice_table(tmp_path):
+async def test_init_schema_creates_the_operator_notice_table(audit_db):
     """The real boot path, on a fresh database, actually creates the table."""
-    db = await _audit_db(tmp_path)
+    db = audit_db
     rows = await db.fetchall(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
         ("operator_notice_audit",),
@@ -293,10 +304,10 @@ async def test_init_schema_creates_the_operator_notice_table(tmp_path):
 
 @pytest.mark.asyncio
 async def test_collect_phase_row_claims_nothing_and_is_visible_as_unsettled(
-    tmp_path,
+    audit_db,
 ):
     """The negative evidence this table exists for."""
-    db = await _audit_db(tmp_path)
+    db = audit_db
     store = OperatorNoticeAuditStore(db, AGENT_DID)
 
     await store.record_collected(
@@ -320,14 +331,14 @@ async def test_collect_phase_row_claims_nothing_and_is_visible_as_unsettled(
 
 
 @pytest.mark.asyncio
-async def test_first_terminal_settle_wins(tmp_path):
+async def test_first_terminal_settle_wins(audit_db):
     """A late "the turn failed" must not overwrite an honest delivery.
 
     This is the fallback-notice case: it settles ``delivered`` the moment it is
     persisted to history, and the surrounding turn dying afterwards does not
     take it back out of the user's history.
     """
-    db = await _audit_db(tmp_path)
+    db = audit_db
     store = OperatorNoticeAuditStore(db, AGENT_DID)
     await store.record_collected(
         notice_id="n1", session_id=None, delivery_role="user", fallback=True,
@@ -351,18 +362,18 @@ async def test_first_terminal_settle_wins(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_settle_refuses_a_non_terminal_state(tmp_path):
+async def test_settle_refuses_a_non_terminal_state(audit_db):
     """``collected``/``injected`` are not outcomes and cannot be settled to."""
-    db = await _audit_db(tmp_path)
+    db = audit_db
     store = OperatorNoticeAuditStore(db, AGENT_DID)
     with pytest.raises(ValueError):
         await store.settle("n1", state=OperatorNoticeState.COLLECTED)
 
 
 @pytest.mark.asyncio
-async def test_rows_are_scoped_to_the_owning_agent(tmp_path):
+async def test_rows_are_scoped_to_the_owning_agent(audit_db):
     """A shared backend must not leak one agent's notices into another's."""
-    db = await _audit_db(tmp_path)
+    db = audit_db
     mine = OperatorNoticeAuditStore(db, AGENT_DID)
     theirs = OperatorNoticeAuditStore(db, "did:test:someone-else")
     await mine.record_collected(
@@ -407,8 +418,8 @@ async def _collected_turn(db, *, supports_inline=True):
 
 
 @pytest.mark.asyncio
-async def test_first_chunk_settles_delivered_and_does_not_requeue(tmp_path):
-    db = await _audit_db(tmp_path)
+async def test_first_chunk_settles_delivered_and_does_not_requeue(audit_db):
+    db = audit_db
     producer, turn = await _collected_turn(db)
 
     async def _stream():
@@ -454,9 +465,9 @@ class _RecordingStream:
 
 
 @pytest.mark.asyncio
-async def test_consumer_break_after_first_chunk_stays_delivered(tmp_path):
+async def test_consumer_break_after_first_chunk_stays_delivered(audit_db):
     """The #1256 stop button does not un-send what the model already read."""
-    db = await _audit_db(tmp_path)
+    db = audit_db
     producer, turn = await _collected_turn(db)
     provider_stream = _RecordingStream(["hello", "never reached"])
 
@@ -477,8 +488,8 @@ async def test_consumer_break_after_first_chunk_stays_delivered(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_failure_before_first_chunk_requeues(tmp_path):
-    db = await _audit_db(tmp_path)
+async def test_failure_before_first_chunk_requeues(audit_db):
+    db = audit_db
     producer, turn = await _collected_turn(db)
 
     async def _stream():
@@ -499,9 +510,9 @@ async def test_failure_before_first_chunk_requeues(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cancellation_before_first_chunk_is_cancelled_not_failed(tmp_path):
+async def test_cancellation_before_first_chunk_is_cancelled_not_failed(audit_db):
     """Cancelled and failed answer different questions after the fact."""
-    db = await _audit_db(tmp_path)
+    db = audit_db
     producer, turn = await _collected_turn(db)
 
     async def _stream():
@@ -520,8 +531,8 @@ async def test_cancellation_before_first_chunk_is_cancelled_not_failed(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_empty_stream_is_not_an_observation_of_delivery(tmp_path):
-    db = await _audit_db(tmp_path)
+async def test_empty_stream_is_not_an_observation_of_delivery(audit_db):
+    db = audit_db
     producer, turn = await _collected_turn(db)
 
     async def _stream():
@@ -549,7 +560,7 @@ async def test_empty_stream_is_not_an_observation_of_delivery(tmp_path):
     ids=["eager-image-resolution", "tool-call-logging"],
 )
 async def test_streaming_pre_provider_failure_never_consumes_the_notice(
-    tmp_path, failure
+    audit_db, failure
 ):
     """Turn setup that dies before the provider must not eat the notice.
 
@@ -564,7 +575,7 @@ async def test_streaming_pre_provider_failure_never_consumes_the_notice(
     assertion is the strong one — the notice is not merely requeued, it was
     never consumed, and no audit row was ever written.
     """
-    db = await _audit_db(tmp_path)
+    db = audit_db
 
     async def _boom(_attachments):
         raise _PreStreamExploded("attachment store unavailable")
@@ -601,9 +612,9 @@ async def test_streaming_pre_provider_failure_never_consumes_the_notice(
 
 
 @pytest.mark.asyncio
-async def test_streaming_provider_failure_requeues_for_the_next_turn(tmp_path):
+async def test_streaming_provider_failure_requeues_for_the_next_turn(audit_db):
     """Inline notice + dead provider => failed row, and the notice comes back."""
-    db = await _audit_db(tmp_path)
+    db = audit_db
 
     def _stream_factory():
         async def _stream():
@@ -633,8 +644,8 @@ async def test_streaming_provider_failure_requeues_for_the_next_turn(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_provider_failure_requeues_for_the_next_turn(tmp_path):
-    db = await _audit_db(tmp_path)
+async def test_non_streaming_provider_failure_requeues_for_the_next_turn(audit_db):
+    db = audit_db
     llm = _InlineRoute()
     agent, producer = _turn_agent(db, llm)
     producer.enqueue_auto_mode("session")
@@ -654,14 +665,14 @@ async def test_non_streaming_provider_failure_requeues_for_the_next_turn(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_persisted_fallback_notice_is_delivered_and_never_requeued(tmp_path):
+async def test_persisted_fallback_notice_is_delivered_and_never_requeued(audit_db):
     """The durable form settles at persistence and survives the turn dying.
 
     Requeuing it would put a second copy of the same notice in the user's
     conversation history — the double-delivery the split boundary exists to
     prevent.
     """
-    db = await _audit_db(tmp_path)
+    db = audit_db
     llm = _InlineRoute(supports_inline=False)
     agent, producer = _turn_agent(db, llm)
     producer.enqueue_auto_mode("session")

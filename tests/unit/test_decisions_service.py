@@ -36,6 +36,7 @@ from kestrel_sovereign.llm.decisions.resolve import PinStatus, RouteDecisionStat
 from kestrel_sovereign.llm.decisions.thresholds import ThresholdBook
 from kestrel_sovereign.llm.model_discovery import ModelDiscoveryMixin
 from kestrel_sovereign.llm.service import LLMService
+from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
 SECRET = "the patient said something private"
 
@@ -73,6 +74,8 @@ class FakeDecisionAdapter:
         self.discovery_error = discovery_error
         self.decide_calls: List[str] = []
         self.discovery_calls = 0
+        self.entered = asyncio.Event()
+        self.cancelled = 0
 
     async def list_decision_models(self, client):
         self.discovery_calls += 1
@@ -82,8 +85,13 @@ class FakeDecisionAdapter:
 
     async def adecide(self, client, model, request, *, timeout):
         self.decide_calls.append(model)
+        self.entered.set()
         if self.delay:
-            await asyncio.sleep(self.delay)
+            try:
+                await asyncio.sleep(self.delay)
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
         if self.error is not None:
             raise self.error
         return self.body
@@ -183,10 +191,50 @@ async def test_a_failed_dispatch_is_never_resent_to_another_route() -> None:
 async def test_timeout_is_typed_and_still_recorded() -> None:
     slow = FakeDecisionAdapter(["nimble"], delay=5)
     service = _service([_route("ollama:local", slow, local=True)])
-    with pytest.raises(DecisionTimeout):
-        await service.decide(_request(), caller="c", timeout_seconds=0.05)
+    # The deadline includes cold discovery. Prove this case dispatched before
+    # expiring it; wall-clock load must not choose another contract for us.
+    with pinned_loop_clock() as clock:
+        task = asyncio.create_task(service.decide(_request(), caller="c", timeout_seconds=0.05))
+        try:
+            await await_within_hang_guard(slow.entered.wait(), step="decision dispatch")
+            clock.advance(0.06)
+            with pytest.raises(DecisionTimeout):
+                await await_within_hang_guard(task, step="dispatched decision timeout")
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert slow.decide_calls == ["nimble"] and slow.cancelled == 1
     [row] = _logged(service)
     assert row["success"] is False and row["metadata"]["usage_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_cold_discovery_timeout_never_invents_a_dispatched_record(monkeypatch) -> None:
+    slow = FakeDecisionAdapter(["nimble"])
+    service = _service([_route("ollama:local", slow, local=True)])
+    entered = asyncio.Event()
+    original = slow.list_decision_models
+
+    async def delayed_discovery(client):
+        entered.set()
+        await asyncio.Event().wait()
+        return await original(client)
+
+    monkeypatch.setattr(slow, "list_decision_models", delayed_discovery)
+    with pinned_loop_clock() as clock:
+        task = asyncio.create_task(service.decide(_request(), caller="c", timeout_seconds=0.05))
+        try:
+            await await_within_hang_guard(entered.wait(), step="cold decision discovery")
+            clock.advance(0.06)
+            with pytest.raises(DecisionTimeout):
+                await await_within_hang_guard(task, step="pre-dispatch decision timeout")
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert slow.decide_calls == [] and not slow.entered.is_set()
+    assert _logged(service) == [] and not service._pending_modality_records()
 
 
 @pytest.mark.asyncio

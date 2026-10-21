@@ -88,8 +88,9 @@ import os
 import re
 import secrets
 import time
+import weakref
 from collections import OrderedDict, deque
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
@@ -113,6 +114,10 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
+from kestrel_sovereign.execution_custody import (
+    execution_finite_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.hold import HoldStateError, HoldTurnRefusal
 from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
@@ -144,8 +149,8 @@ from kestrel_sovereign.signals.durable import (
     DurableConsumerRegistration,
     DurableDelivery,
     DurableIngressAttestation,
-    DurableSourceBoundary,
     DurableSignalStore,
+    DurableSourceBoundary,
 )
 from kestrel_sovereign.signals.in_flight_control import (
     InFlightControlActionRegistration,
@@ -158,6 +163,8 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_MARKER,
     DURABLE_COGNITION_MARKER_VALUE,
     DURABLE_TERMINAL_CONSUMER_ID,
+    DURABLE_TERMINAL_MARKER,
+    DURABLE_TERMINAL_MARKER_VALUE,
 )
 from kestrel_sovereign.signals.store import SignalLogStore
 from kestrel_sovereign.storage.db.write_audit import (
@@ -173,11 +180,11 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 from kestrel_sovereign.storage.session_id_column import new_session_id
 from kestrel_sovereign.storage.turn_provenance import WakeReplyReceipt
 from kestrel_sovereign.telemetry import (
-    capture_turn_ids,
     KESTREL_AGENT_NAME,
     KESTREL_TURN_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
+    capture_turn_ids,
     optional_span,
     session_span_attributes,
 )
@@ -269,15 +276,27 @@ class _StoppedCognitionResult(SignalResult):
 class SignalDispatchHandle(SignalHandle):
     """SDK terminal handle plus the earlier durable-admission receipt.
 
-    ``SignalHandle.wait()`` remains the released SDK 0.35.1 terminal dispatch
-    contract.  ACK-bearing Core ingress uses this explicit receipt instead of
-    mistaking background-task creation for a durable commit.
+    Terminal and admission waits observe their original dispatcher owners;
+    withdrawing a reader never cancels those borrowed operations. ACK-bearing
+    ingress uses the earlier receipt rather than mistaking Task creation for
+    a durable commit. Explicit ``cancel()`` retains the SDK cancellation contract.
     """
 
     durable_admission: asyncio.Future[DurableAdmissionResult]
 
+    async def wait(self) -> SignalResult:
+        from kestrel_sovereign._async_ownership import await_owned_task
+        outcome = await await_owned_task(self.task, defer_cancellation=False)
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.result
+
     async def wait_for_durable_admission(self) -> DurableAdmissionResult:
-        return await asyncio.shield(self.durable_admission)
+        from kestrel_sovereign._async_ownership import await_owned_task
+        outcome = await await_owned_task(self.durable_admission, defer_cancellation=False)
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.result
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +631,7 @@ class DispatcherAgent(Protocol):
     async def process_input(self, prompt: str) -> Any: ...
 
     def _track_background_task(
-        self, coro: Coroutine, *, name: str
+        self, coro: Coroutine, *, name: str, admission=None
     ) -> asyncio.Task: ...
 
 
@@ -830,6 +849,10 @@ class SignalDispatcher:
         # cancelled-before-start reservation reconciled) before storage closes.
         self._outcome_log_tasks: set[asyncio.Task] = set()
         self._outcome_log_tasks_by_signal: dict[str, set[asyncio.Task]] = {}
+        # One bounded, strongest receipt survives completion callbacks for
+        # durable transition/repair AND outcome writers. The historical name
+        # is retained; these writers share one storage outcome/admission fence.
+        self._outcome_log_control_error: BaseException | None = None
         # Cursor-owned cognition must not write a route-level outcome before
         # its exact durable ACK/NACK decision.  The task-local collector lets
         # the normal routing code continue constructing its audited result
@@ -862,6 +885,9 @@ class SignalDispatcher:
         # for shutdown and test/health inspection.
         self._retained_durable_cognition_tasks: set[asyncio.Task[SignalResult]] = set()
         self._retained_durable_cognition_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._retained_cognition_control_debt: dict[str, tuple[DurableDelivery, BaseException]] = {}
+        self._cognition_control_terminal_owners: dict[tuple[str, ...], asyncio.Task[None]] = {}
+        self._cognition_control_terminal_receipts: dict[tuple[str, ...], weakref.ReferenceType] = {}
         # Channel ingress ACKs after its selected delivery is durable, not
         # after cognition completes.  These owners make that promise useful
         # after the provider has advanced its cursor: every restarted
@@ -896,6 +922,7 @@ class SignalDispatcher:
         # otherwise a peer can requeue the same cursor delivery while side
         # effects from the original task are still running.
         self._durable_shutdown_owner_fenced = False
+        self._durable_control_cleanup_fenced = False
         self._fenced_durable_shutdown_completion: Optional[asyncio.Task[None]] = None
         self._runtime_owner_fence_lock = asyncio.Lock()
         # What the UI side-channel emit actually did, per signal (#2922).
@@ -989,6 +1016,8 @@ class SignalDispatcher:
         no new operation can reach durable storage; work admitted before that
         point remains valid and shutdown waits for it to finish.
         """
+        if self._outcome_log_control_error is not None:
+            raise execution_finite_error(self._outcome_log_control_error)
         current_task = asyncio.current_task()
         if current_task is None:  # pragma: no cover - async APIs run in Tasks
             raise RuntimeError("Durable signal delivery requires an asyncio task")
@@ -1119,8 +1148,9 @@ class SignalDispatcher:
         _durable_terminal_consumer_id: Optional[str] = None,
     ) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result
-        (scheduler, heartbeat). Always returns a `SignalResult` — failures
-        are encoded as `Status.FAILED` with `error` set, never raised."""
+        (scheduler, heartbeat). Ordinary failures return `Status.FAILED`.
+        Execution-authority loss and uncertain commits remain typed errors
+        so the owning invocation can reconcile instead of retrying effects."""
         start = time.monotonic()
         # Nested public dispatches inherit ContextVars from their caller. A
         # signal emitted by durable cognition is a new source unit and must not
@@ -1144,6 +1174,7 @@ class SignalDispatcher:
         )
 
         ctx_token = set_current_signal(signal)
+        admission_error = None
         try:
             async with self._admit_durable_operation():
                 result = await self._run(
@@ -1181,9 +1212,21 @@ class SignalDispatcher:
                 # this await cannot create a storage-close gap.
                 await self._drain_outcome_logs_for_signal(signal.id)
                 return result
-        except _DurableDeliveryShuttingDownError:
+        except _DurableDeliveryShuttingDownError as error:
+            if is_execution_control_error(error):
+                admission_error = error
+                raise
             return self._durable_shutdown_signal_result(signal, start)
-        except Exception as e:
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                admission_error = error
+            raise
+        except BaseException as e:
+            if is_execution_control_error(e):
+                admission_error = e
+                raise
+            if not isinstance(e, Exception):
+                raise
             # Defensive — every failure path inside _run should already
             # produce a SignalResult. If we land here, log it loudly.
             logger.exception(
@@ -1201,21 +1244,27 @@ class SignalDispatcher:
             )
         finally:
             if _durable_admission is not None and not _durable_admission.done():
-                # Cancellation and unexpected pipeline failure are not a
-                # durable receipt.  Resolve the waiter so its source can retry
-                # rather than waiting forever on an abandoned task.
-                _durable_admission.set_result(
-                    DurableAdmissionResult(
-                        DurableAdmissionDisposition.NOT_ADMITTED,
-                        signal.id,
+                # Control/uncertain commit is not proven retryable absence.
+                # Keep the original receipt in BOTH public completion lanes.
+                if admission_error is not None:
+                    _durable_admission.set_exception(admission_error)
+                    # Terminal-only callers need not consume this second lane.
+                    # Harvest without changing what admission waiters receive.
+                    _durable_admission.exception()
+                else:
+                    _durable_admission.set_result(
+                        DurableAdmissionResult(
+                            DurableAdmissionDisposition.NOT_ADMITTED,
+                            signal.id,
+                        )
                     )
-                )
             reset_current_signal(ctx_token)
             self._deferred_outcome_logs.reset(deferred_token)
             self._durable_cognition_route.reset(durable_route_token)
 
     async def enqueue_signal(
-        self, signal: Signal, *, source_event_id: Optional[str] = None
+        self, signal: Signal, *, source_event_id: Optional[str] = None,
+        admission=None,
     ) -> SignalDispatchHandle:
         """Returns immediately with a tracked handle. The dispatch runs as
         an agent-owned background task; exceptions are logged not swallowed,
@@ -1228,8 +1277,9 @@ class SignalDispatcher:
             source_event_id=source_event_id,
             _durable_admission=durable_admission,
         )
+        options = {"admission": admission} if admission is not None else {}
         task = self._agent._track_background_task(
-            coro, name=f"signal_dispatch:{signal.source}:{signal.id}"
+            coro, name=f"signal_dispatch:{signal.source}:{signal.id}", **options,
         )
         return SignalDispatchHandle(
             signal_id=signal.id,
@@ -1278,7 +1328,7 @@ class SignalDispatcher:
             durable_admission=durable_admission,
         )
 
-    def _hold_durable_cognition_stop_completion(
+    async def _hold_durable_cognition_stop_completion(
         self,
         request_id: str,
     ) -> _DurableCognitionSettlementGuard | None:
@@ -1334,71 +1384,92 @@ class SignalDispatcher:
         async def await_settlement_release() -> None:
             await settlement_release.wait()
 
-        operation = asyncio.create_task(
-            await_settlement_release(),
-            name=f"durable_cognition_settlement:{request_id}",
-        )
+        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign.agent.invocation import admit_request_operation
+        operation = None
+        completion_callback = None
         try:
-            bind_operation(self._agent, request_id, operation)
-        except BaseException:
-            operation.cancel()
-            cleanup(
-                self._agent,
-                request_id,
-                disposition=RequestCompletionDisposition.ABANDONED,
+            operation = await admit_request_operation(
+                self._agent, request_id,
+                await_settlement_release(),
+                name=f"durable_cognition_settlement:{request_id}",
+            )
+            guard = _DurableCognitionSettlementGuard(
+                request_id=request_id,
                 generation=generation,
+                operation=operation,
             )
-            raise
-        guard = _DurableCognitionSettlementGuard(
-            request_id=request_id,
-            generation=generation,
-            operation=operation,
-        )
 
-        def release_settlement_owner(completed_owner: asyncio.Task) -> None:
-            stop_reached_settlement = (
-                guard.operation.cancelling() > 0 or guard.operation.cancelled()
-            )
-            owner_abandoned_settlement = completed_owner.cancelled()
-            # Race matrix for the single release invariant:
-            #
-            #   cognition/settlement                  Stop completion
-            #   stopped + terminal NACK committed  -> COMPLETED (STOPPED)
-            #   stopped + NACK unavailable         -> ABANDONED (UNREACHABLE)
-            #   completed + late Stop during ACK   -> ABANDONED (UNREACHABLE)
-            #   any owner cancellation pre-settle  -> ABANDONED (UNREACHABLE)
-            #   no Stop, any ordinary terminal path-> COMPLETED
-            #
-            # The barrier is the shared linearization guard: cancellation must
-            # reach it, and only durable Stop terminalization can turn that
-            # cancellation into successful completion evidence.
-            disposition = (
-                RequestCompletionDisposition.ABANDONED
-                if (
-                    (stop_reached_settlement or owner_abandoned_settlement)
-                    and not guard.stop_terminalized
+            def release_settlement_owner(completed_owner: asyncio.Task) -> None:
+                stop_reached_settlement = (
+                    guard.operation.cancelling() > 0 or guard.operation.cancelled()
                 )
-                else RequestCompletionDisposition.COMPLETED
-            )
-            try:
-                cleanup(
-                    self._agent,
-                    guard.request_id,
-                    disposition=disposition,
-                    generation=guard.generation,
+                owner_abandoned_settlement = completed_owner.cancelled()
+                from kestrel_sovereign._async_ownership import owned_task_error
+                owner_error = owned_task_error(completed_owner)
+                unresolved_control = (
+                    owner_error is not None and is_execution_control_error(owner_error)
                 )
-            except Exception:
-                # A failed release must remain visible as unfinished Stop debt;
-                # never wake a waiter with invented completion evidence.
-                logger.exception(
-                    "Could not release durable cognition settlement owner: signal=%s",
-                    guard.request_id,
+                # Race matrix for the single release invariant:
+                #
+                #   cognition/settlement                  Stop completion
+                #   stopped + terminal NACK committed  -> COMPLETED (STOPPED)
+                #   stopped + NACK unavailable         -> ABANDONED (UNREACHABLE)
+                #   completed + late Stop during ACK   -> ABANDONED (UNREACHABLE)
+                #   any owner cancellation pre-settle  -> ABANDONED (UNREACHABLE)
+                #   no Stop, any ordinary terminal path-> COMPLETED
+                #
+                # The barrier is the shared linearization guard: cancellation must
+                # reach it, and only durable Stop terminalization can turn that
+                # cancellation into successful completion evidence.
+                disposition = (
+                    RequestCompletionDisposition.ABANDONED
+                    if (
+                        unresolved_control or (
+                            (stop_reached_settlement or owner_abandoned_settlement)
+                            and not guard.stop_terminalized
+                        )
+                    )
+                    else RequestCompletionDisposition.COMPLETED
                 )
-            finally:
-                settlement_release.set()
+                try:
+                    cleanup(
+                        self._agent,
+                        guard.request_id,
+                        disposition=disposition,
+                        generation=guard.generation,
+                    )
+                except Exception:
+                    # A failed release must remain visible as unfinished Stop debt;
+                    # never wake a waiter with invented completion evidence.
+                    logger.exception(
+                        "Could not release durable cognition settlement owner: signal=%s",
+                        guard.request_id,
+                    )
+                finally:
+                    settlement_release.set()
 
-        owner.add_done_callback(release_settlement_owner)
-        return guard
+            completion_callback = release_settlement_owner
+            owner.add_done_callback(completion_callback)
+            return guard
+        except BaseException as opening:
+            if completion_callback is not None:
+                owner.remove_done_callback(completion_callback)
+            if operation is not None:
+                operation.cancel()
+                outcome = await await_owned_task(operation)
+                opening = execution_finite_error(
+                    opening,
+                    outcome.error if is_execution_control_error(outcome.error) else None,
+                    outcome.cancellation, retain_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
+                )
+            from kestrel_sovereign.agent.invocation import retire_request_delivery
+            retire_request_delivery(
+                self._agent, request_id, abandoned=True,
+                generation=generation, error=opening,
+            )
+            raise opening
 
     async def enqueue_durable_terminal(
         self,
@@ -1454,7 +1525,10 @@ class SignalDispatcher:
         timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
         if timer is not None:
             timer.cancel()
-        task = asyncio.create_task(
+        tracker = getattr(self._agent, "_track_runtime_task", None)
+        if not callable(getattr(type(self._agent), "_track_runtime_task", None)):
+            tracker = asyncio.create_task
+        task = tracker(
             self._drain_durable_cognition_consumer(consumer_id),
             name=f"durable_cognition_drain:{consumer_id}:{self._agent.did}",
         )
@@ -1578,6 +1652,7 @@ class SignalDispatcher:
             statuses=[PENDING, RETRY],
             limit=limit,
             rebuildable_sources=self._durable_rebuildable_sources(),
+            claim_executor_id=self._durable_delivery_owner,
         )
 
     def _durable_rebuildable_sources(self) -> frozenset[str]:
@@ -1594,12 +1669,20 @@ class SignalDispatcher:
     async def _schedule_next_durable_cognition_drain(self, consumer_id: str) -> None:
         pending = await self._drainable_durable_deliveries(consumer_id, limit=1)
         if not pending:
-            return
+            # A live sibling's retry (or our own outstanding release receipt)
+            # is deliberately absent from the executable window. Poll its
+            # liveness at a bounded interval, never a zero-delay task loop.
+            pending = await self.list_durable_deliveries(
+                consumer_id=consumer_id, statuses=[PENDING, RETRY], limit=1,
+                rebuildable_sources=self._durable_rebuildable_sources(),
+            )
+            if not pending:
+                return
         next_attempt = pending[0].next_attempt_at
         delay = 0.0
         if next_attempt is not None:
             delay = max(0.0, (next_attempt - datetime.now(timezone.utc)).total_seconds())
-        self._schedule_durable_cognition_drain(consumer_id, delay=delay)
+        self._schedule_durable_cognition_drain(consumer_id, delay=max(1.0, delay))
 
     def _schedule_durable_cognition_drain(self, consumer_id: str, *, delay: float) -> None:
         if self._durable_shutdown:
@@ -1613,7 +1696,9 @@ class SignalDispatcher:
             self._start_durable_cognition_drain(consumer_id)
 
         self._durable_cognition_drain_timers[consumer_id] = (
-            asyncio.get_running_loop().call_later(delay, wake)
+            asyncio.get_running_loop().call_later(
+                delay, wake, context=self._resident_timer_context(),
+            )
         )
 
     async def initialize_durable_delivery(self) -> None:
@@ -1806,7 +1891,7 @@ class SignalDispatcher:
 
         try:
             deferred = await self._durable_claim_deferred_by_hold(consumer_id)
-        except BaseException:
+        except BaseException as opening:
             # The claim is private until this method returns. A failed or
             # cancelled Hold read must return the exact token before propagating
             # so no unexecuted attempt remains leased or spent.
@@ -1817,14 +1902,10 @@ class SignalDispatcher:
                         delivery_id=delivery.delivery_id,
                         lease_token=delivery.lease_token,
                     )
-                except BaseException:
-                    # Preserve the admission failure as the public result.
-                    # Lease expiry/restart recovery still owns the row if the
-                    # database also disappears during the exact rollback.
-                    logger.exception(
-                        "Could not return unpublished durable lease after "
-                        "Hold-state read failure: delivery=%s",
-                        delivery.delivery_id,
+                except BaseException as cleanup:
+                    raise execution_finite_error(
+                        opening, cleanup, retain_originals=True,
+                        prefer_cancellation=True, isolate_control_originals=True,
                     )
             raise
         if not deferred:
@@ -2016,7 +2097,7 @@ class SignalDispatcher:
             await self.initialize_durable_delivery()
             try:
                 deferred = await self._durable_claim_deferred_by_hold(consumer_id)
-            except BaseException:
+            except BaseException as opening:
                 # Unknown Hold state must not hand work off, and must not
                 # leave this event's reservation leased to a claimant that is
                 # about to fail. Return it exactly as a Hold deferral would,
@@ -2026,12 +2107,10 @@ class SignalDispatcher:
                         consumer_id=consumer_id,
                         event_id=event_id,
                     )
-                except BaseException:
-                    logger.exception(
-                        "Could not return initial durable reservation after "
-                        "Hold-state read failure: consumer=%s event=%s",
-                        consumer_id,
-                        event_id,
+                except BaseException as cleanup:
+                    raise execution_finite_error(
+                        opening, cleanup, retain_originals=True,
+                        prefer_cancellation=True, isolate_control_originals=True,
                     )
                 raise
             if deferred:
@@ -2287,6 +2366,12 @@ class SignalDispatcher:
                     delivery_id=delivery_id,
                     lease_token=lease_token,
                 )
+        except BaseException as error:
+            # Clearing the local pending phase is not a native release ACK.
+            # The same bounded durable-writer latch must fence new claims
+            # even after this private claimant has unwound.
+            self._retain_durable_writer_control(error)
+            raise
         finally:
             # Hold has ended this local admission whether or not the immediate
             # database repair succeeded. The durable pending-phase marker lets
@@ -2411,6 +2496,7 @@ class SignalDispatcher:
         statuses: Optional[List[str]] = None,
         limit: int = 100,
         rebuildable_sources: Optional[frozenset[str]] = None,
+        claim_executor_id: Optional[str] = None,
     ) -> List[DurableDelivery]:
         """Observe durable delivery state for this agent only."""
         async with self._admit_durable_operation():
@@ -2421,6 +2507,7 @@ class SignalDispatcher:
                 statuses=statuses,
                 limit=limit,
                 rebuildable_sources=rebuildable_sources,
+                claim_executor_id=claim_executor_id,
             )
 
     async def purge_expired_durable_deliveries(self) -> int:
@@ -2451,8 +2538,8 @@ class SignalDispatcher:
         # A public caller may be cancelled by the bounded agent shutdown
         # wrapper.  Shield the owned teardown so the next caller can either
         # join the same cleanup or retry a genuine cleanup failure.
-        await asyncio.shield(completion)
-        return not self._durable_shutdown_owner_fenced
+        await self._await_durable_shutdown_completion(completion)
+        return not self.durable_shutdown_owner_fenced
 
     async def wait_for_durable_shutdown_release(self) -> None:
         """Join the eventual owner release after a bounded shutdown fence.
@@ -2464,10 +2551,27 @@ class SignalDispatcher:
         """
         completion = self._durable_shutdown_completion
         if completion is not None:
-            await asyncio.shield(completion)
+            await self._await_durable_shutdown_completion(completion)
         fenced = self._fenced_durable_shutdown_completion
         if fenced is not None:
-            await asyncio.shield(fenced)
+            await self._await_durable_shutdown_completion(fenced)
+
+    async def _await_durable_shutdown_completion(self, completion):
+        """Keep retained control ahead of shield's synthetic cancellation."""
+        from kestrel_sovereign._async_ownership import await_owned_task
+        try:
+            outcome = await await_owned_task(completion, defer_cancellation=False)
+            if outcome.error is not None:
+                raise outcome.error
+        except BaseException as error:
+            from kestrel_sovereign._async_ownership import owned_task_error
+            debt = tuple(original for _, original in self._retained_cognition_control_debt.values())
+            completed_error = owned_task_error(completion) if completion.done() else None
+            raise execution_finite_error(
+                *debt, self._outcome_log_control_error, completed_error, error,
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
 
     def _start_durable_shutdown_completion(self) -> asyncio.Task[None]:
         """Close durable admission and return the one owned teardown task.
@@ -2502,9 +2606,8 @@ class SignalDispatcher:
     @staticmethod
     def _observe_durable_shutdown_completion(task: asyncio.Task[None]) -> None:
         """Harvest detached teardown failures without changing retry semantics."""
-        if task.cancelled():
-            return
-        task.exception()
+        from kestrel_sovereign._async_ownership import owned_task_error
+        owned_task_error(task)
 
     async def _complete_durable_shutdown(self) -> None:
         """Reconcile durable state once, leaving failures available for retry."""
@@ -2536,13 +2639,29 @@ class SignalDispatcher:
         # committed reservation task created immediately before its parent
         # completed.
         await self._durable_admissions_drained.wait()
-        await self._drain_outcome_log_tasks()
-        await self._drain_post_commit_reservation_repairs()
+        cleanup_errors = []
+        for drain in (self._drain_outcome_log_tasks, self._drain_post_commit_reservation_repairs):
+            try:
+                await drain(finite_errors=cleanup_errors)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        cleanup_error = execution_finite_error(*cleanup_errors)
+        if cleanup_error is not None:
+            # Still join every accepted writer/repair, but uncertain storage
+            # control is not permission to publish an ordinary owner release.
+            raise cleanup_error
         retained = await self._wait_for_retained_durable_cognition_cancellation()
         if retained:
             await self._activate_retained_durable_shutdown_fence()
             return
 
+        if self._retained_cognition_control_debt:
+            # A settled route with an unpersisted control outcome still owns
+            # cleanup debt. Do not let shutdown silently retire its liveness.
+            self._durable_control_cleanup_fenced = True
+            self._schedule_runtime_owner_heartbeat()
+        await self._drain_retained_durable_cognition_cleanup_tasks()
+        self._durable_control_cleanup_fenced = False
         await self._stop_runtime_owner_heartbeat()
         await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
 
@@ -2567,10 +2686,7 @@ class SignalDispatcher:
         # public durable operation: public work is closed, but the retained
         # task's exact owner must remain non-reclaimable while it can act.
         async with self._runtime_owner_fence_lock:
-            await self._durable_store.heartbeat_runtime_owner(
-                agent_id=self._agent.did,
-                owner_id=self._durable_delivery_owner,
-            )
+            await self._retain_runtime_owner_cleanup_liveness()
         self._schedule_runtime_owner_heartbeat()
         await self._release_runtime_owner_after_shutdown(mark_owner_stopped=False)
         if (
@@ -2605,11 +2721,12 @@ class SignalDispatcher:
         # Once every retained task is terminal, no original cognition can make
         # another external effect. Stop the fence heartbeat before atomically
         # marking the owner stopped, so a delayed heartbeat cannot revive it.
+        await self._drain_retained_durable_cognition_cleanup_tasks()
+        self._durable_control_cleanup_fenced = False
         self._durable_shutdown_owner_fenced = False
         await self._stop_runtime_owner_heartbeat()
         async with self._runtime_owner_fence_lock:
             pass
-        await self._drain_retained_durable_cognition_cleanup_tasks()
         await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
 
     async def _release_runtime_owner_after_shutdown(
@@ -2647,8 +2764,18 @@ class SignalDispatcher:
                 *(asyncio.shield(task) for task in tasks),
                 return_exceptions=True,
             )
+        # A failed/cancelled fixed terminalizer is retained debt, not permission
+        # to stop the owner and let ordinary recovery replay its delivery. One
+        # bounded exact-token retry per shutdown attempt; no detached retry loop.
+        for delivery, error in tuple(getattr(self, "_retained_cognition_control_debt", {}).values()):
+            if any(not task.done() for task in self._retained_durable_cognition_tasks):
+                # Renewal loss may publish evidence before a stubborn route
+                # settles. A receipt is not proof that its effects have ended.
+                raise error
+            await self._terminalize_failed_cognition(delivery, error)
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
 
-    async def _drain_outcome_log_tasks(self) -> None:
+    async def _drain_outcome_log_tasks(self, *, finite_errors=None) -> None:
         """Join every accepted outcome log before releasing shared storage.
 
         Each task owns a lifecycle reservation, so normally the admission
@@ -2660,18 +2787,30 @@ class SignalDispatcher:
         """
         while self._outcome_log_tasks:
             tasks = tuple(self._outcome_log_tasks)
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tasks),
-                return_exceptions=True,
-            )
+            await self._join_outcome_log_tasks(tasks, finite_errors=finite_errors)
+        if self._outcome_log_control_error is not None:
+            raise execution_finite_error(self._outcome_log_control_error)
 
     async def _drain_outcome_logs_for_signal(self, signal_id: str) -> None:
         """Join this dispatch's outcome writers before returning its result."""
         while tasks := self._outcome_log_tasks_by_signal.get(signal_id):
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tuple(tasks)),
-                return_exceptions=True,
-            )
+            await self._join_outcome_log_tasks(tuple(tasks))
+        if self._outcome_log_control_error is not None:
+            raise execution_finite_error(self._outcome_log_control_error)
+
+    async def _join_outcome_log_tasks(self, tasks, *, finite_errors=None) -> None:
+        from kestrel_sovereign._async_ownership import await_owned_task
+        originals = []
+        for task in tasks:
+            outcome = await await_owned_task(task)
+            originals.extend((outcome.error, outcome.cancellation))
+        if finite_errors is not None:
+            # This local writer batch can be ordinary while a later repair
+            # supplies native control to the SAME shutdown boundary.
+            finite_errors.extend(error for error in (self._outcome_log_control_error, *originals) if error is not None)
+        error = execution_finite_error(self._outcome_log_control_error, *originals)
+        if error is not None:
+            raise error
 
     def shutdown(self) -> None:
         """Compatibility teardown for embeddings that cannot await shutdown.
@@ -2748,35 +2887,42 @@ class SignalDispatcher:
         for reservation in reservations:
             self._discard_transient_durable_handoff(reservation.delivery_id)
 
-        for reservation in reservations:
-            while True:
-                try:
-                    abandoned = await self._durable_store.abandon_initial_reservation(
-                        agent_id=self._agent.did,
-                        consumer_id=reservation.consumer_id,
-                        delivery_id=reservation.delivery_id,
-                        owner_id=self._durable_delivery_owner,
-                        reservation_token=reservation.reservation_token,
-                    )
-                except asyncio.CancelledError:
-                    # The repair task is normally protected by its parent's
-                    # shield, but a direct cancellation (for example during
-                    # event-loop teardown) can still arrive at this await.
-                    # Retrying the owner/token-conditional release is safe and
-                    # ensures the cancellation cannot leave an INITIAL_RESERVED
-                    # row behind.
-                    continue
-                if not abandoned:
-                    # A transaction that definitely rolled back reaches this
-                    # path too: the dispatcher deliberately keeps its opaque
-                    # capability until conditional repair proves there is no
-                    # matching committed row.  This is an expected no-op, not
-                    # an ownership violation.
-                    logger.debug(
-                        "Committed-reservation repair found no matching row for %s",
-                        reservation.delivery_id,
-                    )
-                break
+        withdrawal = None
+        try:
+            for reservation in reservations:
+                while True:
+                    try:
+                        abandoned = await self._durable_store.abandon_initial_reservation(
+                            agent_id=self._agent.did,
+                            consumer_id=reservation.consumer_id,
+                            delivery_id=reservation.delivery_id,
+                            owner_id=self._durable_delivery_owner,
+                            reservation_token=reservation.reservation_token,
+                        )
+                    except asyncio.CancelledError as error:
+                        # Ordinary observer withdrawal can defer reporting
+                        # until mandatory CAS repair settles. Native UNKNOWN
+                        # is different: a later no-match cannot reconcile an
+                        # acknowledgement already lost on this original CAS.
+                        if is_execution_control_error(error):
+                            raise
+                        withdrawal = withdrawal or error
+                        continue
+                    if not abandoned:
+                        logger.debug(
+                            "Committed-reservation repair found no matching row for %s",
+                            reservation.delivery_id,
+                        )
+                    break
+        except BaseException as error:
+            terminal = execution_finite_error(
+                error, withdrawal, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
+            )
+            self._retain_durable_writer_control(terminal)
+            raise terminal
+        if withdrawal is not None:
+            raise withdrawal
 
     async def _repair_post_commit_reservations(self, persisted) -> None:
         """Finish committed-reservation repair despite repeated cancellation.
@@ -2791,26 +2937,54 @@ class SignalDispatcher:
         for reservation in persisted.initial_reservations:
             self._discard_transient_durable_handoff(reservation.delivery_id)
 
-        repair_task = asyncio.create_task(
-            self._requeue_committed_initial_reservations(persisted),
-            name=f"durable_signal_post_commit_repair:{self._agent.did}",
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error,
+            owned_task_admission_error,
         )
-        self._post_commit_reservation_repairs.add(repair_task)
-        repair_task.add_done_callback(self._post_commit_reservation_repairs.discard)
-        while not repair_task.done():
-            try:
-                await asyncio.shield(repair_task)
-            except asyncio.CancelledError:
-                # The original failure is retained by the caller.  A repeated
-                # cancellation must not strand a committed reservation.
-                continue
-        # Do not catch a database repair error here.  The caller that is
-        # already preserving a persistence/activation exception records the
-        # cleanup fault explicitly, while normal callers must see the repair
-        # error rather than silently proceeding with an unsafe handoff.
-        repair_task.result()
 
-    async def _drain_post_commit_reservation_repairs(self) -> None:
+        def completed(task):
+            self._post_commit_reservation_repairs.discard(task)
+            self._retain_durable_writer_control(owned_task_error(task))
+
+        admission = OwnedTaskAdmission()
+        opening = None
+        try:
+            repair_task = create_owned_task(
+                self._requeue_committed_initial_reservations(persisted),
+                name=f"durable_signal_post_commit_repair:{self._agent.did}",
+                retain_originals=True, retirement_resource=self,
+                admission=admission,
+            )
+        except BaseException as error:
+            repair_task = admission.task
+            opening = owned_task_admission_error(self, admission, error)
+            self._retain_durable_writer_control(opening)
+            if repair_task is None:
+                raise opening
+        try:
+            self._post_commit_reservation_repairs.add(repair_task)
+            repair_task.add_done_callback(completed)
+        except BaseException as error:
+            # Accepted work cannot escape a later publication refusal. This
+            # async owner can physically join it before propagating failure.
+            outcome = await await_owned_task(repair_task)
+            self._post_commit_reservation_repairs.discard(repair_task)
+            terminal = execution_finite_error(
+                error, outcome.error, outcome.cancellation,
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
+            self._retain_durable_writer_control(terminal)
+            raise terminal
+        outcome = await await_owned_task(repair_task)
+        error = execution_finite_error(
+            opening, outcome.error, outcome.cancellation, retain_originals=True,
+            prefer_cancellation=True, isolate_control_originals=True,
+        )
+        if error is not None:
+            raise error
+
+    async def _drain_post_commit_reservation_repairs(self, *, finite_errors=None) -> None:
         """Await every dispatcher-owned committed-reservation repair.
 
         Unlike general agent background work, a reservation repair is part of
@@ -2818,11 +2992,74 @@ class SignalDispatcher:
         therefore run to completion before the owner release below makes any
         remaining work visible to a restart worker.
         """
+        originals = []
+        observed = set()
         while self._post_commit_reservation_repairs:
-            repairs = tuple(self._post_commit_reservation_repairs)
-            await asyncio.gather(
-                *(asyncio.shield(repair) for repair in repairs),
+            repairs = tuple(task for task in self._post_commit_reservation_repairs if task not in observed)
+            if not repairs:
+                # A reentrant join can retain a genuinely pending original.
+                # Its native debt, not a busy re-observation loop, owns it.
+                break
+            from kestrel_sovereign._async_ownership import await_owned_task
+            for repair in repairs:
+                observed.add(repair)
+                outcome = await await_owned_task(repair)
+                originals.extend((outcome.error, outcome.cancellation))
+                if repair.done():
+                    # The producer's completion callback does the same discard.
+                    # This is physical Task retirement, not a native success ACK.
+                    self._post_commit_reservation_repairs.discard(repair)
+        originals.append(self._outcome_log_control_error)
+        if finite_errors is not None:
+            finite_errors.extend(error for error in originals if error is not None)
+            return
+        error = execution_finite_error(*originals,
+                                       retain_originals=True, prefer_cancellation=True,
+                                       isolate_control_originals=True)
+        if error is not None:
+            raise error
+
+    def _retain_durable_writer_control(self, error: BaseException | None) -> None:
+        """One existing bounded safety latch for this runtime's native writers."""
+        if error is not None and is_execution_control_error(error):
+            from kestrel_sovereign.execution_custody import execution_native_source_error
+            self._outcome_log_control_error = execution_native_source_error(
+                self._outcome_log_control_error, error,
             )
+
+    def _runtime_owner_cleanup_required(self) -> bool:
+        """Keep exact owner protection until retained cognition has joined."""
+        return (
+            bool(self._retained_cognition_control_debt)
+            or self.durable_shutdown_owner_fenced
+            or any(not task.done() for task in self._retained_durable_cognition_tasks)
+        )
+
+    def _resident_timer_context(self):
+        """A timer belongs to its existing runtime, never an ingress turn."""
+        from contextvars import copy_context
+
+        if self._runtime_owner_cleanup_required():
+            # Do not manufacture live work admission for cleanup metadata.
+            # The heartbeat's debt branch permits only the fixed native CAS.
+            return copy_context()
+        factory = getattr(type(self._agent), "_runtime_owner_context", None)
+        if callable(factory):
+            try:
+                return self._agent._runtime_owner_context()
+            except BaseException as error:
+                if not is_execution_control_error(error):
+                    raise
+                # Supervise timers across the revocation->retention window.
+                # Copying the original denied context grants no ordinary work;
+                # heartbeat admission itself still enforces that denial.
+                return copy_context()
+        return copy_context()
+
+    def _rearm_cleanup_runtime_owner_heartbeat(self) -> None:
+        """Install supervision when initialized runtime cleanup debt changes."""
+        if "_runtime_owner_stale_after" in vars(self):
+            self._schedule_runtime_owner_heartbeat(retry=True)
 
     def _schedule_runtime_owner_heartbeat(self, *, retry: bool = False) -> None:
         """Keep owner liveness separate from delivery lease countdowns.
@@ -2831,7 +3068,7 @@ class SignalDispatcher:
         Crucially it still creates a future timer: an exception is observable,
         but never changes into a silent end to runtime ownership heartbeats.
         """
-        if self._durable_shutdown and not self._durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
             return
         if self._runtime_owner_heartbeat_timer is not None:
             self._runtime_owner_heartbeat_timer.cancel()
@@ -2846,7 +3083,8 @@ class SignalDispatcher:
                 * (2 ** min(self._runtime_owner_heartbeat_failures, 3)),
             )
         self._runtime_owner_heartbeat_timer = asyncio.get_running_loop().call_later(
-            interval, self._start_runtime_owner_heartbeat
+            interval, self._start_runtime_owner_heartbeat,
+            context=self._resident_timer_context(),
         )
 
     async def _stop_runtime_owner_heartbeat(self) -> None:
@@ -2860,40 +3098,110 @@ class SignalDispatcher:
             self._runtime_owner_heartbeat_timer.cancel()
             self._runtime_owner_heartbeat_timer = None
         task = self._runtime_owner_heartbeat_task
-        self._runtime_owner_heartbeat_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        try:
+            if task is not None:
+                # The heartbeat can already be committing cleanup-owner CAS.
+                # Cancelling it manufactures an UNKNOWN acknowledgement during
+                # otherwise successful teardown. Join the original bounded SQL
+                # operation; caller cancellation cannot close its store early.
+                from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+                outcome = await await_owned_task(task)
+                # Callback publication can have failed before the Agent
+                # harvester was installed. Stop owns the same terminal receipt
+                # as the retry path, before its finally clears the slot.
+                self._finish_runtime_owner_heartbeat(task)
+                raise_owned_outcome(outcome, operation="runtime-owner heartbeat retirement")
+        finally:
+            if self._runtime_owner_heartbeat_task is task:
+                self._runtime_owner_heartbeat_task = None
+            # Its completion callback may have rearmed while we were joining.
+            if self._runtime_owner_heartbeat_timer is not None:
+                self._runtime_owner_heartbeat_timer.cancel()
+                self._runtime_owner_heartbeat_timer = None
 
     def _start_runtime_owner_heartbeat(self) -> None:
         self._runtime_owner_heartbeat_timer = None
-        if self._durable_shutdown and not self._durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
             return
-        task = self._agent._track_background_task(
-            self._heartbeat_runtime_owner(),
-            name=f"durable_signal_owner_heartbeat:{self._agent.did}",
-        )
-        self._runtime_owner_heartbeat_task = task
-        task.add_done_callback(self._finish_runtime_owner_heartbeat)
+        task = self._runtime_owner_heartbeat_task
+        if task is not None:
+            # Publication can fail after this exact monitor was accepted.
+            # Its fallback timer observes it; it may never create a competing
+            # heartbeat or mistake missing callback publication for settlement.
+            if task.done():
+                self._finish_runtime_owner_heartbeat(task)
+            else:
+                self._schedule_runtime_owner_heartbeat(retry=True)
+            return
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        admission = OwnedTaskAdmission()
+        try:
+            task = self._agent._track_background_task(
+                self._heartbeat_runtime_owner(),
+                name=f"durable_signal_owner_heartbeat:{self._agent.did}",
+                admission=admission,
+            )
+            self._runtime_owner_heartbeat_task = task
+            task.add_done_callback(self._finish_runtime_owner_heartbeat)
+        except BaseException as error:
+            self._runtime_owner_heartbeat_task = admission.task
+            self._retain_durable_writer_control(error)
+            # The fired timer no longer owns liveness. Canonical Agent Task
+            # admission closes an unstarted operation on refusal; an accepted
+            # monitor remains in the original slot through publication failure.
+            self._runtime_owner_heartbeat_failures += 1
+            self._schedule_runtime_owner_heartbeat(retry=True)
+            raise
+
+    async def _retain_runtime_owner_cleanup_liveness(self) -> None:
+        """Refresh only the already-owned shutdown/terminalization metadata."""
+        if self._durable_store.backend.backend_type == "postgres":
+            # False means the original live owner no longer has a leased or
+            # receipt-pending retry
+            # cognition. Never insert or revive it to manufacture protection.
+            retained = await self._durable_store.backend.retain_cognition_cleanup_owner(
+                agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+            )
+            if not retained and self._retained_cognition_control_debt:
+                # A zero-row CAS is lost protection, not a healthy heartbeat.
+                # Keep the original debt and expose its terminal evidence; a
+                # timer retry cannot manufacture another owner's authority.
+                from kestrel_sovereign.execution_custody import execution_finite_error
+                raise execution_finite_error(*(
+                    error for _, error in self._retained_cognition_control_debt.values()
+                ))
+            if not retained and any(
+                not task.done() for task in self._retained_durable_cognition_tasks
+            ):
+                from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+                raise ExecutionAuthorityError("original retained cognition cleanup owner was lost")
+        else:
+            await self._durable_store.heartbeat_runtime_owner(
+                agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+            )
 
     async def _heartbeat_runtime_owner(self) -> None:
+        if self._runtime_owner_cleanup_required():
+            # Irreversible runtime denial also denies ordinary metadata SQL.
+            # Keep only the existing managed owner's cleanup liveness; this
+            # fixed path cannot revive a stopped owner or admit cognition.
+            async with self._runtime_owner_fence_lock:
+                if self._runtime_owner_cleanup_required():
+                    await self._retain_runtime_owner_cleanup_liveness()
+            return
         # The timer can have queued this coroutine immediately before
         # shutdown flips the lifecycle state.  Take the same admission as
         # public APIs so it either completes before teardown or performs no
         # post-close storage work at all.
         if self._durable_shutdown:
-            if not self._durable_shutdown_owner_fenced:
+            if not self.durable_shutdown_owner_fenced:
                 raise _DurableDeliveryShuttingDownError(
                     "Durable signal delivery is shutting down"
                 )
             async with self._runtime_owner_fence_lock:
-                if not self._durable_shutdown_owner_fenced:
+                if not self.durable_shutdown_owner_fenced:
                     return
-                await self._durable_store.heartbeat_runtime_owner(
-                    agent_id=self._agent.did,
-                    owner_id=self._durable_delivery_owner,
-                )
+                await self._retain_runtime_owner_cleanup_liveness()
             return
 
         async with self._admit_durable_operation():
@@ -2953,10 +3261,17 @@ class SignalDispatcher:
         )
 
     def _finish_runtime_owner_heartbeat(self, task: asyncio.Task) -> None:
-        if self._runtime_owner_heartbeat_task is task:
-            self._runtime_owner_heartbeat_task = None
-        if task.cancelled():
-            if not self._durable_shutdown or self._durable_shutdown_owner_fenced:
+        if self._runtime_owner_heartbeat_task is not task:
+            return
+        self._runtime_owner_heartbeat_task = None
+        finish = getattr(type(self._agent), "_finish_background_task", None)
+        if callable(finish):
+            finish(self._agent, task)
+        from kestrel_sovereign._async_ownership import owned_task_error
+        error = owned_task_error(task)
+        self._retain_durable_writer_control(error)
+        if isinstance(error, asyncio.CancelledError):
+            if not self._durable_shutdown or self._runtime_owner_cleanup_required():
                 self._runtime_owner_heartbeat_failures += 1
                 logger.warning(
                     "Durable signal runtime-owner heartbeat was cancelled; "
@@ -2964,20 +3279,18 @@ class SignalDispatcher:
                 )
                 self._schedule_runtime_owner_heartbeat(retry=True)
             return
-        try:
-            task.result()
-        except _DurableDeliveryShuttingDownError:
+        if isinstance(error, _DurableDeliveryShuttingDownError):
             # A queued timer callback can lose the lifecycle race after
             # shutdown closes admission.  That rejection is normal, but its
             # exception must still be retrieved before returning.
             return
-        except Exception:
-            logger.exception("Durable signal runtime-owner heartbeat failed")
-            if not self._durable_shutdown or self._durable_shutdown_owner_fenced:
+        if error is not None:
+            logger.error("Durable signal runtime-owner heartbeat failed (%s)", type(error).__name__)
+            if not self._durable_shutdown or self._runtime_owner_cleanup_required():
                 self._runtime_owner_heartbeat_failures += 1
                 self._schedule_runtime_owner_heartbeat(retry=True)
             return
-        if self._durable_shutdown and not self._durable_shutdown_owner_fenced:
+        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
             return
         self._runtime_owner_heartbeat_failures = 0
         self._schedule_runtime_owner_heartbeat()
@@ -3501,9 +3814,9 @@ class SignalDispatcher:
         """Keep a cursor-owned cognition lease alive until its turn settles."""
 
         stop = asyncio.Event()
-        lost: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        lost: asyncio.Future[str | BaseException] = asyncio.get_running_loop().create_future()
 
-        def report_loss(reason: str) -> None:
+        def report_loss(reason: str | BaseException) -> None:
             if not lost.done():
                 lost.set_result(reason)
 
@@ -3513,6 +3826,7 @@ class SignalDispatcher:
             return
 
         async def renew() -> None:
+            asyncio.current_task()._kestrel_renewal_stop = stop
             try:
                 expires_at = delivery.lease_expires_at
                 while not stop.is_set():
@@ -3532,7 +3846,12 @@ class SignalDispatcher:
                             delivery_id=delivery.delivery_id,
                             lease_token=delivery.lease_token,
                         )
-                    except Exception:
+                    except BaseException as error:
+                        if is_execution_control_error(error):
+                            report_loss(error)
+                            return
+                        if not isinstance(error, Exception):
+                            raise
                         logger.exception(
                             "Could not renew durable cognition lease: delivery=%s",
                             delivery.delivery_id,
@@ -3554,9 +3873,12 @@ class SignalDispatcher:
                         report_loss("Durable cognition lease ownership was lost")
                         return
                     expires_at = renewed.lease_expires_at
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    report_loss(error)
+                    return
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Durable cognition lease renewal task failed: delivery=%s",
                     delivery.delivery_id,
@@ -3566,14 +3888,32 @@ class SignalDispatcher:
         task = asyncio.create_task(
             renew(), name=f"durable_cognition_lease_renewal:{delivery.delivery_id}"
         )
+        body_error: BaseException | None = None
         try:
             yield lost
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
+            from kestrel_sovereign._async_ownership import await_owned_task
+
             stop.set()
-            if not task.done():
-                task.cancel()
-            with suppress(asyncio.CancelledError):
-                await asyncio.shield(task)
+            # Wake the interval only. Never inject cancellation into an
+            # in-flight renewal COMMIT or its native pool-release ACK.
+            # Harvest its original control evidence only after it is terminal.
+            outcome = await await_owned_task(task)
+            child_error = outcome.error
+            if isinstance(child_error, asyncio.CancelledError) and not is_execution_control_error(child_error):
+                child_error = None  # Our requested cancellation of the renewer.
+            renewal_error = lost.result() if lost.done() else None
+            terminal = execution_finite_error(
+                body_error,
+                renewal_error if isinstance(renewal_error, BaseException) else None,
+                child_error,
+                outcome.cancellation,
+            )
+            if terminal is not None and terminal is not body_error:
+                raise terminal
 
     @staticmethod
     def _legacy_channel_cognition_signal(
@@ -3754,7 +4094,12 @@ class SignalDispatcher:
                 )
                 volatile_integrity_binding = (
                     self._volatile_source_integrity_binding(signal, source_event_id)
-                    if durable_projection.payload_elided
+                    if durable_projection.payload_elided or (
+                        signal.source == "channel.message"
+                        and durable_terminal_consumer_id is not None
+                        and (config := resolve_agent_privacy_config(self._agent)) is not None
+                        and config.requires_anonymization()
+                    )
                     else None
                 )
                 # Persisted caller identity is independent of the audit log's
@@ -3860,7 +4205,7 @@ class SignalDispatcher:
                                 durable_projection.signal,
                                 **persistence_kwargs,
                             )
-                        except BaseException:
+                        except BaseException as exc:
                             # The before-commit hook already gave us the
                             # capability set. If cancellation arrives after
                             # commit but before this await returns, use it to
@@ -3883,6 +4228,10 @@ class SignalDispatcher:
                                         "failed while preserving persistence "
                                         "failure: %s",
                                         cleanup_exc,
+                                    )
+                                    raise execution_finite_error(
+                                        exc, cleanup_exc, retain_originals=True,
+                                        isolate_control_originals=True,
                                     )
                             raise
                         if persisted.created:
@@ -3908,6 +4257,12 @@ class SignalDispatcher:
                                         "failure: %s",
                                         cleanup_exc,
                                     )
+                                    raise execution_finite_error(
+                                        exc, cleanup_exc, retain_originals=True,
+                                        isolate_control_originals=True,
+                                    )
+                                if is_execution_control_error(exc):
+                                    raise
                                 if isinstance(exc, Exception):
                                     logger.error(
                                         "Durable signal event %s committed but "
@@ -3935,6 +4290,8 @@ class SignalDispatcher:
                         **persistence_kwargs,
                     )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.exception(
                 "Failed to persist durable signal event %s (source=%s)",
                 signal.id,
@@ -3972,14 +4329,66 @@ class SignalDispatcher:
         # keyed-MAC-verified live envelope.
         recorded_binding = None
         use_verified_live_signal = False
+        verified_terminal_retry = False
         if not persisted.created:
             recorded_binding = await self._durable_store.get_event_integrity(
                 agent_id=self._agent.did, event_id=persisted.event_id
             )
+            integrity_signal = signal
+            if (
+                signal.source == "channel.message"
+                and durable_delivery_consumer_id == DURABLE_COGNITION_CONSUMER_ID
+            ):
+                terminal = await self.get_durable_delivery_for_event(
+                    consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+                    event_id=persisted.event_id,
+                )
+                if terminal is not None and terminal.status == TERMINAL_ACKABLE:
+                    expected = dict(signal.payload)
+                    expected.pop(DURABLE_COGNITION_MARKER, None)
+                    expected[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+                    candidate = replace(signal, payload=expected)
+                    if recorded_binding is not None:
+                        # The provider retried the same envelope through the
+                        # normal door. Reassert ONLY the retained terminal
+                        # marker before comparing its original keyed binding.
+                        integrity_signal = candidate
+                        verified_terminal_retry = secrets.compare_digest(
+                            recorded_binding,
+                            self._volatile_source_integrity_binding(candidate, source_event_id),
+                        )
+                    else:
+                        # Legacy non-elided receipts still require their
+                        # privacy-safe persisted projection to match exactly.
+                        projection = self._signal_for_durable_persistence(candidate, registration)
+                        retained = self._signal_from_durable_event(terminal.event, dispatch_signal=signal)
+                        caller_matches = retained.caller == candidate.caller
+                        if (
+                            isinstance(retained.caller, str)
+                            and retained.caller.startswith(_DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX)
+                        ):
+                            # The protected field is intentionally opaque in
+                            # keyless NORMAL installs. This channel's original
+                            # raw sender is already in its retained payload;
+                            # it is the source-owned replay identity, not the
+                            # opaque audit label. Recovery above validated the
+                            # versioned label and exact payload equality below
+                            # still fences content and correlation metadata.
+                            caller_matches = (
+                                candidate.caller == retained.payload.get("sender")
+                                == projection.signal.payload.get("sender")
+                            )
+                        verified_terminal_retry = not projection.payload_elided and projection.signal.payload == candidate.payload and (
+                            retained.source == candidate.source
+                            and retained.target_agent == candidate.target_agent
+                            and retained.kind == candidate.kind
+                            and caller_matches
+                            and retained.dedupe_key == candidate.dedupe_key
+                            and retained.payload == projection.signal.payload
+                        )
             if recorded_binding is not None:
                 live_integrity_binding = (
-                    volatile_integrity_binding
-                    or self._volatile_source_integrity_binding(signal, source_event_id)
+                    self._volatile_source_integrity_binding(integrity_signal, source_event_id)
                 )
                 if not secrets.compare_digest(recorded_binding, live_integrity_binding):
                     return self._fail(
@@ -4016,7 +4425,7 @@ class SignalDispatcher:
             legacy_signal = self._legacy_channel_cognition_signal(
                 signal, consumer_id=durable_delivery_consumer_id or ""
             )
-            if legacy_signal is not None and source_event_id is not None:
+            if legacy_signal is not None and source_event_id is not None and not verified_terminal_retry:
                 try:
                     upgraded_legacy_delivery = await self._durable_store.upgrade_legacy_delivery_for_redelivery(
                         agent_id=self._agent.did,
@@ -4041,7 +4450,9 @@ class SignalDispatcher:
                             "requiring selected delivery proof: event=%s",
                             persisted.event_id,
                         )
-                except Exception:
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.exception(
                         "Could not upgrade legacy durable channel redelivery: event=%s",
                         persisted.event_id,
@@ -4072,6 +4483,7 @@ class SignalDispatcher:
                     durable_projection.payload_elided and persisted.created
                 )
                 or use_verified_live_signal,
+                verified_terminal_retry=verified_terminal_retry,
             )
 
         if durable_terminal_consumer_id is not None:
@@ -4110,7 +4522,7 @@ class SignalDispatcher:
         consumer_id: str,
         durable_admission: asyncio.Future[DurableAdmissionResult] | None,
     ) -> SignalResult:
-        """Mark one selected malformed-ingress delivery terminal and ACKable.
+        """Mark one selected non-cognitive ingress delivery terminal and ACKable.
 
         No channel content reaches cognition on this path. The durable row is
         nevertheless claimed and terminally settled so a polling provider can
@@ -4191,6 +4603,7 @@ class SignalDispatcher:
         durable_admission: asyncio.Future[DurableAdmissionResult] | None,
         durable_created: bool,
         use_live_signal: bool,
+        verified_terminal_retry: bool = False,
         claimed_delivery: DurableDelivery | None = None,
         retry_delay: timedelta = timedelta(),
     ) -> SignalResult:
@@ -4251,6 +4664,15 @@ class SignalDispatcher:
                 consumer_id=consumer_id,
                 event_id=persisted_event_id,
             )
+            if existing is None and consumer_id == DURABLE_COGNITION_CONSUMER_ID:
+                terminal = await self.get_durable_delivery_for_event(
+                    consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+                    event_id=persisted_event_id,
+                )
+                if terminal is not None and terminal.status == TERMINAL_ACKABLE and verified_terminal_retry:
+                    # The persistence boundary already checked this exact
+                    # original terminal envelope, including private-mode MAC.
+                    existing = terminal
             if existing is not None and existing.status in {
                 ACKNOWLEDGED,
                 TERMINAL_ACKABLE,
@@ -4362,7 +4784,12 @@ class SignalDispatcher:
                 dispatch_signal=signal,
                 use_live_signal=use_live_signal,
             )
-        except Exception:
+        except BaseException as error:
+            if is_execution_control_error(error):
+                await self._terminalize_failed_cognition(delivery, error)
+                raise
+            if not isinstance(error, Exception):
+                raise
             # A claim without a recoverable canonical caller must never wait
             # for its lease to expire.  Release this exact token before
             # producing the ordinary audited failure so cursor-owning ingress
@@ -4375,7 +4802,12 @@ class SignalDispatcher:
                     error="Durable cognition caller recovery failed",
                     retry_delay=retry_delay,
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not release durable cognition lease after caller recovery failure: "
                     "delivery=%s",
@@ -4398,6 +4830,9 @@ class SignalDispatcher:
         try:
             hold_admission = await get_effective_hold_state(self._agent)
         except HoldStateError as exc:
+            if is_execution_control_error(exc):
+                await self._terminalize_failed_cognition(delivery, exc)
+                raise
             result = self._failure_result(
                 routing_signal,
                 start,
@@ -4409,7 +4844,12 @@ class SignalDispatcher:
                     persisted_event_id=persisted_event_id,
                     delivery=delivery,
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not return durable cognition lease after final Hold "
                     "read failure: delivery=%s",
@@ -4431,7 +4871,12 @@ class SignalDispatcher:
                     persisted_event_id=persisted_event_id,
                     delivery=delivery,
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not return held durable cognition lease: delivery=%s",
                     delivery.delivery_id,
@@ -4440,7 +4885,12 @@ class SignalDispatcher:
             return result
         try:
             await self._begin_durable_cognition_execution(delivery)
-        except Exception as exc:
+        except BaseException as exc:
+            if is_execution_control_error(exc):
+                await self._terminalize_failed_cognition(delivery, exc)
+                raise
+            if not isinstance(exc, Exception):
+                raise
             logger.exception(
                 "Could not commit durable cognition execution phase: delivery=%s",
                 delivery.delivery_id,
@@ -4456,12 +4906,15 @@ class SignalDispatcher:
             self._schedule_outcome_log(routing_signal, registration, result)
             return result
 
-        settlement_guard = self._hold_durable_cognition_stop_completion(
+        settlement_guard = await self._hold_durable_cognition_stop_completion(
             routing_signal.id
         )
         routing_task: asyncio.Task[SignalResult] | None = None
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        routing_admission = OwnedTaskAdmission()
         deferred_outcomes: list[_DeferredOutcomeLog] = []
         lease_loss_reason: Optional[str] = None
+        lease_loss_error: BaseException | None = None
         try:
             async with self._renew_durable_cognition_lease(delivery) as lease_lost:
                 # The routing task inherits this task-local collector.  Its
@@ -4491,9 +4944,11 @@ class SignalDispatcher:
                         finally:
                             self._durable_cognition_route.reset(route_token)
 
-                    routing_task = asyncio.create_task(
+                    from kestrel_sovereign._async_ownership import create_owned_task
+                    routing_task = create_owned_task(
                         route_durable_cognition(),
                         name=f"durable_cognition_route:{delivery.delivery_id}",
+                        retain_originals=True, admission=routing_admission,
                     )
                 finally:
                     self._durable_retry_skips_coalescing.reset(coalescing_token)
@@ -4504,13 +4959,26 @@ class SignalDispatcher:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if lease_lost in completed:
-                    lease_loss_reason = lease_lost.result()
+                    loss = lease_lost.result()
+                    if isinstance(loss, BaseException):
+                        lease_loss_error = loss
+                        # Publish debt before cancelling the child. Liveness
+                        # cleanup cannot switch back to ordinary admission if
+                        # that child refuses cancellation or returns normally.
+                        self._retain_cognition_native_control(delivery, loss)
+                        self._rearm_cleanup_runtime_owner_heartbeat()
+                        lease_loss_reason = str(loss)
+                    else:
+                        lease_loss_reason = loss
                     if routing_task not in completed:
                         settled = await self._cancel_durable_cognition_routing_task(
                             routing_task,
                             delivery=delivery,
+                            control_error=lease_loss_error,
                         )
                         if not settled:
+                            if lease_loss_error is not None:
+                                raise lease_loss_error
                             result = self._failure_result(
                                 signal,
                                 start,
@@ -4532,7 +5000,25 @@ class SignalDispatcher:
                     signal=routing_signal,
                     start=start,
                 )
-        except asyncio.CancelledError:
+                if lease_loss_error is not None:
+                    raise lease_loss_error
+            # The route may win FIRST_COMPLETED while renewal is unwinding
+            # an in-flight commit. Its owned join can publish control after
+            # that wait; never proceed to ACK/NACK before harvesting it.
+            if lease_lost.done() and isinstance(lease_lost.result(), BaseException):
+                lease_loss_error = execution_finite_error(lease_loss_error, lease_lost.result())
+                raise lease_loss_error
+        except asyncio.CancelledError as error:
+            if routing_task is None and routing_admission.task is not None:
+                from kestrel_sovereign._async_ownership import await_owned_task
+                routing_task = routing_admission.task
+                outcome = await await_owned_task(routing_task)
+                error = execution_finite_error(error, outcome.error, outcome.cancellation,
+                                               retain_originals=True, isolate_control_originals=True)
+            error = execution_finite_error(lease_loss_error, error)
+            if is_execution_control_error(error):
+                error = await self._settle_cognition_control(delivery, error, routing_task)
+                raise error
             if routing_task is not None:
                 # A caller cancellation is not a durable receipt.  Never join
                 # an uncooperative child here: retain it and release the exact
@@ -4541,6 +5027,18 @@ class SignalDispatcher:
                     routing_task.cancel()
                 self._retain_durable_cognition_task(routing_task, delivery=delivery)
             raise
+
+        except BaseException as error:
+            if routing_task is None and routing_admission.task is not None:
+                from kestrel_sovereign._async_ownership import await_owned_task
+                routing_task = routing_admission.task
+                outcome = await await_owned_task(routing_task)
+                error = execution_finite_error(error, outcome.error, outcome.cancellation,
+                                               retain_originals=True, isolate_control_originals=True)
+            error = execution_finite_error(lease_loss_error, error)
+            if is_execution_control_error(error):
+                error = await self._settle_cognition_control(delivery, error, routing_task)
+            raise error
 
         if result is None:
             # A cooperative cancellation has no route-level result.  Its
@@ -4566,7 +5064,12 @@ class SignalDispatcher:
                         lease_token=delivery.lease_token or "",
                         error=failure.error or "Durable cognition routing was cancelled",
                     )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not release durable cognition lease after cancellation: "
                     "delivery=%s",
@@ -4592,7 +5095,12 @@ class SignalDispatcher:
                     delivery_id=delivery.delivery_id,
                     lease_token=delivery.lease_token or "",
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not acknowledge completed durable cognition lease: "
                     "delivery=%s",
@@ -4634,7 +5142,12 @@ class SignalDispatcher:
                     lease_token=delivery.lease_token or "",
                     error="Completed cognition delivery ACK was not accepted",
                 )
-            except Exception:
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                    raise
+                if not isinstance(error, Exception):
+                    raise
                 logger.exception(
                     "Could not release completed durable cognition after ACK rejection: "
                     "delivery=%s",
@@ -4651,11 +5164,16 @@ class SignalDispatcher:
         if self._hold_prevented_execution(result):
             # A final turn-start Hold check can win after the durable lease
             # transfer. No turn ran, so return the exact token and retry budget.
-            await self._release_cognition_hold_lease(
-                consumer_id=consumer_id,
-                persisted_event_id=persisted_event_id,
-                delivery=delivery,
-            )
+            try:
+                await self._release_cognition_hold_lease(
+                    consumer_id=consumer_id,
+                    persisted_event_id=persisted_event_id,
+                    delivery=delivery,
+                )
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                raise
             self._finalize_deferred_durable_outcome(
                 deferred_outcomes,
                 fallback_signal=routing_signal,
@@ -4671,30 +5189,35 @@ class SignalDispatcher:
             Status.DROPPED_VALIDATION,
             Status.DROPPED_CYCLE,
         }
-        released = await self.nack_durable_delivery(
-            consumer_id=consumer_id,
-            delivery_id=delivery.delivery_id,
-            lease_token=delivery.lease_token or "",
-            error=result.error or f"Cognition delivery returned {result.status.value}",
-            retry_delay=retry_delay,
-            terminal=terminal,
-            terminal_ackable=terminal,
-        )
-        if released is None:
+        try:
+            released = await self.nack_durable_delivery(
+                consumer_id=consumer_id,
+                delivery_id=delivery.delivery_id,
+                lease_token=delivery.lease_token or "",
+                error=result.error or f"Cognition delivery returned {result.status.value}",
+                retry_delay=retry_delay,
+                terminal=terminal,
+                terminal_ackable=terminal,
+            )
             # An ordinary NACK correctly refuses an expired lease.  This
             # dispatcher still owns a live managed token, however, so it can
             # make one narrow owner/token-conditional transition after the
             # route task has settled. Preserve a proven terminal no-op in that
             # same atomic update; never turn it into an ordinary retry/failed
             # row and then tell the provider it may advance its cursor.
-            released = await self.release_durable_delivery_after_task(
-                consumer_id=consumer_id,
-                delivery_id=delivery.delivery_id,
-                lease_token=delivery.lease_token or "",
-                error=result.error or f"Cognition delivery returned {result.status.value}",
-                terminal=terminal,
-                terminal_ackable=terminal,
-            )
+            if released is None:
+                released = await self.release_durable_delivery_after_task(
+                    consumer_id=consumer_id,
+                    delivery_id=delivery.delivery_id,
+                    lease_token=delivery.lease_token or "",
+                    error=result.error or f"Cognition delivery returned {result.status.value}",
+                    terminal=terminal,
+                    terminal_ackable=terminal,
+                )
+        except BaseException as error:
+            if is_execution_control_error(error):
+                await self._terminalize_failed_cognition(delivery, error)
+            raise
         # TERMINAL is an external receipt, not a route-level interpretation.
         # Publish it only after this exact delivery row confirms the durable
         # terminal-ackable state. A lost lease/ownership transfer remains
@@ -4728,6 +5251,7 @@ class SignalDispatcher:
         task: asyncio.Task[SignalResult],
         *,
         delivery: DurableDelivery,
+        control_error: BaseException | None = None,
     ) -> bool:
         """Request cancellation, but never let an uncooperative turn pin ingress.
 
@@ -4744,11 +5268,11 @@ class SignalDispatcher:
                 {task}, timeout=_DURABLE_COGNITION_CANCELLATION_GRACE
             )
         except asyncio.CancelledError:
-            self._retain_durable_cognition_task(task, delivery=delivery)
+            self._retain_durable_cognition_task(task, delivery=delivery, control_error=control_error)
             raise
         if task in completed:
             return True
-        self._retain_durable_cognition_task(task, delivery=delivery)
+        self._retain_durable_cognition_task(task, delivery=delivery, control_error=control_error)
         logger.warning(
             "Durable cognition ignored cancellation after lease loss; retained task: "
             "delivery=%s",
@@ -4761,37 +5285,51 @@ class SignalDispatcher:
         task: asyncio.Task[SignalResult],
         *,
         delivery: DurableDelivery,
+        control_error: BaseException | None = None,
     ) -> None:
         """Own and harvest a route task that outlives its ingress dispatch."""
 
         if task in self._retained_durable_cognition_tasks:
+            self._rearm_cleanup_runtime_owner_heartbeat()
             return
         self._retained_durable_cognition_tasks.add(task)
+        self._rearm_cleanup_runtime_owner_heartbeat()
 
         def completed(completed_task: asyncio.Task[SignalResult]) -> None:
-            self._retained_durable_cognition_tasks.discard(completed_task)
-            try:
-                completed_task.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
+            from kestrel_sovereign._async_ownership import owned_task_error
+            # First canonical harvest precedes releasing the physical owner;
+            # Task.result() can erase a cancellation cause on a second read.
+            error = owned_task_error(completed_task)
+            debt = getattr(self, "_retained_cognition_control_debt", {}).get(delivery.delivery_id)
+            from kestrel_sovereign.execution_custody import execution_native_source_error
+            retained_error = execution_native_source_error(control_error, debt[1] if debt else None)
+            if error is not None and is_execution_control_error(error):
+                retained_error = execution_native_source_error(retained_error, error)
+            elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # The route's final disposition was already made visible when
                 # retention began.  Harvest this late exception so it cannot
                 # become an unobserved task failure or a second audit row.
-                logger.exception(
+                logger.error(
                     "Retained durable cognition task failed after lease loss: "
                     "delivery=%s",
                     delivery.delivery_id,
                 )
 
-            if self._durable_shutdown:
+            if self._durable_shutdown and retained_error is None:
                 # Graceful shutdown marks this managed owner stopped.  A
                 # replacement's owner-aware recovery then owns requeueing;
                 # touching the closing backend from this late callback would
                 # violate the lifecycle admission boundary.
+                self._retained_durable_cognition_tasks.discard(completed_task)
                 return
+            if retained_error is not None:
+                if not hasattr(self, "_retained_cognition_control_debt"):
+                    self._retained_cognition_control_debt = {}
+                retained_error = self._retain_cognition_native_control(delivery, retained_error)
+                self._rearm_cleanup_runtime_owner_heartbeat()
+            self._retained_durable_cognition_tasks.discard(completed_task)
             cleanup = asyncio.create_task(
-                self._release_retained_durable_cognition_task(delivery),
+                self._release_retained_durable_cognition_task(delivery, retained_error),
                 name=(
                     "durable_cognition_retained_cleanup:"
                     f"{delivery.delivery_id}"
@@ -4800,13 +5338,14 @@ class SignalDispatcher:
             self._retained_durable_cognition_cleanup_tasks.add(cleanup)
 
             def harvest_cleanup(cleanup_task: asyncio.Task[None]) -> None:
+                from kestrel_sovereign._async_ownership import owned_task_error
+                error = owned_task_error(cleanup_task)
                 self._retained_durable_cognition_cleanup_tasks.discard(cleanup_task)
-                if cleanup_task.cancelled():
-                    return
-                try:
-                    cleanup_task.result()
-                except Exception:
-                    logger.exception(
+                if error is not None and is_execution_control_error(error):
+                    self._retain_cognition_native_control(delivery, error)
+                    self._rearm_cleanup_runtime_owner_heartbeat()
+                elif error is not None and not isinstance(error, asyncio.CancelledError):
+                    logger.error(
                         "Retained durable cognition cleanup failed: delivery=%s",
                         delivery.delivery_id,
                     )
@@ -4816,10 +5355,14 @@ class SignalDispatcher:
         task.add_done_callback(completed)
 
     async def _release_retained_durable_cognition_task(
-        self, delivery: DurableDelivery
+        self, delivery: DurableDelivery, control_error: BaseException | None = None,
     ) -> None:
         """Requeue one exact retained lease only after its task is terminal."""
 
+        if control_error is not None:
+            await self._terminalize_failed_cognition(delivery, control_error)
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            return
         try:
             released = await self.release_durable_delivery_after_task(
                 consumer_id=delivery.consumer_id,
@@ -4827,9 +5370,14 @@ class SignalDispatcher:
                 lease_token=delivery.lease_token or "",
                 error="Cognition task settled after durable lease loss",
             )
-        except _DurableDeliveryShuttingDownError:
-            return
-        except Exception:
+        except BaseException as error:
+            if is_execution_control_error(error):
+                await self._terminalize_failed_cognition(delivery, error)
+                raise
+            if isinstance(error, _DurableDeliveryShuttingDownError):
+                return
+            if not isinstance(error, Exception):
+                raise
             logger.exception(
                 "Could not release retained durable cognition lease: delivery=%s",
                 delivery.delivery_id,
@@ -4842,6 +5390,169 @@ class SignalDispatcher:
                 delivery.delivery_id,
             )
 
+    async def _settle_cognition_control(self, delivery, error, routing_task):
+        """Never terminalize a delivery while its original route can still act."""
+        self._retain_cognition_native_control(delivery, error)
+        self._rearm_cleanup_runtime_owner_heartbeat()
+        if routing_task is not None and not routing_task.done():
+            # A late renewal control can replace cancellation of the context
+            # body before the ordinary cancellation handler reaches this route.
+            # Publish debt first, then interrupt and retain the original child.
+            routing_task.cancel()
+            self._retain_durable_cognition_task(routing_task, delivery=delivery, control_error=error)
+        else:
+            if routing_task is not None:
+                from kestrel_sovereign._async_ownership import owned_task_error
+                from kestrel_sovereign.execution_custody import execution_finite_error
+                error = execution_finite_error(
+                    error, owned_task_error(routing_task), retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            await self._terminalize_failed_cognition(delivery, error)
+        return error
+
+    def _retain_cognition_native_control(self, delivery, *errors):
+        """One source-only boundary for every existing cognition-debt writer."""
+        from kestrel_sovereign.execution_custody import (
+            _native_source_originals, execution_native_source_error,
+        )
+        prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
+        previous = None if prior is None else prior[1]
+        sources = _native_source_originals(previous)
+        incoming = tuple(source for error in errors for source in _native_source_originals(error))
+        if previous is not None and incoming and all(
+            any(source is old for old in sources) for source in incoming
+        ):
+            retained = previous
+        else:
+            retained = execution_native_source_error(previous, *errors)
+        if retained is not None:
+            self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
+        return retained
+
+    async def _terminalize_failed_cognition(
+        self, delivery: DurableDelivery, error: BaseException,
+    ) -> None:
+        """Keep irreversible control evidence non-retryable and non-ACKable."""
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error,
+            owned_task_admission_error,
+        )
+        from kestrel_sovereign.execution_custody import (
+            execution_cleanup_debts, execution_native_source_error, execution_finite_error,
+        )
+
+        retained_error = self._retain_cognition_native_control(delivery, error)
+        self._rearm_cleanup_runtime_owner_heartbeat()
+        key = (self._agent.did, delivery.consumer_id, delivery.delivery_id,
+            self._durable_delivery_owner, delivery.lease_token or "")
+        owners = vars(self).setdefault("_cognition_control_terminal_owners", {})
+        receipts = vars(self).setdefault("_cognition_control_terminal_receipts", {})
+        receipt = receipts.get(key)
+        if receipt is not None and receipt() is not None:
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            return
+        task = owners.get(key)
+        opening = None
+        if task is None or (task.done() and owned_task_error(task) is not None):
+            # Concurrent retention callbacks and shutdown join the SAME native
+            # terminalizer. Its successful original-token receipt survives a
+            # later callback; the cleared CAS cannot manufacture new debt.
+            # A failed metadata attempt keeps the existing bounded exact-token
+            # reconciliation policy, never a replacement owner or work grant.
+            admission = OwnedTaskAdmission()
+            try:
+                task = create_owned_task(
+                    self._apply_cognition_control_terminal(delivery, error),
+                    name=f"durable_cognition_control_terminal:{delivery.delivery_id}",
+                    retirement_resource=delivery, retain_originals=True,
+                    admission=admission,
+                )
+            except BaseException as admission_error:
+                task = admission.task
+                if task is not None:
+                    owners[key] = task
+                opening = owned_task_admission_error(delivery, admission, admission_error)
+                terminal = execution_finite_error(
+                    error, opening, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+                # One bounded source latch owns the exact delivery. A later
+                # allocation refusal is a new caller's finite observation,
+                # not another permanent link in that shared source history.
+                already_unadmitted = any(
+                    resource is delivery and owner is None
+                    for resource, owner in execution_cleanup_debts(retained_error)
+                )
+                retained = (retained_error if already_unadmitted else
+                            execution_native_source_error(terminal) or retained_error)
+                self._retain_cognition_native_control(delivery, retained)
+                if task is None:
+                    raise terminal
+            owners[key] = task
+        outcome = await await_owned_task(task)
+        # Caller cancellation is not a failed receipt. The owned child has
+        # been joined, so clear confirmed settlement before propagating it;
+        # otherwise every retry loses the now-cleared original-token CAS.
+        if opening is None and outcome.error is None:
+            # Keep only the successful original-token receipt while an
+            # original delivery callback still owns its immutable snapshot.
+            # Neither completed tasks nor their signal/ContextVar graph may
+            # become a dispatcher-lifetime cache.
+            def forget_receipt(reference):
+                if receipts.get(key) is reference:
+                    receipts.pop(key, None)
+            receipts[key] = weakref.ref(delivery, forget_receipt)
+            if owners.get(key) is task:
+                owners.pop(key, None)
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+        if opening is not None or outcome.error is not None or outcome.cancellation is not None:
+            terminal = execution_finite_error(
+                error, opening, outcome.error, outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if outcome.error is not None:
+                # An observer's finite C and ordinary retryable metadata error
+                # are not new shared native source facts. Genuine native
+                # terminalizer uncertainty does remain with this delivery.
+                self._retain_cognition_native_control(delivery, retained_error, opening, outcome.error)
+                self._rearm_cleanup_runtime_owner_heartbeat()
+            raise terminal
+
+    async def _apply_cognition_control_terminal(self, delivery, error):
+        reason = f"execution_control_unresolved: {type(error).__name__}: {error}"[:500]
+        backend = self._durable_store.backend
+        if backend.backend_type == "postgres":
+            # Ordinary admission is deliberately still denied. Only the fixed
+            # exact-identity native terminalizer may perform this cleanup CAS.
+            terminalized = await backend.fail_cognition_delivery(
+                agent_id=self._agent.did, consumer_id=delivery.consumer_id,
+                delivery_id=delivery.delivery_id,
+                owner_id=self._durable_delivery_owner,
+                lease_token=delivery.lease_token or "", error=reason,
+            )
+            if not terminalized:
+                note = "original cognition terminalization CAS did not match; cleanup debt remains unresolved"
+                if note not in getattr(error, "__notes__", ()):
+                    error.add_note(note)
+                raise error
+            self._discard_transient_durable_handoff(delivery.delivery_id)
+        else:
+            terminalized = await self.release_durable_delivery_after_task(
+                consumer_id=delivery.consumer_id, delivery_id=delivery.delivery_id,
+                lease_token=delivery.lease_token or "", error=reason,
+                terminal=True, terminal_ackable=False,
+            )
+            if terminalized is None:
+                note = "original cognition terminalization CAS did not match; cleanup debt remains unresolved"
+                if note not in getattr(error, "__notes__", ()):
+                    error.add_note(note)
+                raise error
+
+        self._durable_store._failed_retry_release_receipts.discard(
+            (self._agent.did, delivery.consumer_id, delivery.delivery_id)
+        )
+
     @staticmethod
     def _completed_durable_cognition_result(
         task: asyncio.Task[SignalResult],
@@ -4853,9 +5564,13 @@ class SignalDispatcher:
 
         try:
             return task.result()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if is_execution_control_error(error):
+                raise
             return None
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.exception(
                 "Durable cognition route task failed outside its result contract: "
                 "signal=%s",
@@ -5023,6 +5738,8 @@ class SignalDispatcher:
             if not await self._agent_is_held():
                 return None
         except HoldStateError as exc:
+            if is_execution_control_error(exc):
+                raise
             result = self._failure_result(
                 signal,
                 start,
@@ -5225,6 +5942,8 @@ class SignalDispatcher:
                 )
 
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.exception(
                     "Handler raised for signal %s (source=%s, mode=%s)",
                     signal.id,
@@ -5327,6 +6046,8 @@ class SignalDispatcher:
                         span.set_attribute(KESTREL_TURN_ID, result.turn_id)
                 return result
         except InvocationSelfFencedError as error:
+            if is_execution_control_error(error):
+                raise
             # Losing the distributed owner lease is a fail-closed
             # infrastructure decision, not receipt-backed evidence that an
             # operator requested Stop. Keep durable ingress retryable.
@@ -5339,6 +6060,8 @@ class SignalDispatcher:
                 audit=audit,
             )
         except InvocationCancelledError as error:
+            if is_execution_control_error(error):
+                raise
             # Cooperative Stop is neither a provider failure nor retry
             # authority. Preserve the ordinary route audit while carrying a
             # typed disposition to the durable settlement boundary below.
@@ -5369,6 +6092,8 @@ class SignalDispatcher:
                 audit=audit,
             )
         except HoldStateError as exc:
+            if is_execution_control_error(exc):
+                raise
             # A final turn-start read can fail after the earlier source
             # snapshot. Durable routing recognizes this typed outage and
             # returns its lease attempt-neutrally below.
@@ -5387,6 +6112,8 @@ class SignalDispatcher:
                 audit=audit,
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in
             # `_route_under_locks` calls `_fail` without it. Catch
@@ -5485,6 +6212,19 @@ class SignalDispatcher:
 
         async def await_monitored_execution(execution):
             """Race cognition against source-owned durable withdrawal."""
+            import sys
+
+            from kestrel_sovereign._async_ownership import await_owned_task
+            finite_originals = []
+
+            async def join_sibling(task):
+                outcome = await await_owned_task(task)
+                error = outcome.error
+                # Our withdrawal/cleanup cancellation is expected only when
+                # the worker carries no stronger native control receipt.
+                if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
+                    error = None
+                return error, outcome.cancellation
 
             async def execute_with_tracking():
                 from kestrel_sovereign.hold import source_owns_hold_disposition
@@ -5581,14 +6321,16 @@ class SignalDispatcher:
                     if withdrawal is not None:
                         if not execution_task.done():
                             execution_task.cancel()
-                        await asyncio.gather(
-                            execution_task,
-                            return_exceptions=True,
-                        )
+                        originals = await join_sibling(execution_task)
+                        finite_originals.extend(originals)
+                        error = execution_finite_error(*originals)
+                        if error is not None:
+                            raise error
                         return None, str(withdrawal), None
                 result, tracking = await execution_task
                 return result, None, tracking
             finally:
+                originals = [sys.exc_info()[1], *finite_originals]
                 tasks = tuple(
                     task for task in (execution_task, monitor_task)
                     if task is not None
@@ -5598,19 +6340,25 @@ class SignalDispatcher:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(
-                    *tasks,
-                    return_exceptions=True,
-                )
+                for task in tasks:
+                    originals.extend(await join_sibling(task))
                 finish_execution = getattr(
                     self._agent,
                     "finish_cognition_signal_execution",
                     None,
                 )
                 if callable(finish_execution):
-                    finished = finish_execution(signal)
-                    if inspect.isawaitable(finished):
-                        await finished
+                    try:
+                        finished = finish_execution(signal)
+                        if inspect.isawaitable(finished):
+                            finished_task = asyncio.ensure_future(finished)
+                            outcome = await await_owned_task(finished_task)
+                            originals.extend((outcome.error, outcome.cancellation))
+                    except BaseException as finish_error:
+                        originals.append(finish_error)
+                error = execution_finite_error(*originals)
+                if error is not None:
+                    raise error
 
         # Resolve the constitution body for full-injection sources.
         # Codex round-5 P1 fix: the dispatcher UNCONDITIONALLY
@@ -5633,7 +6381,9 @@ class SignalDispatcher:
                         value = await value
                     if isinstance(value, str):
                         constitution_text = value
-                except Exception:
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.exception(
                         "_get_governing_constitution raised for signal %s; "
                         "the dispatch will refuse to proceed without the "
@@ -5691,7 +6441,9 @@ class SignalDispatcher:
                         refreshed = await refreshed
                     if isinstance(refreshed, str) and refreshed:
                         audit.constitution_hash = refreshed
-                except Exception:
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     logger.exception(
                         "Post-anchor constitution_hash refresh raised for "
                         "signal %s; canary derivation may use stale value",
@@ -5757,7 +6509,7 @@ class SignalDispatcher:
                             SystemPromptNamespaceError,
                         )
 
-                        if isinstance(exc, SystemPromptNamespaceError):
+                        if is_execution_control_error(exc) or isinstance(exc, SystemPromptNamespaceError):
                             raise
                         logger.exception(
                             "Inline-format doctrine resolution failed for "
@@ -5860,301 +6612,284 @@ class SignalDispatcher:
             )
 
         receipt_tool_registered = False
-        if (
-            registration.require_constitution_echo
-            and registration.prompt_template_format == "claude_code"
-            and audit.canary is not None
-        ):
-            register_receipt = getattr(
-                self._agent, "register_constitution_receipt_tool", None
+
+        def clear_registered_receipt(error: BaseException | None = None) -> None:
+            nonlocal receipt_tool_registered
+            if not receipt_tool_registered:
+                return
+            clear_receipt = getattr(
+                self._agent, "clear_constitution_receipt_tool", None,
             )
-            if not callable(register_receipt):
+            try:
+                if callable(clear_receipt):
+                    clear_receipt()
+            except BaseException as cleanup_error:
+                raise execution_finite_error(
+                    error, cleanup_error, retain_originals=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
+                )
+            receipt_tool_registered = False
+
+        receipt_failure = None
+        try:
+            if (
+                registration.require_constitution_echo
+                and registration.prompt_template_format == "claude_code"
+                and audit.canary is not None
+            ):
+                register_receipt = getattr(
+                    self._agent, "register_constitution_receipt_tool", None
+                )
+                if not callable(register_receipt):
+                    return self._fail(
+                        signal,
+                        start,
+                        Status.DROPPED_VALIDATION,
+                        error=(
+                            "require_constitution_echo=True for claude_code "
+                            "but agent cannot register the ephemeral "
+                            "_constitution_receipt tool"
+                        ),
+                        registration=registration,
+                        audit=audit,
+                    )
+                receipt_tool_registered = True
+                value = register_receipt(canary=audit.canary, signal_id=signal.id)
+                if asyncio.iscoroutine(value):
+                    await value
+
+            # Set the in-flight turn's causation chain (already extended
+            # with this hop's frame in step 2 of the pipeline) so outbound
+            # A2A tasks created during the turn carry the lineage forward
+            # (#905 review P1). The chain lives in a ContextVar so
+            # concurrent COGNITION dispatches stay isolated — agent-level
+            # mutable state would race here (#906 review P1: dispatcher
+            # set/clear runs OUTSIDE the CONVERSATION lock that
+            # process_input acquires inside its body).
+            set_chain = getattr(self._agent, "_set_current_chain", None)
+            clear_chain = getattr(self._agent, "_clear_current_chain", None)
+            token = None
+            if set_chain is not None:
+                token = set_chain(signal.causation_chain)
+
+            budget = registration.system_prompt_budget_bytes
+            accepts_anchored = _agent_accepts_kwarg(
+                self._agent.process_input, "anchored_doctrine"
+            )
+            # Resolve anchored doctrine for full-injection sources so the
+            # agent's system-prompt assembler can deliver doctrine content
+            # (TORTOISE_DOCTRINE.md, AGENTS.md). Codex round-16 P2 fix —
+            # without this, the audit recorded the bundle hash but the
+            # model never received the doctrine.
+            anchored_doctrine = None
+            if (
+                registration.constitution_injection == "full"
+                and accepts_anchored
+            ):
+                getter = getattr(self._agent, "get_anchored_doctrine_files", None)
+                if callable(getter):
+                    try:
+                        value = getter()
+                        if asyncio.iscoroutine(value):
+                            value = await value
+                        if value:
+                            anchored_doctrine = value
+                    except BaseException as exc:
+                        from kestrel_sovereign.agent.system_prompt_assembler import (
+                            SystemPromptNamespaceError,
+                        )
+
+                        if (not isinstance(exc, Exception)
+                            or is_execution_control_error(exc)
+                            or isinstance(exc, SystemPromptNamespaceError)):
+                            # Receipt registration and causation binding happen
+                            # before doctrine resolution. This validation error is
+                            # intentionally loud, but it must not leave either
+                            # ephemeral capability visible to a later turn.
+                            if clear_chain is not None:
+                                clear_chain(token)
+                            raise
+                        logger.exception(
+                            "agent.get_anchored_doctrine_files raised for "
+                            "signal %s; proceeding without anchored doctrine",
+                            signal.id,
+                        )
+            process_input_kwargs: dict[str, Any] = {}
+            # Give signal cognition a known lifecycle address. Durable cognition
+            # holds a second registration for this same generation until its
+            # selected delivery is settled, so cooperative Stop cannot publish a
+            # receipt in the process-input/terminal-NACK crash window.
+            if _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
+                process_input_kwargs["invocation_id"] = signal.id
+            if pre_turn_guard is not None:
+                # Bind the signal now; evaluate inside the turn's span. The turn
+                # decides an admission, it does not read signal envelopes, so what
+                # crosses the boundary is a zero-argument verdict. The agent's
+                # capability was already checked above, so this cannot be dropped
+                # silently here.
+                process_input_kwargs["pre_turn_guard"] = functools.partial(
+                    pre_turn_guard, signal
+                )
+            if addendum is not None and accepts_addendum:
+                process_input_kwargs["system_prompt_addendum"] = addendum
+            if budget is not None and accepts_budget:
+                process_input_kwargs["system_prompt_budget_bytes"] = budget
+            if anchored_doctrine is not None:
+                process_input_kwargs["anchored_doctrine"] = anchored_doctrine
+            # A wake turn's session is ONE value, fixed here before the turn starts
+            # (#3429). A bound signal resumes its originating session (e.g. the
+            # restart.completed wake carries the session the restart was requested
+            # from, #1809), so the turn lands in that chat window. An unbound
+            # signal gets a fresh session of its own. Passing None instead left the
+            # turn running with no session while the store filed each row through
+            # the 30-minute time-gap heuristic at write time — gluing unattended
+            # work into whatever chat was newest, or minting a new session per
+            # wake — and work dispatched from that turn stamped an empty origin,
+            # so its own wake was unbound again. With an explicit session, the
+            # turn's rows, its live binding, and the origin its dispatches record
+            # are the same value: one session per autonomous chain. Visibility is
+            # still the signal's: nobody is watching a minted session, so the wake
+            # stays INTERNAL. Guarded by signature inspection like the other
+            # optional kwargs.
+            if _agent_accepts_kwarg(self._agent.process_input, "session_id"):
+                process_input_kwargs["session_id"] = (
+                    signal.session_id or new_session_id()
+                )
+
+            # Tag the persisted wake turn so the transcript renderer collapses this
+            # internal COGNITION prompt to an "Autonomous wake" chip on reload
+            # instead of surfacing the raw instruction template as a user message.
+            # Guarded by signature inspection like the other optional kwargs.
+            if _agent_accepts_kwarg(self._agent.process_input, "signal_wake"):
+                process_input_kwargs["signal_wake"] = {
+                    "source": signal.source,
+                    "mode": signal.mode.value,
+                }
+
+            # The event's ``result_summary`` is capped, so the chat console loads a
+            # long reply from the row that stores it (#3655). The turn names that
+            # row here: by this wake's own stamp, never "the newest reply in the
+            # session", which in an autonomous chain can be another wake's.
+            wake_reply: Optional[WakeReplyReceipt] = None
+            if _agent_accepts_kwarg(self._agent.process_input, "wake_reply"):
+                wake_reply = WakeReplyReceipt(signal_id=signal.id)
+                process_input_kwargs["wake_reply"] = wake_reply
+
+            execution_withdrawal = None
+            pre_turn_refusal: Optional[str] = None
+            injection_tracking = None
+            with capture_turn_ids() as cognition_turn_ids:
+                try:
+                    if process_input_kwargs:
+                        result, execution_withdrawal, injection_tracking = (
+                            await await_monitored_execution(
+                                self._agent.process_input(prompt, **process_input_kwargs)
+                            )
+                        )
+                    else:
+                        result, execution_withdrawal, injection_tracking = (
+                            await await_monitored_execution(
+                                self._agent.process_input(prompt)
+                            )
+                        )
+                except PreTurnRefusal as refusal:
+                    # #3310: the source's guard refused from inside the turn's
+                    # privacy-transition span, before any of the turn body ran.
+                    # That is a policy decision, not a failure — it gets the same
+                    # DROPPED_VALIDATION shape as a durable withdrawal, so the
+                    # occurrence is non-success and no turn is behind it.
+                    pre_turn_refusal = str(refusal) or "pre_turn_guard refused the turn"
+                finally:
+                    if clear_chain is not None:
+                        clear_chain(token)
+
+            if wake_reply is not None:
+                setattr(signal, _REPLY_MESSAGE_ID_ATTR, wake_reply.message_id)
+
+            if pre_turn_refusal is not None:
                 return self._fail(
                     signal,
                     start,
                     Status.DROPPED_VALIDATION,
-                    error=(
-                        "require_constitution_echo=True for claude_code "
-                        "but agent cannot register the ephemeral "
-                        "_constitution_receipt tool"
-                    ),
+                    error=pre_turn_refusal,
                     registration=registration,
                     audit=audit,
                 )
-            value = register_receipt(canary=audit.canary, signal_id=signal.id)
-            if asyncio.iscoroutine(value):
-                await value
-            receipt_tool_registered = True
 
-        # Set the in-flight turn's causation chain (already extended
-        # with this hop's frame in step 2 of the pipeline) so outbound
-        # A2A tasks created during the turn carry the lineage forward
-        # (#905 review P1). The chain lives in a ContextVar so
-        # concurrent COGNITION dispatches stay isolated — agent-level
-        # mutable state would race here (#906 review P1: dispatcher
-        # set/clear runs OUTSIDE the CONVERSATION lock that
-        # process_input acquires inside its body).
-        set_chain = getattr(self._agent, "_set_current_chain", None)
-        clear_chain = getattr(self._agent, "_clear_current_chain", None)
-        token = None
-        if set_chain is not None:
-            token = set_chain(signal.causation_chain)
-
-        budget = registration.system_prompt_budget_bytes
-        accepts_anchored = _agent_accepts_kwarg(
-            self._agent.process_input, "anchored_doctrine"
-        )
-        # Resolve anchored doctrine for full-injection sources so the
-        # agent's system-prompt assembler can deliver doctrine content
-        # (TORTOISE_DOCTRINE.md, AGENTS.md). Codex round-16 P2 fix —
-        # without this, the audit recorded the bundle hash but the
-        # model never received the doctrine.
-        anchored_doctrine = None
-        if (
-            registration.constitution_injection == "full"
-            and accepts_anchored
-        ):
-            getter = getattr(self._agent, "get_anchored_doctrine_files", None)
-            if callable(getter):
-                try:
-                    value = getter()
-                    if asyncio.iscoroutine(value):
-                        value = await value
-                    if value:
-                        anchored_doctrine = value
-                except Exception as exc:
-                    from kestrel_sovereign.agent.system_prompt_assembler import (
-                        SystemPromptNamespaceError,
-                    )
-
-                    if isinstance(exc, SystemPromptNamespaceError):
-                        # Receipt registration and causation binding happen
-                        # before doctrine resolution. This validation error is
-                        # intentionally loud, but it must not leave either
-                        # ephemeral capability visible to a later turn.
-                        try:
-                            if receipt_tool_registered:
-                                clear_receipt = getattr(
-                                    self._agent,
-                                    "clear_constitution_receipt_tool",
-                                    None,
-                                )
-                                if callable(clear_receipt):
-                                    clear_receipt()
-                        finally:
-                            if clear_chain is not None:
-                                clear_chain(token)
-                        raise
-                    logger.exception(
-                        "agent.get_anchored_doctrine_files raised for "
-                        "signal %s; proceeding without anchored doctrine",
-                        signal.id,
-                    )
-        process_input_kwargs: dict[str, Any] = {}
-        # Give signal cognition a known lifecycle address. Durable cognition
-        # holds a second registration for this same generation until its
-        # selected delivery is settled, so cooperative Stop cannot publish a
-        # receipt in the process-input/terminal-NACK crash window.
-        if _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
-            process_input_kwargs["invocation_id"] = signal.id
-        if pre_turn_guard is not None:
-            # Bind the signal now; evaluate inside the turn's span. The turn
-            # decides an admission, it does not read signal envelopes, so what
-            # crosses the boundary is a zero-argument verdict. The agent's
-            # capability was already checked above, so this cannot be dropped
-            # silently here.
-            process_input_kwargs["pre_turn_guard"] = functools.partial(
-                pre_turn_guard, signal
-            )
-        if addendum is not None and accepts_addendum:
-            process_input_kwargs["system_prompt_addendum"] = addendum
-        if budget is not None and accepts_budget:
-            process_input_kwargs["system_prompt_budget_bytes"] = budget
-        if anchored_doctrine is not None:
-            process_input_kwargs["anchored_doctrine"] = anchored_doctrine
-        # A wake turn's session is ONE value, fixed here before the turn starts
-        # (#3429). A bound signal resumes its originating session (e.g. the
-        # restart.completed wake carries the session the restart was requested
-        # from, #1809), so the turn lands in that chat window. An unbound
-        # signal gets a fresh session of its own. Passing None instead left the
-        # turn running with no session while the store filed each row through
-        # the 30-minute time-gap heuristic at write time — gluing unattended
-        # work into whatever chat was newest, or minting a new session per
-        # wake — and work dispatched from that turn stamped an empty origin,
-        # so its own wake was unbound again. With an explicit session, the
-        # turn's rows, its live binding, and the origin its dispatches record
-        # are the same value: one session per autonomous chain. Visibility is
-        # still the signal's: nobody is watching a minted session, so the wake
-        # stays INTERNAL. Guarded by signature inspection like the other
-        # optional kwargs.
-        if _agent_accepts_kwarg(self._agent.process_input, "session_id"):
-            process_input_kwargs["session_id"] = (
-                signal.session_id or new_session_id()
-            )
-
-        # Tag the persisted wake turn so the transcript renderer collapses this
-        # internal COGNITION prompt to an "Autonomous wake" chip on reload
-        # instead of surfacing the raw instruction template as a user message.
-        # Guarded by signature inspection like the other optional kwargs.
-        if _agent_accepts_kwarg(self._agent.process_input, "signal_wake"):
-            process_input_kwargs["signal_wake"] = {
-                "source": signal.source,
-                "mode": signal.mode.value,
-            }
-
-        # The event's ``result_summary`` is capped, so the chat console loads a
-        # long reply from the row that stores it (#3655). The turn names that
-        # row here: by this wake's own stamp, never "the newest reply in the
-        # session", which in an autonomous chain can be another wake's.
-        wake_reply: Optional[WakeReplyReceipt] = None
-        if _agent_accepts_kwarg(self._agent.process_input, "wake_reply"):
-            wake_reply = WakeReplyReceipt(signal_id=signal.id)
-            process_input_kwargs["wake_reply"] = wake_reply
-
-        execution_withdrawal = None
-        pre_turn_refusal: Optional[str] = None
-        injection_tracking = None
-        with capture_turn_ids() as cognition_turn_ids:
-            try:
-                if process_input_kwargs:
-                    result, execution_withdrawal, injection_tracking = (
-                        await await_monitored_execution(
-                            self._agent.process_input(prompt, **process_input_kwargs)
-                        )
-                    )
-                else:
-                    result, execution_withdrawal, injection_tracking = (
-                        await await_monitored_execution(
-                            self._agent.process_input(prompt)
-                        )
-                    )
-            except PreTurnRefusal as refusal:
-                # #3310: the source's guard refused from inside the turn's
-                # privacy-transition span, before any of the turn body ran.
-                # That is a policy decision, not a failure — it gets the same
-                # DROPPED_VALIDATION shape as a durable withdrawal, so the
-                # occurrence is non-success and no turn is behind it.
-                if receipt_tool_registered:
-                    clear_receipt = getattr(
-                        self._agent, "clear_constitution_receipt_tool", None
-                    )
-                    if callable(clear_receipt):
-                        clear_receipt()
-                    receipt_tool_registered = False
-                pre_turn_refusal = str(refusal) or "pre_turn_guard refused the turn"
-            except Exception:
-                if receipt_tool_registered:
-                    clear_receipt = getattr(
-                        self._agent, "clear_constitution_receipt_tool", None
-                    )
-                    if callable(clear_receipt):
-                        clear_receipt()
-                raise
-            finally:
-                if clear_chain is not None:
-                    clear_chain(token)
-
-        if wake_reply is not None:
-            setattr(signal, _REPLY_MESSAGE_ID_ATTR, wake_reply.message_id)
-
-        if pre_turn_refusal is not None:
-            return self._fail(
-                signal,
-                start,
-                Status.DROPPED_VALIDATION,
-                error=pre_turn_refusal,
-                registration=registration,
-                audit=audit,
-            )
-
-        if execution_withdrawal is not None:
-            if receipt_tool_registered:
-                clear_receipt = getattr(
-                    self._agent, "clear_constitution_receipt_tool", None
-                )
-                if callable(clear_receipt):
-                    clear_receipt()
-            return self._fail(
-                signal,
-                start,
-                Status.DROPPED_VALIDATION,
-                error=execution_withdrawal,
-                registration=registration,
-                audit=audit,
-            )
-
-        # Codex round-13/14 P2: surface the agent's actual
-        # injected/dropped clause tracking from the budget-aware
-        # assembler into the signal_log audit. The tracking is
-        # published per-async-task via a ContextVar in
-        # `kestrel_sovereign.agent.context_manager`, so concurrent
-        # COGNITION dispatches don't race on a shared attribute.
-        if injection_tracking is not None:
-            tracked_injected, tracked_dropped = injection_tracking
-            if tracked_injected is not None:
-                # Merge: dispatcher's KESTREL_CONSTITUTION marker
-                # plus the assembler's own clause list. Use a
-                # de-duplicated, order-preserving merge.
-                merged = list(audit.injected_clauses or [])
-                for clause in tracked_injected:
-                    if clause not in merged:
-                        merged.append(clause)
-                audit.injected_clauses = merged
-            if tracked_dropped:
-                audit.dropped_clauses = list(tracked_dropped)
-
-        # Step B: post-dispatch echo verification. If the source
-        # opted in to `require_constitution_echo=True` the dispatcher
-        # asks the agent for the format-specific receipt — checking
-        # against the SAME canary that was injected pre-dispatch
-        # (audit.canary, derived in Step A.5). Anything other than
-        # VERIFIED flips the dispatch to FAILED with
-        # `error="constitution_not_received"` per design §3 — codex
-        # round-3 P2 fix: NOT_REQUIRED returned by a verifier when
-        # echo IS required is a contract violation, not a pass.
-        if registration.require_constitution_echo:
-            await self._verify_canary_post_dispatch(
-                signal, registration, audit, response=result
-            )
-            if receipt_tool_registered:
-                clear_receipt = getattr(
-                    self._agent, "clear_constitution_receipt_tool", None
-                )
-                if callable(clear_receipt):
-                    clear_receipt()
-                receipt_tool_registered = False
-            if audit.echo_canary_status is CanaryStatus.VERIFIED:
-                record_echo_verified(signal.source)
-            else:
-                record_echo_missing(signal.source)
+            if execution_withdrawal is not None:
                 return self._fail(
                     signal,
                     start,
-                    Status.FAILED,
-                    error="constitution_not_received",
+                    Status.DROPPED_VALIDATION,
+                    error=execution_withdrawal,
                     registration=registration,
                     audit=audit,
                 )
 
-        if receipt_tool_registered:
-            clear_receipt = getattr(
-                self._agent, "clear_constitution_receipt_tool", None
-            )
-            if callable(clear_receipt):
-                clear_receipt()
+            # Codex round-13/14 P2: surface the agent's actual
+            # injected/dropped clause tracking from the budget-aware
+            # assembler into the signal_log audit. The tracking is
+            # published per-async-task via a ContextVar in
+            # `kestrel_sovereign.agent.context_manager`, so concurrent
+            # COGNITION dispatches don't race on a shared attribute.
+            if injection_tracking is not None:
+                tracked_injected, tracked_dropped = injection_tracking
+                if tracked_injected is not None:
+                    # Merge: dispatcher's KESTREL_CONSTITUTION marker
+                    # plus the assembler's own clause list. Use a
+                    # de-duplicated, order-preserving merge.
+                    merged = list(audit.injected_clauses or [])
+                    for clause in tracked_injected:
+                        if clause not in merged:
+                            merged.append(clause)
+                    audit.injected_clauses = merged
+                if tracked_dropped:
+                    audit.dropped_clauses = list(tracked_dropped)
 
-        return self._success(
-            signal,
-            start,
-            registration,
-            audit=audit,
-            cognition_result=result,
-            turn_id=(
-                cognition_turn_ids[0]
-                if len(cognition_turn_ids) == 1
-                else None
-            ),
-        )
+            # Step B: post-dispatch echo verification. If the source
+            # opted in to `require_constitution_echo=True` the dispatcher
+            # asks the agent for the format-specific receipt — checking
+            # against the SAME canary that was injected pre-dispatch
+            # (audit.canary, derived in Step A.5). Anything other than
+            # VERIFIED flips the dispatch to FAILED with
+            # `error="constitution_not_received"` per design §3 — codex
+            # round-3 P2 fix: NOT_REQUIRED returned by a verifier when
+            # echo IS required is a contract violation, not a pass.
+            if registration.require_constitution_echo:
+                await self._verify_canary_post_dispatch(
+                    signal, registration, audit, response=result
+                )
+                if audit.echo_canary_status is CanaryStatus.VERIFIED:
+                    record_echo_verified(signal.source)
+                else:
+                    record_echo_missing(signal.source)
+                    return self._fail(
+                        signal,
+                        start,
+                        Status.FAILED,
+                        error="constitution_not_received",
+                        registration=registration,
+                        audit=audit,
+                    )
+
+
+            return self._success(
+                signal,
+                start,
+                registration,
+                audit=audit,
+                cognition_result=result,
+                turn_id=(
+                    cognition_turn_ids[0]
+                    if len(cognition_turn_ids) == 1
+                    else None
+                ),
+            )
+        except BaseException as error:
+            receipt_failure = error
+            raise
+        finally:
+            clear_registered_receipt(receipt_failure)
 
     async def _ensure_doctrine_bundle_anchored(self) -> None:
         """Codex round-18 P1: ensure the doctrine bundle is anchored
@@ -6175,7 +6910,9 @@ class SignalDispatcher:
             value = ensure()
             if asyncio.iscoroutine(value):
                 await value
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.exception(
                 "agent.ensure_doctrine_bundle_anchored raised; "
                 "drift detection may be skipped for this dispatch"
@@ -6213,7 +6950,9 @@ class SignalDispatcher:
                 if asyncio.iscoroutine(value):
                     value = await value
                 audit.constitution_hash = value
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception(
                     "agent.get_constitution_hash raised for signal %s; "
                     "leaving constitution_hash NULL",
@@ -6232,7 +6971,9 @@ class SignalDispatcher:
                 if asyncio.iscoroutine(value):
                     value = await value
                 anchored_hash = value
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception(
                     "agent.get_anchored_doctrine_bundle_hash raised for "
                     "signal %s",
@@ -6246,7 +6987,9 @@ class SignalDispatcher:
                 if asyncio.iscoroutine(value):
                     value = await value
                 live_hash = value
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 logger.exception(
                     "agent.compute_live_doctrine_bundle_hash raised for "
                     "signal %s",
@@ -6337,7 +7080,9 @@ class SignalDispatcher:
             value = verifier(**verifier_kwargs)
             if asyncio.iscoroutine(value):
                 value = await value
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.exception(
                 "agent.verify_constitution_echo raised for signal %s",
                 signal.id,
@@ -6524,17 +7269,17 @@ class SignalDispatcher:
                 if not signal_tasks:
                     self._outcome_log_tasks_by_signal.pop(signal.id, None)
             self._release_durable_admission(reservation)
-            if task.cancelled():
-                return
-            try:
-                task.result()
-            except Exception:
+            from kestrel_sovereign._async_ownership import owned_task_error
+            error = owned_task_error(task)
+            if error is not None and is_execution_control_error(error):
+                self._retain_durable_writer_control(error)
+            elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # _log_safe reports storage/UI errors itself.  This is a
                 # defensive harvest for an unexpected task-body failure.
                 logger.error(
                     "Signal outcome-log task failed for %s",
                     signal.id,
-                    exc_info=True,
+                    exc_info=(type(error), error, error.__traceback__),
                 )
 
         task.add_done_callback(_complete)
@@ -6556,32 +7301,10 @@ class SignalDispatcher:
             self._write_outcome_log(signal, registration, result, audit=audit),
             name=f"durable_signal_log_writer:{signal.source}:{signal.id}",
         )
-        cancelled = False
-        while not writer.done():
-            try:
-                await asyncio.shield(writer)
-            except asyncio.CancelledError:
-                # Preserve cancellation for the caller after the accepted
-                # write has reached a terminal outcome.  Repeated
-                # cancellation cannot create a post-close SQLite operation.
-                cancelled = True
-                continue
-            except Exception:
-                # ``asyncio.shield`` re-raises the writer's own failure here.
-                # Without this branch it escaped ``_log_safe`` entirely, so the
-                # handler below never ran: from #2713 (2026-07-24) until now a
-                # dropped signal_log row produced NO log line at all, because
-                # ``_track_background_task`` only discards and shutdown's
-                # ``gather(return_exceptions=True)`` swallows the rest.
-                #
-                # The failure is reported once, from ``writer.result()`` below,
-                # which is also where the loss is counted.  Break rather than
-                # handle it here so there is exactly one reporting path.
-                break
-
-        try:
-            writer.result()
-        except Exception as exc:
+        from kestrel_sovereign._async_ownership import await_owned_task
+        outcome = await await_owned_task(writer)
+        exc = outcome.error
+        if exc is not None:
             # A dropped audit row is a loss, and a loss that leaves no record
             # anyone reads is indistinguishable from no loss at all (#2660):
             # 3,323 of these accumulated in a log file over two months before
@@ -6593,9 +7316,15 @@ class SignalDispatcher:
             # backend that is unavailable. This is an observability signal,
             # not a second audit trail.
             self._record_log_write_failure(signal.id, exc)
-            logger.exception("Failed to write signal_log entry for %s", signal.id)
-        if cancelled:
-            raise asyncio.CancelledError()
+            logger.error("Failed to write signal_log entry for %s", signal.id,
+                         exc_info=(type(exc), exc, exc.__traceback__))
+            if is_execution_control_error(exc):
+                self._retain_durable_writer_control(exc)
+                raise execution_finite_error(exc, outcome.cancellation)
+            if not isinstance(exc, Exception):
+                raise execution_finite_error(exc, outcome.cancellation)
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
 
     def _record_log_write_failure(
         self, signal_id: str, error: BaseException
@@ -6642,9 +7371,9 @@ class SignalDispatcher:
 
     @property
     def durable_shutdown_owner_fenced(self) -> bool:
-        """Whether shutdown returned while live cognition still owns this lease."""
+        """Whether live cognition or control-cleanup debt still retains its owner."""
 
-        return self._durable_shutdown_owner_fenced
+        return self._durable_shutdown_owner_fenced or getattr(self, "_durable_control_cleanup_fenced", False)
 
     async def _write_outcome_log(
         self,

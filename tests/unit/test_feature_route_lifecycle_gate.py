@@ -18,19 +18,10 @@ actual server/app path, asserting:
   resumes on re-enable — proving the receiver set is live, not a stale startup
   snapshot.
 
-Mutation notes (#3258). The match gate (``_gated_matches`` in ``server.py``)
-and the dispatch gate (``_feature_route_gone_response``) refuse the same
-routes with outcomes a plain 404 or a bare disconnect cannot tell apart.
-The assertions that pin the MATCH gate specifically are the websocket close
-code (1000 from the match gate, 1008 from dispatch) and the wrong-method
-requests to a refused path (404 from the match gate; a neutered match gate
-lets Starlette answer 405). Mutants that must fail this module:
-``_gated_matches`` returning Starlette's match unconditionally; its
-live-route check dropped; ``_resolve_live_route_agent`` rebinding with
-more than one survivor (``if survivors:``) or keeping a scoped agent the
-manager no longer lists (``return scoped_agent``). Its ``agent is None``
-guards are redundant with ``_live_feature_route(None, ...) -> None`` and
-are equivalent mutants: dropping one changes nothing observable.
+Mutation notes: the native router match gate and dispatch gate both refuse
+withdrawn features. WebSocket close codes pin matching (1000 instead of 1008),
+and a feature removed between matching and handling pins the dispatch check.
+Cross-agent requests and app dependencies also pin the native inclusion wiring.
 """
 
 import os
@@ -41,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from fastapi.routing import iter_route_contexts
 from starlette.websockets import WebSocketDisconnect
 
 from kestrel_sovereign.features.bridge.feature import BridgeFeature
@@ -152,8 +144,8 @@ class _DriftedRouterFeature:
         return router
 
 
-class _PartiallyCopiedRouterFeature:
-    """A router whose mounted child FastAPI cannot be copied by include_router."""
+class _UnsupportedChildRouterFeature:
+    """A router whose mounted child is outside the live API-route contract."""
 
     def __init__(self):
         self.enabled = True
@@ -300,7 +292,8 @@ def _event_count(stub: "_WebhookFeatureStub") -> int:
 
 def _bridge_health_route_count(app) -> int:
     return sum(
-        1 for r in app.routes if getattr(r, "path", None) == "/api/bridge/health"
+        1 for route in iter_route_contexts(app.routes)
+        if route.path == "/api/bridge/health"
     )
 
 
@@ -378,28 +371,79 @@ def test_repeated_feature_mounts_are_deduplicated_and_unmounted():
     assert _bridge_health_route_count(app) == 0
 
 
-def test_invalid_feature_router_rolls_back_partially_included_routes():
-    """A non-copyable child cannot leave an ungated route or retry duplicate."""
+def test_unsupported_child_is_rejected_before_native_inclusion():
+    """An unsupported child cannot publish a route or claim a dedup key."""
 
     from kestrel_sovereign import server
 
-    feature = _PartiallyCopiedRouterFeature()
+    feature = _UnsupportedChildRouterFeature()
     app = FastAPI()
     app.state.agent = _make_agent({"PartialFeature": feature})
     app.state.agent_manager = None
     normal_path = "/test-feature-lifecycle/partial-normal"
 
     server._mount_feature_routers(app)
-    assert not any(getattr(route, "path", None) == normal_path for route in app.routes)
+    assert not any(
+        route.path == normal_path for route in iter_route_contexts(app.routes)
+    )
     assert getattr(app.state, "_feature_routes", []) == []
     assert getattr(app.state, "_feature_router_keys", set()) == set()
 
-    # A retry sees the same invalid shape but cannot accumulate an earlier
-    # copied route; this guards both runtime reloads and repeated cold wakes.
+    # A retry must remain an honest refusal without accumulating routes.
     server._mount_feature_routers(app)
-    assert not any(getattr(route, "path", None) == normal_path for route in app.routes)
+    assert not any(
+        route.path == normal_path for route in iter_route_contexts(app.routes)
+    )
     assert getattr(app.state, "_feature_routes", []) == []
     assert getattr(app.state, "_feature_router_keys", set()) == set()
+
+
+@pytest.mark.parametrize("registration", ["events", "lifespan"])
+def test_failed_projection_reverts_every_native_registration(registration, monkeypatch):
+    from kestrel_sovereign import server
+
+    async def event():
+        pass
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        yield
+
+    options = {"on_startup": [event], "on_shutdown": [event]} if registration == "events" else {"lifespan": lifespan}
+    router = APIRouter(**options)
+
+    @router.get("/projection-failure")
+    async def endpoint():
+        return {"ok": True}
+
+    app = FastAPI()
+    app.state.agent = _make_agent({"ProjectionFeature": SimpleNamespace(enabled=True, get_router=lambda: router)})
+    app.state.agent_manager = None
+    before_routes = list(app.routes)
+    before_startup = list(app.router.on_startup)
+    before_shutdown = list(app.router.on_shutdown)
+    before_lifespan = app.router.lifespan_context
+    observer = APIRouter()
+    observer.include_router(app.router, prefix="/observed")
+
+    def fail_projection(*args):
+        # A native consumer can cache the temporarily included graph before
+        # projection fails. Rollback must invalidate that graph as well.
+        assert any(context.path == "/observed/projection-failure" for context in iter_route_contexts(observer.routes))
+        raise TypeError("projection refused")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(server._LiveFeatureRoute, "bind", fail_projection)
+        server._mount_feature_routers(app)
+        assert app.routes == before_routes
+        assert app.router.on_startup == before_startup
+        assert app.router.on_shutdown == before_shutdown
+        assert app.router.lifespan_context is before_lifespan
+        assert app.state._feature_router_keys == set()
+        assert not any(context.path == "/observed/projection-failure" for context in iter_route_contexts(observer.routes))
+
+    server._mount_feature_routers(app)
+    assert sum(context.path == "/projection-failure" for context in iter_route_contexts(app.routes)) == 1
 
 
 def test_dynamic_feature_routes_invalidate_openapi_schema_on_mount_and_unmount():
@@ -477,7 +521,9 @@ def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
     app, restore = _boot_multi_agent(agents)
     path = "/test-feature-lifecycle/instance-bound"
     try:
-        assert sum(1 for route in app.routes if getattr(route, "path", None) == path) == 1
+        assert sum(
+            route.path == path for route in iter_route_contexts(app.routes)
+        ) == 1
         headers = {"X-API-Key": API_KEY}
         with TestClient(app) as client:
             assert client.get(f"/api/agents/alice{path}", headers=headers).json() == {
@@ -500,7 +546,7 @@ def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
             agents["bob"].features.pop("ProxyFeature")
             assert client.get(f"/api/agents/bob{path}", headers=headers).status_code == 404
             assert sum(
-                1 for route in app.routes if getattr(route, "path", None) == path
+                route.path == path for route in iter_route_contexts(app.routes)
             ) == 1
     finally:
         restore()
@@ -533,13 +579,14 @@ def test_request_scoped_feature_route_closes_when_target_is_unpublished():
         restore()
 
 
-def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
+@pytest.mark.parametrize("nested_prefix", ["", "/nested"])
+def test_current_feature_route_keeps_app_overrides_and_live_dependencies(nested_prefix):
     """Current feature dispatch must preserve FastAPI's app-bound execution.
 
     The mounted route belongs to Alice, but this request selects Bob. The
     router-level dependency must therefore be Bob's, while the app-level
     dependency and dependency override still run through the app-owned route
-    copy rather than Bob's source ``current.app``.
+    inclusion context rather than Bob's source route.
     """
 
     os.environ["KESTREL_API_KEY"] = API_KEY
@@ -553,6 +600,11 @@ def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
 
     alice = _DependencyBoundRouterFeature("alice", events)
     bob = _DependencyBoundRouterFeature("bob", events)
+    if nested_prefix:
+        for feature in (alice, bob):
+            outer = APIRouter()
+            outer.include_router(feature.get_router(), prefix=nested_prefix)
+            feature._router = outer
     agents = {
         "alice": _make_agent({"ProxyFeature": alice}),
         "bob": _make_agent({"ProxyFeature": bob}),
@@ -565,9 +617,11 @@ def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
     app.dependency_overrides[_overrideable_feature_route_dependency] = (
         dependency_override
     )
-    path = "/test-feature-lifecycle/dependency-bound"
+    path = f"{nested_prefix}/test-feature-lifecycle/dependency-bound"
     try:
         with TestClient(app) as client:
+            schema = client.get("/openapi.json", headers={"X-API-Key": API_KEY}).json()
+            assert path in schema["paths"]
             response = client.get(
                 f"/api/agents/bob{path}",
                 headers={"X-API-Key": API_KEY},
@@ -626,7 +680,7 @@ def test_first_dynamic_webhook_candidate_mounts_shared_dispatch_before_publish()
     assert getattr(app.state, "_feature_webhook_dispatch_mounted", False)
     assert any(
         getattr(route, "path", None) == "/webhooks/{webhook_name}"
-        for route in app.routes
+        for route in iter_route_contexts(app.routes)
     )
     # Simulate the later atomic publication commit. The already-mounted live
     # provider must now resolve and dispatch to this receiver.
@@ -1161,8 +1215,8 @@ def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_
         restore()
 
 
-def test_unprefixed_feature_route_rebinds_to_the_only_survivor():
-    """One remaining agent that serves the shape is not an ambiguous choice."""
+def test_unprefixed_feature_route_requires_an_agent_url_after_owner_withdrawal():
+    """An address never silently switches agents after its owner disappears."""
 
     os.environ["KESTREL_API_KEY"] = API_KEY
     alice = _InstanceBoundRouterFeature("alice-v1")
@@ -1178,17 +1232,16 @@ def test_unprefixed_feature_route_rebinds_to_the_only_survivor():
         with TestClient(app) as client:
             assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
             agents.pop("alice")
-            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert client.get(path, headers=headers).status_code == 404
+            assert bob.served == 0
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {"owner": "bob-v1"}
             assert alice.served == 1 and bob.served == 1
     finally:
         restore()
 
 
-def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
-    """A candidate that no longer serves the shape (feature disabled, or the
-    feature removed) does not count: with it gone the other one is the only
-    survivor and serves; with both live the unprefixed form is refused."""
-
+def test_unprefixed_route_stays_unbound_while_other_agents_change():
+    """Peer lifecycle changes cannot claim an unprefixed address."""
     os.environ["KESTREL_API_KEY"] = API_KEY
     alice = _InstanceBoundRouterFeature("alice-v1")
     bob = _InstanceBoundRouterFeature("bob-v1")
@@ -1204,28 +1257,17 @@ def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
     try:
         with TestClient(app) as client:
             agents.pop("alice")
-            assert client.get(path, headers=headers).status_code == 404
-            # Refused at the match gate: wrong method is 404, never 405 (#3258).
-            assert client.post(path, headers=headers).status_code == 404
-
-            bob.enabled = False
-            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
-            assert bob.served == 0
-
-            bob.enabled = True
-            assert client.get(path, headers=headers).status_code == 404
-            assert client.post(path, headers=headers).status_code == 404
-
-            agents["bob"].features.pop("ProxyFeature")
-            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
-            assert bob.served == 0 and carol.served == 2
-
-            # Enabled and same-named, but the shape is gone from its router:
-            # not a survivor of THIS route, so carol is still the only one.
-            drifted = _DriftedRouterFeature()
-            agents["bob"].features["ProxyFeature"] = drifted
-            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
-            assert drifted.served == 0 and carol.served == 3
+            for state in ("active", "disabled", "removed", "drifted"):
+                if state == "disabled":
+                    bob.enabled = False
+                elif state == "removed":
+                    agents["bob"].features.clear()
+                elif state == "drifted":
+                    agents["bob"].features["ProxyFeature"] = _DriftedRouterFeature()
+                assert client.get(path, headers=headers).status_code == 404
+                assert client.post(path, headers=headers).status_code == 404
+                assert client.get(f"/api/agents/carol{path}", headers=headers).json() == {"owner": "carol-v1"}
+                assert bob.served == 0
     finally:
         restore()
 
@@ -1370,7 +1412,7 @@ def test_dispatch_refuses_a_feature_disabled_after_the_match():
 
 
 def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
-    """Review r2: the owner clause precedes the survivor rule. A mount owner
+    """A mount owner
     re-created under its DID with the feature disabled (readiness rollback,
     then retry) is still the owner: the unprefixed form refuses rather than
     quietly rebinding to the one peer that serves, which is exactly the
@@ -1392,9 +1434,10 @@ def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
         with TestClient(app) as client:
             assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
 
-            # Withdrawn: bob is the sole survivor and serves.
+            # Withdrawn: the unprefixed address cannot select bob implicitly.
             agents.pop("alice")
-            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert client.get(path, headers=headers).status_code == 404
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {"owner": "bob-v1"}
             assert bob.served == 1
 
             # Back under the same DID, but not serving: the owner is retained
@@ -1491,3 +1534,262 @@ def test_a_disabled_feature_answers_not_found_even_for_the_wrong_method():
             assert alice.served == 0
     finally:
         restore()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_ungated_frontend_routes_are_rejected_atomically(tmp_path, caplog, nested):
+    from kestrel_sovereign import server
+
+    (tmp_path / "index.html").write_text("<html>private tenant frontend</html>")
+    router = APIRouter()
+
+    @router.get("/frontend-probe")
+    async def probe():
+        return {"private": True}
+
+    router.frontend("/tenant-spa", directory=tmp_path)
+    if nested:
+        outer = APIRouter()
+        outer.include_router(router, prefix="/nested")
+        router = outer
+    feature = SimpleNamespace(enabled=True, get_router=lambda: router)
+    app = FastAPI()
+    app.state.agent = _make_agent({"FrontendFeature": feature})
+    app.state.agent_manager = None
+    server._mount_feature_routers(app)
+    feature.enabled = False
+    prefix = "/nested" if nested else ""
+    with TestClient(app) as client:
+        assert client.get(f"{prefix}/tenant-spa/").status_code == 404
+        assert client.get(f"{prefix}/frontend-probe").status_code == 404
+    assert app.state._feature_routes == []
+    assert "get_ui_contributions" in caplog.text
+
+
+@pytest.mark.parametrize("tenant_count", [1, 2, 3])
+def test_stable_native_router_does_not_rebuild_handlers_per_request(monkeypatch, tenant_count):
+    from fastapi.routing import APIRoute
+
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+
+    events = []
+    agents = {
+        f"tenant{i}": _make_agent({
+            "StableFeature": _DependencyBoundRouterFeature(f"tenant{i}", events)
+        })
+        for i in range(tenant_count)
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            for tenant in agents:
+                assert client.get(
+                    f"/api/agents/{tenant}/test-feature-lifecycle/dependency-bound",
+                    headers={"X-API-Key": API_KEY},
+                ).json() == {"owner": tenant}
+            builds = []
+            original = APIRoute.get_route_handler
+
+            def tracked(route):
+                builds.append(route.path)
+                return original(route)
+
+            monkeypatch.setattr(APIRoute, "get_route_handler", tracked)
+            for _ in range(3):
+                for tenant in agents:
+                    assert client.get(
+                        f"/api/agents/{tenant}/test-feature-lifecycle/dependency-bound",
+                        headers={"X-API-Key": API_KEY},
+                    ).json() == {"owner": tenant}
+            assert builds == []
+    finally:
+        restore()
+
+
+def test_same_feature_factory_can_change_its_closure_without_changing_shape():
+    from kestrel_sovereign import server
+
+    generations = []
+
+    def current_router():
+        generation = len(generations)
+        generations.append(generation)
+        router = APIRouter()
+
+        @router.get("/factory-generation")
+        async def current():
+            return {"generation": generation}
+
+        return router
+
+    feature = SimpleNamespace(enabled=True, get_router=current_router)
+    app = FastAPI()
+    app.state.agent = _make_agent({"FactoryFeature": feature})
+    app.state.agent_manager = None
+    server._mount_feature_routers(app)
+    with TestClient(app) as client:
+        first = client.get("/factory-generation").json()["generation"]
+        second = client.get("/factory-generation").json()["generation"]
+    assert second > first
+
+
+def test_invalid_live_router_contract_fails_clearly():
+    from kestrel_sovereign import server
+
+    invalid = SimpleNamespace(get_router=lambda: SimpleNamespace(routes=[]))
+    with pytest.raises(TypeError, match="FastAPI APIRouter or None"):
+        server._current_feature_router(invalid, ())
+
+    def broken():
+        raise RuntimeError("feature router construction failed")
+
+    # A broken plugin must report its error instead of being silently omitted.
+    with pytest.raises(RuntimeError, match="router construction failed"):
+        server._current_feature_router(SimpleNamespace(get_router=broken), ())
+
+
+def test_native_binding_cache_is_bounded_by_current_agents(monkeypatch):
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    mounted = []
+    original = server._LiveFeatureRouter
+
+    class TrackedRouter(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            mounted.append(self)
+
+    monkeypatch.setattr(server, "_LiveFeatureRouter", TrackedRouter)
+    events = []
+    agents = {
+        name: _make_agent({"StableFeature": _DependencyBoundRouterFeature(name, events)})
+        for name in ("stable", "withdrawn")
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        assert len(mounted) == 1
+        with TestClient(app) as client:
+            for name in ("stable", "withdrawn"):
+                assert client.get(
+                    f"/api/agents/{name}/test-feature-lifecycle/dependency-bound",
+                    headers={"X-API-Key": API_KEY},
+                ).json() == {"owner": name}
+            assert len(mounted[0]._bindings) == 2
+            del agents["withdrawn"]
+            assert client.get(
+                "/api/agents/stable/test-feature-lifecycle/dependency-bound",
+                headers={"X-API-Key": API_KEY},
+            ).json() == {"owner": "stable"}
+            assert set(mounted[0]._bindings) == {id(agents["stable"])}
+    finally:
+        restore()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("lifecycle", ["active", "disabled", "removed"])
+def test_frontend_added_after_mount_cannot_escape_the_feature_boundary(tmp_path, nested, warm, lifecycle):
+    from kestrel_sovereign import server
+
+    (tmp_path / "index.html").write_text("<html>private tenant frontend</html>")
+    source = APIRouter()
+
+    @source.get("/post-mount-api")
+    async def endpoint():
+        return {"owner": "tenant"}
+
+    router = source
+    if nested:
+        router = APIRouter()
+        router.include_router(source, prefix="/nested")
+    feature = SimpleNamespace(enabled=True, get_router=lambda: router)
+    agent = _make_agent({"MutableFeature": feature})
+    app = FastAPI()
+    app.state.agent = agent
+    app.state.agent_manager = None
+    server._mount_feature_routers(app)
+    prefix = "/nested" if nested else ""
+    with TestClient(app) as client:
+        if warm:
+            assert client.get(f"{prefix}/post-mount-api").json() == {"owner": "tenant"}
+        source.frontend("/late-spa", directory=tmp_path)
+        if lifecycle == "disabled":
+            feature.enabled = False
+        elif lifecycle == "removed":
+            agent.features.clear()
+        assert client.get(f"{prefix}/late-spa/").status_code == 404
+        assert client.get(f"{prefix}/post-mount-api").status_code == (
+            200 if lifecycle == "active" else 404
+        )
+
+
+@pytest.mark.parametrize("failure", ["invalid", "raises"])
+def test_owner_withdrawal_requires_an_agent_url_without_probing_broken_peers(monkeypatch, failure):
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    calls = []
+
+    def broken_router():
+        calls.append(failure)
+        if failure == "raises":
+            raise RuntimeError("unrelated peer router failed")
+        return SimpleNamespace(routes=[], prefix="")
+
+    agents = {
+        "owner": _make_agent({"ProxyFeature": _InstanceBoundRouterFeature("owner")}),
+        "healthy": _make_agent({"ProxyFeature": _InstanceBoundRouterFeature("healthy")}),
+        "broken": _make_agent({"ProxyFeature": SimpleNamespace(enabled=True, get_router=broken_router)}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "owner"}
+            validated_calls = len(calls)
+            del agents["owner"]
+            assert client.get(path, headers=headers).status_code == 404
+            assert client.get(f"/api/agents/healthy{path}", headers=headers).json() == {"owner": "healthy"}
+            assert len(calls) == validated_calls
+    finally:
+        restore()
+
+
+def test_native_context_projection_keeps_host_metadata_when_mounted_during_startup():
+    from fastapi import Header
+    from kestrel_sovereign import server
+
+    events = []
+
+    async def host_dependency(scope: str = Header(alias="X-Host-Scope")):
+        events.append(scope)
+
+    router = APIRouter()
+
+    @router.get("/startup-feature", tags=["feature-tag"])
+    async def endpoint():
+        return {"events": list(events)}
+
+    @asynccontextmanager
+    async def host_lifespan(app):
+        # Match production: feature routers are discovered inside the already
+        # entered host startup, not before the host lifespan is opened.
+        server._mount_feature_routers(app)
+        yield
+
+    app = FastAPI(lifespan=host_lifespan, dependencies=[Depends(host_dependency)])
+    app.router.tags = ["host-tag"]
+    app.state.agent = _make_agent({"StartupFeature": SimpleNamespace(enabled=True, get_router=lambda: router)})
+    app.state.agent_manager = None
+    with TestClient(app) as client:
+        operation = app.openapi()["paths"]["/startup-feature"]["get"]
+        assert set(operation["tags"]) == {"host-tag", "feature-tag"}
+        assert any(
+            parameter["name"] == "X-Host-Scope" and parameter["required"]
+            for parameter in operation["parameters"]
+        )
+        assert client.get("/startup-feature").status_code == 422
+        assert client.get("/startup-feature", headers={"X-Host-Scope": "authorized"}).json() == {
+            "events": ["authorized"],
+        }
+    assert events == ["authorized"]

@@ -649,6 +649,119 @@ _TEXT_TURN = [
 ]
 
 
+class TestTemporaryImageRetirement:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", [False, True], ids=["legacy-sync", "turn-owned"])
+    @pytest.mark.parametrize("phase", ["enter", "write"])
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    async def test_partial_materialization_keeps_native_error_and_retires_all_paths(
+        self, tmp_path, monkeypatch, phase, cleanup_fails, owned,
+    ):
+        import asyncio
+        from kestrel_sovereign.execution_custody import (
+            _explicit_control_chain, execution_cleanup_debts, is_execution_control_error,
+        )
+        from kestrel_sovereign.llm import codex_adapter as module
+
+        create = module.tempfile.NamedTemporaryFile
+        created, paths, original_errors, original_owners = [], [], [], []
+        native_enter = None
+
+        def enter(handle):
+            if len(created) == 2 and handle is created[1] and phase == "enter":
+                handle.close()
+            try:
+                result = native_enter(handle)
+            except ValueError as error:
+                original_errors.append(error)
+                raise
+            if len(created) == 2 and handle is created[1] and phase == "write":
+                handle.close()
+            return result
+
+        def allocate(*args, **kwargs):
+            nonlocal native_enter
+            handle = create(*args, **kwargs)
+            created.append(handle)
+            original_owners.append(asyncio.current_task())
+            paths.append(Path(handle.name))
+            if native_enter is None:
+                native_enter = type(handle).__enter__
+                monkeypatch.setattr(type(handle), "__enter__", enter)
+            if len(created) == 2:
+                if cleanup_fails:
+                    paths[0].unlink()
+                    paths[0].mkdir()
+                native_write = handle.write
+
+                def write(*args, **kwargs):
+                    try:
+                        return native_write(*args, **kwargs)
+                    except ValueError as error:
+                        original_errors.append(error)
+                        raise
+
+                handle.write = write
+            return handle
+
+        monkeypatch.setattr(module.tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setattr(module.tempfile, "NamedTemporaryFile", allocate)
+        inputs = [{"type": "image", "url": "data:image/png;base64,AAAA"} for _ in range(2)]
+        adapter = _adapter_with(_TEXT_TURN) if owned else None
+        try:
+            with pytest.raises(BaseException) as caught:
+                if owned:
+                    await adapter.get_response(
+                        client="declared-unit-protocol", model="auto",
+                        messages=[{"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": item["url"]}}
+                            for item in inputs
+                        ]}], session_id="partial-native-image",
+                    )
+                else:
+                    module._materialize_app_server_data_images(inputs)
+            chain = tuple(_explicit_control_chain(caught.value))
+            assert len(created) == 2 and len(original_errors) == 1
+            assert original_errors[0] in chain, "partial image cleanup replaced original native file failure"
+            assert all(handle.closed for handle in created)
+            assert not paths[1].exists(), "current failed image was never admitted to cleanup inventory"
+            if cleanup_fails:
+                assert paths[0].is_dir()
+                assert any(isinstance(error, OSError) and error.filename == str(paths[0]) for error in chain)
+                if owned:
+                    assert is_execution_control_error(caught.value)
+                    assert all(owner is original_owners[0] for owner in original_owners)
+                    assert original_owners[0].done()
+                    assert any(resource == paths[0] and owner is original_owners[0]
+                               for resource, owner in execution_cleanup_debts(caught.value))
+                    assert tuple(_explicit_control_chain(original_errors[0])) == (original_errors[0],)
+            else:
+                assert not paths[0].exists()
+                assert caught.value is original_errors[0]
+            if owned:
+                assert all(not lock.locked() for lock in adapter._thread_locks.values())
+                assert not any(method == "turn/start" for method, _ in adapter._client.requests)
+        finally:
+            for handle in created:
+                handle.close()
+            for path in paths:
+                if path.is_dir():
+                    path.rmdir()
+                else:
+                    path.unlink(missing_ok=True)
+
+    def test_owned_image_unlink_does_not_follow_a_symlink(self, tmp_path):
+        from kestrel_sovereign.llm.codex_adapter import _cleanup_app_server_data_images
+
+        foreign = tmp_path / "foreign.png"
+        foreign.write_bytes(b"not owned by this cleanup")
+        owned_link = tmp_path / "owned-image.png"
+        owned_link.symlink_to(foreign)
+        assert _cleanup_app_server_data_images([owned_link]) == []
+        assert not owned_link.is_symlink() and foreign.is_file(), "owned image cleanup followed the leaf symlink"
+        assert foreign.read_bytes() == b"not owned by this cleanup"
+
+
 class TestAdapterTextPath:
     @pytest.mark.asyncio
     async def test_get_response_text_and_usage(self):
@@ -1287,7 +1400,6 @@ class TestThreadStartParams:
         """
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
         import tempfile
-        from pathlib import Path
 
         # Redirect tempdir to a tmp_path subdir we control, so we can
         # plant the parent symlink.
@@ -3496,7 +3608,7 @@ class TestDiscoveredRouteCapFromEvent:
         DISCOVERED layer's own current value."""
         import logging
         from kestrel_sovereign.llm.model_catalog import (
-            get_catalog_service, ModelCatalogService,
+            get_catalog_service,
         )
         # Force a fresh catalog with an env override active so the
         # discovered layer is the only place where "same value seen

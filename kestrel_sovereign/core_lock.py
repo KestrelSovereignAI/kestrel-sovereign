@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -524,6 +525,83 @@ def read_core_lock(
         # tomllib decodes the bytes itself, so a lock that is not UTF-8 raises
         # UnicodeDecodeError rather than TOMLDecodeError.
         raise CoreLockError(f"{path}: {exc}") from exc
+    return _lock_from_data(data, Path(path), environment)
+
+
+def read_core_lock_at(
+    checkout: Path, revision: str, *, environment: Optional[Dict[str, str]] = None,
+) -> Optional[CoreLock]:
+    """The ``uv.lock`` *revision* of *checkout* records, or None when it has none.
+
+    What a pull or checkout to *revision* will install, read before it lands
+    (#3702), so a process still running the code that matches the venv can
+    judge it. The blob as git stores it: line-ending filters change nothing a
+    TOML reader sees. Raises :class:`CoreLockError` when git cannot say or the
+    blob is not a lock.
+    """
+    label = Path(checkout) / f"{LOCK_FILENAME}@{revision}"
+    spec = f"{revision}:{LOCK_FILENAME}"
+    try:
+        present = subprocess.run(
+            ["git", "cat-file", "-e", spec],
+            cwd=str(checkout), capture_output=True, check=False,
+        )
+        if present.returncode != 0:
+            # Absent at that revision, or no such revision: tell them apart.
+            known = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"],
+                cwd=str(checkout), capture_output=True, check=False,
+            )
+            if known.returncode == 0:
+                return None
+            raise CoreLockError(f"{label}: {checkout} has no revision {revision!r}")
+        blob = subprocess.run(
+            ["git", "cat-file", "blob", spec],
+            cwd=str(checkout), capture_output=True, check=False,
+        )
+    except OSError as exc:
+        raise CoreLockError(f"{label}: {exc}") from exc
+    if blob.returncode != 0:
+        detail = blob.stderr.decode("utf-8", "replace").strip()
+        raise CoreLockError(f"{label}: {detail or 'git cat-file failed'}")
+    try:
+        data = tomllib.loads(blob.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise CoreLockError(f"{label}: {exc}") from exc
+    return _lock_from_data(data, label, environment)
+
+
+def read_core_lock_landing(
+    checkout: Path, revision: str, *, environment: Optional[Dict[str, str]] = None,
+) -> Optional[CoreLock]:
+    """The ``uv.lock`` *checkout* will hold once it moves to *revision* (#3702).
+
+    What *revision* records (:func:`read_core_lock_at`), unless the working
+    tree has its own changes to ``uv.lock``: git carries those across a pull or
+    checkout that leaves the file alone (``--allow-dirty``) and refuses one that
+    would change it, so either way the lock that lands is the one on disk.
+    """
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--", LOCK_FILENAME],
+            cwd=str(checkout), capture_output=True, check=False,
+        )
+    except OSError as exc:
+        raise CoreLockError(f"{Path(checkout) / LOCK_FILENAME}: {exc}") from exc
+    if status.returncode != 0:
+        detail = status.stderr.decode("utf-8", "replace").strip()
+        raise CoreLockError(
+            f"{Path(checkout) / LOCK_FILENAME}: {detail or 'git status failed'}"
+        )
+    if status.stdout.strip():
+        return load_core_lock(Path(checkout))
+    return read_core_lock_at(checkout, revision, environment=environment)
+
+
+def _lock_from_data(
+    data: dict, path: Path, environment: Optional[Dict[str, str]],
+) -> CoreLock:
+    """The :class:`CoreLock` a parsed ``uv.lock`` describes for this environment."""
     entries = data.get("package")
     if not isinstance(entries, list):
         raise CoreLockError(f"{path}: no [[package]] entries")

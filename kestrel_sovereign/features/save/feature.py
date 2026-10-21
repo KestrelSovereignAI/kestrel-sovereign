@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import (
@@ -269,6 +270,8 @@ class SaveFeature(Feature):
             )
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"save_stash failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -391,6 +394,8 @@ class SaveFeature(Feature):
             )
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"save_excerpt failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -486,6 +491,8 @@ class SaveFeature(Feature):
                 tags=tag_list
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"save_item failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -553,6 +560,8 @@ class SaveFeature(Feature):
                 limit=limit
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -636,6 +645,8 @@ class SaveFeature(Feature):
         try:
             nodes = await getter("learned_fact")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"recall learned_fact lookup failed: {e}")
             return []
 
@@ -730,6 +741,8 @@ class SaveFeature(Feature):
                 limit=limit
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_list failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -777,6 +790,8 @@ class SaveFeature(Feature):
         try:
             item = await store.get_by_id(item_id)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_get failed: {e}")
             return ToolResult.failed(str(e))
 
@@ -819,6 +834,8 @@ class SaveFeature(Feature):
                 )
             await store.delete_item(item_id)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"recall_delete failed: {e}")
             return ToolResult.failed(str(e))
 

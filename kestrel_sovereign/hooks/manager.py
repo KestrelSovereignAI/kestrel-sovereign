@@ -381,10 +381,12 @@ class HooksManager:
                 if getattr(hook, "awaits_user_input", False):
                     output = await hook.execute(input)
                 else:
-                    output = await asyncio.wait_for(
-                        hook.execute(input),
-                        timeout=hook.timeout
-                    )
+                    # Keep the hook on its original owned task. On Python
+                    # 3.11 wait_for creates a hidden child and can replace a
+                    # cancellation-resistant child's stronger native receipt
+                    # with the wrapper's ordinary cancellation.
+                    async with asyncio.timeout(hook.timeout):
+                        output = await hook.execute(input)
 
                 logger.debug(
                     f"Hook '{hook.name}' returned: "
@@ -445,7 +447,12 @@ class HooksManager:
                     if "response_text" in updated_input:
                         input.response_text = updated_input["response_text"]
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(error):
+                    raise
                 # FAIL CLOSED for enforcing hooks: a deny-capable hook that times
                 # out must not silently become "allowed" — that turns a block
                 # into a pass (#1723). Enforcement is the CAPTURED turn-start
@@ -466,6 +473,11 @@ class HooksManager:
                 continue
 
             except Exception as e:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(e):
+                    raise
                 # FAIL CLOSED for enforcing hooks: a crashed deny-capable hook
                 # (e.g. an approval hook whose queue backend raised) must deny,
                 # not allow (#1723). Enforcement is the CAPTURED turn-start
@@ -521,21 +533,27 @@ class HooksManager:
             try:
                 if getattr(hook, "awaits_user_input", False):
                     return await hook.execute(input)
-                return await asyncio.wait_for(
-                    hook.execute(input),
-                    timeout=hook.timeout
+                async with asyncio.timeout(hook.timeout):
+                    return await hook.execute(input)
+            except asyncio.TimeoutError as error:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
                 )
-            except asyncio.TimeoutError:
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(f"Hook '{hook.name}' timed out (parallel)")
                 return None
             except Exception as e:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Hook '{hook.name}' failed (parallel): {e}")
                 return None
 
-        results = await asyncio.gather(
-            *[execute_with_timeout(hook) for hook in matching_hooks]
-        )
-
+        from kestrel_sovereign._async_ownership import gather_owned
+        results = await gather_owned(execute_with_timeout(hook) for hook in matching_hooks)
         return [r for r in results if r is not None]
 
     def _get_matching_hooks(

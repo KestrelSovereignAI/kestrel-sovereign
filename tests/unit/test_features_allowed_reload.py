@@ -9,6 +9,7 @@ ceiling from the edge and intersects it into the feature-discovery allowlist.
 """
 
 import os
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -90,28 +91,40 @@ def _loaded_classes(agent):
     return {type(f).__name__ for f in agent.features.values()}
 
 
-@pytest.mark.asyncio
-async def test_direct_boot_enforces_feature_ceiling(tmp_path):
-    """A spawned child booted directly through KestrelAgent.initialize loads only
-    its mandate-allowed features plus the always-mandatory ones — not everything."""
+@asynccontextmanager
+async def _owned_initialized_agent(creds, tmp_path):
+    """Retire each test's actual runtime before pytest closes its event loop."""
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
 
-    creds = await _spawn_child_dir(tmp_path, "CeilChild", ALLOWED)
     agent = KestrelAgent(
         did=creds.agent_did,
         storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
         llm_service=LLMService(),
     )
-    await agent.initialize()
+    try:
+        await agent.initialize()
+        yield agent
+    finally:
+        await agent.shutdown()
+        await agent.wait_for_shutdown_completion()
+    assert all(task.done() for task in agent._background_tasks)
+    assert not agent._raw_storage.db.backend.is_connected
 
-    loaded = _loaded_classes(agent)
-    allowed_ceiling = set(ALLOWED) | set(MANDATORY_FEATURES)
-    # Nothing beyond the mandate ceiling + mandatory features loaded.
-    assert loaded <= allowed_ceiling, f"loaded beyond ceiling: {loaded - allowed_ceiling}"
-    # The allowed feature and the mandatory ones are present.
-    assert "MemoryFeature" in loaded
-    assert set(MANDATORY_FEATURES) <= loaded
+
+@pytest.mark.asyncio
+async def test_direct_boot_enforces_feature_ceiling(tmp_path):
+    """A spawned child booted directly through KestrelAgent.initialize loads only
+    its mandate-allowed features plus the always-mandatory ones — not everything."""
+    creds = await _spawn_child_dir(tmp_path, "CeilChild", ALLOWED)
+    async with _owned_initialized_agent(creds, tmp_path) as agent:
+        loaded = _loaded_classes(agent)
+        allowed_ceiling = set(ALLOWED) | set(MANDATORY_FEATURES)
+        # Nothing beyond the mandate ceiling + mandatory features loaded.
+        assert loaded <= allowed_ceiling, f"loaded beyond ceiling: {loaded - allowed_ceiling}"
+        # The allowed feature and the mandatory ones are present.
+        assert "MemoryFeature" in loaded
+        assert set(MANDATORY_FEATURES) <= loaded
 
 
 @pytest.mark.asyncio
@@ -154,19 +167,10 @@ async def test_do_spawn_persists_inherited_ceiling():
 async def test_root_agent_loads_beyond_the_ceiling(tmp_path):
     """Control: a non-spawned agent has no ceiling, so it loads optional features
     the spawned child above was denied — proving the restriction is spawn-scoped."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
-    from kestrel_sovereign.llm.service import LLMService
-
     creds = await create_kestrel_identity_async(
         output_dir=str(tmp_path), is_test_instance=True, agent_name="RootFull"
     )
-    agent = KestrelAgent(
-        did=creds.agent_did,
-        storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
-        llm_service=LLMService(),
-    )
-    await agent.initialize()
-
-    loaded = _loaded_classes(agent)
-    # A root agent loads more than the spawned child's ceiling would permit.
-    assert not (loaded <= (set(ALLOWED) | set(MANDATORY_FEATURES)))
+    async with _owned_initialized_agent(creds, tmp_path) as agent:
+        loaded = _loaded_classes(agent)
+        # A root agent loads more than the spawned child's ceiling would permit.
+        assert not (loaded <= (set(ALLOWED) | set(MANDATORY_FEATURES)))

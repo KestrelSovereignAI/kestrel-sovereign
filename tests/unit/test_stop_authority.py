@@ -17,6 +17,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.auth import AuthMethod, CallerContext
+from kestrel_sovereign.execution_custody import (
+    execution_cleanup_debts,
+    is_execution_control_error,
+)
 from kestrel_sovereign.stop import (
     AuthoritativeStopDescendant,
     CancellationAuthority,
@@ -601,14 +605,18 @@ async def test_cleanup_registry_drain_is_bounded_by_a_wedged_tail() -> None:
 
     loop = asyncio.get_running_loop()
     started = loop.time()
-    await registry.drain(timeout_seconds=0.2)
-    elapsed = loop.time() - started
-
-    assert elapsed < 5.0, f"drain did not honour its budget ({elapsed:.1f}s)"
-    assert not wedged.done(), "the tail is abandoned, not cancelled"
-    wedged.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await wedged
+    try:
+        with pytest.raises(TimeoutError) as incomplete:
+            await registry.drain(timeout_seconds=0.2)
+        elapsed = loop.time() - started
+        assert elapsed < 5.0, f"drain did not honour its budget ({elapsed:.1f}s)"
+        assert not wedged.done(), "the tail is retained, not cancelled"
+        assert is_execution_control_error(incomplete.value)
+        assert (registry, wedged) in execution_cleanup_debts(incomplete.value)
+    finally:
+        wedged.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await wedged
 
 
 @pytest.mark.asyncio

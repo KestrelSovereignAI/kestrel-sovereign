@@ -36,6 +36,18 @@ from tests.shared.pytest_cleanup_plugin import (
     cost_tracking,  # noqa: F401 - exposed as a pytest fixture
 )
 from tests.shared.resource_registry import registry
+from tests.shared.hang_backstop import (
+    configure as _hang_backstop_configure,
+    pytest_configure_node,  # noqa: F401 - exposed as a pytest hook
+    pytest_enter_pdb,  # noqa: F401 - exposed as a pytest hook
+    pytest_exception_interact,  # noqa: F401 - exposed as a pytest hook
+    pytest_handlecrashitem,  # noqa: F401 - exposed as a pytest hook
+    pytest_runtest_protocol,  # noqa: F401 - exposed as a pytest hook
+)
+from tests.shared.node_id_length import (
+    pytest_xdist_node_collection_finished,  # noqa: F401 - exposed as a pytest hook
+    refuse_overlong_node_ids,
+)
 from kestrel_sovereign import paths
 from tests.shared.host_runtime_isolation import (
     ISOLATION_DIRNAME,
@@ -49,6 +61,7 @@ from tests.shared.host_runtime_isolation import (
 from tests.shared.postgres_requirement import (
     check_session as _check_postgres_requirement,
     fail_skipped_postgres_case as _fail_skipped_postgres_case,
+    mark_native_postgres_cases as _mark_native_postgres_cases,
 )
 from tests.shared.postgres_worker_isolation import (
     isolate_xdist_worker as _isolate_xdist_worker,
@@ -125,9 +138,12 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-    """Skip cloud_resource tests unless --run-cloud is provided."""
+    """Skip cloud_resource tests unless --run-cloud is provided; refuse overlong IDs."""
+    _mark_native_postgres_cases(items)
     _cleanup_collection_modifyitems(config, items)
+    refuse_overlong_node_ids(items)
 
 
 def _require_pytest_asyncio(config) -> None:
@@ -163,6 +179,7 @@ def _require_pytest_asyncio(config) -> None:
 def pytest_configure(config):
     """Configure pytest with all plugins and load .env for skipif conditions."""
     _require_pytest_asyncio(config)
+    _hang_backstop_configure(config)
     REFUSAL_RECORDER.install()
     # The allow-list's third root: an explicit --basetemp may lie outside the
     # system temporary directory, and every tmp_path lives below it.
@@ -418,6 +435,27 @@ def _isolate_decision_check_env(monkeypatch):
         "KESTREL_CONTINUATION_CHECK_DECISION_MODEL",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _update_continuation_in_process(monkeypatch):
+    """Run ``kestrel update``'s fresh-interpreter continuation in this process (#3702).
+
+    The real continuation starts ``kestrel update`` in a child, which no
+    monkeypatch reaches. On 2026-10-19 the first run of this change's unit
+    tests did exactly that: the child ran the real restart, and its orphan
+    reaping killed the operator's host on :8888. In-process, the continuation
+    keeps every seam a test patched and still round-trips its argv through the
+    real parser. A test of the spawn itself patches this attribute back.
+    """
+    from kestrel_sovereign import cli
+
+    def continue_in_process(argv):
+        args = cli.build_parser().parse_args(argv)
+        assert args.command == "update", argv
+        return cli.cmd_update(args)
+
+    monkeypatch.setattr(cli, "_run_update_continuation", continue_in_process)
 
 
 @pytest.fixture(autouse=True)

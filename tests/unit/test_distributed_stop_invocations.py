@@ -5,6 +5,11 @@ from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    execution_cleanup_debts,
+    is_execution_control_error,
+)
 
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
@@ -1493,9 +1498,18 @@ async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
     original_poll = store.poll_owner
     snapshot_taken = asyncio.Event()
     release_snapshot = asyncio.Event()
+    park_relay = False
+    parked = asyncio.Event()
+    park = asyncio.Event()
 
     async def pause_after_snapshot(*args, **kwargs):
         result = await original_poll(*args, **kwargs)
+        if park_relay:
+            # This inventory test does not inject COMMIT uncertainty during
+            # shutdown. Retire the relay at a proven post-native-poll barrier;
+            # native cancellation/unknown receipts have separate coverage.
+            parked.set()
+            await park.wait()
         snapshot_taken.set()
         await release_snapshot.wait()
         return result
@@ -1515,6 +1529,8 @@ async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
         await asyncio.sleep(0.05)
 
         assert registry._lease_lost is False
+        park_relay = True
+        await asyncio.wait_for(parked.wait(), timeout=30)
     finally:
         release_snapshot.set()
         store.poll_owner = original_poll
@@ -2040,25 +2056,37 @@ async def test_close_is_bounded_when_a_completion_never_settles(tmp_path):
     replica_a.attach(agent)
     original_settle = store.settle
     settle_entered = asyncio.Event()
+    settle_release = asyncio.Event()
+    completion = None
 
     async def never_settles(generation_id, owner_id, disposition):
         settle_entered.set()
-        await asyncio.Event().wait()      # hangs, never raises
+        await settle_release.wait()
+        return await original_settle(generation_id, owner_id, disposition)
 
     store.settle = never_settles
     try:
         assert await replica_a.register(agent, "wedged-turn", 1)
         replica_a.complete_soon(agent, "wedged-turn", 1)
+        (completion,) = tuple(replica_a._cleanup_tasks)
         await asyncio.wait_for(settle_entered.wait(), timeout=30)
 
         loop = asyncio.get_running_loop()
         started = loop.time()
-        await replica_a.close()
+        with pytest.raises(TimeoutError) as incomplete:
+            await replica_a.close()
         elapsed = loop.time() - started
 
         assert elapsed < 45, f"close() was not bounded ({elapsed:.1f}s)"
+        assert not completion.done()
+        assert is_execution_control_error(incomplete.value)
+        assert (replica_a, completion) in execution_cleanup_debts(incomplete.value)
     finally:
         store.settle = original_settle
+        settle_release.set()
+        if completion is not None:
+            assert (await await_owned_task(completion)).error is None
+        await replica_a.close()
         await replica_b.close()
         await first_db.close()
         await second_db.close()

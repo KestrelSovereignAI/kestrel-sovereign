@@ -137,13 +137,11 @@ class TestRotationEndToEnd:
             old_bob = _derive_agent_cipher(old_master, "bob")
 
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) "
-                "VALUES (1, 'alice', 'user', ?)",
+                'INSERT INTO conversation_history (id, agent_id, role, content, metadata) VALUES (1, \'alice\', \'user\', ?, \'{"enc": true}\')',
                 (old_alice.encrypt(b"alice-secret").decode(),),
             )
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) "
-                "VALUES (2, 'bob', 'user', ?)",
+                'INSERT INTO conversation_history (id, agent_id, role, content, metadata) VALUES (2, \'bob\', \'user\', ?, \'{"enc": true}\')',
                 (old_bob.encrypt(b"bob-secret").decode(),),
             )
             # Plaintext row — must NOT be touched
@@ -243,7 +241,6 @@ class TestRotationEndToEnd:
                 content_column="content",
                 id_column="content_hash",
                 agent_id_column=None,
-                is_text_column=False,
             )
 
             # Also drive the count path
@@ -279,8 +276,7 @@ class TestRotationEndToEnd:
             # Insert as BLOB — bytes, not str (matches async_file_store.store_file)
             blob_token = old_global.encrypt(b"file-bytes")
             await db.execute(
-                "INSERT INTO files (content_hash, original_name, content) "
-                "VALUES ('h1', 'a.bin', ?)",
+                'INSERT INTO files (content_hash, original_name, content, metadata) VALUES (\'h1\', \'a.bin\', ?, \'{"enc": true}\')',
                 (blob_token,),
             )
 
@@ -302,7 +298,6 @@ class TestRotationEndToEnd:
                 content_column="content",
                 id_column="content_hash",
                 agent_id_column=None,
-                is_text_column=False,
             )
 
             assert rotation.records_processed == 1, (
@@ -317,21 +312,21 @@ class TestRotationEndToEnd:
             await db.close()
 
     @pytest.mark.asyncio
-    async def test_count_includes_both_prefixes_across_real_tables(self):
+    async def test_count_uses_encryption_metadata_across_real_tables(self):
         db, path = await _fresh_db()
         try:
             key_b64 = Fernet.generate_key()
             cipher = AEADCipher(key_b64)
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (1, 'a', 'user', ?)",
+                'INSERT INTO conversation_history (id, agent_id, role, content, metadata) VALUES (1, \'a\', \'user\', ?, \'{"enc": true}\')',
                 (Fernet(key_b64).encrypt(b"a").decode(),),
             )
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (2, 'a', 'user', ?)",
+                'INSERT INTO conversation_history (id, agent_id, role, content, metadata) VALUES (2, \'a\', \'user\', ?, \'{"enc": true}\')',
                 (cipher.encrypt(b"b").decode(),),
             )
             await db.execute(
-                "INSERT INTO files (content_hash, original_name, content) VALUES ('h1', 'f1.txt', ?)",
+                'INSERT INTO files (content_hash, original_name, content, metadata) VALUES (\'h1\', \'f1.txt\', ?, \'{"enc": true}\')',
                 (cipher.encrypt(b"c").decode(),),
             )
             # Plaintext rows in both tables — must NOT be counted
@@ -347,7 +342,7 @@ class TestRotationEndToEnd:
             service = KeyRotationService(storage=storage)
             count = await service._count_encrypted_records()
             assert count == 3, (
-                "Count must include both gAAAAA% and KSAv2:% across all "
+                "Count must include every metadata-flagged ciphertext across all "
                 "registered encrypted tables, and exclude plaintext rows."
             )
         finally:
@@ -363,11 +358,11 @@ class TestRotationEndToEnd:
             new_alice = _derive_agent_cipher(new_master, "a")
 
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (1, 'a', 'user', ?)",
+                'INSERT INTO conversation_history (id, agent_id, role, content, metadata) VALUES (1, \'a\', \'user\', ?, \'{"enc": true}\')',
                 (old_alice.encrypt(b"first").decode(),),
             )
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) VALUES (2, 'a', 'user', ?)",
+                'INSERT INTO conversation_history (id, agent_id, role, content, metadata) VALUES (2, \'a\', \'user\', ?, \'{"enc": true}\')',
                 (old_alice.encrypt(b"second").decode(),),
             )
             # Pretend row 1 was already rotated in a previous (interrupted) run
@@ -427,8 +422,7 @@ class TestRotationEndToEnd:
             global_b64 = master  # same shape Fernet expects
             global_legacy = Fernet(global_b64).encrypt(b"global-legacy").decode()
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) "
-                "VALUES (1, 'a', 'user', ?)",
+                'INSERT INTO conversation_history (id, agent_id, role, content, metadata) VALUES (1, \'a\', \'user\', ?, \'{"enc": true}\')',
                 (global_legacy,),
             )
             # Row 2: per-agent Fernet (matches what add_conversation writes today
@@ -442,8 +436,7 @@ class TestRotationEndToEnd:
             agent_raw = hkdf.derive(master)
             agent_legacy = Fernet(_b64.urlsafe_b64encode(agent_raw)).encrypt(b"agent-legacy").decode()
             await db.execute(
-                "INSERT INTO conversation_history (id, agent_id, role, content) "
-                "VALUES (2, 'a', 'user', ?)",
+                'INSERT INTO conversation_history (id, agent_id, role, content, metadata) VALUES (2, \'a\', \'user\', ?, \'{"enc": true}\')',
                 (agent_legacy,),
             )
 
@@ -526,5 +519,5 @@ class TestRotationEndToEnd:
         assert rotation.decrypt(runtime.encrypt(pt)) == pt
 
     # The earlier SQL-string-only `_SqlCapture` regression test is now
-    # subsumed by `test_count_includes_both_prefixes_across_real_tables`
+    # subsumed by `test_count_uses_encryption_metadata_across_real_tables`
     # which exercises the count against a real AsyncDatabase.

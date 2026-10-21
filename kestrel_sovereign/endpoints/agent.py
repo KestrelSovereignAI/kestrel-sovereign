@@ -1,30 +1,51 @@
 """Agent invoke and streaming endpoints."""
-from collections import defaultdict
-from collections.abc import Mapping
-from dataclasses import dataclass
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response, UploadFile, File
-from fastapi.responses import StreamingResponse
-from typing import Any, Dict, List, Optional
 import asyncio
 import inspect
 import json
 import logging
 import os
 import re
+import sys
 import time
+from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.streams.tap import AgentStreamTap
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import StreamingResponse
 
-from kestrel_sovereign.kestrel_config.constants import (
-    MAX_SSE_CONNECTIONS_PER_CLIENT,
-    SSE_PING_INTERVAL_SECONDS,
+from kestrel_sovereign._async_ownership import create_owned_iterator
+from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    InvocationSelfFencedError,
+    admit_request_operation,
+    invocation_id_response_header,
+    invocation_log_correlation,
+    new_stream_delivery_id,
+    register_request_delivery,
+    retire_request_delivery,
+    validate_invocation_id,
 )
-from kestrel_sovereign.rate_limit import (
-    durable_stop_rate_limit_key,
-    limiter,
-    stop_admission_rate_limit,
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    bind_request_operation_if_supported,
 )
-from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
+from kestrel_sovereign.api_errors import (
+    ApiHTTPException,
+    generation_incomplete,
+    rate_limited_until,
+)
 from kestrel_sovereign.endpoints.agent_helpers import (
     caller_is_sovereign,
     get_agent,
@@ -36,43 +57,35 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     self_fenced_invocation_http_error,
     validate_request_invocation_id,
 )
-from kestrel_sovereign.api_errors import (
-    ApiHTTPException,
-    generation_incomplete,
-    rate_limited_until,
-)
-from kestrel_sovereign.llm.output_ceiling import incomplete_generation
-from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
-from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
-from kestrel_sovereign.agent.invocation import (
-    InvocationCancelledError,
-    InvocationSelfFencedError,
-    invocation_id_response_header,
-    invocation_log_correlation,
-    new_stream_delivery_id,
-    register_request_delivery,
-    validate_invocation_id,
-)
-from kestrel_sovereign.agent.request_lifecycle import (
-    RequestCompletionDisposition,
-    bind_request_operation_if_supported,
-)
-from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.endpoints.closing_streaming_response import (
     ClosingStreamingResponse,
 )
-from kestrel_sovereign.hold import HoldTurnRefusal
-from kestrel_sovereign.storage.privacy_wrapper import (
-    PRIVACY_TRANSITION_RETRY_MESSAGE,
-    PrivacyViolationError,
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    execution_work_operation,
+    is_execution_control_error,
+    require_execution_work,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
+from kestrel_sovereign.kestrel_config.constants import (
+    MAX_SSE_CONNECTIONS_PER_CLIENT,
+    SSE_PING_INTERVAL_SECONDS,
+)
+from kestrel_sovereign.llm.output_ceiling import incomplete_generation
+from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
+from kestrel_sovereign.rate_limit import (
+    durable_stop_rate_limit_key,
+    limiter,
+    stop_admission_rate_limit,
+)
+from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.stop import (
+    MAX_STOP_CORRELATION_ID_BYTES,
     AuthoritativeStopDescendant,
     CancellationAuthority,
     CooperativeStopTarget,
-    MAX_STOP_CORRELATION_ID_BYTES,
-    StopDisposition,
     StopCleanupRegistry,
+    StopDisposition,
     StopDoor,
     StopRequest,
     StopScope,
@@ -82,6 +95,12 @@ from kestrel_sovereign.stop.runtime_target import (
     build_runtime_stop_target,
     resolve_runtime_stop_identity,
 )
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
+)
+from kestrel_sovereign.streams.tap import AgentStreamTap
+
 logger = logging.getLogger(__name__)
 
 # SSE connection tracking: maps (client_ip, agent_id) -> active connection count
@@ -232,7 +251,9 @@ async def _kite_runtime_observation(
 
     from kestrel_sovereign.agent.invocation import invocation_scope
     from kestrel_sovereign.knowledge.kite_evidence_signing import (
-        KiteEvidenceNonceReplay, KiteEvidenceSigningError, consume_kite_evidence_nonce,
+        KiteEvidenceNonceReplay,
+        KiteEvidenceSigningError,
+        consume_kite_evidence_nonce,
     )
     try:
         nonce_receipt = consume_kite_evidence_nonce(
@@ -443,6 +464,9 @@ async def invoke_agent(request: Request, http_response: Response):
     """
     cleanup_agent = None
     cleanup_request_id = None
+    cleanup_abandoned = False
+    cleanup_opening = None
+    cleanup_generation = None
     try:
         data = await _parse_json_body(request)
         user_input = data.get("input")
@@ -478,15 +502,20 @@ async def invoke_agent(request: Request, http_response: Response):
         )
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
-            register_request_delivery(agent, request_id, nested=False)
+            generation = register_request_delivery(agent, request_id, nested=False)
+            if type(generation) is int:
+                cleanup_generation = generation
             await_admission = getattr(
                 type(agent), "await_durable_request_admission", None
             )
             try:
                 if callable(await_admission):
                     await await_admission(agent, request_id)
-            except BaseException:
-                agent._cleanup_cancelled_request(request_id)
+            except BaseException as error:
+                retire_request_delivery(
+                    agent, request_id, generation=cleanup_generation,
+                    abandoned=is_execution_control_error(error), error=error,
+                )
                 raise
         else:
             agent._current_request_id = request_id
@@ -518,31 +547,34 @@ async def invoke_agent(request: Request, http_response: Response):
             owner_cancellation_baseline = (
                 owner_task.cancelling() if owner_task is not None else 0
             )
-            evidence_task = asyncio.create_task(
-                _kite_runtime_observation(
-                    agent,
-                    request_id=request_id,
-                    provenance=request_invocation_provenance(
-                        request,
-                        source_locator=(
-                            "POST:/api/agent/invoke#kite-release-evidence"
+            try:
+                evidence_task = await admit_request_operation(
+                    agent, request_id,
+                    _kite_runtime_observation(
+                        agent,
+                        request_id=request_id,
+                        provenance=request_invocation_provenance(
+                            request,
+                            source_locator=(
+                                "POST:/api/agent/invoke#kite-release-evidence"
+                            ),
                         ),
+                        request=kite_evidence_request,
                     ),
-                    request=kite_evidence_request,
-                ),
-                name=(
-                    "kite-evidence:"
-                    f"{invocation_log_correlation(request_id)}"
-                ),
-            )
-            bind_operation = getattr(
-                type(agent), "bind_request_operation", None
-            )
-            if callable(bind_operation):
-                bind_operation(agent, request_id, evidence_task)
+                    name=(
+                        "kite-evidence:"
+                        f"{invocation_log_correlation(request_id)}"
+                    ),
+                )
+            except BaseException as opening:
+                cleanup_abandoned = True
+                cleanup_opening = opening
+                raise
             try:
                 operation, observation = await evidence_task
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 if (
                     owner_task is not None
                     and owner_task.cancelling()
@@ -607,7 +639,9 @@ async def invoke_agent(request: Request, http_response: Response):
         # paths to lose continuity. Reviewer flagged at chat.js:520.
         try:
             effective_session_id = await agent.storage.resolve_session_id(session_id)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             effective_session_id = session_id  # fall back; never block the request
 
         try:
@@ -632,7 +666,9 @@ async def invoke_agent(request: Request, http_response: Response):
                     "model": None,
                     "provider": None,
                 }
-        except (asyncio.CancelledError, InvocationCancelledError):
+        except (asyncio.CancelledError, InvocationCancelledError) as error:
+            if is_execution_control_error(error):
+                raise
             if callable(request_cancelled) and request_cancelled(request_id) is True:
                 if invocation_was_self_fenced(agent, request_id):
                     raise self_fenced_invocation_http_error(request_id)
@@ -656,12 +692,18 @@ async def invoke_agent(request: Request, http_response: Response):
             "provider": identity.get("provider"),
         }
     except InvocationSelfFencedError as error:
+        if is_execution_control_error(error):
+            raise
         raise self_fenced_invocation_http_error(request_id) from error
     except HoldTurnRefusal as exc:
+        if is_execution_control_error(exc):
+            raise
         raise exc.as_http_exception() from exc
     except HTTPException:
         raise
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         # A retry loop that declined a server-advised wait is not an internal
         # error: the route is rate limited until a known time, and the caller
         # can act on that (#3127). The reset time is the provider's number,
@@ -699,7 +741,17 @@ async def invoke_agent(request: Request, http_response: Response):
         )
     finally:
         if cleanup_agent is not None and cleanup_request_id is not None:
-            cleanup_agent._cleanup_cancelled_request(cleanup_request_id)
+            error = sys.exception()
+            if cleanup_opening is not None:
+                error = execution_terminal_error(
+                    cleanup_opening, error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            retire_request_delivery(
+                cleanup_agent, cleanup_request_id, generation=cleanup_generation,
+                abandoned=cleanup_abandoned or (error is not None and is_execution_control_error(error)),
+                error=error,
+            )
 
 
 # Chat attachments (#1662). Images can be sent to the model as vision input
@@ -838,7 +890,7 @@ async def stream_agent_response(request: Request):
     stream_tap_registered = False
     setup_cleanup_complete = False
 
-    def cleanup_unstarted_stream() -> None:
+    def cleanup_unstarted_stream(error: BaseException | None = None) -> None:
         """Undo setup if constructing the response fails before generation."""
         nonlocal setup_cleanup_complete
         if setup_cleanup_complete:
@@ -847,7 +899,12 @@ async def stream_agent_response(request: Request):
         if stream_tap_registered and stream_tap is not None and stream_delivery_id is not None:
             stream_tap.unregister(stream_delivery_id)
         if request_lifecycle_registered and agent is not None and request_id is not None:
-            agent._cleanup_cancelled_request(request_id)
+            if error is not None and is_execution_control_error(error):
+                agent._cleanup_cancelled_request(
+                    request_id, disposition=RequestCompletionDisposition.ABANDONED,
+                )
+            else:
+                agent._cleanup_cancelled_request(request_id)
 
     try:
         data = await _parse_json_body(request)
@@ -905,7 +962,7 @@ async def stream_agent_response(request: Request):
         # server-owned id prevents concurrent response streams from publishing
         # into or closing each other's tap queue.
         stream_delivery_id = new_stream_delivery_id()
-        stream_tap.register(stream_delivery_id)
+        stream_tap.register(stream_delivery_id, owner=agent, request_id=request_id)
         stream_tap_registered = True
 
         # Pre-resolve the effective session_id and surface it via a
@@ -916,7 +973,9 @@ async def stream_agent_response(request: Request):
         # heuristic that left auto-load + context-status fragile).
         try:
             effective_session_id = await agent.storage.resolve_session_id(session_id)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             effective_session_id = session_id  # fall back; never block the stream
 
         async def generate():
@@ -955,7 +1014,7 @@ async def stream_agent_response(request: Request):
                     stop_notice_emitted = True
                     return
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
-                agent_stream = OwnedAsyncIterator(
+                agent_stream = await create_owned_iterator(
                     lambda: agent.process_input_streaming(
                         user_input,
                         model_override=model_override,
@@ -1025,16 +1084,24 @@ async def stream_agent_response(request: Request):
                         else stop_notice
                     )
                     stop_notice_emitted = True
-            except InvocationSelfFencedError:
+            except InvocationSelfFencedError as error:
+                if is_execution_control_error(error):
+                    raise
                 yield self_fenced_notice
-            except InvocationCancelledError:
+            except InvocationCancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 # A durable public-turn fence can win before the nested stream
                 # has yielded. Its typed unwind is acknowledged Stop even if
                 # nested cleanup already consumed the cancellation marker.
                 yield stop_notice
             except HoldTurnRefusal as exc:
+                if is_execution_control_error(exc):
+                    raise
                 yield exc.wire_json() + "\n"
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation
                 # in the operator log; the client receives the shared safe
@@ -1058,7 +1125,10 @@ async def stream_agent_response(request: Request):
                     )
                     yield agent_stream_error_block(e)
             finally:
+                active_error = sys.exception()
+                control_failed = active_error is not None and is_execution_control_error(active_error)
                 agent_stream_cleanup_failed = False
+                source_cleanup_error = None
                 try:
                     # One producer task owns construction, iteration, and close
                     # of the nested generator. Its join is cancellation-safe
@@ -1066,12 +1136,13 @@ async def stream_agent_response(request: Request):
                     # context.
                     if agent_stream is not None:
                         await agent_stream.aclose()
-                except BaseException:
+                except BaseException as cleanup_error:
+                    source_cleanup_error = cleanup_error
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
                         and agent_stream.cleanup_error is not None
                     )
-                    raise
+                    raise execution_terminal_error(active_error, cleanup_error)
                 else:
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
@@ -1080,11 +1151,16 @@ async def stream_agent_response(request: Request):
                 finally:
                     try:
                         # Signal stream completion for TTS consumers
-                        await stream_tap.finish(stream_delivery_id)
+                        await stream_tap.finish(stream_delivery_id, completed=(
+                            active_error is None and source_cleanup_error is None
+                            and not agent_stream_cleanup_failed and not stop_notice_emitted
+                        ))
+                    except BaseException as tap_error:
+                        raise execution_terminal_error(active_error, source_cleanup_error, tap_error)
                     finally:
                         # A failed nested close is an abandoned lifecycle,
                         # never proof that Stop succeeded.
-                        if agent_stream_cleanup_failed:
+                        if agent_stream_cleanup_failed or control_failed:
                             agent._cleanup_cancelled_request(
                                 request_id,
                                 disposition=(
@@ -1109,16 +1185,20 @@ async def stream_agent_response(request: Request):
             headers=headers,
         )
     except InvocationSelfFencedError as error:
-        cleanup_unstarted_stream()
+        cleanup_unstarted_stream(error)
+        if is_execution_control_error(error):
+            raise
         raise self_fenced_invocation_http_error(request_id) from error
-    except asyncio.CancelledError:
-        cleanup_unstarted_stream()
+    except asyncio.CancelledError as error:
+        cleanup_unstarted_stream(error)
         raise
-    except HTTPException:
-        cleanup_unstarted_stream()
+    except HTTPException as error:
+        cleanup_unstarted_stream(error)
         raise
-    except Exception:
-        cleanup_unstarted_stream()
+    except Exception as error:
+        cleanup_unstarted_stream(error)
+        if is_execution_control_error(error):
+            raise
         logger.error("Error setting up stream")
         raise ApiHTTPException(
             status_code=500,
@@ -1976,8 +2056,8 @@ async def _acquire_context_status_measurement(
 ) -> _ContextStatusMeasurement:
     """Acquire one dry-run production plan for a session."""
 
-    from kestrel_sovereign.agent.token_counter import get_token_counter
     from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
+    from kestrel_sovereign.agent.token_counter import get_token_counter
 
     privacy_agent = getattr(agent, "privacy_agent", None)
     history_reader = getattr(
@@ -2023,6 +2103,8 @@ async def _acquire_context_status_measurement(
             constitution_text = await got if hasattr(got, "__await__") else got
             constitution_text = constitution_text or ""
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.debug("constitution fetch failed for breakdown: %s", exc)
             if is_real_governing_getter:
                 raise RuntimeError(
@@ -2095,6 +2177,8 @@ async def _acquire_context_status_measurement(
                 try:
                     reflection_guidance = await getter()
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "reflection guidance fetch failed for breakdown: %s",
                         exc,
@@ -2215,8 +2299,8 @@ async def compute_context_status(
       relevance gates and retrieval path execute read-only.
     """
     try:
-        from kestrel_sovereign.agent.token_counter import get_token_counter
         from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
+        from kestrel_sovereign.agent.token_counter import get_token_counter
 
         # 1. No active session → return an idle shape.  Previously passing
         # session_id=None into get_conversation_history leaked the agent's
@@ -2286,6 +2370,8 @@ async def compute_context_status(
                         DEFAULT_PENDING_WARN_THRESHOLD
                     )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"salvage counts fetch failed for breakdown: {e}")
 
         # 5. Pill % = projected whole-window utilization (the design's
@@ -2467,6 +2553,8 @@ async def compute_context_status(
             "silently_pruned_path_active": silently_pruned_path_active,
         }
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error getting context status: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving context status.")
 
@@ -2555,7 +2643,9 @@ def _scoped_agent_did_or_503(agent, verb: str) -> str:
 
     try:
         return resolve_scoped_agent_did(agent)
-    except AgentIdentityUnavailable:
+    except AgentIdentityUnavailable as error:
+        if is_execution_control_error(error):
+            raise
         raise HTTPException(
             status_code=503,
             detail=f"{verb} the agent's durable identity",
@@ -2579,7 +2669,9 @@ def _task_recipient_principal(agent, *, verb: str = "reads require") -> str:
 
     try:
         return resolve_scoped_agent_did(agent)
-    except AgentIdentityUnavailable:
+    except AgentIdentityUnavailable as error:
+        if is_execution_control_error(error):
+            raise
         raise HTTPException(
             status_code=503,
             detail=f"A2A task {verb} a durable recipient identity",
@@ -2655,6 +2747,8 @@ async def list_tasks(
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error listing tasks: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error listing tasks.")
 
@@ -2762,7 +2856,9 @@ def _a2a_inbound_current_scope_is_valid(
         return False
     try:
         return validator(*arguments) is True
-    except Exception:  # noqa: BLE001 - injected host policy boundary
+    except Exception as error:  # noqa: BLE001 - injected host policy boundary
+        if is_execution_control_error(error):
+            raise
         return False
 
 
@@ -2815,7 +2911,9 @@ async def _authorize_verified_a2a_sender(
             )
         if inspect.isawaitable(result):
             result = await result
-    except Exception:  # noqa: BLE001 - injected host policy boundary
+    except Exception as error:  # noqa: BLE001 - injected host policy boundary
+        if is_execution_control_error(error):
+            raise
         logger.warning(
             "Inbound A2A sender authorization provider failed",
             exc_info=True,
@@ -3074,7 +3172,9 @@ async def _create_a2a_task_under_lifecycle_lease(
                     claimed_sender,
                     hosted_policy,
                 )
-            except Exception:  # noqa: BLE001 - manager policy boundary
+            except Exception as error:  # noqa: BLE001 - manager policy boundary
+                if is_execution_control_error(error):
+                    raise
                 logger.warning(
                     "Hosted legacy unsigned A2A sender authorization failed",
                     exc_info=True,
@@ -3138,10 +3238,13 @@ async def _create_a2a_task_under_lifecycle_lease(
             authorized_sender_id = stable_sender_id
     if callable(commit):
         try:
+            require_execution_work(agent)
             return await commit(authorized_sender_id)
         except HTTPException:
             raise
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "Failed to commit verified A2A action: %s",
                 exc,
@@ -3152,6 +3255,7 @@ async def _create_a2a_task_under_lifecycle_lease(
             ) from exc
 
     try:
+        require_execution_work(agent)
         return await agent.task_manager.create_task(
             params=params,
             agent_name=recipient_agent_id,
@@ -3161,14 +3265,17 @@ async def _create_a2a_task_under_lifecycle_lease(
     except TaskAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         logger.error(
             "Failed to create A2A task from peer submission: %s",
             exc,
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail="Failed to create task")
+        raise HTTPException(status_code=500, detail="Failed to create task") from exc
 
 
+@execution_work_operation
 async def _create_verified_a2a_task(
     agent,
     params,
@@ -3283,14 +3390,14 @@ async def send_task(request: Request):
             detail="TaskManager not available — agent cannot accept A2A tasks",
         )
 
+    from kestrel_sovereign.a2a.local_submission import (
+        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+    )
     from kestrel_sovereign.a2a.types import (
         Artifact,
         Message,
-        TextPart,
         TaskSendParams,
-    )
-    from kestrel_sovereign.a2a.local_submission import (
-        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+        TextPart,
     )
     try:
         # Parse body into TaskSendParams. Sender-side already validated
@@ -3657,6 +3764,8 @@ async def get_task(request: Request, task_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error loading task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error loading task.")
 
@@ -3851,10 +3960,19 @@ async def _task_subscription_response(
             )
         _sse_connections[conn_key] += 1
 
+    def release_connection():
+        # No await: the same event loop cannot interleave a quota mutation.
+        # Also usable by the close-aware body before its first pull.
+        _sse_connections[conn_key] -= 1
+        if _sse_connections[conn_key] <= 0:
+            del _sse_connections[conn_key]
+
     async def event_generator():
         import json
         last_ping = time.monotonic()
         ping_interval = 10.0  # 10s heartbeat for intermediaries
+        subscription = None
+        body_error = None
         try:
             # ``TaskManager.subscribe`` already yields the current state
             # first, then streams updates, then breaks on the first
@@ -3862,10 +3980,11 @@ async def _task_subscription_response(
             # on its internal timeout — we forward those as SSE
             # comments-or-pings so the connection stays warm even when
             # the task sits in SUBMITTED for a while.
-            async for ev in agent.task_manager.subscribe(
+            subscription = agent.task_manager.subscribe(
                 task_id,
                 **subscribe_kwargs,
-            ):
+            )
+            async for ev in subscription:
                 if await request.is_disconnected():
                     logger.debug(
                         "task subscribe client disconnected (task=%s)",
@@ -3888,28 +4007,55 @@ async def _task_subscription_response(
                 if now - last_ping >= ping_interval:
                     yield f"event: ping\ndata: {json.dumps({'t': now})}\n\n"
                     last_ping = now
-        except asyncio.CancelledError:
-            logger.debug(
-                "task subscribe cancelled (task=%s)", task_id[:8],
-            )
-        except Exception as e:
-            logger.error(
-                "task subscribe error (task=%s): %s",
-                task_id[:8], e, exc_info=True,
-            )
-            yield (
-                "event: error\ndata: "
-                + json.dumps({"error": "Internal server error"})
-                + "\n\n"
-            )
+        except (Exception, asyncio.CancelledError) as error:
+            body_error = error
+            if is_execution_control_error(error):
+                # Keep the original native carrier, never generic data/EOF.
+                # ClosingStreamingResponse preserves it across ASGI's own
+                # cancellation/disconnect normalization boundary.
+                raise
+            if isinstance(error, asyncio.CancelledError):
+                logger.debug(
+                    "task subscribe cancelled (task=%s)", task_id[:8],
+                )
+            else:
+                logger.error(
+                    "task subscribe error (task=%s): %s",
+                    task_id[:8], error, exc_info=True,
+                )
+                yield (
+                    "event: error\ndata: "
+                    + json.dumps({"error": "Internal server error"})
+                    + "\n\n"
+                )
         finally:
-            async with _sse_lock:
-                _sse_connections[conn_key] -= 1
-                if _sse_connections[conn_key] <= 0:
-                    del _sse_connections[conn_key]
+            original = execution_terminal_error(
+                body_error, sys.exception(), retain_originals=True,
+            )
+            cleanup_error = None
+            try:
+                if subscription is not None:
+                    # This caller advanced the ORIGINAL raw generator. Close
+                    # it in the SAME task/context, including terminal breaks
+                    # and disconnects, without new cleanup-Task admission.
+                    await subscription.aclose()
+            except BaseException as error:
+                cleanup_error = error
+            try:
+                async with _sse_lock:
+                    release_connection()
+            except BaseException as error:
+                cleanup_error = execution_terminal_error(
+                    cleanup_error, error, retain_originals=True,
+                )
+            if cleanup_error is not None:
+                raise execution_terminal_error(
+                    original, cleanup_error, retain_originals=True,
+                )
 
-    return StreamingResponse(
-        event_generator(),
+    return ClosingStreamingResponse(
+        _CloseAwareStreamBody(event_generator(), release_connection),
+        close_in_stream_task=True,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -3984,6 +4130,9 @@ async def heartbeat_trigger(request: Request):
         result = await runner.run_once()
         return result.to_dict()
     except Exception as e:
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Heartbeat trigger error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error triggering heartbeat.")
 
@@ -4031,6 +4180,8 @@ async def agent_health_trigger(request: Request):
     try:
         return await feature.run_once()
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Health trigger error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error running liveness check.")
 

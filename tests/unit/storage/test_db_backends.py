@@ -12,14 +12,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
+
 import kestrel_sovereign.storage.db.sqlite as sqlite_backend_module
 from kestrel_sovereign.storage.db import (
     ConnectionError,
     QueryError,
     SQLiteBackend,
-    sqlite_to_postgres,
-    postgres_to_sqlite,
     normalize_schema,
+    postgres_to_sqlite,
+    sqlite_to_postgres,
 )
 from tests.utils.aiosqlite_workers import (
     CloseStage,
@@ -1152,6 +1153,7 @@ class TestSQLiteBackend:
         self, tmp_path
     ):
         """A stale diagnostic snapshot cannot drive a later application write."""
+        from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
         backend = SQLiteBackend(str(tmp_path / "cancelled-commit-read.db"))
         await backend.connect()
         await backend.execute(
@@ -1184,8 +1186,10 @@ class TestSQLiteBackend:
                         await asyncio.sleep(0.005)
 
                 timed_out_write.cancel()
-                with pytest.raises(asyncio.CancelledError):
+                with pytest.raises(ExecutionCommitOutcomeError) as receipt:
                     await timed_out_write
+                assert receipt.value.commit_outcome == "unknown"
+                assert isinstance(receipt.value.__cause__, asyncio.CancelledError)
                 drain = backend._cancelled_write_drain
                 assert drain is not None and not drain.done()
 
@@ -3143,18 +3147,22 @@ class TestAsyncDatabase:
             "block_in_worker", 0, block_in_worker
         )
 
-        real_gather = asyncio.gather
-        gather_calls = 0
+        real_wait = asyncio.wait
+        wait_calls = 0
+        original_cancellation = None
 
-        def cancel_at_initial_gather(*awaitables, **kwargs):
-            nonlocal gather_calls
-            gather_calls += 1
-            gathered = real_gather(*awaitables, **kwargs)
-            if gather_calls == 1:
+        async def cancel_at_initial_wait(*awaitables, **kwargs):
+            nonlocal wait_calls, original_cancellation
+            wait_calls += 1
+            if wait_calls == 1:
                 current = asyncio.current_task()
                 assert current is not None
                 current.cancel()
-            return gathered
+            try:
+                return await real_wait(*awaitables, **kwargs)
+            except asyncio.CancelledError as error:
+                original_cancellation = error
+                raise
 
         async def skip_engine_dispose(_engine, close=True):
             return None
@@ -3174,12 +3182,17 @@ class TestAsyncDatabase:
             with patch.object(
                 type(factory.engine), "dispose", skip_engine_dispose,
             ), patch.object(
-                session_module.asyncio, "gather", new=cancel_at_initial_gather,
+                session_module.asyncio, "wait", new=cancel_at_initial_wait,
             ):
-                with pytest.raises(asyncio.CancelledError):
+                # A blocked native worker cannot be reported as cleanly
+                # cancelled. Its bounded retirement failure remains primary,
+                # with the original caller cancellation retained as cause.
+                with pytest.raises(ConnectionError) as failed_close:
                     await db.dispose_cached_sqla_factory()
 
-            assert gather_calls == 2
+            assert wait_calls >= 2
+            assert original_cancellation is not None
+            assert failed_close.value.__cause__ is original_cancellation
             assert worker.is_alive()
             assert db._sovereign_sqla_factory is None
             assert db._sovereign_sqla_retirement_owner is factory
@@ -3342,13 +3355,20 @@ class TestAsyncDatabase:
         disposal_started = asyncio.Event()
         release_disposal = asyncio.Event()
 
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        # A real non-connecting PostgreSQL engine supplies the native event
+        # surface. Only the disposal acknowledgement is fault-injected.
+        event_engine = create_async_engine("postgresql+asyncpg://disposable@127.0.0.1:1/disposable")
+
         class PendingPostgresEngine:
-            class dialect:
-                name = "postgresql"
+            dialect = event_engine.dialect
+            sync_engine = event_engine.sync_engine
 
             async def dispose(self):
                 disposal_started.set()
                 await release_disposal.wait()
+                await event_engine.dispose()
                 raise RuntimeError("late PostgreSQL dispose failure")
 
         storage = AsyncStorage(str(tmp_path / "postgres-dispose-owner.db"))
@@ -4087,7 +4107,10 @@ class TestAsyncDatabase:
     
     @pytest.mark.asyncio
     async def test_context_manager(self, tmp_path):
-        from kestrel_sovereign.storage.async_database import AsyncDatabase, SQLiteBackend
+        from kestrel_sovereign.storage.async_database import (
+            AsyncDatabase,
+            SQLiteBackend,
+        )
         
         db_path = str(tmp_path / "test.db")
         backend = SQLiteBackend(db_path)

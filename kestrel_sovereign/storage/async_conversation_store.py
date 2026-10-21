@@ -22,6 +22,7 @@ from time import monotonic, perf_counter
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from .conversation_ids import coerce_persistent_message_id
 from .conversation_created_at import (
     UNDATED_TABLE,
@@ -163,6 +164,15 @@ class EmbeddingColumnMismatch:
     profile_dim: int
     column_dim: int
     checked_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedConversationFields:
+    """Canonical at-rest fields, prepared without DB/provider/lexical effects."""
+
+    content: str
+    rendered_content: Optional[str]
+    metadata: Dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -687,9 +697,9 @@ class AsyncConversationStore:
                 When provided, conversation embeddings are sourced from
                 the active chat provider's embedding capability (OpenAI →
                 text-embedding-3-small, Vertex/Google → text-embedding-004,
-                Ollama → nomic-embed-text). When ``None`` the store falls
-                through to ``get_provider_embedding_service(None)`` which
-                resolves the global default. Set
+                Ollama → nomic-embed-text). When ``None``, provider
+                embeddings are unavailable; a storage lookup never creates
+                an unowned global LLM service. Set
                 ``KESTREL_DISABLE_CONVERSATION_EMBEDDINGS=true`` to opt
                 out entirely (e.g. when the deployment can't reach an
                 embedding provider).
@@ -978,6 +988,8 @@ class AsyncConversationStore:
                         reason=reason,
                     )
                 except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
                     # Exit the database transaction without deleting anything,
                     # then restore the audit sink's historical exception contract
                     # instead of letting the backend wrap it as TransactionError.
@@ -1069,11 +1081,15 @@ class AsyncConversationStore:
             from kestrel_sovereign.llm.embedding_service import (
                 get_provider_embedding_service,
             )
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             return None
         try:
             return get_provider_embedding_service(self._llm_service)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.info(
                 "Provider embedding service unavailable for "
                 "conversation_history writes (%s); falling back to legacy "
@@ -1122,6 +1138,8 @@ class AsyncConversationStore:
         try:
             return service.current_profile_id()
         except Exception as exc:  # pragma: no cover - defensive
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "current_profile_id() failed for agent %s: %s",
                 self.agent_id, exc,
@@ -1197,9 +1215,10 @@ class AsyncConversationStore:
         disagreement means every embedded write will persist without its
         vector, so it is kept for ``/health/detailed`` as a misconfiguration
         and logged at ERROR when found; finding the same disagreement again
-        does not log it again. It never raises: the turn writes keep
+        does not log it again. Recall degradation never raises: the turn writes keep
         succeeding, and refusing to boot would take the agent down over a
-        recall degradation.
+        recall degradation. Execution authority, native retirement and commit
+        control still propagate; these are not recall misconfiguration.
 
         Each run replaces what the last one found, so the flag describes the
         profile the store writes with now, against the width its writes are
@@ -1246,7 +1265,9 @@ class AsyncConversationStore:
             self._embedding_column_dim = await declared_embedding_vec_dimension(
                 self.db, "conversation_history"
             )
-        except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail boot
+        except Exception as exc:  # noqa: BLE001 - ordinary diagnostic unavailability is not fatal
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "Could not read conversation_history.embedding_vec's declared "
                 "width for agent %s: %s", self.agent_id, exc,
@@ -1259,7 +1280,9 @@ class AsyncConversationStore:
         describe = getattr(service, "describe", None)
         try:
             profile = describe() if callable(describe) else None
-        except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail boot
+        except Exception as exc:  # noqa: BLE001 - ordinary diagnostic unavailability is not fatal
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "Could not describe the embedding profile for agent %s: %s",
                 self.agent_id, exc,
@@ -1391,6 +1414,8 @@ class AsyncConversationStore:
                 return self._new_session_id()
             return prev_sid
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Never let implicit-session derivation block the write. Nor may a
             # failure leave the turn without a session: the opening row would
             # be filed under none and its reply would mint another (#3654).
@@ -1444,6 +1469,8 @@ class AsyncConversationStore:
                 (row_id, self.agent_id),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Session canonicalization lookup failed: {e}")
             return session_id
 
@@ -1521,6 +1548,8 @@ class AsyncConversationStore:
                     return False
             return marker_count == 1
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Marker ownership check failed: {e}")
             return False
 
@@ -1598,6 +1627,8 @@ class AsyncConversationStore:
                     )
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 # Most likely cause: the Phase-2 migration hasn't run
                 # yet so the column doesn't exist. Don't crash
                 # retrieval — the legacy keyword-overlap path still
@@ -1659,6 +1690,8 @@ class AsyncConversationStore:
                     # numpy arrays an adapter may produce.
                     out[row_id] = [float(v) for v in raw]
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "Could not decode embedding for message %s: %s",
                     row_id, e,
@@ -1743,24 +1776,8 @@ class AsyncConversationStore:
         if session_id:
             meta['session_id'] = session_id
 
-        # Use per-agent key for new messages.
-        fernet_to_use = self._agent_fernet or self._global_fernet
-        to_store, was_encrypted = encrypt_string(content, fernet_to_use)
-        if was_encrypted:
-            meta['enc'] = True
-            meta['key_version'] = CURRENT_KEY_VERSION
-
-        rendered_to_store: Optional[str] = None
-        if rendered_content is not None:
-            rendered_to_store, rendered_was_encrypted = encrypt_string(
-                rendered_content, fernet_to_use
-            )
-            # rendered_content shares the same key/version as content; the
-            # ``enc`` flag covers both. If content was empty and skipped
-            # encryption but rendered_content didn't, surface that.
-            if rendered_was_encrypted and not was_encrypted:
-                meta['enc'] = True
-                meta['key_version'] = CURRENT_KEY_VERSION
+        fields = self.prepare_storage_fields(content, rendered_content, meta)
+        to_store, rendered_to_store, meta = fields.content, fields.rendered_content, fields.metadata
 
         # Compute the embedding from plaintext before the final INSERT so it
         # can still be co-written without an autoincrement-id round trip.
@@ -1790,6 +1807,8 @@ class AsyncConversationStore:
                 _tokenize_for_search(_strip_search_wrappers(content)),
             )
         except Exception as exc:  # noqa: BLE001 - recall falls back safely
+            if is_execution_control_error(exc):
+                raise
             logger.error(
                 "Blind lexical index write failed for agent %s: %s. "
                 "Persisting the message on the correctness fallback.",
@@ -1853,9 +1872,17 @@ class AsyncConversationStore:
                 lexical_index_id=prepared.lexical_index_id,
                 lexical_index_version=prepared.lexical_index_version,
             )
-        except Exception:
+        except BaseException as write_failure:
+            if is_execution_control_error(write_failure):
+                # Unknown/committed insertion is not proof that its token-first
+                # index is orphaned. Do not delete it or replay another INSERT.
+                raise
             if prepared.lexical_index_id:
-                await self._discard_lexical_tokens(prepared.lexical_index_id)
+                try:
+                    await self._discard_lexical_tokens(prepared.lexical_index_id)
+                except BaseException as cleanup_failure:
+                    from kestrel_sovereign.execution_custody import execution_terminal_error
+                    raise execution_terminal_error(write_failure, cleanup_failure)
                 prepared.lexical_index_id = None
             raise
         if not inserted.lexical_columns_written and prepared.lexical_index_id:
@@ -1884,6 +1911,8 @@ class AsyncConversationStore:
                     prepared.embedding_profile_id,
                 )
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "Failed to upsert embedding_profiles row for agent %s: %s",
                     self.agent_id, exc,
@@ -1913,6 +1942,8 @@ class AsyncConversationStore:
         try:
             embedding = await service.aembed(content)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Embedding generation must NEVER block message persistence.
             # The retriever falls back to keyword overlap for this row.
             logger.warning(
@@ -1986,6 +2017,8 @@ class AsyncConversationStore:
                 (self.agent_id, lexical_index_id),
             )
         except Exception as exc:  # noqa: BLE001 - original write error wins
+            if is_execution_control_error(exc):
+                raise
             logger.debug("Could not clean orphan lexical tokens: %s", exc)
 
     async def _execute_confined(self, sql: str, params: tuple) -> None:
@@ -2087,6 +2120,8 @@ class AsyncConversationStore:
                 await self._execute_confined(sql, base_params)
                 return _InsertedConversation(lexical_columns_written=True)
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 if not _is_missing_lexical_column_error(exc):
                     raise
                 logger.info(
@@ -2123,6 +2158,8 @@ class AsyncConversationStore:
                 sql, base_params + (emb_bind, embedding_profile_id),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             if _is_missing_lexical_column_error(e):
                 # The lexical migration is additive/non-fatal. Preserve the
                 # independently-migrated vector + profile stamp before trying
@@ -2138,6 +2175,8 @@ class AsyncConversationStore:
                     )
                     return _InsertedConversation(lexical_columns_written=False)
                 except Exception as legacy_exc:
+                    if is_execution_control_error(legacy_exc):
+                        raise
                     if not _is_missing_column_error(
                         legacy_exc, "embedding_profile_id", "embedding_vec"
                     ):
@@ -2169,6 +2208,8 @@ class AsyncConversationStore:
                 self._log_unstamped_embedding(e)
                 return _InsertedConversation(lexical_columns_written=True)
             except Exception as e2:
+                if is_execution_control_error(e2):
+                    raise
                 logger.debug(
                     "New lexical-index INSERT paths failed for agent %s (%s); "
                     "retrying the legacy embedding_vec path.", self.agent_id, e2,
@@ -2184,6 +2225,8 @@ class AsyncConversationStore:
                     self._log_unstamped_embedding(e)
                     return _InsertedConversation(lexical_columns_written=False)
                 except Exception as e3:
+                    if is_execution_control_error(e3):
+                        raise
                     logger.debug(
                         "Legacy embedding_vec INSERT also failed for agent %s "
                         "(%s); persisting without an embedding.", self.agent_id, e3,
@@ -2216,6 +2259,29 @@ class AsyncConversationStore:
             "accepted only without embedding_profile_id (%s).",
             self.agent_id, error,
         )
+
+    def prepare_storage_fields(
+        self, content: str, rendered_content: Optional[str], metadata: Optional[Dict],
+    ) -> PreparedConversationFields:
+        """Encode logical fields under THIS store's existing encryption policy.
+
+        Importers can preserve original timestamps/session columns while using
+        the same message encryption as ordinary writes, without embeddings or
+        lexical-index I/O inside their atomic restore transaction.
+        """
+        meta = dict(metadata) if metadata else {}
+        fernet_to_use = self._agent_fernet or self._global_fernet
+        to_store, was_encrypted = encrypt_string(content, fernet_to_use)
+        if was_encrypted:
+            meta['enc'] = True
+            meta['key_version'] = CURRENT_KEY_VERSION
+        rendered_to_store = None
+        if rendered_content is not None:
+            rendered_to_store, rendered_was_encrypted = encrypt_string(rendered_content, fernet_to_use)
+            if rendered_was_encrypted and not was_encrypted:
+                meta['enc'] = True
+                meta['key_version'] = CURRENT_KEY_VERSION
+        return PreparedConversationFields(to_store, rendered_to_store, meta)
 
     def decrypt_stored_content(self, content: str, meta: Optional[Dict]) -> str:
         """Public: decrypt one stored row's content to plaintext.
@@ -2366,6 +2432,8 @@ class AsyncConversationStore:
                         row_id, content, rendered_content, meta
                     )
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         "Split-migration failed for message %s: %s",
                         row_id, e,
@@ -2460,6 +2528,8 @@ class AsyncConversationStore:
                 try:
                     await self._migrate_message(row_id, content, meta)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Migration failed for message {row_id}: {e}")
 
             # rendered_content (#1402): decrypt + apply canonical/transport
@@ -3117,6 +3187,8 @@ class AsyncConversationStore:
                 try:
                     await self._migrate_message(row_id, content, meta)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Migration failed for message {row_id} in get_full_history: {e}")
 
             # Canonical/transport split (#1402)
@@ -3232,6 +3304,8 @@ class AsyncConversationStore:
                 try:
                     await self._migrate_message(row_id, content, meta)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Migration failed for message {row_id} in search_history: {e}")
 
             # Canonical/transport split (#1402): search must match against
@@ -3729,6 +3803,8 @@ class AsyncConversationStore:
         try:
             return await self.get_conversation_names()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"search_sessions: name lookup failed: {e}")
             return {}
     async def clear_history(self) -> None:
@@ -4356,6 +4432,8 @@ class AsyncConversationStore:
         try:
             names = await self.get_conversation_names()
         except Exception as e:  # titles are best-effort decoration
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"list_conversation_sessions: name lookup failed: {e}")
             names = {}
 
@@ -4961,6 +5039,8 @@ class AsyncConversationStore:
                 try:
                     await self._migrate_message(row_id, content, meta)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Migration failed for message {row_id}: {e}")
 
             cleaned_meta = remove_enc_flag(meta)
@@ -5683,6 +5763,8 @@ class AsyncConversationStore:
             )
             index_available = False
         except Exception as exc:  # noqa: BLE001 - pre-migration compatibility
+            if is_execution_control_error(exc):
+                raise
             fallback_reason = "index_unavailable"
             logger.warning(
                 "Blind lexical candidate index unavailable for agent %s (%s); "
@@ -5799,6 +5881,8 @@ class AsyncConversationStore:
             )
             self._lexical_coverage_index_available = bool(row and row[0])
         except Exception as exc:  # noqa: BLE001 - performance hint only
+            if is_execution_control_error(exc):
+                raise
             logger.debug("Could not inspect lexical coverage index: %s", exc)
             self._lexical_coverage_index_available = False
         return self._lexical_coverage_index_available
@@ -5819,6 +5903,8 @@ class AsyncConversationStore:
                 try:
                     current_profile_id = service.current_profile_id()
                 except Exception as exc:  # pragma: no cover - provider defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug("Could not resolve current embedding profile: %s", exc)
         row = await self.db.fetchone(
             "SELECT COUNT(*), "
@@ -5921,6 +6007,8 @@ class AsyncConversationStore:
                 attempted += len(replacement_entries)
                 garbage_collected += replacement_result.garbage_collected
             except Exception as exc:  # noqa: BLE001 - continue resumable sweep
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "Lexical index backfill batch ending at message %s failed: %s",
                     after_id, exc,
@@ -6138,6 +6226,8 @@ class AsyncConversationStore:
                 try:
                     await self._migrate_message(row_id, content, meta)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(f"Migration failed for message {row_id} in get_all_audit_failures: {e}")
 
             cleaned_meta = remove_enc_flag(meta)

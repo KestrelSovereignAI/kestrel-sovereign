@@ -194,7 +194,7 @@ development host:
 
 | ID | Hypothesis | Status | Result |
 |---|---|---|---|
-| E1 | The CI runner has more vCPUs than the 2 xdist workers use | **confirmed** | 4 vCPUs (2 cores × 2 threads). `-n auto` counts physical cores and starts 2 workers. Unit tier: 21.7 min at 2 workers, 14.1 at 4, **10.2 at 8**, with no new failures. |
+| E1 | The CI runner has more vCPUs than the 2 xdist workers use | **confirmed; `-n logical` shipped in #3670** | 4 vCPUs (2 cores × 2 threads). `-n auto` counts physical cores and starts 2 workers. Unit tier: 21.7 min at 2 workers, **14.1 at 4**, 10.2 at 8. But 8 failed two near-limit tests on its second run. |
 | E2 | Splitting the unit tier across 4 runners brings it under 10 minutes | **confirmed** | Split by measured time at 4 workers each: jobs take 4.2–6.5 min, so **~6.5 min wall time**. Exposed three order-dependent tests that must be fixed first. |
 | E3 | A small set of tests dominates the unit tier | **confirmed** | 547 tests (2%) take ≥1 s each and are **52%** of test time; 49 tests take ≥5 s and are 18%. |
 | E4 | The host runs the full unit suite far faster than CI | **confirmed** | 5 min 24 s at `-n 8`; **3 min 53 s at `-n 16`**, all 24,787 tests green. |
@@ -232,8 +232,20 @@ round trips) rather than computing.
 | 8 | 62.3 min | 10.2 min | 6.1× |
 
 Each test slows a little as workers contend for the CPU, but far less than
-the parallelism gained. So `-n 8` is a free, one-line change that roughly
-halves the unit tier. Higher counts are worth measuring next.
+the parallelism gained.
+
+**The second run at 8 workers failed.** That run was the CI of #3670. It
+took 15 min 40 s on a slower runner, and two tests that sit near their
+limits failed:
+
+- `test_paging_survives_tombstones_filling_whole_pages` crossed the 60 s
+  per-test timeout. It takes 27.7 s at 2 workers and 41 s at 4.
+- The 50 ms graph-index benchmark measured 55 ms.
+
+Eight workers on 4 vCPUs oversubscribe the CPU, and the slowest tests have
+no margin for that. One clean run and one failing run is too flaky for a
+merge gate. So #3670 shipped `-n logical` (4 workers, one per vCPU); its own CI ran the unit tier in 15 min 01 s, all green. Going past the vCPU count waits until the slow tests get faster (E3,
+#3276).
 
 ### E2 — Sharding the unit tier
 
@@ -278,7 +290,8 @@ ran each shard at `-n logical` (4 workers):
   second independent reproduction. Nothing else failed.
 - **Balance:** still uneven, because the per-file times came from one run.
 - **Next combination to try:** four shards at `-n 8` each should land near
-  4 minutes.
+  4 minutes. It carries the same oversubscription risk that E1's second
+  8-worker run hit.
 
 ### E3 — Where the unit tier's time goes
 
@@ -394,13 +407,14 @@ GitHub cannot, and every move would mean rewriting:
 
 Updated with the results above.
 
-1. **Raise the unit tier to `-n 8` now** (E1). It is free, needs one line
-   changed, and cuts about 11 minutes from every PR.
-2. **Fix the order-dependent `test_host_features` tests** (E2) and the
-   direct `os.environ` writes that hide them. They are a latent flake today
-   and block sharding.
-3. **Shard both tiers once that is fixed.** Four unit shards split by
-   measured time came to about 6.5 minutes (E2). Parallelize integration
+1. **Run the unit tier at `-n logical`** (E1, #3670). It is free, needs one
+   line changed, and cuts about 7 minutes from every PR. `-n 8` would cut
+   about 11 minutes, but it waits until the slowest tests get faster.
+2. **Fix the order-dependent `test_host_features` tests** (E2, #3671) and
+   the direct `os.environ` writes that hide them. They are a latent flake
+   today and block sharding.
+3. **Shard both tiers once that is fixed** (#3672). Four unit shards split
+   by measured time came to about 6.5 minutes (E2). Parallelize integration
    too (#2794). Keep the required check names stable through aggregator
    jobs.
 4. **Widen the lane to two Talon workers, not three** (E5). Each lane runs

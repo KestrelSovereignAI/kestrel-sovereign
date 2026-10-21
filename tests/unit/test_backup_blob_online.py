@@ -15,7 +15,23 @@ TEST_AGENT_ID = "did:pkh:eip155:1:0xabcabcabcabcabcabcabcabcabcabcabcabcabca"
 
 @pytest.fixture(autouse=True)
 def data_key(monkeypatch):
+    from kestrel_sovereign.llm import embedding_service
+    from kestrel_sovereign.storage.db import sqlite
+
     monkeypatch.setenv("KESTREL_DATA_KEY", "test-backup-blob-key")
+    # Backup/restore semantics do not test provider routing or the one-second
+    # native worker deadline. Own finite fixture cleanup without constructing
+    # an unrelated ambient LLM service; production and deadline tests are unchanged.
+    monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
+    monkeypatch.setattr(sqlite, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", 10.0)
+
+    def refuse_unrelated_provider(*_args, **_kwargs):
+        pytest.fail("backup/restore fixtures must not resolve a provider service")
+
+    # A cost/ownership refusal, not a fake provider response or embedding ACK.
+    monkeypatch.setattr(
+        embedding_service, "get_provider_embedding_service", refuse_unrelated_provider
+    )
 
 
 async def _storage(tmp_path, name="kestrel.db"):
@@ -71,7 +87,10 @@ async def test_backup_blob_restores_into_fresh_storage(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_restore_coerces_text_timestamps_for_postgres(tmp_path, monkeypatch):
+@pytest.mark.parametrize("close_delay", [0, 1.1], ids=["immediate-close", "delayed-close"])
+async def test_restore_coerces_text_timestamps_for_postgres(
+    tmp_path, monkeypatch, close_delay
+):
     """#2116 regression: restore binds created_at/deleted_at that come out of the
     SQLite backup as TEXT strings. On a Postgres target these must be coerced to
     datetime, or asyncpg rejects a str for the TIMESTAMP column (_strip_tz only
@@ -79,11 +98,35 @@ async def test_restore_coerces_text_timestamps_for_postgres(tmp_path, monkeypatc
     from datetime import datetime
 
     source = await _storage(tmp_path, name="src.db")
+    native = source.db.backend._connection
+    native_close = native.close
+    close_entered = asyncio.Event()
+
+    async def observed_close():
+        close_entered.set()
+        try:
+            await asyncio.sleep(close_delay)
+        finally:
+            # The actual accepted closer still retires its worker if the
+            # caller's observation deadline cancels this delay.
+            await native_close()
+
+    monkeypatch.setattr(native, "close", observed_close)
     try:
         await source.add_conversation("user", "ts row")
         blob = await source.create_backup_blob()
     finally:
-        await source.close()
+        try:
+            await source.close()
+        finally:
+            from kestrel_sovereign._async_ownership import await_owned_task
+            from kestrel_sovereign.storage.db.sqlite import _wait_for_aiosqlite_worker_shutdown
+
+            for retained in tuple(source.db.backend._retired_connection_closes.values()):
+                await await_owned_task(retained.close_task)
+            if not close_entered.is_set():
+                await native_close()
+            await _wait_for_aiosqlite_worker_shutdown(native, timeout_s=10.0)
 
     target = await _storage(tmp_path, name="tgt.db")
     bound = []

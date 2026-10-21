@@ -22,6 +22,7 @@ How it works:
 import logging
 
 from .anthropic_adapter import AnthropicAdapter, anthropic_model_info
+from kestrel_sovereign.execution_custody import retain_native_execution_http_client_close
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ class ClaudeMaxAdapter(AnthropicAdapter):
             raise ValueError("Claude plan model discovery requires its Anthropic client")
 
         await self._ensure_fresh_oauth_token(client)
+        retain_native_execution_http_client_close(getattr(client, "_client", None))
         page = await client.models.list()
         models = [anthropic_model_info(model) for model in page.data]
         self._learn_output_ceilings(models)

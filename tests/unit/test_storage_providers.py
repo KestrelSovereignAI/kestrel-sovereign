@@ -983,6 +983,16 @@ class TestSyncManifest:
 class TestFilebaseProvider:
     """Tests for FilebaseProvider (S3-compatible IPFS storage)."""
 
+    @pytest.fixture(autouse=True)
+    def offline_s3_construction(self, monkeypatch):
+        # Construction checks/creates the bucket BEFORE individual tests
+        # install their operation-specific client. Own that transport first.
+        try:
+            import boto3
+        except ImportError:
+            return
+        monkeypatch.setattr(boto3, "client", MagicMock(return_value=MagicMock()))
+
     @pytest.mark.asyncio
     async def test_filebase_provider_creation_without_credentials(self):
         """Test FilebaseProvider creation without credentials."""

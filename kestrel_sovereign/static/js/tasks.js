@@ -448,7 +448,7 @@ window.loadTaskArtifacts = async function(taskId) {
                 border-radius: 4px;
                 font-size: 0.8125rem;
             ">
-                <div style="font-weight: 500; margin-bottom: 0.25rem;">${artifact.name || `Artifact ${idx + 1}`}</div>
+                <div style="font-weight: 500; margin-bottom: 0.25rem;">${escapeHtml(artifact.name || `Artifact ${idx + 1}`)}</div>
                 <pre style="
                     margin: 0;
                     white-space: pre-wrap;

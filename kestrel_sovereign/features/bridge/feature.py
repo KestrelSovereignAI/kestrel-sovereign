@@ -14,10 +14,11 @@ Database tables (created on initialize):
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -140,6 +141,8 @@ class BridgeFeature(Feature):
                 )
                 logger.info("BridgeFeature: database tables ready")
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"BridgeFeature: could not create tables: {e}")
 
         logger.info("BridgeFeature initialized")
@@ -178,6 +181,8 @@ class BridgeFeature(Feature):
                 )
                 db_session_count = row[0] if row else 0
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(f"BridgeFeature: bridge_sessions count failed: {exc}")
                 query_failures.append(f"bridge_sessions count failed: {exc}")
 
@@ -188,12 +193,14 @@ class BridgeFeature(Feature):
                 row = await self._db.fetchone(
                     """
                     SELECT COUNT(*) FROM bridge_log
-                    WHERE agent_id = ? AND created_at > datetime('now', '-1 hour')
+                    WHERE agent_id = ? AND created_at > ?
                     """,
-                    (self._agent_id,),
+                    (self._agent_id, (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()),
                 )
                 recent_invocations = row[0] if row else 0
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(f"BridgeFeature: bridge_log count failed: {exc}")
                 query_failures.append(f"bridge_log count failed: {exc}")
 
@@ -270,6 +277,8 @@ class BridgeFeature(Feature):
                         "last_activity_at": row[5],
                     })
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"BridgeFeature: connections query failed: {e}")
                 db_failed = True
 
@@ -349,6 +358,8 @@ class BridgeFeature(Feature):
                         "created_at": row[6],
                     })
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"BridgeFeature: history query failed: {e}")
                 db_failed = True
 
@@ -432,6 +443,8 @@ class BridgeFeature(Feature):
                     await self._persist_session(session)
                     return session
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"BridgeFeature: session lookup failed: {e}")
 
         # Create new session
@@ -512,6 +525,8 @@ class BridgeFeature(Feature):
                 ),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"BridgeFeature: failed to log invocation: {e}")
 
     def get_capabilities(self) -> List[Dict[str, Any]]:
@@ -545,6 +560,8 @@ class BridgeFeature(Feature):
                         ],
                     })
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     f"BridgeFeature: failed to get tools for {feature_name}: {e}"
                 )
@@ -591,6 +608,8 @@ class BridgeFeature(Feature):
                     (session.last_activity_at.isoformat(), session.id),
                 )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"BridgeFeature: failed to persist session: {e}")
 
     async def _prune_stale_sessions(self) -> None:

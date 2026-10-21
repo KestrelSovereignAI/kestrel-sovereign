@@ -80,6 +80,13 @@ name = "voice_openai"   # OpenAI TTS/STT provider (Realtime path)
 name = "reflection"
 pypi = ">=0.3,<0.4"
 
+# Talon's floor: 0.2.14 is the first release whose finished_runs() lists the
+# jobs still running, which the idle wake reads (#3664), and the one that
+# enforces [talon.policy] dispatcher.
+[[feature]]
+name = "kestrel-feature-talon"
+pypi = ">=0.2.14,<0.3"
+
 # Install editable from a local checkout instead of PyPI — keeps live-editing
 # the feature repo, and reconcile keeps it fresh with `git pull`. `editable`
 # and `extras` may be combined.

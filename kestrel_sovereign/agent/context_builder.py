@@ -17,6 +17,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.logging_config import content_log_summary
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
@@ -88,8 +89,11 @@ from kestrel_sovereign.security.input_guardrails import (  # noqa: E402
 
 
 if TYPE_CHECKING:
-    from storage import AsyncStorage
-    from storage.memory_consolidator import MemoryConsolidator
+    from kestrel_sovereign.llm.constitutional_profile import PromptAdaptation, StateOfMind
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+    from .system_prompt_assembler import SystemPromptResult
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +354,8 @@ class ContextBuilder:
         try:
             resource = await getter()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning("Failed to load canonical SOUL resource: %s", e)
             return False
         if resource is None or not getattr(resource, "content", None):
@@ -396,6 +402,8 @@ class ContextBuilder:
                 search_kwargs["min_score"] = min_score
             rag_results = await self.storage.search_chunks(query, **search_kwargs)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Error during RAG search: {e}")
             return "Error retrieving document context."
 
@@ -485,6 +493,8 @@ class ContextBuilder:
                     }
                     return hybrid.context
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     # Capability failures are observable and never fabricate a
                     # graph result; retain the established RAG path.
                     reason = self._semantic_failure_reason(exc)

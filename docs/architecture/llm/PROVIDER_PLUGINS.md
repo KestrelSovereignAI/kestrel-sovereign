@@ -86,6 +86,60 @@ Report the provider's value as it is. A natural end (`stop`, `end_turn`, `stop_s
 
 ### The optional surface
 
+### Native request and retirement ownership
+
+Sovereign's built-in routes disable SDK-owned retries: each retry must return
+through Core's original execution admission. OpenAI-compatible and Anthropic
+HTTPX clients acquire response-close ownership in the first pre-body hook,
+before SDK error-body reads or other response observers. Native request hooks
+also reject a revoked copied admission; a shared client does not inherit its
+first caller's tenant scope.
+
+Temporary HTTP clients retain the entire pool/transport close, not only their
+responses. Stop during that retirement cannot replace an original request
+control receipt or leave a native pool close running after its owner returns.
+
+The maintained `google-genai` adapters use the SDK's HTTPX async transport and
+retain its nested stream handles in one request-local owner task. Closing a
+forwarding iterator physically joins the SDK layers and response body, rather
+than leaving cleanup to async-generator finalizers. An explicitly injected
+aiohttp transport is refused because it lacks this pre-body custody contract.
+Automatic Vertex mTLS is also explicitly refused before dispatch rather than
+silently disabling the SDK's certificate/endpoint configuration; deployments
+using certificates must supply an explicit certificate-capable HTTPX client.
+Provider shutdown joins `client.aio.aclose()` as well as synchronous close;
+any transport whose ownership Core made explicit is closed separately. A
+caller-injected HTTPX transport remains borrowed according to the SDK contract.
+
+Private OpenRouter SDKs are owned by their complete response/stream lifetime;
+temporary Google catalog clients are closed before the catalog call exits.
+Vertex's cached private SDK belongs to the adapter and is retired by `aclose()`;
+supplied route clients remain borrowed. GenAI shutdown observers join one
+original close Task across the SDK's async, sync and pinned-HTTPX layers. A
+cancelled observer cannot cancel that physical owner or authorize a second
+close attempt, and private retirement debt never mutates a shared source error.
+
+`get_provider_embedding_service(llm_service)` is a borrowed capability lookup,
+not a factory for an implicit LLM service. Without an explicit owner it returns
+`None`; standalone storage users needing semantic embeddings must construct,
+inject and close an `LLMService`. Agent-owned storage already injects that same
+service. This prevents ambient provider credentials from creating unowned SDK
+pools or usage databases during a synchronous metadata lookup.
+
+Offline CLI resolution differs from that borrowed lookup: it explicitly owns a
+new service before awaiting configuration. Its returned `AgentEmbeddingResolution`
+is an async context manager (also exposes `aclose`); reindex and reanchor consume
+that same lifetime. A failed resolver retires before returning control. Close
+allocation refusal preserves an opening cancellation alongside actual unstarted
+resource debt. Retirement uses the existing unpublished-service owner, not a
+second reanchor-only close registry or a source-mutating error projection.
+
+Cancellation and explicit irreversible control receipts remain original errors,
+including their causes/groups. Model discovery must not translate them into an
+empty catalog. These built-in integrations are verified with actual SDKs and
+offline HTTPX transports; they do not imply that an arbitrary third-party
+adapter automatically closes an opaque native transport.
+
 | Method | Default | What it does |
 |---|---|---|
 | `get_streaming_response(...)` | raises `NotImplementedError` | yields text chunks for plain streaming |

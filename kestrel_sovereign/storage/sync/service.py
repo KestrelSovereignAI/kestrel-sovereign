@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Any
 
+from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.storage.sync.retention import (
     RetentionPolicy,
     load_retention_policy,
@@ -335,12 +340,23 @@ class SyncService:
 
     async def stop(self) -> None:
         """Cancel periodic sync and save state on shutdown."""
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
+        if self._poll_task is not None:
+            if not self._poll_task.done():
+                self._poll_task.cancel()
+            outcome = await await_owned_task(self._poll_task)
+            terminal = execution_terminal_error(
+                outcome.error, outcome.cancellation,
+                retain_originals=True, prefer_cancellation=True,
+            )
+            # Only our ordinary request to stop the worker is acknowledged.
+            # Native debt and the shutdown caller's withdrawal remain control;
+            # the exact failed worker stays retained for a later stop observer.
+            if terminal is not None and (
+                is_execution_control_error(terminal)
+                or not isinstance(terminal, asyncio.CancelledError)
+                or outcome.cancellation is not None
+            ):
+                raise terminal
             self._poll_task = None
         await self._save_state()
         logger.info("Sync service stopped")
@@ -352,6 +368,8 @@ class SyncService:
             try:
                 await self.force_snapshot()
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Periodic sync error: {e}")
 
     def _compute_db_fingerprint(self) -> Optional[str]:
@@ -457,6 +475,8 @@ class SyncService:
                 if self.on_sync:
                     self.on_sync(result)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(
                     "Snapshot failed for %s: %s: %s", target.name, type(e).__name__, e
                 )
@@ -576,6 +596,8 @@ class SyncService:
                 metadata["prune"] = prune_result
                 result.metadata = metadata
         except Exception as e:  # noqa: BLE001
+            if is_execution_control_error(e):
+                raise
             logger.warning("Retention prune failed for %s: %s", target.name, e)
             metadata = dict(result.metadata or {})
             metadata["prune_error"] = str(e)

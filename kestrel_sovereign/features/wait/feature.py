@@ -21,6 +21,10 @@ import asyncio
 import logging
 import time
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.storage.async_wait_signal_store import MAX_ATTEMPTS_EXCEEDED
 from kestrel_sovereign.waits.reconciler import (
@@ -28,8 +32,6 @@ from kestrel_sovereign.waits.reconciler import (
     list_undelivered_wakes,
     register_wait_watch,
 )
-from kestrel_sdk.tools.base import ToolCategory
-from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +100,11 @@ class WaitFeature(Feature):
         if agent is None or getattr(agent, "wait_registry", None) is None:
             # Standalone / no wait engine — nothing to reconcile.
             return
-        self._track_owned_background_task(
+        # This is the feature's resident service, not an effect child of the
+        # bootstrap request. Publish through Core's READY/runtime handoff so
+        # normal retirement of that request cannot poison the shared wait
+        # reconciler. The original runtime generation still governs every tick.
+        self._track_owned_runtime_task(
             self._fallback_reconcile_loop(agent),
             name="wait_fallback_reconcile",
         )
@@ -136,6 +142,8 @@ class WaitFeature(Feature):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - loop must never die
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "wait fallback reconcile tick failed: %s", exc,
                     exc_info=True,
@@ -252,6 +260,8 @@ class WaitFeature(Feature):
                         origin_session_id=self._turn_session_id(),
                     )
                 except ValueError as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     return ToolResult.failed(str(exc))
                 return ToolResult.ok(
                     confirmation=(

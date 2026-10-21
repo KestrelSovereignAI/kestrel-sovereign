@@ -604,7 +604,7 @@ plaintext, while malformed marker combinations fail closed.
 ## Rotation and failure semantics
 
 Memory-content rotation is added to `KeyRotationService` only through the
-shared codec; the existing prefix-only encrypted-table walker is insufficient
+shared codec; the existing encrypted-table walker is insufficient
 because it does not supply row AAD or rotate lexical keys.
 
 The restart-stable keyring manifest has this versioned shape:

@@ -19,6 +19,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 logger = logging.getLogger(__name__)
 
 # Default bootstrap files loaded in this order (all optional).
@@ -308,6 +310,8 @@ class BootstrapLoader:
             self._loaded = False
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"bootstrap_config table not available: {e}")
 
     async def save_db_entry(

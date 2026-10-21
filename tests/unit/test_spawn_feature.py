@@ -1828,7 +1828,7 @@ class TestSpawnFeatureWithManager:
         finally:
             child.allow_shutdown_finish.set()
 
-        manager._offboard_agent_runtime_namespace.assert_awaited_once_with(child)
+        manager._offboard_agent_runtime_namespace.assert_awaited_once_with(child, withdrawals=[])
 
     @pytest.mark.asyncio
     async def test_terminate_child_flattens_grouped_retained_agents(self):
@@ -2233,6 +2233,8 @@ class TestSpawnFeatureWithManager:
 
     @pytest.mark.asyncio
     async def test_terminate_child_preserves_active_cancellation_group(self):
+        from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
         manager.get_authoritative_children = AsyncMock(return_value=["helper"])
@@ -2256,19 +2258,15 @@ class TestSpawnFeatureWithManager:
 
         manager.terminate_child = AsyncMock(side_effect=actively_cancelled)
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        task = asyncio.current_task()
-        assert task is not None
-
-        try:
-            with pytest.raises(BaseExceptionGroup) as raised:
-                await feature.terminate_child(child_name="helper")
-            assert any(
-                isinstance(item, asyncio.CancelledError)
-                for item in raised.value.exceptions
-            )
-        finally:
-            while task.cancelling():
-                task.uncancel()
+        # The actual invocation owns its cancellation, not pytest's runner.
+        # Python 3.11 uncancel() does not retract pending cancellation delivery.
+        operation = create_owned_task(feature.terminate_child(child_name="helper"))
+        outcome = await await_owned_task(operation)
+        assert operation.done()
+        assert isinstance(outcome.error, BaseExceptionGroup)
+        assert any(isinstance(item, asyncio.CancelledError)
+                   for item in outcome.error.exceptions)
+        assert retained in outcome.error.exceptions
 
     @pytest.mark.asyncio
     async def test_terminate_child_supports_typed_reconciliation_outcome(self):

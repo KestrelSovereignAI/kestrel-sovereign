@@ -74,6 +74,7 @@ from kestrel_sovereign.privacy import (
     most_restrictive_privacy_mode,
 )
 from kestrel_sovereign.storage.timestamps import utc_timestamp_parameter
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 logger = logging.getLogger(__name__)
 
@@ -449,6 +450,8 @@ async def restore_privacy_state(
             db, agent_id, initial_mode=initial_mode
         )
     except Exception as exc:  # noqa: BLE001 - any read failure must fail closed
+        if is_execution_control_error(exc):
+            raise
         logger.error(
             "Could not read the recorded privacy mode for %s (%s: %s); failing "
             "closed to %s",
@@ -460,6 +463,8 @@ async def restore_privacy_state(
     try:
         return await _fail_closed(db, agent_id)
     except Exception as exc:  # noqa: BLE001 - recovery is best-effort
+        if is_execution_control_error(exc):
+            raise
         logger.error(
             "Could not re-read the privacy record for %s (%s: %s); leaving it "
             "as it is, so this boot's fail-closed mode is not recorded",

@@ -21,6 +21,14 @@ provider Talon registers for the ``talon`` wait kind on
     the optional ``reason`` says why. It must be read-only: no reaping, no
     pushing of preserved work, no registry write.
 
+    Since kestrel-feature-talon 0.2.14 the report also carries
+    ``"unfinished": [job, ...]``, each ``{"job_id", "repo", "issue",
+    "status", "started_at"}``: every job that same read found not finished
+    (running, paused, or parked in ``cancel_unrecorded``). Run history does
+    not need it. The idle detector (#3664) does, because it must know nothing
+    is running, and only a list taken from the read that ``complete`` vouches
+    for can tell it so (see :data:`UNFINISHED_JOBS_KEY`).
+
 Two properties of that operation are load-bearing, and the wait provider's
 other methods have neither. ``active_handles()`` reloads the registry and
 returns every job it holds, but a registry it cannot read logs and returns an
@@ -65,6 +73,20 @@ FINISHED_RUNS_METHOD = "finished_runs"
 #: ``finished_runs()`` (kestrel-feature-talon #37). Earlier releases cannot
 #: report a complete history, so every read through them is refused.
 FINISHED_RUNS_REQUIREMENT = "kestrel-feature-talon>=0.2.10"
+
+#: The ``finished_runs()`` report key listing, from the same read, every job
+#: that is not finished (#3664). Before kestrel-feature-talon 0.2.14
+#: (kestrel-feature-talon #55) the report leaves those jobs out. The
+#: provider's ``active_handles()`` cannot stand in: it reads the registry
+#: again, and a read it cannot make returns what this process remembers, or
+#: nothing, so a running job can go missing from it behind a ``complete``
+#: report.
+UNFINISHED_JOBS_KEY = "unfinished"
+
+#: The first kestrel-feature-talon release whose ``finished_runs()`` reports
+#: :data:`UNFINISHED_JOBS_KEY`. Through an older provider the idle detector
+#: cannot tell that nothing is running, so it never reads the agent as idle.
+UNFINISHED_JOBS_REQUIREMENT = "kestrel-feature-talon>=0.2.14"
 
 #: kestrel-feature-talon ``run_disposition`` values for a run that stopped to
 #: ask a question rather than open a PR: ``BLOCKED`` (Talon also labels the

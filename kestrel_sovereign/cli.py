@@ -606,7 +606,6 @@ async def _run_shell(
     from kestrel_sovereign.security.encryption import DecryptionError
     from kestrel_sovereign.kestrel_agent import (
         KestrelAgent,
-        await_agent_shutdown_completion,
     )
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
@@ -638,7 +637,7 @@ async def _run_shell(
         constitution_source_descriptor_path=constitution_source_descriptor,
     )
     from kestrel_sovereign.hold import (
-        close_bound_host_context,
+        complete_bound_agent_shutdown,
         initialize_with_bound_hold_context,
     )
 
@@ -653,23 +652,24 @@ async def _run_shell(
         **hold_binding_kwargs,
     )
 
-    # Load extension if requested
-    if hasattr(args, 'app') and args.app:
-        if args.app == 'elderly':
-            from kestrel_sovereign.extensions.elderly_extension import ElderlyExtension
-            agent.extension = ElderlyExtension(agent)
-            agent.app_context = args.app
-            print(f"   Extension Loaded: {args.app}")
-
-    print("\u2705 Kestrel Agent Initialized.")
-    print(f"   DID: {agent.agent_id}")
-    print(f"   Memory: {agent_dir}")
-    print(f"   {_SHELL_EXIT_HINT}")
-
-    decryption_error_count = 0
-    MAX_DECRYPTION_ERRORS = 3
-
+    body_failure = None
     try:
+        # Load extension if requested
+        if hasattr(args, 'app') and args.app:
+            if args.app == 'elderly':
+                from kestrel_sovereign.extensions.elderly_extension import ElderlyExtension
+                agent.extension = ElderlyExtension(agent)
+                agent.app_context = args.app
+                print(f"   Extension Loaded: {args.app}")
+
+        print("\u2705 Kestrel Agent Initialized.")
+        print(f"   DID: {agent.agent_id}")
+        print(f"   Memory: {agent_dir}")
+        print(f"   {_SHELL_EXIT_HINT}")
+
+        decryption_error_count = 0
+        MAX_DECRYPTION_ERRORS = 3
+
         while True:
             user_input = input("\n> ")
             if user_input.strip().lower() in _SHELL_EXIT_TOKENS:
@@ -709,25 +709,31 @@ async def _run_shell(
 
     except KeyboardInterrupt:
         print("\nDeactivating agent...")
+    except BaseException as error:
+        body_failure = error
+        raise
     finally:
-        cancelled = False
+        failures = [body_failure] if body_failure is not None else []
         try:
-            await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
-            print("Agent deactivated.")
-        except asyncio.TimeoutError:
-            print(
-                f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
-                "waiting for durable cleanup."
-            )
-        except asyncio.CancelledError:
-            cancelled = True
-            print("Agent shutdown cancelled.")
-        except Exception:
-            print("Agent deactivated (with errors).")
-        cancelled = await await_agent_shutdown_completion(agent) or cancelled
-        await close_bound_host_context(hold_context)
-        if cancelled:
-            raise asyncio.CancelledError()
+            try:
+                await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
+                print("Agent deactivated.")
+            except asyncio.TimeoutError:
+                print(
+                    f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
+                    "waiting for durable cleanup."
+                )
+            except asyncio.CancelledError as error:
+                failures.append(error)
+                print("Agent shutdown cancelled.")
+            except BaseException as error:
+                failures.append(error)
+                print("Agent deactivated (with errors).")
+        except BaseException as reporting_failure:
+            failures.append(reporting_failure)
+            raise
+        finally:
+            await complete_bound_agent_shutdown(agent, hold_context, prior_errors=failures)
 
     return 0
 
@@ -2381,6 +2387,8 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _git_reattach_if_safely_detached,
     _run_uv_sync,
     _run_uv_pip_install_editable,
+    _run_sync_preflight,
+    _run_update_continuation,
     _GitFailedError,
 )
 from kestrel_sovereign.cli_stop import cmd_stop  # noqa: E402

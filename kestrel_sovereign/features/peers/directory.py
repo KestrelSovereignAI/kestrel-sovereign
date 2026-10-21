@@ -20,7 +20,17 @@ from urllib.parse import quote
 import httpx
 
 from kestrel_sovereign.a2a.transport_auth import A2A_TRANSPORT_KEY_HEADER
-
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
+    ExecutionCustody,
+    close_native_execution_stream,
+    execution_work_operation,
+    execution_work_stream,
+    is_execution_control_error,
+    owned_native_http_client,
+    require_execution_work,
+)
 
 PEER_CONNECT_TIMEOUT = 5.0
 PEER_READ_TIMEOUT = 300.0
@@ -249,6 +259,7 @@ class LocalHostPeerDirectory:
         host_url: str,
         *,
         transport_key: str = "",
+        execution_custody: ExecutionCustody | None = None,
         client_factory: Callable[..., Any] = httpx.AsyncClient,
         local_cancel: Optional[Callable[..., Any]] = None,
         local_stop: Optional[Callable[..., Any]] = None,
@@ -259,6 +270,7 @@ class LocalHostPeerDirectory:
         ] = None,
     ) -> None:
         self._host_url = host_url.rstrip("/")
+        self._execution_custody = execution_custody
         self._transport_key = transport_key
         self._client_factory = client_factory
         # Host-owned process-local capability; never serialized onto the wire.
@@ -303,6 +315,19 @@ class LocalHostPeerDirectory:
     @staticmethod
     def _raise_for_route_status(response: Any, *, action: str) -> None:
         status_code = response.status_code
+        if status_code >= 400:
+            try:
+                payload = response.json()
+            except (TypeError, ValueError):
+                payload = None
+            error = payload.get("error") if isinstance(payload, Mapping) else None
+            if isinstance(error, Mapping) and error.get("code") == "execution_control":
+                details = error.get("details")
+                outcome = (details[0].get("commit_outcome") if isinstance(details, list)
+                    and len(details) == 1 and isinstance(details[0], Mapping) else None)
+                if isinstance(outcome, str) and outcome in {"unknown", "committed"}:
+                    raise ExecutionCommitOutcomeError(outcome)
+                raise ExecutionAuthorityError("peer execution stopped; reconcile before continuing")
         if status_code == 404:
             raise PeerNotFoundError("Peer is not in the automatic directory")
         if status_code == 503:
@@ -320,10 +345,12 @@ class LocalHostPeerDirectory:
                 f"Local peer host rejected {action} (HTTP {status_code})"
             ) from exc
 
+    @execution_work_operation
     async def _directory_entries(self, requester: PeerRequester) -> list[PeerIdentity]:
         self._require_requester(requester)
         try:
-            async with self._client_factory() as client:
+            async with owned_native_http_client(self._client_factory()) as client:
+                require_execution_work(self)
                 response = await client.get(
                     f"{self._host_url}/api/agents",
                     headers=self._headers(),
@@ -334,6 +361,8 @@ class LocalHostPeerDirectory:
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PeerTransportError("Could not connect to local peer host") from exc
         except (TypeError, ValueError) as exc:
             raise PeerProtocolError("Local peer host returned malformed peer listing") from exc
@@ -370,9 +399,11 @@ class LocalHostPeerDirectory:
             ))
         return peers
 
+    @execution_work_operation
     async def list_peers(self, requester: PeerRequester) -> Sequence[PeerIdentity]:
         return await self._directory_entries(requester)
 
+    @execution_work_operation
     async def resolve_peer(
         self, requester: PeerRequester, peer_name_or_slug: str,
     ) -> Optional[PeerIdentity]:
@@ -387,6 +418,7 @@ class LocalHostPeerDirectory:
         # An ambiguous display name must not select an arbitrary peer.
         return matches[0] if len(matches) == 1 else None
 
+    @execution_work_operation
     async def resolve_peer_by_agent_id(
         self, requester: PeerRequester, agent_id: str,
     ) -> Optional[PeerIdentity]:
@@ -406,6 +438,7 @@ class LocalHostPeerDirectory:
         # A stable identity must remain unique within a scoped directory.
         return matches[0] if len(matches) == 1 else None
 
+    @execution_work_operation
     async def authorize_inbound_sender(
         self,
         requester: PeerRequester,
@@ -421,6 +454,7 @@ class LocalHostPeerDirectory:
         ]
         return len(matches) == 1
 
+    @execution_work_operation
     async def _authorize_peer(
         self, requester: PeerRequester, peer: PeerIdentity,
     ) -> PeerIdentity:
@@ -447,13 +481,16 @@ class LocalHostPeerDirectory:
             raise PeerNotFoundError("Peer is not in the automatic directory")
         return matches[0]
 
+    @execution_work_operation
     async def invoke(
         self, requester: PeerRequester, peer: PeerIdentity, message: str,
     ) -> Mapping[str, Any]:
         self._require_requester(requester)
         try:
             authorized_peer = await self._authorize_peer(requester, peer)
-            async with self._client_factory() as client:
+            require_execution_work(self)
+            async with owned_native_http_client(self._client_factory()) as client:
+                require_execution_work(self)
                 response = await client.post(
                     self._peer_url(authorized_peer, "api/agent/invoke"),
                     json={"input": message},
@@ -470,8 +507,11 @@ class LocalHostPeerDirectory:
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PeerTransportError("Could not reach local peer host") from exc
 
+    @execution_work_operation
     async def send_a2a_task(
         self,
         requester: PeerRequester,
@@ -481,7 +521,9 @@ class LocalHostPeerDirectory:
         self._require_requester(requester)
         try:
             authorized_peer = await self._authorize_peer(requester, peer)
-            async with self._client_factory() as client:
+            require_execution_work(self)
+            async with owned_native_http_client(self._client_factory()) as client:
+                require_execution_work(self)
                 response = await client.post(
                     self._peer_url(authorized_peer, "api/agent/tasks/send"),
                     json=dict(payload),
@@ -498,14 +540,18 @@ class LocalHostPeerDirectory:
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PeerTransportError("Could not reach local peer host") from exc
 
+    @execution_work_operation
     async def get_a2a_task(
         self, requester: PeerRequester, peer: PeerIdentity, task_id: str,
     ) -> Mapping[str, Any]:
         self._require_requester(requester)
         try:
             authorized_peer = await self._authorize_peer(requester, peer)
+            require_execution_work(self)
             if callable(self._local_get):
                 result = self._local_get(requester, authorized_peer, task_id)
                 if hasattr(result, "__await__"):
@@ -524,6 +570,8 @@ class LocalHostPeerDirectory:
             try:
                 payload = self._principal_payload_factory(task_id, "read_task")
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 raise PeerAccessDeniedError(
                     "Local A2A result read authentication failed"
                 ) from exc
@@ -531,7 +579,8 @@ class LocalHostPeerDirectory:
                 raise PeerProtocolError(
                     "Local A2A result read authentication is malformed"
                 )
-            async with self._client_factory() as client:
+            async with owned_native_http_client(self._client_factory()) as client:
+                require_execution_work(self)
                 response = await client.post(
                     self._peer_url(
                         authorized_peer,
@@ -551,8 +600,11 @@ class LocalHostPeerDirectory:
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PeerTransportError("Could not reach local peer host") from exc
 
+    @execution_work_operation
     async def cancel_a2a_task(
         self,
         requester: PeerRequester,
@@ -563,6 +615,7 @@ class LocalHostPeerDirectory:
         self._require_requester(requester)
         try:
             authorized_peer = await self._authorize_peer(requester, peer)
+            require_execution_work(self)
             if callable(self._local_cancel):
                 result = self._local_cancel(
                     requester,
@@ -577,7 +630,8 @@ class LocalHostPeerDirectory:
                         "Local host returned an invalid cancellation receipt"
                     )
                 return result
-            async with self._client_factory() as client:
+            async with owned_native_http_client(self._client_factory()) as client:
+                require_execution_work(self)
                 response = await client.post(
                     self._peer_url(
                         authorized_peer,
@@ -599,8 +653,11 @@ class LocalHostPeerDirectory:
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PeerTransportError("Could not reach local peer host") from exc
 
+    @execution_work_operation
     async def stop_peer(
         self,
         requester: PeerRequester,
@@ -612,6 +669,7 @@ class LocalHostPeerDirectory:
         self._require_requester(requester)
         try:
             authorized_peer = await self._authorize_peer(requester, peer)
+            require_execution_work(self)
             if callable(self._local_stop):
                 result = self._local_stop(requester, authorized_peer, payload)
                 if hasattr(result, "__await__"):
@@ -621,7 +679,8 @@ class LocalHostPeerDirectory:
                         "Local host returned an invalid peer Stop receipt"
                     )
                 return result
-            async with self._client_factory() as client:
+            async with owned_native_http_client(self._client_factory()) as client:
+                require_execution_work(self)
                 response = await client.post(
                     self._peer_url(
                         authorized_peer,
@@ -641,8 +700,11 @@ class LocalHostPeerDirectory:
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PeerTransportError("Could not reach local peer host") from exc
 
+    @execution_work_stream
     async def subscribe_a2a_task(
         self,
         requester: PeerRequester,
@@ -663,9 +725,12 @@ class LocalHostPeerDirectory:
                 self._authorize_peer(requester, peer),
                 timeout=_remaining(),
             )
-        except TimeoutError:
+        except TimeoutError as exc:
+            if is_execution_control_error(exc):
+                raise
             return
         if callable(self._local_subscribe):
+            require_execution_work(self)
             stream = self._local_subscribe(
                 requester,
                 authorized_peer,
@@ -681,7 +746,9 @@ class LocalHostPeerDirectory:
                         )
                     except StopAsyncIteration:
                         return
-                    except TimeoutError:
+                    except TimeoutError as exc:
+                        if is_execution_control_error(exc):
+                            raise
                         return
                     if not isinstance(event, PeerSubscriptionEvent):
                         raise PeerProtocolError(
@@ -691,7 +758,7 @@ class LocalHostPeerDirectory:
             finally:
                 close = getattr(iterator, "aclose", None)
                 if callable(close):
-                    await close()
+                    await close_native_execution_stream(iterator, self)
             return
         if not callable(self._principal_payload_factory):
             # As with point reads, an API key plus a task id is not creator
@@ -703,6 +770,8 @@ class LocalHostPeerDirectory:
         try:
             payload = self._principal_payload_factory(task_id, "subscribe_task")
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PeerAccessDeniedError(
                 "Local A2A subscription authentication failed"
             ) from exc
@@ -720,7 +789,8 @@ class LocalHostPeerDirectory:
             pool=min(PEER_CONNECT_TIMEOUT, remaining),
         )
         try:
-            async with self._client_factory(timeout=timeout) as client:
+            async with owned_native_http_client(self._client_factory(timeout=timeout)) as client:
+                require_execution_work(self)
                 async with client.stream(
                     "POST",
                     self._peer_url(
@@ -742,6 +812,8 @@ class LocalHostPeerDirectory:
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
+            if is_execution_control_error(exc):
+                raise
             raise PeerTransportError("A2A subscription transport failed") from exc
 
     def _peer_url(self, peer: PeerIdentity, suffix: str) -> str:

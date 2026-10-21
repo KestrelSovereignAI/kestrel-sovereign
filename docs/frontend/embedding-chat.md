@@ -46,7 +46,10 @@ const api = createChatComponent({ deps, container: containerEl });
 - `mount()` wires a chat surface once. A completed mount marks its
   `#chat-container` with `data-kestrel-chat-mounted`; a later `mount()` or
   `initChat()` that finds that marker returns without moving panes or adding
-  listeners. It still applies the new `config.deps` and root first. A new
+  listeners. It still applies the new `config.deps` and root and refreshes
+  cached composer/viewport element references first. Thus detaching surface A,
+  mounting B, and reattaching/mounting A routes subsequent pane, composer and
+  status updates to A without rewiring either surface. A new
   `#chat-container` is wired afresh, composer included, so replace the whole
   chat markup rather than the viewport alone. A root with no
   `#chat-container` is never marked and is re-wired by every call.

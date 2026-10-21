@@ -48,31 +48,42 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
-    Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type, Union,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
 )
 
+from kestrel_sdk.llm import (
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolCallStarted,
+    ToolStreamingMode,
+    VisionInputMode,
+)
 from pydantic import BaseModel
 
-from kestrel_sdk.llm import ToolCallStarted
-
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    owned_execution_stream,
+)
 
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
-from .output_ceiling import attach_stop_reason
-from kestrel_sdk.llm import (
-    ProviderCapabilities,
-    StructuredOutputMode,
-    ToolStreamingMode,
-    VisionInputMode,
-)
 from .codex_app_server import (
+    _CODEX_DISABLED_NATIVE_FEATURES,
     CodexAppServerClient,
     CodexAppServerError,
     CodexAppServerFrameTooLarge,
     CodexAppServerTransportError,
-    _CODEX_DISABLED_NATIVE_FEATURES,
 )
 from .codex_reasoning import (
     normalize_codex_reasoning_effort,
@@ -81,6 +92,7 @@ from .codex_reasoning import (
 from .continuation_store import ContinuationStore, InMemoryContinuationStore
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo
+from .output_ceiling import attach_stop_reason
 
 if TYPE_CHECKING:
     from kestrel_sovereign.features.computer_use.policy import Decision
@@ -453,8 +465,30 @@ _DATA_IMAGE_SUFFIXES = {
 }
 
 
+def _cleanup_app_server_data_images(
+    paths: List[Path], *, retirement_owner: Optional[asyncio.Task[Any]] = None,
+) -> List[OSError]:
+    """Attempt every owned unlink without bypassing later retirement."""
+    failures: List[OSError] = []
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            if retirement_owner is not None:
+                # This synchronous unlink ran in the already accepted turn
+                # owner. Retain that actual failed attempt, not a fabricated
+                # cleanup Task or an ordinary provider-availability failure.
+                error._kestrel_native_retirement_debts = (
+                    *getattr(error, "_kestrel_native_retirement_debts", ()),
+                    (path, retirement_owner),
+                )
+            failures.append(error)
+    return failures
+
+
 def _materialize_app_server_data_images(
     request_input: List[Dict[str, Any]],
+    *, retirement_owner: Optional[asyncio.Task[Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Path]]:
     """Turn inline image data URLs into temporary ``localImage`` inputs.
 
@@ -498,14 +532,17 @@ def _materialize_app_server_data_images(
                 )
                 continue
 
-            with tempfile.NamedTemporaryFile(
+            image_file = tempfile.NamedTemporaryFile(
                 prefix="kestrel-codex-image-",
                 suffix=suffix,
                 delete=False,
-            ) as image_file:
-                image_file.write(payload)
-                path = Path(image_file.name)
+            )
+            path = Path(image_file.name)
+            # Constructor acceptance owns this native artifact, even if its
+            # context entry, write, flush or close fails before publication.
             temp_paths.append(path)
+            with image_file:
+                image_file.write(payload)
             local_item: Dict[str, Any] = {
                 "type": "localImage",
                 "path": str(path),
@@ -513,9 +550,15 @@ def _materialize_app_server_data_images(
             if item.get("detail"):
                 local_item["detail"] = item["detail"]
             materialized.append(local_item)
-    except Exception:
-        for path in temp_paths:
-            path.unlink(missing_ok=True)
+    except BaseException as error:
+        cleanup_errors = _cleanup_app_server_data_images(
+            temp_paths, retirement_owner=retirement_owner,
+        )
+        if cleanup_errors:
+            raise execution_terminal_error(
+                error, *cleanup_errors, retain_originals=True,
+                isolate_control_originals=True,
+            )
         raise
     return materialized, temp_paths
 
@@ -930,6 +973,16 @@ def _env_int(name: str) -> Optional[int]:
         return None
 
 
+async def _acquire_thread_turn_lock(lock: asyncio.Lock, cancel_token: Optional[CancelToken]) -> None:
+    """Retain the exact successful acquisition if Stop wins its handoff."""
+    def release_abandoned(acquired):
+        if acquired:
+            lock.release()
+    await await_or_cancelled(
+        lock.acquire(), cancel_token, abandoned_result_cleanup=release_abandoned,
+    )
+
+
 class CodexAdapter(LLMAdapter):
     """OpenAI ChatGPT-subscription adapter backed by the codex app-server."""
 
@@ -1280,7 +1333,10 @@ class CodexAdapter(LLMAdapter):
 
     # ----------------------------------------------------------- app-server glue
     def _app_server(self) -> CodexAppServerClient:
-        if self._client is None:
+        if self._client is None or (
+            isinstance(self._client, CodexAppServerClient)
+            and self._client.replaceable_after_failed_startup
+        ):
             self._client = CodexAppServerClient()
             if hasattr(self._client, "attach_audit_agent"):
                 self._client.attach_audit_agent(self._agent_for_audit)
@@ -1949,6 +2005,7 @@ class CodexAdapter(LLMAdapter):
         executed_log: Optional[List[Dict[str, Any]]] = None,
         tool_aliases: Optional[Dict[str, str]] = None,
         active_handlers: Optional[set[asyncio.Task[Any]]] = None,
+        terminal_errors: Optional[list[BaseException]] = None,
     ) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
         """Wrap ``executor`` into an app-server ``item/tool/call``
         handler scoped to this turn's thread.
@@ -2027,6 +2084,11 @@ class CodexAdapter(LLMAdapter):
             try:
                 ret = await executor(name, args)
             except Exception as e:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(e):
+                    raise
                 logger.warning("tool_executor(%s) raised: %s", name, e)
                 err_result = {"success": False, "error": f"{e}"}
                 # Failed inline tool calls must remain observable —
@@ -2102,12 +2164,29 @@ class CodexAdapter(LLMAdapter):
                 ),
             )
 
+        control_error: BaseException | None = None
+
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal control_error
             task = asyncio.current_task()
             if active_handlers is not None and task is not None:
                 active_handlers.add(task)
             try:
+                if control_error is not None:
+                    raise control_error
                 return await _handle(params)
+            except BaseException as error:
+                from kestrel_sovereign.execution_custody import (
+                    is_execution_control_error,
+                )
+                if is_execution_control_error(error):
+                    control_error = error
+                    # Reader dispatch deliberately turns this into a protocol
+                    # error reply and a normal task return. The turn owner
+                    # therefore needs evidence independent of its event sink.
+                    if terminal_errors is not None:
+                        terminal_errors.append(error)
+                raise
             finally:
                 if active_handlers is not None and task is not None:
                     active_handlers.discard(task)
@@ -2328,7 +2407,8 @@ class CodexAdapter(LLMAdapter):
             if db is None:
                 return
             from kestrel_sovereign.llm.codex_decline_events import (
-                ensure_codex_decline_events_table, record_decline,
+                ensure_codex_decline_events_table,
+                record_decline,
             )
             await ensure_codex_decline_events_table(db)
             agent_id = (
@@ -2631,10 +2711,11 @@ class CodexAdapter(LLMAdapter):
         knob so the operator can raise the cap or shorten the turn.
         """
         try:
-            async for ev in app.iter_turn_events(
+            async with owned_execution_stream(self, app.iter_turn_events(
                 sink, thread_id=thread_id, cancel_token=cancel_token
-            ):
-                yield ev
+            )) as _owned_forwarder_2646:
+                async for ev in _owned_forwarder_2646:
+                    yield ev
         except CodexAppServerError as e:
             msg = str(e)
             if "idle for" in msg and "no completion" in msg:
@@ -2775,7 +2856,7 @@ class CodexAdapter(LLMAdapter):
         # (same session_id) must not race on the turn-sink / handler
         # registrations. ``setdefault`` keeps lock identity stable.
         lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-        await await_or_cancelled(lock.acquire(), cancel_token)
+        await _acquire_thread_turn_lock(lock, cancel_token)
 
         # Defense against concurrent same-session idle-timeout invalidation:
         # while we were queued on this thread lock, another same-session
@@ -2810,7 +2891,7 @@ class CodexAdapter(LLMAdapter):
             )
             turn_input = _build_turn_input(input_messages, fresh_thread=fresh)
             lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-            await await_or_cancelled(lock.acquire(), cancel_token)
+            await _acquire_thread_turn_lock(lock, cancel_token)
 
         # Per-turn record of every inline-executed tool call. Surfaced
         # on the final LLMResponse so the orchestrator can render
@@ -2821,6 +2902,7 @@ class CodexAdapter(LLMAdapter):
         # independent of this turn task. Track the whole handler lifetime so a
         # cooperative Stop cannot resolve while a side effect is still live.
         active_inline_tool_handlers: set[asyncio.Task[Any]] = set()
+        inline_terminal_errors: list[BaseException] = []
         unregisters: List[Callable[[], None]] = []
         if tool_executor is not None and dyn:
             # Only register an item/tool/call handler when tools were
@@ -2841,6 +2923,7 @@ class CodexAdapter(LLMAdapter):
                 self._make_tool_call_handler(
                     tool_executor, thread_id, allowed_tools, executed_log,
                     tool_aliases, active_inline_tool_handlers,
+                    inline_terminal_errors,
                 ),
                 thread_id=thread_id,
             ))
@@ -2853,6 +2936,7 @@ class CodexAdapter(LLMAdapter):
 
         sink = app.open_turn_sink(thread_id)
         temp_image_paths: List[Path] = []
+        image_retirement_owner = asyncio.current_task()
         # Whether the app-server ended the turn (``turn/completed``). Until it
         # does, a caller that abandons the turn leaves it running on the
         # thread (see below).
@@ -2868,7 +2952,8 @@ class CodexAdapter(LLMAdapter):
             # priority order so per-turn overrides stay consistent
             # with the workspace boundary the sandbox is enforcing.
             request_input, temp_image_paths = _materialize_app_server_data_images(
-                _turn_input_to_request_input(turn_input)
+                _turn_input_to_request_input(turn_input),
+                retirement_owner=image_retirement_owner,
             )
             turn_params: Dict[str, Any] = {
                 "threadId": thread_id,
@@ -2929,6 +3014,8 @@ class CodexAdapter(LLMAdapter):
                     "turn has no nameable model for collaborationMode.settings; "
                     "signal not delivered this turn (model=%r).", model,
                 )
+            from kestrel_sovereign.execution_custody import require_execution_work
+            require_execution_work()
             await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []
@@ -2971,251 +3058,252 @@ class CodexAdapter(LLMAdapter):
                 turn_input_len_chars + instructions_len_chars
             ) // 4
 
-            async for ev in self._iter_with_overflow_hint(
+            async with owned_execution_stream(self, self._iter_with_overflow_hint(
                 app, sink, est_payload_tokens, thread_id=thread_id,
                 cancel_token=cancel_token,
-            ):
-                raise_if_cancelled(cancel_token)
-                method = ev.get("method")
-                p = ev.get("params") or {}
-                # #1518: codex's per-session per-plan ceiling is reported on
-                # the notification stream (NOT on the thread/start response —
-                # confirmed by live observation 2026-06-03 against pro plan,
-                # see #1518 body for the dump). ``thread/tokenUsage/updated``
-                # carries ``tokenUsage.modelContextWindow`` which is the real
-                # binding constraint codex enforces for THIS thread. Capture
-                # it and let the catalog's discovered layer win over the
-                # static config. Best-effort; no-op when the field is absent.
-                if method in self._DISCOVERED_CAP_EVENT_METHODS:
-                    self._record_discovered_route_cap_from_event(p)
-                    # #1844: capture codex's TRUE server-side thread
-                    # occupancy alongside the discovered cap, on the SAME
-                    # accepted-method set + both wire spellings, so a host
-                    # emitting ``thread/token_usage/updated`` isn't silently
-                    # left with ``codex_thread: null`` in /context-status.
-                    self._record_thread_occupancy(
-                        session_id,
-                        p.get("tokenUsage") or p.get("token_usage") or {},
-                    )
-                if method == "item/agentMessage/delta":
-                    delta = p.get("delta") or ""
-                    if delta:
-                        text_parts.append(delta)
-                        yield {"text": delta}
-                elif method in (
-                    "item/reasoning/textDelta",
-                    "item/reasoning/summaryTextDelta",
-                ):
-                    d = p.get("delta") or ""
-                    if d:
-                        yield {"thinking": d}
-                elif method == "item/started":
-                    # Tool activity marker for the chat-UI parser. Fires
-                    # BEFORE the kestrel-dispatched ``item/tool/call`` RPC
-                    # AND before codex-native tool execution
-                    # (commandExecution / fileChange / webSearch), so the
-                    # user sees "🔧 Calling X..." right as codex commits
-                    # to using the tool — same UX timing as the
-                    # orchestrator-dispatched path (which yields the same
-                    # marker shape immediately after a tool_calls
-                    # detection).
-                    item = p.get("item") or {}
-                    itype = item.get("type") or ""
-                    iid = item.get("id") or item.get("callId") or ""
-                    if itype in _FORBIDDEN_CODEX_NATIVE_TOOL_ITEM_TYPES:
-                        raise CodexAppServerError(
-                            "Codex emitted forbidden provider-native tool "
-                            f"{itype!r}; aborting openai:plan because the "
-                            "action did not enter Kestrel's security/audit "
-                            "dispatcher."
+            )) as _owned_forwarder_2982:
+                async for ev in _owned_forwarder_2982:
+                    raise_if_cancelled(cancel_token)
+                    method = ev.get("method")
+                    p = ev.get("params") or {}
+                    # #1518: codex's per-session per-plan ceiling is reported on
+                    # the notification stream (NOT on the thread/start response —
+                    # confirmed by live observation 2026-06-03 against pro plan,
+                    # see #1518 body for the dump). ``thread/tokenUsage/updated``
+                    # carries ``tokenUsage.modelContextWindow`` which is the real
+                    # binding constraint codex enforces for THIS thread. Capture
+                    # it and let the catalog's discovered layer win over the
+                    # static config. Best-effort; no-op when the field is absent.
+                    if method in self._DISCOVERED_CAP_EVENT_METHODS:
+                        self._record_discovered_route_cap_from_event(p)
+                        # #1844: capture codex's TRUE server-side thread
+                        # occupancy alongside the discovered cap, on the SAME
+                        # accepted-method set + both wire spellings, so a host
+                        # emitting ``thread/token_usage/updated`` isn't silently
+                        # left with ``codex_thread: null`` in /context-status.
+                        self._record_thread_occupancy(
+                            session_id,
+                            p.get("tokenUsage") or p.get("token_usage") or {},
                         )
-                    # Only dedupe when the protocol gives us an id;
-                    # falling back to ``""`` would collapse every
-                    # id-less item into one dedupe slot and silently
-                    # drop subsequent start markers (codex P2).
-                    already_started = bool(iid) and iid in started_item_ids
-                    if itype in _TOOL_ITEM_TYPES and not already_started:
-                        if iid:
-                            started_item_ids.add(iid)
-                        label = _item_display_label(item)
-                        # Shell items get a one-line command preview so
-                        # the user sees what's running, not just "shell"
-                        # — codex's native shell is the dominant tool in
-                        # this surface, and a bare "shell" marker is the
-                        # bulk of what made the chat feel opaque in
-                        # Nellie's session.
-                        detail = (
-                            _format_command_summary(item.get("command"))
-                            if itype == "commandExecution" else None
-                        )
-                        # #1659: typed in-band tool sentinel instead of the
-                        # "🔧 Calling X..." emoji text. Same wire channel as
-                        # REVISE/THINK; the chat client renders the card from
-                        # this and the persisted tool_events metadata.
-                        from kestrel_sovereign.agent.streaming import (
-                            _build_tool_sentinel,
-                        )
-                        line = _build_tool_sentinel("start", label, detail=detail)
-                        # NOT appended to ``text_parts`` — those rebuild
-                        # ``LLMResponse.content`` as a clean string when
-                        # the app-server doesn't deliver an agentMessage
-                        # item/completed. Wire markers leaking into
-                        # ``content`` would surface as literal "🔧"
-                        # characters in audit logs, narration checks,
-                        # and any non-chat reader of the response.
-                        yield {"text": line}
-                elif method == "item/completed":
-                    item = p.get("item") or {}
-                    itype = item.get("type")
-                    iid = item.get("id") or item.get("callId") or ""
-                    if itype in _FORBIDDEN_CODEX_NATIVE_TOOL_ITEM_TYPES:
-                        raise CodexAppServerError(
-                            "Codex completed forbidden provider-native tool "
-                            f"{itype!r}; failing openai:plan because the "
-                            "action bypassed Kestrel's security/audit "
-                            "dispatcher."
-                        )
-                    if itype == "agentMessage":
-                        final_text = item.get("text") or final_text
-                    elif itype in _TOOL_ITEM_TYPES:
-                        # Completion marker. Emit even if we missed the
-                        # paired item/started (some app-server builds
-                        # collapse start+complete for very fast items)
-                        # — without a completion line the chat-UI parser
-                        # leaves the card in a "running" state forever.
-                        # Same dedupe carve-out as item/started: only
-                        # gate on iid when one was supplied; missing-id
-                        # items always emit so they're not collapsed
-                        # into a single phantom (codex P2).
-                        already_completed = bool(iid) and iid in completed_item_ids
-                        if already_completed:
-                            # Defensive: never two ✓ lines for one item.
-                            pass
-                        else:
-                            if iid:
-                                completed_item_ids.add(iid)
-                            label = _item_display_label(item)
-                            status = (
-                                item.get("status")
-                                or item.get("state")
-                                or ""
+                    if method == "item/agentMessage/delta":
+                        delta = p.get("delta") or ""
+                        if delta:
+                            text_parts.append(delta)
+                            yield {"text": delta}
+                    elif method in (
+                        "item/reasoning/textDelta",
+                        "item/reasoning/summaryTextDelta",
+                    ):
+                        d = p.get("delta") or ""
+                        if d:
+                            yield {"thinking": d}
+                    elif method == "item/started":
+                        # Tool activity marker for the chat-UI parser. Fires
+                        # BEFORE the kestrel-dispatched ``item/tool/call`` RPC
+                        # AND before codex-native tool execution
+                        # (commandExecution / fileChange / webSearch), so the
+                        # user sees "🔧 Calling X..." right as codex commits
+                        # to using the tool — same UX timing as the
+                        # orchestrator-dispatched path (which yields the same
+                        # marker shape immediately after a tool_calls
+                        # detection).
+                        item = p.get("item") or {}
+                        itype = item.get("type") or ""
+                        iid = item.get("id") or item.get("callId") or ""
+                        if itype in _FORBIDDEN_CODEX_NATIVE_TOOL_ITEM_TYPES:
+                            raise CodexAppServerError(
+                                "Codex emitted forbidden provider-native tool "
+                                f"{itype!r}; aborting openai:plan because the "
+                                "action did not enter Kestrel's security/audit "
+                                "dispatcher."
                             )
-                            failed = (
-                                isinstance(status, str)
-                                and status.lower() in ("failed", "error", "blocked")
-                            ) or bool(item.get("error"))
-                            # #1659: typed done/error sentinel (was ✓/❌ text).
+                        # Only dedupe when the protocol gives us an id;
+                        # falling back to ``""`` would collapse every
+                        # id-less item into one dedupe slot and silently
+                        # drop subsequent start markers (codex P2).
+                        already_started = bool(iid) and iid in started_item_ids
+                        if itype in _TOOL_ITEM_TYPES and not already_started:
+                            if iid:
+                                started_item_ids.add(iid)
+                            label = _item_display_label(item)
+                            # Shell items get a one-line command preview so
+                            # the user sees what's running, not just "shell"
+                            # — codex's native shell is the dominant tool in
+                            # this surface, and a bare "shell" marker is the
+                            # bulk of what made the chat feel opaque in
+                            # Nellie's session.
+                            detail = (
+                                _format_command_summary(item.get("command"))
+                                if itype == "commandExecution" else None
+                            )
+                            # #1659: typed in-band tool sentinel instead of the
+                            # "🔧 Calling X..." emoji text. Same wire channel as
+                            # REVISE/THINK; the chat client renders the card from
+                            # this and the persisted tool_events metadata.
                             from kestrel_sovereign.agent.streaming import (
                                 _build_tool_sentinel,
                             )
-                            err = item.get("error")
-                            line = _build_tool_sentinel(
-                                "error" if failed else "done",
-                                label,
-                                detail=(str(err)[:200] if (failed and err) else None),
-                            )
-                            # See start-marker note: NOT appended to
-                            # ``text_parts``; markers stay on the wire,
-                            # not in LLMResponse.content.
+                            line = _build_tool_sentinel("start", label, detail=detail)
+                            # NOT appended to ``text_parts`` — those rebuild
+                            # ``LLMResponse.content`` as a clean string when
+                            # the app-server doesn't deliver an agentMessage
+                            # item/completed. Wire markers leaking into
+                            # ``content`` would surface as literal "🔧"
+                            # characters in audit logs, narration checks,
+                            # and any non-chat reader of the response.
                             yield {"text": line}
-                        # Kestrel-dispatched tools additionally surface
-                        # ToolCallStarted for the honesty-layer revising
-                        # sentinel + populate the executed_log folded into
-                        # chat history. Provider-native types were rejected
-                        # above and can never reach this marker path.
-                        if itype in _KESTREL_DISPATCHED_TOOL_ITEM_TYPES:
-                            # See dedupe carve-out above. The
-                            # ``ToolCallStarted`` honesty-layer signal
-                            # MUST fire per tool — collapsing two
-                            # id-less calls into one would silently
-                            # break narration auditing.
-                            if iid and iid in seen_tool_ids:
-                                continue
-                            if iid:
-                                seen_tool_ids.add(iid)
-                            raw_args = item.get("arguments")
-                            if isinstance(raw_args, str):
-                                try:
-                                    raw_args = json.loads(raw_args)
-                                except ValueError:
-                                    raw_args = {"_raw": raw_args}
-                            tc = ToolCall(
-                                id=iid,
-                                name=item.get("name") or item.get("tool") or "",
-                                arguments=(
-                                    raw_args if isinstance(raw_args, dict) else {}
-                                ),
+                    elif method == "item/completed":
+                        item = p.get("item") or {}
+                        itype = item.get("type")
+                        iid = item.get("id") or item.get("callId") or ""
+                        if itype in _FORBIDDEN_CODEX_NATIVE_TOOL_ITEM_TYPES:
+                            raise CodexAppServerError(
+                                "Codex completed forbidden provider-native tool "
+                                f"{itype!r}; failing openai:plan because the "
+                                "action bypassed Kestrel's security/audit "
+                                "dispatcher."
                             )
-                            # Critical: the app-server has ALREADY executed
-                            # this tool inline via our item/tool/call handler.
-                            # Yield ToolCallStarted for UI/honesty-layer
-                            # signaling, but DO NOT add to ``tool_calls`` —
-                            # surfacing it would make the orchestrator
-                            # re-dispatch through ``_execute_tool_batch`` and
-                            # duplicate every tool's side effects.
-                            #
-                            # #2675: snapshot the pre-tool prose at this FIRST
-                            # tool boundary (mirrors StreamingMixin snapshotting
-                            # at the first ``ToolCallStarted``). Later markers are
-                            # inter-tool prose, not pre-tool, so guard on ``None``.
-                            if pre_tool_prose_snapshot is None:
-                                pre_tool_prose_snapshot = "".join(text_parts)
-                            yield {"tool_call": tc}
-                elif method in self._DISCOVERED_CAP_EVENT_METHODS:
-                    usage = _usage_from(
-                        p.get("tokenUsage") or p.get("token_usage") or {}
-                    )
-                elif method == "turn/failed":
-                    err = p.get("error") or p.get("turn", {}).get("error") or {}
-                    raise CodexAppServerError(
-                        f"codex turn failed: "
-                        f"{err.get('message') or err or 'unknown'}"
-                    )
-                elif method == "error":
-                    # Standalone error event — codex emits this (instead of,
-                    # or in addition to, ``turn/failed``) when the upstream
-                    # Responses API rejects the request. Pre-#1438 this was
-                    # silently ignored: the read loop kept going, the turn
-                    # ended with empty content, and the caller got HTTP 200
-                    # with ``response=""`` — the honesty floor was breached
-                    # because codex told us the request failed and we
-                    # relayed it as a clean response. Smoking gun: a
-                    # ChatGPT-Plus account asking for ``gpt-5.5-pro`` got
-                    # "model is not supported when using Codex with a
-                    # ChatGPT account" silently swallowed instead of
-                    # surfaced. ``willRetry=True`` is codex's signal that
-                    # it's about to retry internally — leave those alone;
-                    # only escalate when retry is off.
-                    will_retry = bool(p.get("willRetry", False))
-                    if not will_retry:
-                        err = p.get("error") or {}
-                        msg = (
-                            err.get("message") if isinstance(err, dict)
-                            else str(err)
+                        if itype == "agentMessage":
+                            final_text = item.get("text") or final_text
+                        elif itype in _TOOL_ITEM_TYPES:
+                            # Completion marker. Emit even if we missed the
+                            # paired item/started (some app-server builds
+                            # collapse start+complete for very fast items)
+                            # — without a completion line the chat-UI parser
+                            # leaves the card in a "running" state forever.
+                            # Same dedupe carve-out as item/started: only
+                            # gate on iid when one was supplied; missing-id
+                            # items always emit so they're not collapsed
+                            # into a single phantom (codex P2).
+                            already_completed = bool(iid) and iid in completed_item_ids
+                            if already_completed:
+                                # Defensive: never two ✓ lines for one item.
+                                pass
+                            else:
+                                if iid:
+                                    completed_item_ids.add(iid)
+                                label = _item_display_label(item)
+                                status = (
+                                    item.get("status")
+                                    or item.get("state")
+                                    or ""
+                                )
+                                failed = (
+                                    isinstance(status, str)
+                                    and status.lower() in ("failed", "error", "blocked")
+                                ) or bool(item.get("error"))
+                                # #1659: typed done/error sentinel (was ✓/❌ text).
+                                from kestrel_sovereign.agent.streaming import (
+                                    _build_tool_sentinel,
+                                )
+                                err = item.get("error")
+                                line = _build_tool_sentinel(
+                                    "error" if failed else "done",
+                                    label,
+                                    detail=(str(err)[:200] if (failed and err) else None),
+                                )
+                                # See start-marker note: NOT appended to
+                                # ``text_parts``; markers stay on the wire,
+                                # not in LLMResponse.content.
+                                yield {"text": line}
+                            # Kestrel-dispatched tools additionally surface
+                            # ToolCallStarted for the honesty-layer revising
+                            # sentinel + populate the executed_log folded into
+                            # chat history. Provider-native types were rejected
+                            # above and can never reach this marker path.
+                            if itype in _KESTREL_DISPATCHED_TOOL_ITEM_TYPES:
+                                # See dedupe carve-out above. The
+                                # ``ToolCallStarted`` honesty-layer signal
+                                # MUST fire per tool — collapsing two
+                                # id-less calls into one would silently
+                                # break narration auditing.
+                                if iid and iid in seen_tool_ids:
+                                    continue
+                                if iid:
+                                    seen_tool_ids.add(iid)
+                                raw_args = item.get("arguments")
+                                if isinstance(raw_args, str):
+                                    try:
+                                        raw_args = json.loads(raw_args)
+                                    except ValueError:
+                                        raw_args = {"_raw": raw_args}
+                                tc = ToolCall(
+                                    id=iid,
+                                    name=item.get("name") or item.get("tool") or "",
+                                    arguments=(
+                                        raw_args if isinstance(raw_args, dict) else {}
+                                    ),
+                                )
+                                # Critical: the app-server has ALREADY executed
+                                # this tool inline via our item/tool/call handler.
+                                # Yield ToolCallStarted for UI/honesty-layer
+                                # signaling, but DO NOT add to ``tool_calls`` —
+                                # surfacing it would make the orchestrator
+                                # re-dispatch through ``_execute_tool_batch`` and
+                                # duplicate every tool's side effects.
+                                #
+                                # #2675: snapshot the pre-tool prose at this FIRST
+                                # tool boundary (mirrors StreamingMixin snapshotting
+                                # at the first ``ToolCallStarted``). Later markers are
+                                # inter-tool prose, not pre-tool, so guard on ``None``.
+                                if pre_tool_prose_snapshot is None:
+                                    pre_tool_prose_snapshot = "".join(text_parts)
+                                yield {"tool_call": tc}
+                    elif method in self._DISCOVERED_CAP_EVENT_METHODS:
+                        usage = _usage_from(
+                            p.get("tokenUsage") or p.get("token_usage") or {}
                         )
+                    elif method == "turn/failed":
+                        err = p.get("error") or p.get("turn", {}).get("error") or {}
                         raise CodexAppServerError(
-                            f"codex turn failed: {msg or 'unknown'}"
+                            f"codex turn failed: "
+                            f"{err.get('message') or err or 'unknown'}"
                         )
-                elif method == "turn/completed":
-                    # Terminal event. If the turn entered failed state
-                    # (upstream rejection that didn't already raise via
-                    # the ``error`` branch), surface it as an exception
-                    # rather than letting the loop fall through to the
-                    # final yield with empty content. Same honesty
-                    # rationale as the ``error`` branch.
-                    turn_ended = True
-                    turn_info = p.get("turn") or {}
-                    turn_status = turn_info.get("status")
-                    if turn_status == "failed":
-                        err = turn_info.get("error") or {}
-                        msg = (
-                            err.get("message") if isinstance(err, dict)
-                            else str(err)
-                        )
-                        raise CodexAppServerError(
-                            f"codex turn completed in failed state: "
-                            f"{msg or 'unknown'}"
-                        )
+                    elif method == "error":
+                        # Standalone error event — codex emits this (instead of,
+                        # or in addition to, ``turn/failed``) when the upstream
+                        # Responses API rejects the request. Pre-#1438 this was
+                        # silently ignored: the read loop kept going, the turn
+                        # ended with empty content, and the caller got HTTP 200
+                        # with ``response=""`` — the honesty floor was breached
+                        # because codex told us the request failed and we
+                        # relayed it as a clean response. Smoking gun: a
+                        # ChatGPT-Plus account asking for ``gpt-5.5-pro`` got
+                        # "model is not supported when using Codex with a
+                        # ChatGPT account" silently swallowed instead of
+                        # surfaced. ``willRetry=True`` is codex's signal that
+                        # it's about to retry internally — leave those alone;
+                        # only escalate when retry is off.
+                        will_retry = bool(p.get("willRetry", False))
+                        if not will_retry:
+                            err = p.get("error") or {}
+                            msg = (
+                                err.get("message") if isinstance(err, dict)
+                                else str(err)
+                            )
+                            raise CodexAppServerError(
+                                f"codex turn failed: {msg or 'unknown'}"
+                            )
+                    elif method == "turn/completed":
+                        # Terminal event. If the turn entered failed state
+                        # (upstream rejection that didn't already raise via
+                        # the ``error`` branch), surface it as an exception
+                        # rather than letting the loop fall through to the
+                        # final yield with empty content. Same honesty
+                        # rationale as the ``error`` branch.
+                        turn_ended = True
+                        turn_info = p.get("turn") or {}
+                        turn_status = turn_info.get("status")
+                        if turn_status == "failed":
+                            err = turn_info.get("error") or {}
+                            msg = (
+                                err.get("message") if isinstance(err, dict)
+                                else str(err)
+                            )
+                            raise CodexAppServerError(
+                                f"codex turn completed in failed state: "
+                                f"{msg or 'unknown'}"
+                            )
                     # Otherwise terminates iter_turn_events normally.
 
             content = final_text if final_text is not None else "".join(text_parts)
@@ -3272,9 +3360,10 @@ class CodexAdapter(LLMAdapter):
                 self.reset_thread(session_id)
             raise
         finally:
-            app.close_turn_sink(thread_id)
-            for path in temp_image_paths:
-                path.unlink(missing_ok=True)
+            unwind_error = sys.exception()
+            inline_terminal_errors.extend(_cleanup_app_server_data_images(
+                temp_image_paths, retirement_owner=image_retirement_owner,
+            ))
             # Close admission before joining. A handler selected by the reader
             # before this point registers itself in ``active_inline_tool_handlers``
             # synchronously, before its first await, so it cannot slip between
@@ -3284,65 +3373,64 @@ class CodexAdapter(LLMAdapter):
                     _unreg()
                 except Exception:  # noqa: BLE001 - cleanup is best-effort
                     pass
-            unwind_error = sys.exception()
             pending_cleanup_cancellation = (
                 unwind_error
                 if isinstance(unwind_error, asyncio.CancelledError)
                 else None
             )
+            checkpoint_error = None
             try:
-                if active_inline_tool_handlers:
-                    async def settle_inline_tools() -> None:
-                        while active_inline_tool_handlers:
-                            await asyncio.gather(
-                                *tuple(active_inline_tool_handlers),
-                                return_exceptions=True,
+                # These handlers already have physical reader-owned Tasks.
+                # Retiring them must not depend on admitting another collector
+                # Task, or an allocator refusal releases the mutex underneath
+                # an accepted effect. Close admission above, then join originals.
+                while active_inline_tool_handlers:
+                    for handler_owner in tuple(active_inline_tool_handlers):
+                        outcome = await await_owned_task(handler_owner)
+                        # Physical settlement, not deferred callback ordering,
+                        # retires this original member of the closed cohort.
+                        active_inline_tool_handlers.discard(handler_owner)
+                        if outcome.error is not None:
+                            inline_terminal_errors.append(outcome.error)
+                        if outcome.cancellation is not None:
+                            inline_terminal_errors.append(outcome.cancellation)
+                            if pending_cleanup_cancellation is None:
+                                pending_cleanup_cancellation = outcome.cancellation
+                if pending_cleanup_cancellation is not None and executed_log:
+                    checkpoint = getattr(
+                        tool_executor,
+                        "persist_completed_effects",
+                        None,
+                    )
+                    if callable(checkpoint):
+                        from kestrel_sovereign._async_ownership import await_owned_operation
+                        checkpoint_outcome = await await_owned_operation(
+                            checkpoint(list(executed_log)),
+                            name="codex-inline-tool-stop-checkpoint",
+                            retirement_resource=tool_executor, retain_originals=True,
+                        )
+                        if checkpoint_outcome.cancellation is not None:
+                            inline_terminal_errors.append(checkpoint_outcome.cancellation)
+                        if checkpoint_outcome.error is not None:
+                            checkpoint_error = checkpoint_outcome.error
+                        else:
+                            setattr(
+                                pending_cleanup_cancellation,
+                                "_kestrel_completed_effect_checkpointed",
+                                True,
                             )
-
-                    owner = asyncio.create_task(
-                        settle_inline_tools(),
-                        name="codex-inline-tool-stop-boundary",
-                    )
-                    outcome = await await_owned_task(
-                        owner,
-                        pending_cleanup_cancellation,
-                    )
-                    pending_cleanup_cancellation = outcome.cancellation
-                    if outcome.error is not None:
-                        logger.warning(
-                            "codex inline-tool settlement failed: %s",
-                            outcome.error,
-                        )
             finally:
-                lock.release()
-            if pending_cleanup_cancellation is not None and executed_log:
-                checkpoint = getattr(
-                    tool_executor,
-                    "persist_completed_effects",
-                    None,
-                )
-                if callable(checkpoint):
-                    checkpoint_owner = asyncio.create_task(
-                        checkpoint(list(executed_log)),
-                        name="codex-inline-tool-stop-checkpoint",
-                    )
-                    checkpoint_outcome = await await_owned_task(
-                        checkpoint_owner,
-                        pending_cleanup_cancellation,
-                    )
-                    if checkpoint_outcome.error is not None:
-                        checkpoint_outcome.error.add_note(
-                            "caller cancellation remained pending after an "
-                            "inline tool effect completed"
-                        )
-                        raise checkpoint_outcome.error
-                    setattr(
-                        pending_cleanup_cancellation,
-                        "_kestrel_completed_effect_checkpointed",
-                        True,
-                    )
-            if pending_cleanup_cancellation is not None:
-                raise pending_cleanup_cancellation
+                try:
+                    app.close_turn_sink(thread_id)
+                finally:
+                    lock.release()
+            terminal_error = execution_terminal_error(
+                unwind_error, *inline_terminal_errors,
+                pending_cleanup_cancellation, checkpoint_error,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            if terminal_error is not None:
+                raise terminal_error
 
     async def _run_turn_with_retry(
         self,
@@ -3391,6 +3479,8 @@ class CodexAdapter(LLMAdapter):
         preserved so the streaming.py harness-owned check still kicks
         in (#1429 contract).
         """
+        from kestrel_sovereign.execution_custody import require_execution_work
+        require_execution_work()
         if tools:
             # See docstring: tool-bearing turns are outside the safe
             # retry envelope today. Delegate straight through.
@@ -3400,25 +3490,28 @@ class CodexAdapter(LLMAdapter):
             # retry for ``tools=[]`` would deny the one-shot recovery
             # to callers that normalize "no tools" to an empty list.
             # Codex review round 4 caught this.
-            async for ev in self._run_turn(
+            async with owned_execution_stream(self, self._run_turn(
                 model, messages, tools, session_id, tool_executor,
                 cancel_token=cancel_token,
                 keep_trailing_system=keep_trailing_system,
-            ):
-                yield ev
+            )) as _owned_forwarder_3397:
+                async for ev in _owned_forwarder_3397:
+                    yield ev
             return
 
         MAX_ATTEMPTS = 2
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            require_execution_work()
             events_yielded = 0
             try:
-                async for ev in self._run_turn(
+                async with owned_execution_stream(self, self._run_turn(
                     model, messages, None, session_id, None,
                     cancel_token=cancel_token,
                     keep_trailing_system=keep_trailing_system,
-                ):
-                    events_yielded += 1
-                    yield ev
+                )) as _owned_forwarder_3410:
+                    async for ev in _owned_forwarder_3410:
+                        events_yielded += 1
+                        yield ev
                 return
             except CodexAppServerTransportError as e:
                 if attempt >= MAX_ATTEMPTS:
@@ -3495,18 +3588,19 @@ class CodexAdapter(LLMAdapter):
         executed: List[Dict[str, Any]] = []
         pre_tool_prose: Optional[str] = None
         stop_reason: Optional[str] = None
-        async for ev in self._run_turn_with_retry(
+        async with owned_execution_stream(self, self._run_turn_with_retry(
             model, messages, tools, session_id, tool_executor,
             cancel_token=cancel_token,
             keep_trailing_system=keep_trailing_system,
-        ):
-            # Every turn event is the app-server still answering (#3552).
-            report_call_progress()
-            if "final" in ev:
-                content, tool_calls, usage = ev["final"]
-                executed = ev.get("executed") or []
-                pre_tool_prose = ev.get("pre_tool_prose")
-                stop_reason = ev.get("stop_reason")
+        )) as _owned_forwarder_3492:
+            async for ev in _owned_forwarder_3492:
+                # Every turn event is the app-server still answering (#3552).
+                report_call_progress()
+                if "final" in ev:
+                    content, tool_calls, usage = ev["final"]
+                    executed = ev.get("executed") or []
+                    pre_tool_prose = ev.get("pre_tool_prose")
+                    stop_reason = ev.get("stop_reason")
         resp = attach_stop_reason(LLMResponse(
             content=content,
             tool_calls=tool_calls,
@@ -3548,15 +3642,16 @@ class CodexAdapter(LLMAdapter):
         # Tools intentionally not passed: text-only streaming surface.
         # Uses ``_run_turn_with_retry`` so a transient codex idle stall
         # gets one chance to recover before the error surfaces. See #1411.
-        async for ev in self._run_turn_with_retry(
+        async with owned_execution_stream(self, self._run_turn_with_retry(
             model, messages, None, session_id, None,
             cancel_token=cancel_token,
             keep_trailing_system=keep_trailing_system,
-        ):
-            if "text" in ev:
-                yield ev["text"]
-            elif "thinking" in ev:
-                yield ThinkingDelta(ev["thinking"], provider="codex")
+        )) as _owned_forwarder_3542:
+            async for ev in _owned_forwarder_3542:
+                if "text" in ev:
+                    yield ev["text"]
+                elif "thinking" in ev:
+                    yield ThinkingDelta(ev["thinking"], provider="codex")
 
     async def get_streaming_response_with_tools(
         self,
@@ -3576,33 +3671,34 @@ class CodexAdapter(LLMAdapter):
         # callers.  The retry helper already bypasses retries when ``tools`` is
         # truthy, so tool-call semantics remain unchanged while text-only
         # callers retain the safe pre-output idle retry of get_streaming_response.
-        async for ev in self._run_turn_with_retry(
+        async with owned_execution_stream(self, self._run_turn_with_retry(
             model, messages, tools, session_id, tool_executor,
             cancel_token=cancel_token,
             keep_trailing_system=keep_trailing_system,
-        ):
-            if "text" in ev:
-                yield ev["text"]
-            elif "thinking" in ev:
-                yield ThinkingDelta(ev["thinking"], provider="codex")
-            elif "tool_call" in ev:
-                tc = ev["tool_call"]
-                yield ToolCallStarted(idx, tc.id or None, tc.name or None)
-                idx += 1
-            elif "final" in ev:
-                content, tcs, usage = ev["final"]
-                resp = attach_stop_reason(LLMResponse(
-                    content=content,
-                    tool_calls=tcs,
-                    input_tokens=usage.get("input_tokens"),
-                    output_tokens=usage.get("output_tokens"),
-                    total_tokens=usage.get("total_tokens"),
-                    cache_read_input_tokens=usage.get("cache_read_input_tokens"),
-                ), ev.get("stop_reason"))
-                executed = ev.get("executed") or []
-                if executed:
-                    resp.executed_tool_calls = executed
-                yield resp
+        )) as _owned_forwarder_3570:
+            async for ev in _owned_forwarder_3570:
+                if "text" in ev:
+                    yield ev["text"]
+                elif "thinking" in ev:
+                    yield ThinkingDelta(ev["thinking"], provider="codex")
+                elif "tool_call" in ev:
+                    tc = ev["tool_call"]
+                    yield ToolCallStarted(idx, tc.id or None, tc.name or None)
+                    idx += 1
+                elif "final" in ev:
+                    content, tcs, usage = ev["final"]
+                    resp = attach_stop_reason(LLMResponse(
+                        content=content,
+                        tool_calls=tcs,
+                        input_tokens=usage.get("input_tokens"),
+                        output_tokens=usage.get("output_tokens"),
+                        total_tokens=usage.get("total_tokens"),
+                        cache_read_input_tokens=usage.get("cache_read_input_tokens"),
+                    ), ev.get("stop_reason"))
+                    executed = ev.get("executed") or []
+                    if executed:
+                        resp.executed_tool_calls = executed
+                    yield resp
 
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """Discover the codex (ChatGPT app-server) serveable model catalog.

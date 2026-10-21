@@ -22,9 +22,9 @@ def _step(outcome, calls=None):
     return step
 
 
-def test_only_the_task_manager_is_trusted_to_report_its_release():
-    """Every other owner's close still swallows failures (#3559, #3560)."""
-    assert TRUTHFUL_CLOSE_OWNERS == frozenset({"task_manager"})
+def test_only_converted_close_owners_are_trusted_to_report_their_release():
+    """Local host-store close joins native retirement rather than swallowing it."""
+    assert TRUTHFUL_CLOSE_OWNERS == frozenset({"task_manager", "host_key_database"})
 
 
 @pytest.mark.asyncio

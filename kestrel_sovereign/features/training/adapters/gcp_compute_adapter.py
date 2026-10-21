@@ -15,6 +15,8 @@ import tempfile
 import uuid
 from typing import Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from ._session_training_lifecycle import (
     ReleaseIntent,
     SessionLifecycleTimeouts,
@@ -45,7 +47,9 @@ def _is_not_found(error: Exception) -> bool:
     """Whether a Compute Engine call failed because the resource is gone."""
     try:
         from google.api_core.exceptions import NotFound
-    except ImportError:
+    except ImportError as error:
+        if is_execution_control_error(error):
+            raise
         return False
     return isinstance(error, NotFound)
 
@@ -110,11 +114,15 @@ class GCPComputeTrainingAdapter:
                 from kestrel_cloud_gcp.compute.manager import GCPComputeEngineManager
                 self._manager = GCPComputeEngineManager()
             except ImportError as e:
+                if is_execution_control_error(e):
+                    raise
                 raise ProviderNotAvailableError(
                     f"GCP Compute manager not available — install kestrel-cloud-gcp "
                     f"to enable GCP-as-training-provider: {e}"
                 )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 raise ProviderNotAvailableError(
                     f"Failed to initialize GCP Compute manager: {e}"
                 )
@@ -126,9 +134,13 @@ class GCPComputeTrainingAdapter:
             manager = self._get_manager()
             # Check for required credentials
             return manager is not None and manager._credentials is not None
-        except (ProviderNotAvailableError, ImportError):
+        except (ProviderNotAvailableError, ImportError) as error:
+            if is_execution_control_error(error):
+                raise
             return False
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.debug("GCP Compute availability check failed", exc_info=True)
             return False
 
@@ -171,12 +183,18 @@ class GCPComputeTrainingAdapter:
         except TrainingProviderError:
             raise
         except (subprocess.SubprocessError, OSError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"GCP Compute training system error: {e}")
             raise TrainingSubmissionError(f"Failed to start GCP training: {e}")
         except (ConnectionError, TimeoutError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"GCP Compute training connection error: {e}")
             raise TrainingSubmissionError(f"Failed to start GCP training: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"GCP Compute training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start GCP training: {e}")
 
@@ -254,6 +272,8 @@ class GCPComputeTrainingAdapter:
                 instance=session.instance_name,
             )
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             if not _is_not_found(error):
                 raise
             logger.info(f"GCP instance {session.instance_name} is already deleted")
@@ -317,12 +337,18 @@ class GCPComputeTrainingAdapter:
         except TrainingProviderError:
             raise
         except (subprocess.SubprocessError, OSError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"GCP training status system error: {e}")
             raise TrainingStatusError(f"Status check failed: {e}")
         except (KeyError, ValueError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"GCP training status parse error: {e}")
             raise TrainingStatusError(f"Status check failed: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to get GCP training status: {e}", exc_info=True)
             raise TrainingStatusError(f"Status check failed: {e}")
 
@@ -355,9 +381,13 @@ class GCPComputeTrainingAdapter:
         except TrainingProviderError:
             raise
         except (subprocess.SubprocessError, OSError) as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"GCP LoRA download system error: {e}")
             raise DownloadError(f"Download failed: {e}")
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to download GCP LoRA weights: {e}", exc_info=True)
             raise DownloadError(f"Download failed: {e}")
 

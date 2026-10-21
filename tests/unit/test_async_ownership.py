@@ -1,4 +1,4 @@
-"""Contract tests for cancellation-safe ownership of internal tasks."""
+"""Contract tests for cancellation-safe ownership and borrowed observation."""
 
 from __future__ import annotations
 
@@ -14,10 +14,195 @@ import pytest
 import kestrel_sovereign
 from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
+    OwnedTaskAdmission,
     await_owned_task,
+    create_owned_task,
+    owned_task_error,
+    owned_iterator_parent_tasks,
     raise_owned_outcome,
     run_blocking_operation,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+@pytest.mark.parametrize("mode", ["success", "allocation", "callback-before", "callback-after"])
+async def test_original_admission_cell_precedes_all_callback_publication(
+    tmp_path, mode, eager,
+):
+    import inspect
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+    path = tmp_path / "original-task-admission.db"
+    entered, release = asyncio.Event(), asyncio.Event()
+    body_started = []
+    async def original():
+        body_started.append(asyncio.current_task())
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            await db.execute("CREATE TABLE admission_effects(id INTEGER)")
+            entered.set()
+            await release.wait()
+            return "original native result"
+        finally:
+            await db.close()
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    admission, accepted, refused = OwnedTaskAdmission(), [], []
+    refusal = RuntimeError("actual canonical admission " + mode)
+    class PublicationTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if mode.startswith("callback") and getattr(callback, "__name__", "") == "close_unstarted":
+                assert admission.task is self, "accepted Task was invisible during callback publication"
+                assert not body_started, "eager body ran before canonical publication"
+                if mode.endswith("-after"):
+                    super().add_done_callback(callback, context=context)
+                raise refusal
+            return super().add_done_callback(callback, context=context)
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        if getattr(operation, "cr_code", None) is original.__code__:
+            if mode == "allocation":
+                refused.append((coroutine, operation))
+                raise refusal
+            options = {"eager_start": True} if eager else {}
+            task = PublicationTask(coroutine, loop=loop, **kwargs, **options)
+            accepted.append(task)
+            return task
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+    try:
+        loop.set_task_factory(factory)
+        if mode == "success":
+            task = create_owned_task(original(), admission=admission, retain_originals=True)
+            assert admission.task is task
+            assert not body_started
+        else:
+            with pytest.raises(RuntimeError) as caught:
+                create_owned_task(original(), admission=admission, retain_originals=True)
+            assert caught.value is refusal
+        loop.set_task_factory(previous)
+        if mode == "success":
+            await entered.wait()
+            release.set()
+            assert (await await_owned_task(task)).result == "original native result"
+        elif admission.task is not None:
+            assert admission.task is accepted[0]
+            assert (await await_owned_task(admission.task)).error is refusal
+            assert not path.exists()
+        else:
+            assert not accepted and not path.exists()
+        assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
+    finally:
+        loop.set_task_factory(previous)
+        release.set()
+        for task in accepted:
+            await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+async def test_borrowed_observation_withdraws_without_cancelling_or_joining_original():
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def original():
+        await release.wait()
+        return "original result"
+
+    source = create_owned_task(original(), retain_originals=True)
+
+    async def observe():
+        entered.set()
+        return await await_owned_task(source, defer_cancellation=False)
+
+    observer = create_owned_task(observe(), retain_originals=True)
+    try:
+        await entered.wait()
+        observer.cancel("actual borrowed observer withdrew")
+        observed = await await_owned_task(observer)
+        assert isinstance(observed.error, asyncio.CancelledError)
+        assert observed.error.args == ("actual borrowed observer withdrew",)
+        assert not source.done() and not source.cancelling()
+        release.set()
+        assert (await await_owned_task(source)).result == "original result"
+    finally:
+        release.set()
+        await await_owned_task(observer)
+        await await_owned_task(source)
+
+
+@pytest.mark.asyncio
+async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate():
+    original = asyncio.CancelledError("original source cancellation")
+    cause = OSError("original source cause")
+
+    async def exit():
+        raise original from cause
+
+    source = create_owned_task(exit(), retain_originals=True)
+    await await_owned_task(source)
+    observed = await await_owned_task(source, defer_cancellation=False)
+    assert observed.error is original and observed.error.__cause__ is cause
+    assert observed.cancellation is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["pending", "forwarding"])
+async def test_borrowed_observation_refuses_owning_or_forwarding_cancellation(mode):
+    source = asyncio.get_running_loop().create_future()
+    kwargs = ({"pending_cancellation": asyncio.CancelledError("already owned")}
+              if mode == "pending" else {"cancel_on_caller_cancellation": True})
+    with pytest.raises(ValueError, match="borrowed observation"):
+        await await_owned_task(source, defer_cancellation=False, **kwargs)
+    assert not source.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain_originals", [False, True])
+async def test_native_original_policy_keeps_caused_cancellation_without_changing_default(retain_originals):
+    cause = ValueError("original native cause")
+    cancellation = asyncio.CancelledError("original native cancellation")
+
+    async def exit():
+        raise cancellation from cause
+
+    task = create_owned_task(exit(), retain_originals=retain_originals)
+    outcome = await await_owned_task(task)
+    expected = cancellation if retain_originals else cause
+    assert outcome.error is expected
+    assert owned_task_error(task) is expected
+    assert (await await_owned_task(task)).error is expected
+    if retain_originals:
+        assert cancellation.__cause__ is cause
+
+
+@pytest.mark.asyncio
+async def test_only_explicit_owned_iterator_sources_inherit_observation_lineage():
+    consumer = asyncio.current_task()
+    sources = []
+
+    async def unrelated():
+        return owned_iterator_parent_tasks()
+
+    async def inner():
+        parents = owned_iterator_parent_tasks()
+        assert parents == (sources[0], consumer)
+        assert await asyncio.create_task(unrelated()) == ()
+        assert await asyncio.to_thread(owned_iterator_parent_tasks) == ()
+        yield "joined"
+
+    async def outer():
+        sources.append(asyncio.current_task())
+        assert owned_iterator_parent_tasks() == (consumer,)
+        iterator = OwnedAsyncIterator(inner, operation="nested observation")
+        try:
+            yield await anext(iterator)
+        finally:
+            await iterator.aclose()
+
+    iterator = OwnedAsyncIterator(outer, operation="root observation")
+    try:
+        assert await anext(iterator) == "joined"
+        assert owned_iterator_parent_tasks() == ()
+    finally:
+        await iterator.aclose()
 
 
 @pytest.mark.asyncio
@@ -121,6 +306,147 @@ async def test_preexisting_cancellation_is_propagated_after_owned_result():
 
     with pytest.raises(asyncio.CancelledError, match="already cancelled"):
         raise_owned_outcome(outcome, operation="test operation")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_stopping", [False, True])
+@pytest.mark.parametrize("falsey", [False, True])
+async def test_owned_cancellation_forwarder_uses_original_owner_once(already_stopping, falsey):
+    entered, unwinding, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    forwards = []
+
+    async def operation():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            unwinding.set()
+            await release.wait()
+
+    task = create_owned_task(operation())
+
+    def forward(original):
+        assert original is task
+        forwards.append(original)
+        if not already_stopping:
+            original.cancel()
+
+    class FalseyForwarder:
+        def __bool__(self):
+            return False
+
+        def __call__(self, original):
+            forward(original)
+
+    policy = FalseyForwarder() if falsey else forward
+    owner = create_owned_task(await_owned_task(task, cancel_on_caller_cancellation=policy))
+    try:
+        await entered.wait()
+        if already_stopping:
+            task.cancel()
+            await asyncio.wait_for(unwinding.wait(), 1)
+        owner.cancel("original caller stop")
+        await asyncio.wait_for(unwinding.wait(), 1)
+        await asyncio.sleep(0)
+        owner.cancel("repeated caller stop")
+        await asyncio.sleep(0)
+        assert not owner.done(), "forwarding interrupted the original unwind"
+        release.set()
+        result = (await await_owned_task(owner)).result
+        assert forwards == [task]
+        assert isinstance(result.error, asyncio.CancelledError)
+        assert result.cancellation.args == ("original caller stop",)
+        assert task.cancelling() == 1
+    finally:
+        release.set()
+        if not task.done() and not task.cancelling():
+            task.cancel()
+        await await_owned_task(task)
+        await await_owned_task(owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", [False, True])
+async def test_forwarder_failure_preserves_original_owned_error(control):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from tests.utils.original_failure import OriginalFailure
+
+    entered, release, forwarded = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = ExecutionAuthorityError("original work denied") if control else LookupError("original work failed")
+    source = OriginalFailure.capture(original)
+    forwarding_failure = ValueError("original forwarding failure")
+
+    async def operation():
+        entered.set()
+        await release.wait()
+        raise original
+
+    def forward(_task):
+        forwarded.set()
+        raise forwarding_failure
+
+    task = create_owned_task(operation())
+    owner = create_owned_task(await_owned_task(task, cancel_on_caller_cancellation=forward))
+    try:
+        await entered.wait()
+        owner.cancel("original caller stop")
+        await asyncio.wait_for(forwarded.wait(), 1)
+        assert not owner.done()
+        release.set()
+        result = (await await_owned_task(owner)).result
+        source.assert_retained(result.error)
+        if not control:
+            assert result.error is original
+        assert any(str(forwarding_failure) in note for note in result.error.__notes__)
+        assert result.cancellation.args == ("original caller stop",)
+    finally:
+        release.set()
+        await await_owned_task(task)
+        await await_owned_task(owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", [False, True])
+async def test_failed_cancellation_forwarder_still_physically_joins(control):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+    entered, release, forwarded = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    failure = ExecutionAuthorityError("forwarder denied") if control else ValueError("forwarder failed")
+
+    async def operation():
+        entered.set()
+        await release.wait()
+        return "physically settled"
+
+    def forward(_task):
+        forwarded.set()
+        raise failure
+
+    task = create_owned_task(operation())
+    owner = create_owned_task(await_owned_task(task, cancel_on_caller_cancellation=forward))
+    try:
+        await entered.wait()
+        owner.cancel("original caller stop")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not owner.done(), "a failed forwarder abandoned the owned operation"
+        assert forwarded.is_set()
+        release.set()
+        result = (await await_owned_task(owner)).result
+        assert result.error is failure and task.result() == "physically settled"
+        assert result.cancellation.args == ("original caller stop",)
+        if control:
+            with pytest.raises(ExecutionAuthorityError) as caught:
+                raise_owned_outcome(result, operation="forwarding test")
+            assert caught.value is failure
+        else:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                raise_owned_outcome(result, operation="forwarding test")
+            assert caught.value.__cause__ is failure
+    finally:
+        release.set()
+        await await_owned_task(task)
+        await await_owned_task(owner)
 
 
 _TEARDOWN_SCENARIO = """
@@ -313,7 +639,13 @@ async def test_initiated_close_still_records_source_unwind_failure_as_cleanup():
 
     with pytest.raises(RuntimeError, match="close unwind cleanup failed"):
         await owned.aclose()
-    consumer.cancel()
+    # Physical close also joins the original cancellation observer; delivery
+    # of its terminal notification to this reader is a separate scheduling
+    # step. Prove the reader is terminal before testing post-terminal cancel,
+    # rather than racing a genuine caller withdrawal into that native join.
+    done, _ = await asyncio.wait({consumer}, timeout=1)
+    assert done, "original cleanup failure did not reach its terminal reader"
+    assert consumer.cancel() is False
     with pytest.raises(RuntimeError, match="close unwind cleanup failed"):
         await consumer
 

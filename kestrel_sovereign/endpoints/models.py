@@ -16,6 +16,7 @@ import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
 from kestrel_sovereign.api_errors import rate_limited_until
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.llm.provider_policy import (
@@ -912,7 +913,9 @@ async def get_identity(request: Request):
                 )
                 if row:
                     description = row[0]
-            except Exception:
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
                 pass
 
         # Hybrid identity surfacing (Quantum Hardening epic, follow-up to PR #999).
@@ -960,6 +963,8 @@ async def get_identity(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error getting identity: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving identity.")
 
@@ -1007,6 +1012,8 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
             try:
                 rename_outcome = await rename_agent_core(agent, body.name)
             except ValueError as e:
+                if is_execution_control_error(e):
+                    raise
                 raise HTTPException(status_code=422, detail=str(e))
             if rename_outcome.skipped_privacy:
                 # Volatile privacy mode: the name applies to the live session only
@@ -1076,7 +1083,9 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
         # Return updated identity
         try:
             agent_node = await agent.storage.get_node(agent.agent_id)
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             if rename_outcome and rename_outcome.any_written and not rename_outcome.success:
                 agent_node = None
             else:
@@ -1108,6 +1117,8 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error updating identity: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error updating identity.")
 
@@ -1150,7 +1161,7 @@ async def set_avatar(request: Request, file: Optional[UploadFile] = File(None)):
             source_url = url
             # SSRF guard (#1727): reject URLs whose host resolves to a private /
             # loopback / link-local / metadata address before fetching.
-            from kestrel_sovereign.security.ssrf import (
+            from kestrel_sdk.security.outbound import (
                 SSRFError,
                 assert_safe_url,
                 pinned_httpx_async_transport,
@@ -1164,11 +1175,12 @@ async def set_avatar(request: Request, file: Optional[UploadFile] = File(None)):
                 async with httpx.AsyncClient(
                     timeout=30.0,
                     transport=transport,
+                    follow_redirects=False,
                 ) as client:
-                    resp = await client.get(url)
+                    resp = await client.get(validated_url.url)
                     resp.raise_for_status()
                     image_data = resp.content
-            except httpx.HTTPError as e:
+            except (httpx.HTTPError, httpx.InvalidURL, SSRFError) as e:
                 raise HTTPException(status_code=400, detail=f"Failed to download image: {e}")
             if len(image_data) > _AVATAR_MAX_SIZE:
                 raise HTTPException(status_code=400, detail="Downloaded image too large.")
@@ -2403,6 +2415,8 @@ async def get_embedding_models(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error listing embedding models: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error listing embedding models.")
 
@@ -2431,6 +2445,8 @@ async def get_embedding_settings(request: Request):
             try:
                 await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
             except Exception as e:  # pragma: no cover - never fail the GET
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(f"embedding capability reconcile skipped in GET: {e}")
         # Resolve the active route's model/dim through the single #2372 resolver
         # so a cleared pin falls through to corpus-match/catalog rather than
@@ -2451,6 +2467,8 @@ async def get_embedding_settings(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error getting embedding settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error getting embedding settings.")
 
@@ -2525,6 +2543,8 @@ async def _classify_stale_embedding_rows(agent, service=None) -> Optional[Dict[s
             agent_id=getattr(agent, "agent_id", None)
         )
     except Exception as e:  # pragma: no cover - defensive; never crash the GET
+        if is_execution_control_error(e):
+            raise
         logger.debug("stale_rows count failed: %s", e)
         return None
 
@@ -2557,6 +2577,8 @@ async def _drain_preference_persistence(agent) -> None:
         try:
             await drain()
         except Exception as e:  # pragma: no cover - persistence is best-effort
+            if is_execution_control_error(e):
+                raise
             logger.debug(f"preference persistence drain failed: {e}")
 
 
@@ -2613,6 +2635,8 @@ async def set_embedding_settings(request: Request):
             try:
                 await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
             except Exception as e:  # pragma: no cover - never block the setter
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(f"embedding capability reconcile skipped in setter: {e}")
 
         try:
@@ -2622,7 +2646,13 @@ async def set_embedding_settings(request: Request):
             # than silently 404'ing to keyword fallback on the next write.
             await agent.llm_service.aset_embedding_route(route, force=force)
         except ValueError as ve:
+            if is_execution_control_error(ve):
+                raise
             raise HTTPException(status_code=400, detail=str(ve))
+
+        # Observe the route writer's original outcome before a success echo,
+        # just as the per-route model setter observes its persistence writer.
+        await _drain_preference_persistence(agent)
 
         if hasattr(agent.llm_service, "aget_embedding_settings"):
             settings = await agent.llm_service.aget_embedding_settings()
@@ -2634,10 +2664,15 @@ async def set_embedding_settings(request: Request):
         # ``stale_rows`` is absent. Mirror the GET endpoint so the button state
         # is correct immediately after a route change without a second reload.
         await _apply_stale_embedding_counts(settings, agent)
+        # Resolution during the echo can schedule another profile writer.
+        # Observe the complete change, not only its initial route write.
+        await _drain_preference_persistence(agent)
         return {"success": True, **settings}
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error setting embedding route: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting embedding route.")
 
@@ -2712,6 +2747,8 @@ async def set_route_embedding_model(request: Request):
             try:
                 await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
             except Exception as e:  # pragma: no cover - never block the setter
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(
                     f"embedding capability reconcile skipped in model setter: {e}"
                 )
@@ -2722,11 +2759,15 @@ async def set_route_embedding_model(request: Request):
                 route, model, dim, force=force
             )
         except EmbeddingSpaceConflictError as ce:
+            if is_execution_control_error(ce):
+                raise
             # Pinning a model/dim that fragments a VERIFIED shared space is a
             # conflict, not a malformed request (#2440) — refuse at set time
             # instead of storing a phantom pin the space silently overrides.
             raise HTTPException(status_code=409, detail=str(ce))
         except ValueError as ve:
+            if is_execution_control_error(ve):
+                raise
             raise HTTPException(status_code=400, detail=str(ve))
 
         # #2418 — drain the persistence write scheduled by the pin/clear BEFORE
@@ -2756,6 +2797,8 @@ async def set_route_embedding_model(request: Request):
             try:
                 route_service = getter(route)
             except Exception as e:  # pragma: no cover - defensive; fall back to active
+                if is_execution_control_error(e):
+                    raise
                 logger.debug(f"route embedding service build failed for {route}: {e}")
         await _apply_stale_embedding_counts(settings, agent, service=route_service)
         # The echo resolved the route, and a cleared pin leaves it to that
@@ -2767,6 +2810,8 @@ async def set_route_embedding_model(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error setting route embedding model: {e}", exc_info=True)
         raise HTTPException(
             status_code=500, detail="Error setting route embedding model."
@@ -2783,8 +2828,51 @@ _REINDEX_JOBS: Dict[str, Dict] = {}
 _REINDEX_JOBS_MAX = 32
 
 
+def _record_reindex_job_failure(job: Dict, error: BaseException) -> None:
+    """Project an actual terminal receipt without discarding native control."""
+    from kestrel_sovereign.execution_custody import (
+        execution_terminal_error,
+        retained_execution_error,
+    )
+
+    terminal = execution_terminal_error(
+        job.get("_control"), error, retain_originals=True,
+    )
+    job["status"] = "error"
+    if is_execution_control_error(terminal):
+        job["_control"] = retained_execution_error(terminal)
+        job["error"] = type(terminal).__name__
+    else:
+        job["error"] = (
+            "Reindex interrupted"
+            if isinstance(terminal, asyncio.CancelledError)
+            else str(terminal)
+        )
+    job["updated_at"] = time.time()
+
+
+def _observe_reindex_job_owner(job: Dict) -> None:
+    """Observe the original completed Task, even if its body never started."""
+    from kestrel_sovereign._async_ownership import owned_task_error
+
+    owner = job.get("_owner_task")
+    if owner is not None and owner.done() and not job.get("_owner_terminal_observed"):
+        error = owned_task_error(owner)
+        if error is not None:
+            _record_reindex_job_failure(job, error)
+        # A Task's terminal receipt is immutable. Repeated polls must not turn
+        # observation into new business progress timestamps or receipt history.
+        job["_owner_terminal_observed"] = True
+
+
 def _reindex_job_public(job: Dict) -> Dict:
     """The subset of a job record that is safe to return to a client."""
+    _observe_reindex_job_owner(job)
+    control = job.get("_control")
+    if control is not None:
+        from kestrel_sovereign.execution_custody import retained_execution_error
+
+        raise retained_execution_error(control)
     return {
         "job_id": job["job_id"],
         "status": job["status"],
@@ -2908,27 +2996,38 @@ async def _run_reindex_job(job: Dict, reindexer, tables, agent_id) -> None:
             job["stats"][tname] = stats.as_dict()
         _accumulate_reindex_stats(job)
         _finalize_reindex_status(job)
-    except Exception as e:  # pragma: no cover - defensive; surfaced via status
+    except BaseException as e:
+        _record_reindex_job_failure(job, e)
+        if is_execution_control_error(e) or not isinstance(e, Exception):
+            raise
         logger.error("reindex job %s failed: %s", job["job_id"], e, exc_info=True)
-        job["status"] = "error"
-        job["error"] = str(e)
     finally:
         job["updated_at"] = time.time()
 
 
-def _prune_reindex_jobs() -> None:
-    """Bound the registry: drop the oldest finished jobs past the cap."""
-    if len(_REINDEX_JOBS) <= _REINDEX_JOBS_MAX:
+def _prune_reindex_jobs(*, reserve: int = 0) -> None:
+    """Prune only physically finished ordinary jobs, retaining native debt.
+
+    A prospective publisher reserves space before admission. If all retained
+    slots are still running or carry control, it must refuse rather than drop
+    a live owner or the original receipt merely to make the cap appear met.
+    """
+    for job in _REINDEX_JOBS.values():
+        _observe_reindex_job_owner(job)
+    limit = _REINDEX_JOBS_MAX - reserve
+    if len(_REINDEX_JOBS) <= limit:
         return
     finished = sorted(
         (
             j
             for j in _REINDEX_JOBS.values()
             if j["status"] in ("done", "error", "partial")
+            and not is_execution_control_error(j.get("_control"))
+            and (j.get("_owner_task") is None or j["_owner_task"].done())
         ),
         key=lambda j: j["updated_at"],
     )
-    while len(_REINDEX_JOBS) > _REINDEX_JOBS_MAX and finished:
+    while len(_REINDEX_JOBS) > limit and finished:
         _REINDEX_JOBS.pop(finished.pop(0)["job_id"], None)
 
 
@@ -2971,6 +3070,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
                 db, agent_id
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.debug("could not load persisted embedding_route: %s", exc)
             found, route = False, None
 
@@ -3002,6 +3103,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
                 db, agent_id
             )
         except Exception as exc:  # pragma: no cover - defensive
+            if is_execution_control_error(exc):
+                raise
             logger.debug("could not load persisted embedding_model pins: %s", exc)
             overrides = {}
         # Sync runtime overrides to the DB state FIRST (#2423): the DB is the
@@ -3015,6 +3118,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
             try:
                 runtime_overrides = llm_service.get_route_embedding_model_overrides()
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug("could not read runtime embedding_model pins: %s", exc)
                 runtime_overrides = {}
             for stale_route in runtime_overrides:
@@ -3025,6 +3130,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
                         stale_route, None, persist=False
                     )
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "could not clear stale embedding_model pin for %s: %s",
                         stale_route,
@@ -3041,6 +3148,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
                     pin_route, model, spec.get("dim"), persist=False
                 )
             except Exception as exc:  # pragma: no cover - defensive; skip bad pin
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "skipping persisted embedding_model pin for %s: %s",
                     pin_route,
@@ -3060,6 +3169,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
         try:
             await llm_service.reconcile_embedding_capabilities(use_cache=True)
         except Exception as exc:  # pragma: no cover - defensive; keep prior behaviour
+            if is_execution_control_error(exc):
+                raise
             logger.debug("reindex embedding capability reconcile skipped: %s", exc)
 
     # (4) Now apply the persisted route — capability has been re-advertised, so a
@@ -3073,6 +3184,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
         try:
             llm_service.set_embedding_route(route, persist=False)
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -3092,6 +3205,8 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
             if active is not None:
                 await llm_service.resolve_route_embedding_model(active)
         except Exception as exc:  # pragma: no cover - defensive; keep prior behaviour
+            if is_execution_control_error(exc):
+                raise
             logger.debug("reindex active-route embedding resolve skipped: %s", exc)
 
     err, embedding_service, target = cli_embeddings._resolve_target(llm_service)
@@ -3139,7 +3254,9 @@ async def reindex_embeddings(request: Request):
     try:
         try:
             data = await request.json()
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             data = {}
         if not isinstance(data, dict):
             data = {}
@@ -3252,13 +3369,28 @@ async def reindex_embeddings(request: Request):
             "error": None,
             "updated_at": time.time(),
         }
+        # There is no await between this final capacity check and publication,
+        # so concurrent preflights cannot over-admit the bounded native owners.
+        _prune_reindex_jobs(reserve=1)
+        if len(_REINDEX_JOBS) >= _REINDEX_JOBS_MAX:
+            raise HTTPException(status_code=503, detail="Embedding reindex job capacity is full.")
+        publish = getattr(agent, "_track_background_task", None)
+        if not callable(publish):
+            raise HTTPException(status_code=503, detail="Embedding reindex owner is unavailable.")
+        job["_owner_task"] = publish(
+            _run_reindex_job(job, reindexer, tables, agent_id),
+            name=f"embedding-reindex-{job_id}",
+        )
+        job["_owner_task"].add_done_callback(
+            lambda _done: _observe_reindex_job_owner(job)
+        )
         _REINDEX_JOBS[job_id] = job
-        _prune_reindex_jobs()
-        asyncio.create_task(_run_reindex_job(job, reindexer, tables, agent_id))
         return {"dry_run": False, **_reindex_job_public(job)}
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error starting embedding reindex: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error starting embedding reindex.")
 
@@ -3284,6 +3416,8 @@ async def get_reindex_job(job_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error reading reindex job: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error reading reindex job.")
 
@@ -3304,7 +3438,9 @@ async def verify_embedding_space(request: Request):
             raise HTTPException(status_code=503, detail="LLM service not available.")
         try:
             data = await request.json()
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             data = {}
         pin_name = data.get("name") if isinstance(data, dict) else None
 
@@ -3328,6 +3464,8 @@ async def verify_embedding_space(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.error(f"Error verifying embedding space: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error verifying embedding space.")
 

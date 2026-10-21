@@ -45,13 +45,17 @@ API.hasCapability = () => true;
 
 const { getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
 const { wipeAgentChatPane } = await import('../../kestrel_sovereign/static/js/chat.js');
-const { refreshConversationsPane } = await import('../../kestrel_sovereign/static/js/identity.js');
+const { refreshConversationsPane, initTrashToggle } = await import('../../kestrel_sovereign/static/js/identity.js');
 
 for (const id of ['conversations-pane', 'conversations-list', 'chat-container']) {
     const el = document.createElement('div');
     el.id = id;
     document.body.appendChild(el);
 }
+const trashButton = document.createElement('button');
+trashButton.id = 'trash-toggle-btn';
+document.body.appendChild(trashButton);
+initTrashToggle();
 
 function chainSession(sessionId, lastMessageAt) {
     // As the list endpoint serializes a wake-only autonomous session.
@@ -295,3 +299,50 @@ test('a wipe of the pane while an older page is in flight abandons the walk', as
     await settle();
     assert.deepEqual(loads, [], 'the conversation the user cleared away is not reopened');
 });
+
+for (const replacement of ['trash', 'refresh', 'failed-refresh']) {
+    test(`a pending ${replacement} invalidates the old walk before its replacement loads`, async () => {
+        loads.length = 0;
+        requests.length = 0;
+        const releaseOld = holdPage('finch-p2');
+        const originalGet = API.getConversations;
+        const originalTrash = API.listTrash;
+        let releaseReplacement;
+        let rejectReplacement;
+        const pending = new Promise((resolve, reject) => {
+            releaseReplacement = resolve;
+            rejectReplacement = reject;
+        });
+        try {
+            await showAgent('Finch');
+            assert.ok(requests.some(r => r.cursor === 'finch-p2'));
+            if (replacement === 'trash') {
+                API.listTrash = () => pending;
+                trashButton.click();
+                assert.equal(trashButton.dataset.mode, 'trash');
+            } else {
+                API.getConversations = (decrypt, view, cursor = null) => cursor
+                    ? originalGet(decrypt, view, cursor) : pending;
+                refreshConversationsPane();
+            }
+            releaseOld();
+            await settle();
+            assert.deepEqual(loads, [], 'the superseded active-list walk opened during replacement load');
+            if (replacement === 'failed-refresh') rejectReplacement(new Error('offline replacement refused'));
+            else releaseReplacement(replacement === 'trash'
+                ? { messages: [] } : { conversations: [], next_cursor: null });
+            await settle();
+            assert.deepEqual(loads, [], 'a failed or empty replacement resurrected the retired walk');
+        } finally {
+            releaseOld();
+            releaseReplacement({ messages: [], conversations: [], next_cursor: null });
+            await settle();
+            API.getConversations = originalGet;
+            API.listTrash = originalTrash;
+            if (trashButton.dataset.mode === 'trash') {
+                trashButton.click();
+                await settle();
+            }
+        }
+    });
+}

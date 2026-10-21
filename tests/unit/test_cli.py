@@ -831,12 +831,16 @@ class TestCmdTerminateReportsOnlyVerifiedTermination:
         # TEST-NET-1: valid, resolvable, and never assigned to this host.
         assert ProcessManager.is_port_in_use(9998, "192.0.2.1") is False
 
-    def test_an_unresolvable_bind_address_is_not_called_occupied(self):
+    def test_an_unresolvable_bind_address_is_not_called_occupied(self, monkeypatch):
         """A typo is a configuration fault, not another process holding a port.
 
         Claiming occupancy would wedge `terminate` into permanent failure; the bind
         error surfaces at `start`, where it names the address.
         """
+        import socket
+        def unresolvable(*args, **kwargs):
+            raise socket.gaierror(socket.EAI_NONAME, "declared unresolvable bind")
+        monkeypatch.setattr(socket, "getaddrinfo", unresolvable)
         assert ProcessManager.is_port_in_use(
             9999, "not.a.real.host.invalid"
         ) is False

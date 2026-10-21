@@ -36,10 +36,21 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
+)
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+    retained_execution_error,
+)
+from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 
 from . import checks as health_checks
 from .checks import derive_overall_status as _derive_overall_status
@@ -81,6 +92,7 @@ class HealthFeature(Feature):
         self._interval_seconds = DEFAULT_INTERVAL_SECONDS
         self._background_task: Optional[asyncio.Task] = None
         self._health_persist_tasks: set[asyncio.Task] = set()
+        self._health_persist_control: BaseException | None = None
         self._running = False
         self._in_memory_history: List[Dict[str, Any]] = []
         self._start_time = time.monotonic()
@@ -110,39 +122,82 @@ class HealthFeature(Feature):
                 )
                 logger.info("HealthFeature: health_log table ready")
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"HealthFeature: could not create table: {e}")
 
         self._start_background_loop()
 
     async def shutdown(self):
         """Stop the background loop gracefully."""
-        await self._stop_background_loop()
+        errors = [getattr(self, "_health_persist_control", None)]
+        # These are structured drains of already-owned Tasks, not new native
+        # operations. The original caller must not need another observer Task
+        # admitted before it can stop or join its existing resources.
+        try:
+            await self._stop_background_loop()
+        except BaseException as error:
+            errors.append(error)
 
-        # A timed-out health persistence wait remains live so it cannot install
-        # a global SQLite cancellation fence. Teardown still owns that work:
-        # cancel and reap it before the feature/database lifecycle continues.
+        # Stop future ticks first, then join finite writes without forwarding
+        # cancellation into native COMMIT. Feature disable leaves the agent
+        # live; interrupting an accepted acknowledgement would manufacture
+        # unknown commit authority on that shared runtime. Caller cancellation
+        # is propagated only after the original write physically settles.
         pending_persists = [
-            task
-            for task in getattr(self, "_health_persist_tasks", set())
-            if not task.done()
+            task for task in getattr(self, "_health_persist_tasks", set())
         ]
         for task in pending_persists:
-            task.cancel()
-        if pending_persists:
-            await asyncio.gather(*pending_persists, return_exceptions=True)
+            outcome = await await_owned_task(task)
+            self._harvest_health_persistence(task, observation_error=outcome.error)
+            if is_execution_control_error(outcome.error):
+                errors.append(outcome.error)
+            errors.append(outcome.cancellation)
         self._health_persist_tasks = set()
-        await super().shutdown()
+        try:
+            await super().shutdown()
+        except BaseException as error:
+            errors.append(error)
+        errors.append(getattr(self, "_health_persist_control", None))
         logger.info("HealthFeature: background loop stopped")
+        terminal = execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
+        if terminal is not None:
+            raise terminal
+
+    def _harvest_health_persistence(self, task: asyncio.Task, *, observation_error=None) -> None:
+        error = owned_task_error(task)
+        if not task.cancelled():
+            task.exception()
+        if is_execution_control_error(observation_error):
+            self._health_persist_control = execution_terminal_error(
+                getattr(self, "_health_persist_control", None), observation_error,
+            )
+        if error is not None and is_execution_control_error(error):
+            self._health_persist_control = execution_terminal_error(
+                getattr(self, "_health_persist_control", None), error
+            )
+        elif error is not None and not isinstance(error, asyncio.CancelledError):
+            logger.warning("HealthFeature: failed to persist: %s", error)
+        self._health_persist_tasks.discard(task)
 
     async def _stop_background_loop(self) -> None:
         """Stop only the periodic loop, leaving finite persistence owned."""
         self._running = False
-        if self._background_task and not self._background_task.done():
-            self._background_task.cancel()
-            try:
-                await self._background_task
-            except asyncio.CancelledError:
-                pass
+        task = self._background_task
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            outcome = await await_owned_task(task)
+            self._harvest_health_persistence(task, observation_error=outcome.error)
+            terminal = execution_terminal_error(
+                getattr(self, "_health_persist_control", None),
+                outcome.error if is_execution_control_error(outcome.error) else None,
+                outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            self._background_task = None
+            if terminal is not None:
+                raise terminal
         self._background_task = None
 
     # =========================================================================
@@ -212,9 +267,7 @@ class HealthFeature(Feature):
         try:
             limit_val = int(limit)
         except (TypeError, ValueError):
-            return ToolResult.failed(
-                f"limit must be an integer, got {limit!r}"
-            )
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
         if limit_val < 1:
             return ToolResult.failed("limit must be >= 1")
 
@@ -243,9 +296,7 @@ class HealthFeature(Feature):
         try:
             seconds_val = int(seconds)
         except (TypeError, ValueError):
-            return ToolResult.failed(
-                f"seconds must be an integer, got {seconds!r}"
-            )
+            return ToolResult.failed(f"seconds must be an integer, got {seconds!r}")
 
         # _apply_interval silently clamps to [10, 3600]. Honesty: if
         # the request was outside the range, surface as PARTIAL with
@@ -359,16 +410,12 @@ class HealthFeature(Feature):
         if self._db:
             try:
                 table_exists = self._db.table_exists
-                if callable(
-                    getattr(type(self._db), "table_exists_diagnostic", None)
-                ):
+                if callable(getattr(type(self._db), "table_exists_diagnostic", None)):
                     table_exists = self._db.table_exists_diagnostic
                 exists = await table_exists("health_log")
                 if exists:
                     fetchall = self._db.fetchall
-                    if callable(
-                        getattr(type(self._db), "fetchall_diagnostic", None)
-                    ):
+                    if callable(getattr(type(self._db), "fetchall_diagnostic", None)):
                         fetchall = self._db.fetchall_diagnostic
                     rows = await fetchall(
                         """
@@ -395,6 +442,8 @@ class HealthFeature(Feature):
                             }
                         )
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(f"HealthFeature: history query failed: {e}")
 
         if not history:
@@ -443,6 +492,8 @@ class HealthFeature(Feature):
 
     async def _run_health(self) -> Dict[str, Any]:
         """Execute all liveness checks and persist the result to health_log."""
+        if getattr(self, "_health_persist_control", None) is not None:
+            raise self._health_persist_control
         check_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
@@ -471,42 +522,46 @@ class HealthFeature(Feature):
         if pending_persists is None:
             pending_persists = set()
             self._health_persist_tasks = pending_persists
-        pending_persists.difference_update(
-            {task for task in pending_persists if task.done()}
-        )
+        for task in list(pending_persists):
+            if task.done():
+                self._harvest_health_persistence(task)
+        if getattr(self, "_health_persist_control", None) is not None:
+            raise self._health_persist_control
         if self._db and not database_failed and not pending_persists:
             # Use the running loop directly: tests and embedders may replace
             # ``asyncio.create_task`` specifically to suppress the long-lived
             # health loop, but this finite persistence task must remain real.
-            persist_task = asyncio.get_running_loop().create_task(
-                self._db.execute(
-                    """
+            async def persist():
+                try:
+                    return await self._db.execute(
+                        """
                     INSERT INTO health_log
                     (id, agent_id, status, checks_json, overall_healthy, created_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        check_id,
-                        self._agent_id,
-                        overall_status,
-                        json.dumps(checks),
-                        1 if overall_healthy else 0,
-                        now,
-                    ),
-                ),
+                        (
+                            check_id,
+                            self._agent_id,
+                            overall_status,
+                            json.dumps(checks),
+                            1 if overall_healthy else 0,
+                            now,
+                        ),
+                    )
+                except BaseException as error:
+                    asyncio.current_task()._kestrel_owned_terminal_error = (
+                        retained_execution_error(error)
+                    )
+                    raise
+
+            persist_task = create_owned_task(
+                persist(),
                 name=f"health-log-persist:{self._agent_id}",
+                loop=asyncio.get_running_loop(),
             )
             pending_persists.add(persist_task)
 
-            def _persist_done(task: asyncio.Task) -> None:
-                pending_persists.discard(task)
-                if task.cancelled():
-                    return
-                error = task.exception()
-                if error is not None:
-                    logger.warning("HealthFeature: failed to persist: %s", error)
-
-            persist_task.add_done_callback(_persist_done)
+            persist_task.add_done_callback(self._harvest_health_persistence)
             # The liveness call has a bounded wait, but expiry must not cancel a
             # shared-connection write. A cancelled aiosqlite operation installs
             # a backend-wide rollback fence. ``asyncio.wait`` returns with the
@@ -521,6 +576,10 @@ class HealthFeature(Feature):
                     "HealthFeature: persistence still pending after %g seconds",
                     health_checks.DATABASE_HEALTH_CHECK_TIMEOUT_S,
                 )
+            else:
+                self._harvest_health_persistence(persist_task)
+                if getattr(self, "_health_persist_control", None) is not None:
+                    raise self._health_persist_control
         elif self._db and not database_failed:
             logger.warning(
                 "HealthFeature: skipping persistence while a prior health-log "
@@ -538,9 +597,26 @@ class HealthFeature(Feature):
     # =========================================================================
 
     def _start_background_loop(self) -> None:
-        """Start the background loop via ``asyncio.create_task()``."""
+        """Publish a resident service under the original runtime generation."""
         self._running = True
-        self._background_task = asyncio.create_task(self._background_loop())
+
+        async def run():
+            try:
+                await self._background_loop()
+            except BaseException as error:
+                # Capture cause-bearing cancellation before Task normalizes it.
+                task = asyncio.current_task()
+                if task is not None:
+                    task._kestrel_owned_first_error = retained_execution_error(error)
+                raise
+
+        if callable(getattr(type(self.agent), "_track_runtime_task", None)):
+            self._background_task = self.agent._track_runtime_task(
+                run(), name=f"health-worker:{self._agent_id}"
+            )
+        else:
+            self._background_task = asyncio.create_task(run())
+        self._background_task.add_done_callback(self._harvest_health_persistence)
         logger.info(
             f"HealthFeature: background loop started "
             f"(interval={self._interval_seconds}s)"
@@ -557,9 +633,13 @@ class HealthFeature(Feature):
             try:
                 result = await self._run_health()
                 logger.info(f"HealthFeature: tick status={result['status']}")
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                if is_execution_control_error(error):
+                    raise
                 break
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"HealthFeature: tick error: {e}", exc_info=True)
 
             try:

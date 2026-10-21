@@ -854,10 +854,7 @@ async def test_stopping_releases_the_record_once_every_owner_is_truthful(
 async def test_a_rollback_releases_the_record_once_every_owner_is_truthful(
     tmp_path, monkeypatch
 ):
-    """The rollback releases what boot opened. The LLM service has no
-    rollback step: stopping the agent after its failed boot closes it, and
-    only then does the record go.
-    """
+    """Rollback joins LLM owners before storage; trusted releases end custody."""
     _trust(monkeypatch, _BOOT_OWNERS)
     agent = _make_agent(tmp_path)
     try:
@@ -866,9 +863,9 @@ async def test_a_rollback_releases_the_record_once_every_owner_is_truthful(
                 with pytest.raises(RuntimeError, match="every resource"):
                     await agent.initialize()
 
-            assert agent._resource_custody().held == ("llm_service",)
-            assert "serving record" in agent._boot_context.retained_resources
-            _assert_guards_report_this_process(tmp_path)
+            assert agent._resource_custody().held == ()
+            assert "serving record" not in agent._boot_context.retained_resources
+            assert _guard_holder(tmp_path) is None
 
             await _stop(agent)
 
@@ -910,8 +907,9 @@ async def test_one_unconverted_owner_keeps_the_record_through_a_rollback(
                 with pytest.raises(RuntimeError, match="every resource"):
                     await agent.initialize()
 
-            # The LLM service has no rollback step; stopping the agent closes it.
-            assert _owners_held(agent) == {owner, "llm_service"}
+            # LLM now has a native-joined rollback step too. The audit still
+            # retains whichever owner has not been certified truthful.
+            assert _owners_held(agent) == {owner}
             assert "serving record" in agent._boot_context.retained_resources
             _assert_guards_report_this_process(tmp_path)
 
@@ -1004,8 +1002,8 @@ async def test_a_failed_task_manager_rollback_keeps_the_manager_for_shutdown(
                 store = manager.session_service.backend
                 assert store.is_connected, "the store did not close"
 
-            # The LLM service has no rollback step; stopping the agent closes it.
-            assert _owners_held(agent) == {"task_manager", "llm_service"}
+            # Independent native LLM rollback has already joined its owners.
+            assert _owners_held(agent) == {"task_manager"}
             assert "serving record" in agent._boot_context.retained_resources
             _assert_guards_report_this_process(tmp_path)
 
@@ -1064,7 +1062,7 @@ async def test_a_truthful_owner_whose_close_reports_retained_keeps_the_record(
                 with patch.object(agent, PHASE_METHODS[-1], _fail_last_phase):
                     with pytest.raises(RuntimeError, match="every resource"):
                         await agent.initialize()
-                assert _owners_held(agent) == {owner, "llm_service"}
+                assert _owners_held(agent) == {owner}
             else:
                 await agent.initialize()
                 _RELEASE_STEPS[owner](mocks).return_value = retained
@@ -1301,7 +1299,6 @@ async def test_a_failing_feature_rollback_keeps_the_record_and_not_its_neighbour
                     await agent.initialize()
 
             assert agent._resource_custody().held == (
-                "llm_service",
                 f"feature:{failing_cls.__name__}",
             )
             assert "features" in agent._boot_context.retained_resources
@@ -1396,11 +1393,13 @@ async def test_a_feature_whose_registration_cleanup_fails_is_retried(
             if failed_teardowns == 1:
                 assert _unreleased(agent) == []
                 assert resource not in agent._resource_custody().held
+                assert agent._resource_custody().held == ()
+                assert _guard_holder(tmp_path) is None
             else:
                 assert _unreleased(agent) == [failing]
                 assert resource in agent._resource_custody().held
                 assert "features" in agent._boot_context.retained_resources
-            _assert_guards_report_this_process(tmp_path)
+                _assert_guards_report_this_process(tmp_path)
 
             await _stop(agent)
 
@@ -2027,6 +2026,7 @@ async def test_boot_rollback_stops_owner_registered_at_sqlite_commit_cancellatio
     the real boot rollback seam (rather than only dispatcher shutdown) to
     prove an ambiguous registration cannot leave a live runtime owner behind.
     """
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
     from kestrel_sovereign.signals import (
         OrderedLockManager,
         SignalDispatcher,
@@ -2073,8 +2073,10 @@ async def test_boot_rollback_stops_owner_registered_at_sqlite_commit_cancellatio
     try:
         connection.commit = cancel_after_committed_owner_registration
         dispatcher._durable_store.register_runtime_owner = register_with_armed_commit
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(ExecutionCommitOutcomeError) as receipt:
             await dispatcher.initialize_durable_delivery()
+        assert receipt.value.commit_outcome == "unknown"
+        assert isinstance(receipt.value.__cause__, asyncio.CancelledError)
 
         assert dispatcher._durable_initialized is False
         assert dispatcher._durable_runtime_owner_registered is False
@@ -2558,6 +2560,7 @@ async def test_storage_phase_uses_shared_postgres_pool(tmp_path, shared_advisory
                 None if shared_advisory else "postgresql://scheduler-test/kestrel"
             ),
             advisory_backend=host_advisory_backend,
+            execution_custody=None,
         )
         _, kwargs = MockStorage.call_args
         assert kwargs.get("backend") is pg_backend

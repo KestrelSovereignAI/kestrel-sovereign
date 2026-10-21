@@ -1,0 +1,3 @@
+# Preserve reviewed byte-pinned admission profiles on every checkout.
+seccomp.json text eol=lf
+host-config.json text eol=lf

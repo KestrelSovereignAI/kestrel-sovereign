@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from .bm25_index import AsyncBM25Index, BM25_AVAILABLE
 from .embedding_column import (
     decode_stored_embedding,
@@ -61,6 +62,8 @@ def _get_embedding_service(llm_service: Optional[Any] = None):
 
         return get_provider_embedding_service(llm_service)
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         logger.warning(f"Embedding service not available: {e}")
         return None
 
@@ -192,6 +195,8 @@ class AsyncRAGStore:
                 try:
                     batch = await embedding_service.aembed_batch(chunks)
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     # Logged with the stored-without-embedding count below.
                     unembedded_reason = f"the embedding call failed: {e}"
                 else:
@@ -252,6 +257,8 @@ class AsyncRAGStore:
                 try:
                     profile_id = embedding_service.current_profile_id()
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "current_profile_id() failed for RAG chunk batch: %s",
                         exc,
@@ -263,6 +270,8 @@ class AsyncRAGStore:
                         self.db, embedding_service, profile_id,
                     )
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "RAG profile registry upsert failed (non-fatal): %s",
                         exc,
@@ -471,6 +480,8 @@ class AsyncRAGStore:
                     )
             return
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             # Partial-migration shape (only one of the two new columns
             # present). Try each column independently so the row gets
             # the maximum amount of metadata its DB supports. (Codex
@@ -500,6 +511,8 @@ class AsyncRAGStore:
                         (_serialize_embedding(embedding), chunk_id),
                     )
         except Exception as e2:
+            if is_execution_control_error(e2):
+                raise
             logger.warning(
                 "document_chunks.embedding_vec write failed for chunk "
                 "%s: %s. The chunk has no stored vector until it is "
@@ -517,6 +530,8 @@ class AsyncRAGStore:
                         (profile_id, chunk_id),
                     )
             except Exception as e3:
+                if is_execution_control_error(e3):
+                    raise
                 logger.debug(
                     "document_chunks.embedding_profile_id write failed "
                     "for chunk %s: %s (column likely missing — #1477 "
@@ -600,6 +615,8 @@ class AsyncRAGStore:
             if not query_embedding:
                 return []
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to embed query: {e}")
             return []
 
@@ -645,6 +662,8 @@ class AsyncRAGStore:
             self._sqla_factory = make_session_factory(self.db)
             return self._sqla_factory
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.info(
                 "SQLAlchemy session factory unavailable for document_chunks "
                 "vector search (%s); falling back to in-Python search.",
@@ -690,6 +709,8 @@ class AsyncRAGStore:
                         embedding_service_for_profile.current_profile_id()
                     )
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "current_profile_id() failed at RAG read time: %s",
                         exc,
@@ -700,6 +721,8 @@ class AsyncRAGStore:
             backend = get_vector_backend(session_factory, spec)
             top_k = await backend.knn(packed, k=limit, filter=filter_kwargs)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "Vector-backend RAG search failed (%s); falling back to "
                 "in-Python legacy path.", e,
@@ -776,6 +799,8 @@ class AsyncRAGStore:
                         embedding_service_for_profile.current_profile_id()
                     )
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "current_profile_id() failed in legacy RAG "
                         "search: %s", exc,
@@ -795,6 +820,8 @@ class AsyncRAGStore:
                         owner_params + (current_profile_id,),
                     )
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     # Profile column doesn't exist yet (#1477 migration
                     # hasn't run on this DB). Retry without the filter.
                     logger.debug(
@@ -826,6 +853,8 @@ class AsyncRAGStore:
             scored.sort(key=lambda x: x['score'], reverse=True)
             return scored[:limit]
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Embedding search failed: {e}")
             return []
 
@@ -863,6 +892,8 @@ class AsyncRAGStore:
                         embedding_service_for_profile.current_profile_id()
                     )
                 except Exception as exc:  # pragma: no cover - defensive
+                    if is_execution_control_error(exc):
+                        raise
                     logger.debug(
                         "current_profile_id() failed in BM25: %s", exc,
                     )
@@ -909,6 +940,8 @@ class AsyncRAGStore:
                         "LIMIT 1", (),
                     )
                 except Exception as exc:
+                    if is_execution_control_error(exc):
+                        raise
                     column_present = False
                     logger.debug(
                         "BM25 profile filter unavailable (column missing): "
@@ -943,6 +976,8 @@ class AsyncRAGStore:
                             )
                         looked_up.update(row[0] for row in profile_rows)
                     except Exception as exc:
+                        if is_execution_control_error(exc):
+                            raise
                         logger.warning(
                             "BM25 ownership/profile lookup batch %d-%d failed "
                             "(%s); dropping those candidates.",
@@ -971,6 +1006,8 @@ class AsyncRAGStore:
             ]
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"BM25 search failed: {e}")
             return []
 
@@ -1030,6 +1067,8 @@ class AsyncRAGStore:
                     embedding_service_for_profile.current_profile_id()
                 )
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "current_profile_id() failed in LIKE search: %s", exc,
                 )
@@ -1055,6 +1094,8 @@ class AsyncRAGStore:
                 owner_params + like_params + profile_params + (limit,),
             )
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             # Pre-migration DB → retry unfiltered.
             logger.debug(
                 "RAG LIKE search with profile filter failed (%s); "
@@ -1219,5 +1260,7 @@ class AsyncRAGStore:
             return results
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Case law search failed: {e}")
             return []

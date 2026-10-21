@@ -97,8 +97,9 @@ class _Agent:
         """Mirror the production agent seam used by durable persistence."""
         return self._durable_persistence_gate
 
-    def _track_background_task(self, coro, *, name: str):
-        task = asyncio.create_task(coro, name=name)
+    def _track_background_task(self, coro, *, name: str, admission=None):
+        from kestrel_sovereign._async_ownership import create_owned_task
+        task = create_owned_task(coro, name=name, admission=admission)
         self.tasks.append(task)
         return task
 
@@ -3927,6 +3928,15 @@ async def test_renewal_loss_cancels_cognition_before_a_second_executor_retries(t
         await asyncio.wait_for(first_cancelled.wait(), timeout=1)
         assert (await dispatcher_a.list_durable_deliveries())[0].status == RETRY
 
+        # RETRY keeps the live original owner's receipt capability. A sibling
+        # must not race a still-unobserved release ACK; transfer is safe only
+        # after that owner has joined settlement and retired (or becomes stale).
+        assert await dispatcher_b.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id, event_id=first.signal_id,
+            executor_id=dispatcher_b._durable_delivery_owner,
+        ) is None
+        await dispatcher_a.shutdown_durable_delivery()
+
         retry = await dispatcher_b.enqueue_durable_cognition(
             _channel_signal(agent_b.did, "renewal-loss"),
             source_event_id="telegram:update:renewal-loss",
@@ -4034,6 +4044,12 @@ async def test_renewal_loss_quarantines_cancellation_resistant_cognition_until_i
         await asyncio.wait_for(exact_release_finished.wait(), timeout=1)
         assert dispatcher_a.retained_durable_cognition_task_count == 0
         assert (await dispatcher_a.list_durable_deliveries())[0].status == RETRY
+
+        assert await dispatcher_b.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id, event_id=first.signal_id,
+            executor_id=dispatcher_b._durable_delivery_owner,
+        ) is None
+        await dispatcher_a.shutdown_durable_delivery()
 
         retry = await dispatcher_b.enqueue_durable_cognition(
             _channel_signal(agent_b.did, "cancellation-resistant"),
@@ -5464,6 +5480,7 @@ async def test_real_sqlite_commit_boundary_repairs_ambiguous_persistence_outcome
     owner/token capability instead of trusting that callback as proof of a
     rollback.
     """
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
     from kestrel_sovereign.privacy import get_privacy_preset
 
     backend, agent, dispatcher = await _dispatcher(
@@ -5507,7 +5524,7 @@ async def test_real_sqlite_commit_boundary_repairs_ambiguous_persistence_outcome
             if failure_kind == "cancelled"
             else _PostCommitAbort
         )
-        with pytest.raises(expected):
+        with pytest.raises(ExecutionCommitOutcomeError) as receipt:
             await dispatcher.dispatch_signal(
                 _signal(
                     agent_id=agent.did,
@@ -5515,6 +5532,8 @@ async def test_real_sqlite_commit_boundary_repairs_ambiguous_persistence_outcome
                 ),
                 source_event_id=f"sqlite-commit-boundary-{failure_kind}",
             )
+        assert receipt.value.commit_outcome == "unknown"
+        assert isinstance(receipt.value.__cause__, expected)
 
         # The repair is awaited before the original error/cancellation escapes:
         # no raw sidecar and no initial reservation can outlive this boundary.

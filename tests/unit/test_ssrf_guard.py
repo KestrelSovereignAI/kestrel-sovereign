@@ -1,235 +1,171 @@
-"""SSRF guard (#1727): block server-side fetches to non-public addresses."""
+"""DID and stdlib HTTPS callers use the shared SDK outbound policy."""
 from __future__ import annotations
 
-import pytest
-
-from kestrel_sovereign.security.ssrf import (
-    SSRFError,
-    ValidatedOutboundURL,
-    validate_outbound_url,
-    _address_is_blocked,
-    _PinnedAsyncNetworkBackend,
-    _PinnedHTTPSConnection,
-)
 import ipaddress
+from http.client import RemoteDisconnected
+import socket
+import ssl
+import pytest
+from unittest.mock import MagicMock
+from urllib.error import URLError
+
+from kestrel_sdk.security.outbound import SSRFError, ValidatedOutboundURL
+from kestrel_sovereign.security.pinned_urllib import _PinnedHTTPSConnection
 
 
-class TestAddressClassification:
-    @pytest.mark.parametrize("addr", [
-        "127.0.0.1", "::1",            # loopback
-        "169.254.169.254",            # cloud metadata (link-local)
-        "10.0.0.5", "192.168.1.1", "172.16.0.1",  # RFC1918
-        "0.0.0.0",                    # unspecified
-        "fd00::1",                    # IPv6 ULA (private)
-        "::ffff:169.254.169.254",     # IPv4-mapped metadata
-    ])
-    def test_blocked_addresses(self, addr):
-        assert _address_is_blocked(ipaddress.ip_address(addr)) is True
-
-    @pytest.mark.parametrize("addr", ["8.8.8.8", "1.1.1.1", "93.184.216.34"])
-    def test_public_addresses_allowed(self, addr):
-        assert _address_is_blocked(ipaddress.ip_address(addr)) is False
-
-
-class TestValidateOutboundUrl:
-    def test_literal_metadata_ip_rejected(self):
-        with pytest.raises(SSRFError):
-            validate_outbound_url("http://169.254.169.254/latest/meta-data/")
-
-    def test_literal_loopback_rejected(self):
-        with pytest.raises(SSRFError):
-            validate_outbound_url("http://127.0.0.1:8888/api/auth/key")
-
-    def test_literal_private_rejected(self):
-        with pytest.raises(SSRFError):
-            validate_outbound_url("https://10.1.2.3/internal")
-
-    def test_public_literal_ip_allowed(self):
-        validate_outbound_url("https://8.8.8.8/")  # no raise
-
-    def test_disallowed_scheme_rejected(self):
-        with pytest.raises(SSRFError):
-            validate_outbound_url("file:///etc/passwd")
-        with pytest.raises(SSRFError):
-            validate_outbound_url("gopher://127.0.0.1/")
-
-    def test_https_only_for_didweb(self):
-        with pytest.raises(SSRFError):
-            validate_outbound_url("http://example.com/x", allowed_schemes=("https",))
-
-    def test_missing_host_rejected(self):
-        with pytest.raises(SSRFError):
-            validate_outbound_url("https:///nohost")
-
-    def test_localhost_hostname_rejected(self):
-        # Resolves to loopback → blocked.
-        with pytest.raises(SSRFError):
-            validate_outbound_url("http://localhost:9999/")
-
-    @pytest.mark.parametrize("bad", [
-        "http://example.com:abc",       # non-numeric port
-        "http://[not-an-ipv6/",         # malformed IPv6 literal
-    ])
-    def test_malformed_url_raises_ssrferror_not_valueerror(self, bad):
-        # #1727 codex r1: malformed input must surface as SSRFError (→ 400),
-        # never an uncaught ValueError (→ 500).
-        with pytest.raises(SSRFError):
-            validate_outbound_url(bad)
-
-    def test_validation_returns_pinned_public_ip(self, monkeypatch):
-        def fake_getaddrinfo(host, port, proto=0):
-            assert host == "assets.example"
-            assert port == 443
-            return [
-                (None, None, None, None, ("2001:4860:4860::8888", port)),
-                (None, None, None, None, ("93.184.216.34", port)),
-            ]
-
-        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
-        validated = validate_outbound_url("https://assets.example/avatar.png")
-
-        assert validated.host == "assets.example"
-        assert validated.port == 443
-        assert [str(ip) for ip in validated.ip_addresses] == [
-            "2001:4860:4860::8888",
-            "93.184.216.34",
-        ]
-        assert str(validated.ip_address) == "2001:4860:4860::8888"
-
-    def test_validation_rejects_mixed_public_private_dns_before_connect(
-        self,
-        monkeypatch,
-    ):
-        calls = []
-
-        def fake_getaddrinfo(host, port, proto=0):
-            return [
-                (None, None, None, None, ("93.184.216.34", port)),
-                (None, None, None, None, ("127.0.0.1", port)),
-            ]
-
-        async def fake_connect_tcp(self, host, port, **kwargs):
-            calls.append((host, port))
-            return object()
-
-        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
-        monkeypatch.setattr(
-            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
-            fake_connect_tcp,
+class TestPinnedUrllibConnections:
+    def test_certificate_failure_does_not_retry_a_second_address(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")),
         )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=10)
+        first, second = MagicMock(spec=socket.socket), MagicMock(spec=socket.socket)
+        conn._create_connection = MagicMock(side_effect=[first, second])
+        conn._context = MagicMock()
+        conn._context.wrap_socket.side_effect = [ssl.SSLCertVerificationError("bad certificate"), second]
+        with pytest.raises(ssl.SSLCertVerificationError, match="certificate"):
+            conn.connect()
+        conn._create_connection.assert_called_once()
+        first.close.assert_called_once()
+        second.close.assert_not_called()
+        assert conn.sock is None
 
-        with pytest.raises(SSRFError):
-            validate_outbound_url("https://mixed.example/avatar.png")
-
-        assert calls == []
-
-
-class TestPinnedConnections:
-    @pytest.mark.asyncio
-    async def test_httpx_backend_dials_pinned_ip_not_hostname(self, monkeypatch):
-        calls = []
-
-        async def fake_connect_tcp(
-            self,
-            host,
-            port,
-            timeout=None,
-            local_address=None,
-            socket_options=None,
-        ):
-            calls.append((host, port))
-            return object()
-
-        monkeypatch.setattr(
-            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
-            fake_connect_tcp,
+    def test_all_addresses_share_one_connection_deadline(self, monkeypatch):
+        clock = [0.0]
+        monkeypatch.setattr("time.monotonic", lambda: clock[0])
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")),
         )
-        validated = validate_outbound_url("https://93.184.216.34/avatar.png")
-        backend = _PinnedAsyncNetworkBackend(validated)
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=0.5)
+        dials = []
 
-        await backend.connect_tcp(validated.host, validated.port)
+        def stalled(address, timeout, source_address):
+            dials.append((address, timeout))
+            clock[0] += timeout
+            raise TimeoutError("address stalled")
 
-        assert calls == [("93.184.216.34", 443)]
+        conn._create_connection = stalled
+        with pytest.raises(TimeoutError) as error:
+            conn.connect()
+        assert len(dials) == 1
+        assert "deadline" in str(error.value)
+        assert conn.sock is None
 
-    @pytest.mark.asyncio
-    async def test_httpx_backend_accepts_punycode_connect_host_for_validated_idn(
-        self,
-        monkeypatch,
-    ):
-        calls = []
-
-        def fake_getaddrinfo(host, port, proto=0):
-            assert host == "bücher.example"
-            return [
-                (None, None, None, None, ("93.184.216.34", port)),
-            ]
-
-        async def fake_connect_tcp(
-            self,
-            host,
-            port,
-            timeout=None,
-            local_address=None,
-            socket_options=None,
-        ):
-            calls.append((host, port))
-            return object()
-
-        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
-        monkeypatch.setattr(
-            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
-            fake_connect_tcp,
+    def test_tls_uses_remaining_budget_then_restores_the_read_timeout(self, monkeypatch):
+        clock = [0.0]
+        monkeypatch.setattr("time.monotonic", lambda: clock[0])
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"),),
         )
-        validated = validate_outbound_url("https://bücher.example/avatar.png")
-        backend = _PinnedAsyncNetworkBackend(validated)
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=10)
+        raw, wrapped = MagicMock(spec=socket.socket), MagicMock(spec=socket.socket)
 
-        await backend.connect_tcp("xn--bcher-kva.example", validated.port)
+        def dial(address, timeout, source_address):
+            assert timeout == 10
+            clock[0] += 3
+            return raw
 
-        assert validated.host == "bücher.example"
-        assert str(validated.ip_address) == "93.184.216.34"
-        assert calls == [("93.184.216.34", 443)]
+        def tls(sock, server_hostname):
+            assert sock is raw and server_hostname == validated.host
+            raw.settimeout.assert_called_once_with(7)
+            clock[0] += 2
+            return wrapped
 
-    @pytest.mark.asyncio
-    async def test_httpx_backend_falls_back_to_second_validated_ip(
-        self,
-        monkeypatch,
-    ):
-        calls = []
+        conn._create_connection = dial
+        conn._context = MagicMock()
+        conn._context.wrap_socket.side_effect = tls
+        conn.connect()
+        assert conn.sock is wrapped
+        wrapped.settimeout.assert_called_once_with(10)
+        raw.close.assert_not_called()
+        wrapped.close.assert_not_called()
 
-        def fake_getaddrinfo(host, port, proto=0):
-            assert host == "dualstack.example"
-            return [
-                (None, None, None, None, ("2001:4860:4860::8888", port)),
-                (None, None, None, None, ("93.184.216.34", port)),
-            ]
-
-        async def fake_connect_tcp(
-            self,
-            host,
-            port,
-            timeout=None,
-            local_address=None,
-            socket_options=None,
-        ):
-            calls.append((host, port))
-            if host == "2001:4860:4860::8888":
-                raise OSError("IPv6 route unavailable")
-            return object()
-
-        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
-        monkeypatch.setattr(
-            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
-            fake_connect_tcp,
+    @pytest.mark.parametrize("handshake_elapsed", [10, 10.25])
+    def test_tls_finishing_at_the_deadline_closes_both_unpublished_sockets(self, monkeypatch, handshake_elapsed):
+        clock = [0.0]
+        monkeypatch.setattr("time.monotonic", lambda: clock[0])
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"),),
         )
-        validated = validate_outbound_url("https://dualstack.example/avatar.png")
-        backend = _PinnedAsyncNetworkBackend(validated)
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=10)
+        raw, wrapped = MagicMock(spec=socket.socket), MagicMock(spec=socket.socket)
+        conn._create_connection = MagicMock(return_value=raw)
+        conn._context = MagicMock()
 
-        await backend.connect_tcp(validated.host, validated.port)
+        def handshake(sock, server_hostname):
+            assert sock is raw and server_hostname == validated.host
+            raw.settimeout.assert_called_once_with(10)
+            clock[0] += handshake_elapsed
+            return wrapped
 
-        assert calls == [
-            ("2001:4860:4860::8888", 443),
-            ("93.184.216.34", 443),
-        ]
+        conn._context.wrap_socket.side_effect = handshake
+        with pytest.raises(TimeoutError, match="connection deadline exceeded"):
+            conn.connect()
+        conn._create_connection.assert_called_once()
+        raw.close.assert_called_once()
+        wrapped.close.assert_called_once()
+        wrapped.settimeout.assert_not_called()
+        assert conn.sock is None
+
+    def test_reconnect_cannot_discard_an_existing_socket(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"),),
+        )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated)
+        original = MagicMock(spec=socket.socket)
+        conn.sock = original
+        conn._create_connection = MagicMock(side_effect=AssertionError("reconnect guard allowed a new dial"))
+        with pytest.raises(RuntimeError, match="connected"):
+            conn.connect()
+        conn._create_connection.assert_not_called()
+        original.close.assert_not_called()
+        assert conn.sock is original
+
+    def test_unexpected_tls_error_is_not_retried_and_releases_the_socket(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")),
+        )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated)
+        sock = MagicMock()
+        conn._create_connection = MagicMock(return_value=sock)
+        conn._context = MagicMock()
+        conn._context.wrap_socket.side_effect = [TypeError("invalid TLS configuration"), MagicMock()]
+        with pytest.raises(TypeError, match="invalid TLS configuration"):
+            conn.connect()
+        conn._create_connection.assert_called_once()
+        sock.close.assert_called_once()
+        assert conn.sock is None
+
+    def test_all_tcp_failures_report_the_last_failure_without_tls(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")),
+        )
+        conn = _PinnedHTTPSConnection(validated.host, validated=validated)
+        conn._create_connection = MagicMock(side_effect=[OSError("first unavailable"), OSError("second unavailable")])
+        conn._context = MagicMock()
+        with pytest.raises(OSError, match="second unavailable"):
+            conn.connect()
+        assert conn._create_connection.call_count == 2
+        conn._context.wrap_socket.assert_not_called()
+        assert conn.sock is None
+
+    def test_changed_origin_is_refused_before_socket_creation(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/did.json", scheme="https", host="example.test", port=443,
+            ip_addresses=(ipaddress.ip_address("8.8.8.8"),),
+        )
+        conn = _PinnedHTTPSConnection("other.test", validated=validated)
+        conn._create_connection = MagicMock()
+        with pytest.raises(SSRFError, match="unexpected origin"):
+            conn.connect()
+        conn._create_connection.assert_not_called()
 
     def test_urllib_connection_dials_pinned_ip_with_original_sni(self):
         validated = ValidatedOutboundURL(
@@ -243,13 +179,6 @@ class TestPinnedConnections:
         dialed = []
         wrapped = []
 
-        class FakeSocket:
-            def setsockopt(self, *args):
-                pass
-
-            def close(self):
-                pass
-
         class FakeContext:
             def wrap_socket(self, sock, server_hostname=None):
                 wrapped.append(server_hostname)
@@ -257,7 +186,7 @@ class TestPinnedConnections:
 
         def fake_create_connection(address, timeout, source_address):
             dialed.append(address)
-            return FakeSocket()
+            return MagicMock(spec=socket.socket)
 
         conn._create_connection = fake_create_connection
         conn._context = FakeContext()
@@ -279,13 +208,6 @@ class TestPinnedConnections:
         dialed = []
         wrapped = []
 
-        class FakeSocket:
-            def setsockopt(self, *args):
-                pass
-
-            def close(self):
-                pass
-
         class FakeContext:
             def wrap_socket(self, sock, server_hostname=None):
                 wrapped.append(server_hostname)
@@ -293,7 +215,7 @@ class TestPinnedConnections:
 
         def fake_create_connection(address, timeout, source_address):
             dialed.append(address)
-            return FakeSocket()
+            return MagicMock(spec=socket.socket)
 
         conn._create_connection = fake_create_connection
         conn._context = FakeContext()
@@ -318,13 +240,6 @@ class TestPinnedConnections:
         dialed = []
         wrapped = []
 
-        class FakeSocket:
-            def setsockopt(self, *args):
-                pass
-
-            def close(self):
-                pass
-
         class FakeContext:
             def wrap_socket(self, sock, server_hostname=None):
                 wrapped.append(server_hostname)
@@ -334,7 +249,7 @@ class TestPinnedConnections:
             dialed.append(address)
             if address[0] == "2001:4860:4860::8888":
                 raise OSError("IPv6 route unavailable")
-            return FakeSocket()
+            return MagicMock(spec=socket.socket)
 
         conn._create_connection = fake_create_connection
         conn._context = FakeContext()
@@ -356,18 +271,82 @@ class TestDidWebSSRF:
             _default_fetcher("https://169.254.169.254/.well-known/did.json")
 
     def test_didweb_fetcher_does_not_follow_redirects(self, monkeypatch):
-        """#1727 codex r1: a public DID host that 30x-redirects to a private
-        address must be refused, not followed."""
+        """Drive urllib's real redirect processing with a controlled HTTPS response."""
         from kestrel_sovereign.identity import did_web
-        from urllib.error import HTTPError
+        from email.message import Message
+        from urllib.response import addinfourl
         import io
 
-        def fake_open(self, url, timeout=None):
-            # Simulate a 302 → urllib (no-redirect opener) raising HTTPError.
-            raise HTTPError(url, 302, "Found", {"Location": "https://169.254.169.254/x"}, io.BytesIO(b""))
+        requests = []
 
-        monkeypatch.setattr("urllib.request.OpenerDirector.open", fake_open)
-        # Public LITERAL IP so validate_outbound_url passes WITHOUT real DNS
-        # (keeps the unit test offline-safe); the redirect is what's under test.
+        def https_response(self, request):
+            requests.append(request.full_url)
+            headers = Message()
+            if len(requests) == 1:
+                headers["Location"] = "https://169.254.169.254/x"
+                response = addinfourl(io.BytesIO(b""), headers, request.full_url, 302)
+                response.msg = "Found"
+            else:
+                response = addinfourl(io.BytesIO(b"private metadata"), headers, request.full_url, 200)
+                response.msg = "OK"
+            return response
+
+        def unexpected_socket(*args, **kwargs):
+            pytest.fail("the controlled HTTPS response must not open a socket")
+
+        monkeypatch.setattr("kestrel_sovereign.security.pinned_urllib._PinnedHTTPSHandler.https_open", https_response)
+        monkeypatch.setattr("socket.create_connection", unexpected_socket)
         with pytest.raises(did_web.DidWebError, match="redirect"):
             did_web._default_fetcher("https://93.184.216.34/.well-known/did.json")
+        assert requests == ["https://93.184.216.34/.well-known/did.json"]
+
+
+@pytest.mark.parametrize("failure", [
+    SSRFError("origin changed"),
+    URLError("connection refused"),
+    RemoteDisconnected("peer disconnected"),
+    TimeoutError("body stalled"),
+    ConnectionResetError("body disconnected"),
+])
+def test_did_fetch_network_failures_have_the_resolver_error_type(monkeypatch, failure):
+    from kestrel_sovereign.identity import did_web
+    opener = MagicMock()
+    opener.open.side_effect = failure
+    monkeypatch.setattr("kestrel_sovereign.security.pinned_urllib.pinned_urllib_https_opener", lambda *args: opener)
+    with pytest.raises(did_web.DidWebError, match="failed"):
+        did_web._default_fetcher("https://8.8.8.8/did.json")
+
+
+def test_did_fetch_does_not_hide_programming_errors(monkeypatch):
+    from kestrel_sovereign.identity import did_web
+    opener = MagicMock()
+    opener.open.side_effect = TypeError("invalid TLS configuration")
+    monkeypatch.setattr("kestrel_sovereign.security.pinned_urllib.pinned_urllib_https_opener", lambda *args: opener)
+    with pytest.raises(TypeError, match="configuration"):
+        did_web._default_fetcher("https://8.8.8.8/did.json")
+
+
+def test_pinned_connection_refuses_proxy_tunnels_before_dialing():
+    validated = ValidatedOutboundURL(url="https://8.8.8.8/did.json", scheme="https", host="8.8.8.8", port=443,
+                                     ip_addresses=(ipaddress.ip_address("8.8.8.8"),))
+    conn = _PinnedHTTPSConnection(validated.host, validated=validated, timeout=1)
+    conn.set_tunnel(validated.host)
+    conn._create_connection = MagicMock(side_effect=AssertionError("proxy tunnel guard allowed a dial"))
+    with pytest.raises(SSRFError, match="tunnel"):
+        conn.connect()
+    conn._create_connection.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [302, 404])
+def test_did_http_errors_close_the_response_before_becoming_resolver_errors(monkeypatch, status):
+    import io
+    from urllib.error import HTTPError
+    from kestrel_sovereign.identity import did_web
+
+    body = io.BytesIO(b"remote error body")
+    opener = MagicMock()
+    opener.open.side_effect = HTTPError("https://8.8.8.8/did.json", status, "refused", {}, body)
+    monkeypatch.setattr("kestrel_sovereign.security.pinned_urllib.pinned_urllib_https_opener", lambda *args: opener)
+    with pytest.raises(did_web.DidWebError):
+        did_web._default_fetcher("https://8.8.8.8/did.json")
+    assert body.closed

@@ -207,6 +207,99 @@ class TestSharedModelCache:
         stale_loop.call_soon_threadsafe.assert_not_called()
 
 
+    @pytest.mark.asyncio
+    async def test_refused_background_admission_closes_original_coroutine(self):
+        import inspect
+
+        from tests.unit.test_cleanup_task_admission import _operation_name
+
+        cache = SharedModelCache()
+        cache.set_stale([_make_model("original")])
+        entered = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        factory = loop.get_task_factory()
+        refused = []
+        failures = []
+
+        async def refresh():
+            entered.set()
+
+        def allocate(loop, coroutine, **kwargs):
+            if _operation_name(coroutine).endswith("._deferred_refresh"):
+                original = coroutine.cr_frame.f_locals.get("operation", coroutine)
+                refused.extend((coroutine, original))
+                error = RuntimeError("actual shared refresh Task allocation refused")
+                failures.append(error)
+                raise error
+            return factory(loop, coroutine, **kwargs) if factory else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+        try:
+            loop.set_task_factory(allocate)
+            with pytest.raises(RuntimeError) as caught:
+                cache.refresh_in_background(refresh)
+            assert caught.value is failures[0]
+            assert refused and all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused), (
+                "shared refresh admission left its unstarted original coroutine open"
+            )
+            assert cache._refresh_task is None and not entered.is_set()
+            assert [model.id for model in cache.get_any()] == ["original"]
+            loop.set_task_factory(factory)
+            assert cache.refresh_in_background(refresh)
+            task = cache._refresh_task
+            await task
+            assert entered.is_set()
+        finally:
+            loop.set_task_factory(factory)
+            for coroutine in refused:
+                coroutine.close()
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["refresh", "publish", "restore", "amend"])
+    async def test_cache_work_requires_original_live_runtime_admission(self, entry):
+        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign.execution_custody import (
+            bind_execution_custody, execution_denial_scopes, is_execution_control_error,
+        )
+        from kestrel_sovereign.llm.model_cache import VendorDiscoveryOutcome
+        from tests.integration.test_execution_authority_postgres import GenerationFence
+
+        cache = SharedModelCache()
+        if entry != "restore":
+            cache.set([_make_model("original")])
+        before = cache._snapshot
+        async def refresh():
+            cache.set([_make_model("not-admitted")])
+
+        try:
+            with bind_execution_custody(GenerationFence()) as scope:
+                scope.revoke("actual original cache publisher runtime retired")
+                error = None
+                try:
+                    if entry == "refresh":
+                        cache.refresh_in_background(refresh)
+                    elif entry == "publish":
+                        cache.set([_make_model("not-admitted")])
+                    elif entry == "restore":
+                        cache.set_stale([_make_model("not-admitted")])
+                    else:
+                        cache.record_failures(before.catalog_version, {
+                            "native": VendorDiscoveryOutcome.failed("declared ordinary availability"),
+                        })
+                except BaseException as denied:
+                    error = denied
+                assert error is not None, "model cache admitted work after original runtime retired"
+                assert is_execution_control_error(error) and scope in execution_denial_scopes(error)
+                assert cache._snapshot is before
+                assert cache._refresh_task is None
+        finally:
+            task = cache._refresh_task
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await await_owned_task(task)
+
+
 class TestSharedModelCacheSingleton:
     """Tests for the module-level singleton."""
 

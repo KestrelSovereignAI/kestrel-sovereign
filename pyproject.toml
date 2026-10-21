@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.53.27"
+version = "0.53.36"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -109,9 +109,11 @@ dependencies = [
     # Release cascade: Frinz and the observability fleet must publish/test
     # constraints that admit this line before Core is released. Do not weaken
     # Core's safety floor to make an older downstream resolver succeed.
-    "kestrel-sovereign-sdk[tracing]>=0.39.0,<0.40",
+    "kestrel-sovereign-sdk[httpx,tracing]>=0.39.2,<0.40",
     # Core web framework
-    "fastapi==0.136.3",
+    # Pre-1.0 router internals changed in a minor release. Advance this tested
+    # current line with the native router/CSRF/frontend acceptance checks.
+    "fastapi>=0.143.3,<0.144",
     "uvicorn==0.48.0",
     "pydantic==2.13.4",
     # HTTP clients
@@ -119,14 +121,13 @@ dependencies = [
     # present in the 3.13/3.14.0 lines (#2546).
     "aiohttp>=3.14.1",
     "httpx>=0.27.0",
+    "httpx2>=2.10,<3",
     # >=2.33.0 fixes unsafe .netrc credential handling (#2546).
     "requests>=2.33.0",
     # Cloud LLM providers
-    # >=2.0.0 required for the GA Realtime API surface
-    # (``client.realtime`` replaces the deprecated ``client.beta.realtime``;
-    # see kestrel-voice-openai #16).  Bounded below 3 because we haven't
-    # validated against a hypothetical major bump.
-    "openai>=2.0.0,<3",
+    # Pydantic AI 2's OpenAI integration requires >=3.26. The host lock is
+    # verified with the Phoenix extra and the native MCP feature together.
+    "openai>=3.26.0,<4",
     # google-generativeai reaches httplib2 through google-api-python-client;
     # >=0.32.0 fixes proxy-bypass request smuggling on that core path.
     "httplib2>=0.32.0",
@@ -200,7 +201,7 @@ dependencies = [
     # Misc
     "certifi==2026.5.20",
     "charset-normalizer==3.4.7",
-    "idna==3.16",
+    "idna>=3.20,<4",
     "packaging==26.2",
     # >=2.7.0 fixes cross-origin sensitive-header forwarding on redirect and
     # adds decompression safeguards.
@@ -227,9 +228,9 @@ dependencies = [
     # >=5.9.0 fixes an uncontrolled-recursion DoS on malformed input.
     "cbor2>=5.9.0",
     # LLM provider SDKs (used at runtime via dynamic import)
-    # >=0.77: GA structured outputs (`output_config`), which the Anthropic
-    # adapter uses for every response_format request (#3492).
-    "anthropic>=0.77.0",
+    # SDK 1.x uses httpx2 and the current Messages API. Keep the adapter and
+    # its progress-body hook on this SDK's native transport types.
+    "anthropic>=1,<2",
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
     # Floor at 1.0: 0.x used ml_dsa_65.generate_keypair() and a verify()
@@ -254,6 +255,8 @@ Documentation = "https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/ma
 Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussions"
 
 [project.optional-dependencies]
+# Installed native MCP seam tests remain separate from core-only boot tests.
+mcp-integration = ["kestrel-feature-mcp>=0.7,<1"]
 # Test dependencies (not needed in production)
 test = [
     # >=9.0.3 fixes unsafe temporary-file handling in pytest's debugger.
@@ -299,25 +302,18 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics,tracing]>=0.39.0,<0.40",
+    "kestrel-sovereign-sdk[metrics]",
 ]
 # Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
 # this extra is the ONLY step needed to get traces flowing: on host start the
 # server supervises a local Phoenix subprocess (loopback-only, SQLite storage)
 # and auto-wires OTEL_EXPORTER_OTLP_ENDPOINT to it.
-# Bounds pinned (#2589): a fresh resolve of `arize-phoenix>=11,<20` under
-# sovereign's fastapi pin lands on phoenix 17.7.0, whose unbounded
-# `pydantic-ai-slim>=1.95` dep resolves to pydantic-ai 2.x — which renamed
-# `MCPServerStreamableHTTP` in 2.0 and makes `import phoenix` fail. Capping
-# `pydantic-ai-slim` below 2.0 is the load-bearing fix: arize-phoenix depends on
-# pydantic-ai-slim directly, and that package provides the importable
-# `pydantic_ai` module, so the extra imports cleanly with no operator manifest
-# pins. The meta `pydantic-ai` package is deliberately NOT listed here: it drags
-# in `pydantic-ai-slim[xai]` → `xai-sdk`, which requires `packaging<26` and so is
-# unsatisfiable against this project's `packaging==26.2` pin.
+# Phoenix 20 supports Pydantic AI 2 and MCP 2. Its published requirements
+# own that integration dependency set; core does not maintain a second copy.
+# Upgrade the MCP feature to its native-client release before rolling out this
+# host lock: feature 0.4 requires MCP <2 and cannot coexist with this set.
 phoenix = [
-    "arize-phoenix>=17.7,<18",
-    "pydantic-ai-slim[anthropic,bedrock,google,mcp,openai,ui]>=1.95,<2",
+    "arize-phoenix>=20.23,<21",
 ]
 # Feature: Cloud GPU/serverless deployment (Azure only now)
 # Note: GCP Compute Engine, Vast.ai, and RunPod support are in the
@@ -413,6 +409,7 @@ testpaths = ["tests"]
 norecursedirs = ["scripts", ".venv", "*.egg-info", ".git", "node_modules"]
 addopts = "-x --tb=short"
 markers = [
+    "native_postgres: Resolved native_pg fixture consumers; mandatory isolated PostgreSQL CI lane",
     "e2e: marks tests as end-to-end (slow)",
     "integration: marks tests as integration tests",
     "load: Load/stress tests (opt-in with --run-load)",
@@ -421,6 +418,7 @@ markers = [
     "cloud_resource: Tests that use cloud resources (RunPod, GPU, etc)",
     "docker: Tests that require Docker",
     "docker_mcp: Tests that require Docker MCP Toolkit (excluded in CI)",
+    "mcp_integration: Installed native MCP feature and real governed-dispatch peers",
     "live: Tests that call live external providers when credentials exist",
     "slow: Slow-running tests",
     "bench: Performance benchmarks (the integration tier excludes these in CI; see .github/workflows/ci.yml)",

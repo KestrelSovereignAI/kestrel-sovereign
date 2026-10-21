@@ -10,6 +10,7 @@ import math
 import random
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable, Optional, TypeVar
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, is_execution_control_error
 
 from kestrel_sovereign.llm.generation_gate import first_unfinished_attempt
 from kestrel_sovereign.llm.output_ceiling import INCOMPLETE_ATTEMPT_ATTR
@@ -483,6 +484,7 @@ async def with_retry(
     max_delay: float = MAX_DELAY,
     throttle_max_retries: int = THROTTLE_MAX_RETRIES,
     throttle_max_delay: float = THROTTLE_MAX_DELAY,
+    acquired_result_cleanup: Callable[[Any], Any] | None = None,
     **kwargs
 ) -> T:
     """
@@ -537,8 +539,15 @@ async def with_retry(
 
     while True:
         try:
-            return await func(*args, **kwargs)
+            return await await_execution_work(
+                None, lambda: func(*args, **kwargs),
+                acquired_result_cleanup=acquired_result_cleanup,
+            )
+        except ExecutionAuthorityError:
+            raise
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             if not is_retryable_error(e):
                 raise
 

@@ -53,6 +53,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,6 +61,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, Outcome, ToolResult, WaitStatus
 
+from kestrel_sovereign._async_ownership import owned_task_error
+from kestrel_sovereign.callbacks import invoke_host_callback, require_callback_result
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
 from kestrel_sovereign.signals.dispatcher import (
     SURFACE_QUEUED,
@@ -458,6 +462,10 @@ class WaitReconciler:
         # ``_pending_signal_tasks`` map and both enqueue a wake for the same
         # terminal transition before either records it pending.
         self._reconcile_lock = asyncio.Lock()
+        # One original unresolved terminal for this existing singleton's
+        # lifetime. A later tick cannot classify its pending row as a restart
+        # or treat a newly successful callback as settlement of native control.
+        self._terminal_control: BaseException | None = None
         # Monotonic timestamp of the last reconcile tick's start. The
         # WaitFeature fallback driver reads it (via
         # :meth:`seconds_since_last_reconcile`) to stand down while the cron
@@ -465,6 +473,19 @@ class WaitReconciler:
         self._last_reconcile_monotonic: Optional[float] = None
 
     # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def _live_operation(self):
+        """Serialize admission and delivery in this same original lifetime."""
+        async with self._reconcile_lock:
+            if self._terminal_control is not None:
+                raise self._terminal_control
+            try:
+                yield
+            except BaseException as error:
+                if is_execution_control_error(error):
+                    self._terminal_control = error
+                raise
 
     async def reconcile(self) -> ToolResult:
         """Run one reconcile tick. ACTION — no LLM cost (the COGNITION wake
@@ -476,7 +497,7 @@ class WaitReconciler:
         could otherwise both detect the same terminal handle and enqueue a
         duplicate wake before either recorded it pending.
         """
-        async with self._reconcile_lock:
+        async with self._live_operation():
             self._last_reconcile_monotonic = time.monotonic()
             return await self._reconcile_once()
 
@@ -552,10 +573,15 @@ class WaitReconciler:
             target = state.pending_signaled_target if state else None
 
             try:
+                original_error = owned_task_error(handle_obj.task)
+                if original_error is not None:
+                    raise original_error
                 result = handle_obj.task.result()
                 status_value = result.status.value
                 delivery_error = result.error or None
             except Exception as e:  # task raised
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "wait_reconcile: pending signal task raised for "
                     "%s:%s: %s", kind, handle, e,
@@ -563,8 +589,7 @@ class WaitReconciler:
                 status_value = "dispatcher_raised"
                 delivery_error = f"{type(e).__name__}: {e}"
 
-            self._pending_signal_tasks.pop((kind, handle), None)
-            wake = self._pending_signal_wakes.pop((kind, handle), None)
+            wake = self._pending_signal_wakes.get((kind, handle))
             bound = wake.bound if wake is not None else None
 
             if status_value in _PERSISTED_STATES:
@@ -677,6 +702,12 @@ class WaitReconciler:
                 )
                 signals_soft_failed += 1
 
+            # Retain the exact owner and wake until classification AND its
+            # durable write have completed. Native metadata/storage control
+            # must not turn this process's in-flight wake into restart loss.
+            self._pending_signal_tasks.pop((kind, handle), None)
+            self._pending_signal_wakes.pop((kind, handle), None)
+
         # --- Phase 1: detect terminal transitions + enqueue -------------
         # Two complementary wake sources, both routed through the SAME
         # per-handle emit logic (:meth:`_process_handle`) so they never
@@ -709,8 +740,10 @@ class WaitReconciler:
         for provider in providers:
             kind = provider.kind
             try:
-                handles = await provider.active_handles()
+                handles = await invoke_host_callback(provider.active_handles)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "wait_reconcile: active_handles() raised for kind %s: %s",
                     kind, e,
@@ -838,8 +871,10 @@ class WaitReconciler:
         if not callable(lookup) or not signal_id:
             return None
         try:
-            retry_at = lookup(signal_id)
+            retry_at = require_callback_result(lookup(signal_id))
         except Exception as exc:  # a broken ledger is not advice
+            if is_execution_control_error(exc):
+                raise
             logger.debug(
                 "cognition_retry_at(%r) raised on the dispatcher: %s",
                 signal_id, exc,
@@ -889,8 +924,10 @@ class WaitReconciler:
         lookup = getattr(dispatcher, "surface_record", None)
         if callable(lookup) and signal_id:
             try:
-                record = lookup(signal_id)
+                record = require_callback_result(lookup(signal_id))
             except Exception as exc:  # a broken ledger is not a verdict
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug(
                     "surface_record(%r) raised on the dispatcher: %s",
                     signal_id, exc,
@@ -937,8 +974,10 @@ class WaitReconciler:
         # older than it however long the harvest takes.
         observed_at = datetime.now(timezone.utc)
         try:
-            status = await provider.poll(handle)
+            status = await invoke_host_callback(provider.poll, handle)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "wait_reconcile: poll(%s:%s) raised: %s",
                 kind, handle, e,
@@ -1110,9 +1149,10 @@ class WaitReconciler:
         )
 
         try:
-            enq = dispatcher.enqueue_signal(signal)
-            handle_obj = await enq if asyncio.iscoroutine(enq) else enq
+            handle_obj = await invoke_host_callback(dispatcher.enqueue_signal, signal)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "wait_reconcile: enqueue_signal raised for %s:%s: %s",
                 kind, handle, e,
@@ -1431,17 +1471,17 @@ async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
         so the caller fails OPEN and allows the watch.
 
     A provider with no ``owns_handle`` is treated as ``None`` (unverifiable).
-    A provider bug is swallowed to ``None`` — an ownership check must never be
-    the thing that blocks an otherwise-valid watch.
+    An ordinary provider bug is swallowed to ``None``. Native control is not
+    an ownership answer and must propagate before any watch is admitted.
     """
     verify = getattr(provider, "owns_handle", None)
     if not callable(verify):
         return None
     try:
-        result = verify(handle)
-        if asyncio.iscoroutine(result):
-            result = await result
+        result = await invoke_host_callback(verify, handle)
     except Exception as exc:  # provider bug — don't block on a broken check
+        if is_execution_control_error(exc):
+            raise
         logger.debug(
             "owns_handle(%r) raised on provider %s: %s",
             handle, getattr(provider, "kind", "?"), exc,
@@ -1449,7 +1489,9 @@ async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
         return None
     if result is None:
         return None
-    return bool(result)
+    if not isinstance(result, bool):
+        raise ValueError("owns_handle must return bool or None")
+    return result
 
 
 async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
@@ -1472,18 +1514,17 @@ async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
     USER_VISIBLE, get its text painted into that window. Routing authority
     stays with locally-owned provider state.
 
-    A provider bug is swallowed to ``None``: failing to resolve an origin must
-    degrade to the pre-#2877 behavior (a system-initiated wake), never block
-    the wake itself.
+    An ordinary provider bug is swallowed to ``None``. Native control must
+    propagate rather than authorizing a replacement system-initiated wake.
     """
     resolve = getattr(provider, "origin_session_id", None)
     if not callable(resolve):
         return None
     try:
-        result = resolve(handle)
-        if asyncio.iscoroutine(result):
-            result = await result
+        result = await invoke_host_callback(resolve, handle)
     except Exception as exc:  # provider bug — wake system-initiated instead
+        if is_execution_control_error(exc):
+            raise
         logger.debug(
             "origin_session_id(%r) raised on provider %s: %s",
             handle, getattr(provider, "kind", "?"), exc,
@@ -1558,6 +1599,18 @@ async def _resolve_owned_provider(agent: Any, ref: str) -> Tuple[str, str, Any]:
     return kind, handle, provider
 
 
+async def _registration_lifetime(agent: Any, ref: str):
+    """Validate a first reference without publishing an unusable singleton."""
+    resolved = None
+    if getattr(agent, "_wait_reconciler", None) is None:
+        # No lifetime exists yet. Preserve lazy validation/no state on a bad
+        # first reference, without repeating native ownership reads. Another
+        # caller may build/fail the singleton during this read; the shared
+        # operation guard below still arbitrates admission before any write.
+        resolved = await _resolve_owned_provider(agent, ref)
+    return _get_reconciler(agent), resolved
+
+
 async def register_wait_watch(
     agent: Any, ref: str, *, origin_session_id: Optional[str] = None
 ) -> None:
@@ -1598,10 +1651,14 @@ async def register_wait_watch(
             ``kind`` with no registered provider, or a handle the named
             provider affirmatively does not own.
     """
-    kind, handle, _provider = await _resolve_owned_provider(agent, ref)
-    await _get_reconciler(agent)._store.start_watch(
-        kind, handle, origin_session_id=origin_session_id
-    )
+    reconciler, resolved = await _registration_lifetime(agent, ref)
+    async with reconciler._live_operation():
+        kind, handle, _provider = (
+            resolved if resolved is not None else await _resolve_owned_provider(agent, ref)
+        )
+        await reconciler._store.start_watch(
+            kind, handle, origin_session_id=origin_session_id
+        )
 
 
 class DurableResumeUnsupportedError(ValueError):
@@ -1740,30 +1797,34 @@ async def register_wait_resume_consumer(
             already terminal is unknown, so the caller must not park on it;
             re-registering the same ``consumer_id`` is idempotent.
     """
-    kind, handle, provider = await _resolve_owned_provider(agent, ref)
-    dispatcher = getattr(agent, "dispatcher", None)
-    register = getattr(dispatcher, "register_durable_consumer", None)
-    elided_by = getattr(dispatcher, "durable_payload_elided_by", None)
-    if not callable(register) or not callable(elided_by):
-        raise ValueError(
-            "durable signal delivery unavailable: the agent's dispatcher "
-            "cannot register durable consumers"
+    reconciler, resolved = await _registration_lifetime(agent, ref)
+    async with reconciler._live_operation():
+        kind, handle, provider = (
+            resolved if resolved is not None else await _resolve_owned_provider(agent, ref)
         )
-    storage = elided_by()
-    if storage is not None:
-        raise DurableResumeUnsupportedError(f"{kind}:{handle}", storage)
-    registration = DurableConsumerRegistration(
-        consumer_id=consumer_id,
-        source=wake_source(provider),
-        agent_id=str(getattr(agent, "did", None) or ""),
-        correlation_selector=f"payload.{WAKE_REF_PAYLOAD_KEY}={kind}:{handle}",
-        max_attempts=max_attempts,
-        lease_seconds=lease_seconds,
-    )
-    await _get_reconciler(agent)._store.start_watch(kind, handle)
-    await register(registration)
-    status = await provider.poll(handle)
-    return WaitResumeRegistration(
-        registration=registration,
-        already_terminal=status if status.outcome.is_terminal() else None,
-    )
+        dispatcher = getattr(agent, "dispatcher", None)
+        register = getattr(dispatcher, "register_durable_consumer", None)
+        elided_by = getattr(dispatcher, "durable_payload_elided_by", None)
+        if not callable(register) or not callable(elided_by):
+            raise ValueError(
+                "durable signal delivery unavailable: the agent's dispatcher "
+                "cannot register durable consumers"
+            )
+        storage = require_callback_result(elided_by())
+        if storage is not None:
+            raise DurableResumeUnsupportedError(f"{kind}:{handle}", storage)
+        registration = DurableConsumerRegistration(
+            consumer_id=consumer_id,
+            source=wake_source(provider),
+            agent_id=str(getattr(agent, "did", None) or ""),
+            correlation_selector=f"payload.{WAKE_REF_PAYLOAD_KEY}={kind}:{handle}",
+            max_attempts=max_attempts,
+            lease_seconds=lease_seconds,
+        )
+        await reconciler._store.start_watch(kind, handle)
+        await invoke_host_callback(register, registration)
+        status = await invoke_host_callback(provider.poll, handle)
+        return WaitResumeRegistration(
+            registration=registration,
+            already_terminal=status if status.outcome.is_terminal() else None,
+        )

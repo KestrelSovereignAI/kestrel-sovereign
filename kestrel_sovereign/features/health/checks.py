@@ -8,6 +8,8 @@ Each check function returns a dict with:
     duration_ms: float - wall-clock time for the check
 
 Checks are designed to be fast and non-destructive.
+Ordinary capability failures become diagnostics; original execution control
+and native retirement debt propagate to the lifecycle owner without conversion.
 """
 
 import asyncio
@@ -18,6 +20,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import ResourceLock
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import (
     resolve_conversation_store,
     resolve_feature_database,
@@ -50,7 +53,9 @@ async def _run_database_bound_check(
             DATABASE_HEALTH_CHECK_TIMEOUT_S
         ) as deadline:
             return await check
-    except TimeoutError:
+    except TimeoutError as error:
+        if is_execution_control_error(error):
+            raise
         # Do not relabel a TimeoutError raised by the check/provider itself as
         # this wrapper's deadline. This mirrors every other deadline boundary
         # on the consolidation and health paths.
@@ -198,6 +203,8 @@ async def check_database(db) -> Dict[str, Any]:
             "duration_ms": _elapsed(start),
         }
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         return {
             "name": "database",
             "status": "fail",
@@ -312,6 +319,8 @@ async def check_llm_service(agent) -> Dict[str, Any]:
             "duration_ms": _elapsed(start),
         }
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         return {
             "name": "llm_service",
             "status": "fail",
@@ -387,6 +396,8 @@ async def check_memory_system(agent) -> Dict[str, Any]:
             result["details"] = {"consolidation_drain": settled_drain}
         return result
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         return {
             "name": "memory_system",
             "status": "fail",
@@ -493,6 +504,8 @@ async def check_disk_space(threshold_mb: int = 100) -> Dict[str, Any]:
             "duration_ms": _elapsed(start),
         }
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         return {
             "name": "disk_space",
             "status": "fail",
@@ -570,6 +583,8 @@ async def check_context_budget(agent) -> Dict[str, Any]:
             "duration_ms": _elapsed(start),
         }
     except Exception as e:
+        if is_execution_control_error(e):
+            raise
         return {
             "name": "context_budget",
             "status": "fail",
@@ -642,6 +657,8 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
             **parameters,
         )
     except Exception as error:
+        if is_execution_control_error(error):
+            raise
         return {
             "name": "scheduler_liveness",
             "status": "fail",
@@ -773,6 +790,8 @@ async def check_scheduled_task_failures(agent, db) -> Dict[str, Any]:
 
         markers = await load_failure_markers(db, agent_did, agent=agent)
     except Exception as error:
+        if is_execution_control_error(error):
+            raise
         return {
             "name": "scheduled_task_failures",
             "status": "fail",
@@ -822,6 +841,8 @@ async def check_bootstrap_state(agent, threshold_seconds: int = 3600) -> Dict[st
         try:
             agent_node = await storage.get_node(getattr(agent, "agent_id", None))
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.debug("Bootstrap health check could not load agent node: %s", exc)
 
     try:
@@ -832,6 +853,8 @@ async def check_bootstrap_state(agent, threshold_seconds: int = 3600) -> Dict[st
             mark_stale=False,
         )
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         return {
             "name": "bootstrap_state",
             "status": "warn",
@@ -1139,6 +1162,8 @@ async def check_resource_locks(agent) -> Dict[str, Any]:
     try:
         return _classify_resource_lock_snapshot(snapshot(), start)
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         return {
             "name": "resource_locks",
             "status": "warn",
@@ -1276,7 +1301,9 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
     try:
         if hasattr(llm_service, "get_model_preference"):
             pinned_vendor = (llm_service.get_model_preference() or {}).get("vendor")
-    except Exception:  # pragma: no cover - never let a health check raise
+    except Exception as error:  # pragma: no cover - ordinary preference failures are optional
+        if is_execution_control_error(error):
+            raise
         pinned_vendor = None
 
     vendors = sorted(failures)

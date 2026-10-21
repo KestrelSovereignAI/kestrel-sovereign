@@ -75,6 +75,20 @@ one new generation. Failed or cancellation-resistant stops seal the proxy and
 retain the exact client for terminal cleanup; they are never reported as idle
 success. A transient cold-start failure instead restores the idle/retryable
 state, and caller cancellation cannot interrupt a wake transaction midway.
+
+Initialization and terminal cleanup retain their original Task admission receipt,
+including allocation refusal or callback-publication failure. Completed is not
+the same as retired: an unresolved native outcome keeps its exact original
+operation fenced, even for a shutdown already queued on the retirement lock.
+Ordinary facade failures retain bounded retry after the original operation
+settles; successful retirement and a settled acknowledgement alone do not create
+permanent cleanup debt. Each finite observer keeps its own original withdrawal
+without adding that cancellation to another observer's shared source history.
+Uncertainty from an independent ingress operation still denies new work, but
+does not pretend that a child's as-yet-unattempted physical stop already failed.
+An earlier bounded cleanup that waited behind that ingress may finish its first
+stop once the exact ingress owner settles; it cannot retry a failed native stop.
+
 Wake preparation failures retain the existing secret-free tool error envelope;
 an ancillary telemetry failure after publication leaves the live child running
 and supervised rather than misclassifying it as idle.
@@ -198,3 +212,257 @@ registered as infrastructure daemons, so their intentional residency does not it
 `idle_agents_only` restart.
 While retired, the supervisor waits on the child-publication event rather than
 polling once per second; a cold wake or terminal shutdown releases that wait.
+Immutable hosted BIN overrides have the same operator custody as immutable
+VENV overrides. A validated executable contained in the runtime workspace
+prevents both cleanup eligibility and deletion. Failed revalidation retains
+the prior executable identity and makes custody unproven; it never grants
+Core permission to reclaim the workspace after a failed wake.
+
+Immutable runtime custody starts at construction, before asynchronous child
+initialization. Protected VENV/BIN paths accumulate across override removal or
+retargeting rather than replacing the previous operator-owned artifacts. A
+failed immutable validation leaves custody uncertainty sticky; validating the
+current setting does not prove ownership of the historical path or authorize
+its deletion. Reclamation remains fail-closed until explicit owner reconciliation.
+
+Finite cleanup joins preserve independent original failures and the current
+caller's withdrawal without rewriting a shared native source receipt. This
+also applies to configuration-fence finalizers, startup registration rollback,
+single-agent onboarding rollback, and SQLite worker retirement. Ordinary
+configuration body-error precedence does not suppress native finalizer control.
+An accepted SDK response/context close remains the same close task even when
+publishing its completion callback fails.
+
+Every explicit native `create_owned_task` admission supplies a fresh
+`OwnedTaskAdmission`. Its start gate keeps the operation unentered until
+canonical callback publication succeeds, including under eager execution.
+Synchronous refund/drain handoffs publish `admission.task` into their existing
+record even when creation raises; their asynchronous consumers join that exact
+Task. Existing unbounded asynchronous join boundaries can use
+`await_owned_operation` for the same receipt-and-join protocol. Bounded tail
+owners keep their original absolute deadline and explicit handoff instead.
+An accepted but unstarted closer retains `(resource, original_task)` debt;
+only genuine no-Task refusal uses `(resource, None)`. Debt belongs on a private
+carrier, not the original native exception. Independent cleanup phases still
+get their attempt before the finite terminal failure is raised. Shared source
+latches never acquire another shutdown observer's actual cancellation.
+The physical result of an original closer is distinct from its completion
+observer's callback error: successful physical retirement closes that record,
+while the observer keeps its own failure finitely. A later healthy observation
+must not invent a replacement close or replay observer debt. Failed native
+attempts reuse their existing private error carrier instead of growing a new
+exception ancestry on every Stop. Cached publication diagnostics and subsequent
+native failures are composed in isolation from their original source graphs.
+Core-owned completion-observation groups carry canonical source provenance;
+genuine foreign source groups remain whole. Host hook rollback returns its
+current finite failures separately from retained context control. All cognition
+debt writers use the same bounded source-only retention boundary, including
+late route and cleanup completion callbacks. PostgreSQL and Phoenix close
+accounting uses the original Task's physical result, not its joiner's aggregate.
+
+Manager, server and dispatcher finite lifecycle owners use an explicit native
+composition policy: every original source and actual current join withdrawal
+remains in the finite result without decorating any original source graph.
+This does not change the generic non-native caused-cancellation defaults.
+The manager's two completed-cleanup writers have a different lifetime: their
+shared summary keeps one strongest genuine original (UNKNOWN before COMMITTED
+before other denial), fixed irreversible classification, and exact unresolved
+retirement ownership. It does not keep every completed source after the bounded
+128-record display history is evicted or acknowledged. Compacted independent
+scope evidence fails closed at this manager's aggregate reader rather than
+attributing all sources to the selected original's tenant. Exact per-operation
+scopes remain unchanged. Display acknowledgement is not physical retirement:
+generic debts stay conservative, and unretired typed ACK receipts keep their
+mutable original retirement record, including an owner not yet published.
+Only that receipt's actual retirement permits its redundant ownership record
+to be compacted; a successful unrelated Task or Future is not a retirement ACK.
+
+Coordinator and lock-acquisition Tasks need admission receipts too: their body
+must not enter before completion-callback publication succeeds. A failed
+publication joins the actual accepted Task, rather than describing acceptance
+as no-Task refusal. Lock observation is separate from acquisition; a lock
+physically acquired before an observer failure is released unless ownership
+has explicitly transferred. An unentered server phase keeps private debt for
+its actual resources and accepted Task (or genuine None), without modifying
+the original failure. An existing Agent continuation remains owned and joined
+even when admission of its new observing waiter fails.
+
+Finite multi-owner boundaries keep originals and actual withdrawals unreduced
+until later owners finish. An ordinary-first failure cannot erase cancellation
+before a later native result arrives. Nested writer drains and shutdown waiters
+can pass caller-local finite collectors; these lists never become shared control
+history. Fleet topology and post-removal reconciliation failures preserve
+conservative relationship state while independent cleanup still receives its
+attempt. Forwarding an already compacted manager summary preserves its unscoped
+classification instead of attributing discarded sources to its selected tenant.
+
+Session-training acquisition and rejected-session release retain the actual
+physical hook task and session when native retirement is unresolved. A later
+close reports that evidence without issuing a replacement release. Ordinary
+provider release failures retain their existing bounded retry behavior. Local
+component tests do not prove authenticated provider termination or billing
+acceptance; those remain separate provider verification boundaries.
+
+Submission, compensation and release publish their original Task on the job
+before registering fallible completion observers. A refused/unpublished owner
+does not advance the physical release phase underneath an accepted task. Native
+submission or compensation control is not a business failure string and cannot
+skip the first independent session release; the finite result retains both
+outcomes. Public training adapters preserve that control. The SQLite backend
+likewise roots the exact connection and accepted closer (or an explicit absent
+closer) before observer publication. A live worker with no admitted closer is
+unresolved retirement, not a completed close; later probes cannot retry it or
+discard its original control while that worker remains live.
+
+SQLite diagnostic success tests control the before-deadline schedule with the
+existing pinned loop clock, while joining the real native worker under an
+independent thread-based hang guard. Only physical retirement permits advancing
+the worker poll; snapshot, backup-destination and primary closes share this test
+driver without replacing the original close Task or deadline. Deliberate expiry
+tests cross the captured production deadline while the original worker is held
+and require the overrun diagnostic and retained owner before releasing it. These
+tests do not promise real-time disk performance under arbitrary CI load or change
+the production shutdown budget; the broader operational #3460 remains separate.
+
+Stop-claim CAS races likewise require one live lease epoch. Their test-only lease
+is derived from the independent hang guard; actual database elapsed time and
+the stored heartbeat's cutoff are checked before interpreting winner counts.
+Separate native tests retain the production two-second lease and demonstrate
+real database-clock expiry, subsequent takeover and stale-owner fencing. They
+do not promise two-second response/renewal performance under arbitrary load or
+retroactively establish the ordering of an earlier uninstrumented CI failure.
+
+Native HTTP sends capture their original custody and validator inventory before
+request observers execute. Mutable request extensions are descriptive transport
+metadata, never dispatch authority. The final native dispatch and response-body
+owner use the privately retained send admission, including concurrent/nested
+sends and redirects on a shared client. Clearing or replacing extensions cannot
+authorize a request after the original policy retires.
+
+Private host ingress has a caller-local Core admission rooted before task
+publication. Backend observation follows actual joined task lineage, not mere
+ContextVar inheritance into resident readers or supervisors. Native failure
+observation follows nested TaskGroups and their actual direct/gather waiters,
+including a group child running before its parent's exit wait begins. This
+membership is a physical join obligation, not copied-context authority. Native
+classification comes from the actual backend phase: a foreign exception's
+attributes, type, cause, or group membership do not prove that this ingress
+attempted COMMIT. Healthy rolled-back foreign failures release their observation.
+
+An unresolved native ingress retains its original resource/phase owners,
+admitted scope snapshot, selected client and actual caller withdrawal privately.
+Public errors contain detached classifications only, including later lifecycle
+and configuration rejections. Terminal shutdown still performs the first
+physical child stop; an unrelated ingress failure cannot substitute for that
+retirement. Every physical stop producer uses the same per-client disposition
+handoff, including when settlement is harvested before its callback runs.
+
+Reserved quiesce/resume RPCs use their existing lifecycle owner outside data
+admission, with the same native observation. An unresolved outcome is monotonic:
+a later failed reset cannot weaken a previously observed UNKNOWN. A fully
+retired known ACK plus withdrawal, or a denial confined to a captured caller
+scope, is delivered finitely without poisoning a distinct live caller's runtime.
+Neither case clears an unresolved commit or physical-retirement debt.
+
+Finite shutdown outcomes are composed only after the enclosing ownership
+boundary finishes collecting its originals. Successful native work can still
+have a failed completion observer: that error belongs to the finite drain, not
+the physical worker's shared failure latch. Reaper, offboarding, refund,
+reconciliation and unsealing outcomes must all survive independently, including
+ordinary-first failures followed by native control and actual caller withdrawal.
+Cold-identity admission uses the same physically balanced manager-lock helper
+as the drain and handoff seal. Spawn expiry and admitted-spawn joins retain
+native unwind failures without weakening signed deadlines or authorizing retry.
+Admission hooks use an acceptance receipt before completion publication.
+Bookkeeping-observer or expiry-fence failures still join the original hook;
+they cannot return while it retains native work. An unexpected observation in
+a finite group must not filter away an independent original native source.
+
+These finite collectors span enclosing server phases and descendant setup,
+not just an individual join. Ordinary phase errors and actual Phoenix
+withdrawals stay unreduced until the complete lifespan has finished, including
+an external native lifespan failure. Core-owned observation composition reuses
+an already enclosing original carrier instead of wrapping it again or turning
+a sole typed result into duplicate error groups. Generic terminal-selection
+and non-native caused-cancellation defaults remain unchanged.
+
+Dynamic scheduler preparation harvests the actual successful Task result even
+when completion observation fails. Its exact nonce-bearing rollback owner
+compensates before that finite error escapes. Both loaded and cold runtime
+offboarding use one receipt-backed admission boundary: a failed completion
+observer cannot restore authority over an accepted deletion or lose its record.
+The original administrative/terminal/quarantine owners manually harvest a
+completed record when necessary. Observation failure never changes a proven
+REMOVED result into pending deletion, and no cancellation count or boolean may
+invent a caller exception. These are component ownership guarantees, not a new
+filesystem deletion policy or a grant of destructive authority.
+
+Standalone CLI and main callers own their Hold context separately from the
+Agent. They complete both safe retirements before reporting a settled Agent
+failure. A genuinely pending original Agent Task instead retains that exact
+context/Task dependency; it is neither a successful context close nor permission
+to allocate a replacement cleanup attempt. Component native tests establish
+these ownership boundaries, not whole-Agent genesis, provider billing or deployed
+production acceptance.
+The protected lifetime begins immediately after successful acquisition: extension
+setup, banner output and shutdown diagnostics cannot bypass mandatory completion
+and context retirement. Failed fallback observation retains its original waiter
+admission error and whole native group while independent safe cleanup still runs.
+
+Quarantine and ordinary-budget completion use an idempotent physical harvester
+from both callbacks and direct joins. Failed callback publication does not
+create another cleanup Task or leave a completed record in the live registry;
+bounded unsafe metadata and native source retention are published once. A
+raised completion outcome is collected before independent original joins,
+registration compensation or reconciliation continue. Native groups remain
+whole even when their leaves include unexpected control, without turning that
+control into a successful lifecycle result. Child-specific TTL readers surface
+native uncertainty and actual withdrawals rather than reducing them to a
+boolean refusal. Their outer lifecycle caller preserves earlier terminal
+evidence beside the later reader failure and does not finalize the child.
+Finite composition keeps a representative of every explicit graph component,
+including mutually enclosing cycles beside independent errors; it does not
+rewrite originals or grow a repeated-observation history.
+
+The same guarantee reaches the actual live and cold TTL Task, not only its
+inner termination helper. Native uncertainty escapes that exact timer without
+starting an ambiguous replacement retry, and its original terminal carrier is
+available to both callback and direct readers. Ordinary availability retries
+remain separate. Cold retirement uses receipt-backed admission and joins the
+accepted original before reporting a failed publication or actual withdrawal.
+An already-harvested child reader consults the existing bounded private native
+summary rather than rebuilding completed Task history. A successful manager
+call followed by an unsafe reader refusal still reports actual caller
+withdrawal. Finalization keeps earlier originals through settlement, hook and
+bookkeeping failures; unresolved settlement never publishes completion. Native
+groups remain whole during the lifecycle's own child sweep. Independent drain
+joins finish before an unexpected process-control original is surfaced without
+demoting it into ordinary availability diagnostics.
+
+Retained child control is part of the reader's complete exit policy, including
+ordinary cleanup refusal and callback-observation failure; it is not checked
+only after an empty snapshot. Diagnostic wrapping shares one classification
+rule across manager-lock admission, drain/reconciliation and failed-spawn
+handoff phases: native or unexpected terminal control remains original, while
+ordinary availability keeps its diagnostic envelope. A descendant fence owns
+every actual withdrawal collected across its original spawn joins, including
+when releasing the same token fails. A previously handled cancellation count
+alone does not create a new observation or force a new cancellation result.
+
+The retained failed-spawn producer follows the same terminal policy. Its four
+restrictive cleanup phases share the existing retry policy, but native
+uncertainty is retained with the bounded private source reducer before retry.
+A later successful cleanup cannot erase it from the worker's terminal outcome.
+Returned native control is not a successful acknowledgement. Actual finite
+withdrawal returned after runtime cleanup
+stays with the original worker through witness settlement and slot publication;
+later failures cannot replace it. Completed physical phases do not acquire new
+retirement debt, and current withdrawal is not stored as shared native history.
+
+When an ordinary-class Core commit or diagnostic wrapper carries both native
+control and actual observer cancellation, restrictive retry retains the exact
+finite cancellation before projecting its bounded native summary. Only Core's
+authenticated finite provenance can distinguish those observations from genuine
+source cancellation or a genuine source group. The original carrier stays
+unchanged; later phase success or failure cannot erase its finite observations,
+and shared manager history remains source-only.

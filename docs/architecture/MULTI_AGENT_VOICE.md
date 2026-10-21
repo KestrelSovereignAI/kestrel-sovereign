@@ -150,6 +150,129 @@ The draft fix is therefore **not a separate task** — it's the cheapest first s
 3. **Privacy across the room.** Each session already routes through the per-agent privacy resolver (#723). In a shared room, whose privacy mode governs a turn that one agent voices and another hears? Likely: each agent's own mode gates its own I/O, but this needs to be stated, not assumed. See [security/PRIVACY_AGENT.md](security/PRIVACY_AGENT.md).
 4. **Solo semantics with an armed mic.** If I solo A's *output* but my mic is armed to B, is that a coherent state or should solo also re-arm? Lean toward keeping the buses independent (they're orthogonal by design), but the UI should make the split legible.
 
+## Realtime interruption and typed-response correlation
+
+Server VAD `speech_started` retires prior output without clearing the fresh
+microphone input that triggered it. An explicit local Stop may still clear
+buffered input; its acknowledgement does not identify a subsequent response.
+
+For browser typed turns, `response.create.response.metadata.kestrel_input_generation`
+contains a fresh correlation ID. Only a matching `response.created` admits that
+typed turn's output, including tool continuations. This is routing evidence,
+not execution authority: hosted tool dispatch still validates original custody.
+Missing or mismatched correlation fails closed; if no matching response starts
+within `responseStartTimeoutMs` (30 seconds by default), the original client
+emits `RESPONSE_CORRELATION_UNCONFIRMED` and physically closes its transport.
+Providers must echo this metadata for typed-turn support; compatibility with
+other vendors is not inferred from OpenAI compatibility claims.
+
+The protocol uses the documented OpenAI
+[response metadata](https://developers.openai.com/api/reference/resources/realtime/client-events)
+and [Realtime VAD interruption](https://developers.openai.com/api/docs/guides/realtime-conversations)
+contracts. Native loopback WebRTC/WebSocket tests cover cancellation, correlation,
+fresh speech preservation and bounded refusal without paid provider calls.
+
+### PCM playback clear ownership
+
+The PCM controller closes its real gain synchronously on every abandonment,
+including typed replacement, before asking the playback AudioWorklet to clear.
+Every push, end, clear acknowledgement and drain carries its original playback
+generation. Only a matching native worklet clear ACK can release buffered fresh
+PCM and reopen the gain; user mute/solo remains an independent gate. Repeated
+clears share one owner and deadline rather than accumulating waiters or
+extending the deadline. Clear timeout or pending-audio overflow retires the
+original client with `AUDIO_OUTPUT_CONTROL_FAILED`, including its microphone,
+playback context and socket. Queued audio is not silently truncated on overflow.
+PCM/end messages retain their producer order while waiting for clear ACK;
+adjacent duplicate ends coalesce so control metadata is bounded too. A Stop
+received while the original worklet is loading is forwarded once its handler
+exists, at the latest requested generation and under the original deadline.
+
+A loopback Chromium proof measures the actual post-gain graph: stale positive
+PCM stays excluded while fresh negative-marker PCM renders after clear ACK.
+Removing the epoch or gain gate fails that native proof. Separate native client
+tests cover typed replacement, Stop during initialization, and missing clear
+ACK through both voice clients. Failure tests observe automatic physical
+retirement before fixture cleanup; removing the production error-callback
+close makes those assertions fail.
+These are local PCM guarantees, **not** a claim that JSON response filtering or
+an input-clear ACK fences the separate WebRTC RTP stream. New Console/client
+sessions explicitly require `response-framed-pcm-v1`; OpenAI implements this
+as `openai-realtime-ga-framed-v1` over its existing session WebSocket, with the
+same configured model/provider. Unsupported providers return a clear capability
+error before mint, not a silent provider/model switch or Pipeline fallback.
+Older API callers may omit the profile and retain legacy WebRTC compatibility;
+that legacy RTP path does not acquire these PCM Stop guarantees.
+
+### Capture generation boundary (component API)
+
+`capture.reset()` requests a new local microphone generation. The capture
+worklet discards its old partial PCM frame and resampling offset; the main
+owner rejects already queued or delayed frames from an older generation.
+`onchunk` keeps its existing PCM first argument and adds original-generation
+metadata as an optional second argument. Reset keeps the same stream and
+tracks, including when requested through `onAcquire` before worklet setup.
+
+The returned generation is a **request token, not an acknowledgement or work
+authority**. Only a matching actual native PCM frame demonstrates that the
+processor crossed that boundary. A controlled transform unit proves old
+partial samples are absent; real browser tests delay/replay an original native
+frame, require its exclusion, and require fresh non-silent PCM from the same
+still-live microphone. Ordinary VAD must not request a capture reset and lose
+the fresh utterance prefix. Strict Stop/typed replacement now requests capture
+reset and holds bounded fresh-generation audio until the provider's ordered
+input-clear ACK. Repeated unacknowledged clears have a fixed deadline/count
+bound. Ordinary VAD abandons output without clearing/resetting fresh input.
+
+### Explicit framed realtime contract
+
+The canonical provider mint helper requests PCM16 mono at 24kHz, retains VAD
+events, and disables provider-driven response creation/interruption. Browser
+startup waits for an actual `session.updated` with the effective model, PCM
+format and manual-response settings before sending microphone data. This is
+an effective-config acknowledgement, not an echoed `event_id`; model is not
+sent in `session.update`. Token-registration and socket-session IDs are distinct.
+
+Typed turns, positively matched speech commits and tool continuations request
+responses with input-generation plus unique per-request nonce metadata. Only
+a matching `response.created` admits that response's audio, text, arguments or
+completion. Missing/foreign IDs and delayed older completions are excluded;
+continuations cannot reuse a predecessor request nonce. Metadata does not grant
+governance/tool authority. The existing server-side execution gates still apply.
+
+Startup, input-clear and response-correlation deadlines, protocol rejection and
+audio-buffer bounds fail closed by retiring the original microphone, both audio
+contexts and socket. Only the recognized harmless no-active-response cancellation
+error remains nonfatal. Strictness also survives either route-refusal check and
+older backends returning409: automatic Pipeline fallback is not permitted for a
+required profile. Operators can still explicitly select Pipeline; legacy API
+opt-out retains its fallback description.
+
+Stop/typed input during mint or worklet loading applies its local boundary
+without depending on an already-open socket. Pre-readiness controls coalesce
+and are sent only after effective configuration ACK, with the original bounded
+clear deadline preserved. Socket identity is learned separately when actually
+supplied; a schema-valid effective-config ACK need not contain an `id`.
+
+Realtime and Pipeline share the same public startup-settlement owner. Closing
+rejects `start()` even while an unabortable permission/worklet acquisition is
+pending. This is **not** a native completion receipt: the original acquisition
+remains rooted and performs its original late cleanup. `whenStartupSettled()`
+observes that actual operation's settlement separately. Native tests first
+require public cancellation and closure of acquired resources while HTTP is
+still held, then release it and join the original operation, proving no late
+successor worklet/socket appeared.
+
+Loopback browser tests exercise actual WebSocket messages, capture/playback
+worklets and post-gain output: stale positive PCM is excluded, fresh negative
+PCM renders, and fresh nonzero input uses the same live microphone. Native
+failure checks precede fixture cleanup. These offline tests do not claim live
+provider acceptance, production rollout completion or physical speaker audibility.
+
+Protocol references: [WebSocket authentication](https://developers.openai.com/api/docs/guides/voice-websockets),
+[Realtime client events](https://developers.openai.com/api/reference/resources/realtime/client-events),
+[VAD controls](https://developers.openai.com/api/docs/guides/realtime-vad).
+
 ## Appendix — source map
 
 **Frontend (kestrel-sovereign):**

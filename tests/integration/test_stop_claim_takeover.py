@@ -8,6 +8,7 @@ that CI job has a PostgreSQL service (#3336): under ``tests/unit`` every
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from uuid import uuid4
 
 import pytest
@@ -30,11 +31,18 @@ from kestrel_sovereign.stop.receipt import (
     opaque_stop_identifier,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.database_clock import database_lease_cutoff_sql
+from kestrel_sovereign.storage.database_clock import (
+    database_clock,
+    database_lease_cutoff_sql,
+)
+from tests.utils.virtual_clock import HANG_GUARD_SECONDS, await_within_hang_guard
 
 AGENT_DID = "did:test:claim-agent"
 # Older than any lease: an owner whose heartbeat reads this is proven dead.
 _DEAD_HEARTBEAT = "2000-01-01T00:00:00.000+00:00"
+# A CAS race tests one live epoch, not the production heartbeat's real-time
+# scheduling. Its lease exceeds the independently bounded race/observation.
+_RACE_LEASE_SECONDS = 2 * HANG_GUARD_SECONDS
 
 
 def _request(correlation_id: str | None = None) -> StopRequest:
@@ -86,7 +94,9 @@ async def _claim_row(db: AsyncDatabase, request: StopRequest):
     )
 
 
-async def _outlive_one_lease(db: AsyncDatabase, request: StopRequest) -> str:
+async def _outlive_one_lease(
+    db: AsyncDatabase, request: StopRequest, *, expected_claim_id: str | None = None
+) -> str:
     """Wait until the claim's current heartbeat is older than one lease.
 
     Timed by the database clock the lease logic reads, not by asyncio's: a
@@ -94,7 +104,9 @@ async def _outlive_one_lease(db: AsyncDatabase, request: StopRequest) -> str:
     heartbeat that was waited out.
     """
 
-    _, _, heartbeat_at = await _claim_row(db, request)
+    claim_id, owner_id, heartbeat_at = await _claim_row(db, request)
+    if expected_claim_id is not None:
+        assert claim_id == expected_claim_id
     cutoff_sql, cutoff_args = database_lease_cutoff_sql(
         db, STOP_OWNER_LEASE_SECONDS
     )
@@ -104,7 +116,37 @@ async def _outlive_one_lease(db: AsyncDatabase, request: StopRequest) -> str:
             (heartbeat_at, *cutoff_args),
         ):
             await asyncio.sleep(0.05)
+    if expected_claim_id is not None:
+        assert await _claim_row(db, request) == (claim_id, owner_id, heartbeat_at)
     return heartbeat_at
+
+
+@contextmanager
+def _observe_takeover_updates(db, monkeypatch):
+    """Record actual CAS predecessors/successors/row counts without replacing SQL."""
+    updates = []
+    execute = db.execute
+
+    async def observed_execute(query, params=None, **kwargs):
+        affected = await execute(query, params, **kwargs)
+        if query.startswith("UPDATE stop_operation_claims SET claim_id = ?"):
+            updates.append((params[3], params[0], affected))
+        return affected
+
+    with monkeypatch.context() as observation:
+        observation.setattr(db, "execute", observed_execute)
+        yield updates
+
+
+async def _settle_claim_tasks(tasks) -> None:
+    """Unwind these original test owners before their shared backend closes."""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await await_within_hang_guard(
+        asyncio.gather(*tasks, return_exceptions=True),
+        step="original Stop claim transactions settling",
+    )
 
 
 async def _receipt_count(db: AsyncDatabase, request: StopRequest) -> int:
@@ -265,21 +307,128 @@ async def test_a_resumed_stale_owner_cannot_write_a_receipt(db_backend):
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_concurrent_retries_take_over_an_expired_claim_exactly_once(
-    db_backend,
+    db_backend, monkeypatch,
 ):
-    owner, *retriers = await _stores(db_backend, 5)
+    owner, *retriers = await _stores(
+        db_backend, 5, claim_lease_seconds=_RACE_LEASE_SECONDS
+    )
     request = _request()
-    await owner.claim(request)
+    stale = await owner.claim(request)
     await _kill_owner(owner._db, request)
+    start = asyncio.Event()
 
-    results = await asyncio.gather(*(r.claim(request) for r in retriers))
+    async def contend(store):
+        await start.wait()
+        return await store.claim(request)
 
-    winners = [r for r in results if isinstance(r, StopOperationClaim)]
-    assert len(winners) == 1
-    assert results.count(None) == len(retriers) - 1
-    claim_id, owner_id, _ = await _claim_row(owner._db, request)
-    assert claim_id == winners[0].claim_id
-    assert owner_id == retriers[results.index(winners[0])].owner_id
+    contenders = [asyncio.create_task(contend(store)) for store in retriers]
+    with _observe_takeover_updates(owner._db, monkeypatch) as updates:
+        async def race_and_observe():
+            began = await database_clock(owner._db)
+            start.set()
+            results = await asyncio.gather(*contenders)
+            claim_id, owner_id, _ = await _claim_row(owner._db, request)
+            observed = await database_clock(owner._db)
+            assert 0 <= (observed - began).total_seconds() < _RACE_LEASE_SECONDS, (
+                "the race did not remain in one database-clock lease window"
+            )
+            cutoff_sql, cutoff_args = database_lease_cutoff_sql(
+                owner._db, _RACE_LEASE_SECONDS
+            )
+            assert await owner._db.fetchval(
+                f"SELECT CASE WHEN heartbeat_at > {cutoff_sql} THEN 1 ELSE 0 END "
+                "FROM stop_operation_claims WHERE operation_id = ? AND claim_id = ?",
+                (*cutoff_args, _operation_id(request), claim_id),
+            ) == 1, "the winning lease expired during the one-epoch race"
+            # Verify the time precondition BEFORE interpreting winner counts.
+            winners = [r for r in results if isinstance(r, StopOperationClaim)]
+            assert len(winners) == 1
+            assert results.count(None) == len(retriers) - 1
+            assert claim_id == winners[0].claim_id
+            assert owner_id == retriers[results.index(winners[0])].owner_id
+            assert sorted(affected for _, _, affected in updates) == [0, 0, 0, 1]
+            assert [(old, new) for old, new, affected in updates if affected] == [
+                (stale.claim_id, claim_id)
+            ]
+            assert await owner.renew_claim(stale) is False
+            with pytest.raises(StopReceiptConflict):
+                await owner.persist(
+                    request, _outcomes(request, StopDisposition.STOPPED),
+                    door=StopDoor.AGENT, claim_id=stale.claim_id,
+                )
+            assert await _receipt_count(owner._db, request) == 0
+            ended = await database_clock(owner._db)
+            assert 0 <= (ended - began).total_seconds() < _RACE_LEASE_SECONDS
+
+        race = asyncio.create_task(race_and_observe())
+        try:
+            await await_within_hang_guard(
+                race, step="one live Stop lease epoch and its database observations"
+            )
+        finally:
+            start.set()
+            await _settle_claim_tasks([race, *contenders])
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_successive_takeovers_require_expiry_and_fence_the_prior_epoch(
+    db_backend, monkeypatch,
+):
+    """Two unrenewed winners across real database lease epochs are legitimate.
+
+    This uses the production lease and unchanged SQL, not a sleep chosen to
+    imitate CI. Live-epoch refusal is covered by the bounded race above and
+    the production hold/renewal tests; no two-second I/O speed is assumed here.
+    """
+    original, first, second = await _stores(db_backend, 3)
+    request = _request()
+    original_claim = await original.claim(request)
+    await _kill_owner(original._db, request)
+
+    with _observe_takeover_updates(original._db, monkeypatch) as updates:
+        async def successive_epochs():
+            a = await first.claim(request)
+            assert isinstance(a, StopOperationClaim) and a.taken_over
+            row_a = await _claim_row(original._db, request)
+            assert row_a[:2] == (a.claim_id, first.owner_id)
+            heartbeat = await _outlive_one_lease(
+                original._db, request, expected_claim_id=a.claim_id
+            )
+            assert heartbeat == row_a[2]
+            b = await second.claim(request)
+            assert isinstance(b, StopOperationClaim) and b.taken_over
+            assert b.claim_id != a.claim_id
+            assert (await _claim_row(original._db, request))[:2] == (
+                b.claim_id, second.owner_id,
+            )
+            assert updates == [
+                (original_claim.claim_id, a.claim_id, 1), (a.claim_id, b.claim_id, 1),
+            ]
+            assert await first.renew_claim(a) is False
+            with pytest.raises(StopReceiptConflict):
+                await first.persist(
+                    request, _outcomes(request, StopDisposition.STOPPED),
+                    door=StopDoor.AGENT, claim_id=a.claim_id,
+                )
+            assert await _receipt_count(original._db, request) == 0
+            receipt = await second.persist(
+                request, _outcomes(request, StopDisposition.ALREADY_COMPLETE),
+                door=StopDoor.AGENT, claim_id=b.claim_id,
+            )
+            assert await _receipt_count(original._db, request) == 1
+            assert await first.persist(
+                request, _outcomes(request, StopDisposition.STOPPED),
+                door=StopDoor.AGENT, claim_id=a.claim_id,
+            ) == receipt
+
+        operation = asyncio.create_task(successive_epochs())
+        try:
+            await await_within_hang_guard(
+                operation, step="actual database-clock expiry and next Stop lease epoch"
+            )
+        finally:
+            await _settle_claim_tasks([operation])
 
 
 @pytest.mark.asyncio

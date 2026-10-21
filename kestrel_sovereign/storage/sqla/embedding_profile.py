@@ -30,6 +30,8 @@ from typing import Any, Optional, Set
 from sqlalchemy import Boolean, Float, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .base import SovereignBase
 
 logger = logging.getLogger(__name__)
@@ -58,7 +60,8 @@ async def upsert_embedding_profile(
     method. Idempotent — second call for the same id is a no-op via
     the in-process cache, so the storage hot path stays cheap.
 
-    Failure is always swallowed and logged at DEBUG. The registry
+    Ordinary availability failure is logged at DEBUG. Original execution
+    control propagates before availability handling. The registry
     table is operator-visibility only; storage and kNN don't read it.
     A failed upsert never blocks message persistence.
     """
@@ -69,6 +72,8 @@ async def upsert_embedding_profile(
     try:
         profile = embedding_service.describe()
     except Exception as exc:  # pragma: no cover - defensive
+        if is_execution_control_error(exc):
+            raise
         logger.debug("Embedding service describe() raised: %s", exc)
         return
     if profile is None:
@@ -108,6 +113,8 @@ async def upsert_embedding_profile(
             )
         _PROFILE_UPSERT_CACHE.add(profile.profile_id)
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         logger.debug(
             "Embedding profile registry upsert failed (non-fatal) for %s: %s",
             profile_id, exc,
@@ -163,8 +170,8 @@ async def record_space_parity(
     ``(space_id, dim, normalized)``), then stamp ``parity_cosine`` onto that row
     and any member rows already written under this ``space_id``.
 
-    Best-effort: swallows and logs failures at DEBUG; recording drift must never
-    break the parity flow.
+    Best-effort for ordinary availability errors. Original execution control
+    still propagates; it cannot become an acknowledged parity result.
     """
     if not space_id:
         return
@@ -217,6 +224,8 @@ async def record_space_parity(
             (pc, str(space_id)),
         )
     except Exception as exc:
+        if is_execution_control_error(exc):
+            raise
         logger.debug(
             "record_space_parity failed (non-fatal) for space %s: %s",
             space_id, exc,

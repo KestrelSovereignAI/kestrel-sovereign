@@ -51,8 +51,10 @@ from .conversation_created_at import (
 )
 from .legacy_session_stamp import stamp_legacy_sessions
 from .session_id_column import column_session_id
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.knowledge import Visibility
 from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
+
 from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
@@ -1342,13 +1344,13 @@ class AsyncStorage:
 
         from .memory_retriever import calculate_decay
 
-        # Pre-filter to past-grace rows in SQL; the decay-strength test then runs
-        # per row in Python. created_at is written by the consolidator as
-        # ``datetime.now(utc).isoformat()`` ("T"+offset), so the cutoff MUST use
-        # the same format to sort correctly.
-        grace_cutoff_iso = (
-            datetime.now(UTC) - timedelta(days=grace_days)
-        ).isoformat()
+        # Bind the same instant in the native timestamp column's type.
+        # SQLite keeps explicit ISO text; asyncpg requires a UTC datetime.
+        from .timestamps import utc_timestamp_parameter
+
+        grace_cutoff = utc_timestamp_parameter(
+            self.db.backend_type, datetime.now(UTC) - timedelta(days=grace_days)
+        )
 
         # Scan past-grace candidates oldest-first in bounded pages rather than
         # pulling the whole tail into memory: a table with many old-but-high-
@@ -1368,7 +1370,7 @@ class AsyncStorage:
                 ORDER BY created_at ASC
                 LIMIT ? OFFSET ?
                 """,
-                (self.agent_id, grace_cutoff_iso, page_size, offset),
+                (self.agent_id, grace_cutoff, page_size, offset),
             )
             if not page:
                 break
@@ -1402,6 +1404,8 @@ class AsyncStorage:
             try:
                 await self.graph.delete_node(episode_id)
             except Exception as e:  # noqa: BLE001 - one bad node must not abort the sweep
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "[retention] skipping episode %s — graph node delete failed: %s",
                     episode_id, e,
@@ -2667,7 +2671,9 @@ class AsyncStorage:
                 "has_private_identity_resource",
                 {"resource_type": resource.resource_type},
             )
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             logger.debug("Agent graph node missing while linking SOUL resource")
     
     # --- Backup/Restore Operations ---

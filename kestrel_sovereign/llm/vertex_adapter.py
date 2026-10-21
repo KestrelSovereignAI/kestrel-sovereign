@@ -28,6 +28,7 @@ from kestrel_sdk.llm import (
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
+from .genai_custody import close_genai_client, genai_operation, genai_stream, joined_iterator, prepare_genai_client
 from .google_adapter import _finish_reason, _normalized_google_genai_usage
 from .gemini_contents import (
     SYSTEM_MARKER_ROLE,
@@ -101,6 +102,7 @@ class VertexAIAdapter(LLMAdapter):
             out[idx] = cls._embedding_values(item)
         return out
 
+    @genai_operation
     async def aembed(
         self,
         client: Any,
@@ -116,6 +118,7 @@ class VertexAIAdapter(LLMAdapter):
         )
         return self._embeddings_from_response(response, 1)[0]
 
+    @genai_operation
     async def aembed_batch(
         self,
         client: Any,
@@ -159,6 +162,13 @@ class VertexAIAdapter(LLMAdapter):
         # Resolve credentials file
         self.credentials_file = credentials_file or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         self._client = None
+        self._closed = False
+
+    async def aclose(self):
+        """Retire only this adapter's cached client, never a supplied route."""
+        self._closed = True
+        if self._client is not None:
+            await close_genai_client(self._client)
 
     def _get_project_from_credentials(self) -> Optional[str]:
         """Extract project_id from GOOGLE_APPLICATION_CREDENTIALS file if available."""
@@ -185,6 +195,8 @@ class VertexAIAdapter(LLMAdapter):
         Lazy initialization to avoid import errors if SDK not installed.
         Prefers GOOGLE_API_KEY (AI Studio) over Vertex AI service account.
         """
+        if self._closed:
+            raise RuntimeError("Vertex adapter is closed")
         if self._client is None:
             try:
                 from google import genai
@@ -355,6 +367,7 @@ class VertexAIAdapter(LLMAdapter):
         """
         return tool_call_from_part(part, f"vertex_call_{index}")
 
+    @genai_operation
     async def get_response(
         self,
         client: Any,
@@ -449,6 +462,7 @@ class VertexAIAdapter(LLMAdapter):
             logger.error(f"Vertex AI API error: {e}")
             raise
 
+    @genai_stream
     async def _stream_with_usage(
         self,
         client: Any,
@@ -558,24 +572,25 @@ class VertexAIAdapter(LLMAdapter):
         Yields:
             Text chunks as they arrive
         """
-        async for item in self._stream_with_usage(
+        async with joined_iterator(self._stream_with_usage(
             client=client,
             model=model,
             messages=messages,
             tools=tools,
             response_format=response_format,
             **kwargs
-        ):
-            if isinstance(item, str):
-                yield item
-            elif item.tool_calls:
-                logger.warning(
-                    "Vertex AI returned %d function call(s) (%s) on the "
-                    "text-only stream, which cannot carry them; use "
-                    "get_streaming_response_with_tools to receive tool calls",
-                    len(item.tool_calls),
-                    ", ".join(call.name for call in item.tool_calls),
-                )
+        )) as stream:
+            async for item in stream:
+                if isinstance(item, str):
+                    yield item
+                elif item.tool_calls:
+                    logger.warning(
+                        "Vertex AI returned %d function call(s) (%s) on the "
+                        "text-only stream, which cannot carry them; use "
+                        "get_streaming_response_with_tools to receive tool calls",
+                        len(item.tool_calls),
+                        ", ".join(call.name for call in item.tool_calls),
+                    )
 
     async def get_streaming_response_with_tools(
         self,
@@ -641,14 +656,15 @@ class VertexAIAdapter(LLMAdapter):
 
             # No tools - stream text and forward the terminal usage response so
             # the service layer meters text-only streamed turns (#1684).
-            async for item in self._stream_with_usage(
+            async with joined_iterator(self._stream_with_usage(
                 client=client,
                 model=model,
                 messages=messages,
                 response_format=response_format,
                 **kwargs
-            ):
-                yield item
+            )) as stream:
+                async for item in stream:
+                    yield item
 
         except Exception as e:
             logger.error(f"Vertex AI streaming with tools failed: {e}")
@@ -678,13 +694,12 @@ class VertexAIAdapter(LLMAdapter):
             **kwargs
         )
 
+    @genai_operation(resolve_client=False)
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from Vertex AI.
 
-        ``client`` is accepted for contract symmetry with
-        :meth:`get_response` (SDK 0.5.0). Vertex discovery uses the
-        adapter's own ``_get_client()`` (project_id + location bound at
-        construction time), so the parameter is ignored here.
+        A supplied route client is borrowed, as for :meth:`get_response`.
+        Without one, use the adapter's project/location-bound cached client.
 
         Uses the google-genai SDK's asynchronous ``aio.models.list()``. The
         listing awaits, so the per-route discovery deadline can cancel it
@@ -696,7 +711,8 @@ class VertexAIAdapter(LLMAdapter):
             List of ModelInfo objects for each available model
         """
         try:
-            genai_client = self._get_client()
+            genai_client = client if client is not None else self._get_client()
+            prepare_genai_client(genai_client)
             models = []
 
             async for model in await genai_client.aio.models.list():
@@ -728,6 +744,9 @@ class VertexAIAdapter(LLMAdapter):
             return models
 
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.warning(f"Failed to discover Vertex AI models: {e}")
             # Return fallback models
             return self._get_fallback_models()

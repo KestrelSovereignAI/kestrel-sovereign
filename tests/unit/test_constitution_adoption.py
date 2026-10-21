@@ -957,7 +957,9 @@ def upstream(tmp_path, project, monkeypatch):
     """A checkout running ``OLD`` whose upstream now carries ``NEW``.
 
     The step helpers that would change the host are recorded instead of run;
-    the gate's own git reads are real.
+    the gate's own git reads are real. The pull is recorded AND run: it moves
+    only this test's clone, and the continuation a moved ``HEAD`` hands off to
+    judges what the pull left on disk (#3702), as on a real host.
     """
     origin, clone = origin_and_clone(tmp_path, OLD)
     commit_constitution(origin, NEW, "amend the constitution")
@@ -968,8 +970,9 @@ def upstream(tmp_path, project, monkeypatch):
     monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
     steps = []
+    real_pull = cli._run_git_pull
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda _: steps.append("pull") or (0, "")
+        cli, "_run_git_pull", lambda c: steps.append("pull") or real_pull(c)
     )
     monkeypatch.setattr(
         cli,

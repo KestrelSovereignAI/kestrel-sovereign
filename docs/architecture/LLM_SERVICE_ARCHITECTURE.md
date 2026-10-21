@@ -87,6 +87,91 @@ the Codex protocol exposes stable semantic ranks. Live capability negotiation
 remains authoritative; the disk model cache is only a bounded fallback when
 the live catalog RPC is unavailable.
 
+#### Native provider retirement and turn isolation
+
+Withdrawal stops new admission; it does not retire an already acquired native
+resource or an already accepted tool invocation. If authority changes after SDK
+stream acquisition but before publication, `await_execution_work` delegates the
+exact acquired value and its physical exit callback to
+`close_native_execution_stream`. That canonical boundary admits the callback
+lazily under cleanup-only custody, joins its original Task, and retains explicit
+resource/Task debt if admission or physical retirement fails. A denied publication
+must retain the original denial together with actual close errors and observer
+cancellation, without changing their original control graphs.
+
+The physical-close boundary retains and isolates those finite originals by
+default. Plain iterator `GeneratorExit` remains close protocol, while a
+control-bearing one is preserved as evidence. Non-stream OpenAI, Anthropic and
+Ollama producers share the canonical response owner across SDK normalization
+and retries, including late per-model catalog metadata requests. Availability
+probes cannot suppress that owner's original native control, and fresh caller
+scopes may still reuse a healthy shared client. Temporary client lifetime
+retirement remains distinct from per-operation response ownership. Private
+OpenRouter response/stream clients and temporary Google catalog SDKs retire
+before their request lifetime exits; Vertex's cached private client belongs to
+the adapter's `aclose()`. Supplied route clients remain borrowed. All GenAI
+shutdown observers join the same original SDK/session/pool Task, including
+when callback publication fails. Refused or unstarted retirement retains the
+actual resource and original Task rather than reporting physical success.
+Private close debt is carried separately from shared source control errors.
+Asynchronous abandoned-result cleanup and inline Codex Stop checkpoints use
+the same receipt-and-join boundary before releasing their original stream,
+turn sink or mutex. A failed canonical callback cannot hide an accepted Task
+behind a replacement Future or allow its unstarted body to run eagerly.
+
+Offline embedding resolution establishes the same unpublished-service owner
+immediately after constructing a private `LLMService`, before awaiting persisted
+configuration or discovery. A resolution that cannot return retires that owner
+itself. `AgentEmbeddingResolution` then hands off the lifetime explicitly: use
+`async with resolution` or `await resolution.aclose()`. Reindex owns it across
+dry-run, refusal, write and failure exits; reanchor uses that same lifetime with
+its known committed-body distinction. Injected services remain borrowed.
+Synchronous target lookup never constructs a hidden service. Before-Task closer
+refusal retains both the original body/cancellation and actual resource debt.
+
+Semantic maintenance classifies original execution control before business
+status projection. Native uncertainty is not an ordinary failed-run diagnostic
+or stale-lease result. Failed diagnostics retain their original worker error,
+and exact holder/token lease release uses the canonical physical-close owner
+under cleanup-only custody. Its body, native close and actual observer withdrawal
+are isolated finite evidence, never mutations to a shared source receipt.
+
+Codex turn shutdown first closes callback admission, directly joins the original
+accepted reader Tasks, and holds the original thread mutex and event sink through
+any accepted completed-effect checkpoint. It must not allocate an intermediate
+collector to own Tasks already accepted. Checkpoint admission uses the canonical
+owned-Task boundary with the original executor as the retirement resource.
+Physical Task settlement also retires its active-set membership immediately;
+deferred completion bookkeeping must not make that finite drain repeat a join.
+
+Temporary image paths enter the owned cleanup inventory immediately after file
+construction, before context entry or writing. One unlink collector serves both
+partial materialization and turn finalization, attempts every owned path without
+following leaf symlinks, and retains cleanup errors rather than masking the
+opening failure. Within a turn, a failed unlink retains its actual path and the
+original accepted turn Task as native retirement debt, so provider fallback cannot
+consume it as ordinary availability. Image cleanup errors cannot bypass callback
+admission closure, accepted-handler/checkpoint retirement or sink/mutex release.
+
+Provider-key service calls retain original runtime admission across client
+acquisition and result disclosure. The common native HTTP hooks revalidate at
+transport dispatch, after arbitrary request observers. Public SDK/convenience
+wrappers keep both the operation and their existing awaited client shutdown
+inside that same admission; publication is checked again after shutdown.
+Cleanup is not replacement-work authority. Independent body and epilogue
+failures retain their original carriers without rewriting a shared source graph.
+Bootstrap route initialization and payer child-key provisioning use that same
+complete lifecycle, including post-close credential/route disclosure. Bootstrap
+cache hits retain the enclosing caller's admission too; a cached credential does
+not authorize a retired runtime to construct a new route.
+
+A registered callback's pure own-scope denial can remain local to that turn only
+when it carries neither canonical commit outcome nor cleanup debt. An acknowledged
+commit followed by an own-scope denial is still durable execution evidence: the
+shared connection must fail closed rather than treating it as a harmless refusal.
+These rules preserve the original source evidence rather than inferring safety
+from a Task name, exception class, or physical close alone.
+
 ### 3. Model
 
 Which weights. Lives inside a vendor. Always an opaque ID string — **never** a literal in Python.
@@ -226,6 +311,55 @@ and a caller that joined another caller's sweep records its overruns too. The
 Ollama adapter bounds its own listing calls by the same value. Its chat client
 carries no timeout: generation is bounded by the cancellable generation path
 and the orchestrator's call watchdog, not by this deadline.
+
+Owned stream producers carry the original call's observation scope even when
+the stream was constructed before the watchdog's first pull. This transfers
+only progress/attempt timing, not authority, privacy reentry or turn ownership.
+The watchdog recognizes the explicit iterator forwarding lineage; an arbitrary
+child copied from a producer cannot claim it. An already-pinned observation
+scope is never combined with another consumer's listeners or attempt bound.
+Timeouts carrying native commit uncertainty, authority denial or retained
+cleanup debt are control outcomes, not ordinary discovery outages; their
+original carrier propagates instead of becoming an empty catalog.
+
+Implicit Ollama chat/embedding catalogs own their temporary HTTPX pool through
+the same canonical LLM client-close registry as other private clients. The
+adapter inventory references that original Task; no raw wrapper must be admitted
+before cleanup ownership exists. Before-Task refusal retains client/None debt;
+failed receipt publication retains the accepted start-gated Task. Failed closes
+are never repeated. Body, physical-close and actual joiner withdrawal are finite
+isolated evidence, not private cleanup appended to a shared source error.
+Successful physical pool retirement removes obsolete client ownership, but
+first retains independent canonical publication control at the adapter. That
+control fences new private discovery and survives repeated adapter/service
+shutdown. Its finite history is bounded by borrowers admitted before fencing;
+actual joiner withdrawal stays local to its caller and invents no pool debt.
+
+The process-wide background catalog refresh has one original Task and one
+bounded strongest nonlocal-control receipt. Completion callbacks and concurrent
+or later readers share that original receipt, including cancellation carrying
+native commit uncertainty. Fresh/stale reads, refresh joins and new refresh
+admissions observe it even before deferred callback bookkeeping runs. Clearing
+catalog data does not settle native uncertainty or authorize replacement work.
+Only a physically settled refresh's pure denial of its exact original typed
+scope snapshot, with no commit or cleanup debt, stays local to that source;
+its original waiters retain the refusal, but it cannot Hold independent agents.
+This is the same canonical locality predicate used for registered Codex turns,
+never permission for the stopped owner to resume. Source admission, deferred
+factory entry and catalog publication all require original live runtime custody.
+Ordinary provider failures and internal cancellation without native control stay
+cache misses; a withdrawing reader does not acquire or cancel the shared owner.
+Refused Task admission closes the unstarted refresh coroutine without inventing
+a native cleanup acknowledgment.
+Forced discovery (`use_cache=False`) still observes the shared receipt before
+entering discovery. It controls data reuse, not control provenance. Every catalog
+publication, disk restore and outcome amendment rechecks the same receipt under
+the cache lock, so an independent live caller cannot overwrite unresolved source
+uncertainty that appeared while its own discovery was running.
+Cache-hit completion observes that same receipt again after awaited embedding
+and decision reconciliation, even when there are no availability amendments.
+This check preserves the selected snapshot; it does not substitute a newer
+catalog or infer permission from the independent reader's live scope.
 
 The deadline can only cancel a step that awaits. A listing that blocks the
 event loop cannot be cut off and holds every other route's step and deadline
@@ -381,6 +515,10 @@ Current execution truth as of 2026-05-31:
   rather than silently using an unrelated embedding service.
 - RAG and saved-item vector search consume embeddings through storage/vector
   backends once embeddings are written.
+- Provider embedding lookup borrows an explicitly supplied `LLMService`;
+  without that lifecycle owner it returns `None`, never constructs a private
+  service from ambient credentials. Standalone storage callers needing
+  embeddings must construct, inject and close their service themselves.
 - `conversation_history.embedding_vec` exists as SQLAlchemy/vector storage
   groundwork, but the current `MemoryRetriever` semantic score still uses
   keyword/concept overlap.

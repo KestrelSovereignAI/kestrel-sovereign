@@ -6,9 +6,10 @@ remain sequential. All tools go through _dispatch_tool_call —
 nothing bypasses hooks, observability, or context_stats.
 """
 
+import asyncio
 import pytest
 from dataclasses import dataclass
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock
 
 from kestrel_sovereign.agent.orchestrator_engine import (
     OrchestratorEngineMixin,
@@ -146,3 +147,60 @@ class TestIsConcurrencySafe:
 class TestMaxConcurrency:
     def test_env_default(self):
         assert MAX_TOOL_CONCURRENCY == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_parallel_failure_joins_cancellation_resistant_sibling_before_return(uncertain):
+    """Exercise the native batch owner, not a detached gather substitute."""
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    drained = asyncio.Event()
+    finished = []
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError, _explicit_control_chain, execution_commit_outcome,
+    )
+    first_error = ValueError("first child failed")
+    original_unknown = ExecutionCommitOutcomeError("unknown")
+
+    class Agent(OrchestratorEngineMixin):
+        _direct_tools = {"fail": FakeTool(safe=True), "slow": FakeTool(safe=True)}
+        _tool_to_feature = {}
+        features = {}
+
+        async def _dispatch_tool_call(self, call, *args, **kwargs):
+            if call.name == "fail":
+                await entered.wait()
+                raise first_error
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await drained.wait()
+            finished.append("slow child joined")
+            if uncertain:
+                raise original_unknown
+
+    agent = Agent()
+    task = asyncio.create_task(agent._execute_tool_batch(
+        [FakeToolCall("1", "fail", {}), FakeToolCall("2", "slow", {})],
+        {}, set(), [], 0, "message",
+    ))
+    try:
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+        assert not task.done()
+        drained.set()
+        with pytest.raises(BaseException if uncertain else ValueError) as caught:
+            await task
+        assert first_error in tuple(_explicit_control_chain(caught.value))
+        if uncertain:
+            assert original_unknown in tuple(_explicit_control_chain(caught.value))
+            assert execution_commit_outcome(caught.value) == "unknown"
+            assert tuple(_explicit_control_chain(original_unknown)) == (original_unknown,)
+        assert finished == ["slow child joined"]
+    finally:
+        drained.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

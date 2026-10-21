@@ -36,6 +36,11 @@ function createProcessor({ preRollSamples = 0, underflowSamples = 2400 } = {}) {
 }
 
 function send(processor, data) {
+  if (data.generation === undefined) {
+    processor.testGeneration ??= 0;
+    if (data.type === 'flush') processor.testGeneration += 1;
+    data = { ...data, generation: processor.testGeneration };
+  }
   processor.port.onmessage({ data });
 }
 
@@ -88,7 +93,7 @@ test('preserves sample order while reclaiming many consumed chunks', () => {
   send(processor, { type: 'end' });
 
   assert.deepEqual([...render(processor, expected.length)], expected);
-  assert.deepEqual(processor.port.messages, [{ type: 'drained' }]);
+  assert.deepEqual(processor.port.messages, [{ type: 'drained', generation: 0 }]);
 });
 
 test('holds initial audio until pre-roll fills', () => {
@@ -117,7 +122,7 @@ test('end releases a short response and reports drained after playback', () => {
     [...render(processor, pcm.length)],
     [...pcm].map((sample) => Math.fround(toFloat32(sample))),
   );
-  assert.deepEqual(processor.port.messages, [{ type: 'drained' }]);
+  assert.deepEqual(processor.port.messages, [{ type: 'drained', generation: 0 }]);
 });
 
 test('temporary underflow re-establishes pre-roll without losing later audio', () => {
@@ -129,7 +134,7 @@ test('temporary underflow re-establishes pre-roll without losing later audio', (
   send(processor, { type: 'push', pcm: first.buffer });
   render(processor, first.length);
   assert.deepEqual([...render(processor, 2)], [0, 0]);
-  assert.deepEqual(processor.port.messages, [{ type: 'underflow' }]);
+  assert.deepEqual(processor.port.messages, [{ type: 'underflow', generation: 0 }]);
 
   send(processor, { type: 'push', pcm: second.buffer });
   assert.deepEqual([...render(processor, 2)], [0, 0]);
@@ -148,5 +153,20 @@ test('flush discards queued audio for barge-in', () => {
   send(processor, { type: 'flush' });
 
   assert.deepEqual([...render(processor, pcm.length)], [0, 0, 0]);
-  assert.deepEqual(processor.port.messages, []);
+  assert.deepEqual(processor.port.messages, [{ type: 'cleared', generation: 1 }]);
+});
+
+test('only current epochs enqueue/end, and old clears cannot retire fresh PCM', () => {
+  const processor = createProcessor();
+  send(processor, { type: 'flush', generation: 1 });
+  for (const generation of [0, undefined, 2]) {
+    processor.port.onmessage({ data: { type: 'push', generation, pcm: new Int16Array([20000]).buffer } });
+    processor.port.onmessage({ data: { type: 'end', generation } });
+  }
+  assert.deepEqual([...render(processor, 3)], [0, 0, 0]);
+  send(processor, { type: 'push', generation: 1, pcm: new Int16Array([-10000]).buffer });
+  send(processor, { type: 'flush', generation: 0 });
+  send(processor, { type: 'end', generation: 1 });
+  assert.deepEqual([...render(processor, 1)], [Math.fround(toFloat32(-10000))]);
+  assert.deepEqual(processor.port.messages, [{ type: 'cleared', generation: 1 }, { type: 'drained', generation: 1 }]);
 });

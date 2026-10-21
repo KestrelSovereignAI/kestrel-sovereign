@@ -33,6 +33,10 @@ def process_local_service(
     declares; none is verified until a parity probe passes or is rehydrated.
     """
     service = ProcessLocalService.__new__(ProcessLocalService)
+    # Inception now claims its private provider borrower before embedding;
+    # retain the real constructor's ownership state while keeping routes offline.
+    service._owner_agent_did = None
+    service._execution_custody = None
     service.providers = providers
     service.disabled = False
     service._disabled_routes = {}

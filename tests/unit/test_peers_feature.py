@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import httpx
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.a2a.did_registry import (
@@ -98,12 +99,10 @@ async def test_list_peers_filters_out_self():
     feature._transport_key = ""
     feature._own_name = "emma"
 
-    response = MagicMock()
-    response.raise_for_status.return_value = None
-    response.json.return_value = [
+    response = httpx.Response(200, request=httpx.Request("GET", "http://multi_agent/api/agents"), json=[
         {"name": "emma", "status": "online"},
         {"name": "claw", "status": "online", "description": "peer"},
-    ]
+    ])
 
     client = AsyncMock()
     client.__aenter__.return_value = client

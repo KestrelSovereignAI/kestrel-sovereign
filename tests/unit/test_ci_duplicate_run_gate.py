@@ -378,7 +378,7 @@ class TestTierConditions:
     corresponds to a mutation that left every other test green.
     """
 
-    TIERS = ("integration-tests", "llm-tests")
+    TIERS = ("integration-tests", "llm-tests", "native-postgres-tests")
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_skips_main_branch_pushes(self, tier):
@@ -514,5 +514,5 @@ class TestFailFast:
         cancel can reach it. If a tier ever depended on nothing, it could finish
         before unit-tests failed."""
         jobs = _jobs()
-        for tier in ("integration-tests", "llm-tests"):
+        for tier in ("integration-tests", "llm-tests", "native-postgres-tests"):
             assert jobs[tier]["needs"], f"{tier} must declare a dependency"

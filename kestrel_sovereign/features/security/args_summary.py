@@ -234,7 +234,12 @@ def mask_sensitive(
         altered = False
         try:
             nested, end = _JSON_PREFIX.raw_decode(stripped)
-        except (ValueError, RecursionError):
+        except RecursionError:
+            # Decoder recursion limits differ across supported interpreters.
+            # An uninspectable structured payload must be withheld here too,
+            # not returned raw and subsequently truncated inside its string.
+            return "(payload nested past the limit; not shown)"
+        except ValueError:
             nested, altered = repair_json_text(stripped, max_trim=repair_slack) if repair_slack else (None, False)
             end = len(stripped)
             if nested is not None and altered and reconstructed is not None:

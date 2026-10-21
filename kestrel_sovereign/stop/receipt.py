@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -16,9 +17,12 @@ from uuid import uuid4
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
-    raise_owned_outcome,
 )
 from kestrel_sovereign.agent.invocation import validate_invocation_id
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.storage.database_clock import (
     database_lease_cutoff_sql,
     database_now_sql,
@@ -468,6 +472,8 @@ class StopReceiptStore:
                     (stored_operation_id, fingerprint),
                 )
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             domain = self._domain_error(error)
             if domain is not None:
                 raise domain from error
@@ -858,6 +864,8 @@ class StopReceiptStore:
                     claim_id=claim_id,
                 )
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             # The transaction wrapper re-raises as a backend error; a typed
             # conflict must stay typed so callers do not read it as an
             # unavailable store.
@@ -946,7 +954,9 @@ class StopReceiptStore:
                 try:
                     if not await self.renew_claim(claim):
                         return
-                except Exception:  # a missed heartbeat, not a crash
+                except Exception as error:  # a missed heartbeat, not a crash
+                    if is_execution_control_error(error):
+                        raise
                     # Retry on the next tick: renewal is non-revivable, so a
                     # failure that outlasts the lease ends here as a lost
                     # claim, which a retry may then take over. The owner keeps
@@ -961,11 +971,12 @@ class StopReceiptStore:
         try:
             yield
         finally:
+            primary = sys.exception()
             released.set()
-            raise_owned_outcome(
-                await await_owned_task(renewal),
-                operation="Stop operation claim lease",
-            )
+            outcome = await await_owned_task(renewal)
+            terminal = execution_terminal_error(primary, outcome.error, outcome.cancellation)
+            if terminal is not None:
+                raise terminal
 
     async def persist(
         self,
@@ -1105,6 +1116,8 @@ class StopReceiptStore:
                         )
                 return stored
         except Exception as error:
+            if is_execution_control_error(error):
+                raise
             domain = self._domain_error(error)
             if domain is not None:
                 raise domain from error

@@ -98,7 +98,7 @@ def test_clean_wheel_install_exposes_marker(built_wheel, tmp_path):
     environment = _isolated_environment()
     venv_dir = tmp_path / "typed-marker-venv"
     subprocess.run(
-        ["uv", "venv", "--no-project", str(venv_dir)],
+        ["uv", "venv", "--no-project", "--python", sys.executable, str(venv_dir)],
         cwd=tmp_path,
         env=environment,
         check=True,

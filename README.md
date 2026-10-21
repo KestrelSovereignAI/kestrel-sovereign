@@ -280,6 +280,8 @@ Update mode is per-feature, read from the `.kestrel-host-features.toml` **source
 - `git pull --ff-only` so a non-fast-forward upstream aborts instead of producing a surprise merge.
 - Refuses to pull when the working tree has modified TRACKED files unless `--allow-dirty` is passed.
 - Any step's failure short-circuits the rest, so a half-applied update never reaches the restart phase.
+- Before the pull (when features will sync), refuses when a `.kestrel-host-features.toml` window excludes the version pinned by the `uv.lock` the pull will land (read from git at that revision), naming each entry, the window and the locked version. Every `feature sync` restore is held to both, so none could succeed — and finding that after `uv sync` had pruned the packages the sync restores left a host without its features. Nothing is pulled, installed or restarted. A package the lock covers is best declared `pypi = ""`, so the lock decides its version. `--continue-on-error` warns and installs anyway. `kestrel feature sync --preflight [--lock-revision REV]` runs the same check alone, and the restart coordinator's `update_then_restart` runs it against `FETCH_HEAD` before its checkout.
+- The install step hands the remaining steps to a fresh interpreter of the same venv: `kestrel update` re-runs itself with `--no-pull --no-install`, forwarding every other flag, and exits with that run's status. A process keeps every module it has imported after `git pull` or `uv sync` replaces it on disk, so the steps after them would otherwise run a mix of old and new code against packages the sync deleted. The pull does not hand off: until the install, the pulled code need not even import against the installed packages, so the interpreter that imported the old code drives the install. The update that first pulls this change in still runs the old code; if it fails after `uv sync`, run `kestrel update` again — not `git pull && kestrel update`, which starts the new code on the old packages.
 - Before any step runs, refuses (exit status 5, nothing changed) when the revision the pull will land on governs by a constitution an agent is not anchored to: restarting onto it would boot that agent into constitution Safe Mode. Every local agent is judged, even for `kestrel update <name>`, because the package is shared. The refusal names the agents and both hashes and prints the reanchor procedure. The restart step checks again, in a fresh interpreter, against what was installed. `kestrel restart` and the restart coordinator apply the same check; `--allow-constitution-safe-mode` restarts anyway, for an operator about to run that ceremony. See [Deploys that change the governing constitution](docs/architecture/security/SOVEREIGN_TRUST_ROOT.md#deploys-that-change-the-governing-constitution).
 - Source checkout and runtime data root (`KESTREL_HOME`) are resolved separately. The pull/install run against the source checkout (discovered by introspecting `kestrel_sovereign.__file__` — must have both `pyproject.toml` and `.git`). The runtime data root is used only for `feature sync`'s manifest lookup.
 
@@ -326,8 +328,19 @@ use the scheduler host's own storage pool, not the agents' advisory pool.
 
 #### SDK 0.39 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.39.0,<0.40`; the
-`observability` extra carries the same SDK line with `metrics`. 0.39.0 adds
+Core requires `kestrel-sovereign-sdk[httpx,tracing]>=0.39.2,<0.40`; the
+`observability` extra adds `metrics` under that same base constraint. The SDK
+owns the canonical outbound URL/IP policy and native pinned HTTP transport.
+Version 0.39.2 aligns DNS, canonical URLs and native origin checks to IDNA 2008;
+avatar downloads and DID resolution use it. Core retains only its stdlib HTTPS
+I/O implementation for DID documents. That binding shares one TCP/TLS deadline
+across approved addresses, retries TCP connection failures only, and keeps
+certificate verification and environment-proxy isolation. Callers use the
+validated canonical URL; avatar downloads refuse redirects and map transport
+origin refusals to HTTP 400. DID resolution uses a 10-second connection budget
+and socket read timeout; DNS and complete response download still need separate
+liveness bounds, tracked in [#3695](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3695).
+0.39.0 adds
 the decisions contract (LLM contract v7, epic #3424) that `LLMService.decide`
 is built on, on top of the runtime contracts of the 0.37–0.38 line: durable
 isolated execution, provider-neutral private inference leases (including

@@ -1960,7 +1960,7 @@ class TestAgentCancellation:
             async def aclose(self):
                 return None
 
-        monkeypatch.setattr(bridge_router, "OwnedAsyncIterator", StopAfterDequeue)
+        monkeypatch.setattr(bridge_router, "create_owned_iterator", AsyncMock(side_effect=StopAfterDequeue))
         bridge = MagicMock()
         bridge.get_or_create_session = AsyncMock(
             return_value=MagicMock(id="bridge-session")
@@ -2048,7 +2048,7 @@ class TestAgentCancellation:
             async def aclose(self):
                 return None
 
-        monkeypatch.setattr(bridge_router, "OwnedAsyncIterator", StopAtEof)
+        monkeypatch.setattr(bridge_router, "create_owned_iterator", AsyncMock(side_effect=StopAtEof))
         bridge = MagicMock()
         bridge.get_or_create_session = AsyncMock(
             return_value=MagicMock(id="bridge-session")

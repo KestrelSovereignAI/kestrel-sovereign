@@ -18,6 +18,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.llm.inference_leases import (
     InferenceLeaseCoordinator,
@@ -61,6 +62,8 @@ class InferenceLeaseFeature(Feature):
         try:
             providers = discover_inference_lease_providers()
         except InferenceLeaseError as exc:
+            if is_execution_control_error(exc):
+                raise
             # Provider packages are an optional extension boundary. Keep the
             # agent available when one installed entry point is malformed,
             # while failing every lease operation clearly and without falling
@@ -79,6 +82,8 @@ class InferenceLeaseFeature(Feature):
             try:
                 await self._coordinator.restore(payload)
             except InferenceLeaseError as exc:
+                if is_execution_control_error(exc):
+                    raise
                 self._reconciliation_error = str(exc)
                 logger.error("Private inference lease reconciliation failed: %s", exc)
 
@@ -199,8 +204,12 @@ class InferenceLeaseFeature(Feature):
             )
             lease = await self._require_coordinator().acquire(request)
         except (InvalidOperation, TypeError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
             return ToolResult.failed(f"Invalid inference lease request: {exc}")
         except InferenceLeaseError as exc:
+            if is_execution_control_error(exc):
+                raise
             return ToolResult.failed(str(exc))
         self._reconciliation_error = None
         return ToolResult.ok(
@@ -226,6 +235,8 @@ class InferenceLeaseFeature(Feature):
         try:
             lease = await self._require_coordinator().status(lease_id)
         except InferenceLeaseError as exc:
+            if is_execution_control_error(exc):
+                raise
             return ToolResult.failed(str(exc))
         self._reconciliation_error = None
         return ToolResult.ok(
@@ -251,6 +262,8 @@ class InferenceLeaseFeature(Feature):
         try:
             lease = await self._require_coordinator().release(lease_id)
         except InferenceLeaseError as exc:
+            if is_execution_control_error(exc):
+                raise
             return ToolResult.failed(str(exc))
         self._reconciliation_error = None
         return ToolResult.ok(

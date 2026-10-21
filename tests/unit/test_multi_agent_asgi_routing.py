@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 
 
-def _make_middleware(agent_for: dict[str, Any] | None = None):
+def _make_middleware(monkeypatch, agent_for: dict[str, Any] | None = None):
     """Build the middleware with a stubbed agent_manager.
 
     Imports server.py late to avoid loading the whole app at module-import
@@ -42,17 +42,16 @@ def _make_middleware(agent_for: dict[str, Any] | None = None):
     fake_manager = MagicMock()
     fake_manager.get_agent = MagicMock(side_effect=lambda name: (agent_for or {}).get(name))
 
-    # Patch the module-level `app.state.agent_manager` reference the
-    # middleware reads. Using direct attribute set instead of monkeypatch
-    # so the change persists across the await chain.
-    server_module.app.state.agent_manager = fake_manager
+    # Monkeypatch spans the entire async test and restores the exact original
+    # owner afterwards. A direct assignment leaks into the next server lifespan.
+    monkeypatch.setattr(server_module.app.state, "agent_manager", fake_manager, raising=False)
     return mw, inner_calls, fake_manager
 
 
 @pytest.mark.asyncio
-async def test_http_request_with_known_agent_strips_prefix_and_attaches_agent():
+async def test_http_request_with_known_agent_strips_prefix_and_attaches_agent(monkeypatch):
     fake_agent = MagicMock(name="Nellie")
-    mw, inner, _ = _make_middleware({"Nellie": fake_agent})
+    mw, inner, _ = _make_middleware(monkeypatch, {"Nellie": fake_agent})
 
     scope = {
         "type": "http",
@@ -77,10 +76,10 @@ async def test_http_request_with_known_agent_strips_prefix_and_attaches_agent():
 
 
 @pytest.mark.asyncio
-async def test_encoded_route_preserves_slash_and_unicode_agent_name():
+async def test_encoded_route_preserves_slash_and_unicode_agent_name(monkeypatch):
     agent_name = "Emma bird/\N{SNOWMAN}"
     fake_agent = MagicMock(name=agent_name)
-    mw, inner, manager = _make_middleware({agent_name: fake_agent})
+    mw, inner, manager = _make_middleware(monkeypatch, {agent_name: fake_agent})
     from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
 
     segment = encode_agent_route_name(agent_name)
@@ -104,12 +103,12 @@ async def test_encoded_route_preserves_slash_and_unicode_agent_name():
 
 
 @pytest.mark.asyncio
-async def test_websocket_with_known_agent_strips_prefix_and_attaches_agent():
+async def test_websocket_with_known_agent_strips_prefix_and_attaches_agent(monkeypatch):
     """The bug this middleware fixes: WebSocket scope used to bypass agent
     resolution entirely because @app.middleware('http') doesn't fire on it.
     """
     fake_agent = MagicMock(name="Nellie")
-    mw, inner, _ = _make_middleware({"Nellie": fake_agent})
+    mw, inner, _ = _make_middleware(monkeypatch, {"Nellie": fake_agent})
 
     scope = {
         "type": "websocket",
@@ -133,11 +132,11 @@ async def test_websocket_with_known_agent_strips_prefix_and_attaches_agent():
 
 
 @pytest.mark.asyncio
-async def test_websocket_with_unknown_agent_closes_with_4404():
+async def test_websocket_with_unknown_agent_closes_with_4404(monkeypatch):
     """Don't accept a WS for a missing agent — emit a clear close code so the
     browser console has something actionable instead of a generic disconnect.
     """
-    mw, inner, _ = _make_middleware({})  # no agents
+    mw, inner, _ = _make_middleware(monkeypatch, {})  # no agents
 
     scope = {
         "type": "websocket",
@@ -161,8 +160,8 @@ async def test_websocket_with_unknown_agent_closes_with_4404():
 
 
 @pytest.mark.asyncio
-async def test_http_with_unknown_agent_returns_404_json():
-    mw, inner, _ = _make_middleware({})
+async def test_http_with_unknown_agent_returns_404_json(monkeypatch):
+    mw, inner, _ = _make_middleware(monkeypatch, {})
 
     scope = {
         "type": "http",
@@ -207,9 +206,9 @@ async def test_http_with_unknown_agent_returns_404_json():
 
 
 @pytest.mark.asyncio
-async def test_non_agent_path_passes_through_unchanged():
+async def test_non_agent_path_passes_through_unchanged(monkeypatch):
     """Routes outside /api/agents/{name}/... must not be touched."""
-    mw, inner, _ = _make_middleware({"Nellie": MagicMock()})
+    mw, inner, _ = _make_middleware(monkeypatch, {"Nellie": MagicMock()})
 
     scope = {
         "type": "http",
@@ -234,7 +233,7 @@ async def test_non_agent_path_passes_through_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_no_agent_manager_passes_through():
+async def test_no_agent_manager_passes_through(monkeypatch):
     """Single-agent mode (no agent_manager on app.state) — middleware no-op."""
     import server as server_module
 
@@ -245,7 +244,7 @@ async def test_no_agent_manager_passes_through():
 
     mw = server_module.MultiAgentAgentRoutingMiddleware(_inner)
     # Force agent_manager to None.
-    server_module.app.state.agent_manager = None
+    monkeypatch.setattr(server_module.app.state, "agent_manager", None, raising=False)
 
     scope = {
         "type": "http",
@@ -269,8 +268,8 @@ async def test_no_agent_manager_passes_through():
 
 
 @pytest.mark.asyncio
-async def test_lifespan_scope_passes_through():
-    mw, inner, _ = _make_middleware({"Nellie": MagicMock()})
+async def test_lifespan_scope_passes_through(monkeypatch):
+    mw, inner, _ = _make_middleware(monkeypatch, {"Nellie": MagicMock()})
 
     scope = {"type": "lifespan"}
 

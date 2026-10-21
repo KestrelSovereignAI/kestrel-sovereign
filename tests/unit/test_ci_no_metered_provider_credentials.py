@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 
-@pytest.mark.parametrize("job", ["integration-tests", "llm-tests"])
+@pytest.mark.parametrize("job", ["integration-tests", "llm-tests", "native-postgres-tests", "minimum-python-custody"])
 def test_provider_credentials_are_explicitly_blank_in_routine_test_steps(job):
     path = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
     workflow = yaml.safe_load(path.read_text())

@@ -13,7 +13,6 @@ import stat
 import subprocess
 import sys
 import threading
-import time
 import traceback
 import types
 import weakref
@@ -84,6 +83,78 @@ from tests.utils.scheduler_ticks import tick_and_settle
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["error", "unknown", "cancel", "cancel_unknown", "group"])
+async def test_detached_cursor_ingress_retains_native_control_without_provider_retry(monkeypatch, tmp_path, kind):
+    from tests.unit.test_execution_custody_review29 import native_owner, retire
+    from tests.unit.test_execution_custody_review30 import carrier
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.features.channels.feature import ChannelFeature as ActualChannelFeature
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    agent, db = await native_owner(tmp_path)
+    agent.storage.agent_id = agent.did
+    await agent.storage.initialize()
+    agent.signal_registry = SourceRegistry()
+    entered, release = asyncio.Event(), asyncio.Event()
+    failure = carrier(kind)
+
+    class NativeChannel(ActualChannelFeature):
+        async def handle_inbound(self, message):
+            await db.execute("INSERT INTO effects VALUES (1)")
+            entered.set()
+            await release.wait()
+            raise failure
+
+    class CursorClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {"channel": {"channel_type": "telegram", "send_tool": "telegram_send"}}
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(names=("telegram-polling-ack", "telegram-polling-nack"))
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append(name)
+            return {"status": "ok", "http_status": 200}
+
+    channel = NativeChannel(agent)
+    agent.features = {"ChannelFeature": channel}
+    await channel.initialize()
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=CursorClient)
+    agent.features["TestFeature"] = feature
+    key = "telegram:v2:bot:42:update:101"
+    task = None
+    try:
+        await feature.initialize()
+        client = feature._client
+        await client.event_handler({"type": "channel.inbound", "payload": {
+            "message": {"channel_type": "telegram", "direction": "inbound", "sender": "555", "recipient": "42", "content": "native", "id": key, "metadata": {"dedupe_key": key}},
+            "_host_ingress_ack": {"name": "telegram-polling-ack", "payload": {"dedupe_key": key, "attempt_token": _TELEGRAM_ATTEMPT_TOKEN}},
+            "_host_ingress_retry": {"name": "telegram-polling-nack", "payload": {"dedupe_key": key, "attempt_token": _TELEGRAM_ATTEMPT_TOKEN}},
+        }})
+        await asyncio.wait_for(entered.wait(), 5)
+        tasks = tuple(feature._event_ingress_tasks)
+        assert len(tasks) == 1
+        task = tasks[0]
+        release.set()
+        outcome = await await_owned_task(task)
+        assert outcome.error is failure
+        assert client.completions == [], "native control authorized a provider retry or ACK"
+        assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
+        with pytest.raises(BaseException) as caught:
+            await feature.shutdown()
+        assert is_execution_control_error(caught.value)
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        await retire(agent)
+
 # How long a test waits for work it set in motion before calling it hung. This
 # bounds a deadlock, not the work: a passing run returns as soon as the awaited
 # event fires. A foreign owner loop runs on its own thread, which a loaded
@@ -309,6 +380,16 @@ def _idle_test_runtime() -> InstalledFeatureRuntime:
 
 
 def _configure_idle_lifecycle(agent, tmp_path, **kwargs) -> None:
+    # A real Agent publisher returns an actual owned Task. Auto-created Mock
+    # attributes are not native publication acknowledgments.
+    if isinstance(getattr(agent, "_track_background_task", None), Mock):
+        agent._background_tasks = set()
+        agent._remember_shutdown_control = types.MethodType(
+            KestrelAgent._remember_shutdown_control, agent
+        )
+        agent._track_background_task = types.MethodType(
+            KestrelAgent._track_background_task, agent
+        )
     agent.isolated_runtime_root = tmp_path / "runtimes"
     agent.isolated_runtime_namespace = "tenant/agent"
     agent.isolated_runtime_scope = resolve_isolated_runtime_namespace(
@@ -1173,7 +1254,9 @@ async def test_failed_idle_wake_revalidation_keeps_immutable_venv_custody(
     assert immutable_venv.is_dir()
     assert immutable_python.is_file()
     feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
-    assert feature._hosted_immutable_venv_custody_unproven is False
+    # A new successful selection proves its current metadata, not custody of
+    # every historical selection at the failed wake. It cannot erase that debt.
+    assert feature._hosted_immutable_venv_custody_unproven is True
     assert feature.runtime_telemetry_snapshot().cleanup_eligible is False
 
 
@@ -3904,12 +3987,14 @@ def test_hosted_lifecycle_policy_requires_and_binds_explicit_agent_scope(tmp_pat
         KestrelAgent(
             did="did:test:unscoped-idle",
             storage_path=str(tmp_path / "unscoped" / "agent.db"),
+            llm_service=Mock(providers=[]),  # This constructor-policy test owns no providers.
             isolated_runtime_idle_timeout_seconds=60,
         )
 
     agent = KestrelAgent(
         did="did:test:scoped-idle",
         storage_path=str(tmp_path / "scoped" / "agent.db"),
+        llm_service=Mock(providers=[]),
         isolated_runtime_root=tmp_path / "runtimes",
         isolated_runtime_namespace="tenant/agent",
         isolated_runtime_idle_timeout_seconds=60,
@@ -4121,7 +4206,7 @@ async def test_scheduler_revokes_context_for_detached_core_child_before_late_iso
             return True
 
         async def _renew_lease(self, task):
-            await asyncio.Future()
+            await asyncio.current_task()._kestrel_renewal_state.stop_requested.wait()
 
         async def _finalize(self, *args, **kwargs):
             return None

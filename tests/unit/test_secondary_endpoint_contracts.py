@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi import FastAPI
+from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 
 
@@ -41,8 +43,8 @@ def _ensure_observability_router(app):
     ``FastAPI.include_router`` would otherwise add duplicate routes on every
     call. Detect the presence of the summary route and skip if present."""
     target = "/api/observability/summary"
-    for route in app.routes:
-        if getattr(route, "path", None) == target:
+    for context in iter_route_contexts(app.routes):
+        if context.path == target:
             return
     from kestrel_sovereign.endpoints.observability import router as observability_router
     app.include_router(observability_router)
@@ -356,3 +358,13 @@ def test_saved_items_item_crud_search_and_pin_contracts():
         assert delete_response.json() == {"success": True, "deleted_id": "item-1"}
     finally:
         _restore_app(app, original)
+
+
+def test_observability_router_mount_is_idempotent_with_native_includes():
+    app = FastAPI()
+    for _ in range(3):
+        _ensure_observability_router(app)
+    assert sum(
+        context.path == "/api/observability/summary"
+        for context in iter_route_contexts(app.routes)
+    ) == 1

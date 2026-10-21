@@ -14,6 +14,7 @@ import tomllib
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
@@ -52,16 +53,19 @@ SECURITY_FLOORS = {
 # the public operator contribution contracts, 0.37.1 adds lifecycle-owned
 # context-clause contributions, 0.38.1 adds awaited preparation before
 # synchronous context rendering, and 0.39.0 adds the decisions contract (LLM
-# contract v7, #3424) that ``LLMService.decide`` is built on. This remains a Core-only
+# contract v7, #3424) that ``LLMService.decide`` is built on. Version 0.39.1
+# adds the shared outbound policy and native pinned transports; 0.39.2 fixes
+# their canonical host identity before DNS and native requests (#3679).
+# Core's avatar and did:web fetchers require that correction. This is a Core-only
 # release gate: sibling packages are released from their own repositories, but
 # Core must never
 # silently lower its declared/locked line to accommodate an older Frinz or
 # observability constraint. Their compatible releases remain a documented
 # release-cascade prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.39.0"), ("<", "0.40")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.39.2"), ("<", "0.40")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
-    "base": frozenset({"tracing"}),
-    "observability": frozenset({"metrics", "tracing"}),
+    "base": frozenset({"httpx", "tracing"}),
+    "observability": frozenset({"metrics"}),
 }
 SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
     # These are release prerequisites, not declarations about sibling repos'
@@ -86,6 +90,24 @@ def _pyproject() -> dict:
 def _lock() -> dict:
     with open(REPO_ROOT / "uv.lock", "rb") as f:
         return tomllib.load(f)
+
+
+def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
+    """The real HTTPS campaign cannot resolve a Docker-only feature release."""
+    dependencies = _pyproject()["project"]["optional-dependencies"]["mcp-integration"]
+    (requirement,) = [
+        Requirement(raw)
+        for raw in dependencies
+        if Requirement(raw).name == "kestrel-feature-mcp"
+    ]
+    assert not requirement.specifier.contains("0.6.0")
+    assert requirement.specifier.contains("0.7.0")
+    assert requirement.specifier.contains("0.8.0")
+    (package,) = [
+        item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
+    ]
+    assert Version(package["version"]) >= Version("0.7.0")
+    assert package["source"] == {"registry": "https://pypi.org/simple"}
 
 
 def _locked_root_package(lock: dict) -> dict:
@@ -235,7 +257,9 @@ def test_asyncpg_runtime_probe_supports_current_minor_releases():
     assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.30.0"}]
 
 
-def _sdk_contract_requirement(raw_requirements, *, extras):
+def _sdk_contract_requirement(
+    raw_requirements, *, extras, specifiers=SDK_RELEASE_CASCADE_SPECIFIERS,
+):
     requirements = [
         Requirement(raw)
         for raw in raw_requirements
@@ -247,12 +271,12 @@ def _sdk_contract_requirement(raw_requirements, *, extras):
     assert requirement.extras == extras
     assert {
         (specifier.operator, specifier.version) for specifier in requirement.specifier
-    } == SDK_RELEASE_CASCADE_SPECIFIERS
+    } == specifiers
     return requirement
 
 
 def test_sdk_039_release_cascade_contract_is_declared():
-    """Core and its observability extra must require the v0.39 SDK line.
+    """Core owns the transport floor; observability adds metrics to that floor.
 
     This deliberately does not inspect sibling worktrees: their compatible
     Frinz/observability releases are an external release prerequisite, while
@@ -267,11 +291,14 @@ def test_sdk_039_release_cascade_contract_is_declared():
     observability = _sdk_contract_requirement(
         pyproject["project"]["optional-dependencies"]["observability"],
         extras=SDK_RELEASE_CASCADE_CONTRACTS["observability"],
+        specifiers=frozenset(),
     )
-    for requirement in (base, observability):
-        assert Version("0.38.2") not in requirement.specifier
-        assert Version("0.39.0") in requirement.specifier
-        assert Version("0.40.0") not in requirement.specifier
+    for specifier in (base.specifier, base.specifier & observability.specifier):
+        assert Version("0.38.2") not in specifier
+        assert Version("0.39.0") not in specifier
+        assert Version("0.39.1") not in specifier
+        assert Version("0.39.2") in specifier
+        assert Version("0.40.0") not in specifier
 
     # The human release contract identifies downstream gates without probing
     # their (possibly dirty or unavailable) repositories from Core CI.
@@ -282,24 +309,27 @@ def test_sdk_039_release_cascade_contract_is_declared():
 
 
 def test_sdk_039_release_cascade_contract_is_locked():
-    """The lock must exercise the decisions contract on the v0.39 line."""
+    """The lock must exercise the outbound contract and one canonical floor."""
 
     root = _locked_root_package(_lock())
     locked_contracts = {
         (
             frozenset(requirement.get("extras", [])),
             requirement.get("marker"),
-            requirement.get("specifier"),
+            frozenset(
+                (specifier.operator, specifier.version)
+                for specifier in SpecifierSet(requirement.get("specifier", ""))
+            ),
         )
         for requirement in root["metadata"]["requires-dist"]
         if requirement["name"] == "kestrel-sovereign-sdk"
     }
     assert locked_contracts == {
-        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.39.0,<0.40"),
+        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, SDK_RELEASE_CASCADE_SPECIFIERS),
         (
             SDK_RELEASE_CASCADE_CONTRACTS["observability"],
             "extra == 'observability'",
-            ">=0.39.0,<0.40",
+            frozenset(),
         ),
     }
 
@@ -310,5 +340,5 @@ def test_sdk_039_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.39.0") <= version < Version("0.40.0") for version in sdk_versions
+        Version("0.39.2") <= version < Version("0.40.0") for version in sdk_versions
     )

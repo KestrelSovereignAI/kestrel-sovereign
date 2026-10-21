@@ -483,13 +483,17 @@ async def test_a_commit_task_cancelled_during_commit_keeps_the_fence_closed(
     during COMMIT, whether its documents committed is unknown, so the lease is
     kept and transitions stay refused rather than following a commit that may
     still land."""
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
     wrapper = PrivacyEnforcingStorage(sqlite_storage, PrivacyMode.DEIDENTIFIED)
     save = asyncio.create_task(wrapper.store_deidentified_records(_result()))
     await asyncio.wait_for(asyncio.to_thread(delayed_sqlite_commit.entered.wait, 30), timeout=30)
 
     _commit_task().cancel()
-    with pytest.raises(PrivacyViolationError, match="commit outcome is unknown"):
+    with pytest.raises(PrivacyViolationError, match="commit outcome is unknown") as receipt:
         await asyncio.wait_for(save, timeout=30)
+    assert isinstance(receipt.value.__cause__, ExecutionCommitOutcomeError)
+    assert receipt.value.__cause__.commit_outcome == "unknown"
+    assert isinstance(receipt.value.__cause__.__cause__, asyncio.CancelledError)
     assert wrapper._active_deidentified_save_leases == 1
     with pytest.raises(PrivacyViolationError, match="de-identified record save"):
         wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)

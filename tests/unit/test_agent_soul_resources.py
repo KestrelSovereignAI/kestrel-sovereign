@@ -60,6 +60,29 @@ async def test_soul_resource_round_trip_is_encrypted(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_sqlite_text_ciphertext_remains_readable(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        resource = await storage.promote_soul_seed(
+            "legacy private identity", created_by=TEST_AGENT_ID
+        )
+        row = await storage.db.fetchone(
+            "SELECT content_ciphertext FROM agent_identity_resources WHERE id = ?",
+            (resource.id,),
+        )
+        assert isinstance(row[0], bytes)
+        await storage.db.execute(
+            "UPDATE agent_identity_resources SET content_ciphertext = ? WHERE id = ?",
+            (row[0].decode("utf-8"), resource.id),
+        )
+        current = await storage.get_current_agent_resource()
+        assert current.content == "legacy private identity"
+        assert current.id == resource.id
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_soul_resource_versions_select_current_and_keep_provenance(tmp_path):
     storage = await _storage(tmp_path)
     try:

@@ -7,7 +7,7 @@ import os
 import shutil
 import sqlite3
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -149,6 +149,18 @@ async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(
             self.executed = []
             self.terminated = False
 
+        def get_server_pid(self):
+            return 3569
+
+        def is_closed(self):
+            return self.terminated
+
+        def add_termination_listener(self, callback):
+            self.listener = callback
+
+        def remove_termination_listener(self, callback):
+            assert callback == self.listener
+
         async def fetchval(self, query, *_params):
             assert "pg_control_system" in query
             return "cluster-selected-by-load-balancer"
@@ -159,25 +171,26 @@ async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(
         def terminate(self):
             self.terminated = True
 
+        async def close(self):
+            self.terminated = True
+
     connection = _Connection()
 
-    class _Acquire:
-        async def __aenter__(self):
-            return connection
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class _Pool:
-        def acquire(self):
-            return _Acquire()
-
     backend = object.__new__(PostgresBackend)
+    pool = object()
     monkeypatch.setattr(
         backend,
         "_ensure_advisory_pool",
-        AsyncMock(return_value=_Pool()),
+        AsyncMock(return_value=pool),
     )
+    # Structural cluster-selection proof only. The canonical native checkout
+    # now owns reset separately; actual asyncpg retirement is integration-tested.
+    @asynccontextmanager
+    async def checkout(selected, *, admit_work):
+        assert selected is pool and admit_work is False
+        yield connection, None
+
+    monkeypatch.setattr(backend, "_tracked_pool_checkout", checkout)
 
     with pytest.raises(QueryError, match="validated PostgreSQL cluster"):
         async with backend.advisory_locks(
@@ -1486,16 +1499,26 @@ def test_backend_validation_does_not_create_stopped_wal_sidecars(tmp_path):
     from kestrel_sovereign.hold.state import validate_hold_backend_custody
 
     database = tmp_path / "stopped-wal.db"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("CREATE TABLE ordinary_host_state(value TEXT)")
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    _assert_original_sqlite_closed(connection)
     sidecars = (Path(f"{database}-wal"), Path(f"{database}-shm"))
     for sidecar in sidecars:
         sidecar.unlink(missing_ok=True)
 
     assert validate_hold_backend_custody(database, "postgres") is False
     assert not any(sidecar.exists() for sidecar in sidecars)
+
+
+def _assert_original_sqlite_closed(connection):
+    """Check the actual allocated handle, closing even a deliberately RED case."""
+    try:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+    finally:
+        connection.close()
 
 
 def test_backend_validation_rejects_insecure_binding_without_hardening_it(
@@ -1890,6 +1913,10 @@ async def test_database_factory_preserves_both_errors_and_marks_uncertain_cleanu
     from kestrel_sovereign.storage import async_database as database_module
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+
+    primary = RuntimeError("primary schema failure")
+    cleanup = RuntimeError("cleanup failed")
 
     class _Backend:
         backend_type = "postgres"
@@ -1898,24 +1925,31 @@ async def test_database_factory_preserves_both_errors_and_marks_uncertain_cleanu
             return None
 
         async def close(self):
-            raise RuntimeError("cleanup failed")
+            raise cleanup
 
     async def _fail_schema(_self):
-        raise RuntimeError("primary schema failure")
+        raise primary
 
+    backend = _Backend()
     monkeypatch.setattr(
         postgres_module,
         "PostgresBackend",
-        lambda **_kwargs: _Backend(),
+        lambda **_kwargs: backend,
     )
     monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
 
     with pytest.raises(database_module.DatabaseInitializationCleanupError) as failure:
         await database_module.AsyncDatabase.postgres("postgresql://durable/host")
 
-    assert str(failure.value.initialization_error) == "primary schema failure"
-    assert str(failure.value.cleanup_error) == "cleanup failed"
-    assert failure.value.__cause__ is failure.value.cleanup_error
+    assert failure.value.initialization_error is primary
+    assert failure.value.cleanup_error is cleanup
+    # Retirement now retains its SAME recovery owner and the full finite
+    # carrier, not just the last cleanup exception as the public cause.
+    assert isinstance(failure.value.__cause__, database_module.DatabaseRetirementError)
+    assert failure.value.__cause__.retirement_owner is failure.value.retirement_owner
+    assert failure.value.retirement_owner.backend is backend
+    chain = tuple(_explicit_control_chain(failure.value))
+    assert primary in chain and cleanup in chain
 
 
 @pytest.mark.asyncio
@@ -5551,8 +5585,9 @@ async def test_legacy_latch_rejects_repeated_column_conflict_index(tmp_path):
         "ON hold_latches(scope, target_id, target_id)"
     )
     try:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             snapshot = _sqlite_hold_snapshot(connection)
+        _assert_original_sqlite_closed(connection)
         assert (
             "hold_latches",
             frozenset(("scope", "target_id")),

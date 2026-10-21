@@ -1,26 +1,13 @@
 """Latency contract for stale-while-revalidate model catalog reads."""
 
+import asyncio
+
 import pytest
 
-from kestrel_sovereign.llm.model_cache import ModelCatalogSnapshot
+from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.llm.model_cache import SharedModelCache
 from kestrel_sovereign.llm.model_discovery import ModelDiscoveryMixin
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
-
-
-class _Cache:
-    def __init__(self, models):
-        self.models = models
-        self.refresh_factory = None
-
-    def fresh_snapshot(self):
-        return None
-
-    def get_any(self):
-        return self.models
-
-    def refresh_in_background(self, factory):
-        self.refresh_factory = factory
-        return True
 
 
 class _Discovery(ModelDiscoveryMixin):
@@ -47,18 +34,25 @@ async def test_stale_catalog_returns_without_awaiting_provider_refresh(monkeypat
             category=ModelCategory.CHAT,
         )
     ]
-    cache = _Cache(models)
+    cache = SharedModelCache()
+    cache.set_stale(models)
     monkeypatch.setattr(
         "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
         lambda: cache,
     )
     discovery = _Discovery()
 
-    result = await discovery.discover_all_models(stale_while_revalidate=True)
-
-    assert result == models
-    assert discovery.resolved is models
-    assert cache.refresh_factory is not None
+    owner = None
+    try:
+        result = await discovery.discover_all_models(stale_while_revalidate=True)
+        owner = cache._refresh_task
+        assert result == models
+        assert discovery.resolved == models
+        assert owner is not None and not owner.done()
+    finally:
+        if owner is not None:
+            owner.cancel()
+            await await_owned_task(owner)
 
 
 @pytest.mark.asyncio
@@ -72,34 +66,40 @@ async def test_fresh_caller_joins_inflight_background_refresh(monkeypatch):
         )
     ]
 
-    class _JoiningCache:
-        def __init__(self):
-            self.joined = False
+    cache = SharedModelCache()
+    release, joined = asyncio.Event(), asyncio.Event()
 
-        def fresh_snapshot(self):
-            if not self.joined:
-                return None
-            return ModelCatalogSnapshot(
-                version=1, catalog_version=1, models=tuple(models), outcomes={},
-                timestamp=1.0,
-            )
+    async def refresh():
+        await release.wait()
+        cache.set(models)
 
-        async def wait_for_refresh(self):
-            self.joined = True
-            return True
+    assert cache.refresh_in_background(refresh)
+    owner = cache._refresh_task
+    actual_wait = cache.wait_for_refresh
 
-        def get_any(self):
-            return None
+    async def observe_original_join():
+        joined.set()
+        return await actual_wait()
 
-    cache = _JoiningCache()
+    monkeypatch.setattr(cache, "wait_for_refresh", observe_original_join)
     monkeypatch.setattr(
         "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
         lambda: cache,
     )
     discovery = _Discovery()
 
-    result = await discovery.discover_all_models()
-
-    assert result == models
-    assert cache.joined is True
-    assert discovery.reconciled is True
+    reader = asyncio.create_task(discovery.discover_all_models())
+    try:
+        async with asyncio.timeout(5):
+            await joined.wait()
+        assert not reader.done() and not owner.done()
+        release.set()
+        result = await reader
+        assert result == models
+        assert discovery.reconciled is True
+    finally:
+        release.set()
+        for task in (reader, owner):
+            if not task.done():
+                task.cancel()
+            await await_owned_task(task)

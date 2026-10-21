@@ -14,14 +14,16 @@ Tests:
 """
 
 import asyncio
+import inspect
 import json
 import threading
-import pytest
-import pytest_asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
+
+import pytest
+import pytest_asyncio
 
 from kestrel_sovereign.bootstrap.service import BootstrapService, BootstrapState
 from kestrel_sovereign.features.health import checks as health_checks
@@ -43,7 +45,6 @@ from kestrel_sovereign.features.health.feature import (
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db import sqlite as sqlite_backend_module
-
 
 # ============================================================================
 # Helpers
@@ -957,7 +958,7 @@ class TestHealthFeatureInitialize:
         feat = HealthFeature(agent)
 
         # Patch asyncio.create_task to avoid actually starting the loop
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
             yield feat
@@ -998,7 +999,7 @@ class TestHeartbeatCheck:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
             yield feat
@@ -1156,7 +1157,7 @@ class TestHeartbeatStatus:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
             yield feat
@@ -1232,36 +1233,38 @@ class TestHeartbeatStatus:
         assert data["history"][0]["id"] == "mem-1"
 
 
-class _FakeTask:
-    """A fake asyncio.Task that supports await, cancel(), and done().
+class _FakeTask(asyncio.Future):
+    """A native Future with cancellation observation for legacy unit fixtures.
 
     Used in tests to replace asyncio.create_task() without starting a real loop.
     """
 
     def __init__(self):
-        self._done = False
-        self._cancelled = False
+        super().__init__()
         self.cancel_called = False
 
-    def done(self):
-        return self._done
-
-    def cancel(self):
+    def cancel(self, msg=None):
         self.cancel_called = True
-        self._cancelled = True
-        self._done = True
-
-    def __await__(self):
-        if self._cancelled:
-            raise asyncio.CancelledError()
-        # Yield nothing -- completes immediately
-        return
-        yield  # Make this a generator (required for __await__)
+        return super().cancel(msg)
 
 
 def _make_awaitable_task():
     """Create a fake asyncio.Task for testing."""
     return _FakeTask()
+
+
+def _close_suppressed_background(coroutine, **_kwargs):
+    """Dispose the original coroutine when a structural fixture suppresses it.
+
+    DEFAULT keeps each existing Mock's exact configured Future/cancel identity.
+    This does not claim a real background Task, native ACK, or READY handoff.
+    """
+    try:
+        coroutine.close()
+        assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+    finally:
+        coroutine.close()
+    return DEFAULT
 
 
 class TestHeartbeatInterval:
@@ -1271,7 +1274,7 @@ class TestHeartbeatInterval:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task", return_value=_make_awaitable_task()):
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
             await feat.initialize()
             yield feat
             feat._running = False
@@ -1279,7 +1282,7 @@ class TestHeartbeatInterval:
     @pytest.mark.asyncio
     async def test_changes_interval(self, feature):
         from kestrel_sdk.tools.result import ToolResultStatus
-        with patch("asyncio.create_task", return_value=_make_awaitable_task()):
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
             result = await feature.health_interval(seconds=120)
 
         assert result.status is ToolResultStatus.OK
@@ -1369,7 +1372,7 @@ class TestHeartbeatInterval:
         value so the LLM cannot claim "set to 1" when the runtime
         accepted 10."""
         from kestrel_sdk.tools.result import ToolResultStatus
-        with patch("asyncio.create_task", return_value=_make_awaitable_task()):
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
             result = await feature.health_interval(seconds=1)
 
         assert result.status is ToolResultStatus.PARTIAL
@@ -1380,7 +1383,7 @@ class TestHeartbeatInterval:
     @pytest.mark.asyncio
     async def test_clamps_maximum(self, feature):
         from kestrel_sdk.tools.result import ToolResultStatus
-        with patch("asyncio.create_task", return_value=_make_awaitable_task()):
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
             result = await feature.health_interval(seconds=9999)
 
         assert result.status is ToolResultStatus.PARTIAL
@@ -1398,7 +1401,7 @@ class TestDeprecatedAliasTraceability:
         db = _make_db(table_exists_map={"health_log": True})
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
-        with patch("asyncio.create_task", return_value=_make_awaitable_task()):
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
             await feat.initialize()
             yield feat
             feat._running = False
@@ -1423,7 +1426,7 @@ class TestDeprecatedAliasTraceability:
     async def test_heartbeat_interval_alias_tags_partial_on_clamp(self, feature):
         """PARTIAL forwarding preserves the alias marker."""
         from kestrel_sdk.tools.result import ToolResultStatus
-        with patch("asyncio.create_task", return_value=_make_awaitable_task()):
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
             result = await feature.heartbeat_interval_alias(seconds=1)
         assert result.status is ToolResultStatus.PARTIAL
         assert result.data["deprecated_alias"] == "!heartbeat-interval"
@@ -1459,11 +1462,7 @@ class TestLifecycle:
         agent._raw_storage = MagicMock(db=db)
         feat = HealthFeature(agent)
 
-        def fake_create_task(coro):
-            coro.close()
-            return _make_awaitable_task()
-
-        with patch("asyncio.create_task", side_effect=fake_create_task):
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
             await feat.initialize()
 
         assert feat._db is db
@@ -1477,7 +1476,7 @@ class TestLifecycle:
 
         mock_task = _make_awaitable_task()
 
-        with patch("asyncio.create_task", return_value=mock_task):
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=mock_task):
             await feat.initialize()
             assert feat._running is True
 
@@ -1492,7 +1491,7 @@ class TestLifecycle:
         agent.storage.db = None
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
@@ -1516,7 +1515,7 @@ class TestGracefulDegradation:
         agent.storage.db = None
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
@@ -1542,7 +1541,7 @@ class TestGracefulDegradation:
         agent.storage.db = None
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
@@ -1561,7 +1560,7 @@ class TestGracefulDegradation:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
@@ -1596,7 +1595,7 @@ class TestToolDiscovery:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
@@ -1632,7 +1631,7 @@ class TestToolDiscovery:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
@@ -1663,7 +1662,7 @@ class TestGetLatestHeartbeat:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
@@ -1683,7 +1682,7 @@ class TestGetLatestHeartbeat:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 
@@ -1708,7 +1707,7 @@ class TestInMemoryHistoryCap:
         agent = _make_agent(db=db)
         feat = HealthFeature(agent)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch("asyncio.create_task", side_effect=_close_suppressed_background) as mock_create_task:
             mock_create_task.return_value = _make_awaitable_task()
             await feat.initialize()
 

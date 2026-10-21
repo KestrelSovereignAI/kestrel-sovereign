@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from typing import AsyncIterator, Awaitable, Callable, Optional, TypeVar
+from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import execution_terminal_error
 
 CancelToken = Callable[[], bool]
 AuthCancelFactory = Callable[[], BaseException]
@@ -66,12 +68,11 @@ async def anext_or_cancelled(
             if done:
                 return task.result()
             raise_if_cancelled(cancel_token)
-    except BaseException:
+    except BaseException as original:
         if not task.done():
             task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await task
-        raise
+        outcome = await await_owned_task(task)
+        raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
 
 async def await_or_cancelled(
@@ -79,22 +80,44 @@ async def await_or_cancelled(
     cancel_token: Optional[CancelToken],
     *,
     poll_interval: float = _POLL_INTERVAL_SECONDS,
+    abandoned_result_cleanup: Callable[[_T], Awaitable[None] | None] | None = None,
 ) -> _T:
     """Await any operation while polling ``cancel_token``."""
-    raise_if_cancelled(cancel_token)
     task = asyncio.ensure_future(awaitable)
     try:
+        # Own even a pre-created coroutine when Stop was already requested;
+        # it must be cancelled/joined, not abandoned unawaited at admission.
+        raise_if_cancelled(cancel_token)
         while True:
             done, _ = await asyncio.wait({task}, timeout=poll_interval)
             if done:
                 return task.result()
             raise_if_cancelled(cancel_token)
-    except BaseException:
+    except BaseException as original:
         if not task.done():
             task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await task
-        raise
+        outcome = await await_owned_task(task)
+        if outcome.error is None and abandoned_result_cleanup is not None:
+            from kestrel_sovereign._async_ownership import await_owned_operation
+            try:
+                operation = abandoned_result_cleanup(outcome.result)
+                # A synchronous resource release (notably Lock.release) must
+                # happen before any additional cleanup allocation can fail.
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(
+                    original, outcome.cancellation, cleanup_error, retain_originals=True,
+                    isolate_control_originals=True,
+                )
+            if operation is None:
+                raise execution_terminal_error(original, outcome.cancellation)
+            closed = await await_owned_operation(
+                operation, retirement_resource=outcome.result, retain_originals=True,
+            )
+            raise execution_terminal_error(
+                original, outcome.cancellation, closed.error, closed.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
+        raise execution_terminal_error(original, outcome.error, outcome.cancellation)
 
 
 async def await_or_auth_cancelled(
@@ -111,10 +134,10 @@ async def await_or_auth_cancelled(
     """
     if cancellation_token is None:
         return await awaitable
-    cancellation_token.raise_if_cancelled(exc_factory)
     task = asyncio.ensure_future(awaitable)
     abort_task = asyncio.create_task(cancellation_token.wait())
     try:
+        cancellation_token.raise_if_cancelled(exc_factory)
         done, _ = await asyncio.wait(
             {task, abort_task},
             return_when=asyncio.FIRST_COMPLETED,
@@ -122,23 +145,23 @@ async def await_or_auth_cancelled(
         if abort_task in done:
             if not task.done():
                 task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await task
-            raise exc_factory()
+            outcome = await await_owned_task(task)
+            raise execution_terminal_error(exc_factory(), outcome.error, outcome.cancellation)
         abort_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await abort_task
         return task.result()
-    except BaseException:
+    except BaseException as original:
         if not task.done():
             task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await task
+        outcome = await await_owned_task(task)
         if not abort_task.done():
             abort_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await abort_task
-        raise
+        abort_outcome = await await_owned_task(abort_task)
+        raise execution_terminal_error(
+            original, outcome.error, outcome.cancellation,
+            abort_outcome.error, abort_outcome.cancellation,
+        )
 
 
 __all__ = [

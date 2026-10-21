@@ -46,6 +46,8 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .encryption import (
     DecryptionError,
     decrypt_string,
@@ -202,6 +204,8 @@ async def stored_vectors_by_profile(
                 db, table, agent_id, vectors_only=True
             )
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            if is_execution_control_error(exc):
+                raise
             logger.debug("stored-vector profile count of %s failed: %s", table, exc)
             out[table] = None
     return out
@@ -224,7 +228,9 @@ async def dominant_embedding_profile(
     model that keeps new memories in the same coordinate space old memories
     already live in (continuity beats catalog order). Best-effort: any read
     failure, an empty corpus, or a dominant profile with no registry row yields
-    ``None`` and the caller falls back to hint/catalog order.
+    ``None`` and the caller falls back to hint/catalog order. Original execution
+    control is not an availability failure and propagates through the corpus
+    provider before model resolution can choose another coordinate space.
     """
     counts: Dict[str, int] = {}
     for table in _TABLE_SPECS:
@@ -233,6 +239,8 @@ async def dominant_embedding_profile(
                 db, table, agent_id, vectors_only=False
             )
         except Exception as exc:  # pragma: no cover - defensive
+            if is_execution_control_error(exc):
+                raise
             logger.debug("dominant profile scan of %s failed: %s", table, exc)
             continue
         for pid, n in table_counts.items():
@@ -251,6 +259,8 @@ async def dominant_embedding_profile(
             (dominant_id,),
         )
     except Exception as exc:  # pragma: no cover - defensive
+        if is_execution_control_error(exc):
+            raise
         logger.debug("embedding_profiles lookup failed for %s: %s", dominant_id, exc)
         return None
     if not prof_rows or not prof_rows[0]:
@@ -368,6 +378,8 @@ class EmbeddingReindexer:
             try:
                 out[table] = await self.count_stale(table, agent_id)
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug("count_stale(%s) failed: %s", table, exc)
                 out[table] = 0
         return out
@@ -433,6 +445,8 @@ class EmbeddingReindexer:
             try:
                 part = await self.classify_table_stale(table, agent_id)
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug("classify_table_stale(%s) failed: %s", table, exc)
                 continue
             for key in total:
@@ -555,6 +569,8 @@ class EmbeddingReindexer:
         try:
             embeddings = await self.service.aembed_batch([t for _, t in pending])
         except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "aembed_batch failed for %s batch of %d (%s).",
                 spec.name, len(pending), exc,
@@ -608,6 +624,8 @@ class EmbeddingReindexer:
                 )
                 stats.reembedded += 1
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "Failed to write reindexed vector for %s row %s: %s",
                     spec.name, row_id, exc,
@@ -687,6 +705,8 @@ class EmbeddingReindexer:
             try:
                 await upsert_embedding_profile(self.db, self.service, self.target)
             except Exception as exc:  # pragma: no cover - defensive
+                if is_execution_control_error(exc):
+                    raise
                 logger.debug("target profile registry upsert failed: %s", exc)
 
         return stats

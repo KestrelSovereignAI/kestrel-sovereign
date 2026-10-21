@@ -26,32 +26,35 @@ import sys
 import threading
 import warnings
 from contextlib import asynccontextmanager, contextmanager
-
-from kestrel_sovereign.storage.session_grouping import (
-    page_grouped_sessions,
-    parse_message_metadata,
-    summarize_sessions,
-)
-from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
+from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
-from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission, _retain_owned_admission_error, await_owned_task,
+    create_owned_task, owned_task_error, raise_owned_outcome,
+)
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign.turn_scope import turn_scoped
 from kestrel_sovereign.deidentification import (
     DEIDENTIFICATION_ASSURANCES,
     DeidentificationResult,
     EvidenceValidationError,
 )
-from kestrel_sovereign.privacy import (
-    PrivacyMode,
-    PrivacyConfig,
-    get_privacy_preset,
-    privacy_mode_to_config,
-    privacy_config_to_mode,
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
 )
-from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
+from kestrel_sovereign.knowledge import IRI, Visibility
+from kestrel_sovereign.privacy import (
+    PrivacyConfig,
+    PrivacyMode,
+    get_privacy_preset,
+    privacy_config_to_mode,
+    privacy_mode_to_config,
+)
+from kestrel_sovereign.storage.agent_resource_store import (
+    SOUL_MARKDOWN_RESOURCE_TYPE,
+)
 from kestrel_sovereign.storage.async_conversation_store import (
     _escape_like_session_value,
     search_session_summaries,
@@ -60,11 +63,14 @@ from kestrel_sovereign.storage.async_graph_store import (
     NodeDeleteResult,
     NodeSwapResult,
 )
-from kestrel_sovereign.storage.agent_resource_store import (
-    SOUL_MARKDOWN_RESOURCE_TYPE,
-)
+from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
-from kestrel_sovereign.knowledge import IRI, Visibility
+from kestrel_sovereign.storage.session_grouping import (
+    page_grouped_sessions,
+    parse_message_metadata,
+    summarize_sessions,
+)
+from kestrel_sovereign.turn_scope import turn_scoped
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -421,6 +427,110 @@ class ReentrantTransitionLock:
         # NORMAL-mode write. Starts set (no reentrant writer at construction).
         self._reentry_idle = asyncio.Event()
         self._reentry_idle.set()
+        self._native_work = set()
+        self._foreign_native_dependencies = {}
+        self._native_foreign_frames = {}
+        self._native_foreign_depths = {}
+
+    def capture_native_work_factory(self):
+        """Capture the constructing owner's held frame for one lazy source.
+
+        Registration is still deferred until dispatch, and an ended foreign
+        frame cannot be revived. Copied-context children gain no frame rights.
+        """
+        parent = asyncio.current_task()
+        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
+        token = self.current_reentry_token()
+        if token is None and self._token_matches_current_span():
+            token = _transition_lock_reentry_token.get()
+        def start(operation, context=None):
+            return self.start_owned_native_work(operation, context=context,
+                _captured_frame=frame, _captured_token=token)
+        return start
+
+    def start_owned_native_work(self, operation, *, context=None, _captured_frame=None, _captured_token=None):
+        """Retain a fixed native body without lending arbitrary reentry rights.
+
+        Only the actual foreign-mutex owner may reserve continuation of that
+        frame. Its outer exit drains the exact tasks before releasing exclusion.
+        Other workers acquire the ordinary lock path and revalidate live policy.
+        """
+        parent = asyncio.current_task()
+        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
+        if frame is None and _captured_frame is self._reentry_owner:
+            frame = _captured_frame
+        foreign = frame is not None and self._reentry_owner is frame
+        token = self.current_reentry_token()
+        if token is None and self._token_matches_current_span():
+            token = _transition_lock_reentry_token.get()
+        if token is None:
+            token = _captured_token
+        state = {"entered": foreign}
+        retained = asyncio.get_running_loop().create_future()
+        async def run():
+            # Even an eager task factory cannot dispatch the body before its
+            # exact dependency and terminal-harvesting records are installed.
+            opening = await retained
+            if opening is not None:
+                raise opening
+            if foreign:
+                return await operation()
+            with bind_transition_lock_reentry(token):
+                async with self:
+                    state["entered"] = True
+                    return await operation()
+        admission = OwnedTaskAdmission()
+        try:
+            task = create_owned_task(run(), name="privacy-owned-native-work", context=context,
+                admission=admission, retain_originals=True)
+        except BaseException:
+            if admission.task is None:
+                raise
+            return admission.task  # Same failed native gate, never allocation absence.
+        def completed(finished):
+            owned_task_error(finished)
+            self._native_work.discard(finished)
+            self._native_foreign_frames.pop(finished, None)
+            self._native_foreign_depths.pop(finished, None)
+        try:
+            self._native_work.add(task)
+            task._kestrel_native_privacy_state = state
+            if foreign:
+                self._native_foreign_frames[task] = frame
+                self._foreign_native_dependencies.setdefault(frame, set()).add(task)
+            task.add_done_callback(completed)
+        except BaseException as opening:
+            terminal = _retain_owned_admission_error(task, opening)
+            self._native_work.discard(task)
+            self._native_foreign_frames.pop(task, None)
+            self._native_foreign_depths.pop(task, None)
+            dependencies = self._foreign_native_dependencies.get(frame)
+            if dependencies is not None:
+                dependencies.discard(task)
+                if not dependencies:
+                    self._foreign_native_dependencies.pop(frame, None)
+            retained.set_result(terminal)
+            return task
+        retained.set_result(None)
+        return task
+
+    async def join_owned_native_work(self):
+        """Drain entered native bodies before an in-turn policy change.
+
+        Queued workers have not admitted native work: they recheck policy on
+        acquisition and must not be awaited behind the mutex held by this caller.
+        """
+        current = asyncio.current_task()
+        terminal = None
+        for task in tuple(self._native_work):
+            if task is current or not task._kestrel_native_privacy_state["entered"]:
+                continue
+            outcome = await await_owned_task(task)
+            if outcome.error is not None and is_execution_control_error(outcome.error):
+                terminal = execution_terminal_error(terminal, outcome.error)
+            terminal = execution_terminal_error(terminal, outcome.cancellation)
+        if terminal is not None:
+            raise terminal
 
     def locked(self) -> bool:
         return self._lock.locked()
@@ -464,6 +574,12 @@ class ReentrantTransitionLock:
         if task is not None and self._reentry_owner is task:
             self._reentry_depth += 1
             return self
+        # Only an exact task registered by the current foreign frame may use
+        # that frame's native continuation. A copied ContextVar is insufficient.
+        frame = self._native_foreign_frames.get(task)
+        if frame is not None and self._reentry_owner is frame:
+            self._native_foreign_depths[task] = self._native_foreign_depths.get(task, 0) + 1
+            return self
         # (3) First cross-task reentry via a captured span token (the codex
         #     app-server's per-tool reader task). Multiple inline tools in ONE turn
         #     all carry the SAME span token; serialize concurrent token-bearers on
@@ -497,12 +613,30 @@ class ReentrantTransitionLock:
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         task = asyncio.current_task()
+        if self._native_foreign_depths.get(task, 0):
+            self._native_foreign_depths[task] -= 1
+            return False
         # Unwind a cross-task reentry frame (reader task holding the reentry mutex)
         # before the base-lock frame — the two are always distinct tasks, so task
         # identity disambiguates which frame this ``__aexit__`` pairs with.
         if self._reentry_owner is not None and self._reentry_owner is task:
             self._reentry_depth -= 1
             if self._reentry_depth <= 0:
+                terminal = exc
+                # A nested waiter may abandon, but this admitted foreign frame
+                # still owns its exact native continuations through settlement.
+                # Nested native owners may be registered while an earlier
+                # child settles. Keep the same frame open until the entire
+                # exact dependency graph is physically joined.
+                dependencies = self._foreign_native_dependencies.setdefault(task, set())
+                while dependencies:
+                    for child in tuple(dependencies):
+                        outcome = await await_owned_task(child)
+                        dependencies.discard(child)
+                        if outcome.error is not None and is_execution_control_error(outcome.error):
+                            terminal = execution_terminal_error(terminal, outcome.error)
+                        terminal = execution_terminal_error(terminal, outcome.cancellation)
+                self._foreign_native_dependencies.pop(task, None)
                 self._reentry_depth = 0
                 self._reentry_owner = None
                 self._reentry_lock.release()
@@ -510,6 +644,8 @@ class ReentrantTransitionLock:
                 # section; signal any owner blocked in the drain that it may now
                 # release the base lock (#2672 review P1 cancellation).
                 self._reentry_idle.set()
+                if terminal is not None and terminal is not exc:
+                    raise terminal
             return False
         self._depth -= 1
         if self._depth <= 0:
@@ -535,7 +671,7 @@ class ReentrantTransitionLock:
             # lock is safely released, so the owning turn's cancellation still
             # propagates but never at the cost of skipping the drain.
             if pending_cancel is not None:
-                raise pending_cancel
+                raise execution_terminal_error(exc, pending_cancel)
         return False
 
     async def _drain_active_reentrant(self) -> Optional[BaseException]:
@@ -1743,6 +1879,7 @@ class StorePurgeResult:
     outcome: PurgeOutcome
     rows: int = 0
     error: Optional[str] = None
+    control_error: Optional[BaseException] = dataclass_field(default=None, repr=False, compare=False)
 
     @property
     def failed(self) -> bool:
@@ -1985,6 +2122,7 @@ class PrivacyEnforcingStorage:
         self._policy = PrivacyPolicy.from_config(self._privacy_config)
         self._session_conversations: List[Dict] = []
         self._session_files: Dict[str, bytes] = {}
+        self._session_file_metadata: Dict[str, Dict] = {}
         # UTC timestamp (microseconds, see ``_now_iso``) recorded at the
         # moment the wrapper transitions INTO EPHEMERAL.  The leak-purge
         # (#867) uses this to scope its DELETE so that flipping a long-lived
@@ -2806,11 +2944,14 @@ class PrivacyEnforcingStorage:
         """
         try:
             rows = await coro_factory()
-        except Exception as e:  # noqa: BLE001 - every backend failure is retained, not swallowed
+        except BaseException as e:  # every independent original sweep is settled
+            if not is_execution_control_error(e) and not isinstance(e, Exception):
+                raise
             logger.warning(
                 "purge_ephemeral_session: %s purge failed: %s", store, e
             )
-            return StorePurgeResult(store, PurgeOutcome.FAILED, error=repr(e))
+            return StorePurgeResult(store, PurgeOutcome.FAILED, error=repr(e),
+                control_error=e if is_execution_control_error(e) else None)
         n = int(rows or 0)
         return StorePurgeResult(
             store, PurgeOutcome.PURGED if n > 0 else PurgeOutcome.CLEAN, rows=n,
@@ -2868,6 +3009,7 @@ class PrivacyEnforcingStorage:
         # count needed — the buffer never persisted.
         self._session_conversations = []
         self._session_files = {}
+        self._session_file_metadata = {}
 
         # Scoped to ``_entered_ephemeral_at`` (#867) so the DELETE only
         # touches rows authored *during* the EPHEMERAL stint.  Without
@@ -2947,11 +3089,16 @@ class PrivacyEnforcingStorage:
         # the contract is "leave no trace" of user content, and tool-call args
         # are user content. This sink is NOT a required content store, so a
         # failure here is retained (visible) but does not block mode exit.
+        observability_control = None
         if self._observability_purge is not None:
             obs_counts: Dict[str, int] = {}
             try:
                 obs_counts = await self._observability_purge(since) or {}
-            except Exception as e:  # noqa: BLE001 - retained as non-required outcomes, never clean
+            except BaseException as e:  # retain controls through all independent sweeps
+                if not is_execution_control_error(e) and not isinstance(e, Exception):
+                    raise
+                if is_execution_control_error(e):
+                    observability_control = e
                 # The observability sink is NOT a required content store, so a
                 # failure here does not block mode exit — but it must be RETAINED
                 # (never silently read as a clean 0). A structured
@@ -3023,6 +3170,15 @@ class PrivacyEnforcingStorage:
                 "since %s",
                 agent_id, since,
             )
+
+        terminal = execution_terminal_error(
+            *(result.control_error for result in report.store_results.values()),
+            observability_control,
+        )
+        if terminal is not None:
+            # No string report or retry advice can replace the original native
+            # outcome; all independent sweeps above have still been attempted.
+            raise terminal
 
         # Clear the watermark only when the sweep ran to completion. If a
         # required sweep FAILED, PRESERVE it so a retry (the agent stays in
@@ -3159,6 +3315,7 @@ class PrivacyEnforcingStorage:
         count = len(self._session_conversations)
         self._session_conversations.clear()
         self._session_files.clear()
+        self._session_file_metadata.clear()
         logger.info(f"Session cleared: {count} conversations")
         return count
     
@@ -3202,6 +3359,7 @@ class PrivacyEnforcingStorage:
             import hashlib
             content_hash = hashlib.sha256(content).hexdigest()
             self._session_files[content_hash] = content
+            self._session_file_metadata[content_hash] = dict(metadata or {})
             logger.debug(f"File stored in session: {original_name} ({content_hash[:8]}...)")
             return content_hash
         
@@ -3374,12 +3532,19 @@ class PrivacyEnforcingStorage:
         # its own, and the lease is released only once that task has ended
         # with a known outcome.
         progress = _DeidentifiedCommitProgress()
-        commit = asyncio.create_task(
-            self._commit_deidentified_documents(
-                progress, evidence.evidence_id, evidence_bytes, records_bytes, base_metadata
-            ),
-            name=f"deidentified-save:{evidence.evidence_id}",
-        )
+        try:
+            commit = create_owned_task(
+                self._commit_deidentified_documents(
+                    progress, evidence.evidence_id, evidence_bytes, records_bytes, base_metadata
+                ),
+                name=f"deidentified-save:{evidence.evidence_id}",
+                retain_originals=True,
+            )
+        except BaseException:
+            # No transaction was accepted. The refused operation is closed by
+            # the canonical owner; there is no native save to fence here.
+            self._release_deidentified_save_lease()
+            raise
         withdrawn = False
         try:
             # Until COMMIT is issued, cancelling the commit task rolls its
@@ -3414,6 +3579,14 @@ class PrivacyEnforcingStorage:
                 "outcome is unknown; privacy transitions stay refused until "
                 "restart."
             ) from outcome.error
+        if is_execution_control_error(outcome.error):
+            # Pre-COMMIT withdrawal is a known rollback ONLY after its native
+            # epilogue succeeds. A cancelled child can carry failed rollback
+            # retirement debt; keep this original privacy lease and all actual
+            # observer receipts rather than calling that debt a withdrawal.
+            raise_owned_outcome(
+                outcome, operation="de-identified save", retain_originals=True,
+            )
         self._release_deidentified_save_lease()
         if withdrawn and isinstance(outcome.error, asyncio.CancelledError):
             # That error is the cancellation that withdrew the save, not a
@@ -4247,6 +4420,8 @@ class PrivacyEnforcingStorage:
                         )
                     )
                 except Exception as error:  # noqa: BLE001
+                    if is_execution_control_error(error):
+                        raise
                     logger.warning(
                         "strategy ledger assertion read failed: %s", error
                     )
@@ -4354,6 +4529,8 @@ class PrivacyEnforcingStorage:
                     operation_id=operation_id,
                 )
         except Exception as error:  # noqa: BLE001 - the YAML write already landed
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "strategy ledger assertion %s failed: %s", action, error
             )
@@ -4390,6 +4567,8 @@ class PrivacyEnforcingStorage:
                 ),
             )
         except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
             logger.warning("strategy ledger assertion retraction failed: %s", error)
             report.failed += 1
             return
@@ -4410,7 +4589,9 @@ class PrivacyEnforcingStorage:
         if ontology_ref is None:
             try:
                 ontology_ref = ledger_assertions.ontology()
-            except Exception:  # noqa: BLE001
+            except Exception as control_error:  # noqa: BLE001
+                if is_execution_control_error(control_error):
+                    raise
                 return False
         if not ledger_assertions.declares_adapter_markers(held, ontology_ref):
             return False
@@ -4424,6 +4605,8 @@ class PrivacyEnforcingStorage:
         try:
             sources = await self.list_assertion_revision_sources(held.revision_id)
         except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
             logger.warning(
                 "strategy ledger assertion provenance read failed: %s", error
             )
@@ -4541,13 +4724,15 @@ class PrivacyEnforcingStorage:
         self._assert_semantic_assertion_write_allowed("Kite invalid import quarantine")
         import hashlib
 
-        from kestrel_sovereign.features.memory_agency.semantic_facts import map_legacy_fact
+        from kestrel_sovereign.features.memory_agency.semantic_facts import (
+            map_legacy_fact,
+        )
         from kestrel_sovereign.knowledge import (
+            XSD_STRING,
             Assertion,
             DirectLineage,
             EpistemicState,
             SourceOccurrence,
-            XSD_STRING,
         )
         from kestrel_sovereign.knowledge.assertion import Literal
         from kestrel_sovereign.knowledge.shacl_validation import (
@@ -4632,7 +4817,10 @@ class PrivacyEnforcingStorage:
 
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
         from kestrel_sovereign.knowledge import (
+            IRI,
+            XSD_STRING,
             Assertion,
             DerivedLineage,
             EpistemicState,
@@ -4640,16 +4828,16 @@ class PrivacyEnforcingStorage:
             GovernedArtifactDeletionOwner,
             GovernedArtifactDeletionProof,
             GovernedCorpusPolicy,
-            IRI,
             Literal,
-            XSD_STRING,
         )
         from kestrel_sovereign.knowledge.kite_erasure_authority import (
             ERASURE_CORE_SNAPSHOT_OPERATION,
             KiteErasureDrillAuthorityError,
             _consume_kite_erasure_drill_capability,
         )
-        from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProjectionError
+        from kestrel_sovereign.storage.semantic_vector_projection import (
+            SemanticVectorProjectionError,
+        )
 
         if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {"1", "true", "yes", "on"}:
             raise PrivacyViolationError("Kite semantic release drill is unavailable")
@@ -5388,6 +5576,8 @@ class PrivacyEnforcingStorage:
     
     async def get_file_metadata(self, content_hash: str) -> Optional[Dict]:
         """Get file metadata."""
+        if self._policy.use_session_storage and content_hash in self._session_files:
+            return dict(self._session_file_metadata[content_hash])
         return await self._storage.get_file_metadata(content_hash)
     
     async def search_case_law(self, query: str, top_k: int = 3) -> List[Dict]:
@@ -5873,6 +6063,8 @@ class PrivacyEnforcingStorage:
                 (row_id, agent_id)
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(
                 "Pin cleanup skipped (memory_pins likely absent): %s", e
             )
@@ -6127,6 +6319,8 @@ class PrivacyEnforcingStorage:
                 (agent_id, agent_id),
             )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.debug(
                 "Pin cleanup skipped (memory_pins likely absent): %s", e
             )

@@ -15,6 +15,8 @@ import inspect
 import logging
 from typing import Any, Callable, Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from kestrel_sovereign.features.peers.directory import (
     PeerDirectoryError,
     PeerRequester,
@@ -194,13 +196,17 @@ class RecipientA2ASenderAuthorizer:
             if inspect.isawaitable(result):
                 result = await result
         except PeerDirectoryError as exc:
+            if is_execution_control_error(exc):
+                raise
             logger.info(
                 "Inbound A2A sender %s denied by recipient directory: %s",
                 sender_id,
                 exc,
             )
             return False
-        except Exception:  # noqa: BLE001 - injected provider boundary
+        except Exception as exc:  # noqa: BLE001 - injected provider boundary
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "Inbound A2A sender authorization failed for %s",
                 sender_id,
@@ -255,7 +261,9 @@ class RecipientA2ASenderAuthorizer:
         if self._sender_id_resolver is not None:
             try:
                 sender_id = self._sender_id_resolver(signing_did)
-            except Exception:  # noqa: BLE001 - launcher registry boundary
+            except Exception as exc:  # noqa: BLE001 - launcher registry boundary
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "Inbound A2A signing-DID mapping failed for %s",
                     signing_did,
@@ -302,7 +310,9 @@ class RecipientA2ASenderAuthorizer:
 
         try:
             return resolve_scoped_agent_did(agent)
-        except AgentIdentityUnavailable:
+        except AgentIdentityUnavailable as error:
+            if is_execution_control_error(error):
+                raise
             return None
 
 

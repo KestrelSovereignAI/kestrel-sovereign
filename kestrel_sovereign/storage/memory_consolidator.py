@@ -30,6 +30,11 @@ from .async_conversation_store import (
 )
 from .session_grouping import timestamp_predicate, timestamp_query_param
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
+from kestrel_sovereign.execution_custody import (
+    current_execution_custody,
+    is_execution_control_error,
+    require_execution_work,
+)
 
 # ``SalvageState`` lives in ``kestrel_sovereign.agent.salvage``;
 # importing it here would create a circular import via
@@ -145,6 +150,8 @@ class MemoryConsolidator:
             )
             return get_provider_embedding_service(self._llm_service)
         except Exception as e:  # noqa: BLE001 - embeddings are best-effort
+            if is_execution_control_error(e):
+                raise
             logger.debug("episode embedding service unavailable: %s", e)
             return None
 
@@ -154,15 +161,20 @@ class MemoryConsolidator:
         ``SavedItemsStore._get_vector_session_factory``). Returns None when
         construction fails (in-memory SQLite, bare pool, etc.) — callers then
         fall back to keyword recall."""
-        if self._sqla_factory is not None:
+        execution_owner = getattr(self._db, "backend", None)
+        require_execution_work(execution_owner)
+        scoped = bool(current_execution_custody(execution_owner))
+        if self._sqla_factory is not None and not scoped:
             return self._sqla_factory
         if self._sqla_factory_unavailable:
             return None
         try:
             from kestrel_sovereign.storage.sqla import make_session_factory
-            self._sqla_factory = make_session_factory(self._db)
+            self._sqla_factory = make_session_factory(self._db, native_read_fallback=True)
             return self._sqla_factory
         except Exception as e:  # noqa: BLE001
+            if is_execution_control_error(e):
+                raise
             logger.debug("episode vector session factory unavailable: %s", e)
             self._sqla_factory_unavailable = True
             return None
@@ -250,6 +262,8 @@ class MemoryConsolidator:
             )
 
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Consolidation failed: {e}")
             report["error"] = str(e)
 
@@ -1810,6 +1824,8 @@ class MemoryConsolidator:
                 instruction=EPISODE_RETRIEVAL_INSTRUCTION,
             )
         except Exception as e:  # noqa: BLE001
+            if is_execution_control_error(e):
+                raise
             logger.debug("episode query embed failed: %s", e)
             return None
         if not query_embedding:
@@ -1832,7 +1848,9 @@ class MemoryConsolidator:
                     pid = service.current_profile_id()
                     if pid is not None:
                         filter_kwargs["embedding_profile_id"] = pid
-                except Exception:  # noqa: BLE001
+                except Exception as error:  # noqa: BLE001
+                    if is_execution_control_error(error):
+                        raise
                     pass
             backend = get_vector_backend(sf, spec)
             top_k = await backend.knn(
@@ -1840,6 +1858,8 @@ class MemoryConsolidator:
                 filter=filter_kwargs,
             )
         except Exception as e:  # noqa: BLE001
+            if is_execution_control_error(e):
+                raise
             logger.debug("episode kNN failed (%s); using keyword fallback", e)
             return None
         if not top_k:
