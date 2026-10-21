@@ -49,6 +49,10 @@ from kestrel_sovereign.a2a.native_security import (
     NativeDIDRequestGuard,
 )
 from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnershipError
+from kestrel_sovereign.a2a.stores.unified.task_store import (
+    TaskInputConflictError,
+    TaskInputTerminalError,
+)
 from kestrel_sovereign.a2a.task_manager import (
     TaskCancellationAuthorizationError,
     TaskManager,
@@ -162,18 +166,6 @@ class NativeA2ARequestHandler(RequestHandler):
         validate_history_length(params.configuration)
         if params.configuration.HasField("task_push_notification_config"):
             raise PushNotificationNotSupportedError()
-        if params.message.task_id:
-            existing = await self._task(params.message.task_id, principal_id)
-            if (
-                params.message.context_id
-                and params.message.context_id != existing.context_id
-            ):
-                raise InvalidParamsError(
-                    message="Task and message context identifiers disagree"
-                )
-            raise UnsupportedOperationError(
-                message="This task does not accept additional messages"
-            )
         try:
             metadata = MessageToDict(params.metadata)
             require_metadata_extensions(metadata, admitted.activated_extensions)
@@ -201,7 +193,18 @@ class NativeA2ARequestHandler(RequestHandler):
         ):
             raise ContentTypeNotSupportedError()
         try:
+            if params.message.task_id:
+                task = await self.manager.continue_task(
+                    params, creator_agent_id=principal_id
+                )
+                if task is None:
+                    raise TaskNotFoundError()
+                return task
             return await self.manager.create_task(params, creator_agent_id=principal_id)
+        except TaskInputTerminalError as error:
+            raise UnsupportedOperationError(message=str(error)) from error
+        except TaskInputConflictError as error:
+            raise InvalidParamsError(message=str(error)) from error
         except ContextOwnershipError as error:
             if is_execution_control_error(error):
                 raise

@@ -191,6 +191,7 @@ async def prepare_legacy_migration(
         "a2a_outbound_dispatches",
         "a2a_native_questions",
         "a2a_native_question_wakes",
+        "a2a_task_inputs",
     ):
         if await backend.table_exists(target) and await backend.fetch_one(
             f"SELECT 1 FROM {target} LIMIT 1"

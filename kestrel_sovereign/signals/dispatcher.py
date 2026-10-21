@@ -158,6 +158,7 @@ from kestrel_sovereign.signals.in_flight_control import (
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.pre_turn_guard import PreTurnRefusal
 from kestrel_sovereign.signals.registry import SourceRegistry
+from kestrel_sovereign.signals.rehydration import DurableCognitionWithdrawal
 from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_CONSUMER_ID,
     DURABLE_COGNITION_MARKER,
@@ -1588,7 +1589,8 @@ class SignalDispatcher:
         # Legacy dispatcher embeddings have no hosted execution authority.
         # They may not impersonate a runtime handoff under an admitted scope.
         from kestrel_sovereign.execution_custody import (
-            ExecutionAuthorityError, current_execution_custody,
+            ExecutionAuthorityError,
+            current_execution_custody,
         )
         if current_execution_custody(self._agent):
             coro.close()
@@ -3067,8 +3069,11 @@ class SignalDispatcher:
             self._discard_transient_durable_handoff(reservation.delivery_id)
 
         from kestrel_sovereign._async_ownership import (
-            OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error,
+            OwnedTaskAdmission,
+            await_owned_task,
+            create_owned_task,
             owned_task_admission_error,
+            owned_task_error,
         )
 
         def completed(task):
@@ -3151,7 +3156,9 @@ class SignalDispatcher:
     def _retain_durable_writer_control(self, error: BaseException | None) -> None:
         """One existing bounded safety latch for this runtime's native writers."""
         if error is not None and is_execution_control_error(error):
-            from kestrel_sovereign.execution_custody import execution_native_source_error
+            from kestrel_sovereign.execution_custody import (
+                execution_native_source_error,
+            )
             self._outcome_log_control_error = execution_native_source_error(
                 self._outcome_log_control_error, error,
             )
@@ -3233,7 +3240,10 @@ class SignalDispatcher:
                 # Cancelling it manufactures an UNKNOWN acknowledgement during
                 # otherwise successful teardown. Join the original bounded SQL
                 # operation; caller cancellation cannot close its store early.
-                from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+                from kestrel_sovereign._async_ownership import (
+                    await_owned_task,
+                    raise_owned_outcome,
+                )
                 outcome = await await_owned_task(task)
                 # Callback publication can have failed before the Agent
                 # harvester was installed. Stop owns the same terminal receipt
@@ -3886,7 +3896,7 @@ class SignalDispatcher:
         *,
         dispatch_signal: Signal,
         use_live_signal: bool,
-    ) -> Signal:
+    ) -> Signal | DurableCognitionWithdrawal:
         """Recover the executable envelope for one durable retry.
 
         Privacy-elided rows intentionally contain only a marker and no caller.
@@ -3915,7 +3925,7 @@ class SignalDispatcher:
 
     async def _rehydrate_durable_signal(
         self, event, *, dispatch_signal: Signal
-    ) -> Optional[Signal]:
+    ) -> Signal | DurableCognitionWithdrawal | None:
         """Rebuild an envelope the ledger cannot supply from its source's store."""
 
         rehydrate = getattr(self._agent, "rehydrate_durable_cognition_signal", None)
@@ -4859,7 +4869,8 @@ class SignalDispatcher:
             # caller recovery, cognition, renewal, settlement AND audit tails.
             async def resident_delivery():
                 from kestrel_sovereign.signals.context import (
-                    reset_current_signal, set_current_signal,
+                    reset_current_signal,
+                    set_current_signal,
                 )
                 owner = asyncio.current_task()
                 token = self._durable_admission.set((owner, 1))
@@ -4880,7 +4891,10 @@ class SignalDispatcher:
                     reset_current_signal(signal_token)
                     self._durable_admission.reset(token)
 
-            from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task
+            from kestrel_sovereign._async_ownership import (
+                OwnedTaskAdmission,
+                await_owned_task,
+            )
             from kestrel_sovereign.execution_custody import execution_observation_error
             publication = OwnedTaskAdmission()
             operation = resident_delivery()
@@ -5009,6 +5023,21 @@ class SignalDispatcher:
                 error="Durable cognition caller recovery failed",
                 registration=registration,
             )
+
+        if isinstance(routing_signal, DurableCognitionWithdrawal):
+            result = self._failure_result(
+                signal, start, status=Status.DROPPED_VALIDATION,
+                error=routing_signal.reason,
+            )
+            terminal_persisted = await self._settle_cognition_non_delivery(
+                delivery, result, consumer_id=consumer_id, retry_delay=retry_delay,
+            )
+            if terminal_persisted and durable_admission is not None and not durable_admission.done():
+                durable_admission.set_result(DurableAdmissionResult(
+                    DurableAdmissionDisposition.TERMINAL, signal.id,
+                ))
+            self._schedule_outcome_log(signal, registration, result)
+            return result
 
         # The managed claim is durably marked admission-pending. Linearize
         # willingness once, then clear that marker before creating any turn
@@ -5371,6 +5400,32 @@ class SignalDispatcher:
             )
             return result
 
+        terminal_persisted = await self._settle_cognition_non_delivery(
+            delivery, result, consumer_id=consumer_id, retry_delay=retry_delay,
+        )
+        if (
+            settlement_guard is not None
+            and isinstance(result, _StoppedCognitionResult)
+        ):
+            settlement_guard.stop_terminalized = terminal_persisted
+        if (
+            terminal_persisted
+            and durable_admission is not None
+            and not durable_admission.done()
+        ):
+            durable_admission.set_result(
+                DurableAdmissionResult(DurableAdmissionDisposition.TERMINAL, signal.id)
+            )
+        self._finalize_deferred_durable_outcome(
+            deferred_outcomes,
+            fallback_signal=routing_signal,
+            fallback_registration=registration,
+            result=result,
+        )
+        return result
+
+    async def _settle_cognition_non_delivery(self, delivery, result, *, consumer_id, retry_delay) -> bool:
+        """Persist one source withdrawal or unsuccessful route under its exact lease."""
         # Rate limits, quiet hours, coalescing, and cognition failures are
         # recoverable for cursor-owning ingress. Validation/cycle refusal is a
         # proven terminal no-op and may be acknowledged idempotently.
@@ -5414,26 +5469,7 @@ class SignalDispatcher:
         terminal_persisted = (
             terminal and released is not None and released.status == TERMINAL_ACKABLE
         )
-        if (
-            settlement_guard is not None
-            and isinstance(result, _StoppedCognitionResult)
-        ):
-            settlement_guard.stop_terminalized = terminal_persisted
-        if (
-            terminal_persisted
-            and durable_admission is not None
-            and not durable_admission.done()
-        ):
-            durable_admission.set_result(
-                DurableAdmissionResult(DurableAdmissionDisposition.TERMINAL, signal.id)
-            )
-        self._finalize_deferred_durable_outcome(
-            deferred_outcomes,
-            fallback_signal=routing_signal,
-            fallback_registration=registration,
-            result=result,
-        )
-        return result
+        return terminal_persisted
 
     async def _cancel_durable_cognition_routing_task(
         self,
@@ -5490,7 +5526,9 @@ class SignalDispatcher:
             # Task.result() can erase a cancellation cause on a second read.
             error = owned_task_error(completed_task)
             debt = getattr(self, "_retained_cognition_control_debt", {}).get(delivery.delivery_id)
-            from kestrel_sovereign.execution_custody import execution_native_source_error
+            from kestrel_sovereign.execution_custody import (
+                execution_native_source_error,
+            )
             retained_error = execution_native_source_error(control_error, debt[1] if debt else None)
             if error is not None and is_execution_control_error(error):
                 retained_error = execution_native_source_error(retained_error, error)
@@ -5603,7 +5641,8 @@ class SignalDispatcher:
     def _retain_cognition_native_control(self, delivery, *errors):
         """One source-only boundary for every existing cognition-debt writer."""
         from kestrel_sovereign.execution_custody import (
-            _native_source_originals, execution_native_source_error,
+            _native_source_originals,
+            execution_native_source_error,
         )
         prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
         previous = None if prior is None else prior[1]
@@ -5624,11 +5663,16 @@ class SignalDispatcher:
     ) -> None:
         """Keep irreversible control evidence non-retryable and non-ACKable."""
         from kestrel_sovereign._async_ownership import (
-            OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error,
+            OwnedTaskAdmission,
+            await_owned_task,
+            create_owned_task,
             owned_task_admission_error,
+            owned_task_error,
         )
         from kestrel_sovereign.execution_custody import (
-            execution_cleanup_debts, execution_native_source_error, execution_finite_error,
+            execution_cleanup_debts,
+            execution_finite_error,
+            execution_native_source_error,
         )
 
         retained_error = self._retain_cognition_native_control(delivery, error)

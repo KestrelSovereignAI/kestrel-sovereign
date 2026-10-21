@@ -17,9 +17,11 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
 )
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.signals.durable import DurableSignalEvent
+from kestrel_sovereign.signals.rehydration import DurableCognitionWithdrawal
 from kestrel_sovereign.signals.sources.a2a import build_signal_for_completed_task
 from kestrel_sovereign.signals.sources.a2a_task_submitted import (
     build_signal_for_submitted_task,
+    submitted_input_identity,
 )
 from tests.utils.native_a2a import manager_for
 
@@ -102,7 +104,11 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
                 signal.payload["question_id"] == "question-one"
                 and signal.payload["reply_expected"]
             )
-        assert first.dedupe_key == recovered.dedupe_key == task.id
+        assert (
+            first.dedupe_key
+            == recovered.dedupe_key
+            == submitted_input_identity(task.id, 0)
+        )
         candidates = await restarted.list_cognition_wake_candidates(
             recipient_agent_id=restarted.did,
             live_changed_since=datetime.now(UTC) - timedelta(days=1),
@@ -235,7 +241,7 @@ async def test_privacy_elided_rehydration_reads_native_ownership_and_withdraws_s
     now = datetime.now(UTC)
     event = DurableSignalEvent(
         event_id=original.id,
-        source_event_id=task.id,
+        source_event_id=submitted_input_identity(task.id, 0),
         agent_id=native_manager.did,
         target_agent=native_manager.did,
         source=original.source,
@@ -273,13 +279,15 @@ async def test_privacy_elided_rehydration_reads_native_ownership_and_withdraws_s
         TaskState.TASK_STATE_REJECTED,
         recipient_agent_id=native_manager.did,
     )
-    assert (
+    assert isinstance(
         await recipient.rehydrate_durable_cognition_signal(
             event, dispatch_signal=projected
-        )
-        is None
+        ),
+        DurableCognitionWithdrawal,
     )
-    completed_event = replace(event, source="a2a.task_complete")
+    completed_event = replace(
+        event, source="a2a.task_complete", source_event_id=task.id
+    )
     completed = await recipient.rehydrate_durable_cognition_signal(
         completed_event, dispatch_signal=projected
     )

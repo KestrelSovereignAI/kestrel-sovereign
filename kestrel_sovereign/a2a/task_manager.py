@@ -1132,6 +1132,49 @@ class TaskManager:
         """Namespace an opaque peer context away from host chat session IDs."""
         return self.task_store.scope.session_id_for_context(context_id)
 
+    def _announce_submitted_input(self, candidate: NativeTaskSnapshot) -> None:
+        """Publish a committed input snapshot through the canonical owner hook."""
+        candidate.require_recipient(self.did)
+        if self._on_task_submitted is None:
+            return
+        try:
+            self._on_task_submitted(candidate)
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logger.warning(
+                "Task input admission callback failed for %s",
+                candidate.task.id,
+                exc_info=True,
+            )
+
+    async def continue_task(
+        self, params: SendMessageRequest, *, creator_agent_id: str
+    ) -> Task | None:
+        """Admit a follow-up on the same creator-owned task and native context."""
+        if not isinstance(params, SendMessageRequest):
+            raise TypeError("Task continuation requires an official SendMessageRequest")
+        validate_proto_required_fields(params)
+        parse_message_metadata(MessageToDict(params.metadata))
+        candidate, appended = await self.task_store.append_creator_input(
+            params, creator_agent_id=creator_agent_id
+        )
+        if candidate is None:
+            return None
+        if appended:
+            self._announce_submitted_input(candidate)
+            try:
+                await self._notify_status_update(candidate.task, final=False)
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
+                logger.warning(
+                    "Admitted task input subscriber projection failed for %s",
+                    candidate.task.id,
+                    exc_info=True,
+                )
+        return candidate.task
+
     async def create_task(
         self,
         params: SendMessageRequest,
@@ -1175,6 +1218,7 @@ class TaskManager:
         # cannot strand a context reservation or authorize another creator.
         transaction = self.task_store.write_transaction()
         ownership_refusal = None
+        admitted_snapshot = None
         async with transaction:
             try:
                 ownership = await self.context_store.reserve(
@@ -1194,6 +1238,17 @@ class TaskManager:
                     creator_agent_id=creator_agent_id,
                     recipient_agent_id=self.task_store.scope.recipient_id,
                 )
+                await self.task_store.record_initial_input(
+                    task,
+                    params,
+                    creator_agent_id=creator_agent_id,
+                )
+                admitted_snapshot = await self.task_store.get_task_snapshot(
+                    task.id,
+                    recipient_agent_id=self.did,
+                )
+                if admitted_snapshot is None:
+                    raise RuntimeError("New task has no canonical input snapshot")
         if ownership_refusal is not None:
             raise ownership_refusal
         projection_id = self.session_id_for_context(task.context_id)
@@ -1203,24 +1258,8 @@ class TaskManager:
         # its asynchronous delivery through the agent's background-task
         # tracker, so cancellation of this transport coroutine cannot strand a
         # durably SUBMITTED row with no cognition wake.
-        if notify_submitted and self._on_task_submitted is not None:
-            try:
-                self._on_task_submitted(
-                    NativeTaskSnapshot(
-                        task=Task.FromString(task.SerializeToString()),
-                        lifecycle_revision=0,
-                        ownership=ownership,
-                    )
-                )
-            except Exception as e:
-                if is_execution_control_error(e):
-                    raise
-                logger.warning(
-                    "on_task_submitted callback failed for %s: %s",
-                    task.id,
-                    e,
-                    exc_info=True,
-                )
+        if notify_submitted:
+            self._announce_submitted_input(admitted_snapshot)
 
         # The insert-only task reservation is deliberately first: a duplicate
         # caller-supplied ID must be rejected before it can append another user

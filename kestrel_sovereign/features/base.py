@@ -1328,6 +1328,9 @@ class Feature(_SdkFeature):
             result = await selected.execute(**args)
             result = _serialize_tool_result(result)
             artifact = new_data_artifact(f"{skill_name}_result", result)
+            # Struct can hold values (notably NaN/Infinity) which its JSON
+            # encoder cannot publish. Validate before claiming tool completion.
+            MessageToDict(artifact)
         except Exception as error:
             if is_execution_control_error(error):
                 raise

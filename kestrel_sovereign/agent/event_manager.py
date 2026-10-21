@@ -9,8 +9,8 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from a2a.types import TaskState
 from google.protobuf.json_format import MessageToDict
@@ -21,6 +21,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     NativeTaskSnapshot,
     require_native_task_snapshot,
 )
+from kestrel_sovereign.signals.rehydration import DurableCognitionWithdrawal
 
 # ---------------------------------------------------------------------------
 # emit_event delivery receipt (#2922)
@@ -85,7 +86,7 @@ class EventDeliveryReceipt:
         return EVENT_REJECTED
 
 
-def describe_background_task(candidate: NativeTaskSnapshot) -> Tuple[str, str]:
+def describe_background_task(candidate: NativeTaskSnapshot) -> tuple[str, str]:
     """Render admitted ownership and application labels without metadata identity."""
     task = candidate.task
     metadata = MessageToDict(task.metadata)
@@ -135,7 +136,7 @@ class EventManagerMixin:
     )
 
     async def emit_event(
-        self, event_type: str, data: Dict[str, Any]
+        self, event_type: str, data: dict[str, Any]
     ) -> EventDeliveryReceipt:
         """
         Emit an event to all registered listeners (for SSE notifications).
@@ -194,7 +195,7 @@ class EventManagerMixin:
             buffered=False,
         )
 
-    def _buffer_pending_event(self, event_type: str, data: Dict[str, Any]) -> None:
+    def _buffer_pending_event(self, event_type: str, data: dict[str, Any]) -> None:
         """Buffer an event emitted while no listener was connected.
 
         Drained by ``get_pending_events`` when a client reconnects. The
@@ -227,6 +228,7 @@ class EventManagerMixin:
         consumer_id: str,
         label: str,
         cancellation_aware: bool,
+        input_revision: int | None = None,
     ) -> None:
         """Retry the task->signal outbox handoff until it is durable.
 
@@ -240,7 +242,15 @@ class EventManagerMixin:
             ACCEPTED_STATUSES,
             await_terminal_delivery,
         )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            submitted_input_identity,
+        )
 
+        source_event_id = (
+            submitted_input_identity(task_id, input_revision)
+            if cancellation_aware
+            else task_id
+        )
         delay = A2A_WAKE_RETRY_INITIAL_SECONDS
         pending = vars(self).setdefault("_a2a_submitted_signal_handles", {})
         # A retry loop must terminate on a condition retrying cannot change.
@@ -305,7 +315,12 @@ class EventManagerMixin:
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, A2A_WAKE_RETRY_MAX_SECONDS)
                     continue
-                if snapshot is None or snapshot.state not in {"submitted", "working"}:
+                if (
+                    snapshot is None
+                    or snapshot.state not in {"submitted", "working"}
+                    or not snapshot.cognition_wake_eligible
+                    or snapshot.input_revision != input_revision
+                ):
                     return
             try:
                 # Dispatch mutates normalization and causation state in-place.
@@ -315,7 +330,7 @@ class EventManagerMixin:
                 signal = signal_factory()
                 handle = await self.dispatcher.enqueue_durable_cognition(
                     signal,
-                    source_event_id=task_id,
+                    source_event_id=source_event_id,
                     consumer_id=consumer_id,
                 )
             except asyncio.CancelledError:
@@ -356,19 +371,23 @@ class EventManagerMixin:
                             exc_info=True,
                         )
                     else:
-                        if snapshot is None or snapshot.state not in {
-                            "submitted",
-                            "working",
-                        }:
+                        if (
+                            snapshot is None
+                            or snapshot.state
+                            not in {
+                                "submitted",
+                                "working",
+                            }
+                            or not snapshot.cognition_wake_eligible
+                            or snapshot.input_revision != input_revision
+                        ):
                             dispatch_task = getattr(handle, "task", None)
                             if dispatch_task is not None and not dispatch_task.done():
                                 dispatch_task.cancel()
 
                 admission_waiter = getattr(handle, "wait_for_durable_admission", None)
                 admission = (
-                    await admission_waiter()
-                    if callable(admission_waiter)
-                    else None
+                    await admission_waiter() if callable(admission_waiter) else None
                 )
                 outcome = await await_terminal_delivery(
                     handle,
@@ -448,7 +467,7 @@ class EventManagerMixin:
             error_msg = ""
             if task.status.message and task.status.message.parts:
                 for part in task.status.message.parts:
-                    if hasattr(part, 'text'):
+                    if hasattr(part, "text"):
                         error_msg = f": {part.text}"
                         break
             msg = f"\u274c Background task failed: {label}{error_msg} ({identifiers})"
@@ -503,7 +522,9 @@ class EventManagerMixin:
             # continue.
             logging.warning(
                 "Failed to enqueue a2a.task_complete signal for %s: %s",
-                task_id, e, exc_info=True,
+                task_id,
+                e,
+                exc_info=True,
             )
 
     def _on_task_submitted(self, candidate: NativeTaskSnapshot) -> None:
@@ -552,6 +573,7 @@ class EventManagerMixin:
                     consumer_id=DURABLE_COGNITION_CONSUMER_ID,
                     label=f"a2a.task_submitted[{task_id}]",
                     cancellation_aware=True,
+                    input_revision=candidate.input_revision,
                 ),
                 name=f"a2a_submitted:{str(task_id)[:8]}",
             )
@@ -561,7 +583,9 @@ class EventManagerMixin:
             # task IS persisted; only the wake was missed.
             logging.warning(
                 "Failed to enqueue a2a.task_submitted signal for %s: %s",
-                task_id, e, exc_info=True,
+                task_id,
+                e,
+                exc_info=True,
             )
 
     async def rehydrate_durable_cognition_signal(
@@ -581,47 +605,75 @@ class EventManagerMixin:
             from kestrel_sovereign.signals.sources.a2a_question_answered import (
                 build_signal_for_question_answered,
             )
+
             store = self.task_manager.questions_for_actor(self.did)
             wake = await store.wake_for_event(getattr(event, "source_event_id", None))
             if wake is None:
                 return None
             recovered = build_signal_for_question_answered(
-                event_id=wake.event_id, payload=json.loads(wake.payload_json),
+                event_id=wake.event_id,
+                payload=json.loads(wake.payload_json),
                 target_agent=self.did,
             )
             return replace(
-                recovered, id=dispatch_signal.id, arrived_at=dispatch_signal.arrived_at,
+                recovered,
+                id=dispatch_signal.id,
+                arrived_at=dispatch_signal.arrived_at,
             )
-        # WORKING recovery deliberately uses a revision-specific source event
-        # identity so it cannot deduplicate against the original SUBMITTED
-        # wake. The canonical task id remains in the durable dedupe field,
-        # which privacy projection retains without storing authored content.
-        task_id = (
-            getattr(event, "dedupe_key", None)
-            if source == "a2a.task_submitted"
-            else getattr(event, "source_event_id", None)
-        )
-        if not isinstance(task_id, str) or not task_id:
+        expected_input_revision = None
+        if source == "a2a.task_submitted":
+            from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+                parse_submitted_input_identity,
+            )
+
+            try:
+                task_id, expected_input_revision = parse_submitted_input_identity(
+                    getattr(event, "source_event_id", None)
+                )
+            except ValueError:
+                return None
+        else:
             task_id = getattr(event, "source_event_id", None)
         if not isinstance(task_id, str) or not task_id:
             return None
         if getattr(event, "target_agent", None) != getattr(self, "did", None):
             return None
         candidate = await self.task_manager.get_task_snapshot(
-            task_id, recipient_agent_id=self.did,
+            task_id,
+            recipient_agent_id=self.did,
         )
         if candidate is None:
-            return None
+            return (
+                DurableCognitionWithdrawal(
+                    "The authoritative A2A task no longer exists"
+                )
+                if source == "a2a.task_submitted"
+                else None
+            )
         task = candidate.task
 
         if source == "a2a.task_submitted":
-            if task.status.state not in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
-                return None
+            if (
+                not candidate.cognition_wake_eligible
+                or candidate.input_revision != expected_input_revision
+            ):
+                return DurableCognitionWithdrawal(
+                    "The authoritative A2A task input was superseded or is not executable"
+                )
+            if task.status.state not in {
+                TaskState.TASK_STATE_SUBMITTED,
+                TaskState.TASK_STATE_WORKING,
+            }:
+                return DurableCognitionWithdrawal(
+                    "The authoritative A2A task is no longer executable"
+                )
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
                 build_signal_for_submitted_task,
             )
 
-            recovered = build_signal_for_submitted_task(candidate, target_agent=self.did)
+            recovered = build_signal_for_submitted_task(
+                candidate, target_agent=self.did
+            )
         else:
             from kestrel_sovereign.signals.sources.a2a import (
                 build_signal_for_completed_task,
@@ -629,7 +681,9 @@ class EventManagerMixin:
 
             if task.status.state not in TERMINAL_STATES:
                 return None
-            recovered = build_signal_for_completed_task(candidate, target_agent=self.did)
+            recovered = build_signal_for_completed_task(
+                candidate, target_agent=self.did
+            )
         return replace(
             recovered,
             id=dispatch_signal.id,
@@ -671,9 +725,10 @@ class EventManagerMixin:
         )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             build_signal_for_submitted_task,
+            submitted_input_identity,
         )
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         horizons = {}
         for source in (SUBMITTED_SOURCE, COMPLETE_SOURCE):
             registration = self.signal_registry.get(source)
@@ -693,23 +748,31 @@ class EventManagerMixin:
             task = candidate.task
             state = task.status.state
             if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
-                signal = build_signal_for_submitted_task(candidate, target_agent=self.did)
+                signal = build_signal_for_submitted_task(
+                    candidate, target_agent=self.did
+                )
                 consumer_id = SUBMITTED_CONSUMER
                 # SUBMITTED owns the callback's original source identity.
                 # WORKING is a later durable lifecycle revision: if the
                 # original wake already ACKed before a process died, reusing
                 # the task ID would deduplicate against that completed wake.
                 source_event_id = (
-                    str(task.id)
+                    submitted_input_identity(task.id, candidate.input_revision)
                     if state == TaskState.TASK_STATE_SUBMITTED
-                    else f"{task.id}:working:{candidate.lifecycle_revision}"
+                    else submitted_input_identity(
+                        task.id,
+                        candidate.input_revision,
+                        working_revision=candidate.lifecycle_revision,
+                    )
                 )
                 if state == TaskState.TASK_STATE_WORKING:
                     original = (
                         await self.dispatcher.get_durable_delivery_for_source_event(
                             consumer_id=SUBMITTED_CONSUMER,
                             source=SUBMITTED_SOURCE,
-                            source_event_id=str(task.id),
+                            source_event_id=submitted_input_identity(
+                                task.id, candidate.input_revision
+                            ),
                         )
                     )
                     if original is not None and not original.is_terminal:
@@ -772,6 +835,11 @@ class EventManagerMixin:
         )
         if snapshot is None:
             return f"A2A task {task_id!r} no longer exists"
+        if (
+            not snapshot.cognition_wake_eligible
+            or snapshot.input_revision != payload.get("input_revision")
+        ):
+            return f"A2A task {task_id!r} input was superseded or is not executable"
         durable_state = snapshot.state
         if durable_state not in {"submitted", "working"}:
             return (
@@ -806,15 +874,17 @@ class EventManagerMixin:
             )
             if snapshot is None:
                 return f"A2A task {task_id!r} no longer exists"
+            if (
+                not snapshot.cognition_wake_eligible
+                or snapshot.input_revision != payload.get("input_revision")
+            ):
+                return f"A2A task {task_id!r} input was superseded or is not executable"
             durable_state = snapshot.state
             if durable_state == "canceled":
                 self_declines = vars(self).get(
                     "_a2a_self_declining_task_ids",
                 )
-                if (
-                    isinstance(self_declines, set)
-                    and task_id in self_declines
-                ):
+                if isinstance(self_declines, set) and task_id in self_declines:
                     self_declines.discard(task_id)
                     # The marker is provisional while the recipient's CAS is
                     # in flight. A creator on another worker may win first;
@@ -901,13 +971,10 @@ class EventManagerMixin:
                 set(),
             )
             self_declines.add(task_id)
-        elif (
-            dispatch_task is not None
-            and not dispatch_task.done()
-        ):
+        elif dispatch_task is not None and not dispatch_task.done():
             dispatch_task.cancel()
 
-    def get_pending_notifications(self) -> List[str]:
+    def get_pending_notifications(self) -> list[str]:
         """
         Get and clear pending task completion notifications.
 
@@ -917,7 +984,7 @@ class EventManagerMixin:
         self._pending_task_notifications.clear()
         return notifications
 
-    def get_pending_events(self) -> List[Tuple[str, Dict[str, Any]]]:
+    def get_pending_events(self) -> list[tuple[str, dict[str, Any]]]:
         """Drain events buffered while no SSE listener was connected.
 
         Structured counterpart to ``get_pending_notifications`` for the
@@ -945,7 +1012,7 @@ class EventManagerMixin:
     # produced (``emit_event``'s pending buffer is drain-once). These are
     # replayed to EVERY new SSE connection until cleared.
 
-    def set_sticky_event(self, key: str, event_type: str, data: Dict[str, Any]) -> None:
+    def set_sticky_event(self, key: str, event_type: str, data: dict[str, Any]) -> None:
         """Record a current-state aux event, replayed to every new SSE client."""
         sticky = getattr(self, "_sticky_events", None)
         if sticky is None:
@@ -958,6 +1025,6 @@ class EventManagerMixin:
         if sticky:
             sticky.pop(key, None)
 
-    def get_sticky_events(self) -> List[Tuple[str, Dict[str, Any]]]:
+    def get_sticky_events(self) -> list[tuple[str, dict[str, Any]]]:
         """Return current-state aux events for replay on SSE connect (not drained)."""
         return list(getattr(self, "_sticky_events", {}).values())

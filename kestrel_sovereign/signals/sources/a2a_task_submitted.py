@@ -9,11 +9,12 @@ task and lifecycle revision also drive restart reconciliation.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import timedelta
 from pathlib import Path
 
-from a2a.types import TaskState
+from a2a.types import Role, TaskState
 from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.signals import (
     AttentionPolicy,
@@ -59,41 +60,60 @@ PROMPT_TEMPLATE = (
 # ---------------------------------------------------------------------------
 
 
+def submitted_input_identity(
+    task_id: str, input_revision: int, *, working_revision: int | None = None
+) -> str:
+    """Encode an unambiguous durable identity for exactly one admitted input."""
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("Input wake requires a concrete task ID")
+    if type(input_revision) is not int or input_revision < 0:
+        raise ValueError("Input wake requires a nonnegative input revision")
+    values = [task_id, input_revision]
+    if working_revision is not None:
+        if type(working_revision) is not int or working_revision < 0:
+            raise ValueError("Working wake requires a nonnegative lifecycle revision")
+        values.append(working_revision)
+    return json.dumps(values, separators=(",", ":"))
+
+
+def parse_submitted_input_identity(value: str) -> tuple[str, int]:
+    """Read privacy-retained identity without ever substituting a newer input."""
+    try:
+        parts = json.loads(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Invalid task input wake identity") from error
+    if not isinstance(parts, list) or len(parts) not in {2, 3}:
+        raise ValueError("Invalid task input wake identity")
+    canonical = submitted_input_identity(
+        parts[0], parts[1], working_revision=parts[2] if len(parts) == 3 else None
+    )
+    if canonical != value:
+        raise ValueError("Noncanonical task input wake identity")
+    return parts[0], parts[1]
+
+
 def _a2a_submitted_schema(payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(
             f"a2a.task_submitted payload must be a dict, got {type(payload).__name__}"
         )
+    if type(payload.get("input_revision")) is not int or payload["input_revision"] < 0:
+        raise ValueError("a2a.task_submitted requires a nonnegative input_revision")
     for key in ("task_id", "session_id", "sender"):
         if key not in payload:
             raise ValueError(f"a2a.task_submitted payload missing required key: {key}")
         if not isinstance(payload[key], str):
             raise ValueError(f"a2a.task_submitted payload {key} must be a string")
-    # Optional discriminator fields (added in #1380). Empty strings are
-    # valid (legacy / non-PeersFeature task creators leave them blank).
+    # A native task may have no application-specific verb or skill hint.
     if "a2a_verb" in payload and not isinstance(payload["a2a_verb"], str):
         raise ValueError("a2a.task_submitted payload a2a_verb must be a string")
     if "reply_expected" in payload and not isinstance(payload["reply_expected"], bool):
         raise ValueError("a2a.task_submitted payload reply_expected must be a bool")
-    # ``request_content`` is the sender's actual question/message text
-    # extracted from ``task.history[0]``. Added in #1433 so the
-    # cognition prompt has the question inline rather than forcing the
-    # receiver to call ``check_task_status`` first — without it the
-    # receiver hallucinated "null body" three times in a row on real
-    # questions. Optional (empty string accepted) so historical signal
-    # payloads that predate the field still validate; the prompt
-    # template guards against the missing case.
+    # Keep cumulative user text in the prompt; full structured parts remain
+    # available through the native task's history.
     if "request_content" in payload and not isinstance(payload["request_content"], str):
         raise ValueError("a2a.task_submitted payload request_content must be a string")
-    # Inject defaults for every field the prompt template indexes so any
-    # legacy caller (test fixtures, prior code paths, external
-    # integrations) building a payload with only the required keys still
-    # renders cleanly. Without this, ``Dispatcher._render_prompt()`` would
-    # KeyError on `{payload[a2a_verb]}` / `{payload[skill_id]}` /
-    # `{payload[request_content]}` for older payloads and the cognition
-    # turn would silently never fire (codex review #1433 P2 rounds 1+2).
-    # Keep this list in lockstep with the placeholders in
-    # ``prompts/signals/a2a_task_submitted.md``.
+    # Optional application labels still render with the canonical template.
     payload.setdefault("request_content", "")
     payload.setdefault("a2a_verb", "")
     payload.setdefault("skill_id", "")
@@ -155,6 +175,8 @@ def build_signal_for_submitted_task(
     """Wake the admitted recipient using ownership facts outside peer metadata."""
     candidate = require_native_task_snapshot(candidate, target_agent)
     task = candidate.task
+    if not candidate.cognition_wake_eligible:
+        raise ValueError("This task is not eligible for a cognition wake")
     if task.status.state not in {
         TaskState.TASK_STATE_SUBMITTED,
         TaskState.TASK_STATE_WORKING,
@@ -165,8 +187,18 @@ def build_signal_for_submitted_task(
     metadata = MessageToDict(task.metadata)
     correlation = parse_question_correlation(metadata)
     intent = parse_delivery_intent(metadata)
-    chain = deserialize_causation_chain(metadata)
-    request_content = (message_text(task.history[0]) or "") if task.history else ""
+    admitted = candidate.input_request
+    if candidate.input_revision and admitted is None:
+        raise ValueError("Task input wake has no admitted request")
+    latest_metadata = (
+        MessageToDict(admitted.metadata) if admitted is not None else metadata
+    )
+    chain = deserialize_causation_chain(latest_metadata)
+    request_content = "\n\n".join(
+        text
+        for message in task.history
+        if message.role == Role.ROLE_USER and (text := message_text(message))
+    )
     scope = NativeRecipientScope(
         candidate.ownership.recipient_agent_id, candidate.ownership.tenant
     )
@@ -176,9 +208,10 @@ def build_signal_for_submitted_task(
         mode=SignalMode.COGNITION,
         payload={
             "task_id": task.id,
+            "input_revision": candidate.input_revision,
             "session_id": scope.session_id_for_context(task.context_id),
             "sender": candidate.ownership.creator_agent_id,
-            "skill_id": parse_skill_hint(metadata) or "",
+            "skill_id": parse_skill_hint(latest_metadata) or "",
             "a2a_verb": "question"
             if correlation is not None
             else "message"
@@ -193,7 +226,7 @@ def build_signal_for_submitted_task(
         caller=candidate.ownership.creator_agent_id,
         urgency=Urgency.NORMAL,
         origin_trust=Trust.TRUSTED,
-        dedupe_key=task.id,
+        dedupe_key=submitted_input_identity(task.id, candidate.input_revision),
         causation_chain=list(chain),
     )
 
@@ -203,4 +236,6 @@ __all__ = [
     "SOURCE_NAME",
     "build_a2a_task_submitted_registration",
     "build_signal_for_submitted_task",
+    "parse_submitted_input_identity",
+    "submitted_input_identity",
 ]

@@ -139,15 +139,18 @@ class LocalFeature(Feature):
         self.effects += 1
         return {"at": datetime(2026, 10, 20, tzinfo=UTC)}
 
+    @tool(name="local_nonfinite", description="Exercise an unencodable result")
+    async def local_nonfinite(self) -> dict:
+        self.effects += 1
+        return {"invalid": float("nan")}
+
     @tool(name="local_failure", description="Retain a tool's error text")
     async def local_failure(self) -> ToolResult:
         return ToolResult.failed("The provider produced nothing")
 
 
 def local_feature(manager):
-    feature = LocalFeature(
-        SimpleNamespace(did=manager.did, _execution_custody=None)
-    )
+    feature = LocalFeature(SimpleNamespace(did=manager.did, _execution_custody=None))
     feature.name = "local"
     feature.effects = 0
     assert isinstance(feature, TaskHandler)
@@ -318,3 +321,22 @@ async def test_terminal_cognition_failure_is_retained_without_ack_or_endless_rea
         release.set()
         await dispatcher.shutdown_durable_delivery()
         await asyncio.gather(*agent.tasks, return_exceptions=True)
+
+
+async def test_nonfinite_result_fails_durably_after_one_effect_without_stranding_submission(
+    native_a2a_backend_factory,
+):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    manager = manager_for(backend, NativeRecipientScope("did:local"))
+    try:
+        await manager.initialize()
+        feature = local_feature(manager)
+        result = await manager.execute_skill("local", "local_nonfinite", {})
+        assert feature.effects == 1
+        assert result.status.state == TaskState.TASK_STATE_FAILED
+        assert not result.artifacts
+        stored = await manager.get_task_for_recipient(result.id, manager.did)
+        assert stored == result
+    finally:
+        await manager.close()

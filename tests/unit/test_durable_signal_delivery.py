@@ -22,34 +22,6 @@ from kestrel_sdk.signals import (
     Trust,
 )
 
-from kestrel_sovereign.signals import (
-    ACKNOWLEDGED,
-    FAILED,
-    INITIAL_RESERVED,
-    LEASED,
-    PENDING,
-    RETRY,
-    TERMINAL_ACKABLE,
-    DurableAdmissionDisposition,
-    DurableConsumerRegistration,
-    DurableSourceBoundary,
-    DurableSignalStore,
-    OrderedLockManager,
-    SignalDispatcher,
-    SignalLogStore,
-    SignalWithDurableCorrelation,
-    SourceRegistry,
-)
-from kestrel_sovereign.signals import dispatcher as dispatcher_module
-from kestrel_sovereign.signals.sources.channels import (
-    DURABLE_COGNITION_CONSUMER_ID,
-    DURABLE_COGNITION_MARKER,
-    DURABLE_COGNITION_MARKER_VALUE,
-    DURABLE_TERMINAL_CONSUMER_ID,
-    DURABLE_TERMINAL_MARKER,
-    DURABLE_TERMINAL_MARKER_VALUE,
-    build_channel_message_registration,
-)
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     InvocationSelfFencedError,
@@ -64,6 +36,37 @@ from kestrel_sovereign.hold import (
     HoldEnforcementUnavailableError,
     HoldScope,
     HoldState,
+)
+from kestrel_sovereign.signals import (
+    ACKNOWLEDGED,
+    FAILED,
+    INITIAL_RESERVED,
+    LEASED,
+    PENDING,
+    RETRY,
+    TERMINAL_ACKABLE,
+    DurableAdmissionDisposition,
+    DurableConsumerRegistration,
+    DurableSignalStore,
+    DurableSourceBoundary,
+    OrderedLockManager,
+    SignalDispatcher,
+    SignalLogStore,
+    SignalWithDurableCorrelation,
+    SourceRegistry,
+)
+from kestrel_sovereign.signals import dispatcher as dispatcher_module
+from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+    submitted_input_identity,
+)
+from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_CONSUMER_ID,
+    DURABLE_COGNITION_MARKER,
+    DURABLE_COGNITION_MARKER_VALUE,
+    DURABLE_TERMINAL_CONSUMER_ID,
+    DURABLE_TERMINAL_MARKER,
+    DURABLE_TERMINAL_MARKER_VALUE,
+    build_channel_message_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
@@ -2330,6 +2333,8 @@ async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
 
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as A2A_CONSUMER,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_signal_for_submitted_task,
     )
 
@@ -2355,7 +2360,7 @@ async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
         await dispatcher_a.register_durable_consumer(consumer)
         handle = await dispatcher_a.enqueue_durable_cognition(
             build_signal_for_submitted_task(_native_a2a_snapshot(task, did), target_agent=did),
-            source_event_id=task.id,
+            source_event_id=submitted_input_identity(task.id, 0),
             consumer_id=A2A_CONSUMER,
         )
         assert (
@@ -2407,11 +2412,14 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
 
     from types import MethodType
 
-    from kestrel_sovereign.agent.event_manager import EventManagerMixin
     from a2a.types import Task, TaskState, TaskStatus
+
+    from kestrel_sovereign.agent.event_manager import EventManagerMixin
     from kestrel_sovereign.privacy import get_privacy_preset
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as A2A_CONSUMER,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_signal_for_submitted_task,
     )
 
@@ -2435,7 +2443,7 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
         await dispatcher_a.register_durable_consumer(consumer)
         handle = await dispatcher_a.enqueue_durable_cognition(
             build_signal_for_submitted_task(_native_a2a_snapshot(task, did), target_agent=did),
-            source_event_id=task.id,
+            source_event_id=submitted_input_identity(task.id, 0),
             consumer_id=A2A_CONSUMER,
         )
         assert (
@@ -2830,8 +2838,11 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     """
 
     from a2a.types import Task, TaskState, TaskStatus
+
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_signal_for_submitted_task,
     )
 
@@ -2853,7 +2864,7 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     await dispatcher_a.register_durable_consumer(consumer)
     handle = await dispatcher_a.enqueue_durable_cognition(
         build_signal_for_submitted_task(_native_a2a_snapshot(submitted, did), target_agent=did),
-        source_event_id=submitted.id,
+        source_event_id=submitted_input_identity(submitted.id, 0),
         consumer_id=SUBMITTED_CONSUMER,
     )
     await handle.wait_for_durable_admission()
@@ -2898,7 +2909,7 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
         [recovered] = await dispatcher_b.list_durable_deliveries(
             consumer_id=SUBMITTED_CONSUMER
         )
-        assert recovered.event.source_event_id == "peer-task"
+        assert recovered.event.source_event_id == submitted_input_identity("peer-task", 0)
         assert recovered.status == ACKNOWLEDGED
         assert len(agent_b.prompts) == 1
     finally:

@@ -409,9 +409,10 @@ configuration refuses publication.
 
 This is a private implementation candidate, exercised with unpublished SDK
 builds containing the reviewed signing and HTTP-authorization repairs. Push
-configuration, task continuation, remaining draft-route retirement, offline
-migration, released dependency adoption and full host interoperability remain
-acceptance work. The isolated HTTP tests do not establish those gates.
+configuration, outbound same-task continuation, remaining draft-route retirement,
+released dependency adoption and full host interoperability remain acceptance
+work. The offline reviewed migration is implemented; it has not been run on
+operator data. The isolated HTTP tests do not establish release acceptance.
 
 The native task manager records the handler's admitted Task as its baseline.
 Lifecycle and cancellation writes apply that handler's delta to the latest
@@ -446,6 +447,29 @@ without creating a context. Session history remains a projection; it cannot
 grant context ownership. Populate the ledger during the one-time migration
 from authoritative task principals, and fail preflight on ambiguous ownership
 rather than choosing an owner from caller metadata or historical display names.
+
+### Admitted task input and execution ownership
+
+Incoming `SendMessage` continuations append the original message to the same
+creator-owned task. An omitted context is inferred from that task; a conflicting
+context or a terminal task is refused. The full official request, message ID
+and deterministic request digest commit in `a2a_task_inputs` with the task and
+its server-owned `input_revision`. Retrying an identical retained message does
+not admit another input or wake; reusing its ID for different content is refused.
+
+Each admitted input has a distinct, unambiguous durable wake identity. Recovery
+of a WORKING task first checks the original wake for that same input. Privacy
+recovery cannot substitute a newer input into an earlier event. A source-store
+read that proves withdrawal returns an explicit terminal no-op, which settles
+through the dispatcher's existing lease-conditional delivery path. Missing
+recovery data remains an error and never authorizes an acknowledgement.
+
+The source revalidates the input revision before cognition and monitors it
+through execution. All recipient lifecycle, terminal, artifact and decline
+writes made by that signal also include the input revision in the SQL authority
+predicate. If a newer input wins first, the old turn cannot publish over it.
+The dispatcher physically joins a withdrawn execution before settling its
+receipt. Explicit creator cancellation retains its existing authority.
 
 ### Semantic mapping
 
