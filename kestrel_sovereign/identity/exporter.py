@@ -492,7 +492,7 @@ class IdentityExporter:
         """Get skills from both graph storage and runtime feature tools.
 
         Graph-stored skills provide persisted usage data (times_used, last_used).
-        Runtime feature tools (via AgentSkill) ensure every registered tool
+        Runtime feature tools (via their SDK ToolSchema) ensure every registered tool
         appears in the identity package even if it has never been invoked.
         Graph data is merged into runtime records where both exist.
         """
@@ -517,7 +517,7 @@ class IdentityExporter:
         for row in rows:
             props = json.loads(row[2]) if row[2] else {}
             # Key by the RAW logical id (strip our own import namespace) so the
-            # runtime-tool merge below — which looks up graph_skills[agent_skill.id]
+            # runtime-tool merge below — which looks up graph_skills[schema.name]
             # with a raw id — finds an imported skill's persisted usage data
             # (times_used/last_used), and so a re-export carries the raw id rather
             # than re-prefixing it every migration hop (F186).
@@ -530,7 +530,7 @@ class IdentityExporter:
                 "config": props.get("config", {}),
             }
 
-        # 2. Build SkillRecords from runtime features using AgentSkill as
+        # 2. Build SkillRecords from runtime features using ToolSchema as
         #    the canonical metadata source, enriched with graph usage data.
         seen_ids: set = set()
         skills: List[SkillRecord] = []
@@ -543,17 +543,14 @@ class IdentityExporter:
                 if not get_tools:
                     continue
                 for tool in get_tools():
-                    agent_skill = getattr(tool, 'agent_skill', None)
-                    if agent_skill is None:
-                        continue
-
-                    graph_data = graph_skills.get(agent_skill.id, {})
-                    skills.append(SkillRecord.from_agent_skill(
-                        agent_skill,
+                    schema = tool.schema
+                    graph_data = graph_skills.get(schema.name, {})
+                    skills.append(SkillRecord.from_tool_schema(
+                        schema,
                         times_used=graph_data.get("times_used", 0),
                         last_used=graph_data.get("last_used"),
                     ))
-                    seen_ids.add(agent_skill.id)
+                    seen_ids.add(schema.name)
 
         # 3. Include graph-only skills not covered by current runtime features
         #    (e.g., skills from features that were uninstalled but have history).
