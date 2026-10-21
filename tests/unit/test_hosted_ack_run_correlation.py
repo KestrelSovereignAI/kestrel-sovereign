@@ -105,3 +105,25 @@ async def test_internal_route_rejects_session_on_non_ack_disposition():
             telegram_terminal_disposition="unsupported_update",
             acknowledgement_session_id="run-a",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition,session_id", [
+    ("unsupported_update", "run-a"), ("care_acknowledgement", True),
+    ("care_acknowledgement", 42), ("care_acknowledgement", ""),
+    ("care_acknowledgement", " leading"), ("care_acknowledgement", "line\nbreak"),
+    ("care_acknowledgement", "x" * 257),
+])
+async def test_direct_terminal_producer_rejects_bad_session_or_non_ack_purpose(disposition, session_id):
+    from kestrel_sovereign.features.channels.feature import ChannelFeature, InboundAdmissionDisposition
+    from kestrel_sovereign.features.channels.models import ChannelMessage, MessageDirection
+
+    feature = ChannelFeature(SimpleNamespace())
+    message = ChannelMessage(
+        id="telegram:v2:bot:42:update:12", channel_type="telegram",
+        direction=MessageDirection.INBOUND, sender="123", recipient="123", content="OK",
+        metadata={"dedupe_key": "telegram:v2:bot:42:update:12"},
+    )
+    message._kestrel_cursor_owned_protocol = True
+    result = await feature.handle_terminal_inbound(message, disposition=disposition, session_id=session_id)
+    assert result.disposition == InboundAdmissionDisposition.REJECTED
