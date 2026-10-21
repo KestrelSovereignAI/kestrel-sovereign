@@ -1,6 +1,7 @@
 """Native outbound dispatch evidence; local IDs never become remote task IDs."""
 
 import hashlib
+import json
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -23,7 +24,10 @@ from google.protobuf.json_format import MessageToDict, SerializeToJsonError
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_label
 from kestrel_sovereign.a2a.native_sender import native_request_digest
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
-from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
+from kestrel_sovereign.a2a.stores.unified.base import (
+    NativeStoreConflict,
+    UnifiedStoreBase,
+)
 
 
 class DispatchState(StrEnum):
@@ -35,7 +39,7 @@ class DispatchState(StrEnum):
     COMPLETE = "complete"
 
 
-class OutboundDispatchConflict(ValueError):
+class OutboundDispatchConflict(NativeStoreConflict):
     """An outbound identity, original message or remote receipt conflicts."""
 
 
@@ -230,9 +234,12 @@ class OutboundStore(UnifiedStoreBase):
             values["cancel_state"] = DispatchState(values["cancel_state"])
         return OutboundDispatch(**values)
 
-    async def get(self, dispatch_id: str) -> OutboundDispatch | None:
+    async def get(
+        self, dispatch_id: str, *, lock: bool = False
+    ) -> OutboundDispatch | None:
         row = await self.backend.fetch_one(
-            f"SELECT {_COLUMNS} FROM a2a_outbound_dispatches WHERE sender_id = ? AND sender_tenant = ? AND dispatch_id = ?",
+            f"SELECT {_COLUMNS} FROM a2a_outbound_dispatches WHERE sender_id = ? AND sender_tenant = ? AND dispatch_id = ?"
+            + (" FOR UPDATE" if lock and self.is_postgres else ""),
             (self._sender_scope.recipient_id, self._sender_scope.tenant, dispatch_id),
         )
         return self._snapshot(row) if row is not None else None
@@ -494,10 +501,48 @@ class OutboundStore(UnifiedStoreBase):
         values.extend(source.value for source in sources)
         committed = None
         async with self.write_transaction():
+            owner_guard = "1 = 1"
+            if receipt is not None and receipt[0] is not None:
+                if self.is_postgres:
+                    # Root and follow-up receipts share this lock before row
+                    # locks. It also serializes first claims without a row.
+                    await self.backend.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                        (
+                            json.dumps(
+                                [
+                                    "a2a-outbound-task-owner",
+                                    dispatch.sender_id,
+                                    dispatch.sender_tenant,
+                                    dispatch.recipient_id,
+                                    dispatch.tenant,
+                                    receipt[0],
+                                ]
+                            ),
+                        ),
+                    )
+                if dispatch.parent_dispatch_id is None:
+                    owner_guard = (
+                        "NOT EXISTS (SELECT 1 FROM a2a_outbound_dispatches AS owner "
+                        "WHERE owner.sender_id = ? AND owner.sender_tenant = ? "
+                        "AND owner.recipient_id = ? AND owner.tenant = ? "
+                        "AND owner.remote_task_id = ? AND owner.parent_dispatch_id IS NULL "
+                        "AND owner.dispatch_id <> ?)"
+                    )
+                    values.extend(
+                        (
+                            dispatch.sender_id,
+                            dispatch.sender_tenant,
+                            dispatch.recipient_id,
+                            dispatch.tenant,
+                            receipt[0],
+                            dispatch.dispatch_id,
+                        )
+                    )
             affected = await self.backend.execute(
                 f"UPDATE a2a_outbound_dispatches SET {assignments} "
                 f"WHERE {' AND '.join(predicates)} AND revision = ? "
-                f"AND state IN ({', '.join('?' for _ in sources)})",
+                f"AND state IN ({', '.join('?' for _ in sources)}) AND {owner_guard}",
                 tuple(values),
             )
             if affected == 1:
@@ -532,7 +577,7 @@ class OutboundStore(UnifiedStoreBase):
         """
         return await self._transition(
             dispatch,
-            sources=(DispatchState.SUBMITTING,),
+            sources=(DispatchState.RESERVED, DispatchState.SUBMITTING),
             state=DispatchState.NOT_SENT,
             operation_id=operation_id,
         )
@@ -656,6 +701,12 @@ class OutboundStore(UnifiedStoreBase):
                 "Peer response changed the requested context"
             )
         if isinstance(response, Task):
+            try:
+                task_state_label(response.status.state)
+            except ValueError as error:
+                raise OutboundDispatchConflict(
+                    "Peer response has an unknown or unspecified task state"
+                ) from error
             remote_id = response.id
             complete = response.status.state in TERMINAL_STATES
         else:

@@ -165,8 +165,9 @@ async def test_postgres_apply_refuses_other_live_database_connections(
 
 @pytest.mark.parametrize("action", ["preview", "apply"])
 @pytest.mark.parametrize("serving_path", ["alias", "target"])
+@pytest.mark.parametrize("selected_path", ["alias", "target"])
 async def test_symlink_database_cannot_hide_a_serving_host(
-    draft, tmp_path, action, serving_path
+    draft, tmp_path, action, serving_path, selected_path
 ):
     import hashlib
 
@@ -179,10 +180,11 @@ async def test_symlink_database_cannot_hide_a_serving_host(
         await preview((alias, owners, plan))
     before = hashlib.sha256(database.read_bytes()).hexdigest()
     record = ServingRecord.acquire(
-        profile if serving_path == "alias" else database.parent
+        profile if serving_path == "alias" else database.parent,
+        storage_path=alias,
     )
     try:
-        arguments = [action, "--sqlite", alias]
+        arguments = [action, "--sqlite", alias if selected_path == "alias" else database]
         arguments.extend(
             ["--owners", owners, "--output", plan]
             if action == "preview"

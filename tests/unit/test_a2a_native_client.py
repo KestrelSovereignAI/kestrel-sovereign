@@ -471,7 +471,36 @@ async def test_credentials_added_after_session_creation_are_refused(peer_session
     with pytest.raises(NativePeerProtocolError, match="ambient credentials"):
         await p.session.send(dispatch, wire)
     assert not p.trace
-    assert (await p.store.get(dispatch.dispatch_id)).state is DispatchState.RESERVED
+    assert (await p.store.get(dispatch.dispatch_id)).state is DispatchState.NOT_SENT
+
+
+async def test_lost_submission_cas_keeps_the_other_owner_and_typed_refusal(
+    peer_session, monkeypatch,
+):
+    p = peer_session
+    dispatch, wire = await reserve(p)
+    begin = p.store.begin_submission
+    no_delivery = p.store.record_no_delivery
+    cleanup_snapshots = []
+
+    async def another_worker_wins(snapshot, *, operation_id):
+        winner = await begin(snapshot, operation_id="competing-worker")
+        assert winner is not None
+        return await begin(snapshot, operation_id=operation_id)
+
+    async def retain_valid_snapshot(snapshot, *, operation_id):
+        cleanup_snapshots.append(snapshot)
+        return await no_delivery(snapshot, operation_id=operation_id)
+
+    monkeypatch.setattr(p.store, "begin_submission", another_worker_wins)
+    monkeypatch.setattr(p.store, "record_no_delivery", retain_valid_snapshot)
+    with pytest.raises(OutboundDispatchConflict, match="cannot be submitted again"):
+        await p.session.send(dispatch, wire)
+    retained = await p.store.get(dispatch.dispatch_id)
+    assert retained.state is DispatchState.SUBMITTING
+    assert retained.operation_id == "competing-worker"
+    assert not p.trace
+    assert cleanup_snapshots == [dispatch]
 
 
 async def test_restarting_after_submission_intent_uses_reads_only(peer_session):

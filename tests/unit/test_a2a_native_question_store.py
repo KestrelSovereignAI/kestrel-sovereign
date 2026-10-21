@@ -61,7 +61,7 @@ def correlation(kind, question_id):
     }
 
 
-async def reserve(p, question_id="question-one", *, parts=None):
+async def reserve(p, question_id="question-one", *, parts=None, deadline_seconds=10):
     request = SendMessageRequest(
         tenant="peer-tenant",
         metadata=correlation("question", question_id),
@@ -90,7 +90,7 @@ async def reserve(p, question_id="question-one", *, parts=None):
         request,
         origin_turn_id="local-turn",
         origin_session_id="local-session",
-        deadline=p.clock.now + timedelta(seconds=10),
+        deadline=p.clock.now + timedelta(seconds=deadline_seconds),
     )
     return question, dispatch, request
 

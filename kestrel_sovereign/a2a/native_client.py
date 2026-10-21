@@ -424,6 +424,14 @@ class NativePeerSession:
         # explicit before hashing, so the reservation binds exactly what is sent.
         wire.configuration.SetInParent()
         self._validate_message(wire, verb)
+        if parent is not None:
+            root = await self._store.get(parent.root_dispatch_id)
+            if root is not None and root.verb == "question":
+                if self._questions is None:
+                    raise NativePeerProtocolError(
+                        "Question continuation requires its primary correlation ledger"
+                    )
+                await self._questions.require_continuation_intent(root)
         dispatch = await self._store.reserve(
             uuid4().hex,
             wire,
@@ -453,21 +461,7 @@ class NativePeerSession:
             raise OutboundDispatchConflict(
                 "Outbound request differs from its reservation"
             )
-        await self._admit(dispatch)
-        await self._require_continuation_intent(dispatch)
-        if dispatch.verb == "question":
-            if self._questions is None:
-                raise NativePeerProtocolError(
-                    "Native question dispatch requires its primary correlation ledger"
-                )
-            await self._questions.require_intent(dispatch, wire)
-        submitting = await self._store.begin_submission(
-            dispatch, operation_id=uuid4().hex
-        )
-        if submitting is None:
-            raise OutboundDispatchConflict(
-                "Dispatch cannot be submitted again; reconcile delivery with peer reads"
-            )
+        submitting = dispatch
         dispatch_claimed = False
         may_have_sent = False
 
@@ -489,6 +483,22 @@ class NativePeerSession:
 
         receipt = None
         try:
+            await self._admit(dispatch)
+            await self._require_continuation_intent(dispatch)
+            if dispatch.verb == "question":
+                if self._questions is None:
+                    raise NativePeerProtocolError(
+                        "Native question dispatch requires its primary correlation ledger"
+                    )
+                await self._questions.require_intent(dispatch, wire)
+            claimed = await self._store.begin_submission(
+                dispatch, operation_id=uuid4().hex
+            )
+            if claimed is None:
+                raise OutboundDispatchConflict(
+                    "Dispatch cannot be submitted again; reconcile delivery with peer reads"
+                )
+            submitting = claimed
             response = None
             async with (
                 self._network(before_dispatch=authorize_original_send),
@@ -550,7 +560,12 @@ class NativePeerSession:
             await self._questions.require_continuation_intent(root)
 
     async def _acknowledge(self, dispatch, response):
-        if dispatch.verb == "question":
+        root = (
+            dispatch
+            if dispatch.parent_dispatch_id is None
+            else await self._store.get(dispatch.root_dispatch_id)
+        )
+        if root is not None and root.verb == "question":
             if self._questions is None:
                 raise NativePeerProtocolError(
                     "Native question receipt requires its correlation ledger"

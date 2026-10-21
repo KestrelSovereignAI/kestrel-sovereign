@@ -2853,7 +2853,9 @@ class KestrelAgent(
         data_dir = self._serving_data_dir()
         if data_dir is None or self._serving_record is not None:
             return
-        self._serving_record = ServingRecord.acquire(data_dir)
+        self._serving_record = ServingRecord.acquire(
+            data_dir, storage_path=Path(self.storage_path)
+        )
 
     def _resource_custody(self) -> ResourceCustody:
         """The tracker of the resources this agent holds (#3522)."""
@@ -4784,6 +4786,12 @@ class KestrelAgent(
 
     async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
+        if self._resource_custody().is_held("task_manager"):
+            # Native stores and executions borrow this primary connection.
+            # A failed manager close must retain both handles until its retry
+            # has joined every execution and released every borrowed service.
+            logging.getLogger(__name__).error("boot rollback: retaining storage until native task-manager teardown completes")
+            return ReleaseOutcome.RETAINED
         # Dispatcher teardown owns a runtime-owner release against this very
         # backend.  If that release has not finished, retaining both handles
         # is the only safe rollback state: closing here would strand a live
@@ -11171,6 +11179,12 @@ Expected Duration: {expected_duration}
             # join. Neither SQLAlchemy nor primary storage may close early.
             return tail_result(True)
         await self._join_llm_storage_dependents()
+
+        if custody.is_held("task_manager"):
+            # The finite prefix could not join the native manager. Keep its
+            # primary backend and SQLAlchemy owners available for a retry.
+            logging.getLogger(__name__).warning("Retaining primary storage until native task-manager release completes")
+            return tail_result(True)
 
         # Dispose an optional cached SQLAlchemy engine as its own bounded
         # phase.  Otherwise a slow engine disposal can consume the guard that

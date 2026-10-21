@@ -207,7 +207,7 @@ async def test_unresolved_reads_back_off_without_delaying_deadline_or_explicit_r
     questions,
 ):
     p = questions
-    q, dispatch, _ = await reserve(p)
+    q, dispatch, _ = await reserve(p, deadline_seconds=60)
     submitting = await p.outbound.begin_submission(
         dispatch, operation_id="lost-original"
     )
@@ -237,7 +237,7 @@ async def test_unresolved_reads_back_off_without_delaying_deadline_or_explicit_r
         clock.now = second
         await supervisor._read_pass()
     assert reads == [0, 2, 6, 14]
-    p.clock.now += timedelta(seconds=11)
+    p.clock.now += timedelta(seconds=61)
     await supervisor._deadline_pass()
     assert (await p.store.get(q.question_id)).status == "EXPIRED"
     assert [wake.wave for wake in await p.store.pending_wakes()] == ["deadline"]

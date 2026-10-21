@@ -95,6 +95,59 @@ def test_each_instance_owns_its_record(data_dir):
     assert serving_holder(data_dir) is None
 
 
+def test_canonical_database_records_release_only_their_own_instance(data_dir, tmp_path):
+    target = tmp_path / "volume" / "agent.db"
+    target.parent.mkdir()
+    target.touch()
+    alias = data_dir / "agent.db"
+    alias.symlink_to(target)
+    first = ServingRecord.acquire(data_dir, storage_path=alias)
+    second = ServingRecord.acquire(data_dir, storage_path=target)
+    try:
+        first.release()
+        assert serving_holder(data_dir) is not None
+        assert serving_holder(target.parent) is not None
+    finally:
+        second.release()
+    assert serving_holder(data_dir) is None
+    assert serving_holder(target.parent) is None
+
+
+def test_failed_canonical_record_publication_rolls_back_profile(data_dir, tmp_path, monkeypatch):
+    target = tmp_path / "volume" / "agent.db"
+    acquire = ServingRecord._acquire_one
+
+    def reject_target(cls, directory):
+        if directory == target.parent:
+            raise OSError("canonical directory unavailable")
+        return acquire(directory)
+
+    monkeypatch.setattr(ServingRecord, "_acquire_one", classmethod(reject_target))
+    with pytest.raises(OSError, match="canonical directory unavailable"):
+        ServingRecord.acquire(data_dir, storage_path=target)
+    assert serving_holder(data_dir) is None
+
+
+def test_failed_canonical_release_retains_profile_until_retry(data_dir, tmp_path, monkeypatch):
+    target = tmp_path / "volume" / "agent.db"
+    record = ServingRecord.acquire(data_dir, storage_path=target)
+    unlink = Path.unlink
+
+    def refuse_alias(path, **kwargs):
+        if path.parent.parent == target.parent:
+            raise OSError("canonical record is still held")
+        return unlink(path, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", refuse_alias)
+        with pytest.raises(OSError, match="still held"):
+            record.release()
+    assert serving_holder(data_dir) is not None
+    assert serving_holder(target.parent) is not None
+    record.release()
+    assert serving_holder(data_dir) is None and serving_holder(target.parent) is None
+
+
 def test_a_record_of_an_exited_process_is_stale_and_swept(data_dir):
     stale = ServingRecord.acquire(data_dir)
     # Same PID, another start instant: the process it named has exited and

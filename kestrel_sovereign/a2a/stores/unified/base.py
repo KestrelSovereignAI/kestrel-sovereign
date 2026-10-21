@@ -5,13 +5,19 @@ Provides common functionality for all stores using DatabaseBackend.
 """
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.storage.db.interface import DatabaseBackend, TransactionError
 from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
 
 logger = logging.getLogger(__name__)
+
+
+class NativeStoreConflict(ValueError):
+    """A native domain refusal, distinct from a failed database operation."""
 
 
 class UnifiedStoreBase:
@@ -53,13 +59,27 @@ class UnifiedStoreBase:
         """Check if using SQLite backend."""
         return self._backend.backend_type == "sqlite"
 
-    def write_transaction(self):
+    @asynccontextmanager
+    async def write_transaction(self):
         """Serialize a read/modify/write unit on the supported canonical backend."""
         if self.is_sqlite:
-            return self._backend.transaction(immediate=True)
-        if self.is_postgres:
-            return self._backend.transaction()
-        raise ValueError("Native stores require a SQLite or PostgreSQL backend")
+            transaction = self._backend.transaction(immediate=True)
+        elif self.is_postgres:
+            transaction = self._backend.transaction()
+        else:
+            raise ValueError("Native stores require a SQLite or PostgreSQL backend")
+        try:
+            async with transaction:
+                yield
+        except TransactionError as error:
+            # Backends roll back before wrapping a body failure. Retain typed
+            # domain refusals after that rollback, while preserving actual SQL,
+            # commit, cleanup and custody failures as infrastructure failures.
+            if isinstance(
+                error.__cause__, NativeStoreConflict
+            ) and not is_execution_control_error(error):
+                raise error.__cause__
+            raise
 
     # ==========================================================================
     # SQL Dialect Helpers

@@ -1,12 +1,23 @@
-"""One MIME policy for native message admission and outbound preflight."""
+"""Native content encoding and one MIME policy for message admission."""
 
+import json
 from collections.abc import Sequence
 from email import policy
+from typing import Any
 
 from a2a.types import Part
 from a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 
 DEFAULT_NATIVE_MEDIA_TYPES = ("text/plain", "application/json")
+
+
+def encode_inline_json(value: Any) -> bytes:
+    """Retain exact local JSON values in standard inline content.
+
+    Escaping makes surrogateescaped filesystem names representable without
+    losing bytes, and avoids protobuf Struct's binary64 conversion of ints.
+    """
+    return json.dumps(value, allow_nan=False, ensure_ascii=True).encode("utf-8")
 
 
 def _media_type(value: str, *, allow_range: bool) -> tuple[str, str]:

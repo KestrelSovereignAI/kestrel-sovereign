@@ -1,5 +1,6 @@
 """Local commands and real workflows must preserve exact JSON integer results."""
 
+import os
 from types import SimpleNamespace
 
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
@@ -16,6 +17,20 @@ class ExactResultFeature(Feature):
 
     async def initialize(self):
         pass
+
+    @tool(name="list_names", description="Return a POSIX file name losslessly")
+    async def list_names(self) -> ToolResult:
+        self.effects += 1
+        return ToolResult.ok(
+            confirmation="Listed names",
+            data={"names": [os.fsdecode(b"report-\xff.txt")]},
+        )
+
+    @tool(name="consume_names", description="Consume the exact returned file name")
+    async def consume_names(self, value: dict) -> ToolResult:
+        self.observed = value
+        assert os.fsencode(value["data"]["names"][0]) == b"report-\xff.txt"
+        return ToolResult.ok(confirmation="Consumed the file name")
 
     @tool(
         name="exact_result", description="Return an integer beyond binary64 precision"
@@ -42,7 +57,10 @@ def provider(manager):
     feature.name = "exact"
     feature.effects = 0
     manager.register_provider(
-        "exact", feature.get_agent_skills(), feature, {"!exact": "exact_result"}
+        "exact",
+        feature.get_agent_skills(),
+        feature,
+        {"!exact": "exact_result", "!names": "list_names"},
     )
     return feature
 
@@ -56,6 +74,38 @@ async def test_local_command_retains_integer_types_and_complete_values(manager):
     )
     assert type(result["data"]["small"]) is int
     assert result["data"]["snowflake"] == 1153921230456789012
+
+
+async def test_local_command_preserves_surrogateescaped_names_after_one_effect(manager):
+    feature = provider(manager)
+    result = await manager.execute_command("!names")
+    assert os.fsencode(result["data"]["names"][0]) == b"report-\xff.txt"
+    assert feature.effects == 1
+    assert await manager.task_store.backend.fetch_all(
+        "SELECT status FROM a2a_tasks"
+    ) == [("completed",)]
+
+
+async def test_workflow_carries_surrogateescaped_names_without_repeating_effect(
+    manager,
+):
+    feature = provider(manager)
+    workflow = TaskFeature(SimpleNamespace(did=manager.did))
+    workflow.set_task_manager(manager)
+    result = await workflow.run_workflow(
+        [
+            {"feature": "exact", "skill": "list_names"},
+            {
+                "feature": "exact",
+                "skill": "consume_names",
+                "args": {"value": "{{prev.result}}"},
+            },
+        ]
+    )
+    assert result.status is ToolResultStatus.OK
+    assert result.data["completed"] == 2 and result.data["failed"] == 0
+    assert feature.effects == 1
+    assert os.fsencode(feature.observed["data"]["names"][0]) == b"report-\xff.txt"
 
 
 async def test_real_workflow_carries_exact_result_into_the_next_typed_tool(manager):

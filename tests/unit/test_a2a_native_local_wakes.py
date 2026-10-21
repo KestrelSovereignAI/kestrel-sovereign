@@ -135,6 +135,54 @@ async def test_peer_metadata_cannot_disable_its_server_owned_wake_policy(manager
     assert [item.task.id for item in await candidates(manager)] == [task.id]
 
 
+async def test_interrupted_sync_command_is_terminal_and_absent_from_pending_inbox(
+    manager,
+):
+    from google.protobuf.json_format import MessageToDict
+
+    feature = provider(manager)
+    execution = asyncio.create_task(
+        manager.execute_skill("local-wake", "hold_local", {}, sync=True)
+    )
+    async with asyncio.timeout(3):
+        await feature.started.wait()
+    [(task_id,)] = await manager.task_store.backend.fetch_all(
+        "SELECT id FROM a2a_tasks"
+    )
+    execution.cancel("interrupt local command")
+    with pytest.raises(asyncio.CancelledError, match="interrupt local command"):
+        await execution
+    stored = await manager.get_task_for_recipient(task_id, manager.did)
+    assert stored.status.state == TaskState.TASK_STATE_CANCELED
+    assert (
+        MessageToDict(stored.metadata)["cancellation_receipt"]["actor_agent_id"]
+        == manager.did
+    )
+    assert await manager.get_pending_tasks(recipient_agent_id=manager.did) == []
+    assert await candidates(manager) == []
+    assert feature.effects == 1 and not feature.release.is_set()
+
+
+async def test_sync_interruption_keeps_an_independent_terminal_winner(manager):
+    feature = provider(manager)
+    execution = asyncio.create_task(
+        manager.execute_skill("local-wake", "hold_local", {}, sync=True)
+    )
+    async with asyncio.timeout(3):
+        await feature.started.wait()
+    [(task_id,)] = await manager.task_store.backend.fetch_all("SELECT id FROM a2a_tasks")
+    winner = await manager.update_status(
+        task_id, TaskState.TASK_STATE_COMPLETED,
+        new_text_message("Independent completion"), recipient_agent_id=manager.did,
+    )
+    execution.cancel("observer interrupted")
+    with pytest.raises(asyncio.CancelledError, match="observer interrupted"):
+        await execution
+    assert await manager.get_task_for_recipient(task_id, manager.did) == winner
+    assert await manager.get_pending_tasks(recipient_agent_id=manager.did) == []
+    assert await candidates(manager) == [] and feature.effects == 1
+
+
 async def test_stale_input_wake_cannot_drive_or_mutate_a_local_async_invocation(
     manager,
     monkeypatch,

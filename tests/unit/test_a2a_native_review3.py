@@ -227,7 +227,7 @@ async def test_identical_working_responses_back_off_but_actual_progress_resets_t
     from tests.unit.test_a2a_native_question_store import response
 
     p = questions
-    q, dispatch, request = await reserve_question(p)
+    q, dispatch, request = await reserve_question(p, deadline_seconds=3600)
     submitting = await p.outbound.begin_submission(
         dispatch, operation_id="original-send"
     )

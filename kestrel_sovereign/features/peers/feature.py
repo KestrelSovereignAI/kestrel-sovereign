@@ -1111,6 +1111,7 @@ class PeersFeature(Feature):
         )
         from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
         from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
+        from kestrel_sovereign.a2a.stores.unified.question_store import QuestionConflict
         from kestrel_sovereign.a2a.stores.unified.outbound_store import (
             DispatchState,
             OutboundDispatchConflict,
@@ -1198,6 +1199,7 @@ class PeersFeature(Feature):
             PeerDirectoryError,
             A2AError,
             OutboundDispatchConflict,
+            QuestionConflict,
             NativePeerProtocolError,
             NativeSenderProofError,
         ) as error:

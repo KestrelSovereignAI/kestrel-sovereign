@@ -14,15 +14,19 @@ from kestrel_sovereign.a2a.extensions import parse_question_correlation
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_label
 from kestrel_sovereign.a2a.native_sender import native_request_digest
 from kestrel_sovereign.a2a.projections import message_text
-from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
+from kestrel_sovereign.a2a.stores.unified.base import (
+    NativeStoreConflict,
+    UnifiedStoreBase,
+)
 from kestrel_sovereign.a2a.stores.unified.outbound_store import (
     DispatchState,
     OutboundDispatch,
+    OutboundDispatchConflict,
     OutboundStore,
 )
 
 
-class QuestionConflict(ValueError):
+class QuestionConflict(NativeStoreConflict):
     """Correlation, native receipt or question ownership disagrees with durable intent."""
 
 
@@ -218,7 +222,12 @@ class NativeQuestionStore(UnifiedStoreBase):
         return [NativeQuestion(*row) for row in rows]
 
     def deadline_passed(self, question: NativeQuestion) -> bool:
-        return question.deadline <= _timestamp(self._clock())
+        return self.deadline_remaining_seconds(question) <= 0
+
+    def deadline_remaining_seconds(self, question: NativeQuestion) -> float:
+        return (
+            datetime.fromisoformat(question.deadline) - self._clock()
+        ).total_seconds()
 
     async def retained_response(
         self, dispatch: OutboundDispatch
@@ -254,7 +263,7 @@ class NativeQuestionStore(UnifiedStoreBase):
         In particular, a taskless Message has no remote task to read after a
         crash. Its answer must survive the same commit as its delivery receipt.
         """
-        question = await self.for_dispatch(dispatch.dispatch_id)
+        question = await self.for_dispatch(dispatch.root_dispatch_id)
         if question is None:
             raise QuestionConflict("Native question receipt has no registered intent")
         self.outbound_store.validate_response(dispatch, response)
@@ -268,8 +277,33 @@ class NativeQuestionStore(UnifiedStoreBase):
             receipt = await self.outbound_store.acknowledge(
                 dispatch, response, operation_id=operation_id
             )
-            if receipt is not None and receipt.state is DispatchState.COMPLETE:
-                await self.record_answer(question.question_id, receipt, response)
+            if receipt is None:
+                raise OutboundDispatchConflict(
+                    "Peer receipt conflicts with the current dispatch or another task owner"
+                )
+            root_receipt = receipt
+            if dispatch.parent_dispatch_id is not None:
+                # The child's receipt already holds the task-owner advisory
+                # lock. Acquire the root row next, in that same global order,
+                # so cancellation and other observations cannot stale this CAS.
+                root = await self.outbound_store.get(
+                    dispatch.root_dispatch_id, lock=True
+                )
+                if root is None:
+                    raise OutboundDispatchConflict(
+                        "Question continuation lost its root"
+                    )
+                root_receipt = await self.outbound_store.acknowledge(
+                    root,
+                    response,
+                    operation_id=operation_id,
+                )
+                if root_receipt is None:
+                    raise OutboundDispatchConflict(
+                        "Question root receipt lost its authority"
+                    )
+            if root_receipt.state is DispatchState.COMPLETE:
+                await self.record_answer(question.question_id, root_receipt, response)
         return receipt
 
     async def reserve(

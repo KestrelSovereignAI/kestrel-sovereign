@@ -179,6 +179,17 @@ class NativeQuestionSupervisor:
                 != self._observation_progress(before)
                 else min(delay * 2, self.max_interval)
             )
+            if question.status == "WAITING":
+                # A growing retry interval must not skip the remaining answer
+                # window. Tighten reads as its original deadline approaches;
+                # the independent deadline lane still never waits for I/O.
+                delay = min(
+                    delay,
+                    max(
+                        self.interval,
+                        self.store.deadline_remaining_seconds(question) / 2,
+                    ),
+                )
             self._next_read[question.question_id] = (self._clock() + delay, delay)
 
     async def _settle_local(self, question):

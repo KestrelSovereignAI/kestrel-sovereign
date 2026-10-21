@@ -8,6 +8,28 @@ from google.protobuf.json_format import ParseDict
 from kestrel_sovereign.a2a.media import part_media_type, validate_input_parts
 
 
+def test_inline_json_preserves_exact_integers_and_filesystem_names():
+    import json
+    import os
+
+    from kestrel_sovereign.a2a.media import encode_inline_json
+
+    value = {"id": 10**30, "name": os.fsdecode(b"report-\xff.txt")}
+    encoded = encode_inline_json(value)
+    assert encoded.isascii()
+    decoded = json.loads(encoded)
+    assert decoded == value and type(decoded["id"]) is int
+    assert os.fsencode(decoded["name"]) == b"report-\xff.txt"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_inline_json_rejects_nonfinite_numbers(value):
+    from kestrel_sovereign.a2a.media import encode_inline_json
+
+    with pytest.raises(ValueError):
+        encode_inline_json({"value": value})
+
+
 @pytest.mark.parametrize(
     "value", [{"nested": [None, {}, []]}, [], 0, False, None, "scalar"]
 )

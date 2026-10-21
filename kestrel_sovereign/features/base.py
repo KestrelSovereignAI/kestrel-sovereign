@@ -1330,7 +1330,9 @@ class Feature(_SdkFeature):
             # Inline standard JSON preserves integer types and identifiers
             # beyond binary64 precision. Encoding must succeed before the
             # task may claim completion after its tool effect.
-            payload = json.dumps(result, allow_nan=False, ensure_ascii=False).encode("utf-8")
+            from kestrel_sovereign.a2a.media import encode_inline_json
+
+            payload = encode_inline_json(result)
             artifact = new_raw_artifact(
                 f"{skill_name}_result", payload, media_type="application/json"
             )

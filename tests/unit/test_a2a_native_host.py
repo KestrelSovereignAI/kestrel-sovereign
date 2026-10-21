@@ -1067,7 +1067,7 @@ async def test_same_host_session_rechecks_sender_directory_before_submission(
             await session.send(dispatch, wire)
         assert (
             await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
-        ).state.value == "reserved"
+        ).state.value == "not-sent"
         from a2a.types import ListTasksRequest
 
         listed = await p.manager.task_store.list_for_creator(
@@ -1297,7 +1297,7 @@ async def test_same_host_session_cannot_spend_a_replaced_generation(
             await session.send(dispatch, wire)
         assert (
             await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
-        ).state.value == "reserved"
+        ).state.value == "not-sent"
 
 
 async def test_native_message_tool_audit_lists_immutable_dispatch_and_remote_id(
@@ -1642,7 +1642,13 @@ async def test_native_question_requires_pre_dispatch_intent_and_correlates_recip
             await session.send(dispatch, wire)
         assert (
             await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
-        ).state.value == "reserved"
+        ).state.value == "not-sent"
+        # A refused attempt is retained as non-delivery. New intent uses a
+        # distinct attempt rather than reopening its consumed reservation.
+        params.message.message_id = uuid4().hex
+        dispatch, wire = await session.reserve(
+            params, dispatch_tool="send_a2a_question", verb="question"
+        )
         question = await questions.reserve(
             dispatch,
             wire,
@@ -2196,6 +2202,97 @@ async def test_public_task_tool_continues_a_retained_native_task(local_native_pe
     assert len(await p.sender_manager.outbound_store.list_recent()) == 2
 
 
+async def test_refused_follow_up_releases_parent_without_replaying_attempt(
+    local_native_peer, monkeypatch
+):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router, feature._peer_requester = p.directory, p.requester
+    feature._own_name = "Sender"
+    original = await feature.send_a2a_task("Peer", "Start the native task")
+    store = p.sender_manager.outbound_store
+    reserve = store.reserve
+
+    async def revoke_after_reserve(*args, **kwargs):
+        row = await reserve(*args, **kwargs)
+        if kwargs.get("parent") is not None:
+            p.route_state.allowed = False
+        return row
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "reserve", revoke_after_reserve)
+        refused = await feature.send_a2a_task(
+            "Peer", "Additional input", continue_dispatch_id=original.data["dispatch_id"]
+        )
+    assert refused.data["sent"] is False
+    [child] = [row for row in await store.list_recent() if row.parent_dispatch_id]
+    assert child.state.value == "not-sent"
+    p.route_state.allowed = True
+    retry = await feature.send_a2a_task(
+        "Peer", "Additional input", continue_dispatch_id=original.data["dispatch_id"]
+    )
+    assert retry.data["sent"] is True
+    assert retry.data["dispatch_id"] != child.dispatch_id
+    task = await p.manager.get_task_for_creator(
+        original.data["remote_task_id"], PRINCIPAL, recipient_agent_id=p.recipient.did
+    )
+    assert len(task.history) == 2
+    assert await store.get(child.dispatch_id) == child
+
+
+async def test_expired_question_follow_up_is_typed_and_does_not_reserve_child(
+    native_question_peer,
+):
+    from datetime import datetime, timedelta
+
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    p = native_question_peer
+    sent = await p.feature.send_a2a_question("Peer", "Keep the original deadline")
+    assert sent.data["sent"] is True
+    store = p.sender_manager.questions_for_actor(PRINCIPAL)
+    question = await store.for_dispatch(sent.data["dispatch_id"])
+    store._clock = lambda: datetime.fromisoformat(question.deadline) + timedelta(seconds=1)
+    refused = await p.feature.send_a2a_task(
+        "Peer", "Too late", continue_dispatch_id=sent.data["dispatch_id"]
+    )
+    assert refused.status is ToolResultStatus.ERROR and refused.data["sent"] is False
+    assert "no longer live" in refused.error
+    assert len(await p.sender_manager.outbound_store.list_recent()) == 1
+
+
+async def test_native_follow_up_client_settles_its_original_question_on_read(
+    native_question_peer,
+):
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+
+    p = native_question_peer
+    first = await p.feature.send_a2a_question("Peer", "Answer the original question")
+    assert first.data["sent"] is True
+    # Prove that the follow-up client's receipt owns this settlement. Resident
+    # recovery must not hide a missing root-question acknowledgement.
+    p.feature._question_supervisor_task.cancel()
+    await asyncio.gather(p.feature._question_supervisor_task, return_exceptions=True)
+    followed = await p.feature.send_a2a_task(
+        "Peer", "Additional context", continue_dispatch_id=first.data["dispatch_id"]
+    )
+    assert followed.data["sent"] is True
+    inbox = TaskFeature(p.recipient)
+    inbox.set_task_manager(p.manager)
+    await inbox.respond_to_a2a_task(followed.data["remote_task_id"], "Final answer")
+    questions = p.sender_manager.questions_for_actor(PRINCIPAL)
+    assert (await questions.get(first.data["question_id"])).status == "WAITING"
+    result = await p.feature.get_peer_task_result(followed.data["dispatch_id"])
+    assert result.data["state"] == "completed"
+    settled = await questions.get(first.data["question_id"])
+    assert settled.status == "RESOLVED" and settled.receiver_settled
+    root = await p.sender_manager.outbound_store.get(first.data["dispatch_id"])
+    assert (await questions.retained_response(root)).status.message.parts[0].text == "Final answer"
+    assert [wake.wave for wake in await questions.pending_wakes()] == ["answer"]
+
+
 @pytest.mark.parametrize("expiration_phase", [None, "before-send", "http-dispatch"])
 async def test_question_follow_up_deadline_is_rechecked_at_native_http(
     local_native_peer, expiration_phase
@@ -2264,8 +2361,6 @@ async def test_question_follow_up_deadline_is_rechecked_at_native_http(
         assert retained.state.value == (
             "acknowledged"
             if expiration_phase is None
-            else "reserved"
-            if expiration_phase == "before-send"
             else "not-sent"
         ), "Question continuation crossed its permitted admission phase"
         task = await p.manager.get_task_for_creator(

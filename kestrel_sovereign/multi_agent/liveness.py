@@ -118,9 +118,37 @@ class ServingRecord:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._database_records: list[ServingRecord] = []
 
     @classmethod
-    def acquire(cls, data_dir: Path) -> "ServingRecord":
+    def acquire(
+        cls, data_dir: Path, *, storage_path: Path | None = None
+    ) -> ServingRecord:
+        """Publish profile and canonical database ownership before boot.
+
+        A database symlink may point outside the profile. Both directories
+        must name the serving process so offline tools can select either path.
+        """
+        primary = cls._acquire_one(data_dir)
+        try:
+            if storage_path is not None:
+                database_dir = Path(storage_path).expanduser().resolve().parent
+                if database_dir != Path(data_dir).resolve():
+                    primary._database_records.append(cls._acquire_one(database_dir))
+        except BaseException as error:
+            try:
+                primary.release()
+            except OSError as cleanup_error:
+                from kestrel_sovereign.execution_custody import execution_terminal_error
+
+                raise execution_terminal_error(
+                    error, cleanup_error, retain_originals=True
+                )
+            raise
+        return primary
+
+    @classmethod
+    def _acquire_one(cls, data_dir: Path) -> ServingRecord:
         """Record that this process serves the agent in ``data_dir``.
 
         The record is published whole (written aside, then renamed), so a
@@ -154,6 +182,10 @@ class ServingRecord:
         Raises:
             OSError: The record cannot be removed.
         """
+        # Retain the profile record if an alias record could not be released;
+        # a caller may retry, and no guard may infer successful cleanup.
+        for record in self._database_records:
+            record.release()
         self.path.unlink(missing_ok=True)
 
 
@@ -259,10 +291,7 @@ def _parse_record(payload: dict[str, Any]) -> Optional[_RecordedProcess]:
 def _unprovable(path: Path, evidence: str) -> AgentHolder:
     return AgentHolder(
         evidence=evidence,
-        remedy=(
-            "stop the process serving it; if none is, delete "
-            f"{path} and retry"
-        ),
+        remedy=(f"stop the process serving it; if none is, delete {path} and retry"),
         verified=False,
     )
 

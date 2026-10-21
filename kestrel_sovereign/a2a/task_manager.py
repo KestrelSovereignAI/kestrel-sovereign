@@ -26,6 +26,7 @@ from a2a.types import (
     AgentSkill,
     Artifact,
     Message,
+    Part,
     Role,
     SendMessageRequest,
     Task,
@@ -54,6 +55,7 @@ from kestrel_sovereign.a2a.lifecycle import (
     TERMINAL_STATES,
     task_state_label,
 )
+from kestrel_sovereign.a2a.media import encode_inline_json
 from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.skill_handler import TaskHandler
@@ -532,7 +534,12 @@ class TaskManager:
                 )
             elif hook_output.updated_input is not None:
                 args = hook_output.updated_input
-        metadata = {"skill": skill_id, "args": args, "provider_id": agent_id}
+        # Local arguments are passed explicitly to the handler. Their durable
+        # input representation must also retain exact JSON types and strings.
+        argument_part = Part(
+            raw=encode_inline_json(args), media_type="application/json"
+        )
+        metadata = {"skill": skill_id, "provider_id": agent_id}
         if self._causation_chain_provider is not None:
             chain = self._causation_chain_provider()
             if chain is not None:
@@ -545,6 +552,7 @@ class TaskManager:
             ),
             metadata=metadata,
         )
+        request.message.parts.append(argument_part)
         task = await self.create_task(
             request,
             creator_agent_id=authority_agent_id,
@@ -575,17 +583,25 @@ class TaskManager:
 
         if sync:
             # Execute synchronously with transaction safety
-            expected_state = task.status.state
-            task = await handler.handle_task(task, arguments=args)
-            # The canonical outcome writer owns CAS and uncertain-commit
-            # reconciliation. A persistence failure must reach the caller; an
-            # extra transaction/retry cannot manufacture a completed receipt.
-            task, _ = await self._persist_execution_outcome(
-                task,
-                baseline=baseline,
-                authority_agent_id=authority_agent_id,
-                expected_state=expected_state,
-            )
+            try:
+                expected_state = task.status.state
+                task = await handler.handle_task(task, arguments=args)
+                # The canonical outcome writer owns CAS and uncertain-commit
+                # reconciliation. A persistence failure must reach the caller; an
+                # extra transaction/retry cannot manufacture a completed receipt.
+                task, _ = await self._persist_execution_outcome(
+                    task,
+                    baseline=baseline,
+                    authority_agent_id=authority_agent_id,
+                    expected_state=expected_state,
+                )
+            except asyncio.CancelledError as cancellation:
+                if is_execution_control_error(cancellation):
+                    raise
+                await self._settle_execution_interruption(
+                    baseline, authority_agent_id, cancellation
+                )
+                raise
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
                 from kestrel_sdk.hooks.base import HookEvent, HookInput
@@ -758,6 +774,38 @@ class TaskManager:
                 return current
             raise
 
+    async def _settle_execution_interruption(
+        self,
+        baseline: Task,
+        authority_agent_id: str,
+        cancellation: asyncio.CancelledError,
+    ) -> None:
+        """Retain interruption through the original recipient's outcome writer."""
+        canceled = Task.FromString(baseline.SerializeToString())
+        canceled.status.CopyFrom(
+            TaskStatus(
+                state=TaskState.TASK_STATE_CANCELED,
+                message=new_text_message(
+                    "Task execution was interrupted",
+                    task_id=canceled.id,
+                    context_id=canceled.context_id,
+                ),
+            )
+        )
+        try:
+            await self._persist_handler_cancellation(
+                canceled,
+                baseline=baseline,
+                authority_agent_id=authority_agent_id,
+            )
+        except BaseException as cleanup_error:  # noqa: BLE001 - preserve both control graphs
+            raise execution_terminal_error(
+                cancellation,
+                cleanup_error,
+                retain_originals=True,
+                isolate_control_originals=True,
+            )
+
     async def _execute_async(
         self,
         handler: TaskHandler,
@@ -801,17 +849,9 @@ class TaskManager:
         except asyncio.CancelledError as cancellation:
             if is_execution_control_error(cancellation):
                 raise
-            try:
-                await self.cancel_task(
-                    task.id,
-                    reason="Task canceled during shutdown",
-                    agent_name=authority_agent_id,
-                )
-            except ValueError as cancellation_error:
-                if is_execution_control_error(cancellation_error):
-                    raise
-                # An independently authorized cancellation or other terminal
-                # result won the race. Never narrate over that durable state.
+            await self._settle_execution_interruption(
+                baseline, authority_agent_id, cancellation
+            )
             raise
 
     async def _persist_execution_outcome(

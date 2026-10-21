@@ -307,8 +307,6 @@ async def test_duplicate_local_message_does_not_create_another_dispatch(outbound
 
 
 async def test_remote_id_collision_cannot_rekey_another_dispatch(outbound):
-    from kestrel_sovereign.storage.db.interface import DatabaseError
-
     first, second = request(context="first"), request(context="second")
     a = await outbound.begin_submission(
         await reserve(outbound, first), operation_id="a"
@@ -317,8 +315,7 @@ async def test_remote_id_collision_cannot_rekey_another_dispatch(outbound):
         await reserve(outbound, second), operation_id="b"
     )
     accepted = await outbound.acknowledge(a, task(first), operation_id="ack-a")
-    with pytest.raises(DatabaseError):
-        await outbound.acknowledge(b, task(second), operation_id="ack-b")
+    assert await outbound.acknowledge(b, task(second), operation_id="ack-b") is None
     assert await outbound.get(a.dispatch_id) == accepted
     assert await outbound.get(b.dispatch_id) == b
 
