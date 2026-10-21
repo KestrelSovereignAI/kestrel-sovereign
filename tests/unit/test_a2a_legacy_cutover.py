@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest
+from a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
 
 from kestrel_sovereign.a2a.legacy_cutover import (
     apply_legacy_migration,
@@ -16,6 +16,7 @@ from kestrel_sovereign.a2a.migrate_legacy import LegacyTaskMigrationError
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
+from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.utils.native_a2a import manager_for
 
@@ -119,6 +120,9 @@ async def test_offline_cutover_preserves_archives_ownership_and_history_without_
         assert not await backend.table_exists("a2a_protocol_schema")
         assert await backend.fetch_all("SELECT * FROM a2a_tasks") == before
         archives = await apply_legacy_migration(backend, plan)
+        # Historical conversion emits no new push work. Fresh mutations must
+        # use the canonical triggers restored by the offline transaction.
+        assert await backend.fetch_one("SELECT COUNT(*) FROM a2a_task_changes") == (0,)
         assert (
             await backend.fetch_all(f'SELECT * FROM "{archives["a2a_tasks"]}"')
             == before
@@ -164,12 +168,52 @@ async def test_offline_cutover_preserves_archives_ownership_and_history_without_
                 terminal_changed_since=datetime(2020, 1, 1, tzinfo=UTC),
             )
             assert [item.task.id for item in candidates] == [fresh.id]
+            assert [
+                change.task_id
+                for change in await manager.task_store.changes.pending(limit=10)
+            ] == [fresh.id]
             with pytest.raises(QueryError, match="terminal A2A task"):
                 await backend.execute(
                     "UPDATE a2a_tasks SET status = 'working' WHERE id = 'historical'"
                 )
         finally:
             await manager.close()
+    finally:
+        await backend.close()
+
+
+async def test_offline_cutover_restores_task_journal_before_runtime_boot(
+    native_a2a_backend_factory,
+):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    try:
+        await legacy(backend, terminal_fence=True)
+        plan = await prepare_legacy_migration(backend, ownership=ownership())
+        await apply_legacy_migration(backend, plan)
+        assert await backend.fetch_one("SELECT COUNT(*) FROM a2a_task_changes") == (0,)
+        store = TaskStore(
+            backend,
+            scope=NativeRecipientScope("did:recipient", "tenant"),
+            owns_backend=False,
+        )
+        # Exercise the original committed triggers before initialize could
+        # reinstall them. This terminal probe cannot start cognition.
+        task = Task(
+            id="post-cutover-native",
+            context_id="post-cutover-context",
+            status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
+        )
+        await store.create(
+            task,
+            creator_agent_id="did:creator",
+            recipient_agent_id="did:recipient",
+            cognition_wake_eligible=False,
+            input_wake_eligible=False,
+        )
+        assert [change.task_id for change in await store.changes.pending(limit=10)] == [
+            task.id
+        ]
     finally:
         await backend.close()
 

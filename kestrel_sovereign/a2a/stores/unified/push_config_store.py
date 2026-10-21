@@ -111,6 +111,40 @@ class PushConfigStore(UnifiedStoreBase):
                     ON a2a_push_delivery_attempts (recipient_id, tenant, task_id, config_id, generation, retired)
             """)
 
+            await self._initialize_task_cleanup_guard()
+
+    async def _initialize_task_cleanup_guard(self) -> None:
+        # A live configuration owns a durable consumer even before its first
+        # HTTP attempt. Task cleanup must not orphan that consumer or erase its
+        # credentials behind the public Delete retirement contract.
+        if self.is_sqlite:
+            await self.backend.execute_script("""
+                CREATE TRIGGER IF NOT EXISTS a2a_push_task_cleanup_v1
+                BEFORE DELETE ON a2a_tasks
+                WHEN EXISTS (SELECT 1 FROM a2a_push_configs
+                             WHERE task_id = OLD.id AND state != 'deleted')
+                BEGIN
+                    SELECT RAISE(ABORT, 'task has an active push configuration');
+                END
+            """)
+        elif self.is_postgres:
+            await self.backend.execute_script("""
+                CREATE OR REPLACE FUNCTION a2a_push_task_cleanup_v1()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM a2a_push_configs
+                               WHERE task_id = OLD.id AND state != 'deleted') THEN
+                        RAISE EXCEPTION 'task has an active push configuration'
+                            USING ERRCODE = '23503';
+                    END IF;
+                    RETURN OLD;
+                END;
+                $$;
+                CREATE OR REPLACE TRIGGER a2a_push_task_cleanup_v1
+                    BEFORE DELETE ON a2a_tasks
+                    FOR EACH ROW EXECUTE FUNCTION a2a_push_task_cleanup_v1()
+            """)
+
     @property
     def scope(self) -> NativeRecipientScope:
         return self.task_store.scope

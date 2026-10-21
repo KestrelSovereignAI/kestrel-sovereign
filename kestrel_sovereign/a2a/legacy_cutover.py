@@ -25,6 +25,7 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextOwnership,
     ContextStore,
 )
+from kestrel_sovereign.a2a.stores.unified.task_change_store import TaskChangeStore
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore, _task_payload
 from kestrel_sovereign.signals.durable import DurableSignalStore, DurableSourceBoundary
 from kestrel_sovereign.signals.sources.a2a import SOURCE_NAME as COMPLETE_SOURCE
@@ -94,7 +95,7 @@ _TASK_TRIGGERS = frozenset(
         "a2a_tasks_authority_insert_v5",
         "a2a_tasks_live_authority_update_v5",
     }
-)
+) | TaskChangeStore.TRIGGER_NAMES
 
 
 def _ident(value):
@@ -242,6 +243,10 @@ async def prepare_legacy_migration(
         "a2a_native_questions",
         "a2a_native_question_wakes",
         "a2a_task_inputs",
+        "a2a_task_changes",
+        "a2a_push_configs",
+        "a2a_push_subscriptions",
+        "a2a_push_delivery_attempts",
         "a2a_native_store_schema",
     ):
         if await backend.table_exists(target) and await backend.fetch_one(
@@ -522,6 +527,7 @@ async def apply_legacy_migration(backend, plan: LegacyMigrationPlan):
                         "A reviewed historical task disappeared during cutover"
                     )
             await tasks._install_canceled_terminal_fence()
+            await tasks.changes.initialize()
         for table in current.tables:
             if table.name in _TABLES and table.name != "a2a_tasks":
                 await backend.execute(f"DELETE FROM {_ident(table.name)}")

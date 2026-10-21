@@ -883,13 +883,36 @@ The sender inventories its attempt before an admission COMMIT can become
 uncertain, so a lost acknowledgement before HTTP begins is recoverable without
 inventing a network request or replacing the original database outcome.
 
-These configuration/HTTP primitives are implemented; the handler continues to
-advertise push as unsupported until durable delivery and the standard config
-operations are wired together. The remaining integration must journal task
-change references in the task transaction and use the existing durable signal
-consumer ledger for fan-out, claims and retries. Notification payloads are read
-from the canonical authorized task, rather than duplicating task bodies in a
-second protocol store. No network request may hold a database transaction.
+`TaskChangeStore` records metadata-only references through SQLite and PostgreSQL
+triggers in each original task transaction. The current core schema bundle is
+revision 4. Offline conversion suspends the canonical trigger inventory while
+rewriting history and restores it before commit, without producing new work for
+historical tasks. Task cleanup removes its journal references.
+
+`NativePushOutbox` commits encrypted configuration, durable consumer registration
+and an initial snapshot reference together. A creator-authorized task row lock
+orders that registration against task changes. The existing `DurableSignalStore`
+owns fan-out, claims, leases, retry and acknowledgement. Forwarding commits the
+signal event, initial deliveries and journal receipt together; stable source IDs
+preserve original deliveries after replay. A recipient/tenant-derived source
+scope and immutable journal boundary prevent cross-tenant delivery and sending
+older backfilled changes to a new subscription.
+
+`NativePushWorker` reads each notification from the latest canonical task under
+the subscription's creator authority. It renews the original delivery token and
+checks it again at actual HTTP dispatch. Acknowledgement follows physical HTTP
+retirement. Retry diagnostics contain error types, excluding callback secrets.
+Owned database transitions finish before cancellation is reported, preserving
+actual commit failures. Delete revokes configuration and consumer admission in
+one transaction, joins local request owners, then requires the durable retirement
+receipt. A remote or failed owner leaves deletion pending with credentials
+retained; an expired lease cannot establish retirement. Active configurations
+also block task cleanup before their first HTTP request.
+
+These durable storage and delivery components are implemented. The handler
+continues to advertise push as unsupported until managed host lifetime, standard
+config operations and atomic inline admission are connected. No network request
+may hold a database transaction.
 
 `prepare_native_task_input` copies the complete official request and hashes its
 canonical JSON before extracting inline callback credentials. Initial and
@@ -898,8 +921,8 @@ the original wire digest. Reusing a message ID with changed callback credentials
 conflicts even when its executable content is unchanged. Snapshot readers
 refuse callback material or a missing wire identity. The signing producer and
 task-input projection share one pure digest implementation, avoiding an
-agent/storage import cycle. Native core schema revision 3 requires an explicit
-offline migration from earlier input shapes.
+agent/storage import cycle. Earlier input shapes require explicit offline
+migration; runtime startup refuses to reinterpret them.
 
 The transient callback projection still needs atomic encrypted registration
 with task admission and its durable consumer before push is advertised. Callback

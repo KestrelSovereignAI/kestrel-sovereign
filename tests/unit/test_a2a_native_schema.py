@@ -232,8 +232,10 @@ async def test_previous_native_input_shape_is_refused_before_any_startup_write(
         await backend.close()
 
 
+@pytest.mark.parametrize("revision", [2, 3])
 async def test_pre_projection_core_bundle_revision_requires_offline_migration(
     native_a2a_backend_factory,
+    revision,
 ):
     from kestrel_sovereign.a2a.native_schema import require_native_a2a_schema
 
@@ -245,7 +247,8 @@ async def test_pre_projection_core_bundle_revision_requires_offline_migration(
     try:
         await manager.initialize()
         await backend.execute(
-            "UPDATE a2a_native_store_schema SET revision = 2 WHERE component = 'core'"
+            "UPDATE a2a_native_store_schema SET revision = ? WHERE component = 'core'",
+            (revision,),
         )
         before = await backend.fetch_all(
             "SELECT component, revision FROM a2a_native_store_schema"

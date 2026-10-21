@@ -56,6 +56,7 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextOwnershipError,
     ContextStore,
 )
+from kestrel_sovereign.a2a.stores.unified.task_change_store import TaskChangeStore
 from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
 
 logger = logging.getLogger(__name__)
@@ -283,6 +284,7 @@ class TaskStore(UnifiedStoreBase):
             raise TypeError("TaskStore requires a server-owned native recipient scope")
         super().__init__(backend, owns_backend=owns_backend)
         self._scope = scope
+        self.changes = TaskChangeStore(backend, scope=scope)
 
     @property
     def scope(self) -> NativeRecipientScope:
@@ -368,6 +370,7 @@ class TaskStore(UnifiedStoreBase):
                     await self._ensure_cancellation_schema_objects()
         else:
             await self._ensure_cancellation_schema_objects()
+        await self.changes.initialize()
 
     async def _postgres_cancellation_schema_ready(self) -> bool:
         """Re-probe every PostgreSQL object protected by the migration lock."""

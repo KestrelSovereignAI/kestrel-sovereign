@@ -2,11 +2,17 @@
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 import httpx
 from a2a.server.tasks.push_notification_sender import PushNotificationEvent
-from a2a.types import Task, TaskArtifactUpdateEvent, TaskStatusUpdateEvent
+from a2a.types import (
+    Task,
+    TaskArtifactUpdateEvent,
+    TaskPushNotificationConfig,
+    TaskStatusUpdateEvent,
+)
 from a2a.utils.constants import (
     A2A_JSON_MEDIA_TYPE,
     PROTOCOL_VERSION_1_0,
@@ -36,8 +42,8 @@ class PushDeliveryRevoked(PushConfigConflict):
     """The exact callback generation no longer admits an external request."""
 
 
-def _push_headers(configuration: PushConfiguration) -> dict[str, str]:
-    config = configuration.config
+def push_headers(config: TaskPushNotificationConfig) -> dict[str, str]:
+    """Validate and build the standard callback headers without exposing secrets."""
     headers = {
         "Content-Type": A2A_JSON_MEDIA_TYPE,
         VERSION_HEADER: PROTOCOL_VERSION_1_0,
@@ -66,6 +72,19 @@ def _push_headers(configuration: PushConfiguration) -> dict[str, str]:
     return headers
 
 
+async def validate_push_configuration(
+    config: TaskPushNotificationConfig,
+) -> TaskPushNotificationConfig:
+    """Refuse unsafe or malformed callbacks before any registration write."""
+    if not isinstance(config, TaskPushNotificationConfig):
+        raise TypeError("Native push requires an official TaskPushNotificationConfig")
+    config = TaskPushNotificationConfig.FromString(config.SerializeToString())
+    validate_proto_required_fields(config)
+    push_headers(config)
+    await assert_safe_url(config.url, allowed_schemes=("https",))
+    return config
+
+
 class NativePushTransport:
     """Deliver one event; its durable worker owns retry and lifetime inventory.
 
@@ -89,6 +108,7 @@ class NativePushTransport:
         event: PushNotificationEvent,
         *,
         executor_id: str,
+        before_dispatch: Callable[[], Awaitable[None]] | None = None,
     ) -> PushDeliveryAttempt:
         if not isinstance(
             event, (Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent)
@@ -98,13 +118,27 @@ class NativePushTransport:
         task_id = event.id if isinstance(event, Task) else event.task_id
         if task_id != configuration.config.task_id:
             raise PushConfigConflict("Push event belongs to another native task")
-        headers = _push_headers(configuration)
+        headers = push_headers(configuration.config)
         payload = MessageToJson(to_stream_response(event)).encode("utf-8")
         attempt = self.store.prepare_delivery(configuration, executor_id=executor_id)
         admitted = None
         original = None
         try:
-            admitted = await self.store.admit_delivery(attempt)
+            admission = await await_owned_operation(
+                self.store.admit_delivery(attempt),
+                retirement_resource=attempt,
+                retain_originals=True,
+                name="native-push-admit-http-attempt",
+            )
+            admitted = admission.result
+            error = execution_terminal_error(
+                admission.cancellation,
+                admission.error,
+                retain_originals=True,
+                prefer_cancellation=True,
+            )
+            if error is not None:
+                raise error
             if not admitted:
                 raise PushDeliveryRevoked("Push configuration is no longer active")
             validated = await assert_safe_url(
@@ -116,6 +150,8 @@ class NativePushTransport:
                     raise PushDeliveryRevoked(
                         "Push configuration was revoked before HTTP dispatch"
                     )
+                if before_dispatch is not None:
+                    await before_dispatch()
 
             async with owned_native_http_client(
                 httpx.AsyncClient(

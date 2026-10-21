@@ -37,6 +37,46 @@ async def configured(push_store, url):
     return NativePushTransport(store, timeout=timedelta(seconds=5)), created, task
 
 
+async def test_cancel_during_admission_joins_original_commit_without_http(
+    push_store, outbound_tls, monkeypatch
+):
+    import asyncio
+
+    transport, configuration, task = await configured(
+        push_store, outbound_tls.url + "/callback"
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_admit = transport.store.admit_delivery
+
+    async def original_transaction(attempt):
+        async with transport.store.write_transaction():
+            result = await original_admit(attempt)
+            entered.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(transport.store, "admit_delivery", original_transaction)
+    sending = asyncio.create_task(
+        transport.send(configuration, task, executor_id="original-runtime")
+    )
+    try:
+        await entered.wait()
+        sending.cancel("original admission observer cancellation")
+        await asyncio.sleep(0)
+        assert not sending.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await sending
+        assert caught.value.args == ("original admission observer cancellation",)
+        assert await transport.store.backend.fetch_all(
+            "SELECT retired FROM a2a_push_delivery_attempts"
+        ) == [(1,)]
+        assert outbound_tls.dns == [] and outbound_tls.dials == []
+    finally:
+        release.set()
+        await asyncio.gather(sending, return_exceptions=True)
+
+
 @pytest.mark.parametrize("event_kind", ["task", "status", "artifact"])
 async def test_push_sends_standard_stream_response_and_retires_real_https(
     push_store, outbound_tls, event_kind

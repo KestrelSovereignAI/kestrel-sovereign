@@ -6,6 +6,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -16,7 +17,13 @@ from tests.utils.tls import make_tls_contexts, tls_http_server
 def outbound_tls(tmp_path, monkeypatch, request):
     """Route only a validated public IP to a private real TLS peer."""
     hostname = "xn--strae-oqa.example"
-    certificate_hostname = getattr(request, "param", hostname)
+    settings = getattr(request, "param", hostname)
+    if isinstance(settings, dict):
+        certificate_hostname = settings.get("certificate_hostname", hostname)
+        dns_validations = settings["dns_validations"]
+    else:
+        certificate_hostname, dns_validations = settings, 1
+    assert type(dns_validations) is int and dns_validations > 0
     server_context, client_context, certificate = make_tls_contexts(
         tmp_path, certificate_hostname, ip_addresses=()
     )
@@ -37,7 +44,9 @@ def outbound_tls(tmp_path, monkeypatch, request):
             return actual_dns(host, port, *args, **kwargs)
         dns.append(host)
         assert host == hostname
-        assert dns == [hostname], "hostname was resolved again after validation"
+        assert len(dns) <= dns_validations, (
+            "hostname exceeded its independent validation budget"
+        )
         return [
             (
                 socket.AF_INET,
@@ -61,10 +70,11 @@ def outbound_tls(tmp_path, monkeypatch, request):
             self.wfile.write(body)
 
         def do_POST(self):
+            route = urlsplit(self.path).path
             body = self.rfile.read(int(self.headers["Content-Length"]))
             posts.append((self.path, dict(self.headers), json.loads(body)))
             assert reply.wait(5), "test callback headers were not released"
-            if self.path == "/drip-headers":
+            if route == "/drip-headers":
                 # A real slow-loris peer: each read makes progress well within
                 # the socket timeout, while the whole header never completes
                 # within the sender's total exchange deadline.
@@ -81,9 +91,9 @@ def outbound_tls(tmp_path, monkeypatch, request):
                 return
             status = (
                 302
-                if self.path == "/redirect"
+                if route == "/redirect"
                 else 503
-                if self.path == "/failure"
+                if route == "/failure"
                 else 200
             )
             self.send_response(status)
