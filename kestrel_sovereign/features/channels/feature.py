@@ -40,6 +40,7 @@ from kestrel_sovereign.security.encryption import (
     get_fernet,
 )
 from kestrel_sovereign.signals import DurableAdmissionDisposition
+from kestrel_sovereign.storage.timestamps import utc_timestamp_parameter
 from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_CONSUMER_ID,
     DURABLE_COGNITION_MARKER,
@@ -741,7 +742,7 @@ class ChannelFeature(Feature):
                     stored_content,
                     status,
                     json.dumps(meta) if meta else None,
-                    message.timestamp.isoformat(),
+                    utc_timestamp_parameter(self._db.backend_type, message.timestamp),
                 ),
             )
         except Exception as exc:

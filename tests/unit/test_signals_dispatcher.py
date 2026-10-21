@@ -88,8 +88,10 @@ class _FakeAgent:
         self.process_input_calls.append(prompt)
         return self.process_input_return
 
-    def _track_background_task(self, coro, *, name: str):
-        task = asyncio.create_task(coro, name=name)
+    def _track_background_task(self, coro, *, name: str, admission=None):
+        from kestrel_sovereign._async_ownership import create_owned_task
+
+        task = create_owned_task(coro, name=name, admission=admission)
         self.background_tasks.append(task)
         return task
 
@@ -117,11 +119,27 @@ async def dispatcher_components(db_path):
         backend=backend,
         locks=locks,
     )
-    # Drain background log writes before closing the backend.
-    pending = [t for t in agent.background_tasks if not t.done()]
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
-    await backend.close()
+    try:
+        # Negative custody tests already join a failed shutdown and assert its
+        # retained audit receipt. Do not start a fresh retry of that uncertainty
+        # from fixture teardown, outside the test's owning exception scope.
+        completion = dispatcher._durable_shutdown_completion
+        if completion is None:
+            await dispatcher.shutdown_durable_delivery()
+        elif not completion.done():
+            await dispatcher._await_durable_shutdown_completion(completion)
+        else:
+            from kestrel_sovereign._async_ownership import owned_task_error
+
+            error = owned_task_error(completion)
+            if error is not None:
+                assert error is dispatcher._outcome_log_control_error
+    finally:
+        # Storage cleanup is independent even when a teardown assertion fails.
+        pending = [t for t in agent.background_tasks if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await backend.close()
 
 
 def _action_reg(name: str = "action_src", handler=None) -> SourceRegistration:
@@ -1296,14 +1314,17 @@ async def test_enqueue_signal_returns_handle_immediately(dispatcher_components):
     await started.wait()
     assert not handle.done
 
-    # ACK-bearing ingress needs the earlier durable receipt, not this
-    # background handle. The event is committed before a slow handler runs.
-    receipt = await handle.wait_for_durable_admission()
-    assert receipt.disposition is DurableAdmissionDisposition.COMMITTED
-    assert receipt.signal_id == handle.signal_id
+    # Finite action work has no resident owner. Its transport may not retire
+    # the original ingress before the handler and outcome writers settle.
+    admission = asyncio.create_task(handle.wait_for_durable_admission())
+    await asyncio.sleep(0)
+    assert not admission.done()
     assert not handle.done
 
     can_finish.set()
+    receipt = await admission
+    assert receipt.disposition is DurableAdmissionDisposition.COMMITTED
+    assert receipt.signal_id == handle.signal_id
     result = await handle.wait()
     assert result.status == Status.OK
     assert result.action_result == "done"

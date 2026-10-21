@@ -255,6 +255,9 @@ class DurableAdmissionResult:
 
     disposition: DurableAdmissionDisposition
     signal_id: str
+    # Core's finite dispatch has transferred the selected lease and every
+    # remaining writer to the original resident runtime before publication.
+    resident_owned: bool = False
 
     @property
     def acknowledged(self) -> bool:
@@ -1175,6 +1178,24 @@ class SignalDispatcher:
 
         ctx_token = set_current_signal(signal)
         admission_error = None
+        staged_admission = (
+            asyncio.get_running_loop().create_future()
+            if _durable_admission is not None else None
+        )
+
+        def publish_resident_admission(staged):
+            # Finite duplicate/terminal branches do not escape their ingress
+            # before their own outcome writers have physically settled.
+            if staged.cancelled():
+                return
+            error = staged.exception()
+            if error is None:
+                receipt = staged.result()
+                if receipt.resident_owned and not _durable_admission.done():
+                    _durable_admission.set_result(receipt)
+
+        if staged_admission is not None:
+            staged_admission.add_done_callback(publish_resident_admission)
         try:
             async with self._admit_durable_operation():
                 result = await self._run(
@@ -1185,13 +1206,13 @@ class SignalDispatcher:
                         if source_event_id is not None
                         else getattr(signal, "source_event_id", None)
                     ),
-                    durable_admission=_durable_admission,
+                    durable_admission=staged_admission,
                     durable_delivery_consumer_id=_durable_delivery_consumer_id,
                     durable_terminal_consumer_id=_durable_terminal_consumer_id,
                 )
                 if (
-                    _durable_admission is not None
-                    and not _durable_admission.done()
+                    staged_admission is not None
+                    and not staged_admission.done()
                 ):
                     # A validation/cycle refusal is a proven terminal no-op for
                     # this exact signal.  Every other unresolved outcome,
@@ -1203,7 +1224,7 @@ class SignalDispatcher:
                         in {Status.DROPPED_VALIDATION, Status.DROPPED_CYCLE}
                         else DurableAdmissionDisposition.NOT_ADMITTED
                     )
-                    _durable_admission.set_result(
+                    staged_admission.set_result(
                         DurableAdmissionResult(disposition, signal.id)
                     )
                 # The public dispatch contract returns only after its own
@@ -1211,6 +1232,8 @@ class SignalDispatcher:
                 # remains separately admitted so a caller cancellation in
                 # this await cannot create a storage-close gap.
                 await self._drain_outcome_logs_for_signal(signal.id)
+                if _durable_admission is not None and not _durable_admission.done():
+                    _durable_admission.set_result(staged_admission.result())
                 return result
         except _DurableDeliveryShuttingDownError as error:
             if is_execution_control_error(error):
@@ -1321,7 +1344,13 @@ class SignalDispatcher:
             if consumer_id in self._started_durable_cognition_consumers:
                 self._schedule_durable_cognition_drain(consumer_id, delay=0.0)
 
-        task.add_done_callback(release_live_admission)
+        # This callback releases an ingress-local reservation but re-arms an
+        # existing resident consumer. Capture that SAME runtime while the
+        # publisher is admitted, not the expiring HTTP/turn context inherited
+        # by the dispatch task. Revocation of the original runtime still wins.
+        task.add_done_callback(
+            release_live_admission, context=self._resident_timer_context(),
+        )
         return SignalDispatchHandle(
             signal_id=signal.id,
             task=task,
@@ -1525,10 +1554,7 @@ class SignalDispatcher:
         timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
         if timer is not None:
             timer.cancel()
-        tracker = getattr(self._agent, "_track_runtime_task", None)
-        if not callable(getattr(type(self._agent), "_track_runtime_task", None)):
-            tracker = asyncio.create_task
-        task = tracker(
+        task = self._track_resident_durable_task(
             self._drain_durable_cognition_consumer(consumer_id),
             name=f"durable_cognition_drain:{consumer_id}:{self._agent.did}",
         )
@@ -1551,7 +1577,24 @@ class SignalDispatcher:
             if consumer_id in self._durable_cognition_drain_rerun:
                 self._start_durable_cognition_drain(consumer_id)
 
-        task.add_done_callback(complete)
+        task.add_done_callback(complete, context=self._resident_timer_context())
+
+    def _track_resident_durable_task(self, coro, *, name, admission=None):
+        """One resident publisher for initial delivery handoff and retry drains."""
+        tracker = getattr(type(self._agent), "_track_runtime_task", None)
+        if callable(tracker):
+            options = {"admission": admission} if admission is not None else {}
+            return tracker(self._agent, coro, name=name, **options)
+        # Legacy dispatcher embeddings have no hosted execution authority.
+        # They may not impersonate a runtime handoff under an admitted scope.
+        from kestrel_sovereign.execution_custody import (
+            ExecutionAuthorityError, current_execution_custody,
+        )
+        if current_execution_custody(self._agent):
+            coro.close()
+            raise ExecutionAuthorityError("durable handoff requires original runtime owner")
+        from kestrel_sovereign._async_ownership import create_owned_task
+        return create_owned_task(coro, name=name, admission=admission)
 
     async def _drain_durable_cognition_consumer(self, consumer_id: str) -> None:
         """Claim and route all currently-due work for one durable consumer."""
@@ -2250,17 +2293,103 @@ class SignalDispatcher:
             )
 
     async def get_durable_delivery_for_source_event(
-        self, *, consumer_id: str, source: str, source_event_id: str
+        self, *, consumer_id: str, source: str, source_event_id: str,
+        expected_channel_signal: Signal | None = None,
     ) -> Optional[DurableDelivery]:
-        """Read one consumer delivery by its producer's source event ID."""
+        """Read one consumer delivery by its producer's source event ID.
+
+        An optional normalized channel signal requests an exact terminal-only
+        redelivery proof. It uses the same original keyed privacy binding or
+        retained projection as native ingress, without admitting new work,
+        activating a lease, or persisting the supplied envelope. The caller
+        must use the channel source's canonical builder, sanitizer and schema.
+        A mismatch returns ``None``; ordinary observational reads are unchanged.
+        """
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
-            return await self._durable_store.get_delivery_for_source_event(
+            delivery = await self._durable_store.get_delivery_for_source_event(
                 agent_id=self._agent.did,
                 consumer_id=consumer_id,
                 source=source,
                 source_event_id=source_event_id,
             )
+            if expected_channel_signal is None or delivery is None:
+                return delivery
+            registration = self._registry.get(source)
+            if (
+                not isinstance(expected_channel_signal, Signal)
+                or registration is None
+                or consumer_id != DURABLE_TERMINAL_CONSUMER_ID
+                or source != "channel.message"
+                or expected_channel_signal.source != source
+            ):
+                return None
+            recorded_binding = await self._durable_store.get_event_integrity(
+                agent_id=self._agent.did, event_id=delivery.event_id,
+            )
+            if not self._durable_channel_terminal_matches(
+                delivery, expected_channel_signal, registration,
+                recorded_binding=recorded_binding, source_event_id=source_event_id,
+            ):
+                return None
+            return delivery
+
+    def _durable_channel_terminal_matches(
+        self, delivery: DurableDelivery, candidate: Signal,
+        registration: SourceRegistration, *, recorded_binding: str | None,
+        source_event_id: str | None,
+    ) -> bool:
+        """One native equality rule for ingress and read-only terminal proof."""
+        event = delivery.event
+        if (
+            not isinstance(candidate.payload, dict)
+            or delivery.consumer_id != DURABLE_TERMINAL_CONSUMER_ID
+            or delivery.status != TERMINAL_ACKABLE
+            or delivery.agent_id != self._agent.did
+            or delivery.event_id != event.event_id
+            or event.agent_id != self._agent.did
+            or event.source != candidate.source
+            or event.source != "channel.message"
+            or event.source_event_id != source_event_id
+            or event.target_agent != candidate.target_agent
+            or candidate.target_agent != self._agent.did
+            or candidate.mode not in registration.allowed_modes
+            or event.mode != candidate.mode.value
+            or event.session_id != candidate.session_id
+            or event.visibility != candidate.visibility.value
+            or event.urgency != candidate.urgency.value
+            or candidate.origin_trust != registration.trust
+            or candidate.payload.get(DURABLE_TERMINAL_MARKER) != DURABLE_TERMINAL_MARKER_VALUE
+        ):
+            return False
+        if recorded_binding is not None:
+            return secrets.compare_digest(
+                recorded_binding,
+                self._volatile_source_integrity_binding(candidate, source_event_id),
+            )
+        if event.caller_identity is None:
+            # Elided/legacy rows with no original MAC cannot prove an envelope
+            # just because today's privacy policy allows payload persistence.
+            return False
+        projection = self._signal_for_durable_persistence(candidate, registration)
+        retained = self._signal_from_durable_event(event, dispatch_signal=candidate)
+        caller_matches = retained.caller == candidate.caller
+        if (
+            isinstance(retained.caller, str)
+            and retained.caller.startswith(_DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX)
+        ):
+            caller_matches = (
+                candidate.caller == retained.payload.get("sender")
+                == projection.signal.payload.get("sender")
+            )
+        return not projection.payload_elided and projection.signal.payload == candidate.payload and (
+            retained.source == candidate.source
+            and retained.target_agent == candidate.target_agent
+            and retained.kind == candidate.kind
+            and caller_matches
+            and retained.dedupe_key == candidate.dedupe_key
+            and retained.payload == projection.signal.payload
+        )
 
     def _delivery_with_transient_handoff(
         self, delivery: DurableDelivery
@@ -4348,44 +4477,11 @@ class SignalDispatcher:
                     expected.pop(DURABLE_COGNITION_MARKER, None)
                     expected[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
                     candidate = replace(signal, payload=expected)
-                    if recorded_binding is not None:
-                        # The provider retried the same envelope through the
-                        # normal door. Reassert ONLY the retained terminal
-                        # marker before comparing its original keyed binding.
-                        integrity_signal = candidate
-                        verified_terminal_retry = secrets.compare_digest(
-                            recorded_binding,
-                            self._volatile_source_integrity_binding(candidate, source_event_id),
-                        )
-                    else:
-                        # Legacy non-elided receipts still require their
-                        # privacy-safe persisted projection to match exactly.
-                        projection = self._signal_for_durable_persistence(candidate, registration)
-                        retained = self._signal_from_durable_event(terminal.event, dispatch_signal=signal)
-                        caller_matches = retained.caller == candidate.caller
-                        if (
-                            isinstance(retained.caller, str)
-                            and retained.caller.startswith(_DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX)
-                        ):
-                            # The protected field is intentionally opaque in
-                            # keyless NORMAL installs. This channel's original
-                            # raw sender is already in its retained payload;
-                            # it is the source-owned replay identity, not the
-                            # opaque audit label. Recovery above validated the
-                            # versioned label and exact payload equality below
-                            # still fences content and correlation metadata.
-                            caller_matches = (
-                                candidate.caller == retained.payload.get("sender")
-                                == projection.signal.payload.get("sender")
-                            )
-                        verified_terminal_retry = not projection.payload_elided and projection.signal.payload == candidate.payload and (
-                            retained.source == candidate.source
-                            and retained.target_agent == candidate.target_agent
-                            and retained.kind == candidate.kind
-                            and caller_matches
-                            and retained.dedupe_key == candidate.dedupe_key
-                            and retained.payload == projection.signal.payload
-                        )
+                    integrity_signal = candidate
+                    verified_terminal_retry = self._durable_channel_terminal_matches(
+                        terminal, candidate, registration,
+                        recorded_binding=recorded_binding, source_event_id=source_event_id,
+                    )
             if recorded_binding is not None:
                 live_integrity_binding = (
                     self._volatile_source_integrity_binding(integrity_signal, source_event_id)
@@ -4757,6 +4853,73 @@ class SignalDispatcher:
                 registration=registration,
             )
 
+        if durable_admission is not None:
+            # The exact claim was obtained under live ingress authority. Its
+            # remaining work must be owned before any early cursor receipt:
+            # caller recovery, cognition, renewal, settlement AND audit tails.
+            async def resident_delivery():
+                from kestrel_sovereign.signals.context import (
+                    reset_current_signal, set_current_signal,
+                )
+                owner = asyncio.current_task()
+                token = self._durable_admission.set((owner, 1))
+                signal_token = set_current_signal(signal)
+                self._durable_admission_owners.add(owner)
+                try:
+                    try:
+                        return await self._execute_claimed_durable_cognition(
+                            signal, registration, start, delivery=delivery,
+                            consumer_id=consumer_id, use_live_signal=use_live_signal,
+                            retry_delay=retry_delay, durable_admission=durable_admission,
+                            persisted_event_id=persisted_event_id,
+                        )
+                    finally:
+                        await self._drain_outcome_logs_for_signal(signal.id)
+                finally:
+                    self._durable_admission_owners.discard(owner)
+                    reset_current_signal(signal_token)
+                    self._durable_admission.reset(token)
+
+            from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            publication = OwnedTaskAdmission()
+            operation = resident_delivery()
+            try:
+                resident = self._track_resident_durable_task(
+                    operation, name=f"durable_cognition_owner:{delivery.delivery_id}",
+                    admission=publication,
+                )
+            except BaseException as opening:
+                accepted = publication.task
+                terminal = opening
+                if accepted is not None:
+                    accepted.cancel()
+                    outcome = await await_owned_task(accepted, cancel_on_caller_cancellation=True)
+                    terminal = execution_observation_error(
+                        opening, outcome.error, outcome.cancellation,
+                    )
+                    finish = getattr(type(self._agent), "_finish_background_task", None)
+                    if callable(finish):
+                        finish(self._agent, accepted)
+                # The native completed callback may be the publication that
+                # failed. Only this physical join permits closing its submitted
+                # coroutine if the READY wrapper never entered it.
+                operation.close()
+                try:
+                    if is_execution_control_error(terminal):
+                        await self._terminalize_failed_cognition(delivery, terminal)
+                    else:
+                        await self.nack_durable_delivery(
+                            consumer_id=consumer_id, delivery_id=delivery.delivery_id,
+                            lease_token=delivery.lease_token or "",
+                            error="Resident delivery publication failed", retry_delay=retry_delay,
+                        )
+                except BaseException as cleanup:
+                    raise execution_observation_error(terminal, cleanup)
+                raise terminal
+        else:
+            resident = None
+
         # This exact selected delivery is now leased to the current dispatcher
         # owner.  That durable lease is the retry authority a cursor-owning
         # producer needs; later cognition/NACK work can no longer make an
@@ -4771,8 +4934,34 @@ class SignalDispatcher:
                         else DurableAdmissionDisposition.DUPLICATE
                     ),
                     signal.id,
+                    resident_owned=resident is not None,
                 )
             )
+
+        if resident is not None:
+            from kestrel_sovereign._async_ownership import await_owned_task
+            # This original dispatch remains admitted until its new resident
+            # child physically settles. Explicit handle cancellation forwards
+            # once; borrowed admission readers still never cancel this owner.
+            outcome = await await_owned_task(resident, cancel_on_caller_cancellation=True)
+            terminal = execution_finite_error(
+                outcome.error, outcome.cancellation, retain_originals=True,
+            )
+            if terminal is not None:
+                raise terminal
+            return outcome.result
+        return await self._execute_claimed_durable_cognition(
+            signal, registration, start, delivery=delivery, consumer_id=consumer_id,
+            use_live_signal=use_live_signal, retry_delay=retry_delay,
+            durable_admission=durable_admission,
+            persisted_event_id=persisted_event_id,
+        )
+
+    async def _execute_claimed_durable_cognition(
+        self, signal, registration, start, *, delivery, consumer_id,
+        use_live_signal, retry_delay, durable_admission, persisted_event_id,
+    ):
+        """Execute the already claimed lease under its existing runtime owner."""
 
         # A retried persistence-allowed event must execute the canonical
         # durable envelope, not whatever a duplicate provider callback happens
