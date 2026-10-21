@@ -125,3 +125,34 @@ def test_malformed_declared_causation_is_not_dropped_into_a_fresh_chain(field, v
 def test_declared_causation_has_one_explicit_payload_shape(payload):
     with pytest.raises(ValueError):
         deserialize_causation_chain(native_metadata({CAUSATION_URI: payload}))
+
+
+@pytest.mark.parametrize("skill", ["ask", "workflow.assign"])
+def test_native_skill_hint_is_advisory_versioned_metadata(skill):
+    from kestrel_sovereign.a2a.extensions import (
+        SKILL_HINT_URI,
+        parse_skill_hint,
+        skill_hint_metadata,
+    )
+
+    metadata = skill_hint_metadata(skill)
+    assert metadata == {SKILL_HINT_URI: {"version": 1, "skill_id": skill}}
+    assert parse_skill_hint(metadata) == skill
+    assert parse_skill_hint({"skill": skill}) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"version": True, "skill_id": "ask"},
+        {"version": 2, "skill_id": "ask"},
+        {"version": 1, "skill_id": ""},
+        {"version": 1, "skill_id": False},
+        {"version": 1, "skill_id": "ask", "authority": "operator"},
+    ],
+)
+def test_invalid_native_skill_hint_cannot_claim_behavior_or_authority(payload):
+    from kestrel_sovereign.a2a.extensions import SKILL_HINT_URI, parse_skill_hint
+
+    with pytest.raises(ValueError):
+        parse_skill_hint({SKILL_HINT_URI: payload})

@@ -597,3 +597,11 @@ async def test_receiver_checks_its_own_header_limit_before_resolution(
             policy=NativeProofPolicy(max_header_bytes=1024),
             resolver=forbidden_resolver,
         )
+
+
+@pytest.mark.parametrize("nonce", ["", "x" * 32, "a" * 31])
+def test_producer_rejects_invalid_claims_with_typed_proof_error(
+    identity, request_message, nonce
+):
+    with pytest.raises(NativeSenderProofError, match="claims"):
+        _sign(identity, request_message, nonce=nonce)

@@ -20,6 +20,7 @@ from a2a.types import (
     Message,
     SendMessageRequest,
     Task,
+    TaskState,
 )
 from a2a.utils.constants import VERSION_HEADER
 from a2a.utils.proto_utils import validate_proto_required_fields
@@ -28,10 +29,12 @@ from google.protobuf.message import Message as ProtoMessage
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.a2a.extensions import (
-    CAUSATION_URI,
-    QUESTION_CORRELATION_URI,
+    NATIVE_EXTENSION_URIS,
     SIGNED_SENDER_URI,
+    SKILL_HINT_URI,
+    parse_skill_hint,
 )
+from kestrel_sovereign.a2a.media import validate_input_parts
 from kestrel_sovereign.a2a.native_card import (
     REQUIRED_NATIVE_EXTENSIONS,
     verify_native_agent_card,
@@ -202,14 +205,11 @@ class NativePeerSession:
             snapshot, signing_did=signing_did, trusted_document=trusted_document
         )
         extensions = {item.uri: item for item in snapshot.capabilities.extensions}
-        supported = REQUIRED_NATIVE_EXTENSIONS | {
-            CAUSATION_URI,
-            QUESTION_CORRELATION_URI,
-        }
+        supported = frozenset(NATIVE_EXTENSION_URIS)
         versions = [
             MessageToDict(item.params).get("version")
             for uri, item in extensions.items()
-            if uri in REQUIRED_NATIVE_EXTENSIONS
+            if uri in signer.extensions
         ]
         if (
             len(extensions) != len(snapshot.capabilities.extensions)
@@ -253,6 +253,8 @@ class NativePeerSession:
             raise NativePeerProtocolError(
                 "Peer interface or activated extensions are not the selected native contract"
             )
+        self._card_bytes = snapshot.SerializeToString()
+        self._activated_extensions = signer.extensions
         self._http = http_client
         self._require_http()
         self._scope = recipient
@@ -294,10 +296,20 @@ class NativePeerSession:
         return self._scope
 
     @asynccontextmanager
-    async def _network(self):
-        with bind_native_http_execution_admission(self._http, self._admit):
+    async def _network(self, *, before_dispatch=None):
+        with bind_native_http_execution_admission(
+            self._http, before_dispatch or self._admit
+        ):
             async with native_execution_response_owner(self._http):
                 yield
+
+    @property
+    def agent_card(self) -> AgentCard:
+        return AgentCard.FromString(self._card_bytes)
+
+    @property
+    def activated_extensions(self) -> frozenset[str]:
+        return self._activated_extensions
 
     async def _admit(self, dispatch: OutboundDispatch | None = None) -> None:
         if dispatch is not None:
@@ -330,6 +342,20 @@ class NativePeerSession:
         # The SDK touches configuration before interception. Make its presence
         # explicit before hashing, so the reservation binds exactly what is sent.
         wire.configuration.SetInParent()
+        card = self.agent_card
+        hint = parse_skill_hint(MessageToDict(wire.metadata))
+        modes = card.default_input_modes
+        if hint is not None:
+            if SKILL_HINT_URI not in self._activated_extensions:
+                raise NativePeerProtocolError(
+                    "Peer did not activate the skill-hint extension"
+                )
+            selected = next((skill for skill in card.skills if skill.id == hint), None)
+            if selected is None:
+                raise NativePeerProtocolError(
+                    "Peer does not advertise the suggested skill"
+                )
+        validate_input_parts(wire.message.parts, modes)
         dispatch = await self._store.reserve(
             uuid4().hex,
             wire,
@@ -359,11 +385,27 @@ class NativePeerSession:
             raise OutboundDispatchConflict(
                 "Dispatch cannot be submitted again; reconcile delivery with peer reads"
             )
+        dispatch_claimed = False
+        may_have_sent = False
+
+        async def authorize_original_send():
+            nonlocal dispatch_claimed, may_have_sent
+            if dispatch_claimed:
+                raise OutboundDispatchConflict(
+                    "The SDK cannot replay the original native send"
+                )
+            dispatch_claimed = True
+            await self._admit()
+            # No await separates this observation from the original native
+            # dispatcher. False proves this attempt never admitted peer HTTP;
+            # True is only evidence that delivery may have occurred.
+            may_have_sent = True
+
         receipt = None
         try:
             response = None
             async with (
-                self._network(),
+                self._network(before_dispatch=authorize_original_send),
                 owned_execution_stream(self, self._client.send_message(wire)) as events,
             ):
                 async for event in events:
@@ -387,22 +429,17 @@ class NativePeerSession:
             return NativeDispatchReceipt(receipt, response)
         finally:
             if receipt is None:
-                original = sys.exc_info()[1]
-                outcome = await await_owned_task(
-                    create_owned_task(
-                        self._store.mark_unknown(submitting, operation_id=uuid4().hex),
-                        name="a2a-retain-unknown-delivery",
-                        retain_originals=True,
-                    )
+                await self._retain_failed_mutation(
+                    (
+                        self._store.mark_unknown
+                        if may_have_sent
+                        else self._store.record_no_delivery
+                    )(submitting, operation_id=uuid4().hex),
+                    original=sys.exc_info()[1],
                 )
-                terminal = execution_terminal_error(
-                    original, outcome.error, outcome.cancellation, retain_originals=True
-                )
-                if terminal is not None and terminal is not original:
-                    raise terminal
 
     @execution_work_operation
-    async def get_task(self, dispatch: OutboundDispatch) -> Task:
+    async def get_task(self, dispatch: OutboundDispatch) -> NativeDispatchReceipt:
         self._require_binding(dispatch)
         if not dispatch.remote_task_id:
             raise OutboundDispatchConflict(
@@ -424,32 +461,89 @@ class NativePeerSession:
             raise NativePeerProtocolError(
                 "Peer read changed the retained task or context"
             )
-        return result
+        observed = await self._store.acknowledge(
+            dispatch, result, operation_id=uuid4().hex
+        )
+        if observed is None:
+            raise OutboundDispatchConflict("Retained dispatch changed during task read")
+        return NativeDispatchReceipt(observed, result)
 
     @execution_work_operation
-    async def cancel_task(self, dispatch: OutboundDispatch) -> Task:
+    async def cancel_task(self, dispatch: OutboundDispatch) -> NativeDispatchReceipt:
         self._require_binding(dispatch)
         if not dispatch.remote_task_id:
             raise OutboundDispatchConflict(
                 "Dispatch has no acknowledged remote task to cancel"
             )
         await self._admit(dispatch)
-        async with self._network():
-            result = await self._client.cancel_task(
-                CancelTaskRequest(
-                    id=dispatch.remote_task_id,
-                    tenant=self._scope.tenant,
+        request = CancelTaskRequest(
+            id=dispatch.remote_task_id, tenant=self._scope.tenant
+        )
+        submitting = await self._store.begin_cancellation(
+            dispatch, request, operation_id=uuid4().hex
+        )
+        if submitting is None:
+            raise OutboundDispatchConflict("Cancellation lost its dispatch claim")
+        dispatch_claimed = False
+        may_have_sent = False
+        receipt = None
+
+        async def authorize_cancel():
+            nonlocal dispatch_claimed, may_have_sent
+            if dispatch_claimed:
+                raise OutboundDispatchConflict(
+                    "The SDK cannot replay native cancellation"
                 )
+            dispatch_claimed = True
+            await self._admit(submitting)
+            may_have_sent = True
+
+        try:
+            async with self._network(before_dispatch=authorize_cancel):
+                result = await self._client.cancel_task(request)
+            await self._admit()
+            if (
+                result.id != dispatch.remote_task_id
+                or result.context_id != dispatch.remote_context_id
+                or result.status.state != TaskState.TASK_STATE_CANCELED
+            ):
+                raise NativePeerProtocolError(
+                    "Peer cancellation returned a different task, context or outcome"
+                )
+            receipt = await self._store.acknowledge(
+                submitting, result, operation_id=uuid4().hex
             )
-        await self._admit()
-        if (
-            result.id != dispatch.remote_task_id
-            or result.context_id != dispatch.remote_context_id
-        ):
-            raise NativePeerProtocolError(
-                "Peer cancellation changed the retained task or context"
+            if receipt is None:
+                raise OutboundDispatchConflict(
+                    "Cancellation receipt lost its dispatch claim"
+                )
+            return NativeDispatchReceipt(receipt, result)
+        finally:
+            if receipt is None:
+                await self._retain_failed_mutation(
+                    self._store.retain_cancellation_failure(
+                        submitting,
+                        may_have_sent=may_have_sent,
+                        operation_id=uuid4().hex,
+                    ),
+                    original=sys.exc_info()[1],
+                )
+
+    @staticmethod
+    async def _retain_failed_mutation(
+        settle, *, original: BaseException | None
+    ) -> None:
+        """Retain delivery uncertainty without replacing the original control error."""
+        outcome = await await_owned_task(
+            create_owned_task(
+                settle, name="a2a-retain-mutation-outcome", retain_originals=True
             )
-        return result
+        )
+        terminal = execution_terminal_error(
+            original, outcome.error, outcome.cancellation, retain_originals=True
+        )
+        if terminal is not None and terminal is not original:
+            raise terminal
 
     @execution_work_operation
     async def reconcile(self, dispatch: OutboundDispatch) -> OutboundDispatch | None:

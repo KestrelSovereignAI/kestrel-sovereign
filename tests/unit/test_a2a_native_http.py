@@ -784,3 +784,27 @@ async def test_sender_interceptor_preserves_the_callers_context_and_signs_each_r
         )
         == 3
     )
+
+
+@pytest.mark.parametrize("mime", ["image/png", "bad", "*/json"])
+async def test_native_server_refuses_unsupported_or_malformed_input_before_task_admission(
+    wire, mime
+):
+    from a2a.types import Part
+    from a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+
+    params = send(wire.admission)
+    params.message.parts.append(Part(raw=b"not fetched or admitted", media_type=mime))
+    params.configuration.return_immediately = True
+    with pytest.raises(
+        ContentTypeNotSupportedError if mime == "image/png" else InvalidParamsError
+    ):
+        async for _ in wire.client(polling=False).send_message(params):
+            pytest.fail("Invalid input must not return an accepted native task")
+    assert not wire.submissions
+    listed = await wire.manager.task_store.list_for_creator(
+        ListTasksRequest(tenant=wire.admission.scope.tenant),
+        creator_agent_id=PRINCIPAL,
+        recipient_agent_id=wire.admission.scope.recipient_id,
+    )
+    assert not listed.tasks

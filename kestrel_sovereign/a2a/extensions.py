@@ -18,6 +18,14 @@ SIGNED_SENDER_URI = EXTENSION_DOCUMENT + "#signed-sender-v1"
 RECIPIENT_POLICY_URI = EXTENSION_DOCUMENT + "#recipient-policy-v1"
 QUESTION_CORRELATION_URI = EXTENSION_DOCUMENT + "#question-correlation-v1"
 CAUSATION_URI = EXTENSION_DOCUMENT + "#causation-v1"
+SKILL_HINT_URI = EXTENSION_DOCUMENT + "#skill-hint-v1"
+NATIVE_EXTENSION_URIS = (
+    SIGNED_SENDER_URI,
+    RECIPIENT_POLICY_URI,
+    QUESTION_CORRELATION_URI,
+    CAUSATION_URI,
+    SKILL_HINT_URI,
+)
 
 
 def _payload(metadata: Mapping[str, Any], uri: str, keys: set[str]) -> dict | None:
@@ -44,6 +52,23 @@ class QuestionCorrelation:
 
     kind: str
     question_id: str
+
+
+def parse_skill_hint(metadata: Mapping[str, Any]) -> str | None:
+    """Read an advisory published skill; it grants no tool-execution authority."""
+    payload = _payload(metadata, SKILL_HINT_URI, {"version", "skill_id"})
+    if payload is None:
+        return None
+    skill_id = payload["skill_id"]
+    if not isinstance(skill_id, str) or not skill_id.strip():
+        raise ValueError("Native A2A skill hint requires a concrete skill_id")
+    return skill_id
+
+
+def skill_hint_metadata(skill_id: str) -> dict[str, Any]:
+    metadata = {SKILL_HINT_URI: {"version": 1, "skill_id": skill_id}}
+    parse_skill_hint(metadata)
+    return metadata
 
 
 def parse_question_correlation(

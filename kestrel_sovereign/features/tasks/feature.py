@@ -31,6 +31,7 @@ from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
+from kestrel_sovereign.a2a.extensions import parse_skill_hint
 from kestrel_sovereign.a2a.lifecycle import (
     TERMINAL_STATES,
     task_state_from_label,
@@ -166,6 +167,9 @@ class TaskFeature(Feature):
             "status": task_state_label(task.status.state),
             "message": message_text(task.status.message) if task.status.HasField("message") else None,
             "request_content": message_text(task.history[0]) if task.history else None,
+            "request": MessageToDict(task.history[0]) if task.history else None,
+            "context_id": task.context_id,
+            "skill_hint": parse_skill_hint(metadata),
             "sender": snapshot.ownership.creator_agent_id,
             "task_type": metadata.get("task_type"),
             "artifacts": [MessageToDict(artifact) for artifact in task.artifacts],
@@ -758,6 +762,9 @@ class TaskFeature(Feature):
                 "status": data["status"],
                 "message": data["message"],
                 "request_content": data["request_content"],
+                "request": data["request"],
+                "context_id": data["context_id"],
+                "skill_hint": data["skill_hint"],
                 "sender": data["sender"],
                 "task_type": data["task_type"],
                 "artifacts": data["artifacts"],
@@ -811,6 +818,9 @@ class TaskFeature(Feature):
                 "task_type": metadata.get("task_type"),
                 "message": message_text(task.status.message) if task.status.HasField("message") else None,
                 "request_content": message_text(task.history[0]) if task.history else None,
+            "request": MessageToDict(task.history[0]) if task.history else None,
+            "context_id": task.context_id,
+            "skill_hint": parse_skill_hint(metadata),
                 "sender": snapshot.ownership.creator_agent_id,
             })
             if len(task_list) == limit_val:
@@ -867,6 +877,9 @@ class TaskFeature(Feature):
                 "artifacts": data["artifacts"],
                 "message": data["message"],
                 "request_content": data["request_content"],
+                "request": data["request"],
+                "context_id": data["context_id"],
+                "skill_hint": data["skill_hint"],
                 "sender": data["sender"],
             },
         )

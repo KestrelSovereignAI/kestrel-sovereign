@@ -32,9 +32,12 @@ from a2a.utils.errors import (
 )
 from a2a.utils.proto_utils import validate_proto_required_fields
 from a2a.utils.task import apply_history_length, validate_history_length
+from google.protobuf.json_format import MessageToDict
 from starlette.exceptions import HTTPException
 
+from kestrel_sovereign.a2a.extensions import parse_skill_hint
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
+from kestrel_sovereign.a2a.media import validate_input_parts
 from kestrel_sovereign.a2a.native_security import (
     AuthorizedNativeRequest,
     NativeDIDRequestGuard,
@@ -73,9 +76,11 @@ class NativeA2ARequestHandler(RequestHandler):
         self.guard = guard
         self._card = AgentCard.FromString(card.SerializeToString())
         extensions = self._card.capabilities.extensions
-        if len({item.uri for item in extensions}) != len(extensions) or {
-            item.uri for item in extensions if item.required
-        } != guard.required_extensions:
+        if (
+            len({item.uri for item in extensions}) != len(extensions)
+            or {item.uri for item in extensions if item.required}
+            != guard.required_extensions
+        ):
             raise ValueError(
                 "Native Agent Card extensions must match the request guard"
             )
@@ -160,6 +165,25 @@ class NativeA2ARequestHandler(RequestHandler):
             raise UnsupportedOperationError(
                 message="This task does not accept additional messages"
             )
+        try:
+            hint = parse_skill_hint(MessageToDict(params.metadata))
+        except ValueError as error:
+            raise InvalidParamsError(message=str(error)) from error
+        modes = self._card.default_input_modes
+        if hint is not None:
+            selected = next(
+                (
+                    skill
+                    for skill in self.manager.get_agent_skills()
+                    if skill.id == hint
+                ),
+                None,
+            )
+            if selected is None:
+                raise InvalidParamsError(
+                    message="Recipient does not advertise the suggested skill"
+                )
+        validate_input_parts(params.message.parts, modes)
         output_modes = params.configuration.accepted_output_modes
         if output_modes and not set(output_modes).intersection(
             self._card.default_output_modes

@@ -1,30 +1,16 @@
-"""
-Peers Feature — Inter-agent communication for multi_agent environments.
+"""Peer discovery and native A2A communication for hosted agents.
 
-Allows agents to discover sibling agents and send messages to them
-through the multi_agent host proxy. Works in both local and cloud
-deployments. Two transports:
-
-* ``ask_agent`` — synchronous Q&A via ``/api/agent/invoke``. Legacy
-  surface kept until Epic #1367 reroutes it onto the A2A path as
-  ``send_a2a_question``.
-
-* ``send_a2a_task`` — asynchronous A2A task submission via
-  ``/api/agent/tasks/send``. Persists to the recipient's TaskStore,
-  fires the ``a2a.task_submitted`` signal so the recipient wakes,
-  carries causation chain for cycle detection.
-
-The legacy Mesh Protocol (send_mesh_message / mesh_inbox / receive_mesh_message
-+ /agent/mesh endpoint + features/peers/mesh.py) was retired in #1367.
-All Falconer workflow events (assign, review_needed, complete, etc.)
-now go through send_a2a_task with ``metadata["skill"]`` set to the
-corresponding ``workflow.*`` skill id.
+Native message, task and blocking ask tools share one official SDK producer
+and one sender-owned dispatch ledger. Standard Message Parts carry all input
+handoffs. Published skill hints are advisory and never grant execution rights.
+The question supervisor is being migrated before the draft protocol is retired.
 """
 
 import json
 import logging
 import os
 from collections.abc import Sequence as SequenceABC
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -1489,125 +1475,44 @@ class PeersFeature(Feature):
 
     @tool(
         name="ask_agent",
-        description="Send a message to another agent in the multi_agent and get their response. Use this to collaborate, ask questions, or delegate tasks to peer agents.",
+        description="Send a native A2A message to a peer and wait for its terminal or interrupted response. The durable dispatch remains available if delivery becomes uncertain.",
         category=ToolCategory.COMMUNICATION,
-        command_prefix="!ask"
+        command_prefix="!ask",
     )
     @execution_work_operation
     async def ask_agent(self, agent_name: str, message: str) -> ToolResult:
-        """
-        Send a message to a peer agent and return their response.
+        from a2a.types import Message
+        from google.protobuf.json_format import MessageToDict
 
-        Args:
-            agent_name: Name of the agent to message (e.g. "emma", "claw")
-            message: The message or question to send
-        """
-        try:
-            router, requester, peer = await self._resolve_automatic_peer(
-                agent_name,
-            )
-        except PeerDirectoryConfigurationError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Not running in a multi_agent environment — no host to proxy through",
-                data={"response": None, "agent": agent_name},
-            )
-        except PeerSelfTargetError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Cannot send a message to yourself",
-                data={"response": None, "agent": agent_name},
-            )
-        except PeerAccessDeniedError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"response": None, "agent": agent_name},
-            )
-        except PeerNotFoundError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"response": None, "agent": agent_name},
-            )
-        except PeerTransportError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
-                data={"response": None, "agent": agent_name},
-            )
-        except PeerDirectoryError as exc:
-            if is_execution_control_error(exc):
-                raise
-            logger.error("Could not resolve peer %r: %s", agent_name, exc)
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"response": None, "agent": agent_name},
-            )
+        from kestrel_sovereign.a2a.projections import message_text
 
-        try:
-            data = await router.invoke(requester, peer, message)
-        except PeerNotFoundError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"response": None, "agent": agent_name},
+        receipt = await self._dispatch_native_peer(
+            agent_name,
+            message,
+            context_id="",
+            parts=None,
+            skill_id="",
+            verb="message",
+            dispatch_tool="ask_agent",
+            return_immediately=False,
+        )
+        if isinstance(receipt, ToolResult):
+            return receipt
+        response = receipt.response
+        text = (
+            message_text(response)
+            if isinstance(response, Message)
+            else (
+                message_text(response.status.message)
+                if response.status.HasField("message")
+                else ""
             )
-        except PeerAccessDeniedError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"response": None, "agent": agent_name},
-            )
-        except PeerUnavailableError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                f"Agent '{agent_name}' is offline",
-                data={"response": None, "agent": agent_name},
-            )
-        except PeerTransportError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
-                data={"response": None, "agent": agent_name},
-            )
-        except PeerDirectoryError as exc:
-            if is_execution_control_error(exc):
-                raise
-            logger.error("Failed to message peer %r: %s", agent_name, exc)
-            return ToolResult.failed(
-                f"Could not message agent '{agent_name}'",
-                data={"response": None, "agent": agent_name},
-            )
-        except Exception as control_error:  # noqa: BLE001 - provider extension boundary
-            if is_execution_control_error(control_error):
-                raise
-            logger.exception("Peer router raised unexpectedly while invoking %r", agent_name)
-            return ToolResult.failed(
-                f"Could not message agent '{agent_name}'",
-                data={"response": None, "agent": agent_name},
-            )
-
-        if not isinstance(data, Mapping):
-            logger.warning("Peer router returned a non-object invoke result")
-            return ToolResult.failed(
-                f"Could not message agent '{agent_name}'",
-                data={"response": None, "agent": agent_name},
-            )
-
-        response_text = data.get("response", data.get("output", str(data)))
+        )
+        data = self._native_dispatch_result(receipt, agent_name).data
+        data["response"] = text
+        data["native_response"] = MessageToDict(response)
         return ToolResult.ok(
-            confirmation=f"Got response from {agent_name}",
-            data={"agent": agent_name, "response": response_text},
+            confirmation=f"Peer response received from {agent_name}", data=data
         )
 
     # ------------------------------------------------------------------
@@ -2087,6 +1992,143 @@ class PeersFeature(Feature):
         # resolve by name. A present-but-failed store returned above.
         return task_data, chain, resolved_peer_agent_id, None
 
+    async def _dispatch_native_peer(
+        self,
+        recipient: str,
+        message: str,
+        *,
+        context_id: str,
+        parts: list | None,
+        skill_id: str,
+        verb: str,
+        dispatch_tool: str,
+        return_immediately: bool = True,
+    ):
+        """The common native request, reservation and send path for peer tools."""
+        from uuid import uuid4
+
+        from a2a.types import Message, Part, Role, SendMessageRequest
+        from a2a.utils.errors import A2AError
+        from google.protobuf.json_format import ParseDict, ParseError
+
+        from kestrel_sovereign.a2a.extensions import (
+            causation_metadata,
+            skill_hint_metadata,
+        )
+        from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
+        from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
+        from kestrel_sovereign.a2a.stores.unified.outbound_store import (
+            DispatchState,
+            OutboundDispatchConflict,
+        )
+
+        if not isinstance(message, str) or not message.strip():
+            return ToolResult.failed("A2A message must contain text")
+        if not isinstance(context_id, str) or not isinstance(skill_id, str):
+            return ToolResult.failed("A2A context_id and skill_id must be strings")
+        if parts is not None and not isinstance(parts, list):
+            return ToolResult.failed(
+                "A2A parts must be an array of standard Part objects"
+            )
+        if any(not isinstance(part, dict) for part in (parts or [])):
+            return ToolResult.failed("Each A2A part must be a standard Part object")
+        try:
+            content = [Part(text=message)] + [
+                ParseDict(part, Part()) for part in (parts or [])
+            ]
+        except ParseError as error:
+            return ToolResult.failed(f"Invalid A2A part: {error}")
+        provider = getattr(self.agent, "_provide_causation_chain", None)
+        chain = provider() if callable(provider) else None
+        metadata = causation_metadata(chain) if chain else {}
+        if skill_id:
+            metadata.update(skill_hint_metadata(skill_id))
+        dispatch = None
+        store = None
+        try:
+            store = self._native_outbound_store()
+            router, requester, peer = await self._resolve_automatic_peer(recipient)
+            async with router.open_a2a_session(requester, peer) as session:
+                request = SendMessageRequest(
+                    tenant=session.recipient_scope.tenant,
+                    message=Message(
+                        message_id=uuid4().hex,
+                        context_id=context_id,
+                        role=Role.ROLE_USER,
+                        parts=content,
+                    ),
+                    metadata=metadata,
+                    configuration={"return_immediately": return_immediately},
+                )
+                dispatch, wire = await session.reserve(
+                    request,
+                    dispatch_tool=dispatch_tool,
+                    verb=verb,
+                )
+                return await session.send(dispatch, wire)
+        except (
+            PeerDirectoryError,
+            A2AError,
+            OutboundDispatchConflict,
+            NativePeerProtocolError,
+            NativeSenderProofError,
+        ) as error:
+            if is_execution_control_error(error):
+                raise
+            current = (
+                None if dispatch is None else await store.get(dispatch.dispatch_id)
+            )
+            committed = current is not None and current.state in {
+                DispatchState.ACKNOWLEDGED,
+                DispatchState.COMPLETE,
+            }
+            uncertain = dispatch is not None and (
+                current is None
+                or current.state
+                in {
+                    DispatchState.SUBMITTING,
+                    DispatchState.UNKNOWN,
+                }
+            )
+            return ToolResult.failed(
+                "A2A delivery was acknowledged; inspect the retained dispatch before further action"
+                if committed
+                else "A2A delivery is uncertain; reconcile the dispatch before sending again"
+                if uncertain
+                else f"Could not send A2A {verb}: {error}",
+                data={
+                    "sent": True if committed else None if uncertain else False,
+                    "recipient": recipient,
+                    "remote_task_id": current.remote_task_id if committed else None,
+                    "dispatch_id": dispatch.dispatch_id
+                    if dispatch is not None
+                    else None,
+                    "delivery_state": current.state.value
+                    if current is not None
+                    else "not_submitted",
+                },
+            )
+
+    @staticmethod
+    def _native_dispatch_result(receipt, recipient: str) -> ToolResult:
+        from a2a.types import Message
+        from google.protobuf.json_format import MessageToDict
+
+        data = {
+            "sent": True,
+            "recipient": recipient,
+            "dispatch_id": receipt.dispatch.dispatch_id,
+            "remote_task_id": receipt.dispatch.remote_task_id,
+            "context_id": receipt.dispatch.remote_context_id,
+            "state": receipt.dispatch.remote_task_state,
+            "response_kind": receipt.dispatch.response_kind,
+        }
+        if isinstance(receipt.response, Message):
+            data["response"] = MessageToDict(receipt.response)
+        return ToolResult.ok(
+            confirmation=f"A2A {receipt.dispatch.verb} sent to {recipient}", data=data
+        )
+
     @tool(
         name="send_a2a_message",
         description=(
@@ -2104,103 +2146,21 @@ class PeersFeature(Feature):
     )
     @execution_work_operation
     async def send_a2a_message(
-        self,
-        recipient: str,
-        message: str,
-        context_id: str = "",
+        self, recipient: str, message: str, context_id: str = ""
     ) -> ToolResult:
         """Send one native message; its immutable dispatch ID is sender-owned."""
-        from uuid import uuid4
-
-        from a2a.client.errors import A2AClientError
-        from a2a.types import Message, Part, Role, SendMessageRequest
-
-        from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
-        from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
-        from kestrel_sovereign.a2a.extensions import causation_metadata
-        from kestrel_sovereign.a2a.stores.unified.outbound_store import (
-            DispatchState,
-            OutboundDispatchConflict,
+        receipt = await self._dispatch_native_peer(
+            recipient,
+            message,
+            context_id=context_id,
+            parts=None,
+            skill_id="",
+            verb="message",
+            dispatch_tool="send_a2a_message",
         )
-
-        if not isinstance(message, str) or not message.strip():
-            return ToolResult.failed("A2A message must contain text")
-        provider = getattr(self.agent, "_provide_causation_chain", None)
-        chain = provider() if callable(provider) else None
-        metadata = causation_metadata(chain) if chain else {}
-        dispatch = None
-        try:
-            router, requester, peer = await self._resolve_automatic_peer(recipient)
-            async with router.open_a2a_session(requester, peer) as session:
-                request = SendMessageRequest(
-                    tenant=session.recipient_scope.tenant,
-                    message=Message(
-                        message_id=uuid4().hex,
-                        context_id=context_id,
-                        role=Role.ROLE_USER,
-                        parts=[Part(text=message)],
-                    ),
-                    metadata=metadata,
-                    configuration={"return_immediately": True},
-                )
-                dispatch, wire = await session.reserve(
-                    request,
-                    dispatch_tool="send_a2a_message",
-                    verb="message",
-                )
-                receipt = await session.send(dispatch, wire)
-        except (
-            PeerDirectoryError,
-            A2AClientError,
-            OutboundDispatchConflict,
-            NativePeerProtocolError,
-            NativeSenderProofError,
-        ) as error:
-            if is_execution_control_error(error):
-                raise
-            current = (
-                None
-                if dispatch is None
-                else await self.agent.task_manager.outbound_store.get(
-                    dispatch.dispatch_id
-                )
-            )
-            committed = current is not None and current.state in {
-                DispatchState.ACKNOWLEDGED, DispatchState.COMPLETE,
-            }
-            uncertain = dispatch is not None and (
-                current is None or current.state in {
-                    DispatchState.SUBMITTING, DispatchState.UNKNOWN,
-                }
-            )
-            return ToolResult.failed(
-                "A2A delivery was acknowledged; inspect the retained dispatch before further action"
-                if committed else "A2A delivery is uncertain; reconcile the dispatch before sending again"
-                if uncertain
-                else f"Could not send A2A message: {error}",
-                data={
-                    "sent": True if committed else None if uncertain else False,
-                    "recipient": recipient,
-                    "remote_task_id": current.remote_task_id if committed else None,
-                    "dispatch_id": dispatch.dispatch_id
-                    if dispatch is not None
-                    else None,
-                    "delivery_state": current.state.value
-                    if current is not None
-                    else "not_submitted",
-                },
-            )
-        return ToolResult.ok(
-            confirmation=f"A2A message sent to {recipient}",
-            data={
-                "sent": True,
-                "recipient": recipient,
-                "dispatch_id": receipt.dispatch.dispatch_id,
-                "remote_task_id": receipt.dispatch.remote_task_id,
-                "context_id": receipt.dispatch.remote_context_id,
-                "response_kind": receipt.dispatch.response_kind,
-            },
-        )
+        if isinstance(receipt, ToolResult):
+            return receipt
+        return self._native_dispatch_result(receipt, recipient)
 
     @tool(
         name="send_a2a_question",
@@ -2440,286 +2400,65 @@ class PeersFeature(Feature):
     @tool(
         name="get_peer_task_result",
         description=(
-            "Fetch the current state + full reply text of an A2A "
-            "task you previously sent to a peer agent. Use this when "
-            "an `a2a.question_answered` signal arrived with "
-            "`truncated=true` (the inline reply was clipped at 8 "
-            "KiB) — this tool fetches the FULL untruncated body from "
-            "the peer's task store. Returns the same envelope shape "
-            "a local `get_task_result` would, but routed through the "
-            "host proxy to the peer (#1444 truncation recovery path)."
+            "Read the full standard Task for your immutable outbound dispatch_id. "
+            "Reconciles uncertain original delivery by peer reads without resending. "
+            "The retained ledger supplies the stable peer, tenant and remote task ID."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a result",
     )
     @execution_work_operation
-    async def get_peer_task_result(
-        self,
-        recipient: str,
-        task_id: str,
-    ) -> ToolResult:
-        """Fetch a peer's task envelope and return the full reply
-        text. Mirrors ``get_task_result`` but for tasks the caller
-        SENT to a peer (not tasks in the caller's own store).
+    async def get_peer_task_result(self, dispatch_id: str) -> ToolResult:
+        from a2a.utils.errors import A2AError
+        from google.protobuf.json_format import MessageToDict
 
-        Args:
-            recipient: The peer agent name the task was sent to.
-            task_id: The task id returned from
-                ``send_a2a_question`` / ``send_a2a_task``.
-        """
-        try:
-            retained_agent_id = await self._outbound_recipient_agent_id(task_id)
-            router, requester, peer = await self._resolve_retained_automatic_peer(
-                recipient, retained_agent_id,
-            )
-        except PeerDirectoryConfigurationError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Not running in a multi_agent environment — no host "
-                "to proxy through",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-        except (PeerNotFoundError, PeerAccessDeniedError) as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-        except PeerSelfTargetError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-        except PeerTransportError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                f"Could not reach peer '{recipient}' for task {task_id}",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-        except PeerDirectoryError as exc:
-            if is_execution_control_error(exc):
-                raise
-            logger.error(
-                "Could not resolve peer task recipient %r: %s", recipient, exc,
-            )
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-
-        try:
-            data = await router.get_a2a_task(requester, peer, task_id)
-        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-        except PeerTransportError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                f"Could not reach peer '{recipient}' for task {task_id}",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-        except PeerDirectoryError as exc:
-            if is_execution_control_error(exc):
-                raise
-            logger.error(
-                "Error fetching peer task %s from %r: %s",
-                task_id, recipient, exc,
-            )
-            return ToolResult.failed(
-                f"Error fetching peer task {task_id} from {recipient}",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-        except Exception as control_error:  # noqa: BLE001 - provider extension boundary
-            if is_execution_control_error(control_error):
-                raise
-            logger.exception(
-                "Peer router raised unexpectedly fetching task %s from %r",
-                task_id, recipient,
-            )
-            return ToolResult.failed(
-                f"Error fetching peer task {task_id} from {recipient}",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-
-        if not isinstance(data, Mapping):
-            return ToolResult.failed(
-                f"Peer '{recipient}' returned an invalid task result",
-                data={"recipient": recipient, "task_id": task_id},
-            )
-
-        # Reuse the supervisor's dual-shape parser to extract the
-        # reply text — handles both canonical A2A and kestrel's
-        # flattened endpoint shape consistently with how the
-        # ``a2a.question_answered`` signal got built in the first
-        # place.
-        raw_status = data.get("status")
-        if isinstance(raw_status, dict):
-            current_state = raw_status.get("state", "unknown")
-        elif isinstance(raw_status, str):
-            current_state = raw_status
-        else:
-            current_state = "unknown"
-        reply_text = ""
-        if isinstance(raw_status, dict):
-            msg = raw_status.get("message") or {}
-            for part in (msg.get("parts") or []):
-                if isinstance(part, dict) and "text" in part:
-                    reply_text = part["text"] or ""
-                    break
-        if not reply_text:
-            top_msg = data.get("message")
-            if isinstance(top_msg, str) and top_msg:
-                reply_text = top_msg
-        # Group artifacts by ``name`` first, then reassemble each
-        # group in INDEX order. The A2A artifact model allows a task
-        # to carry multiple unrelated artifact groups simultaneously
-        # (e.g. ``reply_body`` chunks + a separate ``debug_log``);
-        # concatenating ALL text parts globally would interleave
-        # unrelated groups and pollute the answer. The chunking
-        # convention in the receiver-side
-        # ``attach_artifact_to_a2a_task`` tool documents
-        # ``reply_body`` as the canonical group name for chunked Q&A
-        # replies — we look there first, falling back to whatever
-        # single group exists. Codex round 2 P2 on the artifact PR.
-        artifacts_raw = data.get("artifacts") or []
-        terminal_states = A2A_TERMINAL_TASK_STATES
-        groups: dict[str, list[dict]] = {}
-        for art in artifacts_raw:
-            if not isinstance(art, dict):
-                continue
-            group_name = art.get("name") or ""
-            groups.setdefault(group_name, []).append(art)
-
-        artifact_bodies: dict[str, str] = {}
-        artifact_group_complete: dict[str, bool] = {}
-        for group_name, group_arts in groups.items():
-            arts_sorted = sorted(
-                group_arts,
-                key=lambda a: (
-                    a.get("index")
-                    if isinstance(a.get("index"), int)
-                    else 0
-                ),
-            )
-            body = "".join(
-                part["text"] or ""
-                for art in arts_sorted
-                for part in (art.get("parts") or [])
-                if isinstance(part, dict) and "text" in part
-            )
-            last_chunk_seen = any(
-                a.get("lastChunk") is True for a in arts_sorted
-            )
-            complete = (
-                current_state in terminal_states or last_chunk_seen
-            )
-            artifact_bodies[group_name] = body
-            artifact_group_complete[group_name] = complete
-
-        # Primary body: ``reply_body`` is the documented convention;
-        # fall back to whichever single group exists (preserves
-        # backwards-compat with legacy senders that don't follow the
-        # naming convention) or empty.
-        if "reply_body" in artifact_bodies:
-            primary_name = "reply_body"
-        elif len(artifact_bodies) == 1:
-            primary_name = next(iter(artifact_bodies))
-        else:
-            primary_name = None
-        artifact_body = (
-            artifact_bodies.get(primary_name, "") if primary_name else ""
+        from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
+        from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
+        from kestrel_sovereign.a2a.projections import message_text
+        from kestrel_sovereign.a2a.stores.unified.outbound_store import (
+            DispatchState,
+            OutboundDispatchConflict,
         )
-        # If the inline reply was empty but the primary artifact group
-        # carries text, the asking lineage's answer IS the artifact
-        # body — surface it as reply_text so the resumed turn doesn't
-        # have to special-case the chunked path.
-        if not reply_text and artifact_body:
-            reply_text = artifact_body
 
-        # Completeness:
-        #   - No artifacts → inline message IS the body → complete.
-        #   - Primary group has its completeness flag (terminal state
-        #     OR lastChunk=True).
-        #   - No primary group identifiable (multiple unnamed groups,
-        #     none labeled ``reply_body``) → fall back to overall
-        #     completeness: complete iff EVERY group is complete OR
-        #     task is terminal.
-        if not artifact_bodies:
-            artifact_body_complete = True
-        elif primary_name is not None:
-            artifact_body_complete = artifact_group_complete[primary_name]
-        else:
-            artifact_body_complete = current_state in terminal_states or all(
-                artifact_group_complete.values()
+        try:
+            async with self._open_native_dispatch(dispatch_id) as (session, dispatch):
+                if dispatch.state in {DispatchState.SUBMITTING, DispatchState.UNKNOWN}:
+                    reconciled = await session.reconcile(dispatch)
+                    if reconciled is None:
+                        return ToolResult.failed(
+                            "Delivery is still uncertain; no matching authorized peer Task was found",
+                            data={
+                                "dispatch_id": dispatch_id,
+                                "delivery_state": "unknown",
+                            },
+                        )
+                    dispatch = reconciled
+                receipt = await session.get_task(dispatch)
+        except (
+            PeerDirectoryError,
+            A2AError,
+            OutboundDispatchConflict,
+            NativePeerProtocolError,
+            NativeSenderProofError,
+        ) as error:
+            if is_execution_control_error(error):
+                raise
+            return ToolResult.failed(
+                f"Could not read native peer task: {error}",
+                data={"dispatch_id": dispatch_id},
             )
-
-        artifact_segment_count = sum(len(g) for g in groups.values())
-
-        # #1576: close the loop on the sender-side outbound row. When
-        # the peer reports a terminal state, stamp it on our local
-        # audit row so a later ``list_outbound_a2a_tasks`` shows
-        # ``terminal_state`` populated. Non-terminal interim states
-        # are intentionally NOT stamped — the row stays NULL until a
-        # terminal fetch lands, matching Emma's pinned acceptance
-        # ("terminal/error state when known").
-        _audit_db = getattr(self, "_db", None)
-        if (
-            _audit_db is not None
-            and current_state in terminal_states
-        ):
-            try:
-                from kestrel_sovereign.a2a.outbound_store import (
-                    update_outbound_terminal_state,
-                )
-                await update_outbound_terminal_state(
-                    _audit_db,
-                    agent_id=str(
-                        getattr(self.agent, "did", None) or self._own_name
-                    ),
-                    task_id=task_id,
-                    terminal_state=current_state,
-                )
-            except Exception as exc:  # noqa: BLE001
-                if is_execution_control_error(exc):
-                    raise
-                logger.debug(
-                    "outbound_store: terminal stamp failed for %s: %s",
-                    task_id, exc,
-                )
-
+        task = receipt.response
+        reply = (
+            message_text(task.status.message) if task.status.HasField("message") else ""
+        )
         return ToolResult.ok(
-            confirmation=(
-                f"Fetched peer task {task_id[:8]} from {recipient} "
-                f"(state={current_state}, {len(reply_text)} chars, "
-                f"{artifact_segment_count} artifact segment(s) across "
-                f"{len(groups)} group(s), complete={artifact_body_complete})"
-            ),
+            confirmation="Read native peer task",
             data={
-                "recipient": recipient,
-                "task_id": task_id,
-                "state": current_state,
-                "reply_text": reply_text,
-                "artifacts": artifacts_raw,
-                # The primary group body (the documented ``reply_body``
-                # convention) reassembled in index order.
-                "artifact_body": artifact_body,
-                "artifact_body_complete": artifact_body_complete,
-                "artifact_segment_count": artifact_segment_count,
-                # All groups, keyed by name, for callers that need to
-                # inspect non-reply artifacts (logs, side-channel
-                # results, etc.).
-                "artifact_bodies": artifact_bodies,
-                "artifact_group_complete": artifact_group_complete,
+                "dispatch_id": dispatch_id,
+                "remote_task_id": task.id,
+                "state": receipt.dispatch.remote_task_state,
+                "reply_text": reply,
+                "task": MessageToDict(task),
             },
         )
 
@@ -2731,324 +2470,175 @@ class PeersFeature(Feature):
         *,
         local_recipient_match: bool = False,
     ) -> Optional[ToolResult]:
-        """Route a creator's cancellation to the durable task recipient.
+        """Route a local dispatch handle to its reauthorized native recipient.
 
-        This is intentionally not a second public tool. ``TaskFeature`` owns
-        the user-facing cancellation surface and checks this seam before its
-        local TaskStore because a shared PostgreSQL backend also exposes the
-        recipient's row to the sender. ``None`` means the exact sender-owned
-        outbound route is absent; every unreadable or unsafe route returns a
-        fail-closed result. The durable route supplies the recipient; neither
-        a display name nor possession of the task id is routing authority.
+        TaskFeature owns the public cancellation tool. An exact absent outbound
+        handle permits its independently proven local inbox path; unreadable or
+        ambiguous evidence always fails closed. The protocol carries no reason
+        field, so an optional operator reason remains local presentation.
         """
-        db = getattr(self, "_db", None)
-        if db is None:
-            if local_recipient_match:
-                return None
-            return ToolResult.failed(
-                "The durable outbound route store is unavailable",
-                data={"task_id": task_id},
-            )
-        if not getattr(self, "_outbound_route_store_ready", False):
-            return ToolResult.failed(
-                "The durable outbound route store is unavailable",
-                data={"task_id": task_id},
-            )
+        from a2a.utils.errors import A2AError
+
+        from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
+        from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
+        from kestrel_sovereign.a2a.stores.unified.outbound_store import (
+            DispatchState,
+            OutboundDispatchConflict,
+        )
 
         try:
-            from kestrel_sovereign.a2a.outbound_store import (
-                ROUTE_STATE_ROUTABLE,
-                get_outbound_task,
-            )
-
-            audit_agent_id = str(
-                getattr(self.agent, "did", None) or self._own_name
-            )
-            outbound = await get_outbound_task(
-                db,
-                agent_id=audit_agent_id,
-                task_id=task_id,
-            )
-            if outbound is None:
-                if local_recipient_match:
-                    return None
-                return ToolResult.failed(
-                    "No unambiguous local or outbound task route exists",
-                    data={"task_id": task_id},
+            store = self._native_outbound_store()
+            dispatch = await store.get(task_id)
+            if dispatch is None:
+                return (
+                    None
+                    if local_recipient_match
+                    else ToolResult.failed(
+                        "No sender-owned outbound dispatch exists",
+                        data={"dispatch_id": task_id},
+                    )
                 )
             if local_recipient_match:
                 return ToolResult.failed(
-                    "Task ID is ambiguous between inbound and outbound work",
-                    data={"task_id": task_id, "error_type": "ambiguous_direction"},
+                    "Handle is ambiguous between inbound and outbound work",
+                    data={"dispatch_id": task_id, "error_type": "ambiguous_direction"},
                 )
-            recipient_agent_id = outbound.recipient_agent_id
-            if (
-                outbound.route_state != ROUTE_STATE_ROUTABLE
-                or not isinstance(recipient_agent_id, str)
-                or not recipient_agent_id
-            ):
-                raise PeerNotFoundError(
-                    "No durable stable identity exists for this peer task"
-                )
-            router, requester, peer = await self._resolve_retained_automatic_peer(
-                outbound.recipient,
-                recipient_agent_id,
-            )
-        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
-            if is_execution_control_error(control_error):
+            async with self._open_native_dispatch(task_id) as (session, dispatch):
+                if dispatch.state in {DispatchState.SUBMITTING, DispatchState.UNKNOWN}:
+                    reconciled = await session.reconcile(dispatch)
+                    if reconciled is None:
+                        return ToolResult.failed(
+                            "Delivery remains uncertain; cancellation has no acknowledged remote task",
+                            data={"dispatch_id": task_id, "delivery_state": "unknown"},
+                        )
+                    dispatch = reconciled
+                if dispatch.cancel_state in {
+                    DispatchState.SUBMITTING,
+                    DispatchState.UNKNOWN,
+                }:
+                    receipt = await session.get_task(dispatch)
+                    if receipt.dispatch.state is not DispatchState.COMPLETE:
+                        return ToolResult.failed(
+                            "Cancellation remains uncertain; the peer task is still active",
+                            data={
+                                "dispatch_id": task_id,
+                                "remote_task_id": dispatch.remote_task_id,
+                                "cancel_state": receipt.dispatch.cancel_state.value,
+                            },
+                        )
+                elif dispatch.state is DispatchState.COMPLETE:
+                    receipt = await session.get_task(dispatch)
+                else:
+                    receipt = await session.cancel_task(dispatch)
+        except (
+            PeerDirectoryError,
+            A2AError,
+            OutboundDispatchConflict,
+            NativePeerProtocolError,
+            NativeSenderProofError,
+        ) as error:
+            if is_execution_control_error(error):
                 raise
             return ToolResult.failed(
-                "Peer is not available in the automatic directory",
-                data={"task_id": task_id},
+                f"Could not confirm native task cancellation: {error}",
+                data={"dispatch_id": task_id, "cancellation_confirmed": False},
             )
-        except PeerDirectoryConfigurationError as control_error:
-            if is_execution_control_error(control_error):
-                raise
+        state = receipt.dispatch.remote_task_state
+        if state != "canceled":
             return ToolResult.failed(
-                "Peer routing is not configured safely",
-                data={"task_id": task_id},
-            )
-        except (PeerTransportError, PeerUnavailableError) as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Could not resolve the durable outbound task recipient",
+                f"Peer task is already terminal: {state}",
                 data={
-                    "task_id": task_id,
-                    "error_type": RECIPIENT_UNREACHABLE_ERROR_TYPE,
-                },
-            )
-        except PeerDirectoryError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Could not resolve the durable outbound task recipient",
-                data={"task_id": task_id},
-            )
-        except Exception as control_error:  # noqa: BLE001 - durable route backend boundary
-            if is_execution_control_error(control_error):
-                raise
-            logger.exception(
-                "Could not read durable outbound route for task %s", task_id
-            )
-            return ToolResult.failed(
-                "Could not read the durable outbound task route",
-                data={"task_id": task_id},
-            )
-
-        reason_text = reason or "Task canceled by creator"
-        session_id = f"a2a-cancel:{task_id}"
-        payload: Dict[str, Any] = {
-            "reason": reason_text,
-            "sessionId": session_id,
-            "metadata": {
-                "sender": self._current_legacy_outbound_sender(),
-                "a2a_verb": "cancel_task",
-            },
-        }
-        try:
-            self._maybe_sign_outbound(
-                payload,
-                task_id=task_id,
-                sess_id=session_id,
-                message=reason_text,
-            )
-            response = await router.cancel_a2a_task(
-                requester,
-                peer,
-                task_id,
-                payload,
-            )
-        except OutboundSigningError as exc:
-            if is_execution_control_error(exc):
-                raise
-            return ToolResult.failed(
-                "Could not authenticate task cancellation",
-                data={"task_id": task_id, "error_type": exc.code},
-            )
-        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError) as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Task cancellation is not authorized",
-                data={"task_id": task_id},
-            )
-        except PeerTaskConflictError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Task cancellation conflicts with the recipient's terminal state",
-                data={"task_id": task_id, "error_type": "lifecycle_conflict"},
-            )
-        except (PeerTransportError, PeerUnavailableError) as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Could not reach the task recipient",
-                data={
-                    "task_id": task_id,
-                    "error_type": RECIPIENT_UNREACHABLE_ERROR_TYPE,
-                },
-            )
-        except PeerDirectoryError as control_error:
-            if is_execution_control_error(control_error):
-                raise
-            return ToolResult.failed(
-                "Peer task cancellation failed",
-                data={"task_id": task_id},
-            )
-        except Exception as control_error:  # noqa: BLE001 - provider extension boundary
-            if is_execution_control_error(control_error):
-                raise
-            logger.exception(
-                "Peer router raised unexpectedly canceling task %s", task_id
-            )
-            return ToolResult.failed(
-                "Peer task cancellation failed",
-                data={"task_id": task_id},
-            )
-        if not isinstance(response, Mapping):
-            return ToolResult.failed(
-                "Peer returned an invalid cancellation receipt",
-                data={"task_id": task_id},
-            )
-        receipt = response.get("cancellation_receipt")
-        if (
-            response.get("id") != task_id
-            or response.get("status") != "canceled"
-            or not isinstance(receipt, Mapping)
-            or not isinstance(receipt.get("status_before"), str)
-        ):
-            return ToolResult.failed(
-                "Peer returned an invalid cancellation receipt",
-                data={"task_id": task_id},
-            )
-        durable_reason = receipt.get("reason", reason_text)
-
-        try:
-            from kestrel_sovereign.a2a.outbound_store import (
-                update_outbound_terminal_state,
-            )
-
-            stamped = await update_outbound_terminal_state(
-                db,
-                agent_id=audit_agent_id,
-                task_id=task_id,
-                terminal_state="canceled",
-            )
-        except Exception as control_error:  # noqa: BLE001 - audit backend boundary
-            if is_execution_control_error(control_error):
-                raise
-            logger.exception(
-                "Cancellation succeeded but its outbound audit stamp failed: %s",
-                task_id,
-            )
-            stamped = 0
-        audit_confirmed = stamped == 1
-        if not audit_confirmed:
-            # A question's terminal SSE can win the race and stamp this exact
-            # sender-owned row before the cancellation response returns. A
-            # zero-row CAS (or uncertain post-commit backend exception) is
-            # successful only when a fresh read proves the desired state.
-            try:
-                refreshed = await get_outbound_task(
-                    db,
-                    agent_id=audit_agent_id,
-                    task_id=task_id,
-                )
-            except Exception as control_error:  # noqa: BLE001 - audit reconciliation boundary
-                if is_execution_control_error(control_error):
-                    raise
-                logger.exception(
-                    "Could not reconcile outbound cancellation audit row: %s",
-                    task_id,
-                )
-                refreshed = None
-            audit_confirmed = (
-                refreshed is not None
-                and refreshed.terminal_state == "canceled"
-            )
-        if not audit_confirmed:
-            return ToolResult.partial(
-                confirmation=f"Cancelled outbound task {task_id[:8]}",
-                error="Cancellation succeeded but its outbound audit row was not updated",
-                data={
-                    "task_id": task_id,
-                    "status": "canceled",
-                    "status_before": receipt["status_before"],
-                    "reason": durable_reason,
+                    "dispatch_id": task_id,
+                    "remote_task_id": receipt.dispatch.remote_task_id,
+                    "state": state,
                 },
             )
         return ToolResult.ok(
-            confirmation=f"Cancelled outbound task {task_id[:8]}",
+            confirmation="Peer task cancellation confirmed",
             data={
-                "task_id": task_id,
-                "status": "canceled",
-                "status_before": receipt["status_before"],
-                "reason": durable_reason,
+                "dispatch_id": task_id,
+                "remote_task_id": receipt.dispatch.remote_task_id,
+                "state": state,
+                "cancellation_confirmed": True,
+                "local_reason": reason,
             },
         )
+
+    @asynccontextmanager
+    async def _open_native_dispatch(self, dispatch_id: str):
+        from kestrel_sovereign.a2a.stores.unified.outbound_store import (
+            OutboundDispatchConflict,
+        )
+
+        if not isinstance(dispatch_id, str) or not dispatch_id.strip():
+            raise OutboundDispatchConflict("An immutable local dispatch_id is required")
+        store = self._native_outbound_store()
+        dispatch = await store.get(dispatch_id)
+        if dispatch is None:
+            raise OutboundDispatchConflict("No sender-owned native dispatch exists")
+        router, requester, peer = await self._resolve_retained_automatic_peer(
+            "", dispatch.recipient_id
+        )
+        async with router.open_a2a_session(requester, peer) as session:
+            yield session, dispatch
+
+    def _native_outbound_store(self):
+        from kestrel_sovereign.a2a.task_manager import (
+            OutboundActorScopeError,
+            TaskManager,
+        )
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+
+        manager = getattr(self.agent, "task_manager", None)
+        if not isinstance(manager, TaskManager):
+            raise PeerDirectoryConfigurationError(
+                "Native outbound audit requires the agent's canonical task manager"
+            )
+        try:
+            owner = resolve_scoped_agent_did(self.agent)
+            return manager.outbound_for_actor(owner)
+        except AgentIdentityUnavailable as error:
+            raise PeerAccessDeniedError(
+                "Outbound audit has no authenticated local owner"
+            ) from error
+        except OutboundActorScopeError as error:
+            raise PeerAccessDeniedError(str(error)) from error
 
     @tool(
         name="list_outbound_a2a_tasks",
         description=(
-            "List the A2A tasks you SENT to peer agents — your local "
-            "audit log of outbound dispatches (#1576). Each row carries "
-            "task_id, recipient, verb (message/question/task), "
-            "dispatch_tool, created_at, and terminal_state (populated "
-            "after a get_peer_task_result fetch confirms the peer's "
-            "final state). Use this when you need to enumerate "
-            "'what did I send and to whom?' without per-id round trips."
+            "List your native outbound A2A dispatch audit. Each row has an immutable "
+            "dispatch_id, stable recipient, selected tenant and interface, delivery state, "
+            "and the nullable remote_task_id and last observed task state. "
+            "Message bodies are not stored in this audit."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a outbound",
     )
     @execution_work_operation
     async def list_outbound_a2a_tasks(
-        self,
-        limit: int = 50,
-        recipient: str = "",
+        self, limit: int = 50, recipient: str = ""
     ) -> ToolResult:
-        """Return the most recent outbound A2A dispatches, newest first.
+        """List this sender's native dispatch audit without fetching peer data."""
+        from dataclasses import asdict
 
-        Args:
-            limit: Maximum rows to return (clamped to [1, 1000]).
-                Default 50.
-            recipient: Optional peer name to filter by; empty returns
-                rows for every recipient.
-        """
-        db = getattr(self, "_db", None)
-        if db is None:
-            return ToolResult.failed(
-                "Outbound audit store unavailable (no DB attached)",
-                data={"rows": [], "count": 0},
-            )
         try:
-            from kestrel_sovereign.a2a.outbound_store import (
-                list_outbound_tasks,
-            )
-            rows = await list_outbound_tasks(
-                db,
-                agent_id=str(
-                    getattr(self.agent, "did", None) or self._own_name
-                ),
-                limit=limit,
-                recipient=recipient or None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if is_execution_control_error(exc):
+            store = self._native_outbound_store()
+            recipient_id = None
+            if recipient:
+                _, _, peer = await self._resolve_automatic_peer(recipient)
+                recipient_id = peer.agent_id
+            rows = await store.list_recent(limit=limit, recipient_id=recipient_id)
+        except (PeerDirectoryError, ValueError) as error:
+            if is_execution_control_error(error):
                 raise
-            return ToolResult.failed(
-                f"Outbound audit query failed: {exc}",
-                data={"rows": [], "count": 0},
-            )
-        public = [r.to_public_dict() for r in rows]
+            return ToolResult.failed(str(error), data={"rows": [], "count": 0})
         return ToolResult.ok(
-            confirmation=(
-                f"Outbound A2A audit: {len(public)} row(s)"
-                + (f" to {recipient}" if recipient else "")
-            ),
-            data={"rows": public, "count": len(public)},
+            confirmation=f"Found {len(rows)} outbound A2A dispatches",
+            data={"rows": [asdict(row) for row in rows], "count": len(rows)},
         )
 
     # ------------------------------------------------------------------
@@ -4883,27 +4473,13 @@ class PeersFeature(Feature):
     @tool(
         name="send_a2a_task",
         description=(
-            "Submit a tracked A2A task to another agent. Persists in "
-            "the recipient's TaskStore, fires the a2a.task_submitted "
-            "signal so they wake and process it, returns the task_id "
-            "for tracking. Caller can poll status via get_a2a_task "
-            "(or receive the a2a.task_complete signal). Use this for "
-            "delegated work you'll check on later. For an answer "
-            "now use send_a2a_question; for a fire-and-forget "
-            "notification use send_a2a_message.\n\n"
-            "SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or "
-            "``references`` to hand off durable payload (planning docs, "
-            "evidence bundles, saved-memory/recall references, logs, "
-            "diffs) WITH the task — the recipient retrieves them from "
-            "the task store via get_task_result/check_task_status. "
-            "This is the SEND side; it is distinct from the "
-            "RESPONDER-side attach_artifact_to_a2a_task tool, which a "
-            "RECIPIENT uses to attach output onto an INCOMING task "
-            "before responding. Each artifact is a dict like "
-            "{'name': 'plan', 'text': '...'} (or 'data': {...} for "
-            "structured metadata, optional 'index'/'last_chunk' for "
-            "chunked bodies). Each reference is a dict descriptor like "
-            "{'ref_type': 'memory', 'id': '...', 'label': '...'}."
+            "Delegate tracked work to a peer using native A2A. The dispatch_id is your "
+            "immutable local handle; remote_task_id is assigned by the peer and can be null. "
+            "Supply standard message parts for input attachments, such as {'text':'plan', "
+            "'filename':'plan.txt'} or {'data':{'ref_type':'memory','id':'...'}}. "
+            "Artifacts are peer outputs. skill_id is an optional advisory hint from the "
+            "peer's signed Agent Card; it grants no direct tool invocation. "
+            "Use context_id to continue a conversation context."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a send",
@@ -4914,71 +4490,19 @@ class PeersFeature(Feature):
         recipient: str,
         message: str,
         skill_id: str = "",
-        session_id: str = "",
-        # See send_a2a_question for why these are ``List[Any]``
-        # rather than ``Optional[List[Any]]``: kestrel_sdk's @tool
-        # schema generator maps Union (the Optional unwrap) to
-        # ``string``, which is incompatible with the strict
-        # validator. Codex round 2 P2 on PR #1628.
-        artifacts: List[Any] = None,
-        references: List[Any] = None,
+        context_id: str = "",
+        parts: List[Any] = None,
     ) -> ToolResult:
-        """
-        Submit an A2A task to a peer agent and wake their cognition loop.
-
-        Args:
-            recipient: Peer agent name (e.g. "Meridian").
-            message: The task description / prompt for the recipient.
-            skill_id: Optional A2A skill id from the receiver's
-                AgentCard (e.g. ``"workflow.assign"``). The valid set is
-                whatever that specific recipient advertises in its
-                AgentCard — call ``list_peers`` first to discover each
-                peer's advertised capabilities/skills. Defaults to
-                empty — the receiver routes via their default handler.
-            session_id: Optional A2A session id; auto-generated when
-                empty so multiple sends are independent sessions.
-            artifacts: Optional send-side handoff payload. Each item is
-                a dict with ``name`` and a body (``text`` for raw text,
-                ``data`` for a structured dict, or pre-shaped
-                ``parts``), plus optional ``description``, ``metadata``,
-                ``index``, ``last_chunk``. Persisted on the recipient's
-                task at SUBMITTED so the recipient can retrieve them.
-            references: Optional durable references (pointers to
-                saved-memory / recall items, URIs). Each item is a dict
-                descriptor; carried as structured-data artifacts in the
-                ``references`` group.
-        """
-        task_data, _chain, _recipient_agent_id, err = await self._post_a2a_task(
-            recipient=recipient, message=message,
-            skill_id=skill_id, session_id=session_id,
-            extra_metadata={"a2a_verb": "task"},
-            artifacts=artifacts, references=references,
+        """Delegate work using standard input Parts and an optional advisory skill."""
+        receipt = await self._dispatch_native_peer(
+            recipient,
+            message,
+            context_id=context_id,
+            parts=parts,
+            skill_id=skill_id,
+            verb="task",
             dispatch_tool="send_a2a_task",
         )
-        if err is not None:
-            return err
-        attached = len(_coerce_outbound_artifacts(artifacts, references))
-        return ToolResult.ok(
-            confirmation=(
-                f"A2A task {task_data['id']} submitted to {recipient} "
-                f"(state={(task_data.get('status') or {}).get('state','?')}, "
-                f"{attached} artifact(s) attached). "
-                f"Recipient's dispatcher has been signaled."
-            ),
-            data={
-                "sent": True,
-                "task_id": task_data["id"],
-                "session_id": task_data["sessionId"],
-                "state": (task_data.get("status") or {}).get("state"),
-                "recipient": recipient,
-                "artifacts_attached": attached,
-            },
-        )
-
-    # Agent Mesh Protocol retired in #1367. The send_mesh_message /
-    # mesh_inbox / receive_mesh_message tools and the /agent/mesh
-    # endpoint were replaced by send_a2a_task above (and the wider
-    # send_a2a_* family in the follow-up epic). All inter-agent
-    # communication now goes through /api/agent/tasks/send so it gets
-    # persistence (TaskStore), lifecycle (SUBMITTED→WORKING→COMPLETED),
-    # and dispatcher-driven inbound wake (a2a.task_submitted signal).
+        if isinstance(receipt, ToolResult):
+            return receipt
+        return self._native_dispatch_result(receipt, recipient)

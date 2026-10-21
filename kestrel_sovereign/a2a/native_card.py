@@ -18,11 +18,11 @@ from a2a.utils.signing import create_agent_card_signer, create_signature_verifie
 from jwt.exceptions import InvalidKeyError
 
 from kestrel_sovereign.a2a.extensions import (
-    CAUSATION_URI,
-    QUESTION_CORRELATION_URI,
+    NATIVE_EXTENSION_URIS,
     RECIPIENT_POLICY_URI,
     SIGNED_SENDER_URI,
 )
+from kestrel_sovereign.a2a.media import DEFAULT_NATIVE_MEDIA_TYPES
 from kestrel_sovereign.a2a.native_routes import native_http_interfaces
 from kestrel_sovereign.a2a.native_sender import SENDER_PROOF_HEADER
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
@@ -140,12 +140,7 @@ def create_native_agent_card(
                         else {"version": 1}
                     ),
                 )
-                for uri in (
-                    SIGNED_SENDER_URI,
-                    RECIPIENT_POLICY_URI,
-                    QUESTION_CORRELATION_URI,
-                    CAUSATION_URI,
-                )
+                for uri in NATIVE_EXTENSION_URIS
             ],
         ),
         security_schemes={
@@ -158,8 +153,8 @@ def create_native_agent_card(
         security_requirements=[
             SecurityRequirement(schemes={"signedSender": StringList()})
         ],
-        default_input_modes=["text/plain"],
-        default_output_modes=["text/plain"],
+        default_input_modes=DEFAULT_NATIVE_MEDIA_TYPES,
+        default_output_modes=DEFAULT_NATIVE_MEDIA_TYPES,
         skills=skills,
     )
     validate_proto_required_fields(card)

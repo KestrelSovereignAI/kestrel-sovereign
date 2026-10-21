@@ -8,7 +8,14 @@ from enum import StrEnum
 from uuid import uuid4
 
 import rfc8785
-from a2a.types import AgentInterface, Message, Role, SendMessageRequest, Task
+from a2a.types import (
+    AgentInterface,
+    CancelTaskRequest,
+    Message,
+    Role,
+    SendMessageRequest,
+    Task,
+)
 from a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict
 
@@ -22,6 +29,7 @@ class DispatchState(StrEnum):
     RESERVED = "reserved"
     SUBMITTING = "submitting"
     UNKNOWN = "unknown"
+    NOT_SENT = "not-sent"
     ACKNOWLEDGED = "acknowledged"
     COMPLETE = "complete"
 
@@ -79,6 +87,9 @@ class OutboundDispatch:
     response_kind: str | None
     updated_at: str
     operation_id: str
+    cancel_operation_id: str | None
+    cancel_request_digest: str | None
+    cancel_state: DispatchState | None
 
 
 _COLUMNS = ", ".join(OutboundDispatch.__dataclass_fields__)
@@ -103,12 +114,27 @@ class OutboundStore(UnifiedStoreBase):
         sender_scope: NativeRecipientScope,
         owns_backend: bool = False,
         clock: Callable[[], datetime] = _utc_now,
+        max_list_limit: int = 1000,
     ):
         super().__init__(backend, owns_backend=owns_backend)
         if not isinstance(sender_scope, NativeRecipientScope):
             raise TypeError("Native outbound sender requires its host-selected scope")
         self._sender_scope = sender_scope
         self._clock = clock
+        if (
+            isinstance(max_list_limit, bool)
+            or not isinstance(max_list_limit, int)
+            or not 1 <= max_list_limit <= 2**31 - 1
+        ):
+            raise ValueError(
+                "Outbound audit list capacity must be a positive SQL integer"
+            )
+        self._max_list_limit = max_list_limit
+
+    @property
+    def sender_scope(self) -> NativeRecipientScope:
+        """The host-selected local actor namespace, independent of peer tenants."""
+        return self._sender_scope
 
     def _timestamp(self) -> str:
         timestamp = self._clock()
@@ -154,18 +180,25 @@ class OutboundStore(UnifiedStoreBase):
                 response_kind TEXT,
                 updated_at TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
+                cancel_operation_id TEXT,
+                cancel_request_digest TEXT,
+                cancel_state TEXT CHECK (cancel_state IN ({states})),
                 PRIMARY KEY (sender_id, sender_tenant, dispatch_id),
                 UNIQUE (sender_id, sender_tenant, message_id)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS a2a_outbound_remote_task_owner
             ON a2a_outbound_dispatches (sender_id, sender_tenant, recipient_id, tenant, remote_task_id)
             WHERE remote_task_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS a2a_outbound_sender_created
+            ON a2a_outbound_dispatches (sender_id, sender_tenant, created_at DESC, dispatch_id DESC);
         """)
 
     @staticmethod
     def _snapshot(row) -> OutboundDispatch:
         values = dict(zip(OutboundDispatch.__dataclass_fields__, row, strict=True))
         values["state"] = DispatchState(values["state"])
+        if values["cancel_state"] is not None:
+            values["cancel_state"] = DispatchState(values["cancel_state"])
         return OutboundDispatch(**values)
 
     async def get(self, dispatch_id: str) -> OutboundDispatch | None:
@@ -174,6 +207,38 @@ class OutboundStore(UnifiedStoreBase):
             (self._sender_scope.recipient_id, self._sender_scope.tenant, dispatch_id),
         )
         return self._snapshot(row) if row is not None else None
+
+    async def list_recent(
+        self,
+        *,
+        limit: int = 50,
+        recipient_id: str | None = None,
+    ) -> list[OutboundDispatch]:
+        """Read only this local actor's audit, with an optional stable peer filter."""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= self._max_list_limit
+        ):
+            raise ValueError(
+                f"Outbound list limit must be between 1 and {self._max_list_limit}"
+            )
+        predicates = ["sender_id = ?", "sender_tenant = ?"]
+        values: list[str | int] = [
+            self._sender_scope.recipient_id,
+            self._sender_scope.tenant,
+        ]
+        if recipient_id is not None:
+            _text(recipient_id, "recipient_id")
+            predicates.append("recipient_id = ?")
+            values.append(recipient_id)
+        values.append(limit)
+        rows = await self.backend.fetch_all(
+            f"SELECT {_COLUMNS} FROM a2a_outbound_dispatches WHERE {' AND '.join(predicates)} "
+            "ORDER BY created_at DESC, dispatch_id DESC LIMIT ?",
+            tuple(values),
+        )
+        return [self._snapshot(row) for row in rows]
 
     async def reserve(
         self,
@@ -233,6 +298,9 @@ class OutboundStore(UnifiedStoreBase):
             response_kind=None,
             updated_at=now,
             operation_id=uuid4().hex,
+            cancel_operation_id=None,
+            cancel_request_digest=None,
+            cancel_state=None,
         )
         values = tuple(
             getattr(reservation, field)
@@ -263,6 +331,7 @@ class OutboundStore(UnifiedStoreBase):
         state: DispatchState,
         operation_id: str,
         receipt: tuple[str | None, str, str, str, str | None] | None = None,
+        cancellation: tuple[str, str, DispatchState] | None = None,
     ) -> OutboundDispatch | None:
         _text(operation_id, "operation_id")
         if (dispatch.sender_id, dispatch.sender_tenant) != (
@@ -289,6 +358,11 @@ class OutboundStore(UnifiedStoreBase):
         if receipt is not None:
             assignments += ", remote_task_id = ?, remote_context_id = ?, response_digest = ?, response_kind = ?, remote_task_state = ?"
             values.extend(receipt)
+        if cancellation is not None:
+            assignments += (
+                ", cancel_operation_id = ?, cancel_request_digest = ?, cancel_state = ?"
+            )
+            values.extend(cancellation)
         # Snapshot objects are evidence supplied by our callers, not authority.
         # Match every original binding and previous receipt against the row.
         predicates = []
@@ -329,6 +403,75 @@ class OutboundStore(UnifiedStoreBase):
             operation_id=operation_id,
         )
 
+    async def record_no_delivery(
+        self, dispatch: OutboundDispatch, *, operation_id: str
+    ):
+        """Record a local attempt whose original native dispatch never admitted HTTP.
+
+        The caller must own that native-dispatch observation. A peer error or an
+        empty reconciliation read cannot establish this outcome.
+        """
+        return await self._transition(
+            dispatch,
+            sources=(DispatchState.SUBMITTING,),
+            state=DispatchState.NOT_SENT,
+            operation_id=operation_id,
+        )
+
+    async def begin_cancellation(
+        self,
+        dispatch: OutboundDispatch,
+        request: CancelTaskRequest,
+        *,
+        operation_id: str,
+    ) -> OutboundDispatch | None:
+        """Claim one explicit cancellation without losing the known remote ID."""
+        if (
+            not isinstance(request, CancelTaskRequest)
+            or not dispatch.remote_task_id
+            or request.id != dispatch.remote_task_id
+            or request.tenant != dispatch.tenant
+            or dispatch.cancel_state not in {None, DispatchState.NOT_SENT}
+        ):
+            raise OutboundDispatchConflict(
+                "Cancellation has no safe acknowledged route or is already in flight"
+            )
+        return await self._transition(
+            dispatch,
+            sources=(DispatchState.ACKNOWLEDGED,),
+            state=dispatch.state,
+            operation_id=operation_id,
+            cancellation=(
+                operation_id,
+                native_request_digest(request, "CancelTask"),
+                DispatchState.SUBMITTING,
+            ),
+        )
+
+    async def retain_cancellation_failure(
+        self, dispatch: OutboundDispatch, *, may_have_sent: bool, operation_id: str
+    ) -> OutboundDispatch | None:
+        """Uncertain cancellation never deletes prior delivery evidence or permits replay."""
+        if (
+            dispatch.cancel_state is not DispatchState.SUBMITTING
+            or not dispatch.cancel_operation_id
+            or not dispatch.cancel_request_digest
+        ):
+            raise OutboundDispatchConflict(
+                "Cancellation attempt has no durable submission claim"
+            )
+        return await self._transition(
+            dispatch,
+            sources=(DispatchState.ACKNOWLEDGED,),
+            state=dispatch.state,
+            operation_id=operation_id,
+            cancellation=(
+                dispatch.cancel_operation_id,
+                dispatch.cancel_request_digest,
+                DispatchState.UNKNOWN if may_have_sent else DispatchState.NOT_SENT,
+            ),
+        )
+
     async def acknowledge(
         self,
         dispatch: OutboundDispatch,
@@ -367,6 +510,12 @@ class OutboundStore(UnifiedStoreBase):
             raise OutboundDispatchConflict(
                 "Peer receipt changed the acknowledged task or context"
             )
+        if dispatch.state is DispatchState.COMPLETE and (
+            not complete
+            or not isinstance(response, Task)
+            or task_state_label(response.status.state) != dispatch.remote_task_state
+        ):
+            raise OutboundDispatchConflict("Peer changed a retained terminal outcome")
         digest = hashlib.sha256(
             response.SerializeToString(deterministic=True)
         ).hexdigest()
@@ -376,6 +525,7 @@ class OutboundStore(UnifiedStoreBase):
                 DispatchState.SUBMITTING,
                 DispatchState.UNKNOWN,
                 DispatchState.ACKNOWLEDGED,
+                DispatchState.COMPLETE,
             ),
             state=DispatchState.COMPLETE if complete else DispatchState.ACKNOWLEDGED,
             operation_id=operation_id,
@@ -388,6 +538,15 @@ class OutboundStore(UnifiedStoreBase):
                 if isinstance(response, Task)
                 else None,
             ),
+            cancellation=(
+                dispatch.cancel_operation_id,
+                dispatch.cancel_request_digest,
+                DispatchState.COMPLETE,
+            )
+            if complete
+            and dispatch.cancel_operation_id
+            and dispatch.cancel_request_digest
+            else None,
         )
 
     async def reconcile(

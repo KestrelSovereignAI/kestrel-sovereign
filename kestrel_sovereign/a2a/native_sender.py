@@ -162,22 +162,25 @@ def sign_native_request(
         ALG_ML_DSA_65,
     ):
         raise NativeSenderProofError("Signed sender v1 requires Ed25519 and ML-DSA-65")
-    claims = _Claims(
-        version=1,
-        protocol="1.0",
-        extension=SIGNED_SENDER_URI,
-        sender=sender,
-        recipient=recipient,
-        operation=operation,
-        request_digest=native_request_digest(params, operation),
-        timestamp=timestamp,
-        nonce=nonce,
-        extensions=_extension_set(extensions),
-        signers=[
-            _Signer(alg=ALG_ED25519, kid=classical_kid),
-            _Signer(alg=ALG_ML_DSA_65, kid=pq_kid),
-        ],
-    )
+    try:
+        claims = _Claims(
+            version=1,
+            protocol="1.0",
+            extension=SIGNED_SENDER_URI,
+            sender=sender,
+            recipient=recipient,
+            operation=operation,
+            request_digest=native_request_digest(params, operation),
+            timestamp=timestamp,
+            nonce=nonce,
+            extensions=_extension_set(extensions),
+            signers=[
+                _Signer(alg=ALG_ED25519, kid=classical_kid),
+                _Signer(alg=ALG_ML_DSA_65, kid=pq_kid),
+            ],
+        )
+    except ValidationError as error:
+        raise NativeSenderProofError("Invalid native sender proof claims") from error
     encoded = rfc8785.dumps(claims.model_dump(mode="json"))
     signatures = sign_hybrid(
         encoded, keypair, classical_kid=classical_kid, pq_kid=pq_kid

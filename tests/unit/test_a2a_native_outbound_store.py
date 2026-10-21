@@ -531,3 +531,209 @@ async def test_equal_sender_ids_do_not_cross_local_tenant_namespaces(outbound):
     assert separate.sender_tenant != original.sender_tenant
     assert await outbound.get(original.dispatch_id) == original
     assert await other.get(original.dispatch_id) == separate
+
+
+async def test_native_outbound_listing_has_actor_scope_filter_and_deterministic_limit(
+    outbound,
+):
+    from datetime import UTC, datetime
+
+    fixed = datetime(2026, 10, 20, tzinfo=UTC)
+    outbound._clock = lambda: fixed
+    a = await reserve(outbound, request(), dispatch_id="a", recipient="did:peer-a")
+    b = await reserve(outbound, request(), dispatch_id="b", recipient="did:peer-b")
+    c = await reserve(outbound, request(), dispatch_id="c", recipient="did:peer-a")
+    other_sender = OutboundStore(
+        outbound.backend, sender_scope=NativeRecipientScope("did:other")
+    )
+    other_tenant = OutboundStore(
+        outbound.backend,
+        sender_scope=NativeRecipientScope("did:sender", "another-tenant"),
+    )
+    await reserve(other_sender, request(), dispatch_id="foreign-sender")
+    await reserve(other_tenant, request(), dispatch_id="foreign-tenant")
+    assert await outbound.list_recent() == [c, b, a]
+    assert await outbound.list_recent(limit=2) == [c, b]
+    assert await outbound.list_recent(recipient_id="did:peer-a") == [c, a]
+    assert await outbound.list_recent(recipient_id="did:absent") == []
+    assert outbound.sender_scope == NativeRecipientScope("did:sender")
+
+
+@pytest.mark.parametrize("limit", [True, 0, -1, 1001, 1.5, "1"])
+async def test_native_outbound_listing_refuses_invalid_limits(outbound, limit):
+    with pytest.raises(ValueError, match="list limit"):
+        await outbound.list_recent(limit=limit)
+
+
+async def test_native_outbound_listing_honors_host_configured_capacity(outbound):
+    small = OutboundStore(
+        outbound.backend, sender_scope=outbound.sender_scope, max_list_limit=2
+    )
+    await reserve(small, request())
+    assert len(await small.list_recent(limit=2)) == 1
+    with pytest.raises(ValueError, match="between 1 and 2"):
+        await small.list_recent(limit=3)
+
+
+@pytest.mark.parametrize("capacity", [True, 0, -1, 2**31, "2", 1.5])
+async def test_host_list_capacity_refuses_malformed_configuration(outbound, capacity):
+    with pytest.raises(ValueError, match="list capacity"):
+        OutboundStore(
+            outbound.backend,
+            sender_scope=outbound.sender_scope,
+            max_list_limit=capacity,
+        )
+
+
+@pytest.mark.parametrize("recipient", ["", " ", False, 0])
+async def test_outbound_list_refuses_nonconcrete_peer_filter(outbound, recipient):
+    with pytest.raises(ValueError, match="recipient_id"):
+        await outbound.list_recent(recipient_id=recipient)
+
+
+async def test_primary_manager_outbound_scope_is_one_canonical_actor_contract(outbound):
+    from kestrel_sovereign.a2a.task_manager import OutboundActorScopeError
+    from tests.utils.native_a2a import manager_for
+
+    manager = manager_for(outbound.backend, outbound.sender_scope, owns_backend=False)
+    await manager.initialize()
+    try:
+        assert (
+            manager.outbound_for_actor(outbound.sender_scope.recipient_id)
+            is manager.outbound_store
+        )
+        with pytest.raises(OutboundActorScopeError, match="different local actor"):
+            manager.outbound_for_actor("did:another-actor")
+        manager.outbound_store = OutboundStore(
+            outbound.backend,
+            sender_scope=NativeRecipientScope(
+                outbound.sender_scope.recipient_id, "different-tenant"
+            ),
+        )
+        with pytest.raises(OutboundActorScopeError, match="tenant"):
+            manager.outbound_for_actor(outbound.sender_scope.recipient_id)
+    finally:
+        await manager.close()
+
+
+async def test_known_no_delivery_is_terminal_and_cannot_forget_an_ack(outbound):
+    params = request()
+    reserved = await reserve(outbound, params)
+    submitting = await outbound.begin_submission(reserved, operation_id="intent")
+    failed = await outbound.record_no_delivery(
+        submitting, operation_id="no-native-dispatch"
+    )
+    assert failed.state is DispatchState.NOT_SENT
+    assert failed.remote_task_id is None
+    assert await outbound.begin_submission(failed, operation_id="replay") is None
+    with pytest.raises(OutboundDispatchConflict, match="Only an unknown"):
+        await outbound.reconcile(failed, [], operation_id="no-reconciliation")
+    other_params = request()
+    other = await reserve(outbound, other_params)
+    active = await outbound.begin_submission(other, operation_id="second-intent")
+    acknowledged = await outbound.acknowledge(
+        active, task(other_params), operation_id="accepted"
+    )
+    assert (
+        await outbound.record_no_delivery(acknowledged, operation_id="cannot-forget")
+        is None
+    )
+    assert await outbound.get(other.dispatch_id) == acknowledged
+
+
+async def test_primary_actor_contract_refuses_another_connection_even_with_same_namespace(
+    outbound, native_a2a_backend_factory
+):
+    from kestrel_sovereign.a2a.task_manager import OutboundActorScopeError
+    from tests.utils.native_a2a import manager_for
+
+    secondary = native_a2a_backend_factory()
+    await secondary.connect()
+    manager = manager_for(outbound.backend, outbound.sender_scope, owns_backend=False)
+    await manager.initialize()
+    try:
+        manager.outbound_store = OutboundStore(
+            secondary, sender_scope=outbound.sender_scope
+        )
+        with pytest.raises(OutboundActorScopeError, match="primary backend"):
+            manager.outbound_for_actor(outbound.sender_scope.recipient_id)
+    finally:
+        await manager.close()
+        await secondary.close()
+
+
+async def test_cancellation_intent_has_one_claim_and_keeps_original_receipt(outbound):
+    from a2a.types import CancelTaskRequest
+
+    params = request()
+    original = await reserve(outbound, params)
+    submitting = await outbound.begin_submission(original, operation_id="send")
+    accepted = await outbound.acknowledge(submitting, task(params), operation_id="ack")
+    cancel = CancelTaskRequest(id=accepted.remote_task_id, tenant=accepted.tenant)
+    claimed = await outbound.begin_cancellation(accepted, cancel, operation_id="cancel")
+    assert claimed.remote_task_id == accepted.remote_task_id
+    assert claimed.response_digest == accepted.response_digest
+    assert claimed.request_digest == accepted.request_digest
+    assert claimed.cancel_request_digest != claimed.request_digest
+    assert (
+        await outbound.begin_cancellation(
+            accepted, cancel, operation_id="racing-cancel"
+        )
+        is None
+    )
+    with pytest.raises(OutboundDispatchConflict, match="already in flight"):
+        await outbound.begin_cancellation(claimed, cancel, operation_id="retry")
+    unknown = await outbound.retain_cancellation_failure(
+        claimed, may_have_sent=True, operation_id="lost-ack"
+    )
+    assert unknown.cancel_state is DispatchState.UNKNOWN
+    with pytest.raises(OutboundDispatchConflict, match="already in flight"):
+        await outbound.begin_cancellation(unknown, cancel, operation_id="replay")
+    # Read observations may settle the known task, but cannot erase an uncertain cancel.
+    observed = await outbound.acknowledge(
+        unknown, task(params), operation_id="active-read"
+    )
+    assert observed.cancel_state is DispatchState.UNKNOWN
+    finished = await outbound.acknowledge(
+        observed,
+        task(params, state=TaskState.TASK_STATE_COMPLETED),
+        operation_id="terminal-read",
+    )
+    assert finished.cancel_state is DispatchState.COMPLETE
+    assert finished.remote_task_state == "completed"
+    with pytest.raises(OutboundDispatchConflict, match="terminal outcome"):
+        await outbound.acknowledge(finished, task(params), operation_id="stale-replica")
+    with pytest.raises(OutboundDispatchConflict, match="terminal outcome"):
+        await outbound.acknowledge(
+            finished,
+            task(params, state=TaskState.TASK_STATE_CANCELED),
+            operation_id="rewrite-outcome",
+        )
+    assert await outbound.get(original.dispatch_id) == finished
+
+
+async def test_cancellation_claim_refuses_foreign_remote_task_or_tenant(outbound):
+    from a2a.types import CancelTaskRequest
+
+    params = request()
+    original = await reserve(outbound, params)
+    submitting = await outbound.begin_submission(original, operation_id="send")
+    accepted = await outbound.acknowledge(submitting, task(params), operation_id="ack")
+    for cancel in [
+        CancelTaskRequest(id="foreign-task", tenant=accepted.tenant),
+        CancelTaskRequest(id=accepted.remote_task_id, tenant="foreign-tenant"),
+    ]:
+        with pytest.raises(OutboundDispatchConflict, match="safe acknowledged route"):
+            await outbound.begin_cancellation(
+                accepted, cancel, operation_id="bad-cancel"
+            )
+    foreign = OutboundStore(
+        outbound.backend, sender_scope=NativeRecipientScope("did:foreign")
+    )
+    with pytest.raises(OutboundDispatchConflict, match="another sender"):
+        await foreign.begin_cancellation(
+            accepted,
+            CancelTaskRequest(id=accepted.remote_task_id, tenant=accepted.tenant),
+            operation_id="foreign-cancel",
+        )
+    assert await outbound.get(original.dispatch_id) == accepted

@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException
 
 from kestrel_sovereign import __version__
 from kestrel_sovereign.a2a.did_registry import same_a2a_sender_identity_witness
-from kestrel_sovereign.a2a.extensions import CAUSATION_URI, QUESTION_CORRELATION_URI
+from kestrel_sovereign.a2a.extensions import NATIVE_EXTENSION_URIS
 from kestrel_sovereign.a2a.native_card import (
     REQUIRED_NATIVE_EXTENSIONS,
     create_native_agent_card,
@@ -33,6 +33,7 @@ from kestrel_sovereign.a2a.native_routes import (
 from kestrel_sovereign.a2a.native_sender import NativeProofPolicy
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.a2a.task_manager import OutboundActorScopeError
 from kestrel_sovereign.execution_custody import owned_native_http_client
 from kestrel_sovereign.features.peers.directory import (
     PeerAccessDeniedError,
@@ -237,10 +238,11 @@ async def open_hosted_native_peer_session(
         sender_manager = sender.task_manager
         sender_task_store = sender_manager.task_store
         sender_scope = sender_task_store.scope
-        outbound = sender_manager.outbound_store
+        try:
+            outbound = sender_manager.outbound_for_actor(requester.identity)
+        except OutboundActorScopeError as error:
+            raise PeerAccessDeniedError(str(error)) from error
         scope = recipient.task_manager.task_store.scope
-        if sender_manager.task_store.scope.recipient_id != requester.identity:
-            raise PeerAccessDeniedError("Sender ledger differs from its host principal")
         signing_document = {
             "id": recipient_identity.signing_did,
             "verificationMethod": recipient_identity.new_verification_methods,
@@ -258,8 +260,7 @@ async def open_hosted_native_peer_session(
         signer = NativeSenderInterceptor.for_identity(
             sender_identity,
             recipient=scope,
-            extensions=REQUIRED_NATIVE_EXTENSIONS
-            | {CAUSATION_URI, QUESTION_CORRELATION_URI},
+            extensions=frozenset(NATIVE_EXTENSION_URIS),
             policy=NativeProofPolicy(),
             clock=time.time,
             nonce=lambda: uuid4().hex,

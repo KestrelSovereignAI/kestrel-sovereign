@@ -509,6 +509,22 @@ and tenant before recording an answer or emitting a question-answered wake.
 The native intake/outbound integration must enforce that ledger check; parsing
 or displaying this payload alone does not satisfy the correlation gate.
 
+### Skill hint v1
+
+The optional `#skill-hint-v1` extension carries exactly
+`{"version": 1, "skill_id": "published-skill-id"}` under its URI metadata key.
+The selected signed card must advertise that skill. The hint describes intent
+for the receiving agent; it neither invokes a provider directly nor grants tool
+permissions. Input MIME admission still uses the agent's declared input modes.
+
+`send_a2a_task` carries input handoffs in standard `Message.parts`, including
+text, filenames and arbitrary JSON `data` values. Artifacts are outputs of a
+task. The inbox exposes the complete original native Message, preserving those
+parts. Kestrel currently advertises `text/plain` and `application/json`; it
+rejects unsupported or malformed declared MIME types before creating a task.
+Omitted MIME types use the content-kind default; malformed values never use a
+default. File URLs are content references, not permission to fetch them.
+
 ### Causation v1
 
 The metadata key is this document's `#causation-v1` URI. Its payload has exactly
@@ -648,6 +664,22 @@ authorized reads of the original context/message. An absent result is not
 permission to replay a send. Taskless native Message responses retain their
 actual type rather than acquiring an invented task ID. Questions use the
 sender-owned correlation ID and the same durable recipient/tenant binding.
+
+Native message, tracked-task and blocking `ask_agent` tools share the SDK
+producer. Result lookup accepts the immutable local `dispatch_id`, reads the
+sender's canonical primary ledger and resolves its stable peer under current
+authorization. It never routes by a caller-supplied remote task ID. Reads record
+the observed native Task by compare-and-swap and cannot regress a terminal
+outcome. The outbound audit exposes the selected tenant, delivery state, remote
+task ID and cancellation intent without storing message bodies.
+
+Failure before the original native HTTP dispatcher is admitted records
+`not-sent`; possible delivery records `unknown`. Neither permits an implicit
+SDK replay. Cancellation records a separate intent on the same dispatch before
+entering the SDK. A lost cancellation acknowledgement preserves the known
+remote identity and requires read reconciliation. An active read cannot prove
+that cancellation did not happen; a terminal read settles the retained outcome.
+Only a cancellation proven never dispatched permits a new explicit attempt.
 
 Ship inbound and outbound together. Delete `POST /api/agent/tasks/send`, old
 task read/cancel/subscribe routes, all draft wire models and all callers.

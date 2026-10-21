@@ -939,6 +939,7 @@ async def local_native_peer(publication, request):
 
         def open_a2a_session(self, selected, selected_peer):
             import httpx
+
             from kestrel_sovereign.a2a.native_publication import (
                 open_hosted_native_peer_session,
             )
@@ -982,7 +983,7 @@ async def local_native_peer(publication, request):
 async def test_same_host_session_uses_real_sdk_binding_and_creator_ledger(
     local_native_peer,
 ):
-    from a2a.types import SendMessageRequest, Message, Part, Role
+    from a2a.types import Message, Part, Role, SendMessageRequest
 
     p = local_native_peer
     async with p.directory.open_a2a_session(p.requester, p.peer) as session:
@@ -1009,7 +1010,9 @@ async def test_same_host_session_uses_real_sdk_binding_and_creator_ledger(
         assert (
             await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
         ) == receipt.dispatch
-        assert await session.get_task(receipt.dispatch) == receipt.response
+        observed = await session.get_task(receipt.dispatch)
+        assert observed.response == receipt.response
+        assert observed.dispatch.revision > receipt.dispatch.revision
 
 
 async def test_native_peer_message_tool_reaches_official_host_binding(
@@ -1036,7 +1039,8 @@ async def test_native_peer_message_tool_reaches_official_host_binding(
 async def test_same_host_session_rechecks_sender_directory_before_submission(
     local_native_peer,
 ):
-    from a2a.types import SendMessageRequest, Message, Part, Role
+    from a2a.types import Message, Part, Role, SendMessageRequest
+
     from kestrel_sovereign.features.peers.directory import PeerAccessDeniedError
 
     p = local_native_peer
@@ -1073,6 +1077,7 @@ async def test_same_host_session_rechecks_sender_directory_before_submission(
 async def test_native_message_tool_reports_lost_ack_as_unknown(local_native_peer):
     import httpx
     from a2a.types import ListTasksRequest
+
     from kestrel_sovereign.features.peers.feature import PeersFeature
 
     p = local_native_peer
@@ -1109,13 +1114,14 @@ async def test_actual_server_refresh_wires_native_message_tool_and_local_directo
     local_native_peer,
 ):
     import httpx
+
     from kestrel_sovereign import server
+    from kestrel_sovereign.a2a.did_registry import HostA2ADidResolver
+    from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
     from kestrel_sovereign.endpoints import models
     from kestrel_sovereign.features.peers.feature import PeersFeature
     from kestrel_sovereign.identity.runtime_identity import AgentIdentity
     from kestrel_sovereign.kestrel_agent import KestrelAgent
-    from kestrel_sovereign.a2a.did_registry import HostA2ADidResolver
-    from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
 
     p = local_native_peer
     assert isinstance(p.sender.identity, AgentIdentity)
@@ -1165,6 +1171,7 @@ async def test_native_tool_does_not_report_acknowledged_race_as_not_sent(
     local_native_peer,
 ):
     from a2a.types import ListTasksRequest
+
     from kestrel_sovereign.features.peers.feature import PeersFeature
 
     p = local_native_peer
@@ -1221,10 +1228,11 @@ async def test_native_tool_does_not_report_acknowledged_race_as_not_sent(
 async def test_same_host_session_cannot_spend_a_replaced_generation(
     local_native_peer, fault
 ):
-    from a2a.types import SendMessageRequest, Message, Part, Role
+    from a2a.types import Message, Part, Role, SendMessageRequest
+
+    from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
     from kestrel_sovereign.features.peers.directory import PeerAccessDeniedError
     from kestrel_sovereign.identity.runtime_identity import AgentIdentity
-    from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
 
     p = local_native_peer
     async with p.directory.open_a2a_session(p.requester, p.peer) as session:
@@ -1272,3 +1280,276 @@ async def test_same_host_session_cannot_spend_a_replaced_generation(
         assert (
             await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
         ).state.value == "reserved"
+
+
+async def test_native_message_tool_audit_lists_immutable_dispatch_and_remote_id(
+    local_native_peer,
+):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    sent = await feature.send_a2a_message("Peer", "Native audit visibility")
+    listed = await feature.list_outbound_a2a_tasks(recipient="Peer")
+    assert listed.data["count"] == 1
+    row = listed.data["rows"][0]
+    assert row["dispatch_id"] == sent.data["dispatch_id"]
+    assert row["remote_task_id"] == sent.data["remote_task_id"]
+    assert row["sender_tenant"] == "sender-tenant" and row["tenant"] == p.scope.tenant
+    assert row["state"] == "acknowledged" and row["verb"] == "message"
+    assert "Native audit visibility" not in str(row)
+
+
+async def test_native_message_audit_refuses_another_local_tenant_store(
+    local_native_peer,
+):
+    from kestrel_sovereign.a2a.stores.unified.outbound_store import OutboundStore
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    p.sender_manager.outbound_store = OutboundStore(
+        p.backend, sender_scope=NativeRecipientScope(PRINCIPAL, "other-tenant")
+    )
+    feature = PeersFeature(p.sender)
+    result = await feature.list_outbound_a2a_tasks()
+    assert result.data == {"rows": [], "count": 0}
+    assert "different local actor, tenant or primary backend" in result.error
+
+
+async def test_host_session_refuses_wrong_sender_tenant_before_any_sdk_request(
+    local_native_peer,
+):
+    from kestrel_sovereign.a2a.stores.unified.outbound_store import OutboundStore
+    from kestrel_sovereign.features.peers.directory import PeerAccessDeniedError
+
+    p = local_native_peer
+    p.sender_manager.outbound_store = OutboundStore(
+        p.backend, sender_scope=NativeRecipientScope(PRINCIPAL, "other-tenant")
+    )
+    with pytest.raises(
+        PeerAccessDeniedError, match="different local actor, tenant or primary backend"
+    ):
+        async with p.directory.open_a2a_session(p.requester, p.peer):
+            pytest.fail("A foreign sender ledger cannot open a native session")
+
+
+async def test_tracked_task_tool_uses_native_input_parts_and_advisory_hint(
+    local_native_peer,
+):
+    from google.protobuf.json_format import MessageToDict
+
+    from kestrel_sovereign.a2a.extensions import SKILL_HINT_URI
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    result = await feature.send_a2a_task(
+        "Peer",
+        "Read the plan and memory reference",
+        skill_id="ask",
+        parts=[
+            {"text": "Full plan", "filename": "plan.txt"},
+            {"data": {"ref_type": "memory", "id": "memory-42", "flags": [False, None]}},
+        ],
+    )
+    assert result.data["sent"] is True and result.data["state"] == "submitted"
+    assert result.data["dispatch_id"] != result.data["remote_task_id"]
+    task = await p.manager.get_task_for_creator(
+        result.data["remote_task_id"], PRINCIPAL, recipient_agent_id=p.recipient.did
+    )
+    assert not task.artifacts, "Input handoffs are Message Parts; Artifacts are outputs"
+    assert [part.WhichOneof("content") for part in task.history[0].parts] == [
+        "text",
+        "text",
+        "data",
+    ]
+    assert MessageToDict(task.metadata)[SKILL_HINT_URI] == {
+        "version": 1,
+        "skill_id": "ask",
+    }
+    inbox = TaskFeature(p.recipient)
+    inbox.set_task_manager(p.recipient.task_manager)
+    inspected = await inbox._get_task_status_data(task.id)
+    assert inspected["ok"] and inspected["skill_hint"] == "ask"
+    assert inspected["request"]["parts"][1] == {
+        "text": "Full plan",
+        "filename": "plan.txt",
+    }
+    assert inspected["request"]["parts"][2]["data"] == {
+        "ref_type": "memory",
+        "id": "memory-42",
+        "flags": [False, None],
+    }
+    assert "metadata" not in inspected, (
+        "Internal execution metadata is not inbox presentation"
+    )
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        "legacy-json-string",
+        [{"type": "text", "text": "draft"}],
+        [False],
+        [{"data": {}, "text": "two contents"}],
+    ],
+)
+async def test_tracked_task_tool_refuses_draft_or_malformed_parts_before_reservation(
+    local_native_peer, parts
+):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    result = await feature.send_a2a_task(
+        "Peer", "Bad parts must not dispatch", parts=parts
+    )
+    assert result.status.value == "error"
+    assert not await p.sender_manager.outbound_store.list_recent()
+
+
+async def test_tracked_task_unknown_advisory_skill_cannot_select_execution(
+    local_native_peer,
+):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    result = await feature.send_a2a_task(
+        "Peer", "Unknown published skill", skill_id="operator.shell"
+    )
+    assert result.data["sent"] is False
+    assert result.data["delivery_state"] == "not_submitted"
+    assert not await p.sender_manager.outbound_store.list_recent()
+
+
+async def test_native_result_and_public_cancel_use_local_dispatch_handle(
+    local_native_peer,
+):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    p.sender.features = {"peers": feature}
+    task_feature = TaskFeature(p.sender)
+    task_feature.set_task_manager(p.sender_manager)
+    sent = await feature.send_a2a_task("Peer", "Tracked native assignment")
+    dispatch_id = sent.data["dispatch_id"]
+    remote_id = sent.data["remote_task_id"]
+    read = await feature.get_peer_task_result(dispatch_id)
+    assert read.data["task"]["id"] == remote_id
+    assert read.data["task"]["status"]["state"] == "TASK_STATE_SUBMITTED"
+    # A recipient's remote ID never grants the sender a route to cancel it.
+    refused = await task_feature.cancel_task(remote_id)
+    assert refused.status.value == "error"
+    canceled = await task_feature.cancel_task(
+        dispatch_id, reason="Assignment withdrawn"
+    )
+    assert canceled.data["cancellation_confirmed"] is True
+    assert canceled.data["remote_task_id"] == remote_id
+    read = await feature.get_peer_task_result(dispatch_id)
+    assert read.data["state"] == "canceled"
+    assert read.data["task"]["status"]["state"] == "TASK_STATE_CANCELED"
+    row = await p.sender_manager.outbound_store.get(dispatch_id)
+    assert row.remote_task_id == remote_id and row.cancel_state.value == "complete"
+    # Repeated cancellation is a read of the retained terminal task, never a replay.
+    confirmed = await task_feature.cancel_task(dispatch_id)
+    assert confirmed.data["cancellation_confirmed"] is True
+
+
+async def test_native_retained_tool_cannot_retarget_a_revoked_peer(local_native_peer):
+    from a2a.types import TaskState
+
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    sent = await feature.send_a2a_task("Peer", "Retained authorization")
+    row = await p.sender_manager.outbound_store.get(sent.data["dispatch_id"])
+    p.route_state.allowed = False
+    read = await feature.get_peer_task_result(row.dispatch_id)
+    cancel = await feature.cancel_outbound_task(row.dispatch_id)
+    assert read.status.value == cancel.status.value == "error"
+    assert await p.sender_manager.outbound_store.get(row.dispatch_id) == row
+    task = await p.manager.get_task_for_creator(
+        row.remote_task_id, PRINCIPAL, recipient_agent_id=p.recipient.did
+    )
+    assert task.status.state == TaskState.TASK_STATE_SUBMITTED
+
+
+async def test_synchronous_ask_uses_native_blocking_send_and_recipient_response(
+    local_native_peer,
+    monkeypatch,
+):
+    from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+
+    p = local_native_peer
+    native_flags = []
+    native_send = NativeA2ARequestHandler.on_message_send
+
+    async def observe_native_send(handler, params, context):
+        native_flags.append(params.configuration.return_immediately)
+        return await native_send(handler, params, context)
+
+    monkeypatch.setattr(NativeA2ARequestHandler, "on_message_send", observe_native_send)
+    submitted = asyncio.Event()
+    received = []
+    original = p.manager._on_task_submitted
+
+    def announce(snapshot):
+        if original is not None:
+            original(snapshot)
+        received.append(snapshot)
+        submitted.set()
+
+    p.manager._on_task_submitted = announce
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    inbox = TaskFeature(p.recipient)
+    inbox.set_task_manager(p.manager)
+    asking = asyncio.create_task(
+        feature.ask_agent("Peer", "Synchronous native question")
+    )
+    try:
+        await asyncio.wait_for(submitted.wait(), 5)
+        assert native_flags == [False], "The SDK must send a blocking native request"
+        assert not asking.done(), (
+            "Native blocking send waits for a terminal/interrupted task"
+        )
+        task = received[0].task
+        answered = await inbox.respond_to_a2a_task(task.id, "Native peer answer")
+        assert answered.data["state"] == "completed"
+        result = await asyncio.wait_for(asking, 5)
+        assert result.data["response"] == "Native peer answer"
+        assert result.data["state"] == "completed"
+        assert result.data["native_response"]["id"] == task.id
+        retained = await p.sender_manager.outbound_store.get(result.data["dispatch_id"])
+        assert retained.remote_task_id == task.id and retained.state.value == "complete"
+    finally:
+        if not asking.done():
+            asking.cancel()
+        await asyncio.gather(asking, return_exceptions=True)

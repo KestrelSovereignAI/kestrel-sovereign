@@ -49,6 +49,7 @@ from kestrel_sovereign.a2a.extensions import (
     causation_metadata,
     deserialize_causation_chain,
     parse_question_correlation,
+    parse_skill_hint,
 )
 from kestrel_sovereign.a2a.lifecycle import (
     STREAM_STOP_STATES,
@@ -102,6 +103,10 @@ logger = logging.getLogger(__name__)
 
 class TaskCancellationAuthorizationError(PermissionError):
     """The caller has no durable creator/recipient authority for a task."""
+
+
+class OutboundActorScopeError(PermissionError):
+    """The requested sender does not own this manager's primary outbound ledger."""
 
 
 # Only a recipient may advance a live task; cancellation has its own atomic
@@ -253,6 +258,22 @@ class TaskManager:
         # after a child retires. Joining workers cannot reconcile a failed or
         # uncertain durable write, and must not erase its original error.
         self._execution_control: BaseException | None = None
+
+    def outbound_for_actor(self, actor_id: str) -> OutboundStore:
+        """Return the one outbound ledger bound to this actor and primary store."""
+        if (
+            not isinstance(actor_id, str) or not actor_id.strip()
+            or not isinstance(self.task_store, TaskStore)
+            or not isinstance(self.outbound_store, OutboundStore)
+            or self.host_agent_id != actor_id
+            or self.task_store.scope.recipient_id != actor_id
+            or self.outbound_store.sender_scope != self.task_store.scope
+            or self.outbound_store.backend is not self.task_store.backend
+        ):
+            raise OutboundActorScopeError(
+                "Outbound ledger has a different local actor, tenant or primary backend"
+            )
+        return self.outbound_store
 
     async def initialize(self) -> None:
         """Initialize all stores."""
@@ -1125,6 +1146,7 @@ class TaskManager:
         metadata = MessageToDict(params.metadata)
         deserialize_causation_chain(metadata)
         parse_question_correlation(metadata)
+        parse_skill_hint(metadata)
         if not isinstance(creator_agent_id, str) or not creator_agent_id.strip():
             raise ValueError("Task admission requires a verified creator identity")
         if params.tenant != self.task_store.scope.tenant:

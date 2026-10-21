@@ -91,11 +91,18 @@ async def peer_session(native_request_admission, recipient_identity, request):
         revoke_on_response=False,
         response_error=None,
         taskless=False,
+        received_messages=0,
+        received_cancellations=0,
         revoke_on_request=False,
     )
 
     class PeerHandler(NativeA2ARequestHandler):
+        async def on_cancel_task(self, params, context):
+            state.received_cancellations += 1
+            return await super().on_cancel_task(params, context)
+
         async def on_message_send(self, params, context):
+            state.received_messages += 1
             if not state.taskless:
                 return await super().on_message_send(params, context)
             async with self.guard.admit(params, "SendMessage", context):
@@ -236,10 +243,15 @@ async def test_official_client_records_exact_wire_and_keeps_distinct_ids(peer_se
     body["tenant"] = p.admission.scope.tenant
     actual = ParseDict(body, SendMessageRequest())
     assert native_request_digest(actual, "SendMessage") == dispatch.request_digest
-    assert await p.session.get_task(receipt.dispatch) == receipt.response
-    cancelled = await p.session.cancel_task(receipt.dispatch)
-    assert cancelled.id == receipt.response.id
-    assert cancelled.status.state == TaskState.TASK_STATE_CANCELED
+    observed = await p.session.get_task(receipt.dispatch)
+    assert observed.response == receipt.response
+    assert await p.store.get(dispatch.dispatch_id) == observed.dispatch
+    cancelled = await p.session.cancel_task(observed.dispatch)
+    assert cancelled.response.id == receipt.response.id
+    assert cancelled.response.status.state == TaskState.TASK_STATE_CANCELED
+    assert cancelled.dispatch.state is DispatchState.COMPLETE
+    assert cancelled.dispatch.cancel_state is DispatchState.COMPLETE
+    assert await p.store.get(dispatch.dispatch_id) == cancelled.dispatch
     assert len(p.trace) == 3
     await p.session.close()
     assert not p.http.is_closed, "SDK must borrow the host-owned HTTP client"
@@ -480,10 +492,176 @@ async def test_request_observer_cannot_spend_revoked_peer_authority(peer_session
     p.state.revoke_on_request = True
     with pytest.raises(PermissionError, match="revoked"):
         await p.session.send(dispatch, wire)
-    assert (await p.store.get(dispatch.dispatch_id)).state is DispatchState.UNKNOWN
+    assert (await p.store.get(dispatch.dispatch_id)).state is DispatchState.NOT_SENT
     listed = await p.admission.manager.task_store.list_for_creator(
         ListTasksRequest(tenant=p.admission.scope.tenant),
         creator_agent_id=PRINCIPAL,
         recipient_agent_id=p.admission.scope.recipient_id,
     )
     assert not listed.tasks, "Revocation must precede physical recipient admission"
+
+
+async def test_local_signing_refusal_is_recorded_as_not_sent(peer_session):
+    from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
+
+    p = peer_session
+    broken = NativePeerSession(
+        **(p.arguments | {"signer": replace(p.arguments["signer"], nonce=lambda: "")})
+    )
+    try:
+        dispatch, wire = await broken.reserve(
+            request_for(p), dispatch_tool="send_a2a_task", verb="task"
+        )
+        with pytest.raises(NativeSenderProofError):
+            await broken.send(dispatch, wire)
+        current = await p.store.get(dispatch.dispatch_id)
+        assert current.state is DispatchState.NOT_SENT
+        assert not p.trace
+        with pytest.raises(OutboundDispatchConflict):
+            await p.session.send(current, wire)
+        assert not p.trace
+    finally:
+        await broken.close()
+
+
+async def test_sdk_retry_cannot_replay_a_send_after_an_uncertain_ack(
+    peer_session, monkeypatch
+):
+    p = peer_session
+    dispatch, wire = await reserve(p)
+    transport = p.session._client._transport
+    original = transport.send_message
+
+    async def sdk_retry(request, *, context=None):
+        try:
+            return await original(request, context=context)
+        except A2AClientError:
+            return await original(request, context=context)
+
+    monkeypatch.setattr(transport, "send_message", sdk_retry)
+    p.state.drop_ack = True
+    with pytest.raises(OutboundDispatchConflict, match="cannot replay"):
+        await p.session.send(dispatch, wire)
+    assert p.state.received_messages == 1
+    assert (await p.store.get(dispatch.dispatch_id)).state is DispatchState.UNKNOWN
+
+
+async def test_lost_cancellation_ack_preserves_remote_identity_until_read_reconciliation(
+    peer_session,
+):
+    p = peer_session
+    dispatch, wire = await reserve(p)
+    accepted = await p.session.send(dispatch, wire)
+    p.state.drop_ack = True
+    with pytest.raises(A2AClientError, match="Acknowledgement lost"):
+        await p.session.cancel_task(accepted.dispatch)
+    unknown = await p.store.get(dispatch.dispatch_id)
+    assert unknown.state is DispatchState.ACKNOWLEDGED
+    assert unknown.cancel_state is DispatchState.UNKNOWN
+    assert unknown.remote_task_id == accepted.response.id
+    assert unknown.cancel_request_digest and unknown.cancel_operation_id
+    count = len(p.trace)
+    with pytest.raises(OutboundDispatchConflict, match="already in flight"):
+        await p.session.cancel_task(unknown)
+    assert len(p.trace) == count
+    observed = await p.session.get_task(unknown)
+    assert observed.dispatch.state is DispatchState.COMPLETE
+    assert observed.dispatch.cancel_state is DispatchState.COMPLETE
+    assert observed.dispatch.remote_task_state == "canceled"
+    again = await p.session.get_task(observed.dispatch)
+    assert again.dispatch.remote_task_state == "canceled"
+    assert len(p.trace) == count + 2
+
+
+async def test_cancellation_revoked_at_native_boundary_is_proven_not_sent(peer_session):
+    p = peer_session
+    dispatch, wire = await reserve(p)
+    accepted = await p.session.send(dispatch, wire)
+    p.state.revoke_on_request = True
+    with pytest.raises(PermissionError, match="revoked"):
+        await p.session.cancel_task(accepted.dispatch)
+    retained = await p.store.get(dispatch.dispatch_id)
+    assert retained.remote_task_id == accepted.response.id
+    assert retained.state is DispatchState.ACKNOWLEDGED
+    assert retained.cancel_state is DispatchState.NOT_SENT
+    assert len(p.trace) == 2
+    # A new explicitly authorized attempt is safe only because the previous
+    # native dispatcher was never admitted. No implicit SDK retry is allowed.
+    p.state.authorized = True
+    p.state.revoke_on_request = False
+    canceled = await p.session.cancel_task(retained)
+    assert canceled.dispatch.remote_task_state == "canceled"
+
+
+async def test_stale_read_cannot_overwrite_newer_dispatch_evidence(peer_session):
+    p = peer_session
+    dispatch, wire = await reserve(p)
+    accepted = await p.session.send(dispatch, wire)
+    await p.session.get_task(accepted.dispatch)
+    count = len(p.trace)
+    with pytest.raises(OutboundDispatchConflict, match="current committed"):
+        await p.session.get_task(accepted.dispatch)
+    assert len(p.trace) == count
+
+
+async def test_sdk_cancellation_retry_is_blocked_at_actual_native_dispatch(
+    peer_session, monkeypatch
+):
+    p = peer_session
+    dispatch, wire = await reserve(p)
+    accepted = await p.session.send(dispatch, wire)
+    transport = p.session._client._transport
+    original = transport.cancel_task
+
+    async def sdk_retry(request, *, context=None):
+        try:
+            return await original(request, context=context)
+        except A2AClientError:
+            return await original(request, context=context)
+
+    monkeypatch.setattr(transport, "cancel_task", sdk_retry)
+    p.state.drop_ack = True
+    with pytest.raises(OutboundDispatchConflict, match="cannot replay"):
+        await p.session.cancel_task(accepted.dispatch)
+    assert p.state.received_cancellations == 1
+    retained = await p.store.get(dispatch.dispatch_id)
+    assert retained.cancel_state is DispatchState.UNKNOWN
+    assert retained.remote_task_id == accepted.response.id
+
+
+@pytest.mark.parametrize("mime", ["image/png", "bad"])
+async def test_client_mime_preflight_refuses_before_reservation_or_http(
+    peer_session, mime
+):
+    from a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+
+    p = peer_session
+    request = request_for(p)
+    request.message.parts.append(Part(raw=b"unsupported", media_type=mime))
+    with pytest.raises(
+        ContentTypeNotSupportedError if mime == "image/png" else InvalidParamsError
+    ):
+        await p.session.reserve(request, dispatch_tool="send_a2a_task", verb="task")
+    assert not p.trace and not await p.store.list_recent()
+
+
+@pytest.mark.parametrize("kind", ["withdrawal", "cancellation"])
+async def test_cancellation_retains_original_execution_control_and_remote_evidence(
+    peer_session, kind
+):
+    p = peer_session
+    dispatch, wire = await reserve(p)
+    accepted = await p.session.send(dispatch, wire)
+    error = (
+        ExecutionAuthorityError("original cancellation withdrawal")
+        if kind == "withdrawal"
+        else asyncio.CancelledError("original cancellation control")
+    )
+    p.state.response_error = error
+    with pytest.raises(type(error)) as caught:
+        await p.session.cancel_task(accepted.dispatch)
+    assert caught.value is error
+    retained = await p.store.get(dispatch.dispatch_id)
+    assert retained.cancel_state is DispatchState.UNKNOWN
+    assert retained.remote_task_id == accepted.response.id
+    assert retained.state is DispatchState.ACKNOWLEDGED
