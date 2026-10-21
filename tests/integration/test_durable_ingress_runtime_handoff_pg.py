@@ -56,6 +56,7 @@ async def test_real_pg_host_ack_targets_one_run_and_receipt_binds_session(native
     registry.register(build_channel_message_registration())
     dispatcher = SignalDispatcher(agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=logs)
     agent.dispatcher = dispatcher
+    agent.signal_registry = registry
     channel = ChannelFeature(agent)
     source_id = "telegram:v2:bot:42:update:19"
     message = ChannelMessage(
