@@ -276,12 +276,13 @@ async def test_confirmed_prior_message_is_not_reactivated_or_resent(tmp_path, mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", [{"chat_id": "different"}, {"agent_id": "did:other"}, {"bot_id": "000123"}])
-async def test_binding_must_match_exact_agent_bot_and_destination(tmp_path, monkeypatch, changed):
+@pytest.mark.parametrize("changed", [{"chat_id": "different"}, {"agent_id": "did:other"}, {"bot_id": "000123"}, {"bot_id": "124"}])
+@pytest.mark.parametrize("prior", [None, "prior-confirmed"])
+async def test_binding_must_match_exact_agent_bot_and_destination(tmp_path, monkeypatch, changed, prior):
     def factory(binding, events):
         @asynccontextmanager
         async def authority(proxy, arguments):
-            yield HostedTelegramOutbound(replace(binding, **changed))
+            yield HostedTelegramOutbound(replace(binding, **changed), prior_message_id=prior)
         return authority
 
     async with sdk_host(tmp_path, monkeypatch, factory) as (proxy, services, _, events):

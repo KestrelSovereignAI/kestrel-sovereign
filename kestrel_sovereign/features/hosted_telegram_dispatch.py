@@ -197,6 +197,7 @@ def _binding_payload(proxy, selected, destination):
             raise ValueError("invalid hosted Telegram binding identity")
     if (binding.agent_id != proxy.agent.did
         or canonical_telegram_bot_id(binding.bot_id) != binding.bot_id
+        or proxy._telegram_route_identity(binding.bot_id) != proxy._hosted_telegram_route_identity
         or binding.chat_id != destination):
         raise ValueError("hosted Telegram binding differs from dispatch")
     return {

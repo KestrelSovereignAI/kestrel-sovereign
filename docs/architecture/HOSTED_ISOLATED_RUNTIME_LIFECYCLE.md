@@ -34,6 +34,8 @@ factory exit. Direct tools and the channel bridge share this boundary. The
 host must validate its current runtime owner, active route, generation and
 absence of transitions under the original physical database authority session.
 No cached binding or process readiness marker substitutes for that authority.
+The selected bot must also match Core's exact claimed route identity; another
+well-formed bot ID is not interchangeable, including for a prior message ID.
 
 All host operations must use the same lock order: Core traffic gate, then
 route authority. A scheduled delivery must reserve and confirm within this
