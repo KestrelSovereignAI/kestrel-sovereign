@@ -50,7 +50,10 @@ from kestrel_sovereign.a2a.native_input import (
 from kestrel_sovereign.a2a.outcomes import TaskOutcomeConflictError, merge_task_outcome
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.base import json_dumps, json_loads
-from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
+from kestrel_sovereign.a2a.stores.unified.base import (
+    NativeStoreConflict,
+    UnifiedStoreBase,
+)
 from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextOwnership,
     ContextOwnershipError,
@@ -87,7 +90,7 @@ _SNAPSHOT_COLUMNS = (
 )
 
 
-class TaskInputConflictError(ValueError):
+class TaskInputConflictError(NativeStoreConflict):
     """An input would alter an existing request or cross a context boundary."""
 
 
@@ -979,8 +982,14 @@ class TaskStore(UnifiedStoreBase):
         return self._row_to_task(row)
 
     @staticmethod
-    def _input_payload(request: SendMessageRequest) -> NativeTaskInput:
-        prepared = prepare_native_task_input(request)
+    def _input_payload(
+        request: SendMessageRequest | NativeTaskInput,
+    ) -> NativeTaskInput:
+        prepared = (
+            request
+            if isinstance(request, NativeTaskInput)
+            else prepare_native_task_input(request)
+        )
         if prepared.request.message.role != Role.ROLE_USER:
             raise TaskInputConflictError("Native task input requires a user message")
         return prepared
@@ -1000,11 +1009,16 @@ class TaskStore(UnifiedStoreBase):
         )
 
     async def record_initial_input(
-        self, task: Task, request: SendMessageRequest, *, creator_agent_id: str
+        self,
+        task: Task,
+        request: SendMessageRequest | NativeTaskInput,
+        *,
+        creator_agent_id: str,
     ) -> None:
         """Record request0 in the manager's context/task admission transaction."""
         prepared = self._input_payload(request)
         encoded, digest = prepared.request_json, prepared.execution_digest
+        request = prepared.request
         if (
             request.tenant != self.scope.tenant
             or request.message.task_id
@@ -1037,7 +1051,7 @@ class TaskStore(UnifiedStoreBase):
             raise conflict
 
     async def append_creator_input(
-        self, request: SendMessageRequest, *, creator_agent_id: str
+        self, request: SendMessageRequest | NativeTaskInput, *, creator_agent_id: str
     ) -> tuple[NativeTaskSnapshot | None, bool]:
         """Append an input under creator/context authority and the task row lock."""
         from kestrel_sovereign.a2a.extensions import (

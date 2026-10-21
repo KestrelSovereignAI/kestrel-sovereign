@@ -1,7 +1,5 @@
 """Native task authority, real AEAD storage and retryable push retirement."""
 
-import base64
-import os
 from dataclasses import replace
 
 import pytest
@@ -17,14 +15,12 @@ from kestrel_sovereign.a2a.stores.unified.push_config_store import (
     PushTaskNotFound,
 )
 from tests.utils.native_a2a import manager_for
+from tests.utils.native_push import configure_push_test_key
 
 
 @pytest_asyncio.fixture
 async def push_store(native_a2a_backend_factory, monkeypatch):
-    monkeypatch.setenv(
-        "KESTREL_DATA_KEY", base64.urlsafe_b64encode(os.urandom(32)).decode()
-    )
-    monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
+    configure_push_test_key(monkeypatch)
     backend = native_a2a_backend_factory()
     await backend.connect()
     manager = manager_for(backend, NativeRecipientScope("did:recipient", "tenant"))

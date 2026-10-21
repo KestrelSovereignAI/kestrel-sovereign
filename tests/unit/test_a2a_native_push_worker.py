@@ -5,8 +5,15 @@ from datetime import timedelta
 
 import pytest
 
-from kestrel_sovereign.a2a.push_transport import NativePushTransport
-from kestrel_sovereign.a2a.push_worker import NativePushWorker, PushRetirementPending
+from kestrel_sovereign.a2a.push_transport import (
+    NativePushTransport,
+    PushDeliveryRevoked,
+)
+from kestrel_sovereign.a2a.push_worker import (
+    NativePushWorker,
+    PushDeliveryLeaseLost,
+    PushRetirementPending,
+)
 from kestrel_sovereign.signals.durable import ACKNOWLEDGED, FAILED, LEASED, RETRY
 from kestrel_sovereign.storage.db.interface import QueryError
 from tests.unit.test_a2a_native_push_outbox import callback
@@ -16,6 +23,7 @@ from tests.unit.test_a2a_native_push_outbox import (
 from tests.unit.test_a2a_native_push_outbox import (
     push_store as push_store,  # noqa: PLC0414 - pytest fixture dependency
 )
+from tests.utils.native_push import intercept_push_commit_ack
 from tests.utils.outbound_tls import (
     outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - pytest fixture re-export
 )
@@ -175,9 +183,33 @@ async def test_delete_physically_joins_original_response_close_before_ack(
     entered, release = outbound_close_barrier.entered, outbound_close_barrier.release
     revoked = asyncio.Event()
     original_revoke = value.revoke
+    monitor_observed = asyncio.Event()
+    original_read = value.configurations.get
+    original_renew = runner._renew
+
+    async def observe_renewal(delivery):
+        try:
+            return await original_renew(delivery)
+        except PushDeliveryLeaseLost:
+            # Revocation may win between the monitor's config read and its
+            # lease renewal. That is the same real retirement boundary.
+            monitor_observed.set()
+            raise
+
+    monkeypatch.setattr(runner, "_renew", observe_renewal)
+
+    async def observe_revocation(*args, **kwargs):
+        result = await original_read(*args, **kwargs)
+        if result is None:
+            monitor_observed.set()
+        return result
+
+    monkeypatch.setattr(value.configurations, "get", observe_revocation)
 
     async def revoke(*args, **kwargs):
         result = await original_revoke(*args, **kwargs)
+        # The real monitor wins before Delete can issue its own cancellation.
+        await monitor_observed.wait()
         revoked.set()
         return result
 
@@ -316,6 +348,79 @@ async def test_lease_transition_commits_before_reporting_original_cancellation(
     finally:
         release.set()
         await asyncio.gather(renewing, return_exceptions=True)
+
+
+@pytest.mark.parametrize("operation", ["forward", "claim"])
+async def test_metadata_commit_remains_owned_through_original_caller_withdrawal(
+    outbox, monkeypatch, operation
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    from tests.unit.test_a2a_native_push_outbox import callback
+
+    value, task = outbox
+    runner = worker(value)
+    entered, release = asyncio.Event(), asyncio.Event()
+    if operation == "claim":
+        await value.register(callback(task), creator_id="did:creator")
+        await value.forward_pending(limit=10)
+        owner, method = value.signals, "claim_delivery"
+    else:
+        owner, method = value, "forward_pending"
+
+    async def held_ack():
+        entered.set()
+        await release.wait()
+
+    intercept_push_commit_ack(value, monkeypatch, held_ack, owner=owner, method=method)
+    processing = asyncio.create_task(runner.run_once())
+    try:
+        await entered.wait()
+        processing.cancel("original metadata caller withdrawal")
+        await asyncio.sleep(0)
+        assert not processing.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await processing
+        assert caught.value.args == ("original metadata caller withdrawal",)
+        assert not is_execution_control_error(caught.value)
+        if operation == "claim":
+            assert await value.backend.fetch_one(
+                "SELECT COUNT(*) FROM durable_signal_deliveries WHERE status = ?",
+                (LEASED,),
+            ) == (1,)
+        else:
+            assert await value.backend.fetch_one(
+                "SELECT COUNT(*) FROM durable_signal_events"
+            ) == (1,)
+            assert await value.changes.pending(limit=10) == []
+        assert (
+            await value.backend.fetch_all("SELECT * FROM a2a_push_delivery_attempts")
+            == []
+        )
+    finally:
+        release.set()
+        await asyncio.gather(processing, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "error_type", [asyncio.CancelledError, PushDeliveryRevoked, PushDeliveryLeaseLost]
+)
+def test_planned_revocation_cannot_erase_original_commit_control(error_type):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    original = ExecutionCommitOutcomeError("unknown")
+    error = error_type("original delivery control")
+    error.__cause__ = original
+    assert NativePushWorker._delivery_error(error, planned_stop=True) is error
+
+
+@pytest.mark.parametrize(
+    "error_type", [asyncio.CancelledError, PushDeliveryRevoked, PushDeliveryLeaseLost]
+)
+def test_plain_delivery_withdrawal_is_local_only_to_its_planned_stop(error_type):
+    error = error_type("original delivery withdrawal")
+    assert NativePushWorker._delivery_error(error, planned_stop=False) is error
+    assert NativePushWorker._delivery_error(error, planned_stop=True) is None
 
 
 async def test_runner_readiness_follows_its_managed_lifetime(outbox, monkeypatch):

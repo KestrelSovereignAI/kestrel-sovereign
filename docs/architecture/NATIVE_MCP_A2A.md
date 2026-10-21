@@ -915,6 +915,25 @@ returns a frozen, secret-bearing `PreparedPushConfig`. Its one
 server-admitted task ID without DNS inside the transaction. Ordinary config
 creation delegates through the same preparation and registration path.
 
+`TaskManager` binds one ready managed service to its exact canonical task store.
+Inline callback validation finishes before either admission transaction. New
+context ownership, task/input persistence and encrypted registration commit
+before the cognition wake. A continuation registers only when its new input is
+actually appended; an exact message replay cannot recreate a deleted callback.
+A failed registration rolls back the input revision and task change together.
+Both paths retain the original complete wire digest while cognition receives
+only the immutable callback-free projection. Domain refusals remain typed
+native conflicts through the enclosing transaction.
+
+Shutdown joins the managed service before closing any primary store. A stopped
+resident produces explicit service unavailability with its original cause,
+rather than injecting another task's cancellation into the request. Journal
+forwarding, claims and lease/ACK/retry transitions use the same owned database
+handoff. Ordinary withdrawal cannot interrupt their original COMMIT ACK;
+genuine lost acknowledgements retain their native control evidence. Deletion
+recognizes its own config/lease revocation from the monitor while retaining
+actual custody and storage failures.
+
 The optional push schema bundle is revision 1. Configuration, delivery-attempt
 and subscription DDL commit with its completion marker under the native schema
 lease. A completed boot skips data-table DDL. The shared encryption key must be
@@ -927,8 +946,8 @@ accepted publication failure joins that exact resident. Shutdown joins the
 original worker through observer cancellation and physical HTTP close.
 
 These components are implemented. The handler continues to advertise push as
-unsupported until TaskManager, managed host startup, standard config operations
-and atomic inline admission are connected. No network request may hold a
+unsupported until managed host startup and standard config operations are
+connected. No network request may hold a
 database transaction.
 
 `prepare_native_task_input` copies the complete official request and hashes its

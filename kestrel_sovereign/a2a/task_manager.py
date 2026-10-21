@@ -35,7 +35,7 @@ from a2a.types import (
     TaskStatus,
     TaskStatusUpdateEvent,
 )
-from a2a.utils.errors import InvalidParamsError
+from a2a.utils.errors import InvalidParamsError, PushNotificationNotSupportedError
 from a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict
 
@@ -56,7 +56,13 @@ from kestrel_sovereign.a2a.lifecycle import (
     task_state_label,
 )
 from kestrel_sovereign.a2a.media import encode_inline_json
+from kestrel_sovereign.a2a.native_input import (
+    NativeTaskInput,
+    prepare_native_task_input,
+)
 from kestrel_sovereign.a2a.projections import embedded_json_value
+from kestrel_sovereign.a2a.push_outbox import NativePushOutbox, PreparedPushConfig
+from kestrel_sovereign.a2a.push_service import NativePushService
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.skill_handler import TaskHandler
 from kestrel_sovereign.a2a.stores import (
@@ -186,6 +192,7 @@ class TaskManager:
             )
         self.context_store = context_store
         self.task_store = task_store
+        self._push_service: NativePushService | None = None
         self.session_service = session_service
         self.observability_store = observability_store
         self.memory_service = memory_service
@@ -248,6 +255,40 @@ class TaskManager:
         # after a child retires. Joining workers cannot reconcile a failed or
         # uncertain durable write, and must not erase its original error.
         self._execution_control: BaseException | None = None
+
+    @property
+    def push_service(self) -> NativePushService | None:
+        """The immutable managed service for this task manager's publication."""
+        return self._push_service
+
+    def bind_push_service(self, service: NativePushService) -> None:
+        """Bind one ready resident to the exact canonical task store."""
+        if not isinstance(service, NativePushService):
+            raise TypeError("Task push requires its managed native service")
+        worker = service.require_ready()
+        if worker.outbox.configurations.task_store is not self.task_store:
+            raise ValueError(
+                "Task push service belongs to another canonical task store"
+            )
+        if self._push_service is not None and self._push_service is not service:
+            raise ValueError("Task push publication cannot replace its managed service")
+        self._push_service = service
+
+    async def _prepare_task_push(
+        self, prepared: NativeTaskInput
+    ) -> tuple[NativePushOutbox | None, PreparedPushConfig | None]:
+        """Validate callback egress before either task admission transaction."""
+        callback = prepared.push_configuration
+        service = self._push_service
+        if service is None:
+            if callback is not None:
+                raise PushNotificationNotSupportedError()
+            return None, None
+        worker = service.require_ready()
+        outbox = worker.outbox
+        if outbox.configurations.task_store is not self.task_store:
+            raise ValueError("Task push service lost its canonical task store")
+        return outbox, await outbox.prepare(callback) if callback is not None else None
 
     @property
     def did(self) -> str:
@@ -328,6 +369,11 @@ class TaskManager:
             asyncio.CancelledError: The caller was cancelled. The stores not
                 yet closed stay open for a later call.
         """
+        # Resident HTTP custody must settle before any primary-store close.
+        # A failed service retirement leaves those borrowed stores available
+        # to the original owner and its explicit reconciliation path.
+        if self._push_service is not None:
+            await self._push_service.close()
         failures: list[tuple[str, BaseException]] = []
         try:
             await self.drain_execution_tasks(cancel=True)
@@ -1225,9 +1271,18 @@ class TaskManager:
             raise TypeError("Task continuation requires an official SendMessageRequest")
         validate_proto_required_fields(params)
         parse_message_metadata(MessageToDict(params.metadata))
-        candidate, appended = await self.task_store.append_creator_input(
-            params, creator_agent_id=creator_agent_id
-        )
+        prepared_input = prepare_native_task_input(params)
+        push_outbox, push_config = await self._prepare_task_push(prepared_input)
+        async with self.task_store.write_transaction():
+            candidate, appended = await self.task_store.append_creator_input(
+                prepared_input, creator_agent_id=creator_agent_id
+            )
+            if appended and push_config is not None:
+                await push_outbox.register_prepared(
+                    push_config,
+                    creator_id=creator_agent_id,
+                    task_id=candidate.task.id,
+                )
         if candidate is None:
             return None
         if appended:
@@ -1281,6 +1336,9 @@ class TaskManager:
             )
         if params.message.role != Role.ROLE_USER:
             raise InvalidParamsError(message="Task admission requires a user message")
+        prepared_input = prepare_native_task_input(params)
+        push_outbox, push_config = await self._prepare_task_push(prepared_input)
+        params = prepared_input.request
         task = new_task_from_user_message(params.message)
         task.metadata.update(
             without_reserved_cancellation_receipt(MessageToDict(params.metadata))
@@ -1313,9 +1371,13 @@ class TaskManager:
                 )
                 await self.task_store.record_initial_input(
                     task,
-                    params,
+                    prepared_input,
                     creator_agent_id=creator_agent_id,
                 )
+                if push_config is not None:
+                    await push_outbox.register_prepared(
+                        push_config, creator_id=creator_agent_id, task_id=task.id
+                    )
                 admitted_snapshot = await self.task_store.get_task_snapshot(
                     task.id,
                     recipient_agent_id=self.did,

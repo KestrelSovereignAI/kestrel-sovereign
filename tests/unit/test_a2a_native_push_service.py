@@ -6,7 +6,7 @@ import inspect
 import pytest
 
 from kestrel_sovereign._async_ownership import create_owned_task
-from kestrel_sovereign.a2a.push_service import NativePushService
+from kestrel_sovereign.a2a.push_service import NativePushService, PushServiceUnavailable
 from kestrel_sovereign.storage.db.interface import TransactionError
 from tests.unit.test_a2a_native_push_outbox import (
     outbox as outbox,  # noqa: PLC0414 - pytest fixture re-export
@@ -16,6 +16,7 @@ from tests.unit.test_a2a_native_push_outbox import (
 )
 from tests.unit.test_a2a_native_push_outbox import refuse_original_database_write
 from tests.unit.test_a2a_native_push_worker import register, worker
+from tests.utils.native_push import intercept_push_commit_ack
 from tests.utils.outbound_tls import (
     outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - pytest fixture re-export
 )
@@ -40,8 +41,9 @@ async def test_service_publishes_only_its_original_ready_worker_and_joins_shutdo
     await service.close()
     assert service.task is owner and owner.done()
     await service.close()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(PushServiceUnavailable) as stopped:
         service.require_ready()
+    assert isinstance(stopped.value.__cause__, asyncio.CancelledError)
 
 
 async def test_failed_publication_keeps_and_joins_the_original_accepted_resident(
@@ -124,6 +126,7 @@ async def test_startup_cancellation_joins_the_original_resident_before_returning
         with pytest.raises(RuntimeError, match="ready managed"):
             service.require_ready()
         starting.cancel("original startup observer cancellation")
+        release.set()
         with pytest.raises(asyncio.CancelledError) as caught:
             await starting
         assert caught.value.args == ("original startup observer cancellation",)
@@ -132,6 +135,78 @@ async def test_startup_cancellation_joins_the_original_resident_before_returning
         release.set()
         await asyncio.gather(starting, return_exceptions=True)
         await service.close()
+
+
+async def test_startup_cancellation_joins_the_original_journal_commit(
+    outbox, monkeypatch
+):
+    from kestrel_sovereign.a2a import push_service
+
+    value, _ = outbox
+    entered, release, cancel_sent = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_join = push_service.await_owned_task
+    service = NativePushService(worker(value), task_factory=create_owned_task)
+
+    async def held_ack():
+        entered.set()
+        await release.wait()
+
+    intercept_push_commit_ack(value, monkeypatch, held_ack)
+
+    async def observe_original_join(task, *args, **kwargs):
+        if task is service.task and task.cancelling():
+            # The actual cancel producer has scheduled the resident before
+            # waking this witness; no timer stands in for that handoff.
+            cancel_sent.set()
+        return await original_join(task, *args, **kwargs)
+
+    monkeypatch.setattr(push_service, "await_owned_task", observe_original_join)
+    starting = asyncio.create_task(service.start())
+    try:
+        await entered.wait()
+        starting.cancel("original journal observer withdrawal")
+        await cancel_sent.wait()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await starting
+        assert caught.value.args == ("original journal observer withdrawal",)
+        assert await value.backend.fetch_one(
+            "SELECT COUNT(*) FROM durable_signal_events"
+        ) == (1,)
+        assert await value.changes.pending(limit=10) == []
+    finally:
+        release.set()
+        await asyncio.gather(starting, return_exceptions=True)
+        await asyncio.gather(service.close(), return_exceptions=True)
+
+
+async def test_genuine_journal_commit_ack_failure_keeps_its_original_control(
+    outbox, monkeypatch
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        _explicit_control_chain,
+        execution_commit_outcome,
+        is_execution_control_error,
+    )
+
+    value, _ = outbox
+    original = OSError("original native journal COMMIT acknowledgement failed")
+
+    async def failed_ack():
+        raise original
+
+    intercept_push_commit_ack(value, monkeypatch, failed_ack)
+    service = NativePushService(worker(value), task_factory=create_owned_task)
+    try:
+        with pytest.raises((ExecutionCommitOutcomeError, BaseExceptionGroup)) as caught:
+            await service.start()
+        assert is_execution_control_error(caught.value)
+        assert execution_commit_outcome(caught.value) == "unknown"
+        assert any(error is original for error in _explicit_control_chain(caught.value))
+        assert service.task.done() and not service.worker.ready
+    finally:
+        await asyncio.gather(service.close(), return_exceptions=True)
 
 
 async def test_waiting_for_readiness_without_an_accepted_owner_is_refused(outbox):

@@ -106,7 +106,9 @@ class NativePushWorker:
         self.started.clear()
         self._running = True
         try:
-            await self.outbox.forward_pending(limit=self.batch_size)
+            await self._owned_transition(
+                self.outbox.forward_pending(limit=self.batch_size), self.outbox
+            )
             self.started.set()
             while True:
                 await self.run_once()
@@ -128,7 +130,21 @@ class NativePushWorker:
             "lease_token": delivery.lease_token,
         }
 
-    async def _owned_transition(self, operation, delivery: DurableDelivery):
+    @staticmethod
+    def _delivery_error(error: BaseException | None, *, planned_stop: bool):
+        """Expected revocation is local control; original custody still wins."""
+        if (
+            planned_stop
+            and isinstance(
+                error,
+                (asyncio.CancelledError, PushDeliveryRevoked, PushDeliveryLeaseLost),
+            )
+            and not is_execution_control_error(error)
+        ):
+            return None
+        return error
+
+    async def _owned_transition(self, operation, resource):
         """Join the real database transition before reporting cancellation.
 
         Canceling a monitor or HTTP sibling must not interrupt a lease COMMIT
@@ -137,7 +153,7 @@ class NativePushWorker:
         """
         outcome = await await_owned_operation(
             operation,
-            retirement_resource=delivery,
+            retirement_resource=resource,
             retain_originals=True,
             name="native-push-ledger-transition",
         )
@@ -262,13 +278,18 @@ class NativePushWorker:
 
     async def run_once(self) -> int:
         """Forward a bounded journal batch and attempt one delivery per subscriber."""
-        await self.outbox.forward_pending(limit=self.batch_size)
+        await self._owned_transition(
+            self.outbox.forward_pending(limit=self.batch_size), self.outbox
+        )
         count = 0
         for subscription in await self.outbox.subscriptions():
-            delivery = await self.outbox.signals.claim_delivery(
-                agent_id=self.outbox.agent_id,
-                consumer_id=subscription.consumer_id,
-                executor_id=self.executor_id,
+            delivery = await self._owned_transition(
+                self.outbox.signals.claim_delivery(
+                    agent_id=self.outbox.agent_id,
+                    consumer_id=subscription.consumer_id,
+                    executor_id=self.executor_id,
+                ),
+                subscription,
             )
             if delivery is None:
                 continue
@@ -281,15 +302,9 @@ class NativePushWorker:
                 name="native-push-delivery",
                 cancel_on_caller_cancellation=True,
             )
-            error = outcome.error
-            # This worker's Delete deliberately cancels this exact child.
-            # External cancellation and original custody control still win.
-            if (
-                run.revoked
-                and isinstance(error, asyncio.CancelledError)
-                and not is_execution_control_error(error)
-            ):
-                error = None
+            # Delete may win through the monitor before it cancels the local
+            # child. Both paths join the same physical HTTP owner.
+            error = self._delivery_error(outcome.error, planned_stop=run.revoked)
             error = execution_terminal_error(
                 outcome.cancellation,
                 error,
@@ -341,13 +356,9 @@ class NativePushWorker:
         for task, run in owners:
             run.revoked = True
             task.cancel()
-        for task, _ in owners:
+        for task, run in owners:
             outcome = await await_owned_task(task)
-            error = outcome.error
-            if isinstance(
-                error, asyncio.CancelledError
-            ) and not is_execution_control_error(error):
-                error = None
+            error = self._delivery_error(outcome.error, planned_stop=run.revoked)
             original = execution_terminal_error(
                 original, error, outcome.cancellation, retain_originals=True
             )

@@ -16,6 +16,10 @@ from kestrel_sovereign.execution_custody import (
 )
 
 
+class PushServiceUnavailable(RuntimeError):
+    """The resident cannot authorize effects in a caller's request lifetime."""
+
+
 class NativePushService:
     """Bind the original worker to its host's existing resident-task publisher.
 
@@ -50,8 +54,16 @@ class NativePushService:
         if task is not None and task.done():
             error = owned_task_error(task)
             if error is not None:
+                if isinstance(
+                    error, asyncio.CancelledError
+                ) and not is_execution_control_error(error):
+                    # The resident's cancellation is not this caller's
+                    # withdrawal. Retain its cause at the service boundary.
+                    raise PushServiceUnavailable(
+                        "Native push resident worker is stopped"
+                    ) from error
                 raise error
-        raise RuntimeError("Native push has no ready managed resident worker")
+        raise PushServiceUnavailable("Native push has no ready managed resident worker")
 
     async def wait_ready(self) -> None:
         """Race the finite startup signal against the original owner's outcome."""

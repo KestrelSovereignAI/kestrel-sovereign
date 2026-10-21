@@ -8,6 +8,7 @@ from google.protobuf.json_format import MessageToDict
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskInputConflictError
 from tests.unit.test_a2a_native_task_manager import manager as manager
 from tests.unit.test_a2a_native_task_manager import request
+from tests.utils.native_push import managed_push_service
 
 
 async def test_initial_request_is_retained_with_its_task_in_one_admission(manager):
@@ -32,36 +33,43 @@ async def test_initial_request_is_retained_with_its_task_in_one_admission(manage
 
 async def test_inline_callback_secrets_are_not_persisted_or_exposed_to_cognition(
     manager,
+    monkeypatch,
 ):
     from kestrel_sovereign.a2a.native_input import native_request_digest
     from tests.unit.test_a2a_native_input import request as inline_request
 
     original = inline_request()
-    task = await manager.create_task(original, creator_agent_id="did:creator")
-    row = await manager.task_store.backend.fetch_one(
-        "SELECT request_json, request_digest FROM a2a_task_inputs WHERE task_id = ?",
-        (task.id,),
+    original.configuration.task_push_notification_config.url = (
+        "https://1.1.1.1/private-path?secret=do-not-persist"
     )
-    for secret in [
-        "callback.example",
-        "do-not-persist",
-        "callback-validation-secret",
-        "callback-authorization-secret",
-    ]:
-        assert secret not in row[0]
-    snapshot = await manager.get_task_snapshot(task.id, recipient_agent_id=manager.did)
-    assert not snapshot.input_request.configuration.HasField(
-        "task_push_notification_config"
-    )
-    assert snapshot.input_request.message == original.message
-    assert snapshot.input_wire_request_digest == native_request_digest(
-        original, "SendMessage"
-    )
-    assert snapshot.input_request_digest == row[1]
-    assert (
-        native_request_digest(snapshot.input_request, "SendMessage")
-        != snapshot.input_wire_request_digest
-    )
+    async with managed_push_service(manager, monkeypatch, pause_delivery=True):
+        task = await manager.create_task(original, creator_agent_id="did:creator")
+        row = await manager.task_store.backend.fetch_one(
+            "SELECT request_json, request_digest FROM a2a_task_inputs WHERE task_id = ?",
+            (task.id,),
+        )
+        for secret in [
+            "1.1.1.1",
+            "do-not-persist",
+            "callback-validation-secret",
+            "callback-authorization-secret",
+        ]:
+            assert secret not in row[0]
+        snapshot = await manager.get_task_snapshot(
+            task.id, recipient_agent_id=manager.did
+        )
+        assert not snapshot.input_request.configuration.HasField(
+            "task_push_notification_config"
+        )
+        assert snapshot.input_request.message == original.message
+        assert snapshot.input_wire_request_digest == native_request_digest(
+            original, "SendMessage"
+        )
+        assert snapshot.input_request_digest == row[1]
+        assert (
+            native_request_digest(snapshot.input_request, "SendMessage")
+            != snapshot.input_wire_request_digest
+        )
 
 
 async def test_inline_secret_changes_conflict_even_when_execution_projection_is_identical(
