@@ -7,14 +7,10 @@ build-time base — root-absolute ``/assets/…`` — which lands outside the
 ``/phoenix`` where the authenticated proxy serves the real chunk.
 """
 
-import os
-
 import pytest
 from fastapi.testclient import TestClient
 
-os.environ.setdefault("KESTREL_API_KEY", "test-key-123")
-
-import kestrel_sovereign.server as srv  # noqa: E402
+import kestrel_sovereign.server as srv
 
 
 class _FakeSupervisor:
@@ -22,7 +18,8 @@ class _FakeSupervisor:
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
     with TestClient(srv.app, raise_server_exceptions=False) as c:
         yield c
 

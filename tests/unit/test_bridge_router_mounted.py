@@ -10,7 +10,6 @@ endpoint 404'd. These tests boot the real app via ``TestClient`` and assert:
 * with the feature absent, the route is not mounted (404).
 """
 
-import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -78,8 +77,8 @@ def _boot(features):
     return app, restore
 
 
-def test_bridge_health_mounted_when_feature_enabled():
-    os.environ["KESTREL_API_KEY"] = API_KEY
+def test_bridge_health_mounted_when_feature_enabled(monkeypatch):
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     bridge = _make_bridge_feature()
     app, restore = _boot({"BridgeFeature": bridge})
     try:
@@ -96,8 +95,8 @@ def test_bridge_health_mounted_when_feature_enabled():
     assert body["bridge"] is True
 
 
-def test_bridge_health_absent_when_feature_disabled():
-    os.environ["KESTREL_API_KEY"] = API_KEY
+def test_bridge_health_absent_when_feature_disabled(monkeypatch):
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     app, restore = _boot({})
     try:
         with TestClient(app) as client:

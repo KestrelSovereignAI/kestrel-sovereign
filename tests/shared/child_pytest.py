@@ -18,18 +18,25 @@ import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+#: pytest's CI detection (``_pytest.compat.running_on_ci``) reads these. Either
+#: one stops the child truncating its summary lines and assertion diffs, so
+#: its output in CI would differ from the same run anywhere else.
+CI_VARIABLES = ("CI", "BUILD_NUMBER")
+
 
 def child_pytest_env() -> dict[str, str]:
     """This process's environment without pytest's own variables.
 
     Every ``PYTEST_`` variable is dropped and plugin autoload is off, so the
     child loads exactly the plugins its command line names with ``-p``. The
-    import path is the package root only: forwarding ``sys.path`` lets a
-    package directory shadow a stdlib module in the child.
+    CI markers are dropped too, so the child formats its output the same way
+    wherever the parent runs. The import path is the package root only:
+    forwarding ``sys.path`` lets a package directory shadow a stdlib module in
+    the child.
     """
     env = {
         name: value for name, value in os.environ.items()
-        if not name.startswith("PYTEST_")
+        if not name.startswith("PYTEST_") and name not in CI_VARIABLES
     }
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"

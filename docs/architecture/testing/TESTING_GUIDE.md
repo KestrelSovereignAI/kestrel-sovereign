@@ -204,6 +204,21 @@ alone every row and column it did not create:
 `tests/unit/test_embedding_vec_backfill.py` is a worked example, including a
 regression test that the case leaves a reused database unchanged (#3404).
 
+### Environment Variables
+
+A test that needs an environment variable sets it itself with
+`monkeypatch.setenv`, and no test leaves `os.environ` different from how it
+found it (#3671). The suite enforces this: a test that leaves a variable set,
+removed or changed has it put back and fails at teardown, naming the variable
+but never its value. A test module whose import changes the environment fails
+its collection, and a class, module, package or session fixture that leaves it
+changed fails the run's last test; such a fixture holds a variable with
+`pytest.MonkeyPatch.context()` around its `yield`. Because
+`monkeypatch.delenv(name, raising=False)` records nothing for an absent
+variable, a test that must start without one the code under test may write
+uses `unset_environment(monkeypatch, name)` from
+`tests.shared.environment_guard`.
+
 ### Test Organization
 
 ```

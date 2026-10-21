@@ -48,6 +48,10 @@ from tests.shared.node_id_length import (
     pytest_xdist_node_collection_finished,  # noqa: F401 - exposed as a pytest hook
     refuse_overlong_node_ids,
 )
+from tests.shared.environment_guard import (
+    register as _register_environment_guard,
+    unset_environment,
+)
 from kestrel_sovereign import paths
 from tests.shared.host_runtime_isolation import (
     ISOLATION_DIRNAME,
@@ -180,6 +184,10 @@ def pytest_configure(config):
     """Configure pytest with all plugins and load .env for skipif conditions."""
     _require_pytest_asyncio(config)
     _hang_backstop_configure(config)
+    # A plugin, not a fixture defined here: a plugin's autouse fixture is set
+    # up before this conftest's, several of which use monkeypatch, so the
+    # guard sees every monkeypatch undone before it compares (#3671).
+    _register_environment_guard(config)
     REFUSAL_RECORDER.install()
     # The allow-list's third root: an explicit --basetemp may lie outside the
     # system temporary directory, and every tmp_path lives below it.
@@ -553,15 +561,9 @@ def post_ceremony_template(tmp_path_factory):
     )
 
     template_dir = tmp_path_factory.mktemp("post_ceremony_template")
-    previous_data_key = os.environ.get("KESTREL_DATA_KEY")
-    os.environ["KESTREL_DATA_KEY"] = TEST_DATA_KEY
-    try:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("KESTREL_DATA_KEY", TEST_DATA_KEY)
         return build_post_ceremony_template(template_dir)
-    finally:
-        if previous_data_key is None:
-            os.environ.pop("KESTREL_DATA_KEY", None)
-        else:
-            os.environ["KESTREL_DATA_KEY"] = previous_data_key
 
 
 @pytest.fixture
@@ -756,6 +758,23 @@ def _born_hybrid_inception_env(monkeypatch):
     """
     monkeypatch.setenv("KESTREL_DID_WEB_DOMAIN", "agents.kestrel-sovereign.test")
     monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+
+
+@pytest.fixture(autouse=True)
+def _unset_a2a_transport_key(monkeypatch):
+    """Start every test without an A2A transport key, and drop the one it makes (#3671).
+
+    ``ensure_a2a_transport_key`` publishes the fleet transport key in
+    ``os.environ`` whenever a peers feature, the server or the process manager
+    starts, so every test that boots an agent writes it. Before this, the
+    first such test in a worker left its key for the rest, and a later test
+    took the exported-key path or the generated-key path depending on what
+    ran before it. Each test now takes the path a fresh process takes; one
+    that needs a key sets it with ``monkeypatch.setenv``.
+    """
+    from kestrel_sovereign.a2a.transport_auth import A2A_TRANSPORT_KEY_ENV
+
+    unset_environment(monkeypatch, A2A_TRANSPORT_KEY_ENV)
 
 
 # =============================================================================

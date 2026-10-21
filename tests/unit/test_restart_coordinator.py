@@ -66,9 +66,11 @@ from kestrel_sovereign.features.restart_coordinator.update_profiles import (
     get_update_profile,
     is_valid_target_ref,
 )
+from kestrel_sovereign.security.sovereign_key import _EPHEMERAL_KEY_FINGERPRINT_ENV
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.session_id_column import is_stampable_session_id
+from tests.shared.environment_guard import unset_environment
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +741,7 @@ async def test_request_restart_rejects_server_generated_temporary_key(
     from kestrel_sovereign.server import get_api_key
 
     feat, backend = await _make_feature(tmp_path)
-    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    unset_environment(monkeypatch, "KESTREL_API_KEY", _EPHEMERAL_KEY_FINGERPRINT_ENV)
     with patch("kestrel_sovereign.server.secrets.token_urlsafe") as generate:
         generate.return_value = "process-only-bootstrap-key"
         assert get_api_key() == "process-only-bootstrap-key"
