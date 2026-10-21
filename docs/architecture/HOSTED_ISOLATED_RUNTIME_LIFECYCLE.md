@@ -46,7 +46,12 @@ projection; hosts must not log their own credential-bearing exceptions.
 
 `outbound_timeout_seconds` is finite, positive and at most 300 (default 30).
 Caller withdrawal prevents a later send after activation; an already-started
-provider call is conservatively unknown if it does not confirm. A deadline
+provider call is conservatively unknown if it does not confirm. Dispatch
+observes the original caller's new cancellation count, independently of when
+its waiter resumes; an already-handled cancellation is not a new withdrawal.
+Failure to publish the deadline retires the same accepted original owner,
+not an unobserved dispatch. Irreversible Core custody denial is authenticated
+at Core's validator before foreign callback errors are redacted. A deadline
 seals the proxy and starts the existing canonical terminal cleanup. The
 original dispatch retains its host context until accepted RPC work settles
 or the original child is positively retired. Bounded public observation does

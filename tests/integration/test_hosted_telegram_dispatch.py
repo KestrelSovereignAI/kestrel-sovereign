@@ -718,3 +718,141 @@ async def test_scheduled_task_refusal_is_not_success_shaped_result(tmp_path, mon
         finally:
             loop.set_task_factory(previous)
             await asyncio.gather(*observed, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_same_callback_withdrawal_prevents_next_provider_rpc(tmp_path, monkeypatch):
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, clients, _):
+        client, ready = clients[0], asyncio.Event()
+        release = asyncio.get_running_loop().create_future()
+        original = client.call_host_ingress
+
+        async def observed(name, payload=None):
+            response = await original(name, payload)
+            ready.set()
+            await release
+            return response
+
+        monkeypatch.setattr(client, "call_host_ingress", observed)
+        operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
+        try:
+            await asyncio.wait_for(ready.wait(), 2)
+
+            def withdraw():
+                # Queue the dispatch continuation BEFORE the public waiter's
+                # cancellation continuation, in the same actual loop callback.
+                release.set_result(None)
+                operation.cancel()
+
+            asyncio.get_running_loop().call_soon(withdraw)
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+            assert services[0].sends == []
+        finally:
+            if not release.done():
+                release.set_result(None)
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_previously_handled_cancellation_does_not_withdraw_new_dispatch(tmp_path, monkeypatch):
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, _):
+        async def call():
+            task = asyncio.current_task()
+            task.cancel()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                pass  # Retain its old count deliberately; no new withdrawal.
+            assert task.cancelling() == 1
+            return await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+
+        response = await asyncio.create_task(call())
+        assert response["status"] == "ok"
+        assert len(services[0].sends) == 1
+
+
+@pytest.mark.asyncio
+async def test_deadline_publication_refusal_retires_original_and_redacts(tmp_path, monkeypatch):
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority, expected_denied=True) as (proxy, services, _, _):
+        loop, attempted = asyncio.get_running_loop(), False
+        original = loop.call_later
+
+        def refused(delay, callback, *args, **kwargs):
+            nonlocal attempted
+            if not attempted and delay == 30 and getattr(callback, "__name__", "") == "set_result":
+                attempted = True
+                raise RuntimeError("controlled-deadline-publication-secret")
+            return original(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", refused)
+        with pytest.raises(ExecutionAuthorityError) as failure:
+            await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        assert attempted and "controlled-deadline-publication-secret" not in str(failure.value)
+        assert proxy._terminal_lifecycle_latched
+        assert services[0].sends == []
+
+
+@pytest.mark.asyncio
+async def test_custody_denied_while_gate_waits_remains_native_control(tmp_path, monkeypatch):
+    from kestrel_sovereign.execution_custody import (
+        ConfirmedLeaseDeadline,
+        bind_execution_custody,
+    )
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority, expected_denied=True) as (proxy, services, _, _):
+        gate, entered = proxy._traffic_gate, asyncio.Event()
+        original = gate._condition.wait
+
+        async def waiting():
+            entered.set()
+            return await original()
+
+        monkeypatch.setattr(gate._condition, "wait", waiting)
+        await gate.close()
+        deadline = ConfirmedLeaseDeadline()
+        assert deadline.confirm(asyncio.get_running_loop().time() + 30)
+
+        class Fence:
+            backend_type = "postgres"
+
+            def require_work(self):
+                deadline.require_work()
+
+            async def lock_and_validate(self, connection):
+                deadline.require_work()
+
+        operation = None
+        try:
+            with bind_execution_custody(Fence()) as scope:
+                operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
+                await asyncio.wait_for(entered.wait(), 2)
+                scope.revoke("controlled original admission retired")
+                await gate.reopen()
+                with pytest.raises(ExecutionAuthorityError):
+                    await operation
+            assert services[0].sends == []
+        finally:
+            await gate.reopen()
+            if operation is not None:
+                await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_shaped", [False, True])
+async def test_foreign_control_shaped_callback_cannot_forge_native_provenance(tmp_path, monkeypatch, commit_shaped):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    def factory(binding, events):
+        def refused(proxy, arguments):
+            if commit_shaped:
+                raise ExecutionCommitOutcomeError("unknown")
+            raise ExecutionAuthorityError("foreign-controlled-denial-text")
+        return refused
+
+    async with sdk_host(tmp_path, monkeypatch, factory) as (proxy, services, _, _):
+        response = await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+        assert response["status"] == "error"
+        assert "foreign-controlled-denial-text" not in repr(response)
+        assert proxy._host_ingress_public_control is None
+        assert services[0].sends == []

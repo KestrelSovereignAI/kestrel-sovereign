@@ -1999,13 +1999,20 @@ class _HostIngressAdmission:
     core_denied_scopes: tuple = field(default=(), repr=False)
     opening: BaseException | None = field(default=None, repr=False)
     withdrawal_stops_work: bool = False
+    withdrawal_task: asyncio.Task | None = field(default=None, repr=False)
+    withdrawal_cancel_count: int = 0
     provider_rpc_started: bool = False
     physical_client_retired: asyncio.Future | None = field(default=None, repr=False)
     scheduled_tool: bool = False
 
     def require_work(self, agent):
         """Only THIS known Core validation seam can authenticate a denial."""
-        if self.withdrawal_stops_work and self.cancellation is not None:
+        if self.withdrawal_stops_work and (
+            self.cancellation is not None or (
+                self.withdrawal_task is not None
+                and self.withdrawal_task.cancelling() > self.withdrawal_cancel_count
+            )
+        ):
             raise asyncio.CancelledError()
         if self.withdrawal_stops_work and (
             self.native_error is not None
@@ -2516,13 +2523,18 @@ async def _wait_for_host_ingress_operation(
     caller = asyncio.current_task()
     caller_cancel_args: tuple[Any, ...] | None = None
     deadline, timer, early_outcome = None, None, None
-    if deadline_seconds is not None:
-        if on_deadline is None:
-            raise ValueError("bounded ingress observation requires its original retirement owner")
-        deadline = asyncio.get_running_loop().create_future()
-        timer = asyncio.get_running_loop().call_later(deadline_seconds, deadline.set_result, None)
     try:
-        while not operation.done():
+        if deadline_seconds is not None:
+            if on_deadline is None:
+                raise ValueError("bounded ingress observation requires its original retirement owner")
+            try:
+                deadline = asyncio.get_running_loop().create_future()
+                timer = asyncio.get_running_loop().call_later(deadline_seconds, deadline.set_result, None)
+            except BaseException as error:  # noqa: BLE001 - accepted original survives deadline publication refusal
+                if admission is not None and admission.opening is None:
+                    admission.opening = error
+                early_outcome = on_deadline()
+        while early_outcome is None and not operation.done():
             try:
                 if deadline is None:
                     await asyncio.shield(operation)
@@ -12668,6 +12680,15 @@ class ProxyFeature(Feature):
             except BaseException as error:  # noqa: BLE001 - external RPC boundary redaction
                 # The SDK/custom-client boundary is untrusted. Do not retain its
                 # exception object or its potentially secret-bearing message.
+                if admission is not None:
+                    try:
+                        # A trusted Core check inside the tool operation may
+                        # have denied after traffic admission waited. Recheck
+                        # actual irreversible custody, not foreign exception
+                        # classes/attributes, to authenticate that native lane.
+                        admission.require_work(self.agent)
+                    except BaseException:  # noqa: BLE001 - the canonical validator records native provenance
+                        pass
                 outcome_slot.outcome = _redacted_host_ingress_error(error)
                 return
             try:

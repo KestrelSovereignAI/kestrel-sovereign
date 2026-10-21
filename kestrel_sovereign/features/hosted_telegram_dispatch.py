@@ -70,11 +70,14 @@ def start_dispatch(proxy: Any, name: Any, arguments: Any):
     # use underscores; canonical ingress labels intentionally use hyphens.
     request = runtime._prepare_host_ingress_request("telegram-hosted-outbound", arguments)
     slot = runtime._HostIngressOutcomeSlot()
+    caller = asyncio.current_task()
     admission = runtime._HostIngressAdmission(
         proxy._terminal_lifecycle_generation,
         current_execution_custody(proxy.agent),
         proxy=proxy,
         withdrawal_stops_work=True,
+        withdrawal_task=caller,
+        withdrawal_cancel_count=caller.cancelling() if caller is not None else 0,
         # Capture trusted provenance BEFORE allocation/publication can refuse
         # the original worker. No refusal may become scheduler success data.
         scheduled_tool=capture_scheduler_execution_scope() is not None,
