@@ -15,7 +15,7 @@ from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthor
 from kestrel_sovereign.a2a.native_host import create_hosted_native_guard
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import TaskManager, create_task_manager
-from kestrel_sovereign.storage.db.interface import QueryError
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.utils.native_a2a import signing_identity
 from tests.utils.native_a2a_security import (
     EXTENSIONS,
@@ -838,8 +838,10 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
             await backend.execute_script(
                 "CREATE TABLE a2a_sessions (id TEXT PRIMARY KEY)"
             )
-            with pytest.raises(QueryError, match="agent_name"):
+            with pytest.raises(TransactionError, match="agent_name"):
                 await agent._boot_phase_a2a_observability_signals(ctx)
+            for table in ("a2a_tasks", "a2a_contexts", "a2a_protocol_schema"):
+                assert not await backend.table_exists(table)
             assert "task_manager" in ctx.rollback_labels
             assert agent.task_manager is not None
         else:
@@ -1927,10 +1929,11 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
 async def test_public_question_tool_uses_native_intent_and_restarts_without_legacy_rows(
     local_native_peer, monkeypatch
 ):
+    from google.protobuf.json_format import MessageToDict
+
+    from kestrel_sovereign.a2a.extensions import QUESTION_CORRELATION_URI
     from kestrel_sovereign.features.peers.feature import PeersFeature
     from tests.unit.test_a2a_native_question_supervisor import dispatcher_for
-    from kestrel_sovereign.a2a.extensions import QUESTION_CORRELATION_URI
-    from google.protobuf.json_format import MessageToDict
 
     p = local_native_peer
     state = SimpleNamespace(backend=p.backend, store=p.sender_manager.question_store)
@@ -2059,6 +2062,7 @@ async def test_dead_question_resident_refuses_new_sends_before_delivery(
     local_native_peer,
 ):
     from kestrel_sdk.tools.result import ToolResultStatus
+
     from kestrel_sovereign.features.peers.feature import PeersFeature
     from tests.unit.test_a2a_native_question_supervisor import dispatcher_for
 

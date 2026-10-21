@@ -2040,6 +2040,12 @@ def cmd_migrate_config(args) -> int:
     return 0
 
 
+def cmd_migrate_a2a(args) -> int:
+    """Preview or apply the offline native A2A data cutover."""
+    from kestrel_sovereign.cli_migrate_a2a import run
+    return run(args)
+
+
 def cmd_migrate_encryption(args) -> int:
     """One-shot: encrypt pre-migration plaintext rows at rest (#1401).
 
@@ -2679,6 +2685,9 @@ def build_parser() -> argparse.ArgumentParser:
              "CI runners that want every agent they incept tagged as a test.",
     )
 
+    from kestrel_sovereign.cli_migrate_a2a import add_migrate_a2a_subcommand
+    add_migrate_a2a_subcommand(subparsers)
+
     # kestrel migrate-encryption — backfill plaintext rows at rest (#1401)
     migrate_enc_p = subparsers.add_parser(
         "migrate-encryption",
@@ -2966,6 +2975,7 @@ def main() -> int:
         "migrate-llm-config": cmd_migrate_llm_config,
         "migrate-config": cmd_migrate_config,
         "migrate-encryption": cmd_migrate_encryption,
+        "migrate-a2a": cmd_migrate_a2a,
         "config": cmd_config,
         "feature": cmd_feature,
         "skills": cmd_skills,

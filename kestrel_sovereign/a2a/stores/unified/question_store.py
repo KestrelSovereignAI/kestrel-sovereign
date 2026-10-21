@@ -26,6 +26,63 @@ class QuestionConflict(ValueError):
     """Correlation, native receipt or question ownership disagrees with durable intent."""
 
 
+class QuestionResponseError(QuestionConflict):
+    """An authenticated peer returned an invalid question answer."""
+
+
+def answer_fields(question_id: str, response: Task | Message):
+    """Validate peer assertions before a receipt transaction can wrap the error."""
+    if not isinstance(response, (Task, Message)):
+        raise TypeError("Question answers require official Task or Message values")
+    if isinstance(response, Task):
+        if response.status.state not in TERMINAL_STATES:
+            raise QuestionResponseError("Question answer task is not terminal")
+        try:
+            original = parse_question_correlation(MessageToDict(response.metadata))
+        except ValueError as error:
+            raise QuestionResponseError(
+                "Remote task has malformed question correlation"
+            ) from error
+        if original is None or (original.kind, original.question_id) != (
+            "question",
+            question_id,
+        ):
+            raise QuestionResponseError(
+                "Remote task lost its original question correlation"
+            )
+        state = task_state_label(response.status.state)
+        reply = response.status.message if response.status.HasField("message") else None
+    else:
+        if response.task_id:
+            raise QuestionResponseError(
+                "A standalone answer must retain its actual taskless identity"
+            )
+        state, reply = "completed", response
+    if reply is not None:
+        try:
+            answer = parse_question_correlation(MessageToDict(reply.metadata))
+        except ValueError as error:
+            raise QuestionResponseError(
+                "Answer has malformed question correlation"
+            ) from error
+        if (
+            reply.role != Role.ROLE_AGENT
+            or (answer is None and state == "completed")
+            or (
+                answer is not None
+                and (answer.kind, answer.question_id) != ("answer", question_id)
+            )
+        ):
+            raise QuestionResponseError(
+                "Answer does not match the outstanding question identity"
+            )
+    elif state == "completed":
+        raise QuestionResponseError(
+            "Completed question has no correlated answer message"
+        )
+    return state, reply
+
+
 @dataclass(frozen=True)
 class NativeQuestion:
     question_id: str
@@ -53,6 +110,7 @@ class QuestionWake:
     claim_token: str | None
     lease_until: str | None
     handed_off_at: str | None
+    delivery_failed_at: str | None = None
 
 
 _QUESTION_COLUMNS = ", ".join(NativeQuestion.__dataclass_fields__)
@@ -128,7 +186,7 @@ class NativeQuestionStore(UnifiedStoreBase):
                 question_id TEXT NOT NULL, wave TEXT NOT NULL
                     CHECK (wave IN ('answer','deadline','late-answer')),
                 event_id TEXT NOT NULL, payload_json TEXT NOT NULL,
-                claim_token TEXT, lease_until TEXT, handed_off_at TEXT,
+                claim_token TEXT, lease_until TEXT, handed_off_at TEXT, delivery_failed_at TEXT,
                 PRIMARY KEY (sender_id, sender_tenant, question_id, wave),
                 UNIQUE (sender_id, sender_tenant, event_id)
             );
@@ -199,6 +257,13 @@ class NativeQuestionStore(UnifiedStoreBase):
         question = await self.for_dispatch(dispatch.dispatch_id)
         if question is None:
             raise QuestionConflict("Native question receipt has no registered intent")
+        self.outbound_store.validate_response(dispatch, response)
+        if (
+            isinstance(response, Message)
+            and not response.task_id
+            or (isinstance(response, Task) and response.status.state in TERMINAL_STATES)
+        ):
+            answer_fields(question.question_id, response)
         async with self.write_transaction():
             receipt = await self.outbound_store.acknowledge(
                 dispatch, response, operation_id=operation_id
@@ -341,41 +406,11 @@ class NativeQuestionStore(UnifiedStoreBase):
                 raise QuestionConflict(
                     "Answer task differs from the acknowledged native task"
                 )
-            original = parse_question_correlation(MessageToDict(response.metadata))
-            if original is None or (original.kind, original.question_id) != (
-                "question",
-                question_id,
-            ):
-                raise QuestionConflict(
-                    "Remote task lost its original question correlation"
-                )
-            state = task_state_label(response.status.state)
-            reply = (
-                response.status.message if response.status.HasField("message") else None
-            )
-        else:
-            if response.task_id or dispatch.remote_task_id:
-                raise QuestionConflict(
-                    "A standalone answer must retain its actual taskless identity"
-                )
-            state, reply = "completed", response
-        if reply is not None:
-            answer = parse_question_correlation(MessageToDict(reply.metadata))
-            if (
-                reply.role != Role.ROLE_AGENT
-                or (answer is None and state == "completed")
-                or (
-                    answer is not None
-                    and (answer.kind, answer.question_id) != ("answer", question_id)
-                )
-            ):
-                raise QuestionConflict(
-                    "Answer does not match the outstanding question identity"
-                )
-        elif state == "completed":
+        elif dispatch.remote_task_id:
             raise QuestionConflict(
-                "Completed question has no correlated answer message"
+                "A standalone answer differs from its native receipt"
             )
+        state, reply = answer_fields(question_id, response)
         encoded = json.dumps(MessageToDict(response), sort_keys=True)
         if question.response_digest is not None:
             if question.response_digest != digest:
@@ -407,6 +442,13 @@ class NativeQuestionStore(UnifiedStoreBase):
                     state=state,
                     reply=(message_text(reply) or "") if reply is not None else "",
                     withdrawn=False,
+                    requires_full_response=(
+                        isinstance(response, Task) and bool(response.artifacts)
+                    )
+                    or (
+                        reply is not None
+                        and any(not part.HasField("text") for part in reply.parts)
+                    ),
                 )
         if current is None or current.response_digest != digest:
             raise QuestionConflict(
@@ -451,9 +493,17 @@ class NativeQuestionStore(UnifiedStoreBase):
             raise QuestionConflict("Question deadline has not passed")
         return current
 
-    async def settle_unsent(self, question_id: str, dispatch: OutboundDispatch) -> None:
+    async def settle_unsent(self, question_id: str, dispatch: OutboundDispatch) -> bool:
         """Retire proven local non-delivery without inventing a remote Task."""
-        question = await self._binding(question_id, dispatch)
+        question = await self.get(question_id)
+        if (
+            question is None
+            or (dispatch.sender_id, dispatch.sender_tenant) != self._owner
+            or question.dispatch_id != dispatch.dispatch_id
+            or (question.recipient_id, question.recipient_tenant)
+            != (dispatch.recipient_id, dispatch.tenant)
+        ):
+            raise QuestionConflict("Question does not match this sender's dispatch")
         if dispatch.state is not DispatchState.NOT_SENT and not (
             dispatch.state is DispatchState.RESERVED
             and question.status == "EXPIRED"
@@ -465,8 +515,18 @@ class NativeQuestionStore(UnifiedStoreBase):
                 "UPDATE a2a_native_questions SET receiver_settled = 1, "
                 "status = CASE WHEN status = 'WAITING' THEN 'RESOLVED' ELSE status END "
                 "WHERE sender_id = ? AND sender_tenant = ? AND question_id = ? "
-                "AND receiver_settled = 0 AND response_digest IS NULL",
-                (*self._owner, question_id),
+                "AND receiver_settled = 0 AND response_digest IS NULL "
+                "AND EXISTS (SELECT 1 FROM a2a_outbound_dispatches AS dispatch "
+                "WHERE dispatch.sender_id = ? AND dispatch.sender_tenant = ? "
+                "AND dispatch.dispatch_id = ? AND dispatch.revision = ? AND dispatch.state = ?)",
+                (
+                    *self._owner,
+                    question_id,
+                    *self._owner,
+                    dispatch.dispatch_id,
+                    dispatch.revision,
+                    dispatch.state.value,
+                ),
             )
             if changed == 1 and question.status != "EXPIRED":
                 await self._insert_wake(
@@ -476,6 +536,7 @@ class NativeQuestionStore(UnifiedStoreBase):
                     reply="The original question was not delivered; no remote task exists.",
                     withdrawn=False,
                 )
+        return changed == 1
 
     async def _insert_wake(
         self,
@@ -485,6 +546,7 @@ class NativeQuestionStore(UnifiedStoreBase):
         state: str,
         reply: str,
         withdrawn: bool,
+        requires_full_response: bool = False,
     ):
         event_id = str(
             uuid5(NAMESPACE_URL, json.dumps([*self._owner, question.question_id, wave]))
@@ -503,6 +565,7 @@ class NativeQuestionStore(UnifiedStoreBase):
             "reply_text": reply,
             "late": wave == "late-answer",
             "withdrawn": withdrawn,
+            "requires_full_response": requires_full_response,
         }
         await self.backend.execute(
             "INSERT INTO a2a_native_question_wakes (sender_id, sender_tenant, question_id, wave, event_id, payload_json) "
@@ -519,7 +582,7 @@ class NativeQuestionStore(UnifiedStoreBase):
     async def pending_wakes(self) -> list[QuestionWake]:
         rows = await self.backend.fetch_all(
             f"SELECT {_WAKE_COLUMNS} FROM a2a_native_question_wakes "
-            "WHERE sender_id = ? AND sender_tenant = ? AND handed_off_at IS NULL "
+            "WHERE sender_id = ? AND sender_tenant = ? AND handed_off_at IS NULL AND delivery_failed_at IS NULL "
             "ORDER BY question_id, CASE wave WHEN 'deadline' THEN 0 ELSE 1 END",
             self._owner,
         )
@@ -540,14 +603,14 @@ class NativeQuestionStore(UnifiedStoreBase):
         changed = await self.backend.execute(
             "UPDATE a2a_native_question_wakes SET claim_token = ?, lease_until = ? "
             "WHERE sender_id = ? AND sender_tenant = ? AND question_id = ? AND wave = ? "
-            "AND event_id = ? AND payload_json = ? AND handed_off_at IS NULL "
+            "AND event_id = ? AND payload_json = ? AND handed_off_at IS NULL AND delivery_failed_at IS NULL "
             "AND (lease_until IS NULL OR lease_until <= ?) "
             "AND (wave != 'late-answer' OR NOT EXISTS ("
             "SELECT 1 FROM a2a_native_question_wakes earlier "
             "WHERE earlier.sender_id = a2a_native_question_wakes.sender_id "
             "AND earlier.sender_tenant = a2a_native_question_wakes.sender_tenant "
             "AND earlier.question_id = a2a_native_question_wakes.question_id "
-            "AND earlier.wave = 'deadline' AND earlier.handed_off_at IS NULL))",
+            "AND earlier.wave = 'deadline' AND earlier.handed_off_at IS NULL AND earlier.delivery_failed_at IS NULL))",
             (
                 token,
                 _timestamp(now + self._claim_lease),
@@ -573,12 +636,21 @@ class NativeQuestionStore(UnifiedStoreBase):
 
     async def confirm_handoff(self, wake: QuestionWake) -> bool:
         """Only a committed durable signal admission may retire this outbox entry."""
+        return await self._settle_handoff(wake, column="handed_off_at")
+
+    async def record_delivery_failure(self, wake: QuestionWake) -> bool:
+        """Retain permanent consumer failure separately from an admission ACK."""
+        return await self._settle_handoff(wake, column="delivery_failed_at")
+
+    async def _settle_handoff(self, wake: QuestionWake, *, column: str) -> bool:
+        if column not in {"handed_off_at", "delivery_failed_at"}:
+            raise ValueError("Unknown durable question handoff disposition")
         if not _text(wake.claim_token):
             raise QuestionConflict("Question wake has no lease claim")
         changed = await self.backend.execute(
-            "UPDATE a2a_native_question_wakes SET handed_off_at = ? "
+            f"UPDATE a2a_native_question_wakes SET {column} = ? "
             "WHERE sender_id = ? AND sender_tenant = ? AND question_id = ? AND wave = ? "
-            "AND event_id = ? AND payload_json = ? AND claim_token = ? AND handed_off_at IS NULL",
+            "AND event_id = ? AND payload_json = ? AND claim_token = ? AND handed_off_at IS NULL AND delivery_failed_at IS NULL",
             (
                 _timestamp(self._clock()),
                 *self._owner,

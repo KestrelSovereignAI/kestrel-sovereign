@@ -239,7 +239,7 @@ class GatedExport:
     def get_skill_for_command(self, command):
         return None
 
-    async def handle_task(self, task):
+    async def handle_task(self, task, *, arguments=None):
         self.started.set()
         await self.release.wait()
         result = task if self.in_place else Task.FromString(task.SerializeToString())

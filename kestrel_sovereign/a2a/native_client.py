@@ -655,6 +655,10 @@ class NativePeerSession:
         """Search authorized history; never resubmit an uncertain original."""
         self._require_binding(dispatch)
         await self._admit(dispatch)
+        if self._store.submission_active(dispatch.dispatch_id):
+            raise OutboundDispatchConflict(
+                "Original submission is still active; reconciliation must wait"
+            )
         if dispatch.state is DispatchState.SUBMITTING:
             dispatch = await self._store.mark_unknown(
                 dispatch, operation_id=uuid4().hex
@@ -698,23 +702,10 @@ class NativePeerSession:
             raise NativePeerProtocolError(
                 "Native question reconciliation requires its correlation ledger"
             )
-        question = await self._questions.for_dispatch(dispatch.dispatch_id)
-        if question is None:
-            raise NativePeerProtocolError(
-                "Native question has no registered correlation intent"
-            )
-        async with self._store.write_transaction():
-            receipt = await self._store.reconcile(
-                dispatch, candidates, operation_id=uuid4().hex
-            )
-            if receipt is not None and receipt.state is DispatchState.COMPLETE:
-                response = next(
-                    task for task in candidates if task.id == receipt.remote_task_id
-                )
-                await self._questions.record_answer(
-                    question.question_id, receipt, response
-                )
-        return receipt
+        response = self._store.reconciliation_candidate(dispatch, candidates)
+        if response is None:
+            return None
+        return await self._acknowledge(dispatch, response)
 
     @execution_work_stream
     async def subscribe(self, dispatch: OutboundDispatch):

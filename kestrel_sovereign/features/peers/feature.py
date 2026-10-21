@@ -1770,6 +1770,7 @@ class PeersFeature(Feature):
             open_dispatch=self._open_native_dispatch,
             dispatcher=agent.dispatcher,
             interval=interval,
+            max_interval=float(os.environ.get("KESTREL_A2A_QUESTION_MAX_POLL_SECONDS", "60")),
             is_current=lambda: (
                 vars(self).get("_question_supervisor") is supervisor
                 and self._native_question_store() is store

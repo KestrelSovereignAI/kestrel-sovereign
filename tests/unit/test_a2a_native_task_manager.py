@@ -355,7 +355,7 @@ class CompletingProvider:
     def __init__(self):
         self.calls = 0
 
-    async def handle_task(self, task):
+    async def handle_task(self, task, *, arguments=None):
         self.calls += 1
         task.artifacts.append(
             new_data_artifact("result", {"ok": True, "nested": [None, {}, []]})
@@ -373,14 +373,14 @@ class GatedCompletingProvider(CompletingProvider):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def handle_task(self, task):
+    async def handle_task(self, task, *, arguments=None):
         self.started.set()
         await self.release.wait()
-        return await super().handle_task(task)
+        return await super().handle_task(task, arguments=arguments)
 
 
 class FailingProvider(CompletingProvider):
-    async def handle_task(self, task):
+    async def handle_task(self, task, *, arguments=None):
         self.calls += 1
         raise ValueError("The requested tool operation failed")
 

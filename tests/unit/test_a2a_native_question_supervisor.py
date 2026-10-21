@@ -452,6 +452,7 @@ async def test_data_only_answer_retains_native_parts_and_can_hand_off_without_te
     [wake] = await p.store.pending_wakes()
     payload = json.loads(wake.payload_json)
     assert payload["reply_text"] == ""
+    assert payload["requires_full_response"] is True
     assert payload["request"] == MessageToDict(request.message)
     retained = await p.store.retained_response(receipt)
     assert MessageToDict(retained.parts[0].data) == {"result": {"value": 42}}

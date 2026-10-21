@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+from time import monotonic
 
 from a2a.utils.errors import A2AError
 
@@ -14,9 +15,13 @@ from kestrel_sovereign.a2a.stores.unified.outbound_store import (
     DispatchState,
     OutboundDispatchConflict,
 )
-from kestrel_sovereign.a2a.stores.unified.question_store import NativeQuestionStore
+from kestrel_sovereign.a2a.stores.unified.question_store import (
+    NativeQuestionStore,
+    QuestionResponseError,
+)
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.peers.directory import PeerDirectoryError
+from kestrel_sovereign.signals.dispatcher import DurableAdmissionDisposition
 from kestrel_sovereign.signals.sources.a2a_question_answered import (
     DURABLE_COGNITION_CONSUMER_ID,
     build_signal_for_question_answered,
@@ -41,6 +46,8 @@ class NativeQuestionSupervisor:
         dispatcher,
         interval: float,
         is_current,
+        max_interval: float | None = None,
+        clock=monotonic,
     ):
         if not isinstance(store, NativeQuestionStore):
             raise TypeError(
@@ -55,6 +62,20 @@ class NativeQuestionSupervisor:
             raise ValueError(
                 "Question observation interval must be a positive finite duration"
             )
+        if max_interval is None:
+            max_interval = interval
+        if (
+            isinstance(max_interval, bool)
+            or not isinstance(max_interval, (int, float))
+            or not math.isfinite(max_interval)
+            or max_interval < interval
+        ):
+            raise ValueError(
+                "Maximum question observation interval must be finite and at least the initial interval"
+            )
+        self._clock = clock
+        self._next_read: dict[str, tuple[float, float]] = {}
+        self.max_interval = max_interval
         self._is_current = is_current
         self.store = store
         self.open_dispatch = open_dispatch
@@ -96,7 +117,7 @@ class NativeQuestionSupervisor:
     async def recover_once(self) -> None:
         """One joined observation and handoff pass for explicit recovery."""
         await self._deadline_pass()
-        await self._read_pass()
+        await self._read_pass(force=True)
         await self.handoff_wakes()
 
     async def _deadline_pass(self) -> None:
@@ -105,10 +126,22 @@ class NativeQuestionSupervisor:
             self._require_current()
             await self._settle_local(question)
 
-    async def _read_pass(self) -> None:
+    async def _read_pass(self, *, force: bool = False) -> None:
         self._require_current()
-        for question in await self.store.unsettled():
+        questions = await self.store.unsettled()
+        live_ids = {question.question_id for question in questions}
+        self._next_read = {
+            key: schedule
+            for key, schedule in self._next_read.items()
+            if key in live_ids
+        }
+        for question in questions:
             self._require_current()
+            now = self._clock()
+            due, delay = self._next_read.get(question.question_id, (now, self.interval))
+            if not force and now < due:
+                continue
+            before = await self.store.outbound_store.get(question.dispatch_id)
             try:
                 await self._observe(question)
             except (
@@ -116,6 +149,7 @@ class NativeQuestionSupervisor:
                 A2AError,
                 NativePeerProtocolError,
                 NativeSenderProofError,
+                QuestionResponseError,
                 OutboundDispatchConflict,
             ) as error:
                 if is_execution_control_error(error):
@@ -127,6 +161,11 @@ class NativeQuestionSupervisor:
                     question.dispatch_id,
                     type(error).__name__,
                 )
+            after = await self.store.outbound_store.get(question.dispatch_id)
+            delay = (
+                self.interval if after != before else min(delay * 2, self.max_interval)
+            )
+            self._next_read[question.question_id] = (self._clock() + delay, delay)
 
     async def _settle_local(self, question):
         expired = self.store.deadline_passed(question)
@@ -193,6 +232,13 @@ class NativeQuestionSupervisor:
             if admission.signal_id != signal.id:
                 raise RuntimeError("Question wake received another signal's admission")
             self._require_current()
-            if admission.acknowledged:
+            if admission.disposition is DurableAdmissionDisposition.DELIVERY_FAILED:
+                if not await self.store.record_delivery_failure(wake):
+                    raise RuntimeError("Failed question delivery lost its outbox lease")
+                logger.error(
+                    "Native question cognition already failed terminally: event=%s",
+                    wake.event_id,
+                )
+            elif admission.acknowledged:
                 if not await self.store.confirm_handoff(wake):
                     raise RuntimeError("Durable question handoff lost its outbox lease")

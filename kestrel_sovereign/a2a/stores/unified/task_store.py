@@ -206,7 +206,19 @@ class TaskStore(UnifiedStoreBase):
         return self.scope.recipient_id, self.scope.tenant
 
     async def initialize(self) -> None:
-        """Create tables if not exists."""
+        """Create native tables without interpreting or settling old rows."""
+        from kestrel_sovereign.a2a.native_schema import (
+            native_schema_initialization,
+            publish_native_a2a_schema,
+        )
+
+        async with native_schema_initialization(self.backend):
+            await self._initialize_native_objects()
+            await publish_native_a2a_schema(self.backend)
+        logger.info("TaskStore initialized (%s)", self.backend.backend_type)
+
+    async def _initialize_native_objects(self) -> None:
+        """Canonical DDL, also used inside the exclusive offline cutover."""
         ts_type = self.timestamp_type()
         ts_default = self.now_default()
         json_type = self.json_type()
@@ -236,7 +248,8 @@ class TaskStore(UnifiedStoreBase):
                 lifecycle_updated_at {ts_type},
                 status_timestamp_seconds BIGINT,
                 status_timestamp_nanos INTEGER,
-                tenant TEXT NOT NULL DEFAULT ''
+                tenant TEXT NOT NULL DEFAULT '',
+                cognition_wake_eligible INTEGER NOT NULL DEFAULT 1 CHECK (cognition_wake_eligible IN (0,1))
             )
         """)
 
@@ -256,44 +269,13 @@ class TaskStore(UnifiedStoreBase):
         else:
             await self._ensure_cancellation_schema_objects()
 
-        # Pre-#3134 live rows have no trustworthy creator/recipient columns.
-        # Metadata was caller-controlled and a shared PostgreSQL table contains
-        # multiple recipients, so guessing either principal would mint power.
-        # Settle those rows explicitly instead of leaving work permanently live
-        # but uncancellable after upgrade. Operators and clients see a terminal
-        # failure with the migration reason; terminal legacy rows remain intact.
-        legacy_settlement = new_text_message(
-            "Task settled during the cancellation-authority upgrade: "
-            "its legacy row has no trustworthy creator/recipient binding"
-        )
-        settled = await self._backend.execute(
-            f"""
-            UPDATE a2a_tasks
-            SET status = 'failed',
-                message = ?,
-                lifecycle_revision = lifecycle_revision + 1,
-                lifecycle_updated_at = {self.now_sql()},
-                updated_at = {self.now_sql()}
-            WHERE status IN ('submitted', 'working', 'input-required', 'auth-required')
-              AND (creator_agent_id IS NULL OR recipient_agent_id IS NULL)
-            """,
-            (MessageToJson(legacy_settlement),),
-        )
-        if settled:
-            logger.warning(
-                "Settled %d live legacy A2A task(s) without durable authority",
-                settled,
-            )
-
-        logger.info(f"TaskStore initialized ({self._backend.backend_type})")
-
     async def _postgres_cancellation_schema_ready(self) -> bool:
         """Re-probe every PostgreSQL object protected by the migration lock."""
 
         row = await self._backend.fetch_one("""
             SELECT
                 (
-                    SELECT COUNT(*) = 12
+                    SELECT COUNT(*) = 13
                     FROM information_schema.columns
                     WHERE table_schema = current_schema()
                       AND table_name = 'a2a_tasks'
@@ -309,7 +291,8 @@ class TaskStore(UnifiedStoreBase):
                           'lifecycle_updated_at',
                           'status_timestamp_seconds',
                           'status_timestamp_nanos',
-                          'tenant'
+                          'tenant',
+                          'cognition_wake_eligible'
                       )
                 )
                 AND EXISTS (
@@ -364,6 +347,10 @@ class TaskStore(UnifiedStoreBase):
             ("status_timestamp_seconds", "BIGINT"),
             ("status_timestamp_nanos", "INTEGER"),
             ("tenant", "TEXT NOT NULL DEFAULT ''"),
+            (
+                "cognition_wake_eligible",
+                "INTEGER NOT NULL DEFAULT 1 CHECK (cognition_wake_eligible IN (0,1))",
+            ),
         ):
             await self.add_column_if_missing("a2a_tasks", column, sql_type)
 
@@ -1530,6 +1517,7 @@ class TaskStore(UnifiedStoreBase):
             f"""
             SELECT {_TASK_COLUMNS} FROM a2a_tasks
             WHERE {_TASK_SCOPE} AND recipient_agent_id = ?
+              AND cognition_wake_eligible = 1
               AND (
                     (
                         status IN ('submitted', 'working')

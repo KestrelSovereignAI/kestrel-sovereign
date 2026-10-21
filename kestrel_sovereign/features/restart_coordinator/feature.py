@@ -363,6 +363,7 @@ _INFRA_TASK_NAMES = frozenset({
     # Feature-owned bookkeeping: any workflow effect it admits is separately
     # tracked. The resident daemon is joined on disable/shutdown, not user work.
     "workflows:lease-recovery",
+    "native_a2a_question_recovery",
 })
 
 

@@ -893,3 +893,14 @@ async def test_official_client_commits_taskless_question_answer_with_its_receipt
         assert len(p.trace) == 1
     finally:
         await session.close()
+
+
+async def test_reconciliation_cannot_take_over_an_active_original_submission(peer_session):
+    p = peer_session
+    dispatch, wire = await reserve(p)
+    submitting = await p.store.begin_submission(dispatch, operation_id="original")
+    with p.store.active_submission(dispatch):
+        with pytest.raises(OutboundDispatchConflict, match="still active"):
+            await p.session.reconcile(submitting)
+    assert await p.store.get(dispatch.dispatch_id) == submitting
+    assert p.state.received_messages == 0

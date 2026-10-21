@@ -16,11 +16,11 @@ from a2a.types import (
     TaskStatus,
 )
 
+from kestrel_sovereign.a2a.native_schema import NativeA2AMigrationRequired
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified.outbound_store import (
     DispatchState,
     OutboundDispatchConflict,
-    OutboundMigrationRequired,
     OutboundStore,
 )
 
@@ -350,7 +350,7 @@ async def test_draft_rows_require_explicit_migration_before_native_startup(outbo
     await outbound.backend.execute(
         "INSERT INTO a2a_outbound_tasks VALUES (?)", ("historical",)
     )
-    with pytest.raises(OutboundMigrationRequired, match="offline migration"):
+    with pytest.raises(NativeA2AMigrationRequired, match="offline migration"):
         await outbound.initialize()
     assert await outbound.backend.fetch_one(
         "SELECT task_id FROM a2a_outbound_tasks"
@@ -505,7 +505,7 @@ async def test_real_manager_refuses_draft_outbound_data_before_other_schema_writ
     try:
         await backend.execute("CREATE TABLE a2a_outbound_tasks (task_id TEXT)")
         await backend.execute("INSERT INTO a2a_outbound_tasks VALUES (?)", ("draft",))
-        with pytest.raises(OutboundMigrationRequired):
+        with pytest.raises(NativeA2AMigrationRequired):
             await manager.initialize()
         assert not await backend.table_exists("a2a_tasks")
         assert not await backend.table_exists("a2a_outbound_dispatches")

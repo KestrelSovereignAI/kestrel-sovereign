@@ -35,10 +35,6 @@ class DispatchState(StrEnum):
     COMPLETE = "complete"
 
 
-class OutboundMigrationRequired(RuntimeError):
-    """Draft outbound rows require explicit offline provenance migration."""
-
-
 class OutboundDispatchConflict(ValueError):
     """An outbound identity, original message or remote receipt conflicts."""
 
@@ -169,14 +165,12 @@ class OutboundStore(UnifiedStoreBase):
         return timestamp.astimezone(UTC).isoformat()
 
     async def initialize(self) -> None:
-        if await self.backend.table_exists("a2a_outbound_tasks"):
-            legacy = await self.backend.fetch_one(
-                "SELECT 1 FROM a2a_outbound_tasks LIMIT 1"
-            )
-            if legacy is not None:
-                raise OutboundMigrationRequired(
-                    "Draft A2A outbound rows require offline migration before native startup"
-                )
+        from kestrel_sovereign.a2a.native_schema import native_schema_initialization
+
+        async with native_schema_initialization(self.backend):
+            await self._initialize_native_objects()
+
+    async def _initialize_native_objects(self) -> None:
         states = ", ".join(f"'{state.value}'" for state in DispatchState)
         await self.backend.execute_script(f"""
             CREATE TABLE IF NOT EXISTS a2a_outbound_dispatches (
@@ -503,6 +497,42 @@ class OutboundStore(UnifiedStoreBase):
         *,
         operation_id: str,
     ) -> OutboundDispatch | None:
+        remote_id, complete, digest = self.validate_response(dispatch, response)
+        return await self._transition(
+            dispatch,
+            sources=(
+                DispatchState.SUBMITTING,
+                DispatchState.UNKNOWN,
+                DispatchState.ACKNOWLEDGED,
+                DispatchState.COMPLETE,
+            ),
+            state=DispatchState.COMPLETE if complete else DispatchState.ACKNOWLEDGED,
+            operation_id=operation_id,
+            receipt=(
+                remote_id,
+                response.context_id,
+                digest,
+                "task" if isinstance(response, Task) else "message",
+                task_state_label(response.status.state)
+                if isinstance(response, Task)
+                else None,
+            ),
+            cancellation=(
+                dispatch.cancel_operation_id,
+                dispatch.cancel_request_digest,
+                DispatchState.COMPLETE,
+            )
+            if complete
+            and dispatch.cancel_operation_id
+            and dispatch.cancel_request_digest
+            else None,
+        )
+
+    @staticmethod
+    def validate_response(
+        dispatch: OutboundDispatch, response: Task | Message
+    ) -> tuple[str | None, bool, str]:
+        """Check peer data before entering a receipt persistence transaction."""
         if not isinstance(response, (Task, Message)):
             raise TypeError(
                 "Native outbound acknowledgement requires an official Task or Message"
@@ -543,35 +573,7 @@ class OutboundStore(UnifiedStoreBase):
         digest = hashlib.sha256(
             response.SerializeToString(deterministic=True)
         ).hexdigest()
-        return await self._transition(
-            dispatch,
-            sources=(
-                DispatchState.SUBMITTING,
-                DispatchState.UNKNOWN,
-                DispatchState.ACKNOWLEDGED,
-                DispatchState.COMPLETE,
-            ),
-            state=DispatchState.COMPLETE if complete else DispatchState.ACKNOWLEDGED,
-            operation_id=operation_id,
-            receipt=(
-                remote_id,
-                response.context_id,
-                digest,
-                "task" if isinstance(response, Task) else "message",
-                task_state_label(response.status.state)
-                if isinstance(response, Task)
-                else None,
-            ),
-            cancellation=(
-                dispatch.cancel_operation_id,
-                dispatch.cancel_request_digest,
-                DispatchState.COMPLETE,
-            )
-            if complete
-            and dispatch.cancel_operation_id
-            and dispatch.cancel_request_digest
-            else None,
-        )
+        return remote_id, complete, digest
 
     async def reconcile(
         self,
@@ -585,6 +587,16 @@ class OutboundStore(UnifiedStoreBase):
         Zero matches retain uncertainty. Multiple matching tasks are ambiguous;
         neither condition grants permission to resubmit the original message.
         """
+        response = self.reconciliation_candidate(dispatch, candidates)
+        if response is None:
+            return None
+        return await self.acknowledge(dispatch, response, operation_id=operation_id)
+
+    @staticmethod
+    def reconciliation_candidate(
+        dispatch: OutboundDispatch, candidates: list[Task]
+    ) -> Task | None:
+        """Select the unique original-message witness without mutating receipts."""
         if dispatch.state is not DispatchState.UNKNOWN:
             raise OutboundDispatchConflict(
                 "Only an unknown submission can be reconciled"
@@ -623,6 +635,4 @@ class OutboundStore(UnifiedStoreBase):
             raise OutboundDispatchConflict(
                 "More than one remote task claims the original message"
             )
-        return await self.acknowledge(
-            dispatch, next(iter(matches.values())), operation_id=operation_id
-        )
+        return next(iter(matches.values()))

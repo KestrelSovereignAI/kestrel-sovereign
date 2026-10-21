@@ -18,8 +18,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Optional,
-    Protocol,
-    runtime_checkable,
 )
 from uuid import uuid4
 
@@ -57,6 +55,7 @@ from kestrel_sovereign.a2a.lifecycle import (
     task_state_label,
 )
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.a2a.skill_handler import TaskHandler
 from kestrel_sovereign.a2a.stores import (
     FeedbackStore,
     MemoryService,
@@ -84,19 +83,6 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks import HooksManager
-
-
-@runtime_checkable
-class TaskHandler(Protocol):
-    """Protocol for A2A task handling."""
-
-    async def handle_task(self, task: Task) -> Task:
-        """Handle an A2A task and return the updated task."""
-        ...
-
-    def get_skill_for_command(self, command: str) -> str | None:
-        """Find the skill that handles a given command prefix."""
-        ...
 
 
 logger = logging.getLogger(__name__)
@@ -264,7 +250,8 @@ class TaskManager:
     def outbound_for_actor(self, actor_id: str) -> OutboundStore:
         """Return the one outbound ledger bound to this actor and primary store."""
         if (
-            not isinstance(actor_id, str) or not actor_id.strip()
+            not isinstance(actor_id, str)
+            or not actor_id.strip()
             or not isinstance(self.task_store, TaskStore)
             or not isinstance(self.outbound_store, OutboundStore)
             or self.host_agent_id != actor_id
@@ -285,17 +272,20 @@ class TaskManager:
         return self.question_store
 
     async def initialize(self) -> None:
-        """Initialize all stores."""
-        await self.outbound_store.initialize()
-        await self.question_store.initialize()
-        await self.task_store.initialize()
-        await self.context_store.initialize()
-        await self.session_service.initialize()
-        await self.observability_store.initialize()
-        if self.memory_service:
-            await self.memory_service.initialize()
-        if self.feedback_store:
-            await self.feedback_store.initialize()
+        """Initialize all stores after the read-only stored-protocol gate."""
+        from kestrel_sovereign.a2a.native_schema import native_schema_initialization
+
+        async with native_schema_initialization(self.task_store.backend):
+            await self.outbound_store.initialize()
+            await self.question_store.initialize()
+            await self.task_store.initialize()
+            await self.context_store.initialize()
+            await self.session_service.initialize()
+            await self.observability_store.initialize()
+            if self.memory_service:
+                await self.memory_service.initialize()
+            if self.feedback_store:
+                await self.feedback_store.initialize()
         logger.info("TaskManager initialized with all stores")
 
     async def close(self) -> None:
@@ -559,7 +549,7 @@ class TaskManager:
         if sync:
             # Execute synchronously with transaction safety
             expected_state = task.status.state
-            task = await handler.handle_task(task)
+            task = await handler.handle_task(task, arguments=args)
             # The canonical outcome writer owns CAS and uncertain-commit
             # reconciliation. A persistence failure must reach the caller; an
             # extra transaction/retry cannot manufacture a completed receipt.
@@ -596,6 +586,7 @@ class TaskManager:
                     handler,
                     Task.FromString(task.SerializeToString()),
                     authority_agent_id,
+                    arguments=args,
                 ),
                 task.id,
                 authority_agent_id,
@@ -745,13 +736,15 @@ class TaskManager:
         handler: TaskHandler,
         task: Task,
         authority_agent_id: str,
+        *,
+        arguments: dict[str, Any] | None = None,
     ) -> None:
         """Execute a task asynchronously and update the store."""
         expected_state = task.status.state
         baseline = Task.FromString(task.SerializeToString())
         try:
             try:
-                task = await handler.handle_task(task)
+                task = await handler.handle_task(task, arguments=arguments)
             except Exception as error:
                 if is_execution_control_error(error):
                     raise
@@ -1367,9 +1360,16 @@ class TaskManager:
         baseline = Task.FromString(task.SerializeToString())
         if new_state in TERMINAL_STATES and message is not None:
             reply_metadata = MessageToDict(message.metadata)
-            answer_metadata = correlated_answer_metadata(MessageToDict(task.metadata), reply_metadata)
-            if parse_question_correlation(answer_metadata) is not None and message.role != Role.ROLE_AGENT:
-                raise InvalidParamsError(message="A question answer must have the agent role")
+            answer_metadata = correlated_answer_metadata(
+                MessageToDict(task.metadata), reply_metadata
+            )
+            if (
+                parse_question_correlation(answer_metadata) is not None
+                and message.role != Role.ROLE_AGENT
+            ):
+                raise InvalidParamsError(
+                    message="A question answer must have the agent role"
+                )
             if answer_metadata != reply_metadata:
                 message = Message.FromString(message.SerializeToString())
                 message.metadata.update(answer_metadata)

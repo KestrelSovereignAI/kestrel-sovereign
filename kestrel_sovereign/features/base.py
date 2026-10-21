@@ -15,9 +15,7 @@ from typing import (
     List,
     Mapping,
     Optional,
-    Protocol,
     Union,
-    runtime_checkable,
 )
 from typing import (
     Type as Type,
@@ -54,6 +52,8 @@ from kestrel_sdk.tools.base import AgentTool, ToolSchema
 from kestrel_sdk.tools.base import ToolCategory as ToolCategory
 from kestrel_sdk.tools.base import ToolParameter as ToolParameter
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
+from kestrel_sovereign.a2a.skill_handler import TaskHandler as TaskHandler
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
@@ -301,12 +301,6 @@ def _subagent_turn_identity(session_id: Optional[str]):
     return LLMInvocationContext(session_id=session_id)
 
 
-@runtime_checkable
-class TaskHandler(Protocol):
-    """Protocol for A2A task handling. Features implement this."""
-    async def handle_task(self, task: Task) -> Task:
-        """Handle an A2A task and return the updated task."""
-        ...
 
 
 class Feature(_SdkFeature):
@@ -1293,7 +1287,9 @@ class Feature(_SdkFeature):
     # A2A Protocol Implementation
     # =========================================================================
 
-    async def handle_task(self, task: Task) -> Task:
+    async def handle_task(
+        self, task: Task, *, arguments: dict[str, Any] | None = None
+    ) -> Task:
         """Execute an explicit skill using native A2A task and artifact values.
 
         The SDK Feature contributes skills from ToolSchema. The host owns its
@@ -1303,7 +1299,7 @@ class Feature(_SdkFeature):
             raise TypeError("Feature task handling requires an official A2A Task")
         metadata = MessageToDict(task.metadata)
         skill_name = metadata.get("skill")
-        args = metadata.get("args", {})
+        args = metadata.get("args", {}) if arguments is None else arguments
         if not isinstance(skill_name, str) or not skill_name:
             task.status.CopyFrom(
                 TaskStatus(
@@ -1332,6 +1328,8 @@ class Feature(_SdkFeature):
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         try:
             result = await selected.execute(**args)
+            result = _serialize_tool_result(result)
+            artifact = new_data_artifact(f"{skill_name}_result", result)
         except Exception as error:
             if is_execution_control_error(error):
                 raise
@@ -1347,10 +1345,12 @@ class Feature(_SdkFeature):
                 )
             )
             return task
-        task.artifacts.append(new_data_artifact(f"{skill_name}_result", result))
+        task.artifacts.append(artifact)
         failed = (
-            is_flat_toolresult_envelope(result)
-            and result["status"] == ToolResultStatus.ERROR
+            isinstance(result, dict) and (
+                result.get("success") is False
+                or (is_flat_toolresult_envelope(result) and result["status"] == ToolResultStatus.ERROR)
+            )
         )
         task.status.CopyFrom(
             TaskStatus(
@@ -1358,7 +1358,7 @@ class Feature(_SdkFeature):
                 if failed
                 else TaskState.TASK_STATE_COMPLETED,
                 message=new_text_message(
-                    f"Failed {skill_name}" if failed else f"Completed {skill_name}",
+                    str(result.get("error") or "Tool reported failure without error details") if failed else f"Completed {skill_name}",
                     task_id=task.id,
                     context_id=task.context_id,
                 ),

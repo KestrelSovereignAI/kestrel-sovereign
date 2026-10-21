@@ -5871,6 +5871,7 @@ def test_kinds_only_description_withholds_every_per_instance_tail():
         # Durable dispatcher owner-liveness tick, a fresh task every ~40s.
         "durable_signal_owner_heartbeat:did:pkh:eip155:1:0xabc",
         "workflows:lease-recovery",
+        "native_a2a_question_recovery",
     ],
 )
 def test_permanent_bookkeeping_daemons_are_infrastructure(name):

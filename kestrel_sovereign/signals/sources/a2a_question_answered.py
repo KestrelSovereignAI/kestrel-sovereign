@@ -85,6 +85,9 @@ def _a2a_question_answered_schema(payload: dict) -> dict:
         raise ValueError(
             "a2a.question_answered payload origin_session_id must be a string"
         )
+    if not isinstance(payload.get("requires_full_response", False), bool):
+        raise ValueError("a2a.question_answered requires_full_response must be boolean")
+    payload.setdefault("requires_full_response", False)
     if "truncated" in payload and not isinstance(payload["truncated"], bool):
         raise ValueError("a2a.question_answered payload truncated must be a bool")
     if "late" in payload:
