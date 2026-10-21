@@ -533,7 +533,9 @@ async def test_signal_dispatch_does_not_call_an_unreachable_github_nothing_to_do
     agent = _dispatch_agent(registration=None)
     feat = _make_feature({}, agent=agent)
 
-    async def unreachable(view, diagnostics=None, run_history=None, talon_workspaces=None):
+    async def unreachable(
+        view, diagnostics=None, run_history=None, talon_workspaces=None, work_orders=None
+    ):
         diagnostics.update(blockers_checked=3, blockers_unreadable=3)
         return None
 
@@ -557,7 +559,9 @@ async def test_signal_dispatch_still_says_nothing_to_do_when_github_answered():
     agent = _dispatch_agent(registration=None)
     feat = _make_feature({}, agent=agent)
 
-    async def all_closed(view, diagnostics=None, run_history=None, talon_workspaces=None):
+    async def all_closed(
+        view, diagnostics=None, run_history=None, talon_workspaces=None, work_orders=None
+    ):
         diagnostics.update(blockers_checked=3, blockers_unreadable=0)
         return None
 
@@ -622,7 +626,9 @@ async def test_signal_dispatch_one_unreadable_candidate_is_still_unconfirmed():
     agent = _dispatch_agent(registration=None)
     feat = _make_feature({}, agent=agent)
 
-    async def mixed(view, diagnostics=None, run_history=None, talon_workspaces=None):
+    async def mixed(
+        view, diagnostics=None, run_history=None, talon_workspaces=None, work_orders=None
+    ):
         diagnostics.update(
             blockers_checked=0, candidates_checked=3, candidates_unreadable=1,
         )
@@ -646,7 +652,9 @@ async def test_signal_dispatch_says_nothing_to_do_when_candidate_linkage_answere
     agent = _dispatch_agent(registration=None)
     feat = _make_feature({}, agent=agent)
 
-    async def all_in_flight(view, diagnostics=None, run_history=None, talon_workspaces=None):
+    async def all_in_flight(
+        view, diagnostics=None, run_history=None, talon_workspaces=None, work_orders=None
+    ):
         diagnostics.update(candidates_checked=2, candidates_unreadable=0)
         return None
 
@@ -678,7 +686,9 @@ async def test_signal_dispatch_says_why_an_in_flight_issue_was_not_selected(mode
     agent = _dispatch_agent(registration=SimpleNamespace(owner="feature:x"))
     feat = _make_feature({}, agent=agent)
 
-    async def only_in_flight(view, diagnostics=None, run_history=None, talon_workspaces=None):
+    async def only_in_flight(
+        view, diagnostics=None, run_history=None, talon_workspaces=None, work_orders=None
+    ):
         diagnostics.update(
             blockers_checked=1, blockers_unreadable=0,
             open_pr_exclusions=[dict(_IN_FLIGHT)],
@@ -705,7 +715,9 @@ async def test_signal_dispatch_reports_skips_alongside_the_issue_it_dispatched()
     agent = _dispatch_agent(registration=registration)
     feat = _make_feature({}, agent=agent)
 
-    async def skip_then_pick(view, diagnostics=None, run_history=None, talon_workspaces=None):
+    async def skip_then_pick(
+        view, diagnostics=None, run_history=None, talon_workspaces=None, work_orders=None
+    ):
         diagnostics.update(open_pr_exclusions=[dict(_IN_FLIGHT)])
         return dict(_TOP_ISSUE)
 

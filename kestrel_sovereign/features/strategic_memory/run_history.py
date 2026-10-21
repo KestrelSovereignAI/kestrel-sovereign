@@ -115,6 +115,16 @@ class TalonRun:
         """Whether the run stopped to ask something instead of opening a PR."""
         return self.disposition in QUESTION_DISPOSITIONS
 
+    @property
+    def awaits_new_input(self) -> bool:
+        """Whether running the issue again now would be this run again.
+
+        For a local Talon run, that is a run that asked a question. A run on
+        a delegated work order (#3758) widens it to the outcomes after which
+        the executor does nothing further without new input.
+        """
+        return self.ended_with_question
+
 
 @dataclass(frozen=True)
 class RunHistory:

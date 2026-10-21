@@ -41,6 +41,13 @@ def parse_instant(value: Any) -> Optional[datetime]:
     return moment.astimezone(timezone.utc)
 
 
+
+def format_instant(value: Any) -> Any:
+    """An ISO-8601 timestamp as ``YYYY-MM-DD HH:MM UTC`` for an operator to
+    read, or ``value`` unchanged when it is not one."""
+    moment = parse_instant(value)
+    return moment.strftime("%Y-%m-%d %H:%M UTC") if moment is not None else value
+
 def contract_created_at(value: Any) -> Optional[str]:
     """Return ``value`` in the graph ``created_at`` contract, or ``None``.
 

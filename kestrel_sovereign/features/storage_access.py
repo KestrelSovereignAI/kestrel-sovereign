@@ -90,8 +90,9 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     scope (``hold/enforcement.py``), and (#3164) the host Hold door's latch
     target, which must address exactly the row turn-start reads —
     a latch written against any other identity is never read by anything
-    — (#3169) the peer Stop recipient's own Stop address, and (#3168) the
-    holder a descendant Hold is set under by the spawn feature. The owner
+    — (#3169) the peer Stop recipient's own Stop address, (#3168) the
+    holder a descendant Hold is set under by the spawn feature, and (#3758)
+    the owner of the delegated work-order journal. The owner
     whose Workflows runs the Morning Signal reports is not among them: that
     is :func:`resolve_workflow_owner_did` (#3533).
     They had drifted — one gated on truthiness alone,

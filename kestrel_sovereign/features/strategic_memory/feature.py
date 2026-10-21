@@ -30,8 +30,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
+from kestrel_sovereign.waits.reconciler import register_wait_watch
 
 from .atomic_file import (
     file_digest as _strategy_digest,
@@ -88,6 +90,30 @@ from .ledger_index import (
 from .morning_signal import generate_morning_signal
 from .run_history import RunHistoryUnreadable, read_run_history
 from .session_log import collect_session_log
+from .timestamps import format_instant
+from .work_orders import (
+    STATE_NOT_SENT,
+    STATE_RESERVED,
+    STATE_SENDING,
+    STATE_SENT,
+    STATE_UNCONFIRMED,
+    WORK_ORDER_ARTIFACT,
+    WORK_ORDER_SCHEMA,
+    InvalidDispatchExecutor,
+    JournalEntry,
+    WorkOrderJournal,
+    WorkOrderLedger,
+    WorkOrderNotReleasable,
+    WorkOrdersUnreadable,
+    build_work_order,
+    describe_attempt_row,
+    dispatch_executor,
+    open_work_order_journal,
+    read_send_attempt,
+    read_work_orders,
+    work_order_message,
+    work_order_window,
+)
 from .workflow_runs import assess_workflow_runs
 from .workspace_readiness import TalonWorkspaceProviderOutdated, talon_workspaces
 
@@ -119,6 +145,9 @@ _DISPATCH_MODE_ALIASES = {
 # ``workflow_run``.  Both must be live before execute mode is admitted.
 _DEFAULT_DISPATCH_WORKFLOW = "fleet_coding_pipeline"
 _WORKFLOW_RUN_TOOL = "workflow_run"
+# With ``morning_signal_config.dispatch_executor`` set, the pick goes to that
+# agent as a work order over the governed A2A task tool instead (#3758).
+_SEND_A2A_TASK_TOOL = "send_a2a_task"
 #: Every ``reason_code`` a failed ``signal_dispatch`` result can carry. The
 #: scheduler admits a code into the dispatch failure (and so into
 #: ``signal_log.error``) only by membership here — see
@@ -146,6 +175,25 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         # its dispatch would run in (or its provider has no read that says),
         # and no other candidate was selected; not "nothing to do" (#3548).
         "TALON_WORKSPACE_UNCONFIRMED",
+        # Delegated execution (#3758). ``dispatch_executor`` is set but names
+        # no agent; refused rather than launched locally.
+        "INVALID_DISPATCH_EXECUTOR",
+        # The orders sent to the executor, and its answers, stand in for its
+        # run history; they could not be read whole, so nothing is selected.
+        "WORK_ORDERS_UNCONFIRMED",
+        # No governed send_a2a_task, the send raised, or it was not accepted,
+        # and the outbound record shows the order did not reach the executor.
+        "WORK_ORDER_TRANSPORT_UNAVAILABLE",
+        "WORK_ORDER_SEND_FAILED",
+        "WORK_ORDER_REJECTED",
+        # The send failed, and the order may still have reached the executor:
+        # it is kept open, holding the lane and its issue, not discarded.
+        "WORK_ORDER_DELIVERY_UNCONFIRMED",
+        # The dispatch's lane reservation lapsed during selection and another
+        # reader released it; nothing was sent.
+        "WORK_ORDER_LANE_LOST",
+        # The order was sent, but the wake on its report was not armed.
+        "WORK_ORDER_WAKE_UNARMED",
     }
 )
 #: The ``reason_code`` a failed ``strategy_reconcile_blockers`` result can
@@ -324,6 +372,9 @@ class StrategicMemoryFeature(Feature):
         # in-memory change that never reached disk (#3320). Projection runs
         # AFTER release: it reads only the snapshot, never the live ledger.
         self._ledger_mutation_lock = asyncio.Lock()
+        #: The journal of delegated work orders (#3758), opened on first use
+        #: so an agent that never delegates never creates it.
+        self._work_orders: Optional[WorkOrderJournal] = None
 
     @property
     def tool_description(self) -> str:
@@ -2117,13 +2168,14 @@ class StrategicMemoryFeature(Feature):
             data={"briefing": briefing},
         )
 
+    def _morning_signal_config(self) -> Dict[str, Any]:
+        config = self._data.get("morning_signal_config", {})
+        return config if isinstance(config, dict) else {}
+
     def _dispatch_workflow_name(self) -> str:
         """Return the stable workflow capability selected by strategy config."""
 
-        config = self._data.get("morning_signal_config", {})
-        configured = (
-            config.get("dispatch_workflow") if isinstance(config, dict) else None
-        )
+        configured = self._morning_signal_config().get("dispatch_workflow")
         name = str(configured or _DEFAULT_DISPATCH_WORKFLOW).strip()
         return name or _DEFAULT_DISPATCH_WORKFLOW
 
@@ -2163,19 +2215,39 @@ class StrategicMemoryFeature(Feature):
             return dict(result)
         return {"result": str(result)}
 
+    @staticmethod
+    def _dispatch_accepted(result: Any) -> bool:
+        """Whether a governed named tool confirmed it accepted the dispatch."""
+        return (
+            isinstance(result, ToolResult) and result.status.value == "ok"
+        ) or (
+            isinstance(result, dict)
+            and (result.get("status") == "ok" or result.get("success") is True)
+        )
+
     @tool(
         name="signal_dispatch",
         description=(
             "Pick the highest-priority issue from strategic memory and start "
-            "it through a live feature-contributed dispatch workflow. Preview "
-            "with mode='suggest'; execute fails closed when no compatible "
-            "workflow capability and governed runner are enabled."
+            "it through a live feature-contributed dispatch workflow, or, when "
+            "morning_signal_config.dispatch_executor names a peer agent, send "
+            "it to that executor as a kestrel.work_order/v1 A2A task and arm "
+            "a wake on its report. Preview with mode='suggest'; execute fails "
+            "closed when no compatible workflow capability and governed "
+            "runner (or A2A transport) are enabled."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!dispatch",
     )
     async def signal_dispatch(self, mode: str = "execute") -> ToolResult:
-        """Preview or execute the top issue through generic workflow contracts."""
+        """Preview or execute the top issue through generic workflow contracts.
+
+        With ``morning_signal_config.dispatch_executor`` set, this agent keeps
+        selection and the named executor runs the pick (#3758): execute sends
+        a work order instead of launching locally, and the selection guards
+        read the ledger of orders sent to that executor instead of this
+        agent's own Talon registry.
+        """
 
         mode = _normalize_choice(mode or "", _DISPATCH_MODE_ALIASES)
         if mode not in ("execute", "suggest"):
@@ -2188,80 +2260,279 @@ class StrategicMemoryFeature(Feature):
                 },
             )
 
-        workflow_name = self._dispatch_workflow_name()
+        heading = "## Signal Dispatch" + (" (suggest)" if mode == "suggest" else "")
+        config = self._morning_signal_config()
         try:
-            run_history = await read_run_history(self.agent)
-        except RunHistoryUnreadable as exc:
-            # The registry is how selection knows an issue's last run asked a
-            # question nobody has answered (#3398). Selecting without all of
-            # it could dispatch that same run again.
-            return ToolResult.partial(
-                confirmation=(
-                    "## Signal Dispatch"
-                    + (" (suggest)" if mode == "suggest" else "")
-                    + f"\nCould not confirm Talon's run history: {exc}. Nothing "
-                    "was dispatched -- without it, re-dispatching an issue "
-                    "whose last run is still waiting on an answer cannot be "
-                    "ruled out. This is not the same as having nothing to do."
-                ),
-                error=f"Talon's run history is unconfirmed: {exc}",
+            executor = dispatch_executor(config)
+        except InvalidDispatchExecutor as exc:
+            # Falling back to a local launch is the launch the setting exists
+            # to prevent.
+            return ToolResult.failed(
+                f"{exc}; nothing was selected or dispatched.",
                 data={
                     "mode": mode,
                     "issue": None,
-                    "workflow": workflow_name,
+                    "workflow": None,
+                    "executor": None,
                     "dispatched": False,
                     "skipped": [],
-                    "reason_code": "RUN_HISTORY_UNCONFIRMED",
-                    # Set when the provider predates the read (#3446): an
-                    # upgrade fixes it, where a retry does not.
-                    "requirement": exc.requirement,
+                    "reason_code": "INVALID_DISPATCH_EXECUTOR",
                 },
             )
+        workflow_name = None if executor else self._dispatch_workflow_name()
+        target: Dict[str, Any] = {"workflow": workflow_name, "executor": executor}
+
+        work_orders = None
+        if executor is None:
+            try:
+                run_history = await read_run_history(self.agent)
+            except RunHistoryUnreadable as exc:
+                # The registry is how selection knows an issue's last run
+                # asked a question nobody has answered (#3398). Selecting
+                # without all of it could dispatch that same run again.
+                return ToolResult.partial(
+                    confirmation=(
+                        heading
+                        + f"\nCould not confirm Talon's run history: {exc}. Nothing "
+                        "was dispatched -- without it, re-dispatching an issue "
+                        "whose last run is still waiting on an answer cannot be "
+                        "ruled out. This is not the same as having nothing to do."
+                    ),
+                    error=f"Talon's run history is unconfirmed: {exc}",
+                    data={
+                        "mode": mode,
+                        "issue": None,
+                        **target,
+                        "dispatched": False,
+                        "skipped": [],
+                        "reason_code": "RUN_HISTORY_UNCONFIRMED",
+                        # Set when the provider predates the read (#3446): an
+                        # upgrade fixes it, where a retry does not.
+                        "requirement": exc.requirement,
+                    },
+                )
+            try:
+                workspaces = talon_workspaces(self.agent)
+            except TalonWorkspaceProviderOutdated as exc:
+                # Without the read, a candidate in a repository nobody has
+                # provisioned a Talon workspace for is started and then fails
+                # at talon_run, unattended (#3548).
+                return ToolResult.partial(
+                    confirmation=(
+                        heading
+                        + f"\nCould not confirm which repositories have a Talon "
+                        f"workspace: {exc}. Nothing was dispatched -- without it, "
+                        "a run could be started for a repository whose workspace "
+                        "Talon then refuses. This is not the same as having "
+                        "nothing to do."
+                    ),
+                    error=f"Talon workspace readiness is unconfirmed: {exc}",
+                    data={
+                        "mode": mode,
+                        "issue": None,
+                        **target,
+                        "dispatched": False,
+                        "skipped": [],
+                        "reason_code": "TALON_WORKSPACE_UNCONFIRMED",
+                        "requirement": exc.requirement,
+                    },
+                )
+        else:
+            # The executor's runs are not in this agent's Talon registry, so
+            # that registry is not read: the journal of orders sent to the
+            # executor, and its answers to them, stands in for its run history
+            # (#3758). It checks its own workspace before it claims; an order
+            # it cannot run comes back not executed and withholds the issue.
+            def unconfirmed_orders(exc: WorkOrdersUnreadable) -> ToolResult:
+                return ToolResult.partial(
+                    confirmation=(
+                        heading
+                        + f"\nCould not read the work orders sent to {executor}: "
+                        f"{exc}. Nothing was dispatched -- without them, an "
+                        f"issue {executor} still holds, or whose last order is "
+                        "still waiting on an answer, could be ordered again. "
+                        "This is not the same as having nothing to do."
+                    ),
+                    error=f"The work orders sent to {executor} are unconfirmed: {exc}",
+                    data={
+                        "mode": mode,
+                        "issue": None,
+                        **target,
+                        "dispatched": False,
+                        "skipped": [],
+                        "reason_code": "WORK_ORDERS_UNCONFIRMED",
+                    },
+                )
+
+            try:
+                journal = await self._work_order_journal()
+                work_orders = await read_work_orders(
+                    self.agent, executor, journal=journal,
+                    window=work_order_window(config),
+                )
+            except WorkOrdersUnreadable as exc:
+                return unconfirmed_orders(exc)
+            run_history = work_orders.run_history()
+            workspaces = None
+            if mode == "execute":
+                # One order runs at a time. Ordering into a busy lane queues
+                # a second order behind the first, each run, unattended.
+                if not work_orders.lane_idle:
+                    return self._executor_lane_busy(
+                        heading, mode, target, executor, work_orders.lane()
+                    )
+                # The idle read and the send are separated by selection, which
+                # awaits GitHub per candidate. The reservation holds the lane
+                # across both: a dispatch running alongside this one finds it
+                # and stops, before it selects or sends anything.
+                try:
+                    reservation = await journal.reserve(executor)
+                except WorkOrdersUnreadable as exc:
+                    return unconfirmed_orders(exc)
+                if reservation is None:
+                    try:
+                        lane = (
+                            await read_work_orders(
+                                self.agent, executor, journal=journal,
+                                window=work_order_window(config),
+                            )
+                        ).lane()
+                    except WorkOrdersUnreadable as exc:
+                        return unconfirmed_orders(exc)
+                    return self._executor_lane_busy(
+                        heading, mode, target, executor, lane
+                    )
+                try:
+                    return await self._select_and_dispatch(
+                        mode=mode, heading=heading, executor=executor,
+                        workflow_name=workflow_name, target=target,
+                        run_history=run_history, workspaces=workspaces,
+                        work_orders=work_orders, journal=journal,
+                        reservation=reservation,
+                    )
+                finally:
+                    # A no-op once the order was named for sending: only a
+                    # reservation that never became an order is withdrawn.
+                    await self._withdraw_reservation(journal, reservation)
+        return await self._select_and_dispatch(
+            mode=mode, heading=heading, executor=executor,
+            workflow_name=workflow_name, target=target,
+            run_history=run_history, workspaces=workspaces,
+            work_orders=work_orders,
+        )
+
+    async def _work_order_journal(self) -> WorkOrderJournal:
+        """The journal of delegated work orders (#3758), opened once."""
+        if self._work_orders is None:
+            self._work_orders = await open_work_order_journal(self.agent)
+        return self._work_orders
+
+    @staticmethod
+    async def _withdraw_reservation(
+        journal: WorkOrderJournal, reservation: JournalEntry
+    ) -> None:
         try:
-            workspaces = talon_workspaces(self.agent)
-        except TalonWorkspaceProviderOutdated as exc:
-            # Without the read, a candidate in a repository nobody has
-            # provisioned a Talon workspace for is started and then fails at
-            # talon_run, unattended (#3548).
-            return ToolResult.partial(
-                confirmation=(
-                    "## Signal Dispatch"
-                    + (" (suggest)" if mode == "suggest" else "")
-                    + f"\nCould not confirm which repositories have a Talon "
-                    f"workspace: {exc}. Nothing was dispatched -- without it, "
-                    "a run could be started for a repository whose workspace "
-                    "Talon then refuses. This is not the same as having "
-                    "nothing to do."
-                ),
-                error=f"Talon workspace readiness is unconfirmed: {exc}",
-                data={
-                    "mode": mode,
-                    "issue": None,
-                    "workflow": workflow_name,
-                    "dispatched": False,
-                    "skipped": [],
-                    "reason_code": "TALON_WORKSPACE_UNCONFIRMED",
-                    "requirement": exc.requirement,
-                },
+            await journal.withdraw(reservation.order_key)
+        except WorkOrdersUnreadable as exc:
+            # Its lease lapses and the next read withdraws it.
+            logger.warning(
+                "Could not withdraw the %s lane reservation %s: %s",
+                reservation.executor, reservation.order_key, exc,
             )
+
+    @staticmethod
+    def _executor_lane_busy(
+        heading: str,
+        mode: str,
+        target: Dict[str, Any],
+        executor: str,
+        lane: Dict[str, Any],
+    ) -> ToolResult:
+        """Nothing is selected or sent while ``executor`` holds an open order."""
+
+        def describe(order: Dict[str, Any]) -> str:
+            if order["delivery"] == STATE_RESERVED:
+                return (
+                    "another dispatch holds it while it selects (since "
+                    f"{format_instant(order['sent_at'])})"
+                )
+            name = (
+                f"work order {order['order_id']} "
+                f"({order['repo']}#{order['issue_number']})"
+            )
+            if order["delivery"] == STATE_SENDING:
+                return f"{name} is being sent"
+            if order["delivery"] == STATE_UNCONFIRMED:
+                return (
+                    f"{name} may have reached {executor}, but its delivery "
+                    f"could not be confirmed ({order.get('detail')}); once "
+                    f"{executor} confirms it holds no such order, release it "
+                    f"with strategy_release_work_order('{order['order_id']}', "
+                    "reason)"
+                )
+            return f"{name} is {order['state']}"
+
+        busy = "; ".join(describe(order) for order in lane["outstanding"]) or (
+            "another dispatch reserved it while this one was reading it"
+        )
+        return ToolResult.ok(
+            confirmation=(
+                f"{heading}\n{executor}'s lane is busy: {busy}. Nothing was "
+                "selected or sent while that order is open."
+            ),
+            data={
+                "mode": mode,
+                "issue": None,
+                **target,
+                "dispatched": False,
+                "skipped": [],
+                "executor_lane": lane,
+            },
+        )
+
+    async def _select_and_dispatch(
+        self,
+        *,
+        mode: str,
+        heading: str,
+        executor: Optional[str],
+        workflow_name: Optional[str],
+        target: Dict[str, Any],
+        run_history: Any,
+        workspaces: Any,
+        work_orders: Optional[WorkOrderLedger],
+        journal: Optional[WorkOrderJournal] = None,
+        reservation: Optional[JournalEntry] = None,
+    ) -> ToolResult:
+        """Select the top issue and dispatch it: the part of
+        :meth:`signal_dispatch` that runs once its guards are read, and, when
+        delegated, under the executor's lane reservation."""
+        # Delegated outcomes say how the executor's lane stands: the read an
+        # idle check needs is of the executor's lane, not this agent's.
+        lane_data = (
+            {"executor_lane": work_orders.lane()} if work_orders is not None else {}
+        )
         selection: Dict[str, Any] = {}
         issue = await pick_top_issue(
             self._strategy_data_view(),
             selection,
             run_history=run_history,
             talon_workspaces=workspaces,
+            work_orders=work_orders,
         )
         # Candidates passed over because they are not on the allow-list --
         # closed, not agent-ready, in the wrong repository (#3464), an epic or
         # the Sovereign's (#3468) -- because a pull request already works
         # them (#3317), because their last Talon run asked a question
-        # nothing since has answered (#3398), or because Talon has no usable
-        # workspace for their repository (#3548). Every outcome carries them:
+        # nothing since has answered (#3398), because Talon has no usable
+        # workspace for their repository (#3548), or because the executor
+        # still holds an order on them (#3758). Every outcome carries them:
         # "skipped #3310 -- PR #3311 open" is what an orchestrator reading the
         # run needs, not a silence, and a suggest run that names each refusal
         # is evidence the gates hold.
         skipped = (
             list(selection.get("eligibility_exclusions") or [])
+            + list(selection.get("work_order_exclusions") or [])
             + list(selection.get("open_pr_exclusions") or [])
             + list(selection.get("run_exclusions") or [])
             + list(selection.get("workspace_exclusions") or [])
@@ -2282,6 +2553,16 @@ class StrategicMemoryFeature(Feature):
                 if entry.get("reason") == EXCLUDED_TALON_WORKSPACE_UNCONFIRMED
             }
         )
+        # What could not answer: GitHub, and when delegated, the executor whose
+        # report on an issue's last order could not be read, or whose receipt
+        # of it could not be confirmed.
+        source = "GitHub" if executor is None else f"GitHub or {executor}"
+        unread = (
+            "pull-request linkage or post-run activity"
+            if executor is None
+            else "pull-request linkage, post-run activity, last work report or "
+            "order delivery"
+        )
         # Each code stays a literal reason_code dict entry: the declared-code
         # drift test scans the source for those literals (#3184).
         unconfirmed: Optional[Dict[str, str]] = None
@@ -2294,8 +2575,8 @@ class StrategicMemoryFeature(Feature):
             unconfirmed = {
                 "reason_code": "BLOCKERS_UNCONFIRMED",
                 "finding": f"Could not confirm any of {checked} blocker issue(s) "
-                "with GitHub -- every read was unreadable.",
-                "error": "GitHub could not confirm any blocker issue",
+                f"with {source} -- every read was unreadable.",
+                "error": f"{source} could not confirm any blocker issue",
             }
         elif not issue and candidates_unreadable:
             # Milestone/backlog candidates withheld because GitHub could not
@@ -2307,11 +2588,10 @@ class StrategicMemoryFeature(Feature):
                 "reason_code": "CANDIDATES_UNCONFIRMED",
                 "finding": f"Could not confirm {candidates_unreadable} of "
                 f"{candidates_checked} milestone/backlog candidate issue(s) "
-                "with GitHub -- their pull-request linkage or post-run "
-                "activity was unreadable, so they were withheld.",
-                "error": "GitHub could not confirm pull-request linkage or "
-                f"post-run activity for {candidates_unreadable} candidate "
-                "issue(s)",
+                f"with {source} -- their {unread} was unreadable, so they "
+                "were withheld.",
+                "error": f"{source} could not confirm {unread} for "
+                f"{candidates_unreadable} candidate issue(s)",
             }
         elif not issue and workspaces_unconfirmed:
             # A candidate every other gate passed, withheld because Talon
@@ -2328,8 +2608,7 @@ class StrategicMemoryFeature(Feature):
         if unconfirmed is not None:
             return ToolResult.partial(
                 confirmation=(
-                    "## Signal Dispatch"
-                    + (" (suggest)" if mode == "suggest" else "")
+                    heading
                     + f"\n{unconfirmed['finding']} Nothing was dispatched; "
                     "this is not the same as having nothing to do."
                     + skipped_text
@@ -2338,7 +2617,7 @@ class StrategicMemoryFeature(Feature):
                 data={
                     "mode": mode,
                     "issue": None,
-                    "workflow": workflow_name,
+                    **target,
                     "dispatched": False,
                     "skipped": skipped,
                     "reason_code": unconfirmed["reason_code"],
@@ -2346,34 +2625,45 @@ class StrategicMemoryFeature(Feature):
                     "candidates_checked": candidates_checked,
                     "candidates_unreadable": candidates_unreadable,
                     "workspaces_unconfirmed": workspaces_unconfirmed,
+                    **lane_data,
                 },
             )
         if not issue:
             return ToolResult.ok(
-                confirmation=(
-                    "## Signal Dispatch"
-                    + (" (suggest)" if mode == "suggest" else "")
-                    + "\nNo actionable issue found."
-                    + skipped_text
-                ),
+                confirmation=heading + "\nNo actionable issue found." + skipped_text,
                 data={
                     "mode": mode,
                     "issue": None,
-                    "workflow": workflow_name,
+                    **target,
                     "dispatched": False,
                     "skipped": skipped,
+                    **lane_data,
                 },
             )
 
         if mode == "suggest":
+            if executor:
+                plan = (
+                    f"Execute mode will send {executor} a "
+                    f"{WORK_ORDER_SCHEMA} work order"
+                    + (
+                        ""
+                        if work_orders.lane_idle
+                        else ", once its outstanding order's report is in"
+                    )
+                )
+            else:
+                plan = (
+                    f"Execute mode will request the contributed `{workflow_name}` "
+                    "workflow"
+                )
             body = (
                 "## Signal Dispatch (suggest)\n"
                 f"**Top issue:** {issue['repo']}#{issue['issue_number']}: "
                 f"{issue['issue_title']}\n"
                 f"**Priority:** {issue['priority']}\n"
                 f"**Context:** {issue.get('context', 'N/A')}\n\n"
-                f"Execute mode will request the contributed `{workflow_name}` "
-                "workflow; no work was started by this preview."
+                f"{plan}; no work was started by this preview."
                 + skipped_text
             )
             return ToolResult.ok(
@@ -2381,11 +2671,18 @@ class StrategicMemoryFeature(Feature):
                 data={
                     "mode": "suggest",
                     "issue": issue,
-                    "workflow": workflow_name,
+                    **target,
                     "dispatched": False,
                     "skipped": skipped,
                     "body": body,
+                    **lane_data,
                 },
+            )
+
+        if executor:
+            return await self._send_work_order(
+                issue, executor, journal=journal, reservation=reservation,
+                skipped=skipped, skipped_text=skipped_text,
             )
 
         registration = self._resolve_dispatch_workflow(workflow_name)
@@ -2398,7 +2695,7 @@ class StrategicMemoryFeature(Feature):
                 data={
                     "mode": "execute",
                     "issue": issue,
-                    "workflow": workflow_name,
+                    **target,
                     "dispatched": False,
                     "skipped": skipped,
                     "reason_code": "DISPATCH_CAPABILITY_UNAVAILABLE",
@@ -2414,7 +2711,7 @@ class StrategicMemoryFeature(Feature):
                 data={
                     "mode": "execute",
                     "issue": issue,
-                    "workflow": workflow_name,
+                    **target,
                     "dispatched": False,
                     "skipped": skipped,
                     "reason_code": "GOVERNED_DISPATCH_UNAVAILABLE",
@@ -2448,7 +2745,7 @@ class StrategicMemoryFeature(Feature):
                 data={
                     "mode": "execute",
                     "issue": issue,
-                    "workflow": workflow_name,
+                    **target,
                     "dispatched": False,
                     "skipped": skipped,
                     "reason_code": "WORKFLOW_RUNNER_UNAVAILABLE",
@@ -2466,7 +2763,7 @@ class StrategicMemoryFeature(Feature):
                 data={
                     "mode": "execute",
                     "issue": issue,
-                    "workflow": workflow_name,
+                    **target,
                     "dispatched": False,
                     "skipped": skipped,
                     "reason_code": "WORKFLOW_RUNNER_FAILED",
@@ -2474,17 +2771,7 @@ class StrategicMemoryFeature(Feature):
             )
 
         runner_payload = self._dispatch_runner_payload(runner_result)
-        accepted = (
-            isinstance(runner_result, ToolResult)
-            and runner_result.status.value == "ok"
-        ) or (
-            isinstance(runner_result, dict)
-            and (
-                runner_result.get("status") == "ok"
-                or runner_result.get("success") is True
-            )
-        )
-        if not accepted:
+        if not self._dispatch_accepted(runner_result):
             runner_error = (
                 runner_payload.get("error")
                 or "the workflow runner did not confirm acceptance"
@@ -2495,7 +2782,7 @@ class StrategicMemoryFeature(Feature):
                 data={
                     "mode": "execute",
                     "issue": issue,
-                    "workflow": workflow_name,
+                    **target,
                     "capability_owner": getattr(registration, "owner", ""),
                     "dispatched": False,
                     "skipped": skipped,
@@ -2517,12 +2804,369 @@ class StrategicMemoryFeature(Feature):
             data={
                 "mode": "execute",
                 "issue": issue,
-                "workflow": workflow_name,
+                **target,
                 "workflow_run_id": run_id,
                 "capability_owner": getattr(registration, "owner", ""),
                 "dispatched": True,
                 "skipped": skipped,
                 "runner_result": runner_payload,
+            },
+        )
+
+    async def _send_work_order(
+        self,
+        issue: Dict[str, Any],
+        executor: str,
+        *,
+        journal: WorkOrderJournal,
+        reservation: JournalEntry,
+        skipped: List[Dict[str, Any]],
+        skipped_text: str,
+    ) -> ToolResult:
+        """Send the pick to ``executor`` as a work order and arm its wake.
+
+        The outcome is the executor's report, answered on the order's A2A
+        task, not a local launch (#3758). The send goes through governed
+        named-tool dispatch like ``workflow_run`` does, so the operator's
+        policy on ``send_a2a_task`` applies. The wake is a
+        ``wait("a2a:<task_id>", mode="signal")`` watch: A2A completion does
+        not wake the sender of a task (#3755), so without it the report
+        would wake nobody.
+
+        The order is named in the journal before it is sent, under the lane
+        reservation, and its A2A session id is its order id. A send that
+        fails is then classified from the outbound record of the attempt:
+        a transport failure does not prove the executor received nothing, so
+        an attempt that may have reached it is kept ``unconfirmed`` -- the
+        lane stays busy and the issue withheld -- rather than discarded.
+        """
+        order = build_work_order(issue)
+        order_id = order["order_id"]
+        data: Dict[str, Any] = {
+            "mode": "execute",
+            "issue": issue,
+            "workflow": None,
+            "executor": executor,
+            "order_id": order_id,
+            "work_order": order,
+            "dispatched": False,
+            "skipped": skipped,
+        }
+        execute_named_tool = getattr(self.agent, "execute_named_tool", None)
+        if not callable(execute_named_tool):
+            return ToolResult.failed(
+                "Governed named-tool dispatch is unavailable on this agent "
+                "runtime. Upgrade the host before enabling Strategic Memory "
+                "dispatch; no work order was sent.",
+                data={**data, "reason_code": "GOVERNED_DISPATCH_UNAVAILABLE"},
+            )
+        try:
+            named = await journal.begin_send(
+                reservation.order_key, order_id=order_id, repo=issue["repo"],
+                issue_number=issue["issue_number"],
+            )
+        except WorkOrdersUnreadable as exc:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Work order {order_id} was not sent: it could not be "
+                    f"recorded first ({exc}), and an order the journal does not "
+                    "hold is one the next dispatch cannot see." + skipped_text
+                ),
+                error=f"the work-order journal could not record {order_id}: {exc}",
+                data={**data, "reason_code": "WORK_ORDERS_UNCONFIRMED"},
+            )
+        if not named:
+            return ToolResult.failed(
+                f"Work order {order_id} was not sent: this dispatch's hold on "
+                f"{executor}'s lane lapsed while it selected, and another "
+                "reader released it. Run the dispatch again.",
+                data={**data, "reason_code": "WORK_ORDER_LANE_LOST"},
+            )
+
+        failure: Optional[str] = None
+        raised = False
+        claimed_sent = False
+        task_id: Optional[str] = None
+        sender_payload: Dict[str, Any] = {}
+        try:
+            sent = await execute_named_tool(
+                _SEND_A2A_TASK_TOOL,
+                {
+                    "recipient": executor,
+                    "message": work_order_message(order, issue),
+                    # The outbound record of the attempt is found by it, even
+                    # when the send never returns a task id.
+                    "session_id": order_id,
+                    "artifacts": [{"name": WORK_ORDER_ARTIFACT, "data": order}],
+                },
+                session_id=self._dispatch_session_id(),
+                source="strategic_memory.signal_dispatch",
+            )
+        except ToolNotRegisteredError:
+            await self._record_attempt(
+                journal, reservation, STATE_NOT_SENT,
+                detail=f"no enabled feature exposes {_SEND_A2A_TASK_TOOL}",
+            )
+            return ToolResult.failed(
+                f"No enabled feature exposes the governed '{_SEND_A2A_TASK_TOOL}' "
+                f"tool, so no work order can reach {executor}. Enable the Peers "
+                "feature and retry; the selected issue was not dispatched.",
+                data={
+                    **data, "delivery": STATE_NOT_SENT,
+                    "reason_code": "WORK_ORDER_TRANSPORT_UNAVAILABLE",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitize the tool boundary
+            if is_execution_control_error(exc):
+                # The attempt stays ``sending``; its lease lapses and the
+                # next read classifies it from the outbound record.
+                raise
+            logger.exception(
+                "Strategic Memory could not send work order %s to %r",
+                order_id, executor,
+            )
+            failure = f"the send raised {type(exc).__name__}"
+            raised = True
+        else:
+            sender_payload = self._dispatch_runner_payload(sent)
+            sent_data = sender_payload.get("data")
+            if isinstance(sent_data, dict):
+                candidate = sent_data.get("task_id")
+                task_id = candidate if isinstance(candidate, str) and candidate.strip() else None
+                claimed_sent = sent_data.get("sent") is True
+            if not self._dispatch_accepted(sent) or task_id is None:
+                failure = str(
+                    sender_payload.get("error")
+                    or "the A2A transport did not return a task id"
+                )
+        data["sender_result"] = sender_payload
+
+        delivery = STATE_SENT
+        detail: Optional[str] = None
+        if failure is not None:
+            delivery, task_id, detail = await self._failed_send_outcome(
+                executor, order_id,
+                claimed_sent=claimed_sent, task_id=task_id, failure=failure,
+            )
+        await self._record_attempt(
+            journal, reservation, delivery, detail=detail, task_id=task_id
+        )
+        data["delivery"] = delivery
+        if delivery == STATE_NOT_SENT:
+            return ToolResult.failed(
+                f"Work order {order_id} was not accepted for {executor}: "
+                f"{failure}",
+                data={
+                    **data,
+                    **(
+                        {"reason_code": "WORK_ORDER_SEND_FAILED"}
+                        if raised
+                        else {"reason_code": "WORK_ORDER_REJECTED"}
+                    ),
+                },
+            )
+        if delivery == STATE_UNCONFIRMED:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Work order {order_id} for "
+                    f"{issue['repo']}#{issue['issue_number']} may have reached "
+                    f"{executor}, but its delivery could not be confirmed: "
+                    f"{detail}. It is kept open: {executor}'s lane stays busy "
+                    "and the issue is not ordered again until the outbound "
+                    f"record confirms it, or, once {executor} confirms it holds "
+                    "no such order, it is released with "
+                    f"strategy_release_work_order('{order_id}', reason)."
+                    + skipped_text
+                ),
+                error=f"delivery of work order {order_id} is unconfirmed: {detail}",
+                data={
+                    **data,
+                    "a2a_task_id": task_id,
+                    "reason_code": "WORK_ORDER_DELIVERY_UNCONFIRMED",
+                },
+            )
+
+        data.update({"dispatched": True, "a2a_task_id": task_id})
+        sent_line = (
+            f"Work order {order_id} for "
+            f"{issue['repo']}#{issue['issue_number']} sent to {executor} as A2A "
+            f"task {task_id}."
+            + (
+                f" (The send reported {failure!r}, but {executor} accepted the task.)"
+                if failure is not None
+                else ""
+            )
+        )
+        wake = f"a2a:{task_id}"
+        try:
+            await register_wait_watch(
+                self.agent, wake, origin_session_id=self._turn_session_id()
+            )
+        except Exception as exc:  # noqa: BLE001 - the order is sent; say the wake is not armed
+            if is_execution_control_error(exc):
+                raise
+            logger.warning(
+                "Work order %s was sent to %r but its wake %s could not be armed: %s",
+                order_id, executor, wake, exc,
+            )
+            return ToolResult.partial(
+                confirmation=(
+                    f"{sent_line} Its report will not wake this agent: arming "
+                    f"wait('{wake}', mode='signal') failed ({exc}). Arm it, or "
+                    "read the report with get_peer_task_result."
+                    + skipped_text
+                ),
+                error=f"the wake on {wake} could not be armed: {exc}",
+                data={
+                    **data,
+                    "wake": {"ref": wake, "armed": False},
+                    "reason_code": "WORK_ORDER_WAKE_UNARMED",
+                },
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"{sent_line} Its report wakes this agent through {wake}."
+                + skipped_text
+            ),
+            data={**data, "wake": {"ref": wake, "armed": True}},
+        )
+
+    async def _failed_send_outcome(
+        self,
+        executor: str,
+        order_id: str,
+        *,
+        claimed_sent: bool,
+        task_id: Optional[str],
+        failure: str,
+    ) -> Tuple[str, Optional[str], Optional[str]]:
+        """``(delivery, task_id, detail)`` for a send that did not report an
+        accepted task, read from the outbound record of the attempt.
+
+        PeersFeature records the attempt before it makes any request, so no
+        record means no request -- unless the transport itself says the task
+        may have been delivered (``sent: true``) while keeping no record of it.
+        """
+        try:
+            outcome, row = await read_send_attempt(self.agent, executor, order_id)
+        except WorkOrdersUnreadable as exc:
+            return (
+                STATE_UNCONFIRMED, task_id,
+                f"{failure}, and the outbound record could not be read to "
+                f"confirm whether it was delivered ({exc})",
+            )
+        if outcome == STATE_SENT:
+            return STATE_SENT, row["task_id"], None
+        if outcome == STATE_NOT_SENT:
+            return STATE_NOT_SENT, None, f"{failure} ({row.get('error')})"
+        if outcome == STATE_UNCONFIRMED:
+            return (
+                STATE_UNCONFIRMED, row.get("task_id") or task_id,
+                f"{failure}; {describe_attempt_row(row)}",
+            )
+        if claimed_sent:
+            return (
+                STATE_UNCONFIRMED, task_id,
+                f"{failure}; the transport says the task may have been "
+                "delivered, and it kept no record of the attempt",
+            )
+        return STATE_NOT_SENT, None, failure
+
+    @staticmethod
+    async def _record_attempt(
+        journal: WorkOrderJournal,
+        reservation: JournalEntry,
+        delivery: str,
+        *,
+        detail: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> None:
+        """Journal what became of the attempt. A failed write leaves the row
+        ``sending``: once its lease lapses the next read classifies it from
+        the outbound record, so it is logged rather than reported as a send
+        failure."""
+        try:
+            if delivery == STATE_SENT:
+                recorded = await journal.record_sent(
+                    reservation.order_key, task_id=task_id
+                )
+            elif delivery == STATE_NOT_SENT:
+                recorded = await journal.record_not_sent(
+                    reservation.order_key, detail=detail or "not sent"
+                )
+            else:
+                recorded = await journal.record_unconfirmed(
+                    reservation.order_key, detail=detail or "unconfirmed",
+                    task_id=task_id,
+                )
+        except WorkOrdersUnreadable as exc:
+            logger.warning(
+                "Work order reservation %s: could not journal it as %s (%s); "
+                "the next read reconciles it from the outbound record",
+                reservation.order_key, delivery, exc,
+            )
+            return
+        if not recorded:
+            # A reader reconciled it first, or an operator released it.
+            logger.info(
+                "Work order reservation %s was already moved on when this "
+                "dispatch recorded it as %s", reservation.order_key, delivery,
+            )
+
+    @tool(
+        name="strategy_release_work_order",
+        description=(
+            "Release one open delegated work order (#3758) that this agent can "
+            "no longer confirm: one whose delivery to the executor is "
+            "unconfirmed, or whose task the executor can no longer report on. "
+            "Name it by order id or A2A task id. Confirm with the executor "
+            "first that it holds no such order: a released order stops keeping "
+            "the executor's lane busy and its issue from being ordered again. "
+            "The release and its reason are recorded."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def strategy_release_work_order(
+        self, order_id: str, reason: str
+    ) -> ToolResult:
+        """Release an open work order the journal holds.
+
+        Args:
+            order_id: The work order id, or the A2A task id it was sent as
+            reason: Why it no longer stands -- what the executor confirmed
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            return ToolResult.failed(
+                "A reason is required: say what the executor confirmed about "
+                f"work order {order_id}.",
+                data={"order_id": order_id, "released": False},
+            )
+        try:
+            journal = await self._work_order_journal()
+            released = await journal.release(order_id, reason=reason.strip())
+        except (WorkOrderNotReleasable, WorkOrdersUnreadable) as exc:
+            return ToolResult.failed(
+                f"Work order {order_id} was not released: {exc}",
+                data={"order_id": order_id, "released": False},
+            )
+        target = (
+            f"{released.repo}#{released.issue_number}"
+            if released.repo
+            else "no issue"
+        )
+        return ToolResult.ok(
+            confirmation=(
+                f"Released work order {released.order_id} ({target}) to "
+                f"{released.executor}, which was {released.state}: {reason.strip()}"
+            ),
+            data={
+                "order_id": released.order_id,
+                "a2a_task_id": released.task_id,
+                "executor": released.executor,
+                "repo": released.repo,
+                "issue_number": released.issue_number,
+                "previous_state": released.state,
+                "released": True,
             },
         )
 

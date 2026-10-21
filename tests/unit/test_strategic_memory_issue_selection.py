@@ -452,6 +452,7 @@ async def test_diagnostics_say_when_nothing_could_be_confirmed(monkeypatch):
         "open_pr_exclusions": [],
         "run_exclusions": [],
         "workspace_exclusions": [],
+        "work_order_exclusions": [],
     }
 
 
@@ -480,6 +481,7 @@ async def test_a_closed_blocker_is_checked_but_not_unreadable(monkeypatch):
         "open_pr_exclusions": [],
         "run_exclusions": [],
         "workspace_exclusions": [],
+        "work_order_exclusions": [],
     }
 
 

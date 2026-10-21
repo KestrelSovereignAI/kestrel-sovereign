@@ -734,6 +734,8 @@ ROUTED_MODULES = {
     "features/tasks/wait_provider.py",
     "server.py",  # the feature-route mount owner's stable identity (#3240)
     "signals/sources/peer_stop.py",  # the peer Stop recipient's address (#3169)
+    # The delegated work-order journal's owner (#3758).
+    "features/strategic_memory/work_orders.py",
     # #3251: the other-table self-scoped reads.
     "features/health/checks.py",
     "features/memory/reflection_hook.py",

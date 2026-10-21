@@ -635,11 +635,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `recall_blockers` | `!blockers` | `memory` | `limit`, `include_resolved` | 120 | `enabled` |
 | `recall_patterns` | `!patterns` | `memory` | `limit`, `include_superseded` | 123 | `enabled` |
 | `session_log` | `!sessionlog` | `system` | `session_id`, `focus` | 125 | `enabled` |
-| `signal_dispatch` | `!dispatch` | `system` | `mode` | 89 | `enabled` |
+| `signal_dispatch` | `!dispatch` | `system` | `mode` | 133 | `enabled` |
 | `strategy_add_blocker` |  | `system` | `issue`, `title`, `severity`, `owner`, `repo`, `notes` | 243 | `enabled` |
 | `strategy_add_decision` |  | `system` | `decision`, `rationale`, `session`, `impact` | 131 | `enabled` |
 | `strategy_add_pattern` |  | `system` | `pattern`, `source`, `implication` | 110 | `enabled` |
 | `strategy_reconcile_blockers` | `!strategy-reconcile` | `system` | `apply` | 90 | `enabled` |
+| `strategy_release_work_order` |  | `system` | `order_id`, `reason` | 177 | `enabled` |
 | `strategy_resolve_blocker` |  | `system` | `issue`, `resolution` | 114 | `enabled` |
 | `strategy_search` | `!strategy-search` | `memory` | `query`, `kind`, `limit`, `include_retired` | 182 | `enabled` |
 | `strategy_supersede_pattern` |  | `system` | `pattern_id`, `reason`, `superseded_by` | 140 | `enabled` |
@@ -1114,7 +1115,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!import-sovereignty` | `sovereignty` | `<cid>` | Restore this agent's CONVERSATION HISTORY from a prior backup (IPFS CID). Faithfully preserves message timestamps and trash state. NOTE: this currently restores conversation history only — NOT full agent state (memories, knowledge graph, saved items, files, settings). Full-state restore is tracked separately. |
 | `!state-of-mind` | `state_of_mind` |  | Get the current constitutional governance state for this agent |
 | `!blockers` | `strategic_memory` | `[limit] [include_resolved]` | Recall blockers from the strategy index (graph nodes of type 'strategy_blocker'). Resolved blockers are excluded by default; pass include_resolved=True to see them. |
-| `!dispatch` | `strategic_memory` | `[mode]` | Pick the highest-priority issue from strategic memory and start it through a live feature-contributed dispatch workflow. Preview with mode='suggest'; execute fails closed when no compatible workflow capability and governed runner are enabled. |
+| `!dispatch` | `strategic_memory` | `[mode]` | Pick the highest-priority issue from strategic memory and start it through a live feature-contributed dispatch workflow, or, when morning_signal_config.dispatch_executor names a peer agent, send it to that executor as a kestrel.work_order/v1 A2A task and arm a wake on its report. Preview with mode='suggest'; execute fails closed when no compatible workflow capability and governed runner (or A2A transport) are enabled. |
 | `!hygiene` | `strategic_memory` | `[fix]` | Scan all repos for backlog hygiene issues: missing assignees, milestones, status labels. Reports gaps and flags items needing human review. |
 | `!morning` | `strategic_memory` |  | Generate a morning strategic briefing -- milestone status, blockers, the last 24h of workflow runs (failures and persistently failing workflows), recommended work items. Pulls live data from GitHub when GITHUB_TOKEN is available. |
 | `!patterns` | `strategic_memory` | `[limit] [include_superseded]` | Recall learned patterns from the strategy index (graph nodes of type 'strategy_pattern'). Superseded patterns are excluded by default; pass include_superseded=True to see them. |

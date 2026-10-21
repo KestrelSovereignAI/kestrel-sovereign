@@ -37,13 +37,22 @@ from kestrel_sovereign.features.strategic_memory.run_history import (
     RunHistory,
     TalonRun,
 )
-from kestrel_sovereign.features.strategic_memory.timestamps import parse_instant
+from kestrel_sovereign.features.strategic_memory.timestamps import (
+    format_instant,
+    parse_instant,
+)
 from kestrel_sovereign.features.strategic_memory.workspace_readiness import (
     NO_TALON_WORKSPACE,
     TALON_WORKSPACE_UNUSABLE,
     TalonWorkspaces,
     WorkspaceReadiness,
     WorkspaceReadinessUnreadable,
+)
+from kestrel_sovereign.features.strategic_memory.work_orders import (
+    NOT_EXECUTED_DISPOSITIONS,
+    OrderedRun,
+    WorkOrder,
+    WorkOrderLedger,
 )
 
 logger = logging.getLogger(__name__)
@@ -153,11 +162,25 @@ EXCLUDED_NO_TALON_WORKSPACE = NO_TALON_WORKSPACE
 EXCLUDED_TALON_WORKSPACE_UNUSABLE = TALON_WORKSPACE_UNUSABLE
 EXCLUDED_TALON_WORKSPACE_UNCONFIRMED = "talon_workspace_unconfirmed"
 
-#: Exclusions that withhold an issue because GitHub could not answer, not
-#: because it answered "busy". Counted as unreadable so an outage renders as
-#: one rather than as nothing to do.
+#: Exclusions reported in ``diagnostics["work_order_exclusions"]`` when the
+#: pick is delegated to an executor (#3758): an order on the issue is still
+#: in the executor's hands, an order on it may have reached the executor but
+#: its delivery could not be confirmed, or the executor answered the issue's
+#: last order with a report that cannot be read.
+EXCLUDED_WORK_ORDER_OUTSTANDING = "work_order_outstanding"
+EXCLUDED_WORK_ORDER_UNCONFIRMED = "work_order_unconfirmed"
+EXCLUDED_WORK_REPORT_UNREADABLE = "work_report_unreadable"
+
+#: Exclusions that withhold an issue because GitHub (or the executor) could
+#: not answer, not because it answered "busy". Counted as unreadable so an
+#: outage renders as one rather than as nothing to do.
 _UNREADABLE_EXCLUSIONS = frozenset(
-    {EXCLUDED_PR_LINKAGE_UNREADABLE, EXCLUDED_RUN_HISTORY_UNCONFIRMED}
+    {
+        EXCLUDED_PR_LINKAGE_UNREADABLE,
+        EXCLUDED_RUN_HISTORY_UNCONFIRMED,
+        EXCLUDED_WORK_ORDER_UNCONFIRMED,
+        EXCLUDED_WORK_REPORT_UNREADABLE,
+    }
 )
 
 #: Applied after a run that asked a question, :data:`AGENT_READY_LABEL` is a
@@ -209,6 +232,7 @@ async def pick_top_issue(
     diagnostics: Optional[Dict[str, Any]] = None,
     run_history: Optional[RunHistory] = None,
     talon_workspaces: Optional[TalonWorkspaces] = None,
+    work_orders: Optional[WorkOrderLedger] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the highest-priority eligible issue represented by strategic memory.
 
@@ -249,6 +273,14 @@ async def pick_top_issue(
     repository; ``None`` means the caller has no Talon, so no workspace is
     asked about.
 
+    ``work_orders`` is the ledger of orders sent to the executor a delegated
+    dispatch runs on (#3758). ``diagnostics["work_order_exclusions"]`` lists
+    every candidate with an order still in the executor's hands, or whose
+    last order was answered with a report that cannot be read. The caller
+    passes that ledger's run history as ``run_history`` and no
+    ``talon_workspaces``: the selecting agent's own Talon registry says
+    nothing about runs on another agent. ``None`` means nothing is delegated.
+
     ``candidates_checked`` and ``candidates_unreadable`` do the same for the
     milestone and backlog passes: how many distinct candidates had their PR
     linkage looked up, and how many of those GitHub could not answer for. A
@@ -266,6 +298,7 @@ async def pick_top_issue(
     exclusions = diagnostics.setdefault("open_pr_exclusions", [])
     run_exclusions = diagnostics.setdefault("run_exclusions", [])
     workspace_exclusions = diagnostics.setdefault("workspace_exclusions", [])
+    order_exclusions = diagnostics.setdefault("work_order_exclusions", [])
     token = get_github_token()
     if not token:
         logger.info("No GITHUB_TOKEN — cannot pick top issue")
@@ -347,7 +380,7 @@ async def pick_top_issue(
             if run_history is not None
             else None
         )
-        if run is None or not run.ended_with_question:
+        if run is None or not run.awaits_new_input:
             return None
         key = (repo, issue_number)
         if key not in awaiting:
@@ -415,10 +448,39 @@ async def pick_top_issue(
                 )
         return unworkable[key]
 
+    # One exclusion per distinct (repo, number), like linkage. The ledger is
+    # already read, so this costs nothing and is asked first.
+    ordered_issues: Dict[Tuple[str, int], Optional[Dict[str, Any]]] = {}
+
+    def ordered(repo: str, issue_number: int) -> Optional[Dict[str, Any]]:
+        """The exclusion for an issue the executor still holds, or ``None``.
+
+        An order the executor has not answered may be waiting in its inbox
+        behind another, with no Talon label on the issue yet: ordering it
+        again would queue a second run of the same issue (#3758). An answered
+        order whose report cannot be read is an unknown last run, not a known
+        good one.
+        """
+        if work_orders is None:
+            return None
+        key = (repo, issue_number)
+        if key not in ordered_issues:
+            ordered_issues[key] = _work_order_exclusion(
+                repo, issue_number, work_orders.orders_on(repo, issue_number)
+            )
+            if ordered_issues[key] is not None:
+                order_exclusions.append(ordered_issues[key])
+                logger.info(
+                    "Not dispatching %s#%s: %s", repo, issue_number,
+                    describe_exclusion(ordered_issues[key]),
+                )
+        return ordered_issues[key]
+
     async def withheld(repo: str, issue_number: int) -> Optional[Dict[str, Any]]:
         """Why an eligible candidate must not be dispatched now, or ``None``."""
         return (
-            await in_flight(repo, issue_number)
+            ordered(repo, issue_number)
+            or await in_flight(repo, issue_number)
             or await awaiting_new_input(repo, issue_number)
             or await without_workspace(repo, issue_number)
         )
@@ -935,7 +997,7 @@ def _comment_speaks_for_repository(comment: Dict[str, Any]) -> bool:
 def _run_exclusion(
     repo: str, issue_number: int, run: TalonRun, reason: str
 ) -> Dict[str, Any]:
-    return {
+    exclusion = {
         "repo": repo,
         "issue_number": issue_number,
         "reason": reason,
@@ -943,6 +1005,45 @@ def _run_exclusion(
         "disposition": run.disposition,
         "completed_at": run.completed_at.isoformat(),
     }
+    if isinstance(run, OrderedRun):
+        exclusion.update(
+            {
+                "executor": run.executor,
+                "order_id": run.order_id,
+                "a2a_task_id": run.task_id,
+            }
+        )
+    return exclusion
+
+
+def _work_order_exclusion(
+    repo: str, issue_number: int, orders: List[WorkOrder]
+) -> Optional[Dict[str, Any]]:
+    """Why ``orders`` on the issue (newest first) withhold it, or ``None``."""
+    outstanding = next((order for order in orders if order.outstanding), None)
+    if outstanding is not None:
+        return {
+            "repo": repo,
+            "issue_number": issue_number,
+            "reason": (
+                EXCLUDED_WORK_ORDER_UNCONFIRMED
+                if outstanding.unconfirmed
+                else EXCLUDED_WORK_ORDER_OUTSTANDING
+            ),
+            "executor": outstanding.executor,
+            **outstanding.summary(),
+        }
+    if orders and orders[0].unreadable is not None:
+        latest = orders[0]
+        return {
+            "repo": repo,
+            "issue_number": issue_number,
+            "reason": EXCLUDED_WORK_REPORT_UNREADABLE,
+            "executor": latest.executor,
+            **latest.summary(),
+            "detail": latest.unreadable,
+        }
+    return None
 
 
 def _workspace_exclusion(
@@ -1077,16 +1178,25 @@ def describe_exclusion(exclusion: Dict[str, Any]) -> str:
             )
         return f"skipped {target} -- assigned to {who}, who may be the Sovereign"
     if reason in (EXCLUDED_RUN_HISTORY, EXCLUDED_RUN_HISTORY_UNCONFIRMED):
-        completed = parse_instant(exclusion.get("completed_at"))
-        when = (
-            completed.strftime("%Y-%m-%d %H:%M UTC")
-            if completed is not None
-            else exclusion.get("completed_at")
-        )
-        run = (
-            f"Talon job {str(exclusion.get('job_id'))[:8]} ended "
-            f"{exclusion.get('disposition')} at {when} without a PR"
-        )
+        when = format_instant(exclusion.get("completed_at"))
+        disposition = exclusion.get("disposition")
+        if exclusion.get("order_id") is None:
+            run = (
+                f"Talon job {str(exclusion.get('job_id'))[:8]} ended "
+                f"{disposition} at {when} without a PR"
+            )
+        elif disposition in NOT_EXECUTED_DISPOSITIONS:
+            run = (
+                f"{exclusion.get('executor')} did not run work order "
+                f"{exclusion.get('order_id')} (its task ended "
+                f"{str(disposition).removeprefix('order_')}, answered by {when})"
+            )
+        else:
+            run = (
+                f"work order {exclusion.get('order_id')} to "
+                f"{exclusion.get('executor')} ended {disposition} "
+                f"(answered by {when}) without a PR"
+            )
         if reason == EXCLUDED_RUN_HISTORY_UNCONFIRMED:
             return (
                 f"skipped {target} -- {run}, and GitHub could not say whether "
@@ -1095,6 +1205,32 @@ def describe_exclusion(exclusion: Dict[str, Any]) -> str:
         return (
             f"skipped {target} -- {run}, and nothing since authorizes a retry "
             "(a maintainer or orchestrator comment, an issue edit, or agent-ready)"
+        )
+    if reason == EXCLUDED_WORK_ORDER_OUTSTANDING:
+        status = (
+            "being sent"
+            if exclusion.get("state") == "sending"
+            else f"still {exclusion.get('state')}"
+        )
+        return (
+            f"skipped {target} -- work order {exclusion.get('order_id')} to "
+            f"{exclusion.get('executor')} is {status} "
+            f"(sent {format_instant(exclusion.get('sent_at'))}); its report has "
+            "not come back"
+        )
+    if reason == EXCLUDED_WORK_ORDER_UNCONFIRMED:
+        return (
+            f"skipped {target} -- work order {exclusion.get('order_id')} may "
+            f"have reached {exclusion.get('executor')}, but its delivery could "
+            f"not be confirmed ({exclusion.get('detail')}); it is released with "
+            f"strategy_release_work_order once {exclusion.get('executor')} "
+            "confirms it holds no such order"
+        )
+    if reason == EXCLUDED_WORK_REPORT_UNREADABLE:
+        return (
+            f"skipped {target} -- {exclusion.get('executor')} answered work "
+            f"order {exclusion.get('order_id')} with a report that cannot be "
+            f"read: {exclusion.get('detail')}"
         )
     if reason == EXCLUDED_PR_LINKAGE_UNREADABLE:
         return (
