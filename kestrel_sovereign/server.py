@@ -1369,14 +1369,17 @@ def _hosted_peer_directory_context(
     agent,
     *,
     manager=None,
+    preserve_directory: bool = False,
 ) -> tuple[object, object]:
     """Return the effective directory pair for one hosted agent's A2A policy.
 
-    ``PeersFeature`` owns the local-host compatibility adapter after feature
+    ``PeersFeature`` owns the local-host directory after feature
     initialization. Its startup snapshot can predate generated API-key auth,
     explicit multi-agent config discovery, or a platform ``PORT`` override.
-    Rebuild only that local adapter from the active host state before freezing
+    Rebuild only that local directory from the active host state before freezing
     the hosted policy. An injected scoped router remains authoritative.
+    Single-agent/process startup explicitly preserves its existing parent
+    directory; the optional manager reference does not determine server mode.
 
     Agents without a Peers feature retain the explicit construction-injection
     seam. A present Peers feature is authoritative: a missing or malformed
@@ -1414,7 +1417,7 @@ def _hosted_peer_directory_context(
             # Never replace an explicitly injected user-scoped router with
             # global local-host discovery. Only the local directory client is
             # rebuilt from the active host config/auth state.
-            if not isinstance(router, LocalHostPeerDirectory) or manager is None:
+            if not isinstance(router, LocalHostPeerDirectory) or preserve_directory:
                 # A single-agent/process host already has an explicit directory
                 # origin. Keep that parent roster and its existing native factory.
                 return router, requester
@@ -1474,7 +1477,9 @@ async def _onboard_single_agent_native(app: FastAPI, agent, environment=None):
     environment = dict(os.environ if environment is None else environment)
     if NativeHostingConfiguration.from_environment(environment) is None:
         return None
-    router, requester = _hosted_peer_directory_context(app, agent)
+    router, requester = _hosted_peer_directory_context(
+        app, agent, preserve_directory=True
+    )
     agent.peer_directory_router, agent.peer_requester = router, requester
     mark_a2a_inbound_scoped_policy(agent, required=True)
     if getattr(agent, "a2a_inbound_sender_authorizer", None) is None:

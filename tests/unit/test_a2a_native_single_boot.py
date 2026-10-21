@@ -86,7 +86,7 @@ async def test_process_onboarding_keeps_the_attested_signing_did_to_principal_ma
 async def test_single_host_preserves_its_configured_parent_roster_and_native_factory(
     single_candidate,
 ):
-    from kestrel_sovereign.server import _hosted_peer_directory_context
+    from kestrel_sovereign.server import _onboard_single_agent_native
 
     p = single_candidate
     router = LocalHostPeerDirectory("http://parent.native.test:8888")
@@ -98,8 +98,15 @@ async def test_single_host_preserves_its_configured_parent_roster_and_native_fac
     p.app.state.multi_agent_config = SimpleNamespace(
         host=SimpleNamespace(port=9999, bind="127.0.0.1")
     )
-    selected, requester = _hosted_peer_directory_context(p.app, p.recipient)
-    assert selected is router and requester is p.recipient.peer_requester
+    await _onboard_single_agent_native(p.app, p.recipient, {
+        "KESTREL_BASE_URL": "https://single.native.test",
+        "KESTREL_A2A_PUSH_ENABLED": "false",
+    })
+    try:
+        assert p.recipient.peer_directory_router is router
+        assert p.recipient.peer_requester is feature._peer_requester
+    finally:
+        await p.recipient._native_a2a_runtime_authority.close()
 
 
 async def test_process_onboarding_preserves_an_explicitly_owned_native_factory(
