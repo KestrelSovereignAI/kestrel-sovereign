@@ -4670,7 +4670,7 @@ class SignalDispatcher:
             consumer_id=consumer_id,
             delivery_id=delivery.delivery_id,
             lease_token=delivery.lease_token or "",
-            error="Malformed Telegram update recorded as terminal ingress disposition",
+            error="Telegram update recorded as non-cognitive terminal ingress disposition",
             terminal=True,
             terminal_ackable=True,
         )

@@ -32,17 +32,20 @@ def _terminal_signal(did):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("privacy", ["normal", "ephemeral", "isolated", "anonymous"])
-async def test_terminal_read_verifies_native_envelope_without_re_admission(tmp_path, privacy):
+@pytest.mark.parametrize("session_id", [None, "original-run"])
+async def test_terminal_read_verifies_native_envelope_without_re_admission(tmp_path, privacy, session_id):
     backend, agent, dispatcher = await _channel_dispatcher(tmp_path / "terminal.db", "did:agent:receipt")
     agent.privacy_config = get_privacy_preset(privacy)
     source_id = "telegram:v2:bot:42:update:17"
+    def expected():
+        return replace(_terminal_signal(agent.did), session_id=session_id)
     try:
         await dispatcher.register_durable_consumer(DurableConsumerRegistration(
             consumer_id=DURABLE_TERMINAL_CONSUMER_ID, source="channel.message", agent_id=agent.did,
             correlation_selector=f"payload.{DURABLE_TERMINAL_MARKER}={DURABLE_TERMINAL_MARKER_VALUE}", max_attempts=0,
         ))
         handle = await dispatcher.enqueue_durable_terminal(
-            _terminal_signal(agent.did), source_event_id=source_id,
+            expected(), source_event_id=source_id,
             consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
         )
         assert (await handle.wait_for_durable_admission()).acknowledged
@@ -53,22 +56,22 @@ async def test_terminal_read_verifies_native_envelope_without_re_admission(tmp_p
         if privacy in {"ephemeral", "isolated"}:
             assert "content" not in before.event.payload
         assert await dispatcher.get_durable_delivery_for_source_event(
-            **kwargs, expected_channel_signal=_terminal_signal(agent.did),
+            **kwargs, expected_channel_signal=expected(),
         ) == before
         for field in ("content", "sender", "recipient"):
-            changed = _terminal_signal(agent.did)
+            changed = expected()
             changed.payload[field] = "foreign"
             assert await dispatcher.get_durable_delivery_for_source_event(
                 **kwargs, expected_channel_signal=changed,
             ) is None, field
-        changed = _terminal_signal(agent.did)
+        changed = expected()
         changed.payload["metadata"]["reply_to_message_id"] = "778"
         assert await dispatcher.get_durable_delivery_for_source_event(
             **kwargs, expected_channel_signal=changed,
         ) is None
-        for change in ({"target_agent": "did:foreign"}, {"caller": "foreign"}, {"dedupe_key": "foreign"}):
+        for change in ({"target_agent": "did:foreign"}, {"caller": "foreign"}, {"dedupe_key": "foreign"}, {"session_id": "other-run"}, {"session_id": None if session_id else "original-run"}):
             assert await dispatcher.get_durable_delivery_for_source_event(
-                **kwargs, expected_channel_signal=replace(_terminal_signal(agent.did), **change),
+                **kwargs, expected_channel_signal=replace(expected(), **change),
             ) is None
         assert await dispatcher.get_durable_delivery_for_source_event(**kwargs) == before
         assert (await backend.fetch_all("SELECT COUNT(*) FROM durable_signal_events"))[0][0] == 1
@@ -81,12 +84,12 @@ async def test_terminal_read_verifies_native_envelope_without_re_admission(tmp_p
         backend, agent, dispatcher = await _channel_dispatcher(tmp_path / "terminal.db", did)
         agent.privacy_config = get_privacy_preset("normal")
         assert await dispatcher.get_durable_delivery_for_source_event(
-            **kwargs, expected_channel_signal=_terminal_signal(agent.did),
+            **kwargs, expected_channel_signal=expected(),
         ) == before
         if privacy in {"ephemeral", "isolated"}:
             await backend.execute("DELETE FROM durable_signal_event_integrity")
             assert await dispatcher.get_durable_delivery_for_source_event(
-                **kwargs, expected_channel_signal=_terminal_signal(agent.did),
+                **kwargs, expected_channel_signal=expected(),
             ) is None
     finally:
         await dispatcher.shutdown_durable_delivery()

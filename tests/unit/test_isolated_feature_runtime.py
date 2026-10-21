@@ -16922,7 +16922,7 @@ async def test_hosted_ack_session_rejects_other_purposes_and_bad_identity(acknow
     feature._is_telegram_runtime = lambda: True
     feature._hosted_telegram_startup_attested = True
     feature._route_validated_inbound = AsyncMock()
-    with pytest.raises(ProtocolError):
+    with pytest.raises(isolated_runtime.ProtocolError):
         await feature.admit_hosted_telegram_ingress(
             {"id": "telegram:v2:bot:42:update:12"},
             acknowledgement_only=acknowledgement_only, acknowledgement_session_id=session_id,

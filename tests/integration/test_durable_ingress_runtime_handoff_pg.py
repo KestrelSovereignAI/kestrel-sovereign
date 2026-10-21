@@ -31,6 +31,82 @@ from tests.utils.runtime_task_factory import refusing_runtime_completion_factory
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
+@pytest.mark.parametrize("privacy", ["normal", "ephemeral", "isolated", "anonymous"])
+async def test_real_pg_host_ack_targets_one_run_and_receipt_binds_session(native_pg, privacy):
+    """Real proxy, producer, persistence and session selectors; no Workflows substitute claim."""
+    from dataclasses import replace
+    from kestrel_sdk.signals import Trust, Visibility
+    from kestrel_sovereign.features.channels.feature import ChannelFeature, InboundAdmissionDisposition
+    from kestrel_sovereign.features.channels.models import ChannelConfig, ChannelMessage, MessageDirection
+    from kestrel_sovereign.features.isolated_runtime import ProxyFeature
+    from kestrel_sovereign.signals.sources.channels import (
+        DURABLE_TERMINAL_CONSUMER_ID, DURABLE_TERMINAL_MARKER,
+        DURABLE_TERMINAL_MARKER_VALUE, build_signal_for_channel_message,
+    )
+    from tests.unit.test_channels_feature import StubAdapter
+    from tests.unit.test_durable_signal_delivery import _Agent
+
+    backend, control, schema = native_pg
+    agent = _Agent("did:test:pg-run-bound-ack")
+    agent.storage = SimpleNamespace(db=AsyncDatabase(backend), agent_id=agent.did)
+    agent.privacy_config = get_privacy_preset(privacy)
+    logs = SignalLogStore(backend)
+    await logs.initialize()
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    dispatcher = SignalDispatcher(agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=logs)
+    agent.dispatcher = dispatcher
+    channel = ChannelFeature(agent)
+    source_id = "telegram:v2:bot:42:update:19"
+    message = ChannelMessage(
+        id=source_id, channel_type="telegram", direction=MessageDirection.INBOUND,
+        sender="123", recipient="123", content=" OK ", agent_id=agent.did,
+        metadata={"dedupe_key": source_id, "chat_id": "123", "reply_to_message_id": "777",
+                  "session_id": "forged-run"},
+    )
+    proxy = object.__new__(ProxyFeature)
+    proxy.agent = agent
+    proxy._require_event_ingress_work = lambda: None
+    proxy._channel_feature = lambda: channel
+    proxy._authoritative_inbound_channel_type = lambda: "telegram"
+    try:
+        await channel.initialize()
+        channel.registry.register(StubAdapter(
+            channel="telegram", config=ChannelConfig(channel_type="telegram", allowed_senders=["123"]),
+        ))
+        for run in ("run-a", "run-b"):
+            await dispatcher.register_durable_consumer(DurableConsumerRegistration(
+                consumer_id=f"workflow-{run}", source="channel.message", agent_id=agent.did,
+                correlation_selector=f"session_id={run}",
+            ))
+        admission = await proxy._route_validated_inbound(
+            message.to_dict(), cursor_owned_protocol=True,
+            telegram_terminal_disposition="care_acknowledgement",
+            acknowledgement_session_id="run-a",
+        )
+        assert admission.disposition == InboundAdmissionDisposition.DURABLY_ADMITTED
+        expected = build_signal_for_channel_message(message, target_agent=agent.did, session_id="run-a")
+        expected.payload[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+        args = dict(consumer_id=DURABLE_TERMINAL_CONSUMER_ID, source="channel.message", source_event_id=source_id)
+        receipt = await dispatcher.get_durable_delivery_for_source_event(**args, expected_channel_signal=expected)
+        assert receipt is not None
+        assert receipt.event.session_id == "run-a"
+        assert receipt.event.visibility == Visibility.USER_VISIBLE.value
+        assert registry.get("channel.message").trust == Trust.UNTRUSTED
+        for session in (None, "run-b"):
+            assert await dispatcher.get_durable_delivery_for_source_event(
+                **args, expected_channel_signal=replace(expected, session_id=session),
+            ) is None
+        deliveries = await dispatcher.list_durable_deliveries()
+        assert {delivery.consumer_id for delivery in deliveries} == {DURABLE_TERMINAL_CONSUMER_ID, "workflow-run-a"}
+        assert agent.action_calls == 0
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects') == 0
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".durable_signal_events') == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await asyncio.gather(*agent.tasks, return_exceptions=True)
+
+
 async def retire_handoff_test(agent, dispatcher):
     """A failing dispatcher close cannot skip its original native task joins."""
     try:
