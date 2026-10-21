@@ -36,9 +36,13 @@ from kestrel_sovereign.a2a.lifecycle import (
     task_state_from_label,
     task_state_label,
 )
-from kestrel_sovereign.a2a.projections import embedded_json_value, task_presentation
+from kestrel_sovereign.a2a.projections import (
+    embedded_json_value,
+    message_text,
+    task_presentation,
+)
 from kestrel_sovereign.execution_custody import is_execution_control_error
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.base import Feature, is_flat_toolresult_envelope, tool
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sovereign.storage.db.interface import DatabaseError
 
@@ -337,27 +341,15 @@ class TaskFeature(Feature):
 
                     step_duration = int((time.time() - step_start) * 1000)
 
-                    # Honesty: A2A's task.status reports the *transport*
-                    # outcome — the call returned without raising — not
-                    # the *semantic* outcome. A migrated step that
-                    # returned ``ToolResult.failed`` lands here with
-                    # ``task.status.state == COMPLETED`` and would be
-                    # counted as a success in the workflow rollup.
-                    # Inspect the wire-shape (status / error fields)
-                    # and downgrade. Old-style dict tools with
-                    # ``success: False`` are also surfaced as failed so
-                    # the rollup is honest during the migration window.
+                    # Preserve native rejection/failure reasons and inspect
+                    # the business result of a completed tool before rollup.
                     semantic_status, semantic_error = self._classify_step_result(
                         task_state_label(task.status.state), result_data,
+                        failure_message=(message_text(task.status.message)
+                                         if task.status.HasField("message") else None),
                     )
-                    # Serialize the result before storing it in the
-                    # workflow's data dict. ``DynamicTool.execute`` may
-                    # store a raw ``ToolResult`` under ``result``; if
-                    # we leave that in place, downstream JSON
-                    # serialization for the LLM tool-history wire will
-                    # blow up. Walk the dict and ``.to_dict()`` any
-                    # ToolResult instances we find. (Round 5 codex
-                    # finding.)
+                    # All native artifacts are decoded through the shared
+                    # JSON projector before constructing the workflow result.
                     serialized_result = self._serialize_step_payload(result_data)
                     step_record = {
                         "step": i,
@@ -535,99 +527,49 @@ class TaskFeature(Feature):
     def _classify_step_result(
         transport_state: str,
         result_data: Any,
+        *,
+        failure_message: str | None = None,
     ) -> tuple[str, Optional[str]]:
-        """Translate the A2A task state + tool wire-data into a
-        workflow-step status.
+        """Combine native execution state with the returned business outcome.
 
-        A2A's ``task.status.state`` is transport-level: COMPLETED means
-        "the python call returned." A migrated tool that returns
-        ``ToolResult.failed`` is *transport-completed* but *semantically
-        failed*. To keep the workflow rollup honest, this helper
-        inspects the wire-shape.
-
-        Wire shapes seen in the wild (in order of how widely they
-        appear in production paths):
-
-          1. **In-process DynamicTool wrapper, raw ToolResult**
-             ``{"success": True, "result": <ToolResult instance>,
-             "tool": "<name>"}``.
-             ``Feature.handle_task`` → ``DynamicTool.execute``
-             stores the raw return value in ``result``. The
-             ToolResult object is only converted to a dict when
-             the artifact is serialized for the wire (Pydantic
-             ``model_dump()``); a synchronous in-process workflow
-             reads the raw object before that happens. **This is
-             the path codex round 4 caught.**
-          2. **Wire-serialized DynamicTool wrapper, dict ToolResult**
-             ``{"success": True, "result": <ToolResult.to_dict()>,
-             "tool": "..."}``. Same path after serialization.
-          3. **Bare ToolResult envelope** (handlers that bypass
-             DynamicTool): ``{"status": "ok"|"error"|"partial", ...}``.
-          4. **Bare ToolResult instance** (rare; some custom handlers).
-          5. **Pre-migration dict** ``{"success": False, "error": ...}``.
-          6. Anything else → defer to the transport state.
-
-        Returns ``(status, error_or_None)``. ``status`` is one of
-        ``"completed" | "failed" | "partial"``.
+        A failed/canceled/rejected native task always fails its workflow step.
+        A completed tool can still return a partial or unsuccessful business
+        result. Recognize the canonical ToolResult envelope before inspecting
+        a dictionary return carried by DynamicTool's result wrapper.
         """
-        if transport_state == "failed":
-            return "failed", None
+        native_state = task_state_from_label(transport_state)
+        if native_state in TERMINAL_STATES and native_state != TaskState.TASK_STATE_COMPLETED:
+            return "failed", failure_message
 
-        # Normalize a raw ToolResult instance to its dict form so the
-        # rest of the helper is purely structural.
-        def _normalize(candidate: Any) -> Any:
-            if isinstance(candidate, ToolResult):
-                return candidate.to_dict()
-            return candidate
+        def normalize(candidate: Any) -> Any:
+            return candidate.to_dict() if isinstance(candidate, ToolResult) else candidate
 
-        result_data = _normalize(result_data)
-
+        result_data = normalize(result_data)
         if not isinstance(result_data, dict):
-            return ("completed" if transport_state == "completed"
-                    else transport_state), None
-
-        # Resolve to whichever shape carries the @tool's return:
-        #  - bare envelope: result_data IS the ToolResult.to_dict()
-        #  - wrapped: result_data['result'] is the ToolResult — either
-        #    a dict (post-serialize) or a raw ToolResult instance
-        #    (pre-serialize, in-process)
-        candidates: List[Any] = [result_data]
+            return transport_state, None
+        candidates = [result_data]
         if "tool" in result_data and "success" in result_data:
-            inner = _normalize(result_data.get("result"))
+            inner = normalize(result_data.get("result"))
             if isinstance(inner, dict):
                 candidates.append(inner)
 
         for candidate in candidates:
-            if not isinstance(candidate, dict):
+            if not is_flat_toolresult_envelope(candidate):
                 continue
-            envelope_status = candidate.get("status")
-            # Coerce the enum to its wire token for comparison so
-            # both raw ToolResultStatus values (post-normalize from a
-            # raw ToolResult) and bare strings (post-serialize) match.
-            if isinstance(envelope_status, ToolResultStatus):
-                envelope_status = envelope_status.value
-            if envelope_status == "ok":
-                # The @tool said OK explicitly. Even if the outer
-                # wrapper had its own success flag, this is the
-                # source of truth.
+            status = candidate["status"]
+            if status == ToolResultStatus.OK:
                 return "completed", None
-            if envelope_status == "error":
+            if status == ToolResultStatus.ERROR:
                 return "failed", candidate.get("error")
-            if envelope_status == "partial":
+            if status == ToolResultStatus.PARTIAL:
                 return "partial", candidate.get("error")
 
-        # Pre-migration dict shape on the OUTER result_data only —
-        # the wrapper's own ``success: True`` is not authoritative
-        # (it just means DynamicTool.execute didn't raise), so don't
-        # treat outer success=True as a clean completion if we
-        # didn't find an envelope above.
-        if result_data.get("success") is False:
-            return "failed", result_data.get("error")
-        if result_data.get("error") and result_data.get("success") is not True:
-            return "failed", result_data.get("error")
-
-        return ("completed" if transport_state == "completed"
-                else transport_state), None
+        for candidate in candidates:
+            if candidate.get("success") is False or (
+                candidate.get("error") and candidate.get("success") is not True
+            ):
+                return "failed", candidate.get("error")
+        return transport_state, None
 
     @staticmethod
     def _resolve_step_refs(
