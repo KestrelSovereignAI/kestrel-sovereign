@@ -994,8 +994,14 @@ callback egress.
 Its host-owned guard factory supplies request authority and the matching
 lifecycle reader; the embedding host retains its writer during publication and
 withdrawal. The AgentManager embedding uses this contract. Standalone and
-launched-process publication and outbound sessions remain an implementation
-gate, using this same wire implementation.
+launched-process bootstrap and outbound sessions remain an implementation
+gate, using this same wire implementation. `SingleAgentNativeAuthority` now
+provides the original-runtime and scoped-policy guard for that embedding. Its
+writer closes admission, joins current readers, and withdraws the exact route
+binding before the agent's task manager may close its primary storage. Replacing
+an agent field cannot erase the captured runtime's original revocation. This is
+an authority primitive, not a claim that the standalone server startup path is
+already connected.
 
 ## Review, verification and release order
 

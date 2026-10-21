@@ -11,6 +11,7 @@ import sys
 import time
 from dataclasses import dataclass
 from dataclasses import replace as _replace_dataclass
+from functools import partial
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
 from uuid import uuid4
@@ -4847,6 +4848,21 @@ class KestrelAgent(
                 return ReleaseOutcome.RETAINED
         return ReleaseOutcome.RELEASED
 
+    async def _close_native_task_manager(self, manager):
+        """Join standalone publication readers before releasing their primary store."""
+        authority = getattr(self, "_native_a2a_runtime_authority", None)
+        if authority is not None:
+            from kestrel_sovereign.a2a.native_standalone import (
+                SingleAgentNativeAuthority,
+            )
+
+            if not isinstance(authority, SingleAgentNativeAuthority):
+                raise TypeError("Native runtime publication requires its original authority owner")
+            if authority.recipient is not self or authority.manager is not manager:
+                raise ValueError("Native publication retirement belongs to another runtime or task manager")
+            await authority.close()
+        return await manager.close()
+
     async def _boot_teardown_task_manager(self) -> ReleaseOutcome:
         """Close the A2A TaskManager stores.
 
@@ -4858,7 +4874,7 @@ class KestrelAgent(
         if tm is None or not hasattr(tm, "close"):
             self.task_manager = None
             return ReleaseOutcome.RELEASED
-        outcome = reported_outcome(await tm.close())
+        outcome = reported_outcome(await self._close_native_task_manager(tm))
         if outcome is ReleaseOutcome.RELEASED and self.task_manager is tm:
             self.task_manager = None
         return outcome
@@ -10545,7 +10561,7 @@ Expected Duration: {expected_duration}
                 await _release_within(
                     "task_manager",
                     "TaskManager",
-                    self.task_manager.close,
+                    partial(self._close_native_task_manager, self.task_manager),
                     _step_budget(),
                 )
         except asyncio.CancelledError as cancellation:

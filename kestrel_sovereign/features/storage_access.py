@@ -83,6 +83,7 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     native operator task inbox's recipient (``endpoints/task_inbox``),
     the native outbound sender (``features/peers``),
     the inbound-scope gate's recipient (``a2a/inbound_authorization``),
+    the standalone native publication owner (``a2a/native_standalone``),
     the task feature's own durable identity, the task wait provider's
     ownership check, the pre-turn state sections, the restart
     status-events route, (#3240) the feature-route mount owner's

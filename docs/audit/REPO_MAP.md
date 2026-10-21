@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-21
-**Scope:** 3270 tracked files (2441 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3272 tracked files (2443 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -123,6 +123,8 @@ Repo entry points and standard project files.
   - `class NativeRequestAuthority`; `class AuthorizedNativeRequest`; `class NativeDIDRequestGuard`
 - **kestrel_sovereign/a2a/native_sender.py** — Complete-request hybrid proofs for the A2A signed-sender-v1 extension.
   - `class ReplayNonceStore`; `def verification_document_fingerprint(did_document)`; `class NativeProofPolicy`; `class NativeVerifiedSender`; `def sign_native_request(keypair, params)`; `async def verify_native_request(headers, params)`
+- **kestrel_sovereign/a2a/native_standalone.py** — Original single-agent runtime authority over the shared native publication.
+  - `class SingleAgentNativeAuthority`
 - **kestrel_sovereign/a2a/outcomes.py** — Merge an owned handler's changes without losing concurrent durable work.
   - `class TaskOutcomeConflictError`; `def merge_task_outcome(current, baseline, outcome)`
 - **kestrel_sovereign/a2a/projections.py** — Read-only presentation of official native protocol values.
@@ -3500,6 +3502,8 @@ Repo entry points and standard project files.
   - `def identity()`; `def request_message()`; `def test_full_request_digest_uses_actual_protojson_presence(request_message)`; `def test_canonical_request_vector_retains_explicit_optional_zero()`; `def test_compact_claims_have_independent_ed25519_signature(identity, request_message)`; `async def test_shared_store_spends_nonce_across_independent_verifiers(identity, request_message, tmp_path)`; `async def test_every_native_payload_dimension_is_bound(identity, request_message, target)`; `async def test_route_operation_extension_and_clock_binding(identity, request_message, change, diagnostic)`; `…`
 - **tests/unit/test_a2a_native_shutdown.py** — Native primary storage and every service remain owned through shutdown.
   - `async def manager(native_a2a_backend_factory)`; `def observe_closes(manager, monkeypatch)`; `async def test_native_shutdown_closes_every_service_and_its_owned_primary(manager, monkeypatch)`; `async def test_failed_service_close_retains_its_owner_and_is_retried(manager, monkeypatch, store_name)`; `async def test_every_failed_service_is_named_and_original_error_is_preserved(manager, monkeypatch)`; `async def test_cancelled_drain_keeps_primary_and_all_services_for_retry(manager, monkeypatch)`; `async def test_shutdown_keeps_original_execution_receipt_while_closing_other_services(manager, monkeypatch)`; `async def test_sqlite_worker_retirement_is_owned_until_the_worker_exits(tmp_path, monkeypatch)`
+- **tests/unit/test_a2a_native_standalone.py** — Single runtime authority drives the same official SDK bindings and primary DB.
+  - `def single_identity()`; `async def single(native_request_admission, single_identity)`; `async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_manager(single, protocol)`; `async def test_retained_guard_refuses_replaced_runtime_authority(single, fault)`; `async def test_close_joins_original_readers_and_closes_admission_before_withdrawal(single)`; `async def test_another_runtime_owner_cannot_replace_the_original_generation(single)`; `async def test_agent_task_manager_close_joins_publication_before_any_primary_store_close(single, native_a2a_backend_factory)`; `async def test_unrecognized_publication_owner_cannot_discharge_storage(single)`; `…`
 - **tests/unit/test_a2a_native_store_ownership.py** — Borrowed host storage stays open until its actual owner retires it.
   - `async def test_each_store_honors_the_configured_resource_owner(native_a2a_backend_factory, store_type, owns_backend)`; `def test_backend_ownership_cannot_be_a_truthy_configuration_string(value)`
 - **tests/unit/test_a2a_native_task_changes.py** — Original SQLite/PostgreSQL transactions journal every native task mutation.

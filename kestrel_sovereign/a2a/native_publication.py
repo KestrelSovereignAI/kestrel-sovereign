@@ -199,6 +199,11 @@ class NativeA2APublication:
         if self._binding is not None:
             self.registry.withdraw(self._binding)
 
+    @property
+    def is_published(self) -> bool:
+        """Whether this exact route binding remains registered with its host."""
+        return self._binding is not None and self.registry.is_current(self._binding)
+
     async def get_card(self, _base: AgentCard | None = None) -> AgentCard:
         """Refresh public display/skills under the same live identity/policy lease."""
         if self._guard is None or self._binding is None:

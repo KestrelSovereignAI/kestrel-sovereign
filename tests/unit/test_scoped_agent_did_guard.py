@@ -530,6 +530,7 @@ def test_inbound_authorizer_has_no_recipient_without_a_did(agent):
 ROUTED_MODULES = {
     "agent/preturn_state.py",
     "a2a/inbound_authorization.py",
+    "a2a/native_standalone.py",  # standalone native publication owner
     "command_handler.py",
     "endpoints/agent.py",
     "endpoints/task_inbox.py",  # native operator inbox owner
