@@ -227,17 +227,31 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
     return outcome
 
 
-def is_execution_control_error(error: BaseException | None) -> bool:
+def _is_execution_control_node(error: BaseException) -> bool:
+    return (isinstance(error, ExecutionAuthorityError)
+            or bool(_acknowledged_commits(error))
+            or bool(vars(error).get("_kestrel_native_retirement_debts")))
+
+
+def is_execution_control_error(
+    error: BaseException | None, *, recursive: bool = True,
+) -> bool:
     """Original authority, commit, or physical-retirement evidence is control.
 
     An ordinary native close exception still controls retirement when it
     carries the actual retained resource/closer. Availability/tool-error
     normalization must never erase that original ownership evidence.
+
+    By default, inspect the explicit cause/group graph, ignoring implicit
+    context and visiting cyclic graphs only once. With ``recursive=False``,
+    inspect only the supplied node using the SAME predicate: a group or
+    ordinary carrier cannot borrow control from its members or cause. Its own
+    acknowledged commit or native retirement evidence still counts. Neither
+    mode changes the original errors, graph, receipts or physical owners.
     """
-    return any(isinstance(current, ExecutionAuthorityError)
-               or bool(_acknowledged_commits(current))
-               or bool(vars(current).get("_kestrel_native_retirement_debts"))
-               for current in _explicit_control_chain(error))
+    nodes = (_explicit_control_chain(error) if recursive
+             else () if error is None else (error,))
+    return any(_is_execution_control_node(current) for current in nodes)
 
 
 def retained_execution_error(error: BaseException) -> BaseException:
