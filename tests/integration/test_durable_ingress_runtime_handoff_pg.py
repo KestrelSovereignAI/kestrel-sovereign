@@ -88,7 +88,16 @@ async def test_real_pg_host_ack_targets_one_run_and_receipt_binds_session(native
         assert admission.disposition == InboundAdmissionDisposition.DURABLY_ADMITTED
         expected = build_signal_for_channel_message(message, target_agent=agent.did, session_id="run-a")
         expected.payload[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+        registration = registry.get("channel.message")
+        expected.payload = registration.schema(registration.sanitizer(expected.payload))
+        expected.origin_trust = registration.trust
         args = dict(consumer_id=DURABLE_TERMINAL_CONSUMER_ID, source="channel.message", source_event_id=source_id)
+        async with asyncio.timeout(5):
+            while True:
+                receipt = await dispatcher.get_durable_delivery_for_source_event(**args)
+                if receipt is not None and receipt.status == "terminal_ackable":
+                    break
+                await asyncio.sleep(0.01)
         receipt = await dispatcher.get_durable_delivery_for_source_event(**args, expected_channel_signal=expected)
         assert receipt is not None
         assert receipt.event.session_id == "run-a"
