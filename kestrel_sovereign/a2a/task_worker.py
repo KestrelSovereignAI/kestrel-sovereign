@@ -100,10 +100,10 @@ class TaskWorker:
             max_retries: Maximum retry attempts for failed tasks
             retry_delay: Seconds to wait before retrying
         """
-        recipient_agent_id = getattr(task_manager, "host_agent_id", None)
+        recipient_agent_id = getattr(task_manager, "did", None)
         if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
             raise ValueError(
-                "TaskWorker requires task_manager.host_agent_id as its durable "
+                "TaskWorker requires task_manager.did as its durable "
                 "recipient identity"
             )
 

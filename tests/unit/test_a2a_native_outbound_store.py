@@ -479,7 +479,7 @@ async def test_real_task_manager_initializes_outbound_on_its_primary_backend(
         await manager.initialize()
         assert manager.outbound_store.backend is manager.task_store.backend is backend
         reserved = await reserve(manager.outbound_store, request())
-        assert reserved.sender_id == manager.host_agent_id == "did:sender"
+        assert reserved.sender_id == manager.did == "did:sender"
         assert reserved.sender_tenant == "local-tenant"
         await manager.close()
         assert backend.is_connected

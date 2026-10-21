@@ -480,12 +480,12 @@ async def test_background_handler_outcome_commits_and_notifies_once(
     accepted = await manager.execute_skill("feature", skill.id, {}, sync=False)
     await manager.drain_execution_tasks()
     await manager.drain_execution_tasks()
-    persisted = await manager.get_task_for_recipient(accepted.id, manager.host_agent_id)
+    persisted = await manager.get_task_for_recipient(accepted.id, manager.did)
     assert persisted.status.state == state
     assert provider.calls == 1
     assert len(completions) == 1
     assert completions[0].task == persisted
-    assert completions[0].ownership.creator_agent_id == manager.host_agent_id
+    assert completions[0].ownership.creator_agent_id == manager.did
     if state == TaskState.TASK_STATE_FAILED:
         assert persisted.status.message.task_id == persisted.id
         assert persisted.status.message.context_id == persisted.context_id
@@ -511,7 +511,7 @@ async def test_background_shutdown_joins_a_canceled_handler_and_its_durable_rece
     execution = next(iter(manager._execution_tasks))
     await manager.drain_execution_tasks(cancel=True)
     await manager.drain_execution_tasks()
-    persisted = await manager.get_task_for_recipient(accepted.id, manager.host_agent_id)
+    persisted = await manager.get_task_for_recipient(accepted.id, manager.did)
     assert persisted.status.state == TaskState.TASK_STATE_CANCELED
     assert provider.calls == 0
     assert execution.cancelled()
@@ -613,7 +613,7 @@ async def test_local_skill_completion_retains_the_current_turn_causation_extensi
     from kestrel_sovereign.signals.sources.a2a import build_signal_for_completed_task
 
     cause = CausationFrame(
-        agent_id=manager.host_agent_id,
+        agent_id=manager.did,
         source="cron.followup",
         signal_id="signal-one",
         turn_id="turn-one",
@@ -632,9 +632,9 @@ async def test_local_skill_completion_retains_the_current_turn_causation_extensi
     manager.register_provider("feature", [skill], CompletingProvider())
     result = await manager.execute_skill("feature", skill.id, {}, sync=False)
     await manager.drain_execution_tasks()
-    signal = build_signal_for_completed_task(completions[0], manager.host_agent_id)
+    signal = build_signal_for_completed_task(completions[0], manager.did)
     assert signal.causation_chain == [cause]
-    persisted = await manager.get_task_for_recipient(result.id, manager.host_agent_id)
+    persisted = await manager.get_task_for_recipient(result.id, manager.did)
     metadata = MessageToDict(persisted.metadata)
     assert CAUSATION_URI in metadata and "causation_chain" not in metadata
 
@@ -667,7 +667,7 @@ async def test_lost_commit_ack_reconciles_only_the_canonical_payload(
         await manager.task_store.add_artifact(
             task.id,
             new_text_artifact("concurrent", "keep"),
-            recipient_agent_id=manager.host_agent_id,
+            recipient_agent_id=manager.did,
         )
         saved = await canonical_save(task, **kwargs)
         assert saved is not None
@@ -688,7 +688,7 @@ async def test_lost_commit_ack_reconciles_only_the_canonical_payload(
     monkeypatch.setattr(manager.task_store, "get_for_recipient", read)
     if readback == "available":
         returned = await manager.execute_skill("feature", skill.id, {})
-        assert returned == await canonical_read(committed_id, manager.host_agent_id)
+        assert returned == await canonical_read(committed_id, manager.did)
         assert {item.name for item in returned.artifacts} == {"concurrent", "result"}
     else:
         with pytest.raises(RuntimeError) as failed:
@@ -699,7 +699,7 @@ async def test_lost_commit_ack_reconciles_only_the_canonical_payload(
         else:
             assert isinstance(failed.value.__cause__, TaskMutationAuthorizationError)
     assert provider.calls == writes == 1
-    persisted = await canonical_read(committed_id, manager.host_agent_id)
+    persisted = await canonical_read(committed_id, manager.did)
     assert persisted.status.state == TaskState.TASK_STATE_COMPLETED
     assert {item.name for item in persisted.artifacts} == {"concurrent", "result"}
 
@@ -739,9 +739,7 @@ async def test_denied_local_skill_returns_a_native_rejection_without_running_the
     assert result.status.message.task_id == result.id
     assert result.status.message.context_id == result.context_id
     assert MessageToDict(result.metadata)["denied"] is True
-    assert (
-        await manager.get_task_for_recipient(result.id, manager.host_agent_id) == result
-    )
+    assert await manager.get_task_for_recipient(result.id, manager.did) == result
 
 
 @pytest.mark.parametrize(
@@ -752,7 +750,7 @@ async def test_native_stream_closes_on_an_interruption_without_making_the_task_t
     manager, state, already_interrupted
 ):
     task = await admit(manager)
-    recipient = manager.host_agent_id
+    recipient = manager.did
     if already_interrupted:
         await manager.update_status(task.id, state, recipient_agent_id=recipient)
     stream = manager.subscribe(
@@ -775,3 +773,34 @@ async def test_native_stream_closes_on_an_interruption_without_making_the_task_t
         assert resumed.status.state == TaskState.TASK_STATE_WORKING
     finally:
         await stream.aclose()
+
+
+async def test_manager_owner_is_derived_from_authoritative_scope_and_cannot_be_overwritten(
+    manager,
+):
+    assert manager.did == manager.task_store.scope.recipient_id
+    with pytest.raises(AttributeError):
+        manager.did = "did:forged:display-name"
+    assert manager.did == "did:kestrel:recipient"
+    accepted = await admit(manager)
+    [event] = await manager.task_store.backend.fetch_all(
+        "SELECT agent_name FROM a2a_observability WHERE tool_name = 'task_create'"
+    )
+    assert event == (manager.did,)
+    assert accepted.id
+
+
+async def test_failure_and_transition_telemetry_remain_owned_by_the_recipient_did(
+    manager,
+):
+    accepted = await admit(manager)
+    await manager.fail_task(
+        accepted.id,
+        "Deliberate failure",
+        agent_name="A reporting display name",
+        recipient_agent_id=manager.did,
+    )
+    rows = await manager.task_store.backend.fetch_all(
+        "SELECT agent_name FROM a2a_observability"
+    )
+    assert len(rows) >= 3 and all(row == (manager.did,) for row in rows)

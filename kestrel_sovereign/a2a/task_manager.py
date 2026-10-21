@@ -188,7 +188,6 @@ class TaskManager:
         self.memory_service = memory_service
         self.feedback_store = feedback_store
         self.hooks_manager = hooks_manager
-        self.host_agent_id = task_store.scope.recipient_id
         self.outbound_store = OutboundStore(
             task_store.backend, sender_scope=task_store.scope, owns_backend=False
         )
@@ -247,6 +246,11 @@ class TaskManager:
         # uncertain durable write, and must not erase its original error.
         self._execution_control: BaseException | None = None
 
+    @property
+    def did(self) -> str:
+        """This manager's owner, derived from its one server-owned recipient scope."""
+        return self.task_store.scope.recipient_id
+
     def outbound_for_actor(self, actor_id: str) -> OutboundStore:
         """Return the one outbound ledger bound to this actor and primary store."""
         if (
@@ -254,8 +258,7 @@ class TaskManager:
             or not actor_id.strip()
             or not isinstance(self.task_store, TaskStore)
             or not isinstance(self.outbound_store, OutboundStore)
-            or self.host_agent_id != actor_id
-            or self.task_store.scope.recipient_id != actor_id
+            or self.did != actor_id
             or self.outbound_store.sender_scope != self.task_store.scope
             or self.outbound_store.backend is not self.task_store.backend
             or not isinstance(self.question_store, NativeQuestionStore)
@@ -485,7 +488,7 @@ class TaskManager:
             raise ValueError(f"Unknown agent: {agent_id}")
 
         _, handler = self._providers[agent_id]
-        authority_agent_id = self.host_agent_id
+        authority_agent_id = self.did
         hook_feature_name = getattr(handler, "name", None) or agent_id
 
         session_id = session_id or uuid4().hex
@@ -1229,7 +1232,7 @@ class TaskManager:
             if not session:
                 await self.session_service.create_session(
                     session_id=projection_id,
-                    agent_name=self.host_agent_id,
+                    agent_name=self.did,
                     metadata={"a2a_context_id": task.context_id},
                 )
             await self.session_service.append_event(
@@ -1248,7 +1251,7 @@ class TaskManager:
 
         try:
             await self.observability_store.log_tool_call(
-                agent_name=self.host_agent_id,
+                agent_name=self.did,
                 tool_name="task_create",
                 session_id=projection_id,
                 metadata={"task_id": task.id},
@@ -1868,11 +1871,11 @@ class TaskManager:
         if agent_name:
             try:
                 await self.observability_store.log_error(
-                    agent_name=agent_name,
+                    agent_name=self.did,
                     error_type="task_failure",
                     error_message=error,
                     session_id=self.session_id_for_context(task.context_id),
-                    metadata={"task_id": task_id},
+                    metadata={"task_id": task_id, "reported_by": agent_name},
                 )
             except Exception as execution_error:
                 if is_execution_control_error(execution_error):
@@ -1973,12 +1976,13 @@ class TaskManager:
             metadata: dict[str, Any] = {
                 "task_id": task.id,
                 "state_transition": f"{old_state} -> {task_state_label(new_state)}",
+                "reported_by": agent_name,
             }
             if new_state == TaskState.TASK_STATE_CANCELED:
                 metadata["cancellation_reason"] = reason
             try:
                 await self.observability_store.log_agent_response(
-                    agent_name=agent_name,
+                    agent_name=self.did,
                     duration_ms=0,
                     session_id=self.session_id_for_context(task.context_id),
                     metadata=metadata,
@@ -2071,7 +2075,7 @@ class TaskManager:
         if final and self._on_task_complete is not None:
             candidate = await self.task_store.get_task_snapshot(
                 task.id,
-                recipient_agent_id=self.host_agent_id,
+                recipient_agent_id=self.did,
             )
             if candidate is None:
                 raise RuntimeError(

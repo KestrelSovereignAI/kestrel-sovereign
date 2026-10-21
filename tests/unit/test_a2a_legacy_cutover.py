@@ -135,7 +135,7 @@ async def test_offline_cutover_preserves_archives_ownership_and_history_without_
         try:
             await manager.initialize()
             restored = await manager.get_task_for_recipient(
-                "historical", manager.host_agent_id
+                "historical", manager.did
             )
             assert (
                 restored.id == "historical"
@@ -161,7 +161,7 @@ async def test_offline_cutover_preserves_archives_ownership_and_history_without_
                 creator_agent_id="did:creator",
             )
             candidates = await manager.task_store.list_cognition_wake_candidates(
-                recipient_agent_id=manager.host_agent_id,
+                recipient_agent_id=manager.did,
                 live_changed_since=datetime(2020, 1, 1, tzinfo=UTC),
                 terminal_changed_since=datetime(2020, 1, 1, tzinfo=UTC),
             )

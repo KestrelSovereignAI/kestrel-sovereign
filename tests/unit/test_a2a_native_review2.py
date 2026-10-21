@@ -146,7 +146,7 @@ class LocalFeature(Feature):
 
 def local_feature(manager):
     feature = LocalFeature(
-        SimpleNamespace(did=manager.host_agent_id, _execution_custody=None)
+        SimpleNamespace(did=manager.did, _execution_custody=None)
     )
     feature.name = "local"
     feature.effects = 0
@@ -170,7 +170,7 @@ async def test_local_skill_arguments_never_round_trip_through_struct(
         args = {"limit": 2**53 + 1, "nested": {"count": 2}}
         task = await manager.execute_skill("local", "local_int", args, sync=sync)
         await manager.drain_execution_tasks()
-        stored = await manager.get_task_for_recipient(task.id, manager.host_agent_id)
+        stored = await manager.get_task_for_recipient(task.id, manager.did)
         assert stored.status.state == TaskState.TASK_STATE_COMPLETED
         assert feature.observed == (2**53 + 1, {"count": 2})
         assert args == {"limit": 2**53 + 1, "nested": {"count": 2}}

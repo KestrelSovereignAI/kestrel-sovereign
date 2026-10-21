@@ -51,7 +51,7 @@ async def artifacts(native_a2a_backend_factory):
 
 async def test_tool_chunks_use_native_ids_events_and_one_durable_artifact(artifacts):
     manager, feature, task = artifacts
-    stream = manager.subscribe(task.id, recipient_agent_id=manager.host_agent_id)
+    stream = manager.subscribe(task.id, recipient_agent_id=manager.did)
     client_task = await anext(stream)
     try:
         first = await feature.attach_artifact_to_a2a_task(
@@ -76,7 +76,7 @@ async def test_tool_chunks_use_native_ids_events_and_one_durable_artifact(artifa
         event = await anext(stream)
         assert event.append and event.last_chunk
         append_artifact_to_task(client_task, event)
-        stored = await manager.get_task_for_recipient(task.id, manager.host_agent_id)
+        stored = await manager.get_task_for_recipient(task.id, manager.did)
         assert len(stored.artifacts) == 1
         assert list(stored.artifacts) == list(client_task.artifacts)
         assert [part.text for part in stored.artifacts[0].parts] == ["first", "second"]
@@ -93,13 +93,13 @@ async def test_sdk_append_preserves_json_metadata_and_replace_does_not_duplicate
     first = new_text_artifact("reply", "first")
     first.metadata.update({"original": {"nested": [None, {}, []]}, "empty": ""})
     await manager.add_artifact(
-        task.id, first, recipient_agent_id=manager.host_agent_id, last_chunk=False
+        task.id, first, recipient_agent_id=manager.did, last_chunk=False
     )
     second = new_text_artifact("reply", "second", artifact_id=first.artifact_id)
     second.metadata.update({"second": [False, 0, None, {}]})
     before = second.SerializeToString(deterministic=True)
     stored = await manager.add_artifact(
-        task.id, second, recipient_agent_id=manager.host_agent_id, append=True
+        task.id, second, recipient_agent_id=manager.did, append=True
     )
     assert second.SerializeToString(deterministic=True) == before
     assert MessageToDict(stored.artifacts[0].metadata) == {
@@ -111,7 +111,7 @@ async def test_sdk_append_preserves_json_metadata_and_replace_does_not_duplicate
         "replacement", "whole new body", artifact_id=first.artifact_id
     )
     stored = await manager.add_artifact(
-        task.id, replacement, recipient_agent_id=manager.host_agent_id, append=False
+        task.id, replacement, recipient_agent_id=manager.did, append=False
     )
     assert len(stored.artifacts) == 1
     assert stored.artifacts[0] == replacement
@@ -119,21 +119,21 @@ async def test_sdk_append_preserves_json_metadata_and_replace_does_not_duplicate
 
 async def test_unknown_append_is_a_protocol_error_without_a_write_or_event(artifacts):
     manager, feature, task = artifacts
-    stream = manager.subscribe(task.id, recipient_agent_id=manager.host_agent_id)
+    stream = manager.subscribe(task.id, recipient_agent_id=manager.did)
     await anext(stream)
     try:
         with pytest.raises(InvalidAgentResponseError, match="nonexistent artifact_id"):
             await manager.add_artifact(
                 task.id,
                 new_text_artifact("missing", "bad", artifact_id="not-created"),
-                recipient_agent_id=manager.host_agent_id,
+                recipient_agent_id=manager.did,
                 append=True,
             )
         result = await feature.attach_artifact_to_a2a_task(
             task.id, "missing", "bad", artifact_id="not-created"
         )
         assert result.status is ToolResultStatus.ERROR
-        stored = await manager.get_task_for_recipient(task.id, manager.host_agent_id)
+        stored = await manager.get_task_for_recipient(task.id, manager.did)
         assert stored == task
         assert manager._subscribers[task.id][0].empty()
     finally:
@@ -147,10 +147,10 @@ async def test_chunk_flags_fail_before_mutation(artifacts, field, value):
         await manager.add_artifact(
             task.id,
             new_text_artifact("reply", "bad"),
-            recipient_agent_id=manager.host_agent_id,
+            recipient_agent_id=manager.did,
             **{field: value},
         )
-    assert await manager.get_task_for_recipient(task.id, manager.host_agent_id) == task
+    assert await manager.get_task_for_recipient(task.id, manager.did) == task
 
 
 @pytest.mark.parametrize(
@@ -166,9 +166,9 @@ async def test_store_refuses_wrong_or_incomplete_native_artifacts(
     manager, _, task = artifacts
     with pytest.raises(error):
         await manager.task_store.add_artifact(
-            task.id, value, recipient_agent_id=manager.host_agent_id
+            task.id, value, recipient_agent_id=manager.did
         )
-    assert await manager.get_task_for_recipient(task.id, manager.host_agent_id) == task
+    assert await manager.get_task_for_recipient(task.id, manager.did) == task
 
 
 async def test_foreign_or_terminal_task_refuses_new_chunks(artifacts):
@@ -186,7 +186,7 @@ async def test_foreign_or_terminal_task_refuses_new_chunks(artifacts):
     assert (
         list(
             (
-                await manager.get_task_for_recipient(task.id, manager.host_agent_id)
+                await manager.get_task_for_recipient(task.id, manager.did)
             ).artifacts
         )
         == []
@@ -209,7 +209,7 @@ async def test_async_handler_artifacts_reach_stream_before_terminal_status(artif
     task = await manager.execute_skill(
         agent_id="exporter", skill_id="export", args={}, sync=False
     )
-    stream = manager.subscribe(task.id, recipient_agent_id=manager.host_agent_id)
+    stream = manager.subscribe(task.id, recipient_agent_id=manager.did)
     try:
         await asyncio.wait_for(handler.started.wait(), 5)
         client_task = await anext(stream)
@@ -267,7 +267,7 @@ async def test_handler_outcome_preserves_concurrent_artifact_and_history(artifac
         await asyncio.wait_for(handler.started.wait(), 5)
         early = new_text_artifact("already committed", "keep this output")
         await manager.add_artifact(
-            task.id, early, recipient_agent_id=manager.host_agent_id
+            task.id, early, recipient_agent_id=manager.did
         )
         progress = new_text_message(
             "durable progress",
@@ -279,11 +279,11 @@ async def test_handler_outcome_preserves_concurrent_artifact_and_history(artifac
             task.id,
             TaskState.TASK_STATE_WORKING,
             message=progress,
-            recipient_agent_id=manager.host_agent_id,
+            recipient_agent_id=manager.did,
         )
         handler.release.set()
         await manager.drain_execution_tasks()
-        stored = await manager.get_task_for_recipient(task.id, manager.host_agent_id)
+        stored = await manager.get_task_for_recipient(task.id, manager.did)
         assert {artifact.name for artifact in stored.artifacts} == {
             "already committed",
             "export",
@@ -312,7 +312,7 @@ async def test_in_place_handler_cannot_mutate_the_accepted_acknowledgement(artif
         assert acknowledgement.SerializeToString(deterministic=True) == before
         assert acknowledgement.status.state == TaskState.TASK_STATE_SUBMITTED
         stored = await manager.get_task_for_recipient(
-            acknowledgement.id, manager.host_agent_id
+            acknowledgement.id, manager.did
         )
         assert stored.status.state == TaskState.TASK_STATE_COMPLETED
         assert len(stored.artifacts) == 1

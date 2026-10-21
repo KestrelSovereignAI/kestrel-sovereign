@@ -53,8 +53,6 @@ from kestrel_sdk.tools.base import ToolCategory as ToolCategory
 from kestrel_sdk.tools.base import ToolParameter as ToolParameter
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
-from kestrel_sovereign.a2a.skill_handler import TaskHandler as TaskHandler
-
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     execution_work_operation,

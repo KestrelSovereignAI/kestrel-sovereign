@@ -76,16 +76,16 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
         ),
         creator_agent_id="did:kestrel:verified-sender",
     )
-    first = build_signal_for_submitted_task(callbacks[0], native_manager.host_agent_id)
+    first = build_signal_for_submitted_task(callbacks[0], native_manager.did)
     backend = native_a2a_backend_factory()
     await backend.connect()
     restarted = manager_for(backend, native_manager.task_store.scope)
     try:
         await restarted.initialize()
         candidate = await restarted.get_task_snapshot(
-            task.id, recipient_agent_id=restarted.host_agent_id
+            task.id, recipient_agent_id=restarted.did
         )
-        recovered = build_signal_for_submitted_task(candidate, restarted.host_agent_id)
+        recovered = build_signal_for_submitted_task(candidate, restarted.did)
         for signal in (first, recovered):
             assert (
                 signal.payload["sender"]
@@ -104,7 +104,7 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
             )
         assert first.dedupe_key == recovered.dedupe_key == task.id
         candidates = await restarted.list_cognition_wake_candidates(
-            recipient_agent_id=restarted.host_agent_id,
+            recipient_agent_id=restarted.did,
             live_changed_since=datetime.now(UTC) - timedelta(days=1),
             terminal_changed_since=datetime.now(UTC) - timedelta(days=1),
         )
@@ -122,7 +122,7 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
         )
         assert (
             await foreign_tenant.get_task_snapshot(
-                task.id, recipient_agent_id=restarted.host_agent_id
+                task.id, recipient_agent_id=restarted.did
             )
             is None
         )
@@ -172,10 +172,10 @@ async def test_unproven_or_misrouted_snapshots_cannot_mint_trusted_wakes(
         request(), creator_agent_id="did:kestrel:sender"
     )
     candidate = await native_manager.get_task_snapshot(
-        task.id, recipient_agent_id=native_manager.host_agent_id
+        task.id, recipient_agent_id=native_manager.did
     )
     with pytest.raises(TypeError, match="durable task provenance"):
-        build_signal_for_submitted_task(task, native_manager.host_agent_id)
+        build_signal_for_submitted_task(task, native_manager.did)
     with pytest.raises(TaskMutationAuthorizationError):
         build_signal_for_submitted_task(candidate, "did:kestrel:elsewhere")
     for ownership in [
@@ -184,7 +184,7 @@ async def test_unproven_or_misrouted_snapshots_cannot_mint_trusted_wakes(
     ]:
         with pytest.raises(TaskMutationAuthorizationError):
             build_signal_for_submitted_task(
-                replace(candidate, ownership=ownership), native_manager.host_agent_id
+                replace(candidate, ownership=ownership), native_manager.did
             )
 
 
@@ -192,7 +192,7 @@ async def test_native_rejection_reaches_completion_signal_and_actual_notificatio
     native_manager,
 ):
     class Recipient(EventManagerMixin):
-        did = native_manager.host_agent_id
+        did = native_manager.did
         dispatcher = None
 
         def __init__(self):
@@ -206,12 +206,12 @@ async def test_native_rejection_reaches_completion_signal_and_actual_notificatio
     await native_manager.update_status(
         task.id,
         TaskState.TASK_STATE_REJECTED,
-        recipient_agent_id=native_manager.host_agent_id,
+        recipient_agent_id=native_manager.did,
     )
     candidate = await native_manager.get_task_snapshot(
-        task.id, recipient_agent_id=native_manager.host_agent_id
+        task.id, recipient_agent_id=native_manager.did
     )
-    signal = build_signal_for_completed_task(candidate, native_manager.host_agent_id)
+    signal = build_signal_for_completed_task(candidate, native_manager.did)
     assert signal.payload["task_state"] == "rejected"
     assert signal.caller == "did:kestrel:sender"
     assert len(recipient._pending_task_notifications) == 1
@@ -228,16 +228,16 @@ async def test_privacy_elided_rehydration_reads_native_ownership_and_withdraws_s
         creator_agent_id="did:kestrel:sender",
     )
     candidate = await native_manager.get_task_snapshot(
-        task.id, recipient_agent_id=native_manager.host_agent_id
+        task.id, recipient_agent_id=native_manager.did
     )
-    original = build_signal_for_submitted_task(candidate, native_manager.host_agent_id)
+    original = build_signal_for_submitted_task(candidate, native_manager.did)
     projected = replace(original, payload={}, caller=None)
     now = datetime.now(UTC)
     event = DurableSignalEvent(
         event_id=original.id,
         source_event_id=task.id,
-        agent_id=native_manager.host_agent_id,
-        target_agent=native_manager.host_agent_id,
+        agent_id=native_manager.did,
+        target_agent=native_manager.did,
         source=original.source,
         kind=original.kind,
         mode=original.mode.value,
@@ -253,7 +253,7 @@ async def test_privacy_elided_rehydration_reads_native_ownership_and_withdraws_s
         retention_until=now + timedelta(days=1),
     )
     recipient = EventManagerMixin()
-    recipient.did = native_manager.host_agent_id
+    recipient.did = native_manager.did
     recipient.task_manager = native_manager
     recovered = await recipient.rehydrate_durable_cognition_signal(
         event, dispatch_signal=projected
@@ -271,7 +271,7 @@ async def test_privacy_elided_rehydration_reads_native_ownership_and_withdraws_s
     await native_manager.update_status(
         task.id,
         TaskState.TASK_STATE_REJECTED,
-        recipient_agent_id=native_manager.host_agent_id,
+        recipient_agent_id=native_manager.did,
     )
     assert (
         await recipient.rehydrate_durable_cognition_signal(
@@ -314,9 +314,9 @@ async def test_native_wake_uses_declared_intent_and_advisory_hint_without_draft_
         creator_agent_id="did:kestrel:verified-sender",
     )
     snapshot = await native_manager.get_task_snapshot(
-        task.id, recipient_agent_id=native_manager.host_agent_id
+        task.id, recipient_agent_id=native_manager.did
     )
-    signal = build_signal_for_submitted_task(snapshot, native_manager.host_agent_id)
+    signal = build_signal_for_submitted_task(snapshot, native_manager.did)
     assert signal.payload["a2a_verb"] == verb
     assert signal.payload["skill_id"] == "published-advisory-skill"
     assert signal.payload["reply_expected"] is expected_reply
@@ -328,10 +328,10 @@ async def test_undeclared_draft_skill_cannot_become_native_wake_hint(native_mana
         creator_agent_id="did:kestrel:verified-sender",
     )
     snapshot = await native_manager.get_task_snapshot(
-        task.id, recipient_agent_id=native_manager.host_agent_id
+        task.id, recipient_agent_id=native_manager.did
     )
     assert (
-        build_signal_for_submitted_task(snapshot, native_manager.host_agent_id).payload[
+        build_signal_for_submitted_task(snapshot, native_manager.did).payload[
             "skill_id"
         ]
         == ""
