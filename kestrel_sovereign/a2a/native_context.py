@@ -76,6 +76,14 @@ def native_header_values(context: ServerCallContext, name: str) -> list[str]:
     return _native_http_request(context).request.headers.getlist(name)
 
 
+async def wait_native_disconnect(context: ServerCallContext) -> None:
+    """Wait for the HTTP peer after its request body has been fully consumed."""
+    request = _native_http_request(context).request
+    message = await request.receive()
+    if message["type"] != "http.disconnect":
+        raise RuntimeError("Native disconnect monitoring requires a consumed HTTP request")
+
+
 def _require_tenant(value: object, expected: str) -> None:
     # ProtoJSON null denotes an unset scalar. An explicitly unset tenant is
     # consistent only with the advertised default/empty tenant.

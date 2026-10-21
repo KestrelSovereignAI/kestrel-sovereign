@@ -2679,79 +2679,6 @@ def _task_recipient_principal(agent, *, verb: str = "reads require") -> str:
         ) from None
 
 
-@router.get("/tasks")
-async def list_tasks(
-    request: Request,
-    status: Optional[str] = Query(None, description="Filter by status: working, completed, failed, submitted, canceled"),
-    limit: int = Query(50, le=100, description="Max results")
-):
-    """
-    List background A2A tasks.
-
-    Returns tasks managed by the agent's TaskManager.
-    """
-    agent = get_agent(request)
-
-    # Check if agent has a task_manager
-    if not hasattr(agent, 'task_manager') or not agent.task_manager:
-        return {"tasks": [], "total": 0, "message": "TaskManager not available"}
-
-    try:
-        from kestrel_sovereign.a2a.types import TaskState
-
-        # Parse status filter
-        task_state = None
-        if status:
-            try:
-                task_state = TaskState(status.lower())
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid status: {status}. Valid values: working, completed, failed, submitted, canceled"
-                )
-
-        # Get tasks from task store
-        tasks = await agent.task_manager.task_store.list_tasks(
-            recipient_agent_id=_task_recipient_principal(agent),
-            status=task_state,
-            limit=limit,
-        )
-
-        # Convert to response format
-        task_list = []
-        for task in tasks:
-            # Extract message text
-            message_text = None
-            if task.status.message and task.status.message.parts:
-                for part in task.status.message.parts:
-                    if hasattr(part, 'text'):
-                        message_text = part.text
-                        break
-
-            # Extract metadata
-            metadata = task.metadata or {}
-
-            task_list.append({
-                "id": task.id,
-                "status": task.status.state.value,
-                "message": message_text,
-                "agent_id": metadata.get("agent_id"),
-                "skill": metadata.get("skill"),
-                "artifacts_count": len(task.artifacts) if task.artifacts else 0,
-            })
-
-        return {
-            "tasks": task_list,
-            "total": len(task_list)
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        if is_execution_control_error(e):
-            raise
-        logger.error(f"Error listing tasks: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error listing tasks.")
 
 
 def _a2a_did_resolver(agent):
@@ -3735,35 +3662,6 @@ def _task_http_payload(task) -> dict[str, object]:
     }
 
 
-@router.get("/tasks/{task_id}")
-async def get_task(request: Request, task_id: str):
-    """
-    Fetch a single background A2A task with its artifacts.
-
-    Used by the Tasks panel to render "Load artifacts" for a given task.
-    """
-    agent = get_agent(request)
-
-    if not hasattr(agent, "task_manager") or not agent.task_manager:
-        raise HTTPException(status_code=404, detail="TaskManager not available")
-
-    try:
-        task = await agent.task_manager.get_task_for_recipient(
-            task_id,
-            _task_recipient_principal(agent),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        if is_execution_control_error(e):
-            raise
-        logger.error(f"Error loading task {task_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error loading task.")
-
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return _task_http_payload(task)
 
 
 @router.post("/tasks/{task_id:path}/read")

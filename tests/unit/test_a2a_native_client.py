@@ -20,7 +20,7 @@ from a2a.types import (
     TaskState,
 )
 from a2a.utils.signing import InvalidSignaturesError, create_agent_card_signer
-from google.protobuf.json_format import ParseDict
+from google.protobuf.json_format import MessageToDict, ParseDict
 from starlette.applications import Starlette
 
 from kestrel_sovereign.a2a.native_card import (
@@ -91,6 +91,7 @@ async def peer_session(native_request_admission, recipient_identity, request):
         revoke_on_response=False,
         response_error=None,
         taskless=False,
+        early_task_response=False,
         received_messages=0,
         received_cancellations=0,
         revoke_on_request=False,
@@ -103,10 +104,18 @@ async def peer_session(native_request_admission, recipient_identity, request):
 
         async def on_message_send(self, params, context):
             state.received_messages += 1
+            if state.early_task_response:
+                async with self.guard.admit(params, "SendMessage", context) as admitted:
+                    return await self._submit(admitted)
             if not state.taskless:
                 return await super().on_message_send(params, context)
             async with self.guard.admit(params, "SendMessage", context):
+                from kestrel_sovereign.a2a.extensions import correlated_answer_metadata
+
                 return Message(
+                    metadata=correlated_answer_metadata(
+                        MessageToDict(params.metadata), {}
+                    ),
                     message_id=uuid4().hex,
                     role=Role.ROLE_AGENT,
                     context_id=params.message.context_id or uuid4().hex,
@@ -201,6 +210,47 @@ async def peer_session(native_request_admission, recipient_identity, request):
             )
         finally:
             await session.close()
+
+
+@pytest_asyncio.fixture
+async def network_peer(peer_session):
+    """Real loopback HTTP; HTTPX ASGITransport buffers a streaming response."""
+    from a2a.types import AgentCard
+
+    from tests.utils.native_a2a import serve_native_app
+
+    p = peer_session
+    async with serve_native_app(p.http._transport.app) as base:
+        card = AgentCard.FromString(p.arguments["card"].SerializeToString())
+        for interface in card.supported_interfaces:
+            interface.url = interface.url.replace("https://peer.test", base, 1)
+        card = create_agent_card_signer(
+            p.identity.hybrid_keypair.classical.private_key,
+            {"kid": p.identity.signing_did + "#key-1", "alg": "EdDSA"},
+        )(card)
+        selected = next(
+            item
+            for item in card.supported_interfaces
+            if item.protocol_binding == p.arguments["interface"].protocol_binding
+        )
+        async with httpx.AsyncClient(
+            trust_env=False, event_hooks=p.http.event_hooks
+        ) as http:
+            arguments = p.arguments | {
+                "card": card,
+                "interface": selected,
+                "http_client": http,
+            }
+            session = NativePeerSession(**arguments)
+            try:
+                yield SimpleNamespace(
+                    **(
+                        vars(p)
+                        | {"session": session, "http": http, "arguments": arguments}
+                    )
+                )
+            finally:
+                await session.close()
 
 
 def request_for(p):
@@ -665,3 +715,181 @@ async def test_cancellation_retains_original_execution_control_and_remote_eviden
     assert retained.cancel_state is DispatchState.UNKNOWN
     assert retained.remote_task_id == accepted.response.id
     assert retained.state is DispatchState.ACKNOWLEDGED
+
+
+async def test_blocking_send_rejects_active_result_without_forgetting_delivery(
+    peer_session,
+):
+    p = peer_session
+    request = request_for(p)
+    request.configuration.return_immediately = False
+    p.state.early_task_response = True
+    dispatch, wire = await p.session.reserve(
+        request, dispatch_tool="ask_agent", verb="message"
+    )
+    with pytest.raises(NativePeerProtocolError, match="blocking"):
+        await p.session.send(dispatch, wire)
+    retained = await p.store.get(dispatch.dispatch_id)
+    assert retained.state is DispatchState.ACKNOWLEDGED
+    assert retained.remote_task_id and retained.remote_task_state == "submitted"
+    assert p.state.received_messages == 1
+
+
+async def test_sdk_interceptor_cannot_rewrite_the_retained_request_before_signing(
+    peer_session,
+):
+    from a2a.client.interceptors import ClientCallInterceptor
+
+    from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
+
+    p = peer_session
+    dispatch, wire = await reserve(p)
+
+    class RewriteMessage(ClientCallInterceptor):
+        async def before(self, args):
+            changed = SendMessageRequest.FromString(args.input.SerializeToString())
+            changed.message.parts[0].text = "Different work from the retained intent"
+            args.input = changed
+
+        async def after(self, args):
+            return None
+
+    p.session._client._interceptors.insert(0, RewriteMessage())
+    with pytest.raises(NativeSenderProofError, match="retained native intent"):
+        await p.session.send(dispatch, wire)
+    current = await p.store.get(dispatch.dispatch_id)
+    assert (
+        current.state is DispatchState.NOT_SENT
+        and current.request_digest == dispatch.request_digest
+    )
+    assert not p.trace and not p.state.received_messages
+
+
+async def test_native_subscription_uses_official_events_and_retires_borrowed_resources(
+    network_peer,
+):
+    p = network_peer
+    dispatch, wire = await reserve(p)
+    accepted = await p.session.send(dispatch, wire)
+    stream = p.session.subscribe(accepted.dispatch)
+    try:
+        first = await asyncio.wait_for(anext(stream), 5)
+        assert first.HasField("task") and first.task.id == accepted.response.id
+        assert p.admission.manager._subscribers
+        await p.admission.manager.complete_task(
+            accepted.response.id,
+            "Final native subscription result",
+            recipient_agent_id=p.admission.scope.recipient_id,
+        )
+        events = [event async for event in stream]
+        assert events[-1].status_update.status.state == TaskState.TASK_STATE_COMPLETED
+        assert events[-1].status_update.task_id == accepted.response.id
+        assert not p.admission.manager._subscribers
+        assert not p.http.is_closed
+        current = await p.session.get_task(accepted.dispatch)
+        assert current.dispatch.remote_task_state == "completed"
+    finally:
+        await stream.aclose()
+
+
+async def test_native_subscription_close_releases_recipient_subscription(network_peer):
+    p = network_peer
+    dispatch, wire = await reserve(p)
+    accepted = await p.session.send(dispatch, wire)
+    stream = p.session.subscribe(accepted.dispatch)
+    first = await asyncio.wait_for(anext(stream), 5)
+    assert first.task.id == accepted.response.id
+    await stream.aclose()
+    async with asyncio.timeout(5):
+        while p.admission.manager._subscribers:
+            await asyncio.sleep(0.001)
+    assert not p.admission.manager._subscribers and not p.http.is_closed
+
+
+async def test_native_subscription_rechecks_authority_before_delivering_next_event(
+    network_peer,
+):
+    p = network_peer
+    dispatch, wire = await reserve(p)
+    accepted = await p.session.send(dispatch, wire)
+    stream = p.session.subscribe(accepted.dispatch)
+    try:
+        await asyncio.wait_for(anext(stream), 5)
+        p.state.authorized = False
+        await p.admission.manager.complete_task(
+            accepted.response.id,
+            "Must not be exposed after revocation",
+            recipient_agent_id=p.admission.scope.recipient_id,
+        )
+        with pytest.raises(PermissionError, match="revoked"):
+            await asyncio.wait_for(anext(stream), 5)
+        assert not p.admission.manager._subscribers
+        assert (await p.store.get(dispatch.dispatch_id)) == accepted.dispatch
+    finally:
+        await stream.aclose()
+
+
+async def test_official_client_commits_taskless_question_answer_with_its_receipt(
+    peer_session,
+):
+    from datetime import UTC, datetime, timedelta
+    from kestrel_sovereign.a2a.extensions import (
+        NATIVE_EXTENSION_URIS,
+        question_correlation_metadata,
+    )
+    from kestrel_sovereign.a2a.stores.unified.question_store import NativeQuestionStore
+
+    p = peer_session
+    questions = NativeQuestionStore(p.store)
+    await questions.initialize()
+    extensions = frozenset(NATIVE_EXTENSION_URIS)
+    original_signer = p.arguments["signer"]
+    signer = replace(original_signer, extensions=extensions, nonce=lambda: uuid4().hex)
+    session = NativePeerSession(
+        **(
+            p.arguments
+            | {
+                "signer": signer,
+                "question_store": questions,
+            }
+        )
+    )
+    p.state.taskless = True
+    question_id = uuid4().hex
+    try:
+        dispatch, wire = await session.reserve(
+            SendMessageRequest(
+                tenant=p.admission.scope.tenant,
+                message=Message(
+                    message_id=uuid4().hex,
+                    role=Role.ROLE_USER,
+                    parts=[Part(text="A taskless native question")],
+                ),
+                metadata=question_correlation_metadata("question", question_id),
+                configuration={"return_immediately": True},
+            ),
+            dispatch_tool="send_a2a_question",
+            verb="question",
+        )
+        await questions.reserve(
+            dispatch,
+            wire,
+            origin_turn_id="turn",
+            origin_session_id="chat",
+            deadline=datetime.now(UTC) + timedelta(seconds=60),
+        )
+        receipt = await session.send(dispatch, wire)
+        retained = await questions.get(question_id)
+        assert retained.status == "RESOLVED" and retained.receiver_settled
+        assert (
+            receipt.dispatch.remote_task_id is None
+            and receipt.dispatch.response_kind == "message"
+        )
+        assert await questions.retained_response(receipt.dispatch) == receipt.response
+        [wake] = await questions.pending_wakes()
+        assert (
+            json.loads(wake.payload_json)["reply_text"] == "Standalone native response"
+        )
+        assert len(p.trace) == 1
+    finally:
+        await session.close()

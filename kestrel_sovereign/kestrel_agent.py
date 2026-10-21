@@ -3433,7 +3433,12 @@ class KestrelAgent(
             DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
         )
 
+        from kestrel_sovereign.signals.sources.a2a_question_answered import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_QUESTION_COGNITION_CONSUMER_ID,
+        )
+
         for consumer_id, source in (
+            (A2A_QUESTION_COGNITION_CONSUMER_ID, "a2a.question_answered"),
             (A2A_COMPLETE_COGNITION_CONSUMER_ID, "a2a.task_complete"),
             (A2A_SUBMITTED_COGNITION_CONSUMER_ID, "a2a.task_submitted"),
         ):
@@ -3446,22 +3451,6 @@ class KestrelAgent(
                 )
             )
 
-        # Sender-side store for in-flight send_a2a_question
-        # correlation rows (#1444). PeersFeature.send_a2a_question
-        # inserts here on POST; the subscription supervisor marks
-        # RESOLVED on terminal SSE frame; the hourly expiry sweep
-        # walks ``list_waiting_past_deadline`` and marks EXPIRED.
-        from kestrel_sovereign.storage.async_pending_a2a_question_store import (
-            PendingA2AQuestionStore,
-        )
-        # ``agent_id`` is the agent's DID — scopes every query so a
-        # shared backend cannot leak rows across agents (codex
-        # round 1 P1 on PR #1453). DID is guaranteed non-None by
-        # the time we get here.
-        self.pending_a2a_questions = PendingA2AQuestionStore(
-            self._raw_storage.db,
-            agent_id=self.did or "",
-        )
 
 
     async def _boot_phase_providers_payer_sync(self, ctx: BootContext) -> None:
@@ -4627,7 +4616,12 @@ class KestrelAgent(
             DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
         )
 
+        from kestrel_sovereign.signals.sources.a2a_question_answered import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_QUESTION_COGNITION_CONSUMER_ID,
+        )
+
         for consumer_id in (
+            A2A_QUESTION_COGNITION_CONSUMER_ID,
             A2A_COMPLETE_COGNITION_CONSUMER_ID,
             A2A_SUBMITTED_COGNITION_CONSUMER_ID,
         ):

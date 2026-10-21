@@ -507,3 +507,36 @@ async def test_persistence_boundary_preserves_execution_control(
         ):
             pytest.fail("Retired database authority admitted a request")
     assert failed.value is failure and failed.value.__cause__ is control
+
+
+async def test_extension_activation_remains_bound_to_the_verified_request_during_authorization(
+    native_request_admission,
+):
+    from google.protobuf.json_format import MessageToDict
+    from kestrel_sovereign.a2a.extensions import (
+        CAUSATION_URI,
+        causation_metadata,
+        require_metadata_extensions,
+    )
+
+    a = native_request_admission
+    params = send(a)
+    params.metadata.update(causation_metadata([]))
+    context = signed_context(a, params)
+    original = a.guard.authority_factory()
+
+    async def authorize(sender):
+        context.requested_extensions.add(CAUSATION_URI)
+        return await original.authorize_sender(sender)
+
+    guard = replace(
+        a.guard, authority_factory=lambda: replace(original, authorize_sender=authorize)
+    )
+    async with guard.admit(params, "SendMessage", context) as granted:
+        assert CAUSATION_URI in context.requested_extensions
+        assert granted.activated_extensions == EXTENSIONS
+        assert CAUSATION_URI not in granted.activated_extensions
+        with pytest.raises(ValueError, match="activated"):
+            require_metadata_extensions(
+                MessageToDict(granted.request.metadata), granted.activated_extensions
+            )

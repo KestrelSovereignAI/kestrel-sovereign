@@ -248,3 +248,52 @@ async def test_wait_provider_uses_native_terminal_and_interrupted_semantics(
     status = await TaskWaitable(feature).poll(task.id)
     assert status.outcome.value == outcome
     assert status.data.get(TERMINAL_EVENT_FINAL_KEY, False) is final
+
+
+async def test_operator_inbox_routes_share_native_projection_and_ignore_claimed_sender(
+    inbox,
+):
+    import httpx
+    from fastapi import FastAPI
+    from kestrel_sovereign.endpoints.task_inbox import router
+
+    manager, feature, agent = inbox
+    task = await admit(manager)
+    app = FastAPI()
+    app.state.agent = agent
+    app.include_router(router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://operator.test"
+    ) as client:
+        listed = await client.get(
+            "/api/agent/task-inbox", params={"status": "submitted", "limit": 50}
+        )
+        assert listed.status_code == 200
+        [entry] = listed.json()["tasks"]
+        status = await feature.check_task_status(task.id)
+        assert entry == {
+            key: value
+            for key, value in status.data.items()
+            if key not in {"ok", "artifacts"}
+        }
+        assert entry["sender"] == "did:kestrel:verified-sender"
+        fetched = await client.get(f"/api/agent/task-inbox/{task.id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["task"]["contextId"] == task.context_id
+        assert (
+            fetched.json()["summary"]["request_content"]
+            == "first request part\nsecond request part"
+        )
+        for invalid in ["submitted-legacy", "unspecified", ""]:
+            assert (
+                await client.get("/api/agent/task-inbox", params={"status": invalid})
+            ).status_code == 400
+        for limit in [0, 101]:
+            assert (
+                await client.get("/api/agent/task-inbox", params={"limit": limit})
+            ).status_code == 422
+        assert (await client.get("/api/agent/tasks")).status_code == 404
+        assert (await client.get(f"/api/agent/tasks/{task.id}")).status_code == 404
+        agent.did = "did:kestrel:other"
+        assert (await client.get("/api/agent/task-inbox")).status_code == 503
+        assert (await client.get(f"/api/agent/task-inbox/{task.id}")).status_code == 503

@@ -150,7 +150,7 @@ function stopAutoRefresh() {
 let expandedTaskIds = new Set();
 
 export async function loadTasks() {
-    // #879: deep-link defense — no /api/agent/tasks fetches when disabled.
+    // #879: deep-link defense — no /api/agent/task-inbox fetches when disabled.
     if (!API.hasCapability('tasks')) return;
     if (!taskList) return;
 
@@ -163,7 +163,7 @@ export async function loadTasks() {
         }
         params.append('limit', '50');
 
-        const response = await API.request(`/api/agent/tasks?${params.toString()}`);
+        const response = await API.request(`/api/agent/task-inbox?${params.toString()}`);
 
         if (response.message) {
             // TaskManager not available
@@ -237,9 +237,9 @@ function renderTasks(tasks) {
 function renderTaskItem(task) {
     const statusIcon = getStatusIcon(task.status);
     const statusClass = getStatusClass(task.status);
-    const taskId = task.id.substring(0, 8);
-    const fullTaskId = task.id;
-    const agentLabel = task.agent_id ? `${task.agent_id}/${task.skill || 'task'}` : 'Unknown';
+    const taskId = task.task_id.substring(0, 8);
+    const fullTaskId = task.task_id;
+    const agentLabel = task.sender ? `${task.sender}/${task.skill_hint || 'task'}` : 'Unknown';
 
     // Format timestamps if available
     const createdAt = task.created_at ? formatTime(task.created_at) : '';
@@ -432,8 +432,8 @@ window.loadTaskArtifacts = async function(taskId) {
     container.innerHTML = '<div style="color: var(--text-tertiary); font-size: 0.75rem;">Loading...</div>';
 
     try {
-        const response = await API.request(`/api/agent/tasks/${taskId}`);
-        const artifacts = response.artifacts || [];
+        const response = await API.request(`/api/agent/task-inbox/${encodeURIComponent(taskId)}`);
+        const artifacts = response.task.artifacts || [];
 
         if (artifacts.length === 0) {
             container.innerHTML = '<div style="color: var(--text-tertiary); font-size: 0.75rem;">No artifacts found</div>';
@@ -475,7 +475,7 @@ function getStatusIcon(status) {
         case 'working': return kicon('hourglass');
         case 'queued':
         case 'submitted': return kicon('inbox');
-        case 'input_required': return kicon('question');
+        case 'input-required': return kicon('question');
         default: return '•';
     }
 }
@@ -490,7 +490,9 @@ function getStatusClass(status) {
         failed: 'status-failed',
         cancelled: 'status-cancelled',
         canceled: 'status-cancelled',
-        input_required: 'status-input-required',
+        'input-required': 'status-input-required',
+        'auth-required': 'status-input-required',
+        rejected: 'status-failed',
     };
     return classes[status] || 'status-unknown';
 }

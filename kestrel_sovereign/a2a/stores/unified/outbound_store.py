@@ -2,6 +2,7 @@
 
 import hashlib
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -130,6 +131,29 @@ class OutboundStore(UnifiedStoreBase):
                 "Outbound audit list capacity must be a positive SQL integer"
             )
         self._max_list_limit = max_list_limit
+        self._active_submissions: set[str] = set()
+
+    @contextmanager
+    def active_submission(self, dispatch: OutboundDispatch):
+        """Identify a live original sender while its durable receipt is unsettled.
+
+        This local ownership never authorizes delivery or replay. It prevents a
+        resident reader from calling an in-flight send a crashed submission.
+        A fresh process has no live owner and recovers SUBMITTING by reads.
+        """
+        key = dispatch.dispatch_id
+        if key in self._active_submissions:
+            raise OutboundDispatchConflict(
+                "Original submission already has a live owner"
+            )
+        self._active_submissions.add(key)
+        try:
+            yield
+        finally:
+            self._active_submissions.remove(key)
+
+    def submission_active(self, dispatch_id: str) -> bool:
+        return dispatch_id in self._active_submissions
 
     @property
     def sender_scope(self) -> NativeRecipientScope:

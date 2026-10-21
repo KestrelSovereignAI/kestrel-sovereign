@@ -147,7 +147,9 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
 async def test_invalid_declared_extensions_fail_before_context_and_task_admission(
     native_manager, metadata
 ):
-    with pytest.raises(ValueError):
+    from a2a.utils.errors import InvalidParamsError
+
+    with pytest.raises(InvalidParamsError):
         await native_manager.create_task(
             request(metadata), creator_agent_id="did:kestrel:sender"
         )
@@ -284,4 +286,53 @@ async def test_privacy_elided_rehydration_reads_native_ownership_and_withdraws_s
     assert (
         completed.payload["task_state"] == "rejected"
         and completed.caller == "did:kestrel:sender"
+    )
+
+
+@pytest.mark.parametrize(
+    "intent,verb,expected_reply",
+    [("notification", "message", False), ("assignment", "task", True)],
+)
+async def test_native_wake_uses_declared_intent_and_advisory_hint_without_draft_metadata(
+    native_manager, intent, verb, expected_reply
+):
+    from kestrel_sovereign.a2a.extensions import (
+        delivery_intent_metadata,
+        skill_hint_metadata,
+    )
+
+    task = await native_manager.create_task(
+        request(
+            {
+                "skill": "forged.old.skill",
+                "a2a_verb": "forged-old-verb",
+                "reply_expected": not expected_reply,
+                **delivery_intent_metadata(intent),
+                **skill_hint_metadata("published-advisory-skill"),
+            }
+        ),
+        creator_agent_id="did:kestrel:verified-sender",
+    )
+    snapshot = await native_manager.get_task_snapshot(
+        task.id, recipient_agent_id=native_manager.host_agent_id
+    )
+    signal = build_signal_for_submitted_task(snapshot, native_manager.host_agent_id)
+    assert signal.payload["a2a_verb"] == verb
+    assert signal.payload["skill_id"] == "published-advisory-skill"
+    assert signal.payload["reply_expected"] is expected_reply
+
+
+async def test_undeclared_draft_skill_cannot_become_native_wake_hint(native_manager):
+    task = await native_manager.create_task(
+        request({"skill": "operator.shell"}),
+        creator_agent_id="did:kestrel:verified-sender",
+    )
+    snapshot = await native_manager.get_task_snapshot(
+        task.id, recipient_agent_id=native_manager.host_agent_id
+    )
+    assert (
+        build_signal_for_submitted_task(snapshot, native_manager.host_agent_id).payload[
+            "skill_id"
+        ]
+        == ""
     )

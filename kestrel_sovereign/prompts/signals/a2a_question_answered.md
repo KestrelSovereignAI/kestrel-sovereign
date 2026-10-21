@@ -1,35 +1,27 @@
-[A2A_QUESTION_ANSWERED] An earlier `send_a2a_question` of yours to `{payload[recipient]}` has been answered. This is a cognition wake firing locally on YOUR dispatcher — `{payload[recipient]}` did not send you anything new; they transitioned the task you sent them to a terminal state, and your subscription on the task picked up the result.
+[A2A_QUESTION_ANSWERED] Your question to `{payload[recipient_id]}` has a local settlement event.
 
-**Your original question to {payload[recipient]}** (task_id `{payload[task_id]}`):
+Question `{payload[question_id]}`, sender dispatch `{payload[dispatch_id]}`:
 
 ```
 {payload[original_question]}
 ```
 
-**Their reply** (state: `{payload[state]}`, late: `{payload[late]}`):
+Original native input: `{payload[request]}`. Read structured Parts as part of the original question.
+
+Peer outcome: `{payload[state]}`. Late answer: `{payload[late]}`. Confirmed withdrawal: `{payload[withdrawn]}`.
 
 ```
 {payload[reply_text]}
 ```
 
-If the reply block above contains the text `[truncated; call get_peer_task_result(...)`, the full body exceeded the inline cap (8 KiB). Call `get_peer_task_result("{payload[recipient]}", "{payload[task_id]}")` to fetch the complete reply through the host proxy before responding — do NOT pretend the truncated text is the whole answer.
+Read `get_peer_task_result("{payload[dispatch_id]}")` for the full native response and its standard artifacts. If `truncated` is `{payload[truncated]}` and true, fetch the complete result before relying on it. Artifact IDs identify outputs; chunk order comes from the native append and last-chunk events.
 
-If the reply block above says something like "See attached artifacts (N segments)", `{payload[recipient]}` chunked a long body into Artifacts because the per-tool argument cap (10K chars) wouldn't fit it inline. Call `get_peer_task_result("{payload[recipient]}", "{payload[task_id]}")` — the returned `artifact_body` field is the full reassembled body (artifacts walked in `index` order). Check `artifact_body_complete=true` before using it; if it's `false`, `{payload[recipient]}` is still mid-stream and you should wait or re-fetch later.
+`expired` means your local deadline passed. An empty reply is no answer. Only `withdrawn=True` confirms cancellation; otherwise delivery or withdrawal can remain uncertain and the recipient may still answer. Do not resend an uncertain dispatch. A late answer is a separate event after the deadline event; update any conclusions you drew while waiting.
 
-If `state` is `expired`, your subscription deadline passed without `{payload[recipient]}` reaching a terminal state. The reply block will be empty. Decide whether to give up, re-ask via a fresh `send_a2a_question`, or escalate — do NOT claim you got an answer when state is `expired`. What happened to your question depends on `withdrawn`, which is `{payload[withdrawn]}` here:
-
-- If `withdrawn` is `True`, the question was withdrawn: `{payload[recipient]}`'s task was canceled, so they will not answer it or have it re-delivered.
-- If `withdrawn` is `False`, the withdrawal could NOT be confirmed (usually because `{payload[recipient]}` could not be reached), so their task may still be live and they may still answer it. The withdrawal will be retried. If they answer first, you will be woken again with that answer and `late` set to `True`. Being unreachable just now does not show that `{payload[recipient]}` ignored your question.
-
-If `late` is `True`, you were already woken once for this question with `state` `expired`, and `{payload[recipient]}` answered afterwards. This reply is that answer and supersedes the expiry. If you re-asked, escalated, or described `{payload[recipient]}` as unresponsive in the meantime, correct that now: they did answer.
-
-If `state` is `failed` or `canceled`, the recipient transitioned the task into a non-success terminal state. Their reply text (if any) typically carries the reason.
-
-**Now**: integrate the answer into your in-flight context and continue whatever you were doing when you sent the original question. Do NOT re-ask the same question — the response is right here. If the original conversation was with the Sovereign, your next message should fold this answer into your reply to them; if it was internal multi-step work, continue the next step.
+For `failed`, `canceled`, or `rejected`, integrate the failure reason without claiming success. For `completed`, integrate the answer and continue the original conversation. Do not ask the same question again merely because this is a new cognition turn.
 
 source={source}
 target_agent={target_agent}
 arrived_at={arrived_at}
 urgency={urgency}
-
 payload={payload}

@@ -409,8 +409,8 @@ configuration refuses publication.
 
 This is a private implementation candidate, exercised with unpublished SDK
 builds containing the reviewed signing and HTTP-authorization repairs. Push
-configuration, outbound cutover, question-ledger enforcement, old-route
-retirement, released dependency adoption and full host interoperability remain
+configuration, task continuation, remaining draft-route retirement, offline
+migration, released dependency adoption and full host interoperability remain
 acceptance work. The isolated HTTP tests do not establish those gates.
 
 The native task manager records the handler's admitted Task as its baseline.
@@ -468,6 +468,19 @@ holds extension payloads. Unknown required extensions fail before task creation.
 | Cancellation authority | Core CancelTask plus recipient policy | Authenticate creator/recipient authority on every mutation |
 | Wake signals | Internal transition events | One committed transition drives existing wake hooks |
 
+The operator console reads `/api/agent/task-inbox`, independently of the A2A
+binding namespaces. Its task detail includes the complete official Task JSON;
+its summary and the task tools share one ownership-based projection. Claimed
+sender/skill metadata never replaces the committed creator or URI-keyed hint.
+Generic outbound waits use `a2a:<dispatch_id>` and the native outbound ledger;
+questions retain their separate durable resumption rail.
+
+Same-host peers use real HTTP against the configured published URL for Agent
+Card discovery and SDK operations. Sender egress and receiving recipient policy
+run in separate request contexts. A source turn's context variables or database
+execution custody must not become recipient authority. Blocking disconnects
+close only their response subscription; the accepted task remains durable.
+
 ### Recipient policy v1
 
 Native admission authenticates the caller and applies recipient policy before
@@ -508,6 +521,38 @@ the receiver must match the outstanding question's durable sender, recipient
 and tenant before recording an answer or emitting a question-answered wake.
 The native intake/outbound integration must enforce that ledger check; parsing
 or displaying this payload alone does not satisfy the correlation gate.
+
+The sender reserves an immutable native dispatch and its primary-store question
+intent before the SDK can admit HTTP. Both the initial send and the final HTTP
+dispatch gate require that exact live intent and deadline. Only a committed,
+authorized native response with matching question, recipient, tenant and response
+digest can settle it. A new SendMessage cannot introduce an `answer`; answers
+belong to the original task's agent-role status Message. Taskless Messages retain
+their real response body and never acquire an invented remote task ID.
+
+The native question ledger commits terminal receipt, retained answer and wake
+outbox together. Its resident observer uses only GetTask/ListTasks/CancelTask
+through the official client and the retained stable route. A live original
+sender is never reconciled as a crashed submission. Unknown sends or cancellation
+attempts are observed without replay. `KESTREL_A2A_QUESTION_POLL_SECONDS` configures
+the observation interval (positive finite seconds, default 1).
+
+Wakes retain deterministic sender-scoped event IDs across restart. The outbox
+advances only on a canonical durable signal admission receipt; the dispatcher
+owns cognition and retry after that commit. Deadline and late-answer waves are
+distinct, ordered events. A deadline alone cannot assert withdrawal. Privacy-
+elided durable events rehydrate from this same sender-owned outbox. The asking
+turn's local chat session remains separate from the peer's A2A context.
+
+### Delivery intent v1
+
+The optional `#delivery-intent-v1` extension carries exactly
+`{"version": 1, "intent": "notification"}` or
+`{"version": 1, "intent": "assignment"}` under its URI metadata key.
+Notifications request no reply; assignments request task processing. Question
+correlation already defines question intent, so combining these extensions is
+invalid. Neither intent grants execution authority. Every known URI payload
+requires explicit extension activation; metadata cannot activate itself.
 
 ### Skill hint v1
 

@@ -19,6 +19,8 @@ from a2a.types import (
     ListTasksRequest,
     Message,
     SendMessageRequest,
+    StreamResponse,
+    SubscribeToTaskRequest,
     Task,
     TaskState,
 )
@@ -31,9 +33,10 @@ from kestrel_sovereign._async_ownership import await_owned_task, create_owned_ta
 from kestrel_sovereign.a2a.extensions import (
     NATIVE_EXTENSION_URIS,
     SIGNED_SENDER_URI,
-    SKILL_HINT_URI,
-    parse_skill_hint,
+    parse_message_metadata,
+    require_metadata_extensions,
 )
+from kestrel_sovereign.a2a.lifecycle import STREAM_STOP_STATES
 from kestrel_sovereign.a2a.media import validate_input_parts
 from kestrel_sovereign.a2a.native_card import (
     REQUIRED_NATIVE_EXTENSIONS,
@@ -53,10 +56,12 @@ from kestrel_sovereign.a2a.stores.unified.outbound_store import (
     OutboundDispatchConflict,
     OutboundStore,
 )
+from kestrel_sovereign.a2a.stores.unified.question_store import NativeQuestionStore
 from kestrel_sovereign.execution_custody import (
     bind_native_http_execution_admission,
     execution_terminal_error,
     execution_work_operation,
+    execution_work_stream,
     native_execution_response_owner,
     owned_execution_stream,
 )
@@ -79,6 +84,14 @@ _SDK_OPERATIONS = {
     "delete_task_push_notification_config": "DeleteTaskPushNotificationConfig",
     "get_extended_agent_card": "GetExtendedAgentCard",
 }
+
+_REQUEST_BINDING_KEY = "kestrel.native_request_binding"
+
+
+@dataclass(frozen=True)
+class _NativeRequestBinding:
+    operation: str
+    digest: str
 
 
 @dataclass(frozen=True)
@@ -138,6 +151,17 @@ class NativeSenderInterceptor(ClientCallInterceptor):
         if operation is None:
             raise NativeSenderProofError("Unsupported SDK operation for native signing")
         original = args.context
+        expected = (
+            original.state.get(_REQUEST_BINDING_KEY) if original is not None else None
+        )
+        if expected is not None and (
+            not isinstance(expected, _NativeRequestBinding)
+            or expected.operation != operation
+            or expected.digest != native_request_digest(args.input, operation)
+        ):
+            raise NativeSenderProofError(
+                "SDK request differs from its retained native intent"
+            )
         context = ClientCallContext(
             state=dict(original.state) if original is not None else {},
             timeout=original.timeout if original is not None else None,
@@ -198,6 +222,7 @@ class NativePeerSession:
         http_client: httpx.AsyncClient,
         outbound_store: OutboundStore,
         authorize: Callable[[], Awaitable[None]],
+        question_store: NativeQuestionStore | None = None,
     ):
         snapshot = AgentCard.FromString(card.SerializeToString())
         validate_proto_required_fields(snapshot)
@@ -261,15 +286,27 @@ class NativePeerSession:
         self._signing_did = signing_did
         self._interface = AgentInterface.FromString(interface.SerializeToString())
         self._store = outbound_store
-        self._authorize = authorize
-        self._client = ClientFactory(
-            ClientConfig(
-                httpx_client=http_client,
-                streaming=False,
-                polling=False,
-                supported_protocol_bindings=[interface.protocol_binding],
+        if question_store is not None and (
+            not isinstance(question_store, NativeQuestionStore)
+            or question_store.outbound_store is not outbound_store
+        ):
+            raise NativePeerProtocolError(
+                "Native question intent must use this exact outbound ledger"
             )
-        ).create(snapshot, interceptors=[signer])
+        self._questions = question_store
+        self._authorize = authorize
+        self._signer = signer
+        self._client = self._new_sdk_client(streaming=False)
+
+    def _new_sdk_client(self, *, streaming: bool):
+        return ClientFactory(
+            ClientConfig(
+                httpx_client=self._http,
+                streaming=streaming,
+                polling=False,
+                supported_protocol_bindings=[self._interface.protocol_binding],
+            )
+        ).create(self.agent_card, interceptors=[self._signer])
 
     def _require_http(self) -> None:
         safe_headers = {
@@ -333,6 +370,45 @@ class NativePeerSession:
                 "Retained dispatch belongs to another peer binding"
             )
 
+    def _validate_message(self, wire: SendMessageRequest, verb: str):
+        card = self.agent_card
+        metadata = MessageToDict(wire.metadata)
+        try:
+            require_metadata_extensions(metadata, self._activated_extensions)
+            claims = parse_message_metadata(metadata)
+            correlation = claims.correlation
+        except ValueError as error:
+            raise NativePeerProtocolError(str(error)) from error
+        if (correlation is not None) != (verb == "question"):
+            raise NativePeerProtocolError(
+                "Native question creation requires its correlation contract"
+            )
+        hint = claims.skill_hint
+        modes = card.default_input_modes
+        if hint is not None:
+            selected = next((skill for skill in card.skills if skill.id == hint), None)
+            if selected is None:
+                raise NativePeerProtocolError(
+                    "Peer does not advertise the suggested skill"
+                )
+        validate_input_parts(wire.message.parts, modes)
+        return claims
+
+    @staticmethod
+    def _request_context(
+        operation: str, request: ProtoMessage, *, digest: str | None = None
+    ):
+        return ClientCallContext(
+            state={
+                _REQUEST_BINDING_KEY: _NativeRequestBinding(
+                    operation,
+                    native_request_digest(request, operation)
+                    if digest is None
+                    else digest,
+                ),
+            }
+        )
+
     @execution_work_operation
     async def reserve(
         self, request: SendMessageRequest, *, dispatch_tool: str, verb: str
@@ -342,20 +418,7 @@ class NativePeerSession:
         # The SDK touches configuration before interception. Make its presence
         # explicit before hashing, so the reservation binds exactly what is sent.
         wire.configuration.SetInParent()
-        card = self.agent_card
-        hint = parse_skill_hint(MessageToDict(wire.metadata))
-        modes = card.default_input_modes
-        if hint is not None:
-            if SKILL_HINT_URI not in self._activated_extensions:
-                raise NativePeerProtocolError(
-                    "Peer did not activate the skill-hint extension"
-                )
-            selected = next((skill for skill in card.skills if skill.id == hint), None)
-            if selected is None:
-                raise NativePeerProtocolError(
-                    "Peer does not advertise the suggested skill"
-                )
-        validate_input_parts(wire.message.parts, modes)
+        self._validate_message(wire, verb)
         dispatch = await self._store.reserve(
             uuid4().hex,
             wire,
@@ -371,13 +434,26 @@ class NativePeerSession:
     async def send(
         self, dispatch: OutboundDispatch, request: SendMessageRequest
     ) -> NativeDispatchReceipt:
+        with self._store.active_submission(dispatch):
+            return await self._send_once(dispatch, request)
+
+    async def _send_once(
+        self, dispatch: OutboundDispatch, request: SendMessageRequest
+    ) -> NativeDispatchReceipt:
         self._require_binding(dispatch)
         wire = SendMessageRequest.FromString(request.SerializeToString())
+        self._validate_message(wire, dispatch.verb)
         if native_request_digest(wire, "SendMessage") != dispatch.request_digest:
             raise OutboundDispatchConflict(
                 "Outbound request differs from its reservation"
             )
         await self._admit(dispatch)
+        if dispatch.verb == "question":
+            if self._questions is None:
+                raise NativePeerProtocolError(
+                    "Native question dispatch requires its primary correlation ledger"
+                )
+            await self._questions.require_intent(dispatch, wire)
         submitting = await self._store.begin_submission(
             dispatch, operation_id=uuid4().hex
         )
@@ -396,6 +472,8 @@ class NativePeerSession:
                 )
             dispatch_claimed = True
             await self._admit()
+            if dispatch.verb == "question":
+                await self._questions.require_intent(submitting, wire)
             # No await separates this observation from the original native
             # dispatcher. False proves this attempt never admitted peer HTTP;
             # True is only evidence that delivery may have occurred.
@@ -406,7 +484,15 @@ class NativePeerSession:
             response = None
             async with (
                 self._network(before_dispatch=authorize_original_send),
-                owned_execution_stream(self, self._client.send_message(wire)) as events,
+                owned_execution_stream(
+                    self,
+                    self._client.send_message(
+                        wire,
+                        context=self._request_context(
+                            "SendMessage", wire, digest=dispatch.request_digest
+                        ),
+                    ),
+                ) as events,
             ):
                 async for event in events:
                     kind = event.WhichOneof("payload")
@@ -419,12 +505,18 @@ class NativePeerSession:
             if response is None:
                 raise NativePeerProtocolError("Peer returned no Task or Message")
             await self._admit()
-            receipt = await self._store.acknowledge(
-                submitting, response, operation_id=uuid4().hex
-            )
+            receipt = await self._acknowledge(submitting, response)
             if receipt is None:
                 raise OutboundDispatchConflict(
                     "Peer receipt lost its dispatch compare-and-swap"
+                )
+            if (
+                not wire.configuration.return_immediately
+                and isinstance(response, Task)
+                and response.status.state not in STREAM_STOP_STATES
+            ):
+                raise NativePeerProtocolError(
+                    "Peer returned an active Task before its blocking send completed"
                 )
             return NativeDispatchReceipt(receipt, response)
         finally:
@@ -438,6 +530,19 @@ class NativePeerSession:
                     original=sys.exc_info()[1],
                 )
 
+    async def _acknowledge(self, dispatch, response):
+        if dispatch.verb == "question":
+            if self._questions is None:
+                raise NativePeerProtocolError(
+                    "Native question receipt requires its correlation ledger"
+                )
+            return await self._questions.acknowledge(
+                dispatch, response, operation_id=uuid4().hex
+            )
+        return await self._store.acknowledge(
+            dispatch, response, operation_id=uuid4().hex
+        )
+
     @execution_work_operation
     async def get_task(self, dispatch: OutboundDispatch) -> NativeDispatchReceipt:
         self._require_binding(dispatch)
@@ -446,12 +551,11 @@ class NativePeerSession:
                 "Dispatch has no acknowledged remote task; reconcile first"
             )
         await self._admit(dispatch)
+        request = GetTaskRequest(id=dispatch.remote_task_id, tenant=self._scope.tenant)
         async with self._network():
             result = await self._client.get_task(
-                GetTaskRequest(
-                    id=dispatch.remote_task_id,
-                    tenant=self._scope.tenant,
-                )
+                request,
+                context=self._request_context("GetTask", request),
             )
         await self._admit()
         if (
@@ -461,9 +565,7 @@ class NativePeerSession:
             raise NativePeerProtocolError(
                 "Peer read changed the retained task or context"
             )
-        observed = await self._store.acknowledge(
-            dispatch, result, operation_id=uuid4().hex
-        )
+        observed = await self._acknowledge(dispatch, result)
         if observed is None:
             raise OutboundDispatchConflict("Retained dispatch changed during task read")
         return NativeDispatchReceipt(observed, result)
@@ -500,7 +602,12 @@ class NativePeerSession:
 
         try:
             async with self._network(before_dispatch=authorize_cancel):
-                result = await self._client.cancel_task(request)
+                result = await self._client.cancel_task(
+                    request,
+                    context=self._request_context(
+                        "CancelTask", request, digest=submitting.cancel_request_digest
+                    ),
+                )
             await self._admit()
             if (
                 result.id != dispatch.remote_task_id
@@ -510,9 +617,7 @@ class NativePeerSession:
                 raise NativePeerProtocolError(
                     "Peer cancellation returned a different task, context or outcome"
                 )
-            receipt = await self._store.acknowledge(
-                submitting, result, operation_id=uuid4().hex
-            )
+            receipt = await self._acknowledge(submitting, result)
             if receipt is None:
                 raise OutboundDispatchConflict(
                     "Cancellation receipt lost its dispatch claim"
@@ -565,13 +670,15 @@ class NativePeerSession:
         seen_tokens = set()
         while True:
             await self._admit()
+            request = ListTasksRequest(
+                tenant=self._scope.tenant,
+                context_id=dispatch.requested_context_id,
+                page_token=token,
+            )
             async with self._network():
                 result = await self._client.list_tasks(
-                    ListTasksRequest(
-                        tenant=self._scope.tenant,
-                        context_id=dispatch.requested_context_id,
-                        page_token=token,
-                    )
+                    request,
+                    context=self._request_context("ListTasks", request),
                 )
             await self._admit()
             candidates.extend(result.tasks)
@@ -583,9 +690,77 @@ class NativePeerSession:
                     "Peer repeated a task-list pagination token"
                 )
             seen_tokens.add(token)
-        return await self._store.reconcile(
-            dispatch, candidates, operation_id=uuid4().hex
+        if dispatch.verb != "question":
+            return await self._store.reconcile(
+                dispatch, candidates, operation_id=uuid4().hex
+            )
+        if self._questions is None:
+            raise NativePeerProtocolError(
+                "Native question reconciliation requires its correlation ledger"
+            )
+        question = await self._questions.for_dispatch(dispatch.dispatch_id)
+        if question is None:
+            raise NativePeerProtocolError(
+                "Native question has no registered correlation intent"
+            )
+        async with self._store.write_transaction():
+            receipt = await self._store.reconcile(
+                dispatch, candidates, operation_id=uuid4().hex
+            )
+            if receipt is not None and receipt.state is DispatchState.COMPLETE:
+                response = next(
+                    task for task in candidates if task.id == receipt.remote_task_id
+                )
+                await self._questions.record_answer(
+                    question.question_id, receipt, response
+                )
+        return receipt
+
+    @execution_work_stream
+    async def subscribe(self, dispatch: OutboundDispatch):
+        """Consume official SDK events, retaining task identity and original custody."""
+        await self._admit(dispatch)
+        if not dispatch.remote_task_id or not self.agent_card.capabilities.streaming:
+            raise NativePeerProtocolError(
+                "Native subscription requires an acknowledged task and advertised streaming"
+            )
+        request = SubscribeToTaskRequest(
+            id=dispatch.remote_task_id, tenant=self._scope.tenant
         )
+        client = self._new_sdk_client(streaming=True)
+        try:
+            async with (
+                self._network(),
+                owned_execution_stream(
+                    self,
+                    client.subscribe(
+                        request,
+                        context=self._request_context("SubscribeToTask", request),
+                    ),
+                ) as events,
+            ):
+                async for event in events:
+                    await self._admit()
+                    kind = event.WhichOneof("payload")
+                    if kind not in {"task", "status_update", "artifact_update"}:
+                        raise NativePeerProtocolError(
+                            "Native task subscription returned an unsupported event"
+                        )
+                    value = getattr(event, kind)
+                    validate_proto_required_fields(value)
+                    task_id = value.id if kind == "task" else value.task_id
+                    if (
+                        task_id != dispatch.remote_task_id
+                        or value.context_id != dispatch.remote_context_id
+                    ):
+                        raise NativePeerProtocolError(
+                            "Native subscription changed the retained task or context"
+                        )
+                    yield StreamResponse.FromString(event.SerializeToString())
+        finally:
+            await self._retain_failed_mutation(
+                client.close(), original=sys.exc_info()[1]
+            )
 
     async def close(self) -> None:
         """Retire the SDK facade; its injected HTTP client remains host-owned."""

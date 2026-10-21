@@ -1,55 +1,8 @@
-"""Sender-side wake when a previously-asked A2A question reaches a
-terminal state on the receiver (#1444).
+"""Sender-owned wake from an authorized native question receipt or local deadline.
 
-This is the resumption rail for the new fire-and-resume
-``send_a2a_question`` contract. Mechanism:
-
-  1. Sender calls ``send_a2a_question(recipient, message, ...)`` — tool
-     POSTs to recipient's ``/tasks/send``, writes a row to the sender's
-     ``pending_a2a_questions`` table, spawns a tracked SSE subscription
-     against ``GET /tasks/{task_id}/subscribe`` on the recipient.
-  2. Asking turn ENDS immediately. ``ToolResult.ok(data={
-     awaiting_reply: True, task_id, resume_via: 'a2a.question_answered'})``.
-  3. Eventually the recipient calls ``respond_to_a2a_task`` which fires
-     a ``status`` event over the SSE stream with ``final=true`` and the
-     reply text in ``status.message.parts[0].text``.
-  4. The subscription supervisor enqueues an ``a2a.question_answered``
-     COGNITION signal on the sender's dispatcher with the full reply
-     inline.
-  5. A fresh COGNITION turn fires on the sender; its prompt template
-     cites the original question by task_id + recipient and inlines the
-     reply text. The agent integrates the answer and continues.
-
-Distinction from ``a2a.task_complete``:
-
-- ``a2a.task_complete`` is sent to the RECEIVER's dispatcher when one
-  of THEIR tasks (created via ``TaskManager.create_task``) completes —
-  including outbound tasks they sent that came back. Its prompt template
-  says "do not re-spawn the same task" — wrong doctrine for an answered
-  question, which the asking agent DOES want to react to.
-- ``a2a.question_answered`` is fired LOCALLY by the sender's own
-  subscription supervisor. The signal never crosses the wire — it's a
-  cognition-wake produced when a peer's SSE stream tells us our
-  outbound question is terminal. Dedicated source = dedicated prompt
-  template + dedicated rate limit + dedicated redaction policy sized
-  for full reply text.
-
-Cycle safety: ``allow_self_loops=False``. The causation chain
-threaded into the original outbound task's metadata round-trips
-through the receiver's response handling and is rehydrated here when
-the supervisor builds the signal, so A→B→A→B chains still hit the
-dispatcher's depth-2 cycle cap.
-
-Reply text size: 8 KiB inline soft cap. Overflow is truncated with an
-explicit ``call get_peer_task_result('<recipient>', '<task_id>')`` hint
-in the prompt — the receiver-side task store still has the full reply,
-and ``PeersFeature.get_peer_task_result`` fetches it through the host
-proxy. 8 KiB picked so a normal prompt token budget can absorb the
-inline reply without crowding out memories / RAG context (~2K tokens).
-
-Retention: 90 days per Sovereign decision on #1444 — resumed-turn
-context-recall sometimes benefits from looking back at the original
-question/answer pair weeks later.
+The native question outbox and the canonical durable dispatcher own recovery.
+The wire always uses official A2A Task/Message values; these local payloads
+retain the immutable sender dispatch ID, independent of remote task identity.
 """
 
 from __future__ import annotations
@@ -57,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from kestrel_sdk.signals import (
     AttentionPolicy,
@@ -75,9 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 SOURCE_NAME = "a2a.question_answered"
+DURABLE_COGNITION_CONSUMER_ID = "core.a2a.question_answered.cognition"
 PROMPT_TEMPLATE = (
     Path(__file__).resolve().parents[2]
-    / "prompts" / "signals" / "a2a_question_answered.md"
+    / "prompts"
+    / "signals"
+    / "a2a_question_answered.md"
 )
 
 # Soft cap on inline reply text. Overflow truncates with a hint to call
@@ -86,8 +42,7 @@ PROMPT_TEMPLATE = (
 # docstring.
 REPLY_TEXT_INLINE_CAP_BYTES = 8 * 1024
 REPLY_TEXT_OVERFLOW_HINT = (
-    " ...[truncated; call get_peer_task_result(\"{recipient}\", "
-    "\"{task_id}\") for the full body]"
+    ' ...[truncated; call get_peer_task_result("{dispatch_id}") for the full body]'
 )
 
 
@@ -97,23 +52,31 @@ def _a2a_question_answered_schema(payload: dict) -> dict:
             f"a2a.question_answered payload must be a dict, got "
             f"{type(payload).__name__}"
         )
-    for key in ("task_id", "recipient", "original_question",
-                "reply_text", "state"):
-        if key not in payload:
-            raise ValueError(
-                f"a2a.question_answered payload missing required key: {key}"
-            )
-        if not isinstance(payload[key], str):
-            raise ValueError(
-                f"a2a.question_answered payload {key} must be a string"
-            )
-    if payload["state"] not in (
-        "completed", "failed", "canceled", "expired",
+    for key in (
+        "question_id",
+        "dispatch_id",
+        "recipient_id",
+        "original_question",
+        "reply_text",
+        "state",
     ):
+        if not isinstance(payload.get(key), str):
+            raise ValueError(f"a2a.question_answered payload requires string {key}")
+    for key in ("question_id", "dispatch_id", "recipient_id"):
+        if not payload[key].strip():
+            raise ValueError(f"a2a.question_answered payload requires concrete {key}")
+    if payload["state"] not in {
+        "completed",
+        "failed",
+        "canceled",
+        "rejected",
+        "expired",
+    }:
         raise ValueError(
-            f"a2a.question_answered payload state must be one of "
-            f"completed/failed/canceled/expired, got {payload['state']!r}"
+            "a2a.question_answered state must be a native terminal state or expired"
         )
+    if not isinstance(payload.get("request"), dict):
+        raise ValueError("a2a.question_answered requires the original native Message")
     # Optional correlation fields injected by the subscription supervisor
     # so the prompt template can cite them in long-form context.
     if "origin_session_id" in payload and not isinstance(
@@ -123,14 +86,10 @@ def _a2a_question_answered_schema(payload: dict) -> dict:
             "a2a.question_answered payload origin_session_id must be a string"
         )
     if "truncated" in payload and not isinstance(payload["truncated"], bool):
-        raise ValueError(
-            "a2a.question_answered payload truncated must be a bool"
-        )
+        raise ValueError("a2a.question_answered payload truncated must be a bool")
     if "late" in payload:
         if not isinstance(payload["late"], bool):
-            raise ValueError(
-                "a2a.question_answered payload late must be a bool"
-            )
+            raise ValueError("a2a.question_answered payload late must be a bool")
         if payload["late"] and payload["state"] == "expired":
             raise ValueError(
                 "a2a.question_answered late wake must carry the recipient's "
@@ -138,9 +97,7 @@ def _a2a_question_answered_schema(payload: dict) -> dict:
             )
     if "withdrawn" in payload:
         if not isinstance(payload["withdrawn"], bool):
-            raise ValueError(
-                "a2a.question_answered payload withdrawn must be a bool"
-            )
+            raise ValueError("a2a.question_answered payload withdrawn must be a bool")
         if payload["withdrawn"] and payload["state"] != "expired":
             raise ValueError(
                 "a2a.question_answered withdrawn wake must carry state "
@@ -165,8 +122,8 @@ def _a2a_question_answered_redact(payload: dict) -> str:
     state = payload.get("state", "?")
     return (
         f"a2a.question_answered "
-        f"task_id={payload.get('task_id', '?')} "
-        f"recipient={payload.get('recipient', '?')} "
+        f"dispatch_id={payload.get('dispatch_id', '?')} "
+        f"recipient_id={payload.get('recipient_id', '?')} "
         f"state={state} "
         f"late={bool(payload.get('late', False))} "
         f"withdrawn={bool(payload.get('withdrawn', False))} "
@@ -235,109 +192,39 @@ def build_a2a_question_answered_registration() -> SourceRegistration:
 
 
 def build_signal_for_question_answered(
-    *,
-    task_id: str,
-    recipient: str,
-    original_question: str,
-    reply_text: str,
-    state: str,
-    target_agent: str,
-    origin_session_id: str = "",
-    causation_chain: Optional[list] = None,
-    late: bool = False,
-    withdrawn: bool = False,
+    *, event_id: str, payload: dict, target_agent: str
 ) -> Signal:
-    """Build the resumption signal.
+    """Build one immutable outbox event; retries retain the same event identity."""
+    from kestrel_sovereign.a2a.extensions import (
+        CAUSATION_URI,
+        deserialize_causation_chain,
+    )
 
-    Args mirror the schema. ``reply_text`` is truncated to
-    ``REPLY_TEXT_INLINE_CAP_BYTES`` here, NOT at fire-time — by the
-    time the signal is in flight the payload size is locked. The
-    overflow hint references ``task_id`` so the resumed turn can fetch
-    the full body via ``get_a2a_task``.
-
-    ``causation_chain`` is opaque (a list of frame dicts as emitted by
-    ``serialize_chain_for_metadata`` and rehydrated by
-    ``_deserialize_chain``). The caller (subscription supervisor) reads
-    it from the receiver's terminal task metadata and threads it
-    through here so the dispatcher's depth-2 cycle cap still applies.
-
-    ``late`` marks the recipient's own terminal answer arriving after the
-    asker was already woken with ``state='expired'`` (#3440). It gets its own
-    dedupe key: it is a second, distinct wake for the same question.
-
-    ``withdrawn`` marks an ``expired`` wake whose question is confirmed
-    withdrawn: the recipient's task is canceled and will be neither answered
-    nor re-delivered. An ``expired`` wake without it could not confirm the
-    withdrawal, so the recipient's task may still be live (#3440).
-    """
-    truncated = False
-    if len(reply_text.encode("utf-8")) > REPLY_TEXT_INLINE_CAP_BYTES:
-        # Trim to the budget then append the hint. Use byte-aware
-        # truncation so multi-byte UTF-8 sequences don't get cut.
-        encoded = reply_text.encode("utf-8")
-        # Reserve room for the hint so the total payload stays under
-        # cap. The hint cites get_peer_task_result with BOTH recipient
-        # and task_id since fetching the peer's task requires both
-        # (the sender's own store only has tasks it received, not
-        # tasks it sent — codex round 2 P2b on PR #1453).
-        hint = REPLY_TEXT_OVERFLOW_HINT.format(
-            recipient=recipient, task_id=task_id,
+    body = _a2a_question_answered_schema(dict(payload))
+    chain = deserialize_causation_chain(
+        {CAUSATION_URI: body.pop("causation", None)}
+        if body.get("causation") is not None
+        else {}
+    )
+    reply = body["reply_text"]
+    if len(reply.encode("utf-8")) > REPLY_TEXT_INLINE_CAP_BYTES:
+        hint = REPLY_TEXT_OVERFLOW_HINT.format(dispatch_id=body["dispatch_id"])
+        room = REPLY_TEXT_INLINE_CAP_BYTES - len(hint.encode("utf-8"))
+        body["reply_text"] = (
+            reply.encode("utf-8")[:room].decode("utf-8", errors="ignore") + hint
         )
-        hint_bytes = hint.encode("utf-8")
-        room = REPLY_TEXT_INLINE_CAP_BYTES - len(hint_bytes)
-        clipped = encoded[:room].decode("utf-8", errors="ignore")
-        reply_text = clipped + hint
-        truncated = True
-
+        body["truncated"] = True
     return Signal(
+        id=event_id,
         source=SOURCE_NAME,
         kind="answered",
         mode=SignalMode.COGNITION,
-        payload={
-            "task_id": task_id,
-            "recipient": recipient,
-            "original_question": original_question,
-            "reply_text": reply_text,
-            "state": state,
-            "origin_session_id": origin_session_id,
-            "truncated": truncated,
-            "late": late,
-            "withdrawn": withdrawn,
-        },
+        payload=body,
         target_agent=target_agent,
-        # #1522: USER_VISIBLE (was INTERNAL) so the dispatcher emits a
-        # ``signal_completed`` SSE event after the resumed turn logs,
-        # letting an open chat tab render the response live instead of
-        # only on a manual refresh. The ``result_summary`` callback on
-        # the registration supplies the agent's response text as the
-        # event body; the frontend ``signal_completed`` handler
-        # (chat.js ``handleSignalCompleted``) appends it to the active
-        # pane.
-        #
-        # session_id is intentionally left at its default (None). The
-        # conversation session this wake lands in is resolved INSIDE
-        # process_input by the time-gap heuristic at dispatch time and
-        # is not surfaced back onto the signal — it is NOT the A2A
-        # protocol sessionId carried in origin_session_id (a uuid4 from
-        # send time, different namespace). The frontend does not match
-        # on session_id: the notifications SSE stream is pinned to the
-        # selected agent, so the wake renders into the visible pane,
-        # the same precedent as task_notification.
+        session_id=body["origin_session_id"] or None,
         visibility=Visibility.USER_VISIBLE,
-        caller=recipient or None,
+        caller=body["recipient_id"],
         urgency=Urgency.NORMAL,
-        # Dedupe key prevents subscription + startup-replay racing for
-        # the same terminal event from waking two cognition turns.
-        dedupe_key=f"{task_id}:answered:late" if late else f"{task_id}:answered",
-        causation_chain=list(causation_chain or []),
+        dedupe_key=event_id,
+        causation_chain=chain,
     )
-
-
-__all__ = [
-    "PROMPT_TEMPLATE",
-    "REPLY_TEXT_INLINE_CAP_BYTES",
-    "REPLY_TEXT_OVERFLOW_HINT",
-    "SOURCE_NAME",
-    "build_a2a_question_answered_registration",
-    "build_signal_for_question_answered",
-]

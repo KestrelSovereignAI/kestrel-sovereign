@@ -808,3 +808,17 @@ async def test_native_server_refuses_unsupported_or_malformed_input_before_task_
         recipient_agent_id=wire.admission.scope.recipient_id,
     )
     assert not listed.tasks
+
+
+async def test_native_metadata_cannot_activate_its_own_optional_extension(wire):
+    from a2a.utils.errors import InvalidParamsError
+
+    from kestrel_sovereign.a2a.extensions import CAUSATION_URI
+
+    params = send(wire.admission)
+    params.configuration.return_immediately = True
+    params.metadata[CAUSATION_URI] = {"version": 1, "chain": []}
+    with pytest.raises(InvalidParamsError, match="not activated"):
+        async for _ in wire.client(polling=False).send_message(params):
+            pytest.fail("URI metadata is not extension negotiation")
+    assert not wire.submissions

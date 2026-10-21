@@ -19,12 +19,14 @@ RECIPIENT_POLICY_URI = EXTENSION_DOCUMENT + "#recipient-policy-v1"
 QUESTION_CORRELATION_URI = EXTENSION_DOCUMENT + "#question-correlation-v1"
 CAUSATION_URI = EXTENSION_DOCUMENT + "#causation-v1"
 SKILL_HINT_URI = EXTENSION_DOCUMENT + "#skill-hint-v1"
+DELIVERY_INTENT_URI = EXTENSION_DOCUMENT + "#delivery-intent-v1"
 NATIVE_EXTENSION_URIS = (
     SIGNED_SENDER_URI,
     RECIPIENT_POLICY_URI,
     QUESTION_CORRELATION_URI,
     CAUSATION_URI,
     SKILL_HINT_URI,
+    DELIVERY_INTENT_URI,
 )
 
 
@@ -54,6 +56,55 @@ class QuestionCorrelation:
     question_id: str
 
 
+def question_correlation_metadata(kind: str, question_id: str) -> dict[str, Any]:
+    metadata = {
+        QUESTION_CORRELATION_URI: {
+            "version": 1,
+            "kind": kind,
+            "question_id": question_id,
+        }
+    }
+    parse_question_correlation(metadata)
+    return metadata
+
+
+def correlated_answer_metadata(
+    original: Mapping[str, Any], reply: Mapping[str, Any]
+) -> dict[str, Any]:
+    question = parse_question_correlation(original)
+    answer = parse_question_correlation(reply)
+    if question is None:
+        if answer is not None:
+            raise ValueError(
+                "An answer cannot introduce correlation absent from its task"
+            )
+        return dict(reply)
+    if question.kind != "question" or (
+        answer is not None
+        and answer != QuestionCorrelation("answer", question.question_id)
+    ):
+        raise ValueError("Answer correlation disagrees with the original question")
+    return dict(reply) | question_correlation_metadata("answer", question.question_id)
+
+
+def require_metadata_extensions(
+    metadata: Mapping[str, Any], activated: frozenset[str]
+) -> None:
+    """URI metadata cannot activate its own optional wire extension."""
+    if not isinstance(activated, frozenset):
+        raise TypeError("Activated native extensions must be immutable")
+    if any(
+        uri in metadata and uri not in activated
+        for uri in (
+            QUESTION_CORRELATION_URI,
+            CAUSATION_URI,
+            SKILL_HINT_URI,
+            DELIVERY_INTENT_URI,
+        )
+    ):
+        raise ValueError("Native metadata uses an extension that was not activated")
+
+
 def parse_skill_hint(metadata: Mapping[str, Any]) -> str | None:
     """Read an advisory published skill; it grants no tool-execution authority."""
     payload = _payload(metadata, SKILL_HINT_URI, {"version", "skill_id"})
@@ -68,6 +119,23 @@ def parse_skill_hint(metadata: Mapping[str, Any]) -> str | None:
 def skill_hint_metadata(skill_id: str) -> dict[str, Any]:
     metadata = {SKILL_HINT_URI: {"version": 1, "skill_id": skill_id}}
     parse_skill_hint(metadata)
+    return metadata
+
+
+def parse_delivery_intent(metadata: Mapping[str, Any]) -> str | None:
+    payload = _payload(metadata, DELIVERY_INTENT_URI, {"version", "intent"})
+    if payload is None:
+        return None
+    if payload["intent"] not in ("notification", "assignment"):
+        raise ValueError("Native delivery intent must be notification or assignment")
+    if QUESTION_CORRELATION_URI in metadata:
+        raise ValueError("Question correlation already defines its own reply intent")
+    return payload["intent"]
+
+
+def delivery_intent_metadata(intent: str) -> dict[str, Any]:
+    metadata = {DELIVERY_INTENT_URI: {"version": 1, "intent": intent}}
+    parse_delivery_intent(metadata)
     return metadata
 
 
@@ -170,3 +238,24 @@ def deserialize_causation_chain(metadata: Mapping[str, Any]) -> list[CausationFr
             )
         )
     return frames
+
+
+@dataclass(frozen=True)
+class NativeMessageMetadata:
+    correlation: QuestionCorrelation | None
+    skill_hint: str | None
+    delivery_intent: str | None
+    causation_chain: tuple[CausationFrame, ...]
+
+
+def parse_message_metadata(metadata: Mapping[str, Any]) -> NativeMessageMetadata:
+    """One extension contract for new native messages, before any task admission."""
+    correlation = parse_question_correlation(metadata)
+    if correlation is not None and correlation.kind != "question":
+        raise ValueError("Question answers must use their original task response")
+    return NativeMessageMetadata(
+        correlation,
+        parse_skill_hint(metadata),
+        parse_delivery_intent(metadata),
+        tuple(deserialize_causation_chain(metadata)),
+    )

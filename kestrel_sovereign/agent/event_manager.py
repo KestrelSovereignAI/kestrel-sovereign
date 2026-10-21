@@ -6,6 +6,7 @@ listener management, and background task notification queuing.
 """
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -130,7 +131,7 @@ class EventManagerMixin:
     # only when its source is listed here; any other such row waits for its
     # provider to redeliver it with the live envelope (#3392).
     durable_rehydratable_sources: frozenset[str] = frozenset(
-        {"a2a.task_submitted", "a2a.task_complete"}
+        {"a2a.task_submitted", "a2a.task_complete", "a2a.question_answered"}
     )
 
     async def emit_event(
@@ -574,6 +575,23 @@ class EventManagerMixin:
         source = getattr(event, "source", None)
         if source not in self.durable_rehydratable_sources:
             return None
+        if source == "a2a.question_answered":
+            if getattr(event, "target_agent", None) != self.did:
+                return None
+            from kestrel_sovereign.signals.sources.a2a_question_answered import (
+                build_signal_for_question_answered,
+            )
+            store = self.task_manager.questions_for_actor(self.did)
+            wake = await store.wake_for_event(getattr(event, "source_event_id", None))
+            if wake is None:
+                return None
+            recovered = build_signal_for_question_answered(
+                event_id=wake.event_id, payload=json.loads(wake.payload_json),
+                target_agent=self.did,
+            )
+            return replace(
+                recovered, id=dispatch_signal.id, arrived_at=dispatch_signal.arrived_at,
+            )
         # WORKING recovery deliberately uses a revision-specific source event
         # identity so it cannot deduplicate against the original SUBMITTED
         # wake. The canonical task id remains in the durable dedupe field,

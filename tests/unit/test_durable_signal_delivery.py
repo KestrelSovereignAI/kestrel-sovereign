@@ -2313,6 +2313,15 @@ async def test_held_durable_cognition_survives_restart_and_runs_once_after_relea
         await _close(backend_b, agent_b)
 
 
+def _native_a2a_snapshot(task, recipient_id, lifecycle_revision=0):
+    from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
+    from kestrel_sovereign.a2a.stores.unified.task_store import NativeTaskSnapshot
+    return NativeTaskSnapshot(
+        task=task, lifecycle_revision=lifecycle_revision,
+        ownership=ContextOwnership(task.context_id, "", recipient_id, "did:peer:creator"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
     tmp_path,
@@ -2326,11 +2335,11 @@ async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
 
     path = tmp_path / "held-a2a-restart.db"
     did = "did:agent:held-a2a-restart"
-    task = SimpleNamespace(
+    from a2a.types import Task, TaskState, TaskStatus
+    task = Task(
         id="task-held-across-restart",
-        sessionId="session-held-across-restart",
-        metadata={},
-        history=[],
+        context_id="context-held-across-restart",
+        status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
     )
     consumer = DurableConsumerRegistration(
         consumer_id=A2A_CONSUMER,
@@ -2345,7 +2354,7 @@ async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
     try:
         await dispatcher_a.register_durable_consumer(consumer)
         handle = await dispatcher_a.enqueue_durable_cognition(
-            build_signal_for_submitted_task(task, target_agent=did),
+            build_signal_for_submitted_task(_native_a2a_snapshot(task, did), target_agent=did),
             source_event_id=task.id,
             consumer_id=A2A_CONSUMER,
         )
@@ -2399,7 +2408,7 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
     from types import MethodType
 
     from kestrel_sovereign.agent.event_manager import EventManagerMixin
-    from kestrel_sovereign.a2a.types import TaskState
+    from a2a.types import Task, TaskState, TaskStatus
     from kestrel_sovereign.privacy import get_privacy_preset
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as A2A_CONSUMER,
@@ -2408,12 +2417,9 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
 
     path = tmp_path / "private-held-a2a-restart.db"
     did = "did:agent:private-held-a2a-restart"
-    task = SimpleNamespace(
-        id="private-task-held-across-restart",
-        sessionId="private-session",
-        metadata={},
-        history=[],
-        status=SimpleNamespace(state=TaskState.SUBMITTED),
+    task = Task(
+        id="private-task-held-across-restart", context_id="private-context",
+        status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
     )
     consumer = DurableConsumerRegistration(
         consumer_id=A2A_CONSUMER,
@@ -2428,7 +2434,7 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
     try:
         await dispatcher_a.register_durable_consumer(consumer)
         handle = await dispatcher_a.enqueue_durable_cognition(
-            build_signal_for_submitted_task(task, target_agent=did),
+            build_signal_for_submitted_task(_native_a2a_snapshot(task, did), target_agent=did),
             source_event_id=task.id,
             consumer_id=A2A_CONSUMER,
         )
@@ -2445,7 +2451,7 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
     agent_b._hold_store = _HoldSnapshots(EffectiveHoldState(host=None, agent=None))
     agent_b.process_input = AsyncMock(return_value="rehydrated")
     agent_b.task_manager = SimpleNamespace(
-        get_task_for_recipient=AsyncMock(return_value=task),
+        get_task_snapshot=AsyncMock(return_value=_native_a2a_snapshot(task, did)),
     )
     agent_b.rehydrate_durable_cognition_signal = MethodType(
         EventManagerMixin.rehydrate_durable_cognition_signal,
@@ -2468,9 +2474,9 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
         assert delivery.status == ACKNOWLEDGED
         agent_b.process_input.assert_awaited_once()
         assert task.id in agent_b.process_input.await_args.args[0]
-        agent_b.task_manager.get_task_for_recipient.assert_awaited_once_with(
+        agent_b.task_manager.get_task_snapshot.assert_awaited_once_with(
             task.id,
-            did,
+            recipient_agent_id=did,
         )
     finally:
         await dispatcher_b.shutdown_durable_delivery()
@@ -2762,9 +2768,6 @@ class _ReconcilingA2AAgent(_Agent):
     reconcile_a2a_cognition_wakes = _Mixin.reconcile_a2a_cognition_wakes
 
     def __init__(self, did: str, task, lifecycle_revision: int):
-        from kestrel_sovereign.a2a.stores.unified.task_store import (
-            NativeTaskSnapshot,
-        )
         from kestrel_sovereign.signals.sources.a2a import (
             build_a2a_task_complete_registration,
         )
@@ -2783,9 +2786,7 @@ class _ReconcilingA2AAgent(_Agent):
         self.task_manager = SimpleNamespace(
             list_cognition_wake_candidates=AsyncMock(
                 return_value=[
-                    NativeTaskSnapshot(
-                        task=task, lifecycle_revision=lifecycle_revision
-                    )
+                    _native_a2a_snapshot(task, did, lifecycle_revision)
                 ]
             )
         )
@@ -2798,8 +2799,9 @@ class _ReconcilingA2AAgent(_Agent):
 
     async def validate_cognition_signal_execution(self, signal):
         # EventManagerMixin's rule: a submission wake runs while the task is live.
-        state = self.task.status.state.value
-        return None if state in {"submitted", "working"} else f"task is {state}"
+        from a2a.types import TaskState
+        state = self.task.status.state
+        return None if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING} else f"task is {state}"
 
 
 async def _reconciling_a2a_dispatcher(path, did: str, task, lifecycle_revision: int):
@@ -2827,7 +2829,7 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     identity beside it ran the same peer task twice at recovery.
     """
 
-    from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus
+    from a2a.types import Task, TaskState, TaskStatus
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
         build_signal_for_submitted_task,
@@ -2836,7 +2838,7 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     path = tmp_path / "crash-mid-submission.db"
     did = "did:agent:crash-mid-submission"
     submitted = Task(
-        id="peer-task", sessionId="s1", status=TaskStatus(state=TaskState.SUBMITTED)
+        id="peer-task", context_id="c1", status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED)
     )
     consumer = DurableConsumerRegistration(
         consumer_id=SUBMITTED_CONSUMER,
@@ -2850,7 +2852,7 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     agent_a.hang_turns = True
     await dispatcher_a.register_durable_consumer(consumer)
     handle = await dispatcher_a.enqueue_durable_cognition(
-        build_signal_for_submitted_task(submitted, target_agent=did),
+        build_signal_for_submitted_task(_native_a2a_snapshot(submitted, did), target_agent=did),
         source_event_id=submitted.id,
         consumer_id=SUBMITTED_CONSUMER,
     )
@@ -2866,9 +2868,8 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     await asyncio.gather(*agent_a.tasks, return_exceptions=True)
     await backend_a.close()
 
-    working = submitted.model_copy(
-        update={"status": TaskStatus(state=TaskState.WORKING)}
-    )
+    working = Task.FromString(submitted.SerializeToString())
+    working.status.state = TaskState.TASK_STATE_WORKING
     backend_b, agent_b, dispatcher_b = await _reconciling_a2a_dispatcher(
         path, did, working, 1
     )

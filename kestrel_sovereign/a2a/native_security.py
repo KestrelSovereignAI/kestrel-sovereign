@@ -64,6 +64,7 @@ class AuthorizedNativeRequest(Generic[_Request]):
     routing_key: str
     authority: NativeRequestAuthority
     issuer: "NativeDIDRequestGuard"
+    activated_extensions: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,8 @@ class NativeDIDRequestGuard:
             routing_key=self.routing_key,
             scope=self.scope,
         )
-        if not self.required_extensions <= context.requested_extensions:
+        activated_extensions = frozenset(context.requested_extensions)
+        if not self.required_extensions <= activated_extensions:
             raise ExtensionSupportRequiredError(
                 message="Required Agent Card extensions were not activated"
             )
@@ -121,7 +123,7 @@ class NativeDIDRequestGuard:
                     request,
                     recipient=self.scope.recipient_id,
                     operation=operation,
-                    extensions=context.requested_extensions,
+                    extensions=activated_extensions,
                     resolver=authority.resolver,
                     replay_store=self.replay_store,
                     policy=self.proof_policy,
@@ -146,6 +148,7 @@ class NativeDIDRequestGuard:
                 self.routing_key,
                 authority,
                 self,
+                activated_extensions,
             )
 
     async def _authorize(

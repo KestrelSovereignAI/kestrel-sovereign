@@ -1,5 +1,6 @@
 """Official SDK operations over Kestrel's canonical native task lifecycle."""
 
+import asyncio
 from collections.abc import AsyncGenerator
 
 from a2a.server.context import ServerCallContext
@@ -35,9 +36,14 @@ from a2a.utils.task import apply_history_length, validate_history_length
 from google.protobuf.json_format import MessageToDict
 from starlette.exceptions import HTTPException
 
-from kestrel_sovereign.a2a.extensions import parse_skill_hint
+from kestrel_sovereign._async_ownership import gather_owned
+from kestrel_sovereign.a2a.extensions import (
+    parse_message_metadata,
+    require_metadata_extensions,
+)
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
 from kestrel_sovereign.a2a.media import validate_input_parts
+from kestrel_sovereign.a2a.native_context import wait_native_disconnect
 from kestrel_sovereign.a2a.native_security import (
     AuthorizedNativeRequest,
     NativeDIDRequestGuard,
@@ -149,7 +155,10 @@ class NativeA2ARequestHandler(RequestHandler):
                     raise TaskNotCancelableError() from error
                 raise
 
-    async def _submit(self, params: SendMessageRequest, principal_id: str) -> Task:
+    async def _submit(
+        self, admitted: AuthorizedNativeRequest[SendMessageRequest]
+    ) -> Task:
+        params, principal_id = admitted.request, admitted.principal_id
         validate_history_length(params.configuration)
         if params.configuration.HasField("task_push_notification_config"):
             raise PushNotificationNotSupportedError()
@@ -166,7 +175,9 @@ class NativeA2ARequestHandler(RequestHandler):
                 message="This task does not accept additional messages"
             )
         try:
-            hint = parse_skill_hint(MessageToDict(params.metadata))
+            metadata = MessageToDict(params.metadata)
+            require_metadata_extensions(metadata, admitted.activated_extensions)
+            hint = parse_message_metadata(metadata).skill_hint
         except ValueError as error:
             raise InvalidParamsError(message=str(error)) from error
         modes = self._card.default_input_modes
@@ -237,15 +248,35 @@ class NativeA2ARequestHandler(RequestHandler):
         self, params: SendMessageRequest, context: ServerCallContext
     ) -> Task:
         async with self.guard.admit(params, "SendMessage", context) as admitted:
-            task = await self._submit(admitted.request, admitted.principal_id)
+            task = await self._submit(admitted)
             if admitted.request.configuration.return_immediately:
                 return apply_history_length(task, admitted.request.configuration)
             stream, initial = await self._open_stream(task.id, admitted.principal_id)
         async with owned_execution_stream(
             self, self._events(stream, initial, admitted)
         ) as events:
-            async for _ in events:
-                pass
+
+            async def wait_events():
+                async for _ in events:
+                    pass
+                return True
+
+            completed, _ = await gather_owned(
+                (
+                    factory()
+                    for factory in (
+                        wait_events,
+                        lambda: wait_native_disconnect(context),
+                    )
+                ),
+                return_when=asyncio.FIRST_COMPLETED,
+                retain_originals=True,
+                name_prefix="native-a2a-blocking-response",
+            )
+            if completed is not True:
+                raise HTTPException(
+                    status_code=499, detail="A2A HTTP client disconnected"
+                )
         async with self.guard.hold_authority(admitted):
             task = await self._task(task.id, admitted.principal_id)
             return apply_history_length(task, admitted.request.configuration)
@@ -260,7 +291,7 @@ class NativeA2ARequestHandler(RequestHandler):
                 raise UnsupportedOperationError(
                     message="Streaming is not advertised by this agent"
                 )
-            task = await self._submit(admitted.request, admitted.principal_id)
+            task = await self._submit(admitted)
             stream, initial = await self._open_stream(task.id, admitted.principal_id)
         async with owned_execution_stream(
             self, self._events(stream, initial, admitted)

@@ -1928,14 +1928,14 @@ class AgentManager:
             return None
         return sender_id if result is True else None
 
-    async def _authorize_host_attested_local_a2a_route(
+    def _resolve_hosted_a2a_route_binding(
         self,
         *,
         sender: object,
         requester: object,
         peer: object,
     ) -> tuple[str, object]:
-        """Resolve one live sender→recipient route under the caller's lease."""
+        """Resolve cached peer identities under the caller's lease, without recipient I/O."""
 
         from kestrel_sovereign.features.peers.directory import (
             PeerAccessDeniedError,
@@ -1977,6 +1977,24 @@ class AgentManager:
         ):
             raise PeerNotFoundError("Local A2A recipient is no longer published")
 
+        return sender_id, recipient
+
+    async def _authorize_host_attested_local_a2a_route(
+        self,
+        *,
+        sender: object,
+        requester: object,
+        peer: object,
+    ) -> tuple[str, object]:
+        """Resolve one live sender→recipient route under the caller's lease."""
+
+        from kestrel_sovereign.features.peers.directory import PeerAccessDeniedError
+
+        sender_id, recipient = self._resolve_hosted_a2a_route_binding(
+            sender=sender, requester=requester, peer=peer,
+        )
+        sender_policy = self.a2a_hosted_policy_for(sender)
+        recipient_policy = self.a2a_hosted_policy_for(recipient)
         authorize = getattr(
             recipient_policy.router,
             "authorize_inbound_sender",

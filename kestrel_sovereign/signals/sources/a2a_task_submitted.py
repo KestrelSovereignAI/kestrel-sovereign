@@ -29,7 +29,9 @@ from kestrel_sdk.signals import (
 
 from kestrel_sovereign.a2a.extensions import (
     deserialize_causation_chain,
+    parse_delivery_intent,
     parse_question_correlation,
+    parse_skill_hint,
 )
 from kestrel_sovereign.a2a.projections import message_text
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
@@ -46,7 +48,9 @@ DURABLE_COGNITION_CONSUMER_ID = "core.a2a-task-submitted-cognition-v1"
 PROMPT_TEMPLATE = (
     # Inside the package (#1415); see a2a.py for the full rationale.
     Path(__file__).resolve().parents[2]
-    / "prompts" / "signals" / "a2a_task_submitted.md"
+    / "prompts"
+    / "signals"
+    / "a2a_task_submitted.md"
 )
 
 
@@ -58,30 +62,19 @@ PROMPT_TEMPLATE = (
 def _a2a_submitted_schema(payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(
-            f"a2a.task_submitted payload must be a dict, got "
-            f"{type(payload).__name__}"
+            f"a2a.task_submitted payload must be a dict, got {type(payload).__name__}"
         )
     for key in ("task_id", "session_id", "sender"):
         if key not in payload:
-            raise ValueError(
-                f"a2a.task_submitted payload missing required key: {key}"
-            )
+            raise ValueError(f"a2a.task_submitted payload missing required key: {key}")
         if not isinstance(payload[key], str):
-            raise ValueError(
-                f"a2a.task_submitted payload {key} must be a string"
-            )
+            raise ValueError(f"a2a.task_submitted payload {key} must be a string")
     # Optional discriminator fields (added in #1380). Empty strings are
     # valid (legacy / non-PeersFeature task creators leave them blank).
     if "a2a_verb" in payload and not isinstance(payload["a2a_verb"], str):
-        raise ValueError(
-            "a2a.task_submitted payload a2a_verb must be a string"
-        )
-    if "reply_expected" in payload and not isinstance(
-        payload["reply_expected"], bool
-    ):
-        raise ValueError(
-            "a2a.task_submitted payload reply_expected must be a bool"
-        )
+        raise ValueError("a2a.task_submitted payload a2a_verb must be a string")
+    if "reply_expected" in payload and not isinstance(payload["reply_expected"], bool):
+        raise ValueError("a2a.task_submitted payload reply_expected must be a bool")
     # ``request_content`` is the sender's actual question/message text
     # extracted from ``task.history[0]``. Added in #1433 so the
     # cognition prompt has the question inline rather than forcing the
@@ -90,12 +83,8 @@ def _a2a_submitted_schema(payload: dict) -> dict:
     # questions. Optional (empty string accepted) so historical signal
     # payloads that predate the field still validate; the prompt
     # template guards against the missing case.
-    if "request_content" in payload and not isinstance(
-        payload["request_content"], str
-    ):
-        raise ValueError(
-            "a2a.task_submitted payload request_content must be a string"
-        )
+    if "request_content" in payload and not isinstance(payload["request_content"], str):
+        raise ValueError("a2a.task_submitted payload request_content must be a string")
     # Inject defaults for every field the prompt template indexes so any
     # legacy caller (test fixtures, prior code paths, external
     # integrations) building a payload with only the required keys still
@@ -118,10 +107,10 @@ def _a2a_submitted_redact(payload: dict) -> str:
     summary fields a debugger needs to find the corresponding task."""
     return (
         f"a2a.task_submitted "
-        f"task_id={payload.get('task_id','?')} "
-        f"sender={payload.get('sender','?')} "
-        f"verb={payload.get('a2a_verb','?')} "
-        f"skill={payload.get('skill_id','?')}"
+        f"task_id={payload.get('task_id', '?')} "
+        f"sender={payload.get('sender', '?')} "
+        f"verb={payload.get('a2a_verb', '?')} "
+        f"skill={payload.get('skill_id', '?')}"
     )
 
 
@@ -160,35 +149,54 @@ def build_a2a_task_submitted_registration() -> SourceRegistration:
 
 
 def build_signal_for_submitted_task(
-    candidate: NativeTaskSnapshot, target_agent: str,
+    candidate: NativeTaskSnapshot,
+    target_agent: str,
 ) -> Signal:
     """Wake the admitted recipient using ownership facts outside peer metadata."""
     candidate = require_native_task_snapshot(candidate, target_agent)
     task = candidate.task
-    if task.status.state not in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
-        raise ValueError("Task submission wake requires a submitted or working native task")
+    if task.status.state not in {
+        TaskState.TASK_STATE_SUBMITTED,
+        TaskState.TASK_STATE_WORKING,
+    }:
+        raise ValueError(
+            "Task submission wake requires a submitted or working native task"
+        )
     metadata = MessageToDict(task.metadata)
     correlation = parse_question_correlation(metadata)
+    intent = parse_delivery_intent(metadata)
     chain = deserialize_causation_chain(metadata)
     request_content = (message_text(task.history[0]) or "") if task.history else ""
-    scope = NativeRecipientScope(candidate.ownership.recipient_agent_id, candidate.ownership.tenant)
+    scope = NativeRecipientScope(
+        candidate.ownership.recipient_agent_id, candidate.ownership.tenant
+    )
     return Signal(
-        source=SOURCE_NAME, kind="inbound", mode=SignalMode.COGNITION,
+        source=SOURCE_NAME,
+        kind="inbound",
+        mode=SignalMode.COGNITION,
         payload={
             "task_id": task.id,
             "session_id": scope.session_id_for_context(task.context_id),
             "sender": candidate.ownership.creator_agent_id,
-            "skill_id": str(metadata.get("skill") or ""),
-            "a2a_verb": correlation.kind if correlation is not None else "task",
-            "reply_expected": correlation is not None and correlation.kind == "question",
+            "skill_id": parse_skill_hint(metadata) or "",
+            "a2a_verb": "question"
+            if correlation is not None
+            else "message"
+            if intent == "notification"
+            else "task",
+            "reply_expected": correlation is not None or intent == "assignment",
             "question_id": correlation.question_id if correlation is not None else "",
             "request_content": request_content,
         },
-        target_agent=target_agent, visibility=Visibility.INTERNAL,
-        caller=candidate.ownership.creator_agent_id, urgency=Urgency.NORMAL,
-        origin_trust=Trust.TRUSTED, dedupe_key=task.id,
+        target_agent=target_agent,
+        visibility=Visibility.INTERNAL,
+        caller=candidate.ownership.creator_agent_id,
+        urgency=Urgency.NORMAL,
+        origin_trust=Trust.TRUSTED,
+        dedupe_key=task.id,
         causation_chain=list(chain),
     )
+
 
 __all__ = [
     "PROMPT_TEMPLATE",

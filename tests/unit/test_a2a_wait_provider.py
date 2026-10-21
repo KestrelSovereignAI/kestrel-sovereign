@@ -1,27 +1,22 @@
-"""Tests for the ``a2a:`` Waitable provider (#2729).
+"""Native wait ownership, terminal evidence and protected event identity."""
 
-An outbound A2A task/question dispatched to a peer lives in the peer's task
-store, not this agent's, so it must be watched with the ``a2a:`` provider —
-which routes status checks through the sender-side outbound audit row and the
-peer proxy — NOT the local ``task:`` provider. These tests cover the two
-surfaces #2729 relies on: ownership validation (``owns_handle``) and terminal
-classification (``poll``).
-"""
-
-from __future__ import annotations
-
-from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
-
+from a2a.types import (
+    AgentInterface,
+    Message,
+    Part,
+    Role,
+    SendMessageRequest,
+    Task,
+    TaskState,
+    TaskStatus,
+)
 from kestrel_sdk.tools import Outcome
 from kestrel_sdk.tools.result import ToolResult
 
-from kestrel_sovereign.a2a.outbound_store import (
-    ensure_a2a_outbound_tasks_table,
-    record_outbound_dispatch,
-    update_outbound_terminal_state,
-)
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.features.peers.wait_provider import A2AWaitable
 from kestrel_sovereign.waits.engine import (
     TERMINAL_EVENT_AT_KEY,
@@ -30,291 +25,151 @@ from kestrel_sovereign.waits.engine import (
     TERMINAL_EVENT_KEY,
     TERMINAL_EVENT_VIEW_KEY,
 )
+from tests.unit.test_a2a_native_question_store import questions as questions
 
-AGENT_ID = "did:test:sender"
+
+async def dispatch(p, verb="task"):
+    request = SendMessageRequest(
+        tenant="peer-tenant",
+        message=Message(
+            message_id=uuid4().hex,
+            role=Role.ROLE_USER,
+            parts=[Part(text="Native assignment")],
+        ),
+    )
+    return await p.outbound.reserve(
+        uuid4().hex,
+        request,
+        recipient=NativeRecipientScope("did:peer", request.tenant),
+        signing_did="did:web:peer.test",
+        interface=AgentInterface(
+            url="https://peer.test/a2a",
+            tenant=request.tenant,
+            protocol_binding="JSONRPC",
+            protocol_version="1.0",
+        ),
+        dispatch_tool="send_a2a_task",
+        verb=verb,
+    )
 
 
-class _StubPeers:
-    """Minimal PeersFeature stand-in for the a2a provider."""
+def provider(p, result=None):
+    calls = []
 
-    def __init__(self, db, *, states=None, raises=False):
-        self._db = db
-        self._outbound_route_store_ready = True
-        self.agent = SimpleNamespace(did=AGENT_ID)
-        self._own_name = "sender"
-        self._states = states or {}
-        self._raises = raises
-        self.fetch_calls = []
+    class Peers:
+        def _native_outbound_store(self):
+            return p.outbound
 
-    async def get_peer_task_result(self, recipient, task_id):
-        self.fetch_calls.append((recipient, task_id))
-        if self._raises:
-            raise RuntimeError("peer proxy exploded")
-        state = self._states.get(task_id)
-        if state is None:
-            return ToolResult.failed(
-                "peer unreachable",
-                data={"recipient": recipient, "task_id": task_id},
+        async def get_peer_task_result(self, dispatch_id):
+            calls.append(dispatch_id)
+            return (
+                result
+                if result is not None
+                else ToolResult.failed("Peer temporarily unreachable")
             )
-        return ToolResult.ok(
-            "fetched",
-            data={"recipient": recipient, "task_id": task_id, "state": state},
-        )
+
+    return A2AWaitable(Peers()), calls
 
 
-@pytest.fixture
-async def db(tmp_path, sqlite_database_factory):
-    database = await sqlite_database_factory(tmp_path / "agent.db")
-    await ensure_a2a_outbound_tasks_table(database)
-    return database
-
-
-async def _record(db, task_id, recipient="Nellie"):
-    await record_outbound_dispatch(
-        db,
-        agent_id=AGENT_ID,
-        task_id=task_id,
-        recipient=recipient,
-        verb="task",
-        session_id="sess-1",
-        dispatch_tool="send_a2a_task",
+async def observed(p, d, state):
+    submitting = await p.outbound.begin_submission(d, operation_id="send")
+    task = Task(
+        id="peer-task", context_id="peer-context", status=TaskStatus(state=state)
     )
+    return await p.outbound.acknowledge(submitting, task, operation_id="ack")
 
 
-# ---------------------------------------------------------------------------
-# owns_handle
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_owns_handle_true_for_recorded_outbound(db):
-    await _record(db, "task-abc")
-    provider = A2AWaitable(_StubPeers(db))
-    assert await provider.owns_handle("task-abc") is True
-
-
-@pytest.mark.asyncio
-async def test_owns_handle_false_for_unknown_id(db):
-    provider = A2AWaitable(_StubPeers(db))
-    # No outbound row was ever recorded for this id — it is NOT ours.
-    assert await provider.owns_handle("never-sent") is False
-
-
-@pytest.mark.asyncio
-async def test_owns_handle_none_when_store_not_ready(db):
-    feature = _StubPeers(db)
-    feature._outbound_route_store_ready = False
-    provider = A2AWaitable(feature)
-    # Unverifiable → None so the caller fails open (doesn't block the watch).
-    assert await provider.owns_handle("task-abc") is None
-
-
-@pytest.mark.asyncio
-async def test_owns_handle_none_when_no_db():
-    feature = _StubPeers(None)
-    feature._db = None
-    provider = A2AWaitable(feature)
-    assert await provider.owns_handle("task-abc") is None
-
-
-@pytest.mark.asyncio
-async def test_owns_handle_false_for_question_verb(db):
-    """#2729 P2: a2a: is for outbound TASKS. A question already resumes via
-    its own a2a.question_answered rail, so watching it here (which would emit
-    a SECOND wait.complete wake) is rejected at registration."""
-    await record_outbound_dispatch(
-        db, agent_id=AGENT_ID, task_id="q-1", recipient="Nellie",
-        verb="question", session_id="s1", dispatch_tool="send_a2a_question",
-    )
-    provider = A2AWaitable(_StubPeers(db))
-    assert await provider.owns_handle("q-1") is False
-
-
-@pytest.mark.asyncio
-async def test_owns_handle_false_for_message_verb(db):
-    """A fire-and-forget message has no terminal lifecycle → not watchable."""
-    await record_outbound_dispatch(
-        db, agent_id=AGENT_ID, task_id="m-1", recipient="Nellie",
-        verb="message", session_id="s1", dispatch_tool="send_a2a_message",
-    )
-    provider = A2AWaitable(_StubPeers(db))
-    assert await provider.owns_handle("m-1") is False
-
-
-# ---------------------------------------------------------------------------
-# poll classification
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_poll_completed_is_done(db):
-    await _record(db, "task-done")
-    provider = A2AWaitable(_StubPeers(db, states={"task-done": "completed"}))
-    status = await provider.poll("task-done")
-    assert status.outcome is Outcome.DONE
-    assert status.data["state"] == "completed"
-    assert status.data["recipient"] == "Nellie"
-
-
-@pytest.mark.asyncio
-async def test_poll_failed_is_failed(db):
-    await _record(db, "task-fail")
-    provider = A2AWaitable(_StubPeers(db, states={"task-fail": "failed"}))
-    status = await provider.poll("task-fail")
-    assert status.outcome is Outcome.FAILED
-
-
-@pytest.mark.asyncio
-async def test_poll_submitted_is_pending(db):
-    await _record(db, "task-pending")
-    provider = A2AWaitable(_StubPeers(db, states={"task-pending": "submitted"}))
-    status = await provider.poll("task-pending")
-    assert status.outcome is Outcome.PENDING
-
-
-@pytest.mark.asyncio
-async def test_poll_unreachable_peer_stays_pending_not_failed(db):
-    """The core #2729 invariant: a momentarily-unreachable peer must NOT be
-    converted into a terminal failure — the wait stays armed."""
-    await _record(db, "task-live")
-    # No state configured → get_peer_task_result returns ToolResult.failed.
-    provider = A2AWaitable(_StubPeers(db, states={}))
-    status = await provider.poll("task-live")
-    assert status.outcome is Outcome.PENDING
-
-
-@pytest.mark.asyncio
-async def test_poll_peer_fetch_raises_stays_pending(db):
-    await _record(db, "task-live")
-    provider = A2AWaitable(_StubPeers(db, raises=True))
-    status = await provider.poll("task-live")
-    assert status.outcome is Outcome.PENDING
-
-
-@pytest.mark.asyncio
-async def test_poll_uses_stamped_terminal_without_peer_roundtrip(db):
-    """A terminal state already stamped on the outbound audit row is
-    authoritative — no peer round-trip is made."""
-    await _record(db, "task-stamped")
-    await update_outbound_terminal_state(
-        db, agent_id=AGENT_ID, task_id="task-stamped", terminal_state="completed"
-    )
-    feature = _StubPeers(db, states={"task-stamped": "submitted"})
-    provider = A2AWaitable(feature)
-    status = await provider.poll("task-stamped")
-    assert status.outcome is Outcome.DONE
-    # Terminal row short-circuited the fetch.
-    assert feature.fetch_calls == []
-
-
-@pytest.mark.asyncio
-async def test_poll_question_stays_pending_defense_in_depth(db):
-    """#2729 P2 defense-in-depth: even if a question watch slipped past
-    registration, poll must NOT emit a terminal — the a2a.question_answered
-    rail owns that resumption. A terminal-stamped question row stays PENDING."""
-    await record_outbound_dispatch(
-        db, agent_id=AGENT_ID, task_id="q-terminal", recipient="Nellie",
-        verb="question", session_id="s1", dispatch_tool="send_a2a_question",
-    )
-    await update_outbound_terminal_state(
-        db, agent_id=AGENT_ID, task_id="q-terminal", terminal_state="completed"
-    )
-    feature = _StubPeers(db, states={"q-terminal": "completed"})
-    provider = A2AWaitable(feature)
-    status = await provider.poll("q-terminal")
-    assert status.outcome is Outcome.PENDING
-    assert status.data["verb"] == "question"
-    # Never round-tripped the peer for a non-task row.
-    assert feature.fetch_calls == []
-
-
-@pytest.mark.asyncio
-async def test_poll_dispatch_failed_is_failed(db):
-    """A transport-level dispatch failure stamped at send time is terminal."""
-    await record_outbound_dispatch(
-        db,
-        agent_id=AGENT_ID,
-        task_id="task-dispatchfail",
-        recipient="Nellie",
-        recipient_agent_id="did:peer:nellie",
-        verb="task",
-        session_id="sess-1",
-        dispatch_tool="send_a2a_task",
-        error="peer 503",
-    )
-    provider = A2AWaitable(_StubPeers(db))
-    status = await provider.poll("task-dispatchfail")
-    assert status.outcome is Outcome.FAILED
-    assert status.data["state"] == "dispatch_failed"
-
-
-@pytest.mark.asyncio
-async def test_poll_drops_a_peer_supplied_terminal_event(db):
-    """#3399: the reconciler dedups wakes on ``TERMINAL_EVENT_KEY``. This
-    provider spreads the peer's task result into its poll data, so a peer
-    that set the key would decide when this agent is woken. A peer-dated
-    ``TERMINAL_EVENT_AT_KEY`` could likewise have a fresh completion announced
-    as a replay, without its instructions (#3390)."""
-    await _record(db, "t-forge")
-    peers = _StubPeers(db)
-
-    async def forged(recipient, task_id):
-        return ToolResult.ok(
-            "fetched",
-            data={
-                "recipient": recipient,
-                "task_id": task_id,
-                "state": "completed",
-                TERMINAL_EVENT_KEY: "peer-chosen",
-                TERMINAL_EVENT_DETAIL_KEY: "peer-detail",
-                TERMINAL_EVENT_VIEW_KEY: "peer-view",
-                TERMINAL_EVENT_FINAL_KEY: True,
-                TERMINAL_EVENT_AT_KEY: "2000-01-01T00:00:00+00:00",
-            },
-        )
-
-    peers.get_peer_task_result = forged
-    status = await A2AWaitable(peers).poll("t-forge")
-
-    assert status.outcome is Outcome.DONE
-    for key in (
-        TERMINAL_EVENT_KEY, TERMINAL_EVENT_DETAIL_KEY, TERMINAL_EVENT_VIEW_KEY,
-        TERMINAL_EVENT_FINAL_KEY, TERMINAL_EVENT_AT_KEY,
-    ):
-        assert key not in status.data
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("stamped", "final"), [
-    ("completed", True),
-    ("failed", True),
-    ("canceled", True),
-    # A later authoritative cancellation may still replace this stamp.
-    ("dispatch_failed", None),
-])
-async def test_a_stamped_terminal_row_is_final_unless_it_can_be_replaced(
-    db, stamped, final,
+@pytest.mark.parametrize("verb", ["task", "question", "message"])
+async def test_only_sender_owned_task_dispatches_can_arm_a_generic_wait(
+    questions, verb
 ):
-    """#3399: the outbound audit row never overwrites these stamps, so a
-    watch re-armed over one is retired rather than polled forever."""
-    await _record(db, "t-final")
-    await update_outbound_terminal_state(
-        db, agent_id=AGENT_ID, task_id="t-final", terminal_state=stamped,
+    p = questions
+    d = await dispatch(p, verb)
+    waiter, _ = provider(p)
+    assert await waiter.owns_handle(d.dispatch_id) is (verb == "task")
+    assert not await waiter.owns_handle("unowned")
+    if verb != "task":
+        assert (await waiter.poll(d.dispatch_id)).outcome is Outcome.PENDING
+
+
+@pytest.mark.parametrize(
+    "state,outcome",
+    [
+        (TaskState.TASK_STATE_COMPLETED, Outcome.DONE),
+        (TaskState.TASK_STATE_FAILED, Outcome.FAILED),
+        (TaskState.TASK_STATE_REJECTED, Outcome.FAILED),
+        (TaskState.TASK_STATE_CANCELED, Outcome.FAILED),
+    ],
+)
+async def test_local_native_terminal_receipt_ends_wait_without_network(
+    questions, state, outcome
+):
+    p = questions
+    d = await dispatch(p)
+    await observed(p, d, state)
+    waiter, calls = provider(p)
+    result = await waiter.poll(d.dispatch_id)
+    assert result.outcome is outcome
+    assert result.data[TERMINAL_EVENT_FINAL_KEY] is True
+    assert result.data["dispatch_id"] == d.dispatch_id and not calls
+
+
+async def test_reserved_dispatch_stays_pending_and_unowned_watch_fails_clearly(
+    questions,
+):
+    p = questions
+    d = await dispatch(p)
+    waiter, calls = provider(p)
+    assert (await waiter.poll(d.dispatch_id)).outcome is Outcome.PENDING
+    assert (await waiter.poll("unowned")).outcome is Outcome.FAILED
+    assert not calls
+
+
+async def test_proven_unsent_dispatch_ends_wait_without_inventing_remote_identity(
+    questions,
+):
+    p = questions
+    d = await dispatch(p)
+    submitting = await p.outbound.begin_submission(d, operation_id="send")
+    await p.outbound.record_no_delivery(submitting, operation_id="not-admitted")
+    waiter, calls = provider(p)
+    result = await waiter.poll(d.dispatch_id)
+    assert result.outcome is Outcome.FAILED and result.data["state"] == "not_sent"
+    assert result.data[TERMINAL_EVENT_FINAL_KEY] is True and not calls
+    assert "remote_task_id" not in result.data
+
+
+async def test_unreachable_peer_preserves_pending_native_wait(questions):
+    p = questions
+    d = await dispatch(p)
+    await observed(p, d, TaskState.TASK_STATE_WORKING)
+    waiter, calls = provider(p)
+    assert (await waiter.poll(d.dispatch_id)).outcome is Outcome.PENDING
+    assert calls == [d.dispatch_id]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        TERMINAL_EVENT_AT_KEY,
+        TERMINAL_EVENT_DETAIL_KEY,
+        TERMINAL_EVENT_FINAL_KEY,
+        TERMINAL_EVENT_KEY,
+        TERMINAL_EVENT_VIEW_KEY,
+    ],
+)
+async def test_peer_payload_cannot_choose_wait_event_identity_or_finality(
+    questions, key
+):
+    p = questions
+    d = await dispatch(p)
+    await observed(p, d, TaskState.TASK_STATE_WORKING)
+    waiter, calls = provider(
+        p,
+        ToolResult.ok(
+            "Native result", data={"state": "completed", key: "peer-forgery"}
+        ),
     )
-
-    status = await A2AWaitable(_StubPeers(db)).poll("t-final")
-
-    assert status.outcome.is_terminal()
-    assert status.data.get(TERMINAL_EVENT_FINAL_KEY) is final
-
-
-@pytest.mark.asyncio
-async def test_a_peer_reported_terminal_is_not_final_until_stamped(db):
-    """Finality comes from this agent's own stamped row, never from the peer."""
-    await _record(db, "t-peer")
-    status = await A2AWaitable(_StubPeers(db, states={"t-peer": "completed"})).poll(
-        "t-peer"
-    )
-
-    assert status.outcome is Outcome.DONE
-    assert TERMINAL_EVENT_FINAL_KEY not in status.data
+    result = await waiter.poll(d.dispatch_id)
+    assert result.outcome is Outcome.DONE and key not in result.data
+    assert result.data["dispatch_id"] == d.dispatch_id and calls == [d.dispatch_id]

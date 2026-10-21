@@ -4190,6 +4190,44 @@ def _agent_not_found_response(
     )
 
 
+def _native_route_kind(scope) -> str | None:
+    """Classify the installed SDK objects once for auth and prefix routing."""
+    application = scope.get("app")
+    native = getattr(getattr(application, "state", None), "native_a2a_http", None)
+    if native is None:
+        return None
+    from kestrel_sovereign.a2a.native_routes import NativeA2AHTTPRegistry
+
+    if not isinstance(native, NativeA2AHTTPRegistry):
+        raise TypeError("Host native A2A routes require their published registry")
+    if native.admits_public_card(scope):
+        return "card"
+    if native.admits(scope):
+        return "peer"
+    return None
+
+
+def _route_agent_scope(scope) -> str | None:
+    """Route operator surfaces; SDK peer/card routes retain their installed paths."""
+    if _native_route_kind(scope) is not None:
+        return None
+    application = scope.get("app")
+    manager = getattr(getattr(application, "state", None), "agent_manager", None)
+    if manager is None:
+        return None
+    routed = _routed_agent_path(scope.get("path", ""))
+    if routed is None:
+        return None
+    name, remaining = routed
+    agent = manager.get_agent(name)
+    if agent is None:
+        return name
+    scope["path"] = "/" + remaining
+    scope["raw_path"] = scope["path"].encode("utf-8")
+    scope.setdefault("state", {})["agent"] = agent
+    return None
+
+
 class MultiAgentAgentRoutingMiddleware:
     """Strip /api/agents/{name}/ prefix + attach the resolved agent to scope.
 
@@ -4204,37 +4242,15 @@ class MultiAgentAgentRoutingMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
-
-        agent_manager = getattr(app.state, "agent_manager", None)
-        if agent_manager is None:
-            return await self.app(scope, receive, send)
-
-        path = scope.get("path", "")
-        routed = _routed_agent_path(path)
-        if routed is None:
-            return await self.app(scope, receive, send)
-
-        agent_name, remaining_path = routed
-        agent = agent_manager.get_agent(agent_name)
-        if agent is None:
+        missing = _route_agent_scope(scope)
+        if missing is not None:
             if scope["type"] == "http":
                 response = _agent_not_found_response(
-                    agent_name,
-                    correlation_id=scope.get("state", {}).get("correlation_id"),
+                    missing, correlation_id=scope.get("state", {}).get("correlation_id"),
                 )
                 return await response(scope, receive, send)
-            # WebSocket: accept then close with a clear reason — browsers see
-            # the close code in the onclose event.
             await send({"type": "websocket.close", "code": 4404, "reason": "agent not found"})
             return
-
-        # Mutate scope so downstream routes match the prefix-stripped path
-        # and the handler can find the agent on `request.state` /
-        # `websocket.state`. Starlette wires scope["state"] → both.
-        scope["path"] = "/" + remaining_path
-        scope["raw_path"] = scope["path"].encode("utf-8")
-        scope.setdefault("state", {})["agent"] = agent
-
         await self.app(scope, receive, send)
 
 
@@ -4309,6 +4325,7 @@ if SERVE_UI:
 # Include core routers (always present, not feature-gated)
 from kestrel_sovereign.endpoints import (
     agent_router,
+    task_inbox_router,
     conversations_router,
     memories_router,
     sovereignty_router,
@@ -4336,6 +4353,7 @@ register_oauth(app)
 # is rewritten to /api/agent/* by a middleware below — we don't double-mount
 # the router because that would defeat OpenAPI / route-inventory tooling.
 app.include_router(agent_router)
+app.include_router(task_inbox_router)
 app.include_router(conversations_router)
 app.include_router(memories_router)
 app.include_router(sovereignty_router)
@@ -4436,37 +4454,11 @@ async def static_cache_control(request: Request, call_next):
 
 @app.middleware("http")
 async def agent_routing_middleware(request: Request, call_next):
-    """Route /api/agents/{name}/... requests to the correct in-process agent.
-
-    In multi-agent mode:
-    1. Extracts agent name from path prefix /api/agents/{name}/...
-    2. Looks up agent in AgentManager
-    3. Sets request.state.agent to the resolved agent
-    4. Rewrites request path to strip the prefix
-
-    In single-agent mode, this middleware is a no-op.
-    """
-    agent_manager = getattr(request.app.state, 'agent_manager', None)
-    if agent_manager is None:
-        return await call_next(request)
-
-    path = request.url.path
-    routed = _routed_agent_path(path)
-    if routed is not None:
-        agent_name, remaining = routed
-        remaining_path = "/" + remaining
-
-        agent = agent_manager.get_agent(agent_name)
-        if agent is None:
-            return _agent_not_found_response(
-                agent_name,
-                correlation_id=getattr(request.state, "correlation_id", None),
-            )
-
-        request.state.agent = agent
-        # Rewrite path so existing routers see the original endpoint path
-        request.scope["path"] = remaining_path
-
+    """HTTP composition of the same routing rule used by the ASGI middleware."""
+    missing = _route_agent_scope(request.scope)
+    if missing is not None:
+        return _agent_not_found_response(missing,
+            correlation_id=getattr(request.state, "correlation_id", None))
     return await call_next(request)
 
 
@@ -4501,18 +4493,14 @@ async def auth_middleware(request: Request, call_next):
     # Native SDK routes authenticate the signed principal and recipient policy
     # inside their shared handler. This lane must precede operator credentials:
     # an added API key cannot promote a peer call to sovereign authority.
-    native_a2a = getattr(request.app.state, "native_a2a_http", None)
-    if native_a2a is not None:
-        from kestrel_sovereign.a2a.native_routes import NativeA2AHTTPRegistry
+    native_kind = _native_route_kind(request.scope)
+    if native_kind == "card":
+        return await call_next(request)
+    if native_kind == "peer":
         from kestrel_sovereign.auth import CallerContext
 
-        if not isinstance(native_a2a, NativeA2AHTTPRegistry):
-            raise TypeError("Host native A2A routes require their published registry")
-        if native_a2a.admits_public_card(request.scope):
-            return await call_next(request)
-        if native_a2a.admits(request.scope):
-            request.state.caller = CallerContext.a2a_transport()
-            return await call_next(request)
+        request.state.caller = CallerContext.a2a_transport()
+        return await call_next(request)
     if request.url.path in public_paths:
         return await call_next(request)
     if request.url.path in auth_paths:

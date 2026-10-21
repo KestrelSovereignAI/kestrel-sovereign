@@ -47,9 +47,9 @@ from kestrel_sovereign._async_ownership import (
 )
 from kestrel_sovereign.a2a.extensions import (
     causation_metadata,
-    deserialize_causation_chain,
+    correlated_answer_metadata,
+    parse_message_metadata,
     parse_question_correlation,
-    parse_skill_hint,
 )
 from kestrel_sovereign.a2a.lifecycle import (
     STREAM_STOP_STATES,
@@ -69,6 +69,7 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextStore,
 )
 from kestrel_sovereign.a2a.stores.unified.outbound_store import OutboundStore
+from kestrel_sovereign.a2a.stores.unified.question_store import NativeQuestionStore
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     NativeTaskSnapshot,
     TaskCancellationSnapshot,
@@ -205,6 +206,7 @@ class TaskManager:
         self.outbound_store = OutboundStore(
             task_store.backend, sender_scope=task_store.scope, owns_backend=False
         )
+        self.question_store = NativeQuestionStore(self.outbound_store)
 
         # Callback for task completion notifications (for chat notifications)
         self._on_task_complete = on_task_complete
@@ -269,15 +271,23 @@ class TaskManager:
             or self.task_store.scope.recipient_id != actor_id
             or self.outbound_store.sender_scope != self.task_store.scope
             or self.outbound_store.backend is not self.task_store.backend
+            or not isinstance(self.question_store, NativeQuestionStore)
+            or self.question_store.outbound_store is not self.outbound_store
+            or self.question_store.backend is not self.task_store.backend
         ):
             raise OutboundActorScopeError(
                 "Outbound ledger has a different local actor, tenant or primary backend"
             )
         return self.outbound_store
 
+    def questions_for_actor(self, actor_id: str) -> NativeQuestionStore:
+        self.outbound_for_actor(actor_id)
+        return self.question_store
+
     async def initialize(self) -> None:
         """Initialize all stores."""
         await self.outbound_store.initialize()
+        await self.question_store.initialize()
         await self.task_store.initialize()
         await self.context_store.initialize()
         await self.session_service.initialize()
@@ -321,6 +331,7 @@ class TaskManager:
             ("session_service", self.session_service),
             ("context_store", self.context_store),
             ("task_store", self.task_store),
+            ("question_store", self.question_store),
             ("outbound_store", self.outbound_store),
         )
         for name, store in stores:
@@ -1144,9 +1155,10 @@ class TaskManager:
             )
         validate_proto_required_fields(params)
         metadata = MessageToDict(params.metadata)
-        deserialize_causation_chain(metadata)
-        parse_question_correlation(metadata)
-        parse_skill_hint(metadata)
+        try:
+            parse_message_metadata(metadata)
+        except ValueError as error:
+            raise InvalidParamsError(message=str(error)) from error
         if not isinstance(creator_agent_id, str) or not creator_agent_id.strip():
             raise ValueError("Task admission requires a verified creator identity")
         if params.tenant != self.task_store.scope.tenant:
@@ -1353,6 +1365,14 @@ class TaskManager:
 
         # Update status
         baseline = Task.FromString(task.SerializeToString())
+        if new_state in TERMINAL_STATES and message is not None:
+            reply_metadata = MessageToDict(message.metadata)
+            answer_metadata = correlated_answer_metadata(MessageToDict(task.metadata), reply_metadata)
+            if parse_question_correlation(answer_metadata) is not None and message.role != Role.ROLE_AGENT:
+                raise InvalidParamsError(message="A question answer must have the agent role")
+            if answer_metadata != reply_metadata:
+                message = Message.FromString(message.SerializeToString())
+                message.metadata.update(answer_metadata)
         task.status.CopyFrom(TaskStatus(state=new_state, message=message))
 
         # Add message to history if provided

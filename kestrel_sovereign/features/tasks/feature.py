@@ -31,13 +31,12 @@ from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
-from kestrel_sovereign.a2a.extensions import parse_skill_hint
 from kestrel_sovereign.a2a.lifecycle import (
     TERMINAL_STATES,
     task_state_from_label,
     task_state_label,
 )
-from kestrel_sovereign.a2a.projections import message_text
+from kestrel_sovereign.a2a.projections import task_presentation
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
@@ -159,22 +158,7 @@ class TaskFeature(Feature):
             return {"ok": False, "error": str(error)}
         if snapshot is None:
             return {"ok": False, "error": f"Task {task_id} not found"}
-        task = snapshot.task
-        metadata = MessageToDict(task.metadata)
-        return {
-            "ok": True,
-            "task_id": task.id,
-            "status": task_state_label(task.status.state),
-            "message": message_text(task.status.message) if task.status.HasField("message") else None,
-            "request_content": message_text(task.history[0]) if task.history else None,
-            "request": MessageToDict(task.history[0]) if task.history else None,
-            "context_id": task.context_id,
-            "skill_hint": parse_skill_hint(metadata),
-            "sender": snapshot.ownership.creator_agent_id,
-            "task_type": metadata.get("task_type"),
-            "artifacts": [MessageToDict(artifact) for artifact in task.artifacts],
-            "status_timestamp": task.status.timestamp.ToJsonString() if task.status.HasField("timestamp") else None,
-        }
+        return {"ok": True, **task_presentation(snapshot)}
 
     @tool(
         name="list_available_skills",
@@ -757,19 +741,7 @@ class TaskFeature(Feature):
             bits.append(f"reply: {preview!r}")
         return ToolResult.ok(
             confirmation=" — ".join(bits),
-            data={
-                "task_id": data["task_id"],
-                "status": data["status"],
-                "message": data["message"],
-                "request_content": data["request_content"],
-                "request": data["request"],
-                "context_id": data["context_id"],
-                "skill_hint": data["skill_hint"],
-                "sender": data["sender"],
-                "task_type": data["task_type"],
-                "artifacts": data["artifacts"],
-                "status_timestamp": data["status_timestamp"],
-            },
+            data={key: value for key, value in data.items() if key != "ok"},
         )
 
     @tool(
@@ -812,17 +784,7 @@ class TaskFeature(Feature):
             metadata = MessageToDict(task.metadata)
             if task_type and metadata.get("task_type") != task_type:
                 continue
-            task_list.append({
-                "task_id": task.id,
-                "status": task_state_label(task.status.state),
-                "task_type": metadata.get("task_type"),
-                "message": message_text(task.status.message) if task.status.HasField("message") else None,
-                "request_content": message_text(task.history[0]) if task.history else None,
-            "request": MessageToDict(task.history[0]) if task.history else None,
-            "context_id": task.context_id,
-            "skill_hint": parse_skill_hint(metadata),
-                "sender": snapshot.ownership.creator_agent_id,
-            })
+            task_list.append(task_presentation(snapshot, include_artifacts=False))
             if len(task_list) == limit_val:
                 break
         filters = (f" with status={status}" if status else "") + (f" of type={task_type}" if task_type else "")

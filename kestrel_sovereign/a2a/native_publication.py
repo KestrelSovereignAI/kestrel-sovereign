@@ -5,10 +5,10 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
+from a2a.client import A2ACardResolver
 from a2a.types import AgentCard
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
@@ -34,7 +34,11 @@ from kestrel_sovereign.a2a.native_sender import NativeProofPolicy
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import OutboundActorScopeError
-from kestrel_sovereign.execution_custody import owned_native_http_client
+from kestrel_sovereign.execution_custody import (
+    bind_native_http_execution_admission,
+    native_execution_response_owner,
+    owned_native_http_client,
+)
 from kestrel_sovereign.features.peers.directory import (
     PeerAccessDeniedError,
     PeerIdentity,
@@ -210,12 +214,13 @@ async def open_hosted_native_peer_session(
 ):
     """Route a same-host peer through the installed official SDK HTTP binding.
 
-    The explicit ASGI transport is local host policy; advertised URLs are never
-    dialled or resolved. Both directions are reauthorized for every operation.
-    No operator credential or host-attested metadata becomes a wire principal.
+    The SDK uses the published HTTP routes for discovery and every operation.
+    Sender egress is authorized here; recipient authorization runs only at the
+    receiving native handler, in its own request context. No operator credential
+    or in-process sender custody crosses that boundary.
     """
     async with manager.a2a_execution_lease():
-        _, recipient = await manager._authorize_host_attested_local_a2a_route(
+        _, recipient = manager._resolve_hosted_a2a_route_binding(
             sender=sender,
             requester=requester,
             peer=peer,
@@ -226,7 +231,6 @@ async def open_hosted_native_peer_session(
         if not isinstance(publication, HostedNativeA2APublication):
             raise PeerUnavailableError("Peer has no published native A2A interface")
         publication.registry.require_application(app)
-        card = await publication.get_card()
         sender_identity = sender.identity
         recipient_identity = recipient.identity
         sender_witness = manager.a2a_sender_identity_witness(
@@ -240,6 +244,7 @@ async def open_hosted_native_peer_session(
         sender_scope = sender_task_store.scope
         try:
             outbound = sender_manager.outbound_for_actor(requester.identity)
+            questions = sender_manager.questions_for_actor(requester.identity)
         except OutboundActorScopeError as error:
             raise PeerAccessDeniedError(str(error)) from error
         scope = recipient.task_manager.task_store.scope
@@ -247,24 +252,6 @@ async def open_hosted_native_peer_session(
             "id": recipient_identity.signing_did,
             "verificationMethod": recipient_identity.new_verification_methods,
         }
-        interfaces = [
-            item
-            for item in card.supported_interfaces
-            if item.protocol_binding == "JSONRPC"
-        ]
-        if len(interfaces) != 1:
-            raise PeerUnavailableError(
-                "Published peer has no unique native JSON-RPC interface"
-            )
-        interface = interfaces[0]
-        signer = NativeSenderInterceptor.for_identity(
-            sender_identity,
-            recipient=scope,
-            extensions=frozenset(NATIVE_EXTENSION_URIS),
-            policy=NativeProofPolicy(),
-            clock=time.time,
-            nonce=lambda: uuid4().hex,
-        )
 
     def require_current():
         if (
@@ -272,6 +259,7 @@ async def open_hosted_native_peer_session(
             or manager.a2a_hosted_policy_for(recipient) is not recipient_policy
             or sender.task_manager is not sender_manager
             or sender_manager.outbound_store is not outbound
+            or sender_manager.question_store is not questions
             or sender_manager.task_store is not sender_task_store
             or sender_task_store.scope != sender_scope
             or getattr(recipient, "_native_a2a_publication", None) is not publication
@@ -306,7 +294,7 @@ async def open_hosted_native_peer_session(
             (
                 _,
                 current_recipient,
-            ) = await manager._authorize_host_attested_local_a2a_route(
+            ) = manager._resolve_hosted_a2a_route_binding(
                 sender=sender,
                 requester=requester,
                 peer=current_peer,
@@ -320,17 +308,39 @@ async def open_hosted_native_peer_session(
     await authorize()
     async with owned_native_http_client(
         httpx.AsyncClient(
-            transport=httpx.ASGITransport(
-                app,
-                root_path=urlsplit(
-                    publication.configuration.public_base_url
-                ).path.rstrip("/"),
-            ),
             timeout=timeout,
             follow_redirects=False,
             trust_env=False,
         )
     ) as http:
+        from kestrel_sovereign.a2a.native_routes import native_card_path
+
+        with bind_native_http_execution_admission(http, authorize):
+            async with native_execution_response_owner(http):
+                card = await A2ACardResolver(
+                    http,
+                    publication.configuration.public_base_url,
+                    agent_card_path=native_card_path(peer.routing_key),
+                ).get_agent_card()
+        await authorize()
+        interfaces = [
+            item
+            for item in card.supported_interfaces
+            if item.protocol_binding == "JSONRPC"
+        ]
+        if len(interfaces) != 1:
+            raise PeerUnavailableError(
+                "Published peer has no unique native JSON-RPC interface"
+            )
+        interface = interfaces[0]
+        signer = NativeSenderInterceptor.for_identity(
+            sender_identity,
+            recipient=scope,
+            extensions=frozenset(NATIVE_EXTENSION_URIS),
+            policy=NativeProofPolicy(),
+            clock=time.time,
+            nonce=lambda: uuid4().hex,
+        )
         session = NativePeerSession(
             card=card,
             signing_did=recipient_identity.signing_did,
@@ -340,6 +350,7 @@ async def open_hosted_native_peer_session(
             signer=signer,
             http_client=http,
             outbound_store=outbound,
+            question_store=questions,
             authorize=authorize,
         )
         try:

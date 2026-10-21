@@ -1,5 +1,6 @@
 """Actual native proof, DB policy and lifecycle-lease fixtures."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from uuid import uuid4
@@ -135,8 +136,16 @@ def signed_context(
         body = {"jsonrpc": "2.0", "id": "request", "method": operation, "params": body}
     encoded = json.dumps(body).encode()
 
+    body_sent = False
+    disconnected = asyncio.Event()
+
     async def receive():
-        return {"type": "http.request", "body": encoded, "more_body": False}
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": encoded, "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
 
     request = Request(
         {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
@@ -57,3 +58,48 @@ async def native_a2a_backend_factory(request, tmp_path):
             )
     finally:
         await admin.close()
+
+
+@asynccontextmanager
+async def serve_native_app(app, *, root_path=""):
+    """Own a real loopback HTTP listener, including optional reverse-proxy mount."""
+    import asyncio
+    import socket
+
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    serving_app = Starlette(routes=[Mount(root_path, app=app)]) if root_path else app
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    host, port = listener.getsockname()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            serving_app,
+            host=host,
+            port=port,
+            lifespan="off",
+            log_config=None,
+            access_log=False,
+            timeout_graceful_shutdown=2,
+        )
+    )
+    serving = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        async with asyncio.timeout(5):
+            while not server.started:
+                if serving.done():
+                    serving.result()
+                await asyncio.sleep(0.001)
+        yield f"http://{host}:{port}" + root_path
+    finally:
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(serving, 5)
+        finally:
+            listener.close()
+            if not serving.done():
+                serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
