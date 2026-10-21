@@ -36,7 +36,7 @@ from kestrel_sovereign.a2a.lifecycle import (
     task_state_from_label,
     task_state_label,
 )
-from kestrel_sovereign.a2a.projections import task_presentation
+from kestrel_sovereign.a2a.projections import embedded_json_value, task_presentation
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
@@ -331,8 +331,9 @@ class TaskFeature(Feature):
                         for artifact in task.artifacts:
                             if artifact.parts:
                                 for part in artifact.parts:
-                                    if part.HasField('data'):
-                                        result_data = MessageToDict(part.data)
+                                    recognized, value = embedded_json_value(part)
+                                    if recognized:
+                                        result_data = value
 
                     step_duration = int((time.time() - step_start) * 1000)
 

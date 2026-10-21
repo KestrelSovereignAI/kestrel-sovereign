@@ -426,6 +426,14 @@ private operation token and an authorized canonical read. If that read is
 unavailable, execution retains the infrastructure error instead of returning
 the attempted snapshot or running the handler again.
 
+Local decorated-tool results use the SDK's standard inline raw artifact with
+`application/json`. JSON encoding rejects non-finite values before the task
+claims completion and retains integer types and large identifiers that a
+protobuf Value would round to binary64. Commands and workflows share one
+projection for native data values and inline JSON bytes; that projection never
+fetches a file URL. Primary-store and official SDK JSON round trips retain the
+same embedded bytes.
+
 Integrate the SDK request-handler and executor interfaces with the existing
 TaskManager lifecycle. Do not create a second task lifecycle or store. Both
 bindings enter the same authorization path, including get/list/cancel/subscribe

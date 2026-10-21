@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 from a2a.types import TaskState
-from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.tools.result import ToolResult
 
+from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.skill_handler import TaskHandler
@@ -193,7 +193,7 @@ async def test_rich_tool_result_completes_once_and_command_retains_failure_text(
         task = await manager.execute_skill("local", "local_datetime", {})
         assert task.status.state == TaskState.TASK_STATE_COMPLETED
         assert feature.effects == 1
-        data = MessageToDict(task.artifacts[0].parts[0].data)
+        data = embedded_json_value(task.artifacts[0].parts[0])[1]
         assert data["result"]["at"] == "2026-10-20 00:00:00+00:00"
         command = await manager.execute_command("!local-fail")
         assert command == {"success": False, "error": "The provider produced nothing"}

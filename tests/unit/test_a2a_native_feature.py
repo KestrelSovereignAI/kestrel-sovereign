@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import pytest
 from a2a.helpers.proto_helpers import new_task, new_text_artifact, new_text_message
 from a2a.types import TaskState
-from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.tools.result import ToolResult
 
+from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.features.base import Feature, tool
 
 
@@ -55,7 +55,7 @@ async def test_native_feature_preserves_history_and_existing_artifacts_and_produ
     assert result.history[0].SerializeToString() == before
     assert result.artifacts[0] == existing
     assert result.artifacts[1].artifact_id and result.status.message.message_id
-    assert MessageToDict(result.artifacts[1].parts[0].data)["result"] == {
+    assert embedded_json_value(result.artifacts[1].parts[0])[1]["result"] == {
         "nested": [None, {}, []]
     }
 
@@ -76,7 +76,7 @@ async def test_missing_unknown_or_malformed_skills_are_rejected_without_executio
 async def test_native_feature_does_not_report_a_typed_tool_error_as_completed():
     result = await feature().handle_task(task(skill="native_failure"))
     assert result.status.state == TaskState.TASK_STATE_FAILED
-    assert MessageToDict(result.artifacts[0].parts[0].data)["status"] == "error"
+    assert embedded_json_value(result.artifacts[0].parts[0])[1]["status"] == "error"
 
 
 async def test_native_feature_refuses_private_task_objects():

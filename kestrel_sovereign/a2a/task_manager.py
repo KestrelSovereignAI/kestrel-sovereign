@@ -54,6 +54,7 @@ from kestrel_sovereign.a2a.lifecycle import (
     TERMINAL_STATES,
     task_state_label,
 )
+from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.skill_handler import TaskHandler
 from kestrel_sovereign.a2a.stores import (
@@ -1078,9 +1079,10 @@ class TaskManager:
                 artifact = task.artifacts[0]
                 if artifact.parts:
                     part = artifact.parts[0]
-                    if part.HasField("data"):
-                        return MessageToDict(part.data)
-                    elif part.HasField("text"):
+                    recognized, value = embedded_json_value(part)
+                    if recognized:
+                        return value
+                    if part.HasField("text"):
                         return {"success": True, "result": part.text}
 
             if task.status.state in {
@@ -1221,7 +1223,7 @@ class TaskManager:
         admitted_snapshot = None
         async with transaction:
             try:
-                ownership = await self.context_store.reserve(
+                await self.context_store.reserve(
                     task.context_id,
                     self.task_store.scope,
                     creator_agent_id=creator_agent_id,

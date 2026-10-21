@@ -1,6 +1,34 @@
 """Read-only presentation of official native protocol values."""
 
-from a2a.types import Message
+import json
+from typing import Any
+
+from a2a.types import Message, Part
+from google.protobuf.json_format import MessageToDict
+
+from kestrel_sovereign.a2a.media import part_media_type
+
+
+def _reject_nonfinite_json(value: str):
+    raise ValueError(f"Embedded JSON contains the nonstandard constant {value}")
+
+
+def embedded_json_value(part: Part) -> tuple[bool, Any]:
+    """Read native data or inline JSON bytes without fetching a file URL.
+
+    JSON bytes retain integer values that protobuf Value represents only as
+    binary64. The boolean distinguishes an explicit JSON null from a part
+    whose content is not embedded JSON.
+    """
+    if not isinstance(part, Part):
+        raise TypeError("Embedded JSON projection requires an official A2A Part")
+    if part.HasField("data"):
+        return True, MessageToDict(part.data)
+    if part.HasField("raw") and part_media_type(part) == ("application", "json"):
+        return True, json.loads(
+            part.raw.decode("utf-8"), parse_constant=_reject_nonfinite_json
+        )
+    return False, None
 
 
 def message_text(message: Message) -> str | None:
@@ -14,6 +42,7 @@ def message_text(message: Message) -> str | None:
 def task_presentation(candidate, *, include_artifacts: bool = True) -> dict:
     """Present native task content and durable ownership through one contract."""
     from google.protobuf.json_format import MessageToDict
+
     from kestrel_sovereign.a2a.extensions import parse_skill_hint
     from kestrel_sovereign.a2a.lifecycle import task_state_label
     from kestrel_sovereign.a2a.stores.unified.task_store import NativeTaskSnapshot

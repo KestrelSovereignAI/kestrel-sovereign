@@ -28,7 +28,7 @@ from abc import abstractmethod
 
 # Import public native protocol values directly. The host's a2a package still
 # owns lifecycle services; importing it here would re-enter early feature boot.
-from a2a.helpers.proto_helpers import new_data_artifact, new_text_message
+from a2a.helpers.proto_helpers import new_raw_artifact, new_text_message
 from a2a.types import Task, TaskState, TaskStatus
 from google.protobuf.json_format import MessageToDict
 
@@ -1327,10 +1327,13 @@ class Feature(_SdkFeature):
         try:
             result = await selected.execute(**args)
             result = _serialize_tool_result(result)
-            artifact = new_data_artifact(f"{skill_name}_result", result)
-            # Struct can hold values (notably NaN/Infinity) which its JSON
-            # encoder cannot publish. Validate before claiming tool completion.
-            MessageToDict(artifact)
+            # Inline standard JSON preserves integer types and identifiers
+            # beyond binary64 precision. Encoding must succeed before the
+            # task may claim completion after its tool effect.
+            payload = json.dumps(result, allow_nan=False, ensure_ascii=False).encode("utf-8")
+            artifact = new_raw_artifact(
+                f"{skill_name}_result", payload, media_type="application/json"
+            )
         except Exception as error:
             if is_execution_control_error(error):
                 raise
