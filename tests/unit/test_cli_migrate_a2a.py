@@ -161,3 +161,38 @@ async def test_postgres_apply_refuses_other_live_database_connections(
         assert not await backend.table_exists("a2a_protocol_schema")
     finally:
         await backend.close()
+
+
+@pytest.mark.parametrize("action", ["preview", "apply"])
+@pytest.mark.parametrize("serving_path", ["alias", "target"])
+async def test_symlink_database_cannot_hide_a_serving_host(
+    draft, tmp_path, action, serving_path
+):
+    import hashlib
+
+    database, owners, plan = draft
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    alias = profile / "agent.db"
+    alias.symlink_to(database)
+    if action == "apply":
+        await preview((alias, owners, plan))
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    record = ServingRecord.acquire(
+        profile if serving_path == "alias" else database.parent
+    )
+    try:
+        arguments = [action, "--sqlite", alias]
+        arguments.extend(
+            ["--owners", owners, "--output", plan]
+            if action == "preview"
+            else ["--plan", plan]
+        )
+        result = await cli(*arguments)
+        assert (
+            result.returncode == 1
+            and "Stop the selected database's host" in result.stderr
+        )
+        assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+    finally:
+        record.release()

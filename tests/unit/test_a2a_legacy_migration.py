@@ -223,3 +223,15 @@ def test_reviewed_tenant_cannot_override_existing_durable_tenant(archived):
     archived["tenant"] = "original-tenant"
     with pytest.raises(LegacyTaskMigrationError, match="durable tenant"):
         convert_legacy_task(archived, ownership=owner())
+
+
+def test_historical_cancellation_does_not_invent_a_question_answer(archived):
+    archived["status"] = "canceled"
+    archived["message"] = {
+        "role": "agent",
+        "parts": [{"type": "text", "text": "Task canceled by did:actual:sender"}],
+    }
+    task = convert_legacy_task(archived, ownership=owner())
+    assert MessageToDict(task.metadata)[QUESTION_CORRELATION_URI]["kind"] == "question"
+    assert QUESTION_CORRELATION_URI not in MessageToDict(task.status.message.metadata)
+    assert task.status.message.parts[0].text == "Task canceled by did:actual:sender"

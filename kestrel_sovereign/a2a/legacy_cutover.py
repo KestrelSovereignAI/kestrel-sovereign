@@ -29,6 +29,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore, _task_pay
 
 _TABLES = ("a2a_tasks", "a2a_outbound_tasks", "pending_a2a_questions")
 _TERMINAL = frozenset({"completed", "failed", "canceled", "rejected"})
+_QUESTION_ROUTE_FIELDS = ("agent_id", "task_id", "recipient_agent_id")
 # Only Core's known task fences are suspended, inside the exclusive transaction.
 _TASK_TRIGGERS = frozenset(
     {
@@ -212,11 +213,7 @@ async def prepare_legacy_migration(
         raise LegacyTaskMigrationError(
             "Reviewed provenance must cover exactly every legacy task"
         )
-    for row in records.get("a2a_outbound_tasks", []):
-        if row.get("terminal_state") not in _TERMINAL | {"dispatch_failed"}:
-            raise LegacyTaskMigrationError(
-                "Unsettled draft outbound work must drain before cutover"
-            )
+    confirmed_expired_questions = set()
     for row in records.get("pending_a2a_questions", []):
         if (
             row.get("status") not in {"RESOLVED", "EXPIRED"}
@@ -231,6 +228,24 @@ async def prepare_legacy_migration(
             raise LegacyTaskMigrationError(
                 "Unsettled draft questions or owed deliveries must drain before cutover"
             )
+        route = tuple(row.get(field) for field in _QUESTION_ROUTE_FIELDS)
+        if row.get("status") == "EXPIRED" and all(
+            isinstance(value, str) and value for value in route
+        ):
+            confirmed_expired_questions.add(route)
+    for row in records.get("a2a_outbound_tasks", []):
+        if row.get("terminal_state") in _TERMINAL | {"dispatch_failed"}:
+            continue
+        route = tuple(row.get(field) for field in _QUESTION_ROUTE_FIELDS)
+        if (
+            row.get("terminal_state") == "expired"
+            and row.get("verb") == "question"
+            and route in confirmed_expired_questions
+        ):
+            continue
+        raise LegacyTaskMigrationError(
+            "Unsettled draft outbound work must drain before cutover"
+        )
     converted = []
     for row in sorted(tasks, key=lambda row: row["id"]):
         decoded = dict(row)
@@ -248,6 +263,15 @@ async def prepare_legacy_migration(
                 task.id, ownership[task.id], task.SerializeToString(deterministic=True)
             )
         )
+    context_creators = {}
+    for item in converted:
+        owner = item.ownership
+        key = (owner.recipient_agent_id, owner.tenant, owner.context_id)
+        creator = context_creators.setdefault(key, owner.creator_agent_id)
+        if creator != owner.creator_agent_id:
+            raise LegacyTaskMigrationError(
+                "Reviewed tasks disagree on the creator owning one native context"
+            )
     for table in tables:
         if table.name == "a2a_tasks" and any(
             kind == "trigger" and name not in _TASK_TRIGGERS

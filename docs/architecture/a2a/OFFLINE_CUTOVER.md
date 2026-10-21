@@ -16,6 +16,12 @@ protocol. Resolve owed question wakes and confirm recipient settlement for
 expired questions. An unknown send or an unconfirmed expiry is not evidence
 that remote work stopped; the migration refuses those states.
 
+An old outbound `expired` stamp is accepted only for a question whose durable
+sender, task ID, and recipient exactly match an EXPIRED question with confirmed
+receiver settlement and no owed delivery. Missing identities or a different
+question do not establish that proof. A historical cancellation notice remains
+a cancellation; conversion never labels it as a question answer.
+
 Stop every process that can write the selected primary database, including
 co-hosted agents and hosts on other machines. Create and verify a complete
 backend backup. Keep the old release and backup available until the native
@@ -59,6 +65,8 @@ table counts, reviewed ownership, migration ID, and hashes of the exact native
 conversions. It contains no message text or database credentials. Review this
 artifact alongside the provenance evidence and backup. Preview does not create
 native tables, alter task state, or settle questions.
+ Preview also refuses
+multiple creators assigned to one reviewed recipient/tenant/context identity.
 
 ## Apply the reviewed plan
 
@@ -69,7 +77,9 @@ kestrel migrate-a2a apply --sqlite /path/to/agent.db --plan plan.json
 Use `--postgres-dsn-env KESTREL_DATABASE_URL` instead of `--sqlite` for
 PostgreSQL. Apply refuses known local serving records; PostgreSQL apply also
 requires all other client connections to the selected database to be closed.
-Database locks are not a substitute for stopping writers that could reconnect.
+For a symlinked SQLite database, the serving guard checks both the selected
+profile directory and the file's canonical target directory. Database locks
+are not a substitute for stopping writers that could reconnect.
 
 Apply rechecks source data and schema under the database write lease. It
 archives the original task, outbound, and question rows, retains the original

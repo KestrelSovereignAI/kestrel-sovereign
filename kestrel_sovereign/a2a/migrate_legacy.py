@@ -12,7 +12,7 @@ import json
 from collections.abc import Mapping
 from uuid import NAMESPACE_URL, uuid5
 
-from a2a.types import Artifact, Message, Part, Role, Task, TaskStatus
+from a2a.types import Artifact, Message, Part, Role, Task, TaskState, TaskStatus
 from a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.struct_pb2 import Struct
@@ -330,7 +330,10 @@ def convert_legacy_task(row: Mapping, *, ownership: ContextOwnership) -> Task:
                 else {},
             )
         )
-    if QUESTION_CORRELATION_URI in MessageToDict(result.metadata):
+    if (
+        state != TaskState.TASK_STATE_CANCELED
+        and QUESTION_CORRELATION_URI in MessageToDict(result.metadata)
+    ):
         if (
             not result.status.HasField("message")
             or result.status.message.role != Role.ROLE_AGENT

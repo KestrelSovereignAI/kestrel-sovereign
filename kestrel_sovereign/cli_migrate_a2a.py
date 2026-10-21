@@ -123,14 +123,18 @@ def _plan_ownership(review):
 
 async def _run(args):
     if args.sqlite is not None:
-        path = args.sqlite.resolve(strict=True)
+        selected = args.sqlite.expanduser()
+        path = selected.resolve(strict=True)
         if not path.is_file():
             raise ValueError("The selected SQLite database must be an existing file")
-        holder = serving_holder(path.parent)
-        if holder is not None:
-            raise ValueError(
-                f"Stop the selected database's host before offline migration: {holder.evidence}; {holder.remedy}"
-            )
+        # Agents register the profile directory, even when its database file
+        # is a symlink. Check both that spelling and the canonical target.
+        for directory in {selected.parent.resolve(), path.parent}:
+            holder = serving_holder(directory)
+            if holder is not None:
+                raise ValueError(
+                    f"Stop the selected database's host before offline migration: {holder.evidence}; {holder.remedy}"
+                )
         from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
         backend = SQLiteBackend(str(path), cold_read=args.migration_action == "preview")

@@ -134,9 +134,7 @@ async def test_offline_cutover_preserves_archives_ownership_and_history_without_
         )
         try:
             await manager.initialize()
-            restored = await manager.get_task_for_recipient(
-                "historical", manager.did
-            )
+            restored = await manager.get_task_for_recipient("historical", manager.did)
             assert (
                 restored.id == "historical"
                 and restored.context_id == "reviewed-native-context"
@@ -336,5 +334,101 @@ async def test_archive_truncation_aborts_before_conversion_and_rolls_back(
             )
         ).review() == plan.review()
         assert not await backend.table_exists("a2a_protocol_schema")
+    finally:
+        await backend.close()
+
+
+@pytest.mark.parametrize("different_creator", [True, False])
+async def test_preview_checks_all_tasks_sharing_a_reviewed_context(
+    native_a2a_backend_factory, different_creator
+):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    try:
+        await legacy(backend)
+        creator = "did:other" if different_creator else "did:creator"
+        await backend.execute(
+            "INSERT INTO a2a_tasks SELECT 'second', session_id, task_type, status, message, artifacts, history, metadata, created_at, updated_at, ?, recipient_agent_id FROM a2a_tasks WHERE id = 'historical'",
+            (creator,),
+        )
+        owners = ownership()
+        owners["second"] = replace(owners["historical"], creator_agent_id=creator)
+        if different_creator:
+            with pytest.raises(LegacyTaskMigrationError, match="context"):
+                await prepare_legacy_migration(backend, ownership=owners)
+            assert not await backend.table_exists("a2a_protocol_schema")
+        else:
+            plan = await prepare_legacy_migration(backend, ownership=owners)
+            await apply_legacy_migration(backend, plan)
+            assert await backend.fetch_one("SELECT COUNT(*) FROM a2a_contexts") == (1,)
+    finally:
+        await backend.close()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "agent",
+        "recipient",
+        "task",
+        "missing-question",
+        "unconfirmed",
+        "empty-agent",
+        "missing-recipient",
+    ],
+)
+async def test_expired_outbound_requires_its_exact_confirmed_question(
+    native_a2a_backend_factory, fault
+):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    try:
+        await legacy(backend)
+        for table, field in [
+            ("a2a_outbound_tasks", "agent_id"),
+            ("a2a_outbound_tasks", "task_id"),
+            ("a2a_outbound_tasks", "verb"),
+            ("a2a_outbound_tasks", "recipient_agent_id"),
+            ("pending_a2a_questions", "agent_id"),
+            ("pending_a2a_questions", "recipient_agent_id"),
+        ]:
+            await backend.execute(f"ALTER TABLE {table} ADD COLUMN {field} TEXT")
+        await backend.execute(
+            "UPDATE a2a_outbound_tasks SET terminal_state='expired', agent_id='did:sender', task_id='old-question', verb='question', recipient_agent_id='did:peer'"
+        )
+        await backend.execute(
+            "UPDATE pending_a2a_questions SET agent_id='did:sender', recipient_agent_id='did:peer'"
+        )
+        if fault == "missing-question":
+            await backend.execute("DELETE FROM pending_a2a_questions")
+        elif fault == "unconfirmed":
+            await backend.execute(
+                "UPDATE pending_a2a_questions SET receiver_settlement=NULL"
+            )
+        elif fault in {"empty-agent", "missing-recipient"}:
+            column = "agent_id" if fault == "empty-agent" else "recipient_agent_id"
+            value = "" if fault == "empty-agent" else None
+            for table in ("a2a_outbound_tasks", "pending_a2a_questions"):
+                await backend.execute(f"UPDATE {table} SET {column} = ?", (value,))
+        elif fault is not None:
+            column = {
+                "agent": "agent_id",
+                "recipient": "recipient_agent_id",
+                "task": "task_id",
+            }[fault]
+            await backend.execute(
+                f"UPDATE pending_a2a_questions SET {column} = ?", ("different",)
+            )
+        if fault is None:
+            plan = await prepare_legacy_migration(backend, ownership=ownership())
+            await apply_legacy_migration(backend, plan)
+            assert await backend.fetch_one(
+                "SELECT COUNT(*) FROM a2a_outbound_tasks"
+            ) == (0,)
+        else:
+            with pytest.raises(LegacyTaskMigrationError, match="Unsettled draft"):
+                await prepare_legacy_migration(backend, ownership=ownership())
+            assert not await backend.table_exists("a2a_protocol_schema")
     finally:
         await backend.close()
