@@ -1669,13 +1669,11 @@ class TestApprovalQueueScopePersistence:
         """A direct ``request_approval`` call (the path used by code_edit,
         compute, keys, reflection.*) with scope='session' must produce a
         SESSION-level permission so the next call doesn't re-prompt."""
-        async def approve_session():
-            await asyncio.sleep(0.05)
-            pending = queue_with_store.pending_requests
-            assert len(pending) == 1
-            await queue_with_store.submit_decision(pending[0].id, True, "session")
+        async def approve_session(request):
+            assert queue_with_store.pending_requests == [request]
+            await queue_with_store.submit_decision(request.id, True, "session")
 
-        asyncio.create_task(approve_session())
+        queue_with_store.set_callback(approve_session)
         approved, scope = await queue_with_store.request_approval(
             feature_name="code_edit",
             tool_name="code_edit",
@@ -1691,12 +1689,10 @@ class TestApprovalQueueScopePersistence:
 
     @pytest.mark.asyncio
     async def test_always_scope_persists_via_direct_caller(self, queue_with_store, store):
-        async def approve_always():
-            await asyncio.sleep(0.05)
-            pending = queue_with_store.pending_requests
-            await queue_with_store.submit_decision(pending[0].id, True, "always")
+        async def approve_always(request):
+            await queue_with_store.submit_decision(request.id, True, "always")
 
-        asyncio.create_task(approve_always())
+        queue_with_store.set_callback(approve_always)
         approved, scope = await queue_with_store.request_approval(
             feature_name="compute",
             tool_name="execute_script",
@@ -1722,12 +1718,10 @@ class TestApprovalQueueScopePersistence:
     async def test_once_scope_does_not_persist(self, queue_with_store, store):
         """``scope='once'`` should grant the current call but NOT persist —
         the user explicitly asked for one-time approval."""
-        async def approve_once():
-            await asyncio.sleep(0.05)
-            pending = queue_with_store.pending_requests
-            await queue_with_store.submit_decision(pending[0].id, True, "once")
+        async def approve_once(request):
+            await queue_with_store.submit_decision(request.id, True, "once")
 
-        asyncio.create_task(approve_once())
+        queue_with_store.set_callback(approve_once)
         approved, _ = await queue_with_store.request_approval(
             feature_name="keys",
             tool_name="set_key",
@@ -1744,12 +1738,10 @@ class TestApprovalQueueScopePersistence:
         """Audit log MUST capture every popup decision regardless of scope
         or which caller fired the request — the empty audit log on real
         agents was the most visible symptom of #785."""
-        async def approve_session():
-            await asyncio.sleep(0.05)
-            pending = queue_with_store.pending_requests
-            await queue_with_store.submit_decision(pending[0].id, True, "session")
+        async def approve_session(request):
+            await queue_with_store.submit_decision(request.id, True, "session")
 
-        asyncio.create_task(approve_session())
+        queue_with_store.set_callback(approve_session)
         await queue_with_store.request_approval(
             feature_name="reflection",
             tool_name="self_model",
