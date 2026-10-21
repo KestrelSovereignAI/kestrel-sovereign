@@ -1,0 +1,108 @@
+{
+  "AutoRemove": false,
+  "Binds": null,
+  "BlkioDeviceReadBps": [],
+  "BlkioDeviceReadIOps": [],
+  "BlkioDeviceWriteBps": [],
+  "BlkioDeviceWriteIOps": [],
+  "BlkioWeight": 0,
+  "BlkioWeightDevice": [],
+  "CapAdd": null,
+  "CapDrop": [
+    "ALL"
+  ],
+  "Cgroup": "",
+  "CgroupParent": "",
+  "CgroupnsMode": "private",
+  "ConsoleSize": [
+    0,
+    0
+  ],
+  "ContainerIDFile": "",
+  "CpuCount": 0,
+  "CpuPercent": 0,
+  "CpuPeriod": 0,
+  "CpuQuota": 0,
+  "CpuRealtimePeriod": 0,
+  "CpuRealtimeRuntime": 0,
+  "CpuShares": 0,
+  "CpusetCpus": "",
+  "CpusetMems": "",
+  "DeviceCgroupRules": null,
+  "DeviceRequests": null,
+  "Devices": [],
+  "Dns": null,
+  "DnsOptions": [],
+  "DnsSearch": [],
+  "ExtraHosts": null,
+  "GroupAdd": null,
+  "IOMaximumBandwidth": 0,
+  "IOMaximumIOps": 0,
+  "Init": true,
+  "IpcMode": "private",
+  "Isolation": "",
+  "Links": null,
+  "LogConfig": {
+    "Config": {},
+    "Type": "none"
+  },
+  "MaskedPaths": [
+    "/proc/acpi",
+    "/proc/asound",
+    "/proc/interrupts",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/sys/devices/virtual/powercap",
+    "/sys/firmware"
+  ],
+  "Memory": 1073741824,
+  "MemoryReservation": 0,
+  "MemorySwap": 1073741824,
+  "MemorySwappiness": null,
+  "NanoCpus": 2000000000,
+  "NetworkMode": "none",
+  "OomKillDisable": false,
+  "OomScoreAdj": 0,
+  "PidMode": "",
+  "PidsLimit": 256,
+  "PortBindings": {},
+  "Privileged": false,
+  "PublishAllPorts": false,
+  "ReadonlyPaths": [
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger"
+  ],
+  "ReadonlyRootfs": true,
+  "RestartPolicy": {
+    "MaximumRetryCount": 0,
+    "Name": "no"
+  },
+  "Runtime": "runc",
+  "SecurityOpt": [
+    "no-new-privileges",
+    "seccomp=reviewed-policy"
+  ],
+  "ShmSize": 268435456,
+  "Tmpfs": {
+    "/tmp": "rw,nosuid,nodev,size=256m,mode=1777"
+  },
+  "UTSMode": "",
+  "Ulimits": [
+    {
+      "Hard": 0,
+      "Name": "rtprio",
+      "Soft": 0
+    }
+  ],
+  "UsernsMode": "",
+  "VolumeDriver": "",
+  "VolumesFrom": null
+}

@@ -1,0 +1,45 @@
+{
+  "producer": "kestrel-sovereign-sdk 0.41 contracts",
+  "request": {
+    "schema_version": 1,
+    "idempotency_key": "publication-fixture",
+    "artifact_id": "artifact-fixture",
+    "expected_revision_id": "revision-fixture",
+    "title": "Notes – café 🐦",
+    "manifest": {
+      "schema_version": 1,
+      "files": [
+        {
+          "schema_version": 1,
+          "path": "𐀀.md",
+          "sha256": "f293a2fb312487f6809fc5a0c393b75792204b6c42b4b68d08093fd4403c0a96",
+          "size_bytes": 17,
+          "media_type": "text/markdown"
+        },
+        {
+          "schema_version": 1,
+          "path": "café.md",
+          "sha256": "f293a2fb312487f6809fc5a0c393b75792204b6c42b4b68d08093fd4403c0a96",
+          "size_bytes": 17,
+          "media_type": "text/markdown"
+        },
+        {
+          "schema_version": 1,
+          "path": "Ａ.md",
+          "sha256": "f293a2fb312487f6809fc5a0c393b75792204b6c42b4b68d08093fd4403c0a96",
+          "size_bytes": 17,
+          "media_type": "text/markdown"
+        }
+      ],
+      "entrypoint": "café.md"
+    },
+    "provenance": {
+      "schema_version": 1,
+      "session_id": null,
+      "run_id": null,
+      "tool_name": null
+    }
+  },
+  "manifest_sha256": "b2f1a8a98f5f3972cda769e357121df0b3d587f0e417a9c471fcd4522823fbfc",
+  "request_sha256": "6b7a886a096b7f68822fe514b195bbf74234829c535dc4f5ca1502fb3372e8f7"
+}
