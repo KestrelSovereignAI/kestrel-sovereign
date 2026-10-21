@@ -2093,15 +2093,20 @@ class PostgresBackend(DatabaseBackend):
                     raise await self._close_failed_advisory_session(conn, original)
     
     async def table_exists(self, table_name: str) -> bool:
-        """Check whether an unqualified relation resolves on this connection.
+        """Check a literal unqualified relation name in the active search path.
 
-        ``to_regclass`` follows PostgreSQL's active ``search_path``.  That
-        preserves the normal production ``public`` behavior while allowing a
-        transaction-local schema to be inspected on the connection that owns
-        it, rather than accidentally observing an unrelated public table.
+        Read the MVCC catalog directly so a fresh statement sees DDL another
+        initializer committed while this transaction waited for its lease.
+        A previously negative ``to_regclass`` name lookup can remain stale.
+        The name is a bound value, as on SQLite; it is not SQL identifier text.
         """
         return bool(await self.fetch_val(
-            "SELECT to_regclass(?) IS NOT NULL",
+            "SELECT EXISTS ("
+            "SELECT 1 FROM pg_catalog.pg_class relation "
+            "JOIN pg_catalog.pg_namespace namespace "
+            "ON namespace.oid = relation.relnamespace "
+            "WHERE relation.relname = ? "
+            "AND namespace.nspname = ANY(current_schemas(true)))",
             (table_name,),
         ))
 

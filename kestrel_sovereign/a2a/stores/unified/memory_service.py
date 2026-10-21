@@ -94,7 +94,9 @@ class MemoryService(UnifiedStoreBase):
 
         logger.info(f"MemoryService initialized ({self._backend.backend_type})")
 
-    async def _initialize_postgres(self, ts_type: str, ts_default: str, json_type: str) -> None:
+    async def _initialize_postgres(
+        self, ts_type: str, ts_default: str, json_type: str
+    ) -> None:
         """Initialize PostgreSQL-specific schema with tsvector."""
         # Enable pg_trgm extension for fuzzy search
         await self._backend.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
@@ -139,8 +141,13 @@ class MemoryService(UnifiedStoreBase):
         # Check if trigger exists before creating
         trigger_exists = await self._backend.fetch_val("""
             SELECT EXISTS (
-                SELECT 1 FROM pg_trigger
-                WHERE tgname = 'a2a_memory_tsv_update'
+                SELECT 1 FROM pg_trigger trigger
+                JOIN pg_class relation ON relation.oid = trigger.tgrelid
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                WHERE trigger.tgname = 'a2a_memory_tsv_update'
+                  AND NOT trigger.tgisinternal
+                  AND relation.relname = 'a2a_memory'
+                  AND namespace.nspname = current_schema()
             )
         """)
 
@@ -151,7 +158,9 @@ class MemoryService(UnifiedStoreBase):
                 FOR EACH ROW EXECUTE FUNCTION a2a_memory_tsv_trigger()
             """)
 
-    async def _initialize_sqlite(self, ts_type: str, ts_default: str, json_type: str) -> None:
+    async def _initialize_sqlite(
+        self, ts_type: str, ts_default: str, json_type: str
+    ) -> None:
         """Initialize SQLite-specific schema with FTS5."""
         # Main memory table
         await self._backend.execute_script(f"""
@@ -171,39 +180,36 @@ class MemoryService(UnifiedStoreBase):
 
         # FTS5 virtual table for full-text search
         # Note: SQLite requires separate executescript for virtual table
-        try:
-            await self._backend.execute_script("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS a2a_memory_fts
-                USING fts5(
-                    content,
-                    content='a2a_memory',
-                    content_rowid='rowid'
-                )
-            """)
+        await self._backend.execute_script("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS a2a_memory_fts
+            USING fts5(
+                content,
+                content='a2a_memory',
+                content_rowid='rowid'
+            )
+        """)
 
-            # Triggers to keep FTS in sync
-            await self._backend.execute_script("""
-                CREATE TRIGGER IF NOT EXISTS a2a_memory_ai AFTER INSERT ON a2a_memory BEGIN
-                    INSERT INTO a2a_memory_fts(rowid, content)
-                    VALUES (new.rowid, new.content);
-                END
-            """)
-            await self._backend.execute_script("""
-                CREATE TRIGGER IF NOT EXISTS a2a_memory_ad AFTER DELETE ON a2a_memory BEGIN
-                    INSERT INTO a2a_memory_fts(a2a_memory_fts, rowid, content)
-                    VALUES('delete', old.rowid, old.content);
-                END
-            """)
-            await self._backend.execute_script("""
-                CREATE TRIGGER IF NOT EXISTS a2a_memory_au AFTER UPDATE ON a2a_memory BEGIN
-                    INSERT INTO a2a_memory_fts(a2a_memory_fts, rowid, content)
-                    VALUES('delete', old.rowid, old.content);
-                    INSERT INTO a2a_memory_fts(rowid, content)
-                    VALUES (new.rowid, new.content);
-                END
-            """)
-        except Exception as e:
-            logger.warning(f"FTS5 setup failed (may already exist): {e}")
+        # Triggers to keep FTS in sync
+        await self._backend.execute_script("""
+            CREATE TRIGGER IF NOT EXISTS a2a_memory_ai AFTER INSERT ON a2a_memory BEGIN
+                INSERT INTO a2a_memory_fts(rowid, content)
+                VALUES (new.rowid, new.content);
+            END
+        """)
+        await self._backend.execute_script("""
+            CREATE TRIGGER IF NOT EXISTS a2a_memory_ad AFTER DELETE ON a2a_memory BEGIN
+                INSERT INTO a2a_memory_fts(a2a_memory_fts, rowid, content)
+                VALUES('delete', old.rowid, old.content);
+            END
+        """)
+        await self._backend.execute_script("""
+            CREATE TRIGGER IF NOT EXISTS a2a_memory_au AFTER UPDATE ON a2a_memory BEGIN
+                INSERT INTO a2a_memory_fts(a2a_memory_fts, rowid, content)
+                VALUES('delete', old.rowid, old.content);
+                INSERT INTO a2a_memory_fts(rowid, content)
+                VALUES (new.rowid, new.content);
+            END
+        """)
 
     async def add_memory(
         self,
@@ -352,7 +358,7 @@ class MemoryService(UnifiedStoreBase):
                 SELECT m.id, m.session_id, m.content, m.tags, m.metadata, m.created_at
                 FROM a2a_memory m
                 JOIN a2a_memory_fts fts ON m.rowid = fts.rowid
-                WHERE {' AND '.join(conditions)}
+                WHERE {" AND ".join(conditions)}
                 ORDER BY rank
                 LIMIT ?
                 """,

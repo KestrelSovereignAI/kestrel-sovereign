@@ -277,19 +277,38 @@ class TaskManager:
 
     async def initialize(self) -> None:
         """Initialize all stores after the read-only stored-protocol gate."""
-        from kestrel_sovereign.a2a.native_schema import native_schema_initialization
+        from kestrel_sovereign.a2a.native_schema import (
+            NativeStoreSchema,
+            native_schema_initialization,
+            native_store_schema_ready,
+            publish_native_store_schema,
+        )
 
-        async with native_schema_initialization(self.task_store.backend):
-            await self.outbound_store.initialize()
-            await self.question_store.initialize()
-            await self.task_store.initialize()
-            await self.context_store.initialize()
-            await self.session_service.initialize()
-            await self.observability_store.initialize()
-            if self.memory_service:
-                await self.memory_service.initialize()
-            if self.feedback_store:
-                await self.feedback_store.initialize()
+        components = [
+            (
+                NativeStoreSchema.CORE,
+                (
+                    self.outbound_store,
+                    self.question_store,
+                    self.task_store,
+                    self.context_store,
+                    self.session_service,
+                    self.observability_store,
+                ),
+            ),
+        ]
+        if self.memory_service is not None:
+            components.append((NativeStoreSchema.MEMORY, (self.memory_service,)))
+        if self.feedback_store is not None:
+            components.append((NativeStoreSchema.FEEDBACK, (self.feedback_store,)))
+        backend = self.task_store.backend
+        async with native_schema_initialization(backend):
+            for component, stores in components:
+                if await native_store_schema_ready(backend, component):
+                    continue
+                for store in stores:
+                    await store.initialize()
+                await publish_native_store_schema(backend, component)
         logger.info("TaskManager initialized with all stores")
 
     async def close(self) -> None:

@@ -536,6 +536,15 @@ asynchronous skills permit completion cognition only. Restart reconciliation,
 signal builders, privacy rehydration and execution guards honor the same policy,
 and local skill tasks reject subsequent incoming messages. Recovery does not
 replay a physical local tool invocation after process loss.
+
+The native payload-encoding revision does not prove the whole store bundle is
+installed. TaskManager records core, archive and feedback schema completion
+separately, after their canonical initializers succeed in the same shared
+transaction. A repeated boot checks those durable revisions under the schema
+lease and skips completed DDL; adding an optional store initializes that unit.
+Unknown or incomplete revisions refuse startup. Schema failures roll back the
+bundle and its completion records; startup does not hide missing migrations.
+
 Peer context IDs map to a host-chat projection that includes recipient and
 tenant; a peer cannot select an existing human chat session by naming it.
 
