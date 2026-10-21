@@ -75,7 +75,6 @@ from kestrel_sovereign._async_ownership import (
     gather_owned,
     owned_task_error,
     owned_task_observation_control,
-    raise_owned_outcome,
 )
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 from kestrel_sovereign.native_retirement import NativeExecutionObserver, bind_native_execution_observer
@@ -2001,25 +2000,15 @@ class _HostIngressAdmission:
     withdrawal_stops_work: bool = False
     withdrawal_task: asyncio.Task | None = field(default=None, repr=False)
     withdrawal_cancel_count: int = 0
+    dispatch_deadline: float | None = None
+    dispatch_expiry: Callable[[], _HostIngressOutcome] | None = field(default=None, repr=False)
+    dispatch_expired: bool = False
     provider_rpc_started: bool = False
     physical_client_retired: asyncio.Future | None = field(default=None, repr=False)
     scheduled_tool: bool = False
 
     def require_work(self, agent):
         """Only THIS known Core validation seam can authenticate a denial."""
-        if self.withdrawal_stops_work and (
-            self.cancellation is not None or (
-                self.withdrawal_task is not None
-                and self.withdrawal_task.cancelling() > self.withdrawal_cancel_count
-            )
-        ):
-            raise asyncio.CancelledError()
-        if self.withdrawal_stops_work and (
-            self.native_error is not None
-            or self.proxy._terminal_lifecycle_latched
-            or self.proxy._terminal_lifecycle_generation != self.generation
-        ):
-            raise ExecutionAuthorityError("original hosted dispatch admission retired")
         try:
             require_execution_work(agent)
         except BaseException as error:
@@ -2036,6 +2025,26 @@ class _HostIngressAdmission:
                 self.core_outcome = _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome=commit)
                 self.core_denied_scopes = tuple(scope for scope in self.scopes if scope._denial is not None)
             raise
+        # Irreversible native custody is authenticated BEFORE ordinary caller
+        # withdrawal can short-circuit it; cancellation never erases denial.
+        if self.withdrawal_stops_work and (
+            self.cancellation is not None or (
+                self.withdrawal_task is not None
+                and self.withdrawal_task.cancelling() > self.withdrawal_cancel_count
+            )
+        ):
+            raise asyncio.CancelledError()
+        if (self.dispatch_deadline is not None
+            and asyncio.get_running_loop().time() >= self.dispatch_deadline):
+            if self.dispatch_expiry is not None:
+                self.dispatch_expiry()
+            raise ExecutionAuthorityError("original hosted dispatch deadline expired")
+        if self.withdrawal_stops_work and (
+            self.native_error is not None
+            or self.proxy._terminal_lifecycle_latched
+            or self.proxy._terminal_lifecycle_generation != self.generation
+        ):
+            raise ExecutionAuthorityError("original hosted dispatch admission retired")
 
 
 def _detached_host_ingress_control(*, cleanup=False):

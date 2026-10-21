@@ -78,6 +78,7 @@ def start_dispatch(proxy: Any, name: Any, arguments: Any):
         withdrawal_stops_work=True,
         withdrawal_task=caller,
         withdrawal_cancel_count=caller.cancelling() if caller is not None else 0,
+        dispatch_deadline=asyncio.get_running_loop().time() + proxy._hosted_telegram_outbound_timeout,
         # Capture trusted provenance BEFORE allocation/publication can refuse
         # the original worker. No refusal may become scheduler success data.
         scheduled_tool=capture_scheduler_execution_scope() is not None,
@@ -126,6 +127,9 @@ async def wait_dispatch(owner):
         return outcome, None
 
     def expire():
+        if admission.dispatch_expired:
+            return proxy._host_ingress_public_control or admission.core_outcome
+        admission.dispatch_expired = True
         error = (
             ExecutionCommitOutcomeError("unknown") if admission.provider_rpc_started
             else ExecutionAuthorityError("hosted Telegram dispatch deadline expired")
@@ -159,8 +163,9 @@ async def wait_dispatch(owner):
                 admission.opening = opening
         return outcome
 
+    admission.dispatch_expiry = expire
     outcome, cancellation = await runtime._wait_for_host_ingress_operation(
-        task, slot, admission, deadline_seconds=proxy._hosted_telegram_outbound_timeout,
+        task, slot, admission, deadline_seconds=max(0.0, admission.dispatch_deadline - asyncio.get_running_loop().time()),
         on_deadline=expire,
     )
     outcome = runtime._finish_host_ingress_admission(admission, outcome)
@@ -277,7 +282,9 @@ async def dispatch_admitted(proxy, arguments, context):
                         proxy._admit_terminal_cleanup(retry_retirement=False)
                     except BaseException as opening:  # noqa: BLE001 - retain original canonical closer refusal
                         admission.opening = opening
-                    await await_owned_task(admission.physical_client_retired)
+                    retirement = await await_owned_task(admission.physical_client_retired)
+                    if retirement.error is not None and admission.opening is None:
+                        admission.opening = retirement.error
                 raise
     except BaseException as error:  # noqa: BLE001 - detach foreign callback traceback, preserve native control
         final = runtime._redacted_host_ingress_error(error)

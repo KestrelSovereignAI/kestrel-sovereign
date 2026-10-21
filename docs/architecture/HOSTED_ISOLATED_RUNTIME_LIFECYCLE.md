@@ -49,13 +49,19 @@ Caller withdrawal prevents a later send after activation; an already-started
 provider call is conservatively unknown if it does not confirm. Dispatch
 observes the original caller's new cancellation count, independently of when
 its waiter resumes; an already-handled cancellation is not a new withdrawal.
+The original absolute deadline is rechecked at each effect boundary, even if
+an activation continuation resumes before the public deadline waiter.
 Failure to publish the deadline retires the same accepted original owner,
 not an unobserved dispatch. Irreversible Core custody denial is authenticated
-at Core's validator before foreign callback errors are redacted. A deadline
+at Core's validator before ordinary withdrawal or foreign-error redaction can
+mask it. A deadline
 seals the proxy and starts the existing canonical terminal cleanup. The
 original dispatch retains its host context until accepted RPC work settles
 or the original child is positively retired. Bounded public observation does
 not acknowledge physical cleanup or permit replay of an ambiguous send.
+Allocation or callback-publication failure in the retirement observer does not
+release host authority: the shared ownership helper retains the same original
+physical-stop join obligation and reports its observation failure after joining.
 
 For hosted webhook admission, `admit_hosted_telegram_ingress(admission_fence=…)`
 accepts trusted host-only native transaction authority. It is propagated to

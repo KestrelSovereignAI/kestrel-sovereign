@@ -780,7 +780,7 @@ async def test_deadline_publication_refusal_retires_original_and_redacts(tmp_pat
 
         def refused(delay, callback, *args, **kwargs):
             nonlocal attempted
-            if not attempted and delay == 30 and getattr(callback, "__name__", "") == "set_result":
+            if not attempted and 0 < delay <= 30 and getattr(callback, "__name__", "") == "set_result":
                 attempted = True
                 raise RuntimeError("controlled-deadline-publication-secret")
             return original(delay, callback, *args, **kwargs)
@@ -794,7 +794,8 @@ async def test_deadline_publication_refusal_retires_original_and_redacts(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_custody_denied_while_gate_waits_remains_native_control(tmp_path, monkeypatch):
+@pytest.mark.parametrize("withdraw", [False, True])
+async def test_custody_denied_while_gate_waits_remains_native_control(tmp_path, monkeypatch, withdraw):
     from kestrel_sovereign.execution_custody import (
         ConfirmedLeaseDeadline,
         bind_execution_custody,
@@ -828,6 +829,8 @@ async def test_custody_denied_while_gate_waits_remains_native_control(tmp_path, 
                 operation = asyncio.create_task(proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"}))
                 await asyncio.wait_for(entered.wait(), 2)
                 scope.revoke("controlled original admission retired")
+                if withdraw:
+                    operation.cancel()
                 await gate.reopen()
                 with pytest.raises(ExecutionAuthorityError):
                     await operation
@@ -856,3 +859,102 @@ async def test_foreign_control_shaped_callback_cannot_forge_native_provenance(tm
         assert "foreign-controlled-denial-text" not in repr(response)
         assert proxy._host_ingress_public_control is None
         assert services[0].sends == []
+
+
+@pytest.mark.asyncio
+async def test_retirement_observer_allocation_cannot_release_authority_before_stop(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.features.hosted_telegram_dispatch import HostedTelegramOutbound
+
+    exited, refused, target = asyncio.Event(), False, None
+
+    def factory(binding, events):
+        @asynccontextmanager
+        async def authority(proxy, arguments):
+            try:
+                yield HostedTelegramOutbound(binding)
+            finally:
+                exited.set()
+        return authority
+
+    async with sdk_host(tmp_path, monkeypatch, factory) as (proxy, services, clients, _):
+        loop, client, service = asyncio.get_running_loop(), clients[0], services[0]
+        original = loop.create_future
+
+        def allocate():
+            nonlocal refused
+            if (not refused and sys._getframe(1).f_code.co_name == 'await_owned_task'
+                    and sys._getframe(1).f_locals.get('task') is target and target is not None):
+                refused = True
+                raise RuntimeError('controlled original retirement observation refusal')
+            return original()
+
+        monkeypatch.setattr(loop, 'create_future', allocate)
+        service.activation_release.clear()
+        client.stop_release.clear()
+        operation = asyncio.create_task(proxy.call_isolated_tool('telegram_send', {'to': '555', 'message': 'controlled'}))
+        shutdown = None
+        try:
+            await asyncio.wait_for(service.activation_entered.wait(), 2)
+            target, = [admission.physical_client_retired for admission in proxy._host_ingress_admissions
+                       if admission.physical_client_retired is not None]
+            shutdown = asyncio.create_task(proxy.shutdown())
+            await asyncio.wait_for(client.wire_closed.wait(), 2)
+            await asyncio.sleep(0.02)
+            assert refused
+            assert not exited.is_set(), 'Observer allocation released original host authority before stop'
+            client.stop_release.set()
+            await asyncio.wait_for(operation, 2)
+            await asyncio.wait_for(shutdown, 2)
+            assert exited.is_set()
+        finally:
+            service.activation_release.set()
+            client.stop_release.set()
+            await asyncio.gather(*(task for task in (operation, shutdown) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_real_deadline_precedes_provider_even_if_activation_continuation_runs_first(tmp_path, monkeypatch):
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority, timeout=1, expected_denied=True) as (proxy, services, clients, _):
+        loop, client, ready = asyncio.get_running_loop(), clients[0], asyncio.Event()
+        release, attempts = loop.create_future(), []
+        ingress, send, later = client.call_host_ingress, client.call_tool, loop.call_later
+        installed = False
+
+        async def observed(name, payload=None):
+            response = await ingress(name, payload)
+            ready.set()
+            await release
+            return response
+
+        async def sending(*args, **kwargs):
+            attempts.append('actual-sdk-call')
+            return await send(*args, **kwargs)
+
+        def install(delay, callback, *args, **kwargs):
+            nonlocal installed
+            if not installed and 0 < delay <= 1 and getattr(callback, '__name__', '') == 'set_result':
+                installed = True
+
+                def expire():
+                    assert ready.is_set(), 'Activation response must already be held at the real deadline'
+                    release.set_result(None)
+                    callback(*args)
+
+                return later(delay, expire, **kwargs)
+            return later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(client, 'call_host_ingress', observed)
+        monkeypatch.setattr(client, 'call_tool', sending)
+        monkeypatch.setattr(loop, 'call_later', install)
+        operation = asyncio.create_task(proxy.call_isolated_tool('telegram_send', {'to': '555', 'message': 'controlled'}))
+        try:
+            with pytest.raises(ExecutionAuthorityError) as denied:
+                await operation
+            assert installed and type(denied.value) is ExecutionAuthorityError
+            assert attempts == []
+            assert services[0].sends == []
+        finally:
+            if not release.done():
+                release.set_result(None)
+            await asyncio.gather(operation, return_exceptions=True)
