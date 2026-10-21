@@ -19,7 +19,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from kestrel_sdk.signals import Status
 from kestrel_sdk.tools.base import ToolCategory

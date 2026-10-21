@@ -59,22 +59,12 @@ def is_hosted_send(proxy: Any, name: Any) -> bool:
     )
 
 
-def record_scheduled_provenance(proxy):
-    admission = _active_dispatch.get()
-    if (admission is not None and admission.proxy is proxy
-        and admission.admission.task is asyncio.current_task()):
-        from kestrel_sovereign.features.scheduler.runner import (
-            capture_scheduler_execution_scope,
-        )
-
-        # The revocable scope is trusted provenance, even if translating it
-        # to SDK context subsequently fails or observes occurrence revocation.
-        admission.scheduled_tool = capture_scheduler_execution_scope() is not None
-
-
 def start_dispatch(proxy: Any, name: Any, arguments: Any):
     """Snapshot and admit ONE original owner before publishing its task."""
     from kestrel_sovereign.features import isolated_runtime as runtime
+    from kestrel_sovereign.features.scheduler.runner import (
+        capture_scheduler_execution_scope,
+    )
 
     # This is private owner metadata, not a service ingress RPC. Tool names
     # use underscores; canonical ingress labels intentionally use hyphens.
@@ -85,6 +75,9 @@ def start_dispatch(proxy: Any, name: Any, arguments: Any):
         current_execution_custody(proxy.agent),
         proxy=proxy,
         withdrawal_stops_work=True,
+        # Capture trusted provenance BEFORE allocation/publication can refuse
+        # the original worker. No refusal may become scheduler success data.
+        scheduled_tool=capture_scheduler_execution_scope() is not None,
     )
     proxy._host_ingress_admissions.add(admission)
 

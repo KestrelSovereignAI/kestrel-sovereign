@@ -628,3 +628,93 @@ async def test_scheduler_revocation_during_activation_prevents_actual_provider_d
         finally:
             service.activation_release.set()
             await asyncio.gather(operation, return_exceptions=True)
+
+
+def test_host_admission_annotations_resolve_on_eager_annotation_python():
+    from typing import Any, get_type_hints
+
+    from kestrel_sovereign.features.channels.feature import ChannelFeature
+
+    # Python3.14 postpones annotation evaluation. Explicit resolution catches
+    # the same missing import that prevents supported older Python importing.
+    for method in (ChannelFeature.handle_inbound, ChannelFeature.handle_terminal_inbound):
+        assert get_type_hints(method)["admission_fence"] is Any
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hide_identity", [False, True])
+async def test_string_subclass_cannot_skip_hosted_authority(tmp_path, monkeypatch, hide_identity):
+    class Name(str):
+        __hash__ = str.__hash__
+
+        def __eq__(self, other):
+            return False if hide_identity else str.__eq__(self, other)
+
+        def __str__(self):
+            return "not-the-wire-name" if hide_identity else str.__str__(self)
+
+    async with sdk_host(tmp_path, monkeypatch, None) as (proxy, services, _, _):
+        services[0].activated = True
+        response = await proxy.call_isolated_tool(Name("telegram_send"), {"to": "555", "message": "controlled"})
+        assert response["status"] == "error", "String subclass bypassed hosted authority"
+        assert services[0].sends == []
+
+
+@pytest.mark.asyncio
+async def test_authorized_string_subclass_uses_canonical_dispatch(tmp_path, monkeypatch):
+    class Name(str):
+        pass
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, events):
+        response = await proxy.call_isolated_tool(Name("telegram_send"), {"to": "555", "message": "controlled"})
+        assert response["status"] == "ok"
+        assert len(services[0].sends) == 1
+        assert events == ["authority-enter", "activate", "send", "authority-exit"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["allocation", "publication"])
+async def test_scheduled_task_refusal_is_not_success_shaped_result(tmp_path, monkeypatch, phase):
+    from kestrel_sovereign.features.isolated_runtime import (
+        SchedulerExecutionContextUnavailable,
+    )
+    from kestrel_sovereign.features.scheduler.runner import (
+        bind_scheduler_execution_scope,
+    )
+
+    class RefusePublication(asyncio.Task):
+        refused = False
+
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "close_unstarted" and not self.refused:
+                self.refused = True
+                raise RuntimeError("controlled original task publication refusal")
+            return super().add_done_callback(callback, context=context)
+
+    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, _):
+        loop = asyncio.get_running_loop()
+        previous = loop.get_task_factory()
+        observed, attempted = [], False
+
+        def factory(loop, coroutine, **kwargs):
+            nonlocal attempted
+            if not attempted and coroutine.cr_code.co_qualname == "create_owned_task.<locals>.run":
+                attempted = True
+                if phase == "allocation":
+                    raise RuntimeError("controlled original task allocation refusal")
+                task = RefusePublication(coroutine, loop=loop, **kwargs)
+                observed.append(task)
+                return task
+            return (asyncio.Task(coroutine, loop=loop, **kwargs) if previous is None
+                    else previous(loop, coroutine, **kwargs))
+
+        loop.set_task_factory(factory)
+        try:
+            with bind_scheduler_execution_scope(scheduled_scope()), pytest.raises(SchedulerExecutionContextUnavailable):
+                await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+            assert attempted
+            assert services[0].sends == []
+            assert all(task.done() for task in observed)
+        finally:
+            loop.set_task_factory(previous)
+            await asyncio.gather(*observed, return_exceptions=True)

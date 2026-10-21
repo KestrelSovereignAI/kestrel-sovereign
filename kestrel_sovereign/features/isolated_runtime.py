@@ -12970,6 +12970,11 @@ class ProxyFeature(Feature):
             is_hosted_send, start_dispatch, wait_dispatch,
         )
         with bind_execution_runtime(self.agent):
+            if isinstance(name, str):
+                # Flatten accepted string subclasses with the base operation,
+                # not an overridable __str__/__eq__ that could hide the actual
+                # JSON tool name from the hosted dispatch authority boundary.
+                name = str.__str__(name)
             if is_hosted_send(self, name):
                 owner = start_dispatch(self, name, args)
                 self = name = args = None
@@ -12985,8 +12990,6 @@ class ProxyFeature(Feature):
             return await self._call_isolated_tool_owned(name, args)
 
     async def _call_isolated_tool_owned(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        from kestrel_sovereign.features.hosted_telegram_dispatch import record_scheduled_provenance
-        record_scheduled_provenance(self)
         context = _scheduled_tool_execution_context()
         requested_at = asyncio.get_running_loop().time()
         experienced_wake = False
