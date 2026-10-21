@@ -33,9 +33,16 @@ from kestrel_sovereign.storage.conversation_created_at import canonical_created_
 # is read from the entry's ``type`` and never from ``message.role``.
 TURN_TYPES = ("user", "assistant")
 
-# A user-typed entry the user did not write: injected context (``isMeta``) or
-# the summary that replaces history at compaction (``isCompactSummary``).
-NOT_TYPED_BY_THE_USER = ("isMeta", "isCompactSummary")
+# Most "user" entries were not typed by a person: task notifications, peer
+# messages, injected context, compaction summaries, interrupt markers, slash
+# command echoes. Claude Code marks the typed ones with ``origin.kind ==
+# "human"``, so a user turn is admitted on that mark alone, never by ruling the
+# others out one by one.
+HUMAN_ORIGIN = "human"
+
+# The model Claude Code records on assistant entries it wrote itself (API error
+# notices and the like) rather than receiving from a model.
+HARNESS_MODEL = "<synthetic>"
 
 
 class OneSidedTranscriptError(ValueError):
@@ -51,6 +58,14 @@ def _text_of(content) -> str:
         for block in content or []
         if isinstance(block, dict) and block.get("type") == "text"
     )
+
+
+def _is_turn(entry: dict, message: dict) -> bool:
+    """Whether a "user" entry was typed by a person, or an "assistant" entry came from the model."""
+    if entry.get("type") == "user":
+        origin = entry.get("origin")
+        return isinstance(origin, dict) and origin.get("kind") == HUMAN_ORIGIN
+    return message.get("model") != HARNESS_MODEL
 
 
 def extract_messages(jsonl_path: str) -> list[dict]:
@@ -70,10 +85,8 @@ def extract_messages(jsonl_path: str) -> list[dict]:
                 continue
 
             role = entry.get("type")
-            if role not in TURN_TYPES or any(entry.get(flag) for flag in NOT_TYPED_BY_THE_USER):
-                continue
             message = entry.get("message")
-            if not isinstance(message, dict):
+            if role not in TURN_TYPES or not isinstance(message, dict) or not _is_turn(entry, message):
                 continue
             content = _text_of(message.get("content")).strip()
             if content:
@@ -90,8 +103,9 @@ def require_both_sides(messages: list[dict]) -> None:
     """Refuse a transcript with no turns from one of its two sides.
 
     A conversation always has both, so a missing side means the extractor
-    misread the transcript. Importing anyway produced the Apr 2026 birth-session
-    import: every one of the user's turns silently missing, reported as success.
+    misread the transcript (or the transcript predates the ``origin`` mark).
+    Importing anyway produced the Apr 2026 birth-session import: every one of
+    the user's turns silently missing, reported as success.
     """
     counts = Counter(m["role"] for m in messages)
     missing = [role for role in TURN_TYPES if not counts[role]]

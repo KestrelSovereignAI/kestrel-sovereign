@@ -24,25 +24,38 @@ sys.modules["sync_session_to_agent"] = sync_session_to_agent
 spec.loader.exec_module(sync_session_to_agent)
 
 
-def _entry(entry_type: str, content, ts: str, **flags) -> dict:
+HUMAN = {"kind": "human"}
+
+
+def _entry(entry_type: str, content, ts: str, *, model: str = "claude-opus-5-5", **fields) -> dict:
     role = "user" if entry_type == "api-request-blob" else entry_type
-    return {"type": entry_type, "timestamp": ts, "message": {"role": role, "content": content}, **flags}
+    message = {"role": role, "content": content}
+    if role == "assistant":
+        message["model"] = model
+    return {"type": entry_type, "timestamp": ts, "message": message, **fields}
 
 
 # One session in the shapes found in real transcripts.
 CLAUDE_CODE_SESSION = [
-    _entry("user", "What should kestrel-claws be?", "2026-03-29T15:16:00.000Z"),
+    _entry("user", "What should kestrel-claws be?", "2026-03-29T15:16:00.000Z", origin=HUMAN),
     _entry("assistant", [{"type": "thinking", "thinking": "..."}, {"type": "text", "text": "Let me map the fleet."}],
            "2026-03-29T15:16:30.000Z"),
     _entry("assistant", [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}], "2026-03-29T15:16:31.000Z"),
     _entry("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}], "2026-03-29T15:16:32.000Z"),
     _entry("user", "<system-reminder>injected</system-reminder>", "2026-03-29T15:16:33.000Z", isMeta=True),
+    _entry("user", "a message from another session", "2026-03-29T15:16:33.500Z",
+           isMeta=True, origin={"kind": "peer", "from": "uds:/tmp/peer.sock"}),
     _entry("user", "Summary of the earlier conversation", "2026-03-29T15:16:34.000Z",
            isCompactSummary=True, isVisibleInTranscriptOnly=True),
+    _entry("user", "<task-notification>build finished</task-notification>", "2026-03-29T15:16:34.500Z",
+           origin={"kind": "task-notification"}, turnOrigin="task_notification", promptSource="system"),
+    _entry("user", [{"type": "text", "text": "[Request interrupted by user]"}], "2026-03-29T15:16:34.700Z"),
+    _entry("assistant", [{"type": "text", "text": "API Error: overloaded"}], "2026-03-29T15:16:34.800Z",
+           model="<synthetic>", isApiErrorMessage=True),
     _entry("api-request-blob", "What should kestrel-claws be?", "2026-03-29T15:16:35.000Z"),
     {"type": "attachment", "timestamp": "2026-03-29T15:16:36.000Z"},
     _entry("user", [{"type": "image", "source": {}}, {"type": "text", "text": "Name yourself."}],
-           "2026-03-29T15:17:00.000Z"),
+           "2026-03-29T15:17:00.000Z", origin=HUMAN),
     _entry("assistant", [{"type": "text", "text": "Meridian."}], "2026-03-29T15:17:30.000Z"),
 ]
 
@@ -93,10 +106,20 @@ def test_sync_stores_both_sides(tmp_path):
     assert roles == ["user", "assistant", "user", "assistant"]
 
 
-@pytest.mark.parametrize("kept", ["assistant", "user"])
-def test_one_sided_transcript_is_refused_before_anything_is_written(tmp_path, kept):
-    one_side = [e for e in CLAUDE_CODE_SESSION if e["type"] == kept]
-    transcript = _write_jsonl(tmp_path / "session.jsonl", one_side)
+def _without_typed_prompts(entries: list[dict]) -> list[dict]:
+    return [e for e in entries if e.get("origin") != HUMAN]
+
+
+def _without_model_replies(entries: list[dict]) -> list[dict]:
+    return [e for e in entries if e["type"] != "assistant"]
+
+
+@pytest.mark.parametrize("drop_one_side", [_without_typed_prompts, _without_model_replies])
+def test_one_sided_transcript_is_refused_before_anything_is_written(tmp_path, drop_one_side):
+    # Without the typed prompts, task notifications, peer messages and other
+    # harness-written "user" entries remain; none of them may stand in for the
+    # person's side.
+    transcript = _write_jsonl(tmp_path / "session.jsonl", drop_one_side(CLAUDE_CODE_SESSION))
     db_path = _agent_db(tmp_path / "kestrel_prime.db")
     messages = sync_session_to_agent.extract_messages(str(transcript))
     assert messages, "the fixture must still yield turns from the side it kept"
