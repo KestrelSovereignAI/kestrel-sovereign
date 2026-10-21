@@ -25,8 +25,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+API_KEY = "test-key-for-agent-chat-e2e"
+
+
 @pytest.fixture(scope="function")
-def client(monkeypatch):
+def api_key(monkeypatch):
+    """The sovereign key the server checks; without one it mints its own
+    into the environment (#3671)."""
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    return API_KEY
+
+
+@pytest.fixture(scope="function")
+def client(monkeypatch, api_key):
     """
     This fixture sets up a clean agent environment for each test function.
     It uses monkeypatch to ensure the app uses a temporary data directory.
@@ -70,13 +81,6 @@ def client(monkeypatch):
         for t in new_threads:
             if t.is_alive() and not t.daemon:
                 t.join(timeout=2.0)
-
-
-@pytest.fixture(scope="function")
-def api_key():
-    """Get the API key from environment."""
-    from server import get_api_key
-    return get_api_key()
 
 
 def test_health_endpoint(client: TestClient):

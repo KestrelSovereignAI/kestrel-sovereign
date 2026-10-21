@@ -12,6 +12,7 @@ from kestrel_sovereign.setup.context import Flow, SetupContext
 from kestrel_sovereign.setup.env_file import read_env, write_env
 from kestrel_sovereign.setup.prompts import StubPrompter
 from kestrel_sovereign.setup.steps import keys
+from tests.shared.environment_guard import unset_environment
 
 
 @pytest.fixture(autouse=True)
@@ -23,10 +24,10 @@ def _clean_data_key_env(monkeypatch):
     resolves key authority *from the process environment as well as*
     ``.env`` (#2468), so tests that exercise the generate / target-key paths
     must not inherit that ambient export — each test opts back in explicitly
-    when it wants an exported key.
+    when it wants an exported key. The step writes both keys back into
+    ``os.environ``, so both are recorded for ``monkeypatch`` to undo (#3671).
     """
-    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
-    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    unset_environment(monkeypatch, "KESTREL_DATA_KEY", "KESTREL_API_KEY")
 
 
 def _make_ctx(tmp_path: Path, flow: Flow, *, answers=None) -> SetupContext:

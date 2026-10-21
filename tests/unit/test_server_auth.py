@@ -17,6 +17,8 @@ from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
 from kestrel_sovereign import server as server_module
+from kestrel_sovereign.security.sovereign_key import _EPHEMERAL_KEY_FINGERPRINT_ENV
+from tests.shared.environment_guard import unset_environment
 
 API_KEY = "unit-test-key-2490"
 SENTINEL = "sentinel downstream failure"
@@ -174,7 +176,7 @@ def test_credential_evaluation_crash_still_produces_auth_401(client, monkeypatch
 def test_temporary_sovereign_key_provenance_survives_a_child_process(monkeypatch):
     """A host child must not reinterpret its inherited bootstrap key as stable."""
 
-    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    unset_environment(monkeypatch, "KESTREL_API_KEY", _EPHEMERAL_KEY_FINGERPRINT_ENV)
     temporary = server_module.get_api_key()
     proc = subprocess.run(
         [
@@ -205,6 +207,7 @@ def test_quoted_empty_sovereign_key_is_replaced_by_ephemeral_bootstrap(monkeypat
     )
 
     monkeypatch.setenv("KESTREL_API_KEY", '""')
+    unset_environment(monkeypatch, _EPHEMERAL_KEY_FINGERPRINT_ENV)
 
     selected = server_module.get_api_key()
 

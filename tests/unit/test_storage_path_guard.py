@@ -39,6 +39,7 @@ from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 # project directory, which the tests below deliberately unpin.
 from kestrel_sovereign.server import resolve_multi_agent_path
 from kestrel_sovereign.storage.async_storage import get_default_agent_data_dir
+from tests.shared.environment_guard import unset_environment
 from tests.shared.host_runtime_isolation import (
     ISOLATED_LAYOUT,
     SESSION_ROOT_ENV,
@@ -559,7 +560,8 @@ def test_the_session_pre_pin_leaves_nothing_for_a_dotenv_load_to_fill(
 
     for name in paths.RUNTIME_PATH_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("KESTREL_OPERATOR_API_KEY", raising=False)
+    # The load below writes it.
+    unset_environment(monkeypatch, "KESTREL_OPERATOR_API_KEY")
     (tmp_path / "session").mkdir()
     pin_runtime_paths(tmp_path / "session", monkeypatch.setenv, None)
     pinned = {name: os.environ[name] for name in paths.RUNTIME_PATH_ENV_NAMES}
