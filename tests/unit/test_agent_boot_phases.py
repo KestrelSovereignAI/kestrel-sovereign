@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from kestrel_sdk.payer_policy import PayerKind, PayerPolicy, PayerSpec
 
 from kestrel_sovereign.agent.boot import (
     AgentBootError,
@@ -451,8 +452,15 @@ async def _cleanup(agent: KestrelAgent) -> None:
 def _make_agent(tmp_path) -> KestrelAgent:
     # Keep the real default LLMService used by the phase-6 readiness check, but
     # prevent its constructor (which runs before _boot_mocks) from reading the
-    # operator's process-wide on-disk model catalog. Model discovery itself is
-    # lazy and is not called by these boot phases.
+    # operator's process-wide on-disk model catalog. These lifecycle fixtures
+    # perform no inference: declare that through the real NONE payer contract
+    # rather than depending on ambient keys or disabling the readiness check.
+    host = PayerPolicy.host_env_default()
+    policy = PayerPolicy(
+        llm=PayerSpec(vendor="openrouter", kind=PayerKind.NONE),
+        storage=host.storage, compute=host.compute,
+        tools=host.tools, comms=host.comms,
+    )
     with patch(
         "kestrel_sovereign.llm.service.LLMService._load_from_disk_cache",
         return_value=False,
@@ -462,6 +470,7 @@ def _make_agent(tmp_path) -> KestrelAgent:
             storage_path=str(tmp_path / "boot.db"),
             db_backend="sqlite",
             sync_enabled=True,
+            payer_policy=policy,
         )
     load_disk_cache.assert_called_once_with()
     return agent

@@ -53,8 +53,9 @@ Filesystem reads, writes, and listings always run on the host — the agent is e
 
 - **`docker`** (default) — wraps the existing `kestrel_sovereign/features/compute/executors/docker_executor.py`. Each shell command runs in a fresh container with `--read-only`, `--network=none`, `--security-opt=no-new-privileges`, memory and PID limits. Same blast radius as the long-running compute feature. `argv[0]` is named to Docker with `--entrypoint` and the rest follow the image, so the program that runs is the one the policy vetted and no word of the vector is re-read as shell grammar. It used to be quoted into a bash script instead, and a bash script reads its first word with a shell's grammar — `eval 'printf HACKED'` ran `printf` having shown the policy only `eval`, which is not a program at all (#3187). Position alone would not be enough: words after an image are appended to whatever `ENTRYPOINT` it declares, which would demote `argv[0]` to an argument of the image's own program.
 - **`local`** — direct `asyncio.subprocess.exec` on the host. Refuses to construct unless Amendment IX grants both `shell_execution_sandboxed` *and* `shell_execution_host`. The two-grant model exists so a single permissive amendment cannot covertly widen sandboxed access into host access.
+- **`none`** — the file tools only, with no shell execution at all. Needs no shell grant. Every tool needs a backend, and both shell backends refuse to construct without a shell grant, so an agent granted only `filesystem_read` has no working tool unless it uses this one. `shell` is still refused at the constitution gate for an agent without the grant. An agent that later gains a shell grant without the backend being changed is refused right after that gate (`readiness:backend 'none' has no shell execution`), before path, policy or approval, so nobody is asked to approve a command that cannot run.
 
-The backend is selected once at feature init and cannot be swapped at runtime.
+The backend is selected once at feature init and cannot be swapped at runtime. Any value other than `docker`, `local` or `none` leaves the feature unready (`backend refused init: unknown backend …`). A mistyped `none` is never read as the default, because the default can execute (#3760).
 
 ## Tools
 
@@ -64,7 +65,7 @@ The backend is selected once at feature init and cannot be swapped at runtime.
 | `!fs-list <path>` | `filesystem_read` | Auto-approve inside allow-list; human approval outside |
 | `!fs-write <path>` | `filesystem_write` | Always human approval; payload includes a unified-diff preview |
 | `!fs-edit <path> <old> <new>` | `filesystem_write` | Always human approval; replaces the Nth occurrence of `old_text` with `new_text`; payload includes a unified-diff preview |
-| `!shell <cmd>` | `shell_execution_sandboxed` (docker) or `shell_execution_host` (local) | Auto-approved binaries run without a prompt; unlisted binaries route through the queue (human or scoped auto-approve); deny-listed binaries hard-reject |
+| `!shell <cmd>` | `shell_execution_sandboxed` (docker, none) or `shell_execution_host` (local); never runs on `none` | Auto-approved binaries run without a prompt; unlisted binaries route through the queue (human or scoped auto-approve); deny-listed binaries hard-reject |
 
 A path or binary that matches the deny-list is rejected before the approval queue ever sees it; the approver cannot accidentally widen the deny-list. The binary policy has three states (#1694):
 
@@ -79,7 +80,7 @@ Path writes still go through approval regardless of allow-list match — write p
 ```toml
 [features.computer_use]
 enabled = false                       # opt-in
-backend = "docker"                    # docker | local
+backend = "docker"                    # docker | local | none
 allowed_paths = ["~/projects", "~/Documents"]
 deny_paths = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
 max_read_bytes = 5_000_000
@@ -185,16 +186,10 @@ Because pruning keys a set by its manifest, a run that ends without one is clean
 
 ## Enabling, end-to-end
 
-1. Open the agent's `kestrel.toml` (typically `agent_data/<name>/kestrel.toml`), set `[features.computer_use] enabled = true`, configure `allowed_paths` and `denied_binaries`.
-2. Open `kestrel_sovereign/data/KESTREL_CONSTITUTION.md`, find Amendment IX, change `[ ]` to `[x]` for the capabilities you want to grant.
-3. If the agent has been inception-anchored to a previous constitution hash,
-   create a Sovereign-signed artifact and run
-   `!reanchor-constitution /secure/constitution-reanchor.signed.json <new_hash_prefix>`
-   so identity records reflect the change. Configure the external root as
-   described in
-   [Sovereign Constitution Trust Root](security/SOVEREIGN_TRUST_ROOT.md).
-4. Set `agent.privacy_config.computer_access = True` for the session(s) where you want the feature available.
-5. The first tool call will trigger an approval prompt unless it's a read inside the allow-list.
+1. Open the agent's `kestrel.toml` (typically `agent_data/<name>/kestrel.toml`), set `[features.computer_use] enabled = true`, choose `backend` (`none` for an agent granted no shell), and configure `allowed_paths`, `deny_paths` and `denied_binaries`. Setting `deny_paths` replaces the default list, so repeat the defaults you want to keep.
+2. In the same file, set `[privacy] computer_access = true` (#956). Privacy presets never set it.
+3. Grant capabilities for this agent only. Write `agent_data/<name>/CONSTITUTION.md` with an `### Amendment IX` section whose `#### Granted Capabilities` list checks the grants (`- [x] filesystem_read`). Then, with the agent stopped, run `kestrel constitution anchor-overlay --agent-name <name>`. In the default in-process mode that means stopping the host, and with it every agent. The anchor records the overlay's hash on the agent's identity node. Until it does, the integrity audit fails closed on the overlay and the agent enters Safe Mode, so never place an overlay beside a running agent. The anchor is an operator action. It is not signed with the Sovereign root key, so per-agent grants rest on the operator's authority. Granting in `kestrel_sovereign/data/KESTREL_CONSTITUTION.md` instead changes the platform base for every agent; see [Sovereign Constitution Trust Root](security/SOVEREIGN_TRUST_ROOT.md).
+4. The first tool call will trigger an approval prompt unless it's a read inside the allow-list.
 
 ## Out of scope
 

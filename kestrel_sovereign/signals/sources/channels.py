@@ -20,6 +20,7 @@ from kestrel_sdk.signals import (
 )
 
 SOURCE_NAME = "channel.message"
+MAX_CHANNEL_SESSION_ID_BYTES = 256
 # A selector-visible marker limits the durable cognition consumer to new
 # cursor-owning ingress events.  It prevents registration during upgrade from
 # backfilling every historic channel row into a fresh cognition turn.
@@ -122,11 +123,27 @@ def build_channel_message_registration() -> SourceRegistration:
     )
 
 
+def validate_channel_session_id(session_id: str | None) -> str | None:
+    """Validate opaque host-selected correlation; it conveys no authority."""
+    if session_id is None:
+        return None
+    if (
+        type(session_id) is not str
+        or not session_id
+        or session_id != session_id.strip()
+        or not session_id.isprintable()
+        or len(session_id.encode("utf-8")) > MAX_CHANNEL_SESSION_ID_BYTES
+    ):
+        raise ValueError("channel session identity must be nonempty, printable and bounded")
+    return session_id
+
+
 def build_signal_for_channel_message(
     message: ChannelMessage,
     target_agent: str,
     *,
     durable_cognition: bool = False,
+    session_id: str | None = None,
 ) -> Signal:
     """Build one normalized channel signal.
 
@@ -134,9 +151,14 @@ def build_signal_for_channel_message(
     not a property of the generic ``channel.message`` source.  Adding it to
     Slack/WhatsApp/etc. would materialize a Telegram-owned delivery for an
     event whose producer cannot retain or acknowledge a cursor.
+
+    ``session_id`` is explicit host-owned correlation, never inferred from
+    message metadata. It does not promote visibility or source trust. A host
+    must independently authorize its choice before calling this builder.
     """
     if message.direction != MessageDirection.INBOUND:
         raise ValueError("channel message signals require an inbound message")
+    session_id = validate_channel_session_id(session_id)
     payload = {
         "message_id": message.id,
         "channel_type": message.channel_type,
@@ -153,6 +175,7 @@ def build_signal_for_channel_message(
         mode=SignalMode.COGNITION,
         payload=payload,
         target_agent=target_agent,
+        session_id=session_id,
         visibility=Visibility.USER_VISIBLE,
         caller=message.sender,
         urgency=Urgency.NORMAL,
@@ -161,6 +184,8 @@ def build_signal_for_channel_message(
 
 
 __all__ = [
+    "MAX_CHANNEL_SESSION_ID_BYTES",
+    "validate_channel_session_id",
     "DURABLE_COGNITION_CONSUMER_ID",
     "DURABLE_COGNITION_MARKER",
     "DURABLE_COGNITION_MARKER_VALUE",

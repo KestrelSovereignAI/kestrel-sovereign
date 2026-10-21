@@ -184,8 +184,9 @@ def pytest_configure(config):
     """Configure pytest with all plugins and load .env for skipif conditions."""
     _require_pytest_asyncio(config)
     _hang_backstop_configure(config)
-    # A plugin, not hooks imported here: this conftest's hooks never see the
-    # session, so they would miss every session-scoped fixture (#3671).
+    # A plugin, not a fixture defined here: a plugin's autouse fixture is set
+    # up before this conftest's, several of which use monkeypatch, so the
+    # guard sees every monkeypatch undone before it compares (#3671).
     _register_environment_guard(config)
     REFUSAL_RECORDER.install()
     # The allow-list's third root: an explicit --basetemp may lie outside the

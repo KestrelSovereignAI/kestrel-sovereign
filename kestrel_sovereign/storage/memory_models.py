@@ -283,6 +283,15 @@ class MemoryEpisode:
             except (ValueError, TypeError):
                 return None
 
+        # Keep the existing list endpoint's legacy JSON tolerance in the
+        # canonical decoder, shared by relevance recall and listing alike.
+        message_ids = row[6] if row[6] is not None else []
+        if isinstance(message_ids, str):
+            try:
+                message_ids = json.loads(message_ids)
+            except (ValueError, TypeError):
+                message_ids = []
+
         return cls(
             id=row[0],
             agent_id=row[1],
@@ -290,7 +299,7 @@ class MemoryEpisode:
             summary=row[3],
             timespan_start=_dt(row[4]),
             timespan_end=_dt(row[5]),
-            key_message_ids=json.loads(row[6]) if row[6] else [],
+            key_message_ids=message_ids,
             emotional_arc=row[7] or "",
             created_at=_dt(row[8]),
             # Tolerate legacy rows / shorter SELECTs that pre-date the columns.

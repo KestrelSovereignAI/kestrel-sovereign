@@ -207,24 +207,17 @@ regression test that the case leaves a reused database unchanged (#3404).
 ### Environment Variables
 
 A test that needs an environment variable sets it itself with
-`monkeypatch.setenv`, and no test may leave `os.environ` different from how it
-found it. Every test is checked: a test that leaves a variable set, removed or
-changed has it put back and then fails at teardown, naming the variable but
-never its value. A class, module, package or session fixture is checked as it
-is torn down: its teardown must undo what its setup changed and change nothing
-else, or the test whose teardown retired it fails, naming the fixture. Such a
-fixture cannot use `monkeypatch`; it holds a variable with
-`pytest.MonkeyPatch.context()` around its `yield`. A test module whose import
-changes the environment fails its collection the same way (#3671). Before this
-check, three tests passed only because an earlier test in the same process had
-left `KESTREL_API_KEY` set.
-
-`monkeypatch.delenv(name, raising=False)` records nothing when the variable is
-already absent, so a value the code under test then writes, such as the key
-`kestrel setup` or the server generates, outlives the test. Use
-`unset_environment(monkeypatch, name)` from `tests.shared.environment_guard`
-instead. Every test also starts without the A2A transport key that booting an
-agent publishes into the process environment.
+`monkeypatch.setenv`, and no test leaves `os.environ` different from how it
+found it (#3671). The suite enforces this: a test that leaves a variable set,
+removed or changed has it put back and fails at teardown, naming the variable
+but never its value. A test module whose import changes the environment fails
+its collection, and a class, module, package or session fixture that leaves it
+changed fails the run's last test; such a fixture holds a variable with
+`pytest.MonkeyPatch.context()` around its `yield`. Because
+`monkeypatch.delenv(name, raising=False)` records nothing for an absent
+variable, a test that must start without one the code under test may write
+uses `unset_environment(monkeypatch, name)` from
+`tests.shared.environment_guard`.
 
 ### Test Organization
 

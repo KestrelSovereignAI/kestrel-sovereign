@@ -1,4 +1,4 @@
-"""Put back, and fail, a test or fixture that leaves ``os.environ`` changed (#3671).
+"""Put back, and fail, whatever leaves ``os.environ`` changed (#3671).
 
 A test that writes ``os.environ`` directly, or calls code that does, and never
 puts it back hands every later test in its process an environment that test
@@ -6,32 +6,34 @@ did not ask for. Three ``test_host_features`` tests passed only because an
 earlier test had left ``KESTREL_API_KEY`` set; with the unit tier split across
 runners they failed in whichever shard held them.
 
-So every test is checked. The environment is recorded when the test's first
-function-scoped fixture is set up, which is after every module and session
-fixture it uses and before any function fixture or the test body can write; a
-test without one is recorded once its setup is done. It is compared after the
-last function-scoped fixture is torn down. Every
-``monkeypatch`` has been undone by then, whatever order its fixtures ran in,
-so only a change that nothing would undo is reported. A module or session
-fixture first set up during the test, through ``request.getfixturevalue``,
-outlives it by design, so what its setup changed is added to the record. A leak
-is put back first and then fails the test, so it can neither reach the next
-test nor pass unnoticed.
+The guard has one rule at each of three boundaries. Each puts a change back,
+then fails, so no leak passes unnoticed; at a test and at an import that also
+keeps the leak from every later test:
 
-Every class, module, package and session fixture is checked as it is torn
-down, which happens after the last test that uses it: whatever that teardown
-leaves changed, every later test inherits, the next module's included. The
-environment is recorded as its teardown starts, after every fixture that
-depends on it has gone, and each variable its setup changed is expected back as
-it was before that setup. What differs afterwards is put back and fails the
-test whose teardown retired the fixture, naming the fixture.
+* **A test.** ``_environment_guard`` is an autouse fixture. pytest sets up a
+  test's class, module, package and session fixtures before any of its
+  function-scoped ones, and this is the first function-scoped fixture of every
+  test, so it records the environment after the former and before the latter.
+  Its teardown runs after every other function-scoped fixture's,
+  ``monkeypatch``'s included, and before any higher-scoped teardown. What
+  differs then is the test's, ``xfail`` mark or not. That includes a
+  higher-scoped fixture first set up inside the test, through
+  ``request.getfixturevalue`` or a function-scoped fixture that overrides it by
+  name: request such a fixture as an argument instead.
+* **A test module's import.** A module-level write fails that module's
+  collection.
+* **The run.** The environment is recorded as the session starts and compared
+  once every fixture has been torn down, in the last test's teardown. A
+  difference then was left by a class, module, package or session fixture, or
+  by other code outside any test, and fails that last test. Every test after
+  the leak ran with it, so this boundary reports a leak but cannot keep it
+  from them. A run that stops after a test's teardown has left fixtures up (an
+  interrupt, or a teardown error that reaches ``--maxfail``) tears them down
+  as the session finishes. It is compared then, and with no test left to fail
+  a leak is named in the warnings summary; such a run has already failed.
 
-Importing a test module is checked the same way: a module-level write is put
-back and fails that module's collection.
-
-``register`` installs these hooks as a plugin. Imported into a conftest they
-would see only the nodes below its directory, and the session sits at the
-rootdir, above ``tests/``: no session fixture would reach them.
+``register`` installs this module as a plugin, so the fixture is visible to
+every test and the session hooks see the session.
 
 Not covered: ``os.putenv``, which bypasses ``os.environ``.
 """
@@ -41,6 +43,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 import os
 import sys
+from typing import NoReturn
+import warnings
 
 import pytest
 
@@ -50,9 +54,13 @@ PHASE_VARIABLE = "PYTEST_CURRENT_TEST"
 
 PLUGIN_NAME = "kestrel-environment-guard"
 
-_SNAPSHOT_KEY = pytest.StashKey[dict[str, str]]()
-#: The test being checked, so a fixture set up during it can find its record.
-_WATCHED_KEY = pytest.StashKey[pytest.Item]()
+_SESSION_START_KEY = pytest.StashKey[dict[str, str]]()
+#: Set once a test of this process has been set up.
+_RAN_KEY = pytest.StashKey[bool]()
+#: Set once the run has been compared with the session start.
+_COMPARED_KEY = pytest.StashKey[bool]()
+#: Set on a test whose teardown reported a leak.
+_LEAKED_KEY = pytest.StashKey[bool]()
 
 _REMEDY = (
     "Set a variable with monkeypatch.setenv. To start without one that the "
@@ -61,7 +69,7 @@ _REMEDY = (
     "monkeypatch.delenv records nothing for a variable that is already absent."
 )
 
-_FIXTURE_REMEDY = (
+_RUN_REMEDY = (
     "A class, module, package or session fixture can hold a variable with "
     "pytest.MonkeyPatch.context() around its yield, which puts it back as the "
     "fixture is torn down."
@@ -69,7 +77,7 @@ _FIXTURE_REMEDY = (
 
 
 def register(config: pytest.Config) -> None:
-    """Install the guard for every node of the run, the session's included."""
+    """Install the guard for every test of the run."""
     config.pluginmanager.register(sys.modules[__name__], PLUGIN_NAME)
 
 
@@ -113,142 +121,125 @@ def restore_environment(expected: Mapping[str, str]) -> list[str]:
     return changes
 
 
-def _carry_fixture_changes(
-    expected: dict[str, str], before: Mapping[str, str], after: Mapping[str, str]
-) -> None:
-    """Add what a module or session fixture's setup changed to a test's record."""
-    for name in before.keys() | after.keys():
-        if name not in after:
-            expected.pop(name, None)
-        elif before.get(name) != after[name]:
-            expected[name] = after[name]
-
-
-def _check_item(item: pytest.Item) -> None:
-    expected = item.stash[_SNAPSHOT_KEY]
-    del item.stash[_SNAPSHOT_KEY]
-    if item.config.stash.get(_WATCHED_KEY, None) is item:
-        del item.config.stash[_WATCHED_KEY]
-    changes = restore_environment(expected)
+@pytest.fixture(autouse=True)
+def _environment_guard(request: pytest.FixtureRequest):
+    """Fail a test that leaves ``os.environ`` changed, after putting it back."""
+    request.session.stash[_RAN_KEY] = True
+    before = snapshot_environment()
+    yield
+    changes = restore_environment(before)
     if changes:
-        pytest.fail(
-            f"{item.nodeid} left os.environ changed. It has been put back; "
-            "left in place, every later test in this process would have run "
-            "with it (#3671):\n" + "\n".join(changes) + f"\n{_REMEDY}",
-            pytrace=False,
+        _fail(
+            request.node,
+            f"{request.node.nodeid} left os.environ changed. It has been put "
+            "back; left in place, every later test in this process would have "
+            "run with it (#3671):\n" + "\n".join(changes) + f"\n{_REMEDY}",
         )
 
 
-def _watch(item: pytest.Item) -> None:
-    item.stash[_SNAPSHOT_KEY] = snapshot_environment()
-    item.config.stash[_WATCHED_KEY] = item
-    item.addfinalizer(lambda: _check_item(item))
+def _leak_error(item: pytest.Item, message: str) -> BaseException:
+    """The error that reports a leak, recorded on ``item`` for its report."""
+    item.stash[_LEAKED_KEY] = True
+    return pytest.fail.Exception(message, pytrace=False)
 
 
-class _FixtureRetirement:
-    """Checks that one class, module, package or session fixture's teardown
-    leaves the environment as that fixture's setup found it."""
-
-    def __init__(self, fixturedef: pytest.FixtureDef, request: pytest.FixtureRequest):
-        self._fixturedef = fixturedef
-        self._owner = request.node
-        self._before_setup = snapshot_environment()
-        self._after_setup: dict[str, str] = {}
-        self._expected: dict[str, str] = {}
-
-    def setup_finished(self) -> None:
-        self._after_setup = snapshot_environment()
-
-    def carry_setup_into(self, record: dict[str, str]) -> None:
-        """Add what this fixture's setup changed to the record of a test it outlives."""
-        _carry_fixture_changes(record, self._before_setup, self._after_setup)
-
-    def teardown_starts(self) -> None:
-        """Record what the environment must be once this fixture is gone."""
-        self._expected = snapshot_environment()
-        for name in self._before_setup.keys() | self._after_setup.keys():
-            if self._before_setup.get(name) == self._after_setup.get(name):
-                continue
-            if name in self._before_setup:
-                self._expected[name] = self._before_setup[name]
-            else:
-                self._expected.pop(name, None)
-
-    def teardown_finished(self) -> None:
-        changes = restore_environment(self._expected)
-        if changes:
-            owner = self._owner.nodeid or "the session"
-            pytest.fail(
-                f"Tearing down the {self._fixturedef.scope}-scoped fixture "
-                f"{self._fixturedef.argname!r} of {owner} left os.environ "
-                "changed. It has been put back; left in place, every later "
-                "test in this process would have run with it (#3671):\n"
-                + "\n".join(changes) + f"\n{_FIXTURE_REMEDY}",
-                pytrace=False,
-            )
+def _fail(item: pytest.Item, message: str) -> NoReturn:
+    raise _leak_error(item, message)
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_fixture_setup(fixturedef, request):
-    """Record the environment as a test's first function-scoped fixture starts.
+@pytest.hookimpl(trylast=True)
+def pytest_sessionstart(session: pytest.Session) -> None:
+    session.stash[_SESSION_START_KEY] = snapshot_environment()
 
-    The check is registered on the item before that fixture's own finalizer, so
-    it runs after every function-scoped fixture of the test is torn down. A
-    higher-scoped fixture's request belongs to a collector, not the item; one
-    set up while a test is being checked adds its changes to that record.
 
-    A higher-scoped fixture gets two finalizers of its own, one on each side of
-    its setup. A fixture's finalizers run in reverse, so the check added before
-    the setup runs after the fixture's teardown, and the record added after it
-    runs before that teardown, once every fixture that depends on it has gone.
+def _run_leak(session: pytest.Session) -> str | None:
+    """Put back what the run left changed, and describe it."""
+    session.stash[_COMPARED_KEY] = True
+    changes = restore_environment(session.stash[_SESSION_START_KEY])
+    if not changes:
+        return None
+    return (
+        "The run left os.environ changed once every fixture had been torn "
+        "down. It has been put back. A class, module, package or session "
+        "fixture, or other code outside any test, changed it and nothing put "
+        "it back; every test after that change ran with it (#3671):\n"
+        + "\n".join(changes) + f"\n{_RUN_REMEDY}"
+    )
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None):
+    """After the last test every fixture is gone: compare with the session start."""
+    if nextitem is not None:
+        return (yield)
+    try:
+        result = yield
+    except (pytest.exit.Exception, KeyboardInterrupt):
+        # An interrupted run is compared as the session finishes.
+        raise
+    except BaseException as error:
+        leak = _run_leak(item.session)
+        if leak is None:
+            raise
+        # Both are reported: the teardown's own failure and the leak.
+        raise BaseExceptionGroup(
+            "the last test's teardown failed, and the run left os.environ changed",
+            [error, _leak_error(item, leak)],
+        ) from None
+    leak = _run_leak(item.session)
+    if leak is not None:
+        _fail(item, leak)
+    return result
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_sessionfinish(session: pytest.Session):
+    """Compare a run whose fixtures are torn down here, after its last test.
+
+    No test is left to fail, so the leak is named in the warnings summary. Only
+    a run that has failed or been interrupted ends with fixtures still up.
     """
-    item = request.node
-    if isinstance(item, pytest.Item):
-        if _SNAPSHOT_KEY not in item.stash:
-            _watch(item)
-        yield
-        return
-    retirement = _FixtureRetirement(fixturedef, request)
-    fixturedef.addfinalizer(retirement.teardown_finished)
-    yield
-    retirement.setup_finished()
-    fixturedef.addfinalizer(retirement.teardown_starts)
-    watched = request.config.stash.get(_WATCHED_KEY, None)
-    if watched is not None:
-        retirement.carry_setup_into(watched.stash[_SNAPSHOT_KEY])
+    try:
+        return (yield)
+    finally:
+        ran = session.stash.get(_RAN_KEY, False)
+        if ran and not session.stash.get(_COMPARED_KEY, False):
+            leak = _run_leak(session)
+            if leak is not None:
+                warnings.warn(pytest.PytestWarning(leak))
+                if session.exitstatus == pytest.ExitCode.OK:
+                    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_setup(item):
-    """Record the environment after setup for a test with no function-scoped fixture."""
-    outcome = yield
-    if outcome.exception is None and _SNAPSHOT_KEY not in item.stash:
-        _watch(item)
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
+    """Keep a leak a failure: an ``xfail`` mark excuses the test, not its leak."""
+    report = yield
+    if call.when == "teardown" and item.stash.get(_LEAKED_KEY, False):
+        if hasattr(report, "wasxfail"):
+            del report.wasxfail
+        report.outcome = "failed"
+    return report
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_make_collect_report(collector):
+@pytest.hookimpl(wrapper=True)
+def pytest_make_collect_report(collector: pytest.Collector):
     """Fail the collection of a module whose import left the environment changed."""
     if not isinstance(collector, pytest.Module):
-        yield
-        return
+        return (yield)
     before = snapshot_environment()
-    outcome = yield
+    report = yield
     changes = restore_environment(before)
     if not changes:
-        return
+        return report
     message = (
         f"Importing {collector.nodeid} left os.environ changed. It has been put "
         "back; left in place, every test in this process would have run with it "
         "(#3671):\n" + "\n".join(changes) + f"\n{_REMEDY}"
     )
-    report = outcome.get_result()
     if report.failed:
-        # Keep the module's own error, and report the leak beside it.
-        report.sections.append(("os.environ", message))
-        return
-    outcome.force_result(
-        pytest.CollectReport(
-            collector.nodeid, "failed", message, [], sections=report.sections
-        )
+        # Keep the module's own error, and report the leak after it.
+        message = f"{report.longrepr}\n\n{message}"
+    return pytest.CollectReport(
+        collector.nodeid, "failed", message, [], sections=report.sections
     )

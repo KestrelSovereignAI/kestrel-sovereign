@@ -4,6 +4,12 @@ The SDK defines the wire contract.  This module owns provider discovery,
 quote selection, crash-recoverable orchestration, and the hand-off to
 ``LLMService``.  Infrastructure packages remain responsible for all billable
 provider mutations and durable provider state.
+
+Terminal routing state is not permanent evidence of provider absence. Restore,
+status, release and replacement acquisition recheck the original provider; new
+cleanup debt can invalidate a terminal cache to RELEASING, never revive work or
+credentials. Missing or unavailable original evidence must not authorize a
+replacement provider or imply physical absence or financial closure.
 """
 
 from __future__ import annotations
@@ -321,9 +327,18 @@ _ALLOWED_TRANSITIONS: dict[InferenceLeaseState, frozenset[InferenceLeaseState]] 
             InferenceLeaseState.FAILED,
         }
     ),
-    InferenceLeaseState.FAILED: frozenset({InferenceLeaseState.FAILED}),
-    InferenceLeaseState.RELEASED: frozenset({InferenceLeaseState.RELEASED}),
-    InferenceLeaseState.EXPIRED: frozenset({InferenceLeaseState.EXPIRED}),
+    # Terminal routing state cannot certify permanent provider absence. A
+    # provider may invalidate old cleanup evidence after reconciliation, but
+    # must never revive terminal work or credentials.
+    InferenceLeaseState.FAILED: frozenset(
+        {InferenceLeaseState.FAILED, InferenceLeaseState.RELEASING}
+    ),
+    InferenceLeaseState.RELEASED: frozenset(
+        {InferenceLeaseState.RELEASED, InferenceLeaseState.RELEASING}
+    ),
+    InferenceLeaseState.EXPIRED: frozenset(
+        {InferenceLeaseState.EXPIRED, InferenceLeaseState.RELEASING}
+    ),
 }
 
 
@@ -427,6 +442,32 @@ class InferenceLeaseCoordinator:
             )
         return lease
 
+    async def _refresh_provider_lease(
+        self,
+        record: InferenceLeaseRecord,
+        *,
+        failure_context: str,
+    ) -> InferenceLease:
+        """Recheck original provider evidence without authorizing new work.
+
+        Work entry points retain their admission checks; exact-owned release
+        may reconcile cleanup without acquiring a replacement work admission.
+        Missing provider evidence is an error, never proof of absence.
+        """
+        previous = record.lease
+        if previous is None:
+            raise InferenceLeaseNotFoundError("inference lease has no provider identity")
+        provider = self._provider(record.provider_name)
+        try:
+            lease = await provider.status(self._owner_id, previous.lease_id)
+        except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
+            raise InferenceLeaseProvisioningError(
+                f"inference provider {record.provider_name!r} could not {failure_context}"
+            ) from exc
+        return await self._apply_provider_lease(record, lease)
+
     async def restore(self, payload: Mapping[str, Any] | None) -> InferenceLease | None:
         """Resume an interrupted acquire or reconcile a persisted lease."""
 
@@ -443,18 +484,15 @@ class InferenceLeaseCoordinator:
                 owner_id=self._owner_id,
             )
             self._record = record
-            if record.lease is not None and record.lease.is_terminal:
-                return record.lease
+            if record.lease is not None:
+                return await self._refresh_provider_lease(
+                    record,
+                    failure_context="reconcile persisted state",
+                )
             provider = self._provider(record.provider_name)
             try:
-                if record.lease is None:
-                    require_execution_work()
-                    lease = await provider.acquire(record.request, record.quote)
-                else:
-                    lease = await provider.status(
-                        self._owner_id,
-                        record.lease.lease_id,
-                    )
+                require_execution_work()
+                lease = await provider.acquire(record.request, record.quote)
             except Exception as exc:
                 if is_execution_control_error(exc):
                     raise
@@ -533,7 +571,13 @@ class InferenceLeaseCoordinator:
                             "resume acquisition"
                         ) from exc
                     return await self._apply_provider_lease(previous, lease)
-                if not previous.lease.is_terminal:
+                lease = previous.lease
+                if lease.is_terminal:
+                    lease = await self._refresh_provider_lease(
+                        previous,
+                        failure_context="reconcile original lease before replacement",
+                    )
+                if not lease.is_terminal:
                     raise InferenceLeaseProvisioningError(
                         "release the current inference lease before acquiring another"
                     )
@@ -595,21 +639,11 @@ class InferenceLeaseCoordinator:
         async with self._lock:
             require_execution_work()
             record = self._record_for_lease(lease_id)
-            assert record.lease is not None
-            if record.lease.is_terminal:
-                return record.lease
-            provider = self._provider(record.provider_name)
-            try:
-                require_execution_work()
-                lease = await provider.status(self._owner_id, lease_id)
-            except Exception as exc:
-                if is_execution_control_error(exc):
-                    raise
-                raise InferenceLeaseProvisioningError(
-                    f"inference provider {record.provider_name!r} could not report "
-                    "lease status"
-                ) from exc
-            return await self._apply_provider_lease(record, lease)
+            require_execution_work()
+            return await self._refresh_provider_lease(
+                record,
+                failure_context="report lease status",
+            )
 
     async def touch(self, lease_id: str) -> InferenceLease:
         """Renew a ready lease from real LLM traffic and persist the result.
@@ -660,24 +694,31 @@ class InferenceLeaseCoordinator:
         async with self._lock:
             record = self._record_for_lease(lease_id)
             assert record.lease is not None
-            if record.lease.state in {
+            current = record.lease
+            if current.is_terminal:
+                current = await self._refresh_provider_lease(
+                    record,
+                    failure_context="reconcile original cleanup state",
+                )
+            if current.state in {
                 InferenceLeaseState.RELEASED,
                 InferenceLeaseState.EXPIRED,
             }:
-                return record.lease
+                return current
 
             await self._llm_service.deactivate_inference_lease(
                 lease_id,
                 require_active=False,
             )
             releasing = replace(
-                record.lease,
+                current,
                 state=InferenceLeaseState.RELEASING,
                 route=None,
                 failure=None,
                 updated_at=datetime.now(UTC),
             )
-            self._record = replace(record, lease=releasing)
+            releasing_record = replace(record, lease=releasing)
+            self._record = releasing_record
             await self._persist()
             provider = self._provider(record.provider_name)
             try:
@@ -689,7 +730,7 @@ class InferenceLeaseCoordinator:
                     f"inference provider {record.provider_name!r} could not release "
                     "capacity; retry release with the same lease_id"
                 ) from exc
-            return await self._apply_provider_lease(self._record, lease)
+            return await self._apply_provider_lease(releasing_record, lease)
 
 
 __all__ = [
