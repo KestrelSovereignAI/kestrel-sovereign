@@ -3979,7 +3979,12 @@ class SignalDispatcher:
         recovered = rehydrate(event, dispatch_signal=dispatch_signal)
         if inspect.isawaitable(recovered):
             recovered = await recovered
-        return recovered
+        if recovered is None:
+            return None
+        # The source rehydrates payload/caller data, not attempt authority.
+        # First-party hooks already preserve this fresh identity; enforce it
+        # here for supported legacy hooks as well.
+        return replace(recovered, id=dispatch_signal.id, arrived_at=dispatch_signal.arrived_at)
 
     @staticmethod
     def _durable_retry_seed(event) -> Signal:
@@ -5306,7 +5311,7 @@ class SignalDispatcher:
                             if lease_loss_error is not None:
                                 raise lease_loss_error
                             result = self._failure_result(
-                                signal,
+                                routing_signal,
                                 start,
                                 error=(
                                     f"{lease_loss_reason}; cognition cancellation "
@@ -5371,7 +5376,7 @@ class SignalDispatcher:
             # exact lease may still be valid, so release it now rather than
             # waiting for expiry.  The final audit remains one lease-loss row.
             failure = self._failure_result(
-                signal,
+                routing_signal,
                 start,
                 error=lease_loss_reason or "Durable cognition routing was cancelled",
             )
@@ -5449,7 +5454,7 @@ class SignalDispatcher:
                 return result
 
             ack_rejected = self._failure_result(
-                signal,
+                routing_signal,
                 start,
                 error=(
                     "Cognition completed, but its exact durable delivery ACK "
@@ -7694,6 +7699,11 @@ class SignalDispatcher:
         outcome = await await_owned_task(writer)
         from kestrel_sovereign.execution_custody import execution_observation_error
         exc = execution_observation_error(opening, outcome.error)
+        committed = journal is not None and journal._phase == 'acknowledged'
+        if committed:
+            exc = journal.retain_committed(exc, observer=True)
+        withdrawal = (journal.retain_committed(outcome.cancellation, observer=True)
+            if journal is not None else outcome.cancellation)
         if exc is not None:
             # A dropped audit row is a loss, and a loss that leaves no record
             # anyone reads is indistinguishable from no loss at all (#2660):
@@ -7705,16 +7715,18 @@ class SignalDispatcher:
             # durable one, so recording the failure durably would need the
             # backend that is unavailable. This is an observability signal,
             # not a second audit trail.
-            self._record_log_write_failure(signal.id, exc)
-            logger.error("Failed to write signal_log entry for %s", signal.id,
+            if not committed:
+                self._record_log_write_failure(signal.id, exc)
+            logger.error("Signal outcome observation failed after COMMIT for %s" if committed
+                         else "Failed to write signal_log entry for %s", signal.id,
                          exc_info=(type(exc), exc, exc.__traceback__))
-            if is_execution_control_error(exc):
+            if is_execution_control_error(exc) or execution_commit_outcome(exc) is not None:
                 self._retain_durable_writer_control(exc)
-                raise execution_finite_error(exc, outcome.cancellation)
+                raise execution_finite_error(exc, withdrawal)
             if not isinstance(exc, Exception):
-                raise execution_finite_error(exc, outcome.cancellation)
-        if outcome.cancellation is not None:
-            raise journal.retain_committed(outcome.cancellation, observer=True) if journal is not None else outcome.cancellation
+                raise execution_finite_error(exc, withdrawal)
+        if withdrawal is not None:
+            raise withdrawal
 
     def _record_log_write_failure(
         self, signal_id: str, error: BaseException
@@ -7816,7 +7828,7 @@ class SignalDispatcher:
             self._record_surface(signal.id, SURFACE_EMIT_FAILED)
             if is_execution_control_error(error) or not isinstance(error, Exception):
                 if journal is not None:
-                    raise journal.retain_committed(error)
+                    raise journal.retain_committed(error, observer=True)
                 raise
             logger.exception(
                 "Failed to emit signal_completed UI event for %s", signal.id

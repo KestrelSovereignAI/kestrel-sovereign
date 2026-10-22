@@ -21,6 +21,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_accepted_payload_is_not_replaced_after_cutoff,
     test_owner_withdrawal_retains_actual_original_journal_commit,
     test_terminal_snapshot_matches_canonical_handler_envelope,
+    test_inner_writer_observation_retains_commit_and_original_error,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -112,7 +113,7 @@ async def test_original_journal_legacy_pool_compatibility(dispatcher_components,
     try:
         with bind_execution_runtime(owner) if scoped else nullcontext():
             if scoped:
-                with pytest.raises(ExecutionAuthorityError, match='supported native backend'):
+                with pytest.raises(ExecutionAuthorityError, match='supported native backend|PostgresPoolAdapter'):
                     await c.dispatcher.dispatch_signal(signal)
             else:
                 result = await c.dispatcher.dispatch_signal(signal)

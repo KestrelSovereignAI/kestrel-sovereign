@@ -417,22 +417,24 @@ async def test_handler_cannot_terminalize_through_scheduler_after_cutoff(dispatc
             assert is_execution_control_error(error)
 
 
-@pytest.mark.parametrize('boundary', ['before_emit', 'emitter_denial'])
+@pytest.mark.parametrize('boundary', ['before_emit', 'emitter_denial', 'emitter_cancel'])
 async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_components, monkeypatch, boundary):
     from dataclasses import replace
     from kestrel_sdk.signals import Visibility
     from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error, _explicit_control_chain
+    from kestrel_sovereign._async_ownership import create_owned_task
     c = dispatcher_components
     entered, release = asyncio.Event(), asyncio.Event()
     emitted = []
     scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
     original = c.dispatcher._write_outcome_log
     task = None
-    original_denial = ExecutionAuthorityError('original emitter denial')
+    original_denial = (asyncio.CancelledError('original emitter withdrawal') if boundary == 'emitter_cancel'
+                       else ExecutionAuthorityError('original emitter denial'))
 
     async def emit(*args):
         emitted.append(args)
-        if boundary == 'emitter_denial':
+        if boundary in ('emitter_denial', 'emitter_cancel'):
             raise original_denial
 
     async def held_writer(*args, **kwargs):
@@ -446,18 +448,23 @@ async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_co
     signal = replace(_signal('visible.audit'), visibility=Visibility.USER_VISIBLE)
     try:
         with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
-            task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+            task = create_owned_task(c.dispatcher.dispatch_signal(signal))
             await asyncio.wait_for(entered.wait(), 2)
             if boundary == 'before_emit':
                 scope.revoke('original work cutoff before visible journal')
             release.set()
             outcome = await await_owned_task(task)
-            assert is_execution_control_error(outcome.error)
+            assert outcome.error is not None
+            if boundary != 'emitter_cancel':
+                assert is_execution_control_error(outcome.error)
             assert execution_commit_outcome(outcome.error) == 'committed'
-            if boundary == 'emitter_denial':
+            if boundary in ('emitter_denial', 'emitter_cancel'):
                 assert any(error is original_denial for error in _explicit_control_chain(outcome.error))
         assert len(emitted) == (0 if boundary == 'before_emit' else 1)
         assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+        if boundary == 'emitter_cancel':
+            assert c.dispatcher._outcome_log_control_error is None
+            assert (await c.dispatcher.dispatch_signal(_signal('visible.audit'))).action_result is not None
     finally:
         release.set()
         if task is not None:
@@ -466,6 +473,102 @@ async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_co
             await c.dispatcher.shutdown_durable_delivery()
         except BaseException as error:
             assert is_execution_control_error(error)
+
+
+@pytest.mark.parametrize('registered_before_refusal', [False, True])
+async def test_inner_writer_observation_retains_commit_and_original_error(dispatcher_components, registered_before_refusal):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, _explicit_control_chain, _acknowledged_commits
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+    c = dispatcher_components
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    original = RuntimeError('original inner writer observation refused')
+    accepted = []
+
+    class RejectObservation(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'mark_complete':
+                if registered_before_refusal:
+                    super().add_done_callback(callback, context=context)
+                raise original
+            return super().add_done_callback(callback, context=context)
+
+    def factory(loop, coro, **kwargs):
+        operation = _actual_operation(coro)
+        if getattr(operation, 'cr_code', None) is c.dispatcher._write_outcome_log.__func__.__code__:
+            task = RejectObservation(coro, loop=loop, **kwargs)
+            accepted.append(task)
+            return task
+        return previous(loop, coro, **kwargs) if previous else asyncio.Task(coro, loop=loop, **kwargs)
+
+    c.registry.register(_action_reg('inner.observation.audit'))
+    signal = _signal('inner.observation.audit')
+    loop.set_task_factory(factory)
+    try:
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(signal)
+    finally:
+        loop.set_task_factory(previous)
+    assert accepted and all(task.done() for task in accepted)
+    assert any(error is original for error in _explicit_control_chain(caught.value))
+    assert execution_commit_outcome(caught.value) == 'committed'
+    if c.backend.backend_type == 'postgres':
+        assert _acknowledged_commits(caught.value)
+        assert all(receipt.retired for receipt in _acknowledged_commits(caught.value))
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+    assert c.dispatcher._log_write_failures == 0
+    assert c.dispatcher._outcome_log_control_error is None
+    assert (await c.dispatcher.dispatch_signal(_signal('inner.observation.audit'))).action_result is not None
+
+
+@pytest.mark.parametrize('stale_hook_identity', [False, True])
+async def test_ack_refusal_journals_distinct_redelivery_attempt(tmp_path, stale_hook_identity):
+    import time
+    from kestrel_sovereign.signals import DurableConsumerRegistration
+    from tests.unit.test_durable_signal_delivery import _channel_dispatcher, _channel_signal, _close
+    from kestrel_sovereign.signals.sources.channels import (
+        DURABLE_COGNITION_CONSUMER_ID, DURABLE_COGNITION_MARKER, DURABLE_COGNITION_MARKER_VALUE,
+    )
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'ack-refused-audit.db', 'did:agent:ack-journal')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=0)
+    effects = []
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        canonical = _channel_signal(agent.did, 'original-ack-refusal')
+        persisted = await dispatcher._durable_store.persist_signal(canonical, agent_id=agent.did,
+            source_event_id='original-ack-refusal', retention_days=7,
+            caller_identity=None if stale_hook_identity else dispatcher._protect_durable_caller_identity(canonical))
+        delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
+            event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
+        if stale_hook_identity:
+            agent.rehydrate_durable_cognition_signal = lambda event, *, dispatch_signal: canonical
+            agent.durable_rehydratable_sources = frozenset({'channel.message'})
+
+        async def completed_cognition(prompt):
+            effects.append('genuinely completed')
+            # Actual original-token NACK means the later actual ACK CAS
+            # cannot succeed; no fabricated clock or boolean ACK stub.
+            assert await dispatcher.nack_durable_delivery(consumer_id=consumer.consumer_id,
+                delivery_id=delivery.delivery_id, lease_token=delivery.lease_token,
+                error='original lease released after effect before ACK')
+            return 'completed'
+
+        agent.process_input = completed_cognition
+        incoming = dispatcher._durable_retry_seed(delivery.event)
+        assert incoming.id != canonical.id
+        result = await dispatcher._route_durable_cognition_delivery(incoming,
+            dispatcher._registry.get(incoming.source), time.monotonic(), persisted_event_id=delivery.event_id,
+            consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
+            use_live_signal=False, claimed_delivery=delivery)
+        await dispatcher._drain_outcome_logs_for_signal(result.signal_id)
+        assert effects == ['genuinely completed']
+        assert 'ACK' in result.error
+        assert await backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (result.signal_id,)) == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
 
 
 async def test_accepted_payload_is_not_replaced_after_cutoff(dispatcher_components):
