@@ -43,3 +43,26 @@ test('ordinary native rejection remains the same public and native failure', asy
   assert.equal(record.reason, original);
   assert.equal(record.publicReason, original);
 });
+
+for (const rejected of [false, true]) {
+test(`actual public race outcome survives later close observer rejected=${rejected}`, async () => {
+  const settlement = (await factory())();
+  const native = new Error('actual native race winner');
+  const later = new Error('subsequent observer close');
+  let finish;
+  const operation = new Promise((resolve, reject) => { finish = rejected ? reject : resolve; });
+  const caller = settlement.run(() => operation);
+  const publicOutcome = caller.then(value => ({ value }), error => ({ error }));
+  // Let nativeStartup adopt the actual operation before adding this observer.
+  await Promise.resolve();
+  await Promise.resolve();
+  operation.then(() => settlement.close(later), () => settlement.close(later));
+  finish(native);
+  const actualPublic = await publicOutcome;
+  const [record] = await settlement.whenSettled();
+  assert.equal(rejected ? actualPublic.error : actualPublic.value, native);
+  assert.equal(record.status, rejected ? 'rejected' : 'fulfilled');
+  assert.equal(record.publicReason, rejected ? native : null,
+    'public classification must be the actual race outcome, not later close state');
+});
+}

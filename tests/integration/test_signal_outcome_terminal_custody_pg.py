@@ -36,6 +36,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_projection_retained_alias_cannot_rewrite_actual_result,
     test_application_metaclass_cannot_admit_a_foreign_native_backend,
     test_resident_completed_journal_receipt_reaches_withdrawn_ingress,
+    test_application_string_equality_cannot_substitute_accepted_signal_id,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -46,6 +47,97 @@ async def _fresh_journal_pool(original, **options):
     import asyncpg
     options.setdefault('connection_class', original._connection_class)
     return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
+
+
+@pytest.mark.parametrize('phase', ['rollback', 'reset'])
+async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exit(dispatcher_components, monkeypatch, phase):
+    import asyncpg
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_commit_outcome, execution_cleanup_debts
+    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    c.registry.register(_action_reg('native.failed.insert.withdrawal'))
+    await c.dispatcher.dispatch_signal(_signal('native.failed.insert.withdrawal'))
+    await c.backend.execute('CREATE UNIQUE INDEX terminal_status_unique ON signal_log(status)')
+    entered, release = asyncio.Event(), asyncio.Event()
+    writers, exits = [], []
+    async def pause_actual_exit():
+        journal = c.dispatcher._original_outcome_writer.get()
+        if journal is not None and journal._phase == 'submitted':
+            writers.append(journal._writer_admission.task)
+            exits.append(asyncio.current_task())
+            entered.set()
+            await release.wait()
+    if phase == 'rollback':
+        original_exit = asyncpg.transaction.Transaction.__aexit__
+        async def held_exit(transaction, exc_type, exc, tb):
+            result = await original_exit(transaction, exc_type, exc, tb)
+            if exc is not None:
+                await pause_actual_exit()
+            return result
+        monkeypatch.setattr(asyncpg.transaction.Transaction, '__aexit__', held_exit)
+    else:
+        original_reset = NativeJournalPostgresConnection.reset
+        async def held_reset(connection, *args, **kwargs):
+            result = await original_reset(connection, *args, **kwargs)
+            await pause_actual_exit()
+            return result
+        monkeypatch.setattr(NativeJournalPostgresConnection, 'reset', held_reset)
+    task = create_owned_task(c.dispatcher.dispatch_signal(_signal('native.failed.insert.withdrawal')))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        writers[0].cancel('actual terminal writer withdrawal')
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        outcome = await await_owned_task(task)
+    assert exits and all(owner.done() for owner in exits), 'original native exit was not physically joined'
+    errors = tuple(_explicit_control_chain(outcome.error))
+    assert any(type(error) is asyncio.CancelledError and error.args == ('actual terminal writer withdrawal',)
+               for error in errors), 'ordinary SQL failure swallowed actual writer cancellation'
+    assert any(isinstance(error, asyncpg.UniqueViolationError) for error in errors)
+    assert execution_commit_outcome(outcome.error) is None
+    assert not execution_cleanup_debts(outcome.error), 'healthy rollback/reset is not native uncertainty'
+
+
+@pytest.mark.parametrize('setting', ['ROLE', 'SESSION AUTHORIZATION'])
+async def test_original_journal_does_not_inherit_reused_session_principal(dispatcher_components, native_pg, setting):
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    role = schema + '_journal_role'
+    await control.execute(f'CREATE ROLE "{role}"')
+    await control.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"')
+    await control.execute(f'GRANT SELECT,INSERT ON "{schema}".signal_log TO "{role}"')
+    original_pool = c.backend._pool
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    c.backend._pool = pool
+    original_user = await control.fetchval('SELECT CURRENT_USER')
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    observed = []
+    async def handler(payload):
+        async with pool.acquire() as connection:
+            await connection.execute(f'SET {setting} "{role}"')
+            assert await connection.fetchval('SELECT CURRENT_USER') == role
+        async with pool.acquire() as connection:
+            observed.append(await connection.fetchval('SELECT CURRENT_USER'))
+        scope.revoke('actual cutoff after changing authorized session principal')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.reused.principal', handler=handler))
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            await c.dispatcher.dispatch_signal(_signal('native.reused.principal'))
+        assert observed == [original_user], 'native reset silently retained replacement principal'
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 1
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+        await control.execute(f'DROP OWNED BY "{role}"')
+        await control.execute(f'DROP ROLE "{role}"')
 
 
 @pytest.mark.parametrize('asynchronous', [False, True])
