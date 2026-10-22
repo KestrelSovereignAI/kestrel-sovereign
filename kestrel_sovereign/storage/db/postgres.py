@@ -2314,7 +2314,7 @@ class PostgresBackend(DatabaseBackend):
                     native._begin_original_journal(state)
                     program_sealed = True
                 except NativeJournalConfigurationError as error:
-                    native.terminate()
+                    native._retire_original_journal_refusal()
                     raise journal.write_refusal('native_programs_changed') from error
                 journal._postgres_session = native
                 if await native._original_journal_principal() != journal._postgres_pool.principal:

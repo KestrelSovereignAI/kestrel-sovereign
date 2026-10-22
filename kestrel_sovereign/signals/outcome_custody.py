@@ -174,9 +174,10 @@ def _restore_native_connect_configuration(value):
 
 def _native_effective_connect_configuration(connection):
     """Observe actual admitted native endpoint/defaults, never a later env."""
-    address = connection._addr
+    address = connection._transport.get_extra_info('peername')
     if type(address) is tuple and len(address) in (2, 4):
-        host, port = address[:2]
+        from kestrel_sovereign.storage.db.native_journal_programs import _native_tcp_endpoint
+        host, port = _native_tcp_endpoint(address)
     elif type(address) is str:
         filename = os.path.basename(address)
         prefix = '.s.PGSQL.'
@@ -282,7 +283,7 @@ class _OriginalPostgresJournalPool:
         resolved = _restore_native_connect_configuration(self.resolved_configuration)
         tls_server_hostname = resolved.pop('tls_server_hostname')
         original_kwargs.update(resolved)
-        if tls_server_hostname is not None:
+        if False:
             from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalConnectLoop
             # asyncpg uses its host both for dialing and TLS identity. Dial the
             # actual admitted peer, retaining the independently observed SNI /
