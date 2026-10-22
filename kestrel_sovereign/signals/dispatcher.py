@@ -3027,7 +3027,11 @@ class SignalDispatcher:
                 cleanup = error
         if journal is not None:
             original = journal.retain_committed(original)
-        return execution_finite_error(original, cleanup, retain_originals=True)
+        if all(error is None or type(error) is asyncio.CancelledError for error in (original, cleanup)):
+            # Pure ordinary Stop retains its legacy cancellation shape. An
+            # independent failure must not be selected away by that policy.
+            return execution_finite_error(original, cleanup, retain_originals=True)
+        return execution_observation_error(original, cleanup)
 
     @asynccontextmanager
     async def _joined_original_outcome_scope(self, signal_id):
@@ -3060,7 +3064,7 @@ class SignalDispatcher:
             observed_error = outcome.error
             if journal is not None and observed_error is not None and not journal.has_acknowledged_commit():
                 self._record_original_outcome_loss(journal, journal._identity[0], observed_error)
-                if (isinstance(observed_error, Exception) and not is_execution_control_error(observed_error)
+                if (outcome.cancellation is None and isinstance(observed_error, Exception) and not is_execution_control_error(observed_error)
                         and execution_commit_outcome(observed_error) is None):
                     observed_error = None  # ordinary audit loss, not a failed handler
             originals.extend((journal.retain_committed(observed_error),
@@ -3071,7 +3075,7 @@ class SignalDispatcher:
                 complete, publication_error, _ = reconciliation
                 if journal is not None and publication_error is not None and not journal.has_acknowledged_commit():
                     self._record_original_outcome_loss(journal, journal._identity[0], publication_error)
-                    if (isinstance(publication_error, Exception) and not is_execution_control_error(publication_error)
+                    if (outcome.cancellation is None and isinstance(publication_error, Exception) and not is_execution_control_error(publication_error)
                             and execution_commit_outcome(publication_error) is None):
                         publication_error = None
                 publication_error = (journal.retain_committed(publication_error)
@@ -3083,7 +3087,10 @@ class SignalDispatcher:
             # This local writer batch can be ordinary while a later repair
             # supplies native control to the SAME shutdown boundary.
             finite_errors.extend(error for error in (self._outcome_log_control_error, *originals) if error is not None)
-        error = execution_finite_error(self._outcome_log_control_error, *originals)
+        error = (execution_finite_error(self._outcome_log_control_error, *originals)
+            if all(item is None or type(item) is asyncio.CancelledError
+                   for item in (self._outcome_log_control_error, *originals))
+            else execution_observation_error(self._outcome_log_control_error, *originals))
         if error is not None:
             raise error
 
@@ -7860,9 +7867,9 @@ class SignalDispatcher:
                          exc_info=(type(exc), exc, exc.__traceback__))
             if is_execution_control_error(exc) or execution_commit_outcome(exc) is not None:
                 self._retain_durable_writer_control(exc)
-                raise execution_finite_error(exc, withdrawal)
-            if not isinstance(exc, Exception):
-                raise execution_finite_error(exc, withdrawal)
+                raise execution_observation_error(exc, withdrawal)
+            if not isinstance(exc, Exception) or withdrawal is not None:
+                raise execution_observation_error(exc, withdrawal)
         if withdrawal is not None:
             raise withdrawal
 

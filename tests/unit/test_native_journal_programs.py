@@ -60,6 +60,24 @@ def test_native_postgres_proof_targets_only_original_physical_relation():
     assert 'FROM main.signal_log WHERE ' in SignalLogStore._outcome_match_query('main.signal_log', postgres=False)
 
 
+def test_sqlite_native_commit_rechecks_durability_in_same_worker_operation():
+    native = _NativeJournalSQLiteConnection(':memory:')
+    try:
+        native.execute('CREATE TABLE original_effect(value TEXT)')
+        native.commit()
+        native._begin_original_journal()
+        native.execute("INSERT INTO original_effect VALUES('genuine')")
+        current = native.execute('PRAGMA fullfsync').fetchone()[0]
+        native.execute('PRAGMA fullfsync=' + str(1 - current)).close()
+        with pytest.raises(NativeJournalConfigurationError):
+            native.commit()
+        assert native.in_transaction, 'configuration refusal must happen before actual COMMIT'
+        native.rollback()
+        assert native.execute('SELECT COUNT(*) FROM original_effect').fetchone() == (0,)
+    finally:
+        native.close()
+
+
 def test_native_connect_recipe_detaches_nested_values_without_application_hooks():
     from kestrel_sovereign.signals.outcome_custody import _freeze_native_connect_configuration, _restore_native_connect_configuration
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError

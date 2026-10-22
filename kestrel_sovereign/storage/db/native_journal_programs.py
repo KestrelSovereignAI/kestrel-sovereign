@@ -21,6 +21,10 @@ class NativeJournalConfigurationError(RuntimeError):
     """The native connection cannot enter/change an original journal profile."""
 
 
+class NativeJournalDurabilityRefusal(NativeJournalConfigurationError):
+    """Native preflight refused BEFORE the original sqlite COMMIT call."""
+
+
 def _register_program(connection):
     if connection._journal_program_seal is not None:
         raise NativeJournalConfigurationError('Native program configuration is fenced by an original journal')
@@ -127,7 +131,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         # write guard. Check+seal+BEGIN run in one native worker operation.
         if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
             raise NativeJournalConfigurationError('Original journal requires a plain native SQLite connection')
-        self._journal_program_seal = object()
+        self._journal_program_seal = self._original_journal_durability()
         try:
             cursor = super().execute('BEGIN IMMEDIATE')
             cursor.close()
@@ -136,7 +140,29 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
                 self._journal_program_seal = None
             raise
 
+    def _original_journal_durability(self):
+        # Fixed native reads bypass application cursor/row factories. Values
+        # are sampled on the SQLite worker, never from a thread-affine getter
+        # on the event loop. No SQL text comes from application configuration.
+        cursor = super().cursor(factory=sqlite3.Cursor)
+        cursor.row_factory = None
+        try:
+            values = []
+            for name in ('journal_mode', 'synchronous', 'fullfsync',
+                         'checkpoint_fullfsync', 'wal_autocheckpoint'):
+                cursor.execute('PRAGMA main.' + name)
+                row = cursor.fetchone()
+                if row is None or len(row) != 1 or not _has_exact_native_type(row[0], str, int):
+                    raise NativeJournalConfigurationError('Original native durability configuration is unsupported')
+                values.append(row[0])
+            return tuple(values)
+        finally:
+            cursor.close()
+
     def commit(self):
+        if (self._journal_program_seal is not None
+                and self._original_journal_durability() != self._journal_program_seal):
+            raise NativeJournalDurabilityRefusal('Original journal durability changed before native COMMIT')
         result = super().commit()
         if self._journal_program_seal is not None and self.in_transaction:
             raise NativeJournalConfigurationError('Original native journal COMMIT did not end its transaction')

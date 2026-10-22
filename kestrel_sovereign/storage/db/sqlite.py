@@ -2171,6 +2171,11 @@ class SQLiteBackend(DatabaseBackend):
         try:
             await conn.commit()
         except BaseException as error:
+            from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalDurabilityRefusal
+            if original_outcome is not None and type(error) is NativeJournalDurabilityRefusal:
+                # This exact native preflight never called COMMIT. Retain the
+                # actual writer through rollback; do not invent lost-ACK debt.
+                raise original_outcome.write_refusal('durability_changed') from error
             # aiosqlite queues COMMIT on its native worker. A lost await/ACK
             # cannot prove rollback; latch every original admission first.
             outcome = execution_commit_outcome(error) or "unknown"
@@ -2271,7 +2276,7 @@ class SQLiteBackend(DatabaseBackend):
                         sql = cursor.fetchone()[0]
                         if not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
                             return None
-                return (version, *row, columns)
+                return (version, *row, columns, native._original_journal_durability())
             finally:
                 try:
                     if snapshot:

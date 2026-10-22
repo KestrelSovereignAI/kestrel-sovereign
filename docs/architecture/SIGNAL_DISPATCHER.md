@@ -938,6 +938,16 @@ is not fabricated commit uncertainty, and audit-loss handling cannot swallow
 that withdrawal. Accepted signal identity uses canonical native text/enum values,
 never application string equality or hashing as evidence.
 
+SQLite admission also captures its actual journal/synchronous/full-fsync/WAL
+checkpoint configuration. The original native relation checks compare that
+configuration before and after INSERT, and native COMMIT rechecks it atomically
+on the same worker before invoking SQLite COMMIT. A changed configuration refuses
+the row; a known pre-COMMIT refusal is rolled back, not labeled a lost ACK. This
+preserves the accepted backend settings; it does not strengthen SQLite's own
+power-loss guarantees. PostgreSQL admission and both locked relation checks also
+require the actual native heap table access method and native heap handler,
+not merely a permanent relation whose columns happen to match.
+
 Core-owned SQLite connections likewise track native callback/function/extension
 registration. A customized session remains ineligible for original journals until
 reconnect, including after callback removal. This is a supported configuration
