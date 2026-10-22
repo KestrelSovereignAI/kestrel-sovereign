@@ -2231,6 +2231,7 @@ class SQLiteBackend(DatabaseBackend):
             if (query is not original_outcome._query
                     or params is not original_outcome._entry.values):
                 raise ExecutionAuthorityError('Original native signal journal SQL differs')
+            original_outcome.require_sqlite_cleanup(self, conn)
         guard = self._write_guard() if original_outcome is None else self._write_guard(original_outcome=original_outcome)
         async with guard:
             with self._write_operation():

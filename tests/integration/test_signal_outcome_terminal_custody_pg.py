@@ -39,7 +39,8 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
-async def test_postgres_original_journal_rejects_temporary_relation_at_admission(dispatcher_components, native_pg):
+@pytest.mark.parametrize('persistence', ['temporary', 'unlogged'])
+async def test_postgres_original_journal_rejects_temporary_relation_at_admission(dispatcher_components, native_pg, persistence):
     import asyncpg
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error, execution_commit_outcome
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
@@ -61,7 +62,10 @@ async def test_postgres_original_journal_rejects_temporary_relation_at_admission
     error = None
     try:
         with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
-            await c.backend.execute(f'CREATE TEMP TABLE signal_log (LIKE "{schema}".signal_log INCLUDING ALL)')
+            if persistence == 'temporary':
+                await c.backend.execute(f'CREATE TEMP TABLE signal_log (LIKE "{schema}".signal_log INCLUDING ALL)')
+            else:
+                await c.backend.execute(f'ALTER TABLE "{schema}".signal_log SET UNLOGGED')
             try:
                 await c.dispatcher.dispatch_signal(signal)
             except BaseException as caught:

@@ -28,6 +28,9 @@ async def setup_delivery(native_pg):
     agent = _Agent("original")
     dispatcher = SignalDispatcher(agent=agent, registry=SourceRegistry(),
                                   lock_manager=OrderedLockManager(), store=SignalLogStore(backend))
+    # Match production boot before exercising recovered native journal entry.
+    # The durable delivery ledger alone does not create the signal audit table.
+    await dispatcher._store.initialize()
     dispatcher._durable_delivery_owner = "dispatcher:original"
     await dispatcher.initialize_durable_delivery()
     await dispatcher._stop_runtime_owner_heartbeat()

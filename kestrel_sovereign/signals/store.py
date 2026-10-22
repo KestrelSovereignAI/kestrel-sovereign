@@ -284,7 +284,7 @@ class SignalLogStore(UnifiedStoreBase):
         # or a work admission. A queued transition wins before this shared
         # hold, or waits through original COMMIT/reset. Recheck under the hold.
         gate = journal._privacy_gate
-        if gate is not None and not isinstance(gate, DurablePersistenceGate):
+        if gate is not None and type(gate) is not DurablePersistenceGate:
             raise journal.privacy_refusal('unsupported_gate')
         protection = (gate._original_journal(journal._privacy_exclusive_hold)
             if gate is not None else optional_durable_persistence_gate(None))

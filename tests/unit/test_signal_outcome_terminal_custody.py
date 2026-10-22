@@ -29,6 +29,44 @@ class _OriginalWork:
         self.require_work()
 
 
+async def test_original_journal_refuses_overridden_native_privacy_gate(dispatcher_components):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error, _explicit_control_chain
+    from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+    c = dispatcher_components
+    entered = []
+    class OverriddenGate(DurablePersistenceGate):
+        @asynccontextmanager
+        async def _original_journal(self, exclusive_hold=None):
+            entered.append(True)
+            journal = c.dispatcher._original_outcome_writer.get()
+            journal.begin(c.backend)
+            await c.backend._commit_write(c.backend._connection, original_outcome=journal)
+            raise journal.privacy_refusal('overridden_gate_before_insert')
+            yield
+    gate = OverriddenGate()
+    class PrivacyAgent(type(c.agent)):
+        def _get_durable_persistence_gate(self):
+            return gate
+    c.agent.__class__ = PrivacyAgent
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        scope.revoke('actual original cutoff')
+        return {'genuine': True}
+    c.registry.register(_action_reg('overridden.gate', handler=handler))
+    signal = _signal('overridden.gate')
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(signal)
+    assert is_execution_control_error(caught.value)
+    assert execution_commit_outcome(caught.value) != 'committed'
+    assert any(getattr(item, 'reason', None) == 'unsupported_gate' for item in _explicit_control_chain(caught.value))
+    assert not entered
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM main.signal_log WHERE id=?', (signal.id,)) == 0
+    assert c.dispatcher._log_write_failures == 1
+    assert not c.dispatcher._outcome_log_tasks
+
+
 @pytest.mark.timeout(15, method='thread')
 async def test_privacy_getter_cannot_drive_empty_native_commit_helper(dispatcher_components):
     from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error

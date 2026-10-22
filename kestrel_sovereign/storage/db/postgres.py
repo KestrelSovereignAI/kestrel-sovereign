@@ -2217,6 +2217,7 @@ class PostgresBackend(DatabaseBackend):
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
             WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind IN ('r', 'p')
+              AND c.relpersistence = 'p'
         ''', name)
         if row is None or row['relation_name'] != 'signal_log':
             raise ExecutionAuthorityError('Original native signal journal relation unavailable')

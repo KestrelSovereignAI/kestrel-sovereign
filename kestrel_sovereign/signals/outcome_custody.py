@@ -133,7 +133,7 @@ class _OriginalSignalOutcome:
         from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
         self._privacy_exclusive_hold = (
             self._privacy_gate._capture_original_exclusive_hold()
-            if isinstance(self._privacy_gate, DurablePersistenceGate) else None)
+            if type(self._privacy_gate) is DurablePersistenceGate else None)
         self._registration = registration
         # Payload containers and privacy settings belong to acceptance, not
         # to a handler's mutable arguments after revocation.
@@ -159,6 +159,7 @@ class _OriginalSignalOutcome:
         self._audit_loss_recorded = False
         self._outer_admission = self._writer_admission = None
         self._phase = 'accepted'
+        self._observer_depth = 0
         self._require_backing()
         self._admission_key = _JOURNAL_ADMISSION
         dispatcher._accepted_signal_outcomes[acceptance] = self
@@ -189,40 +190,48 @@ class _OriginalSignalOutcome:
         return finite
 
     def _require_backing(self):
-        backend = self._backend
-        if (self._dispatcher._store is not self._store
-                or self._store._backend is not backend
-                or self._dispatcher._agent is not self._agent
-                or self._agent.did != self._agent_id
-                or getattr(self._agent, '_execution_custody', None) is not self._agent_scope
-                or getattr(backend, '_execution_custody', None) is not self._backend_scope):
-            raise ExecutionAuthorityError('Original signal journal runtime identity changed')
-        from kestrel_sovereign.storage.privacy_wrapper import (
-            _resolve_durable_persistence_gate, _resolve_privacy_policy_epoch,
-        )
+        # Identity/privacy getters are observers, never a reentrant native owner.
+        # Keep this on the actual capability (not a copyable ContextVar).
+        if self._observer_depth:
+            raise ExecutionAuthorityError('Original journal observer reentry refused')
+        self._observer_depth += 1
         try:
-            gate = _resolve_durable_persistence_gate(self._agent)
-            epoch = _resolve_privacy_policy_epoch(self._agent)
-        except BaseException as error:
-            raise self.privacy_refusal('identity_unavailable', error)
-        if gate is not self._privacy_gate or epoch != self._privacy_epoch:
-            raise self.privacy_refusal('superseded')
-        hold = self._privacy_exclusive_hold
-        if hold is not None and (gate._exclusive_hold is not hold or not hold.live):
-            raise self.privacy_refusal('exclusive_hold_retired')
-        if backend.backend_type == 'sqlite':
-            if (self._backing is None or backend._connection is not self._backing
-                    or backend.connection_generation != self._generation or backend._closing):
-                raise ExecutionAuthorityError('Original signal journal connection retired')
-            backend.assert_connected_file_still_valid()
-        else:
-            if self._backing is None or backend._pool is not self._backing:
-                raise ExecutionAuthorityError('Original signal journal pool retired')
-            self._postgres_pool.require_original(self._backing)
+            backend = self._backend
+            if (self._dispatcher._store is not self._store
+                    or self._store._backend is not backend
+                    or self._dispatcher._agent is not self._agent
+                    or self._agent.did != self._agent_id
+                    or getattr(self._agent, '_execution_custody', None) is not self._agent_scope
+                    or getattr(backend, '_execution_custody', None) is not self._backend_scope):
+                raise ExecutionAuthorityError('Original signal journal runtime identity changed')
+            from kestrel_sovereign.storage.privacy_wrapper import (
+                _resolve_durable_persistence_gate, _resolve_privacy_policy_epoch,
+            )
+            try:
+                gate = _resolve_durable_persistence_gate(self._agent)
+                epoch = _resolve_privacy_policy_epoch(self._agent)
+            except BaseException as error:
+                raise self.privacy_refusal('identity_unavailable', error)
+            if gate is not self._privacy_gate or epoch != self._privacy_epoch:
+                raise self.privacy_refusal('superseded')
+            hold = self._privacy_exclusive_hold
+            if hold is not None and (gate._exclusive_hold is not hold or not hold.live):
+                raise self.privacy_refusal('exclusive_hold_retired')
+            if backend.backend_type == 'sqlite':
+                if (self._backing is None or backend._connection is not self._backing
+                        or backend.connection_generation != self._generation or backend._closing):
+                    raise ExecutionAuthorityError('Original signal journal connection retired')
+                backend.assert_connected_file_still_valid()
+            else:
+                if self._backing is None or backend._pool is not self._backing:
+                    raise ExecutionAuthorityError('Original signal journal pool retired')
+                self._postgres_pool.require_original(self._backing)
+        finally:
+            self._observer_depth -= 1
 
     def require_preparation(self, result):
         """Check the sealed return before reservation or callback reentrancy."""
-        if (asyncio.current_task() is not self._acceptance.owner
+        if (self._observer_depth or asyncio.current_task() is not self._acceptance.owner
                 or self._phase != 'accepted'
                 or result is not self._completed_result
                 or self._dispatcher._accepted_signal_outcomes.get(self._acceptance) is not self):
@@ -249,6 +258,7 @@ class _OriginalSignalOutcome:
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         if (type(self) is not _OriginalSignalOutcome
                 or getattr(self, '_admission_key', None) is not _JOURNAL_ADMISSION
+                or self._observer_depth
                 or self._dispatcher._accepted_signal_outcomes.get(self._acceptance) is not self
                 or backend is not self._backend
                 or type(self._outer_admission) is not OwnedTaskAdmission
@@ -283,7 +293,7 @@ class _OriginalSignalOutcome:
     def require_sqlite_cleanup(self, backend, connection):
         """Only this submitted writer's fixed connection; no fresh work grant."""
         from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-        if (type(backend) is not SQLiteBackend
+        if (self._observer_depth or type(backend) is not SQLiteBackend
                 or backend is not self._backend or connection is not self._backing
                 or self._phase != 'submitted'
                 or self._writer_admission is None
