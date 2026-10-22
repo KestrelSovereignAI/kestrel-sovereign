@@ -172,7 +172,7 @@ async def test_sqlite_external_commit_during_begin_wait_keeps_live_journal(dispa
     other = SQLiteBackend(c.backend.db_path)
     await other.connect()
     await other.execute('CREATE TABLE begin_wait_effect(value INTEGER)')
-    held, release, beginning = (asyncio.Event() for _ in range(3))
+    held, release, beginning, handler_entered = (asyncio.Event() for _ in range(4))
     native = c.backend._connection._conn
     original_begin = _NativeJournalSQLiteConnection._begin_original_journal
     loop = asyncio.get_running_loop()
@@ -182,11 +182,13 @@ async def test_sqlite_external_commit_during_begin_wait_keeps_live_journal(dispa
         return original_begin(connection)
     monkeypatch.setattr(_NativeJournalSQLiteConnection, '_begin_original_journal', observe_begin)
     async def external_writer():
+        await handler_entered.wait()
         async with other.transaction():
             await other.execute('INSERT INTO begin_wait_effect VALUES(1)')
             held.set()
             await release.wait()
     async def handler(payload):
+        handler_entered.set()
         await held.wait()
         return {'genuine': True}
     c.registry.register(_action_reg('native.begin.wait', handler=handler))
@@ -211,6 +213,7 @@ async def test_sqlite_external_commit_during_begin_wait_keeps_live_journal(dispa
         assert c.dispatcher._log_write_failures == 0
         assert native._journal_program_seal is None
     finally:
+        handler_entered.set()
         release.set()
         await await_owned_task(writer)
         if dispatch is not None:
