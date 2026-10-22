@@ -379,7 +379,7 @@ class _OriginalSignalOutcome:
         if any(not issubclass(type(value), str) for value in values) or type(signal.mode) is not SignalMode:
             raise ExecutionAuthorityError('Original signal identity requires native text and mode')
         # No application equality/hash protocol may become identity evidence.
-        return (*(str.__str__(value) for value in values), signal.mode)
+        return (*values, signal.mode)
 
     def matches(self, signal, registration):
         return (self._identity == self._signal_identity(signal)

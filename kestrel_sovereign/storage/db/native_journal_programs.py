@@ -258,7 +258,7 @@ else:
             # RESET ALL deliberately excludes these PostgreSQL authorization
             # settings. A returned session must not lend its last user's role
             # or session authorization to another original native operation.
-            return 'RESET SESSION AUTHORIZATION;\nRESET ROLE;\n' + super().get_reset_query().replace(
+            return super().get_reset_query().replace(
                 'SELECT pg_advisory_unlock_all();',
                 'SELECT pg_catalog.pg_advisory_unlock_all();')
 
