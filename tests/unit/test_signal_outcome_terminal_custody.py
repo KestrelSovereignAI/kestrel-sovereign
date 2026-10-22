@@ -1649,7 +1649,8 @@ async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize('insert_failure', [False, True])
-async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(dispatcher_components, monkeypatch, insert_failure):
+@pytest.mark.parametrize('boundary', ['resident_done', 'enqueue_publication_before', 'enqueue_publication_after'])
+async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(dispatcher_components, monkeypatch, insert_failure, boundary):
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
     from kestrel_sovereign.signals import DurableConsumerRegistration
@@ -1705,22 +1706,65 @@ async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(disp
         residents.append(resident)
         def withdraw_after_actual_completion(completed):
             callbacks.append((completed.done(), bool(journals)))
-            waiting_ingress.cancel('actual ingress withdrawal after resident completion')
+            if boundary == 'resident_done':
+                waiting_ingress.cancel('actual ingress withdrawal after resident completion')
         resident.add_done_callback(withdraw_after_actual_completion)
         return resident
     monkeypatch.setattr(c.dispatcher, '_track_resident_durable_task', publish_resident)
     await c.dispatcher.register_durable_consumer(consumer)
     signal = _channel_signal(c.agent.did, 'resident-completed-receipt')
-    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
-        handle = await c.dispatcher.enqueue_durable_cognition(signal,
-            source_event_id='telegram:update:resident-completed-receipt', consumer_id=consumer.consumer_id)
-        outcome = await await_owned_task(handle.task)
+    rejected = RuntimeError('actual durable enqueue completion publication refused')
+    entered, release = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    class RejectRelease(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'release_live_admission':
+                if boundary.endswith('_after'):
+                    super().add_done_callback(callback, context=context)
+                raise rejected
+            return super().add_done_callback(callback, context=context)
+    async def held_actual_turn(prompt):
+        entered.set()
+        await release.wait()
+        return 'genuine completed resident turn'
+    caller = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            if boundary == 'resident_done':
+                handle = await c.dispatcher.enqueue_durable_cognition(signal,
+                    source_event_id='telegram:update:resident-completed-receipt', consumer_id=consumer.consumer_id)
+                outcome = await await_owned_task(handle.task)
+            else:
+                c.agent.process_input = held_actual_turn
+                loop.set_task_factory(lambda loop, coro, **kwargs: RejectRelease(coro, loop=loop, **kwargs))
+                caller = asyncio.create_task(c.dispatcher.enqueue_durable_cognition(signal,
+                    source_event_id='telegram:update:resident-completed-receipt', consumer_id=consumer.consumer_id))
+                await asyncio.wait_for(entered.wait(), 3)
+                loop.set_task_factory(previous)
+                if insert_failure:
+                    caller.cancel('actual enqueue caller withdrawal during physical join')
+                    await asyncio.sleep(0)
+                    assert not caller.done(), 'enqueue caller escaped its original dispatch'
+                release.set()
+                outcome = await await_owned_task(caller)
+    finally:
+        loop.set_task_factory(previous)
+        release.set()
+        if caller is not None:
+            await await_owned_task(caller)
     assert callbacks == [(True, True)]
     assert residents and all(owner.done() for owner in residents)
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == int(not insert_failure)
     errors = tuple(_explicit_control_chain(outcome.error))
-    assert any(type(error) is asyncio.CancelledError and error.args == ('actual ingress withdrawal after resident completion',)
-               for error in errors)
+    if boundary == 'resident_done' or insert_failure:
+        reason = ('actual ingress withdrawal after resident completion' if boundary == 'resident_done'
+                  else 'actual enqueue caller withdrawal during physical join')
+        assert any(type(error) is asyncio.CancelledError and error.args == (reason,) for error in errors)
+    if boundary != 'resident_done':
+        assert any(error is rejected for error in errors)
+        assert all(owner.done() for owner in c.agent.background_tasks)
+        assert signal.id not in c.dispatcher._live_durable_cognition_event_ids
     if insert_failure:
         assert len(body_errors) == 1
         assert any(error is body_errors[0] for error in errors), 'withdrawn ingress lost the original resident SQL failure'
