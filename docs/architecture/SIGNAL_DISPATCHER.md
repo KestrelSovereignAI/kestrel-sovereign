@@ -871,6 +871,14 @@ SQLite performs the proof on its same native worker without an application row
 factory and closes the proof cursor there. A transient post-COMMIT privacy
 observation preserves the real committed fact without adding uncertainty to
 otherwise healthy scopes; independent native failures retain their provenance.
+SQLite also captures the actual main-schema generation, catalog row/root page,
+table definition and column inventory at live admission. Its original write
+begins IMMEDIATE before rechecking that identity and main/TEMP trigger absence.
+Main-schema DDL across an invocation conservatively retires that original
+permission, even if the same table name or root page is reused; ordinary work
+can acquire a fresh invocation, never replay the completed original effect.
+The same write lock and native transaction exclude racing destination DDL
+through final row/identity proof and COMMIT/rollback.
 PostgreSQL original journals require the plain permanent audit table, not a
 partitioned parent, TEMP/UNLOGGED relation, or a table with triggers, rewrite
 rules, row-security policies, custom CHECKs, generated/identity columns,
@@ -886,6 +894,16 @@ flush alone cannot prove this: a trigger can re-defer another deletion until
 COMMIT. Unsupported shape before admission refuses routing; shape changed by
 the handler produces finite audit loss with the genuine result, not replay or
 native-source poisoning after healthy rollback.
+Privileged PostgreSQL catalog operators are schema-qualified; its standalone
+native transaction also pins search_path to pg_catalog for proof equality and
+restores the caller's setting on transaction exit. An application operator may
+not delete a row while claiming that its equality proof succeeded.
+
+At the real public/recovery return boundary, native journals detach terminal
+result data before invoking projections. A callback retaining the handler's
+original mutable dictionary cannot change the caller's result or audit digest.
+An uncopyable result fails finitely before projection, carrying the genuine
+completed return and one audit loss, not a failed/replayed handler.
 
 The original privacy-policy epoch and persistence-gate identity also remain
 fixed. The native INSERT retains that same gate through COMMIT/reset and

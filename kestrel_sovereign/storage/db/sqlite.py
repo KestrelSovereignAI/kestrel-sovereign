@@ -2207,6 +2207,61 @@ class SQLiteBackend(DatabaseBackend):
         conn = self._ensure_connected()
         return await self._execute_write_operation(conn, query, params)
 
+    async def _read_original_signal_outcome_relation(self, journal, *, capture=False):
+        from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
+        from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
+        if type(capture) is not bool or type(journal) is not _OriginalSignalOutcome:
+            raise ExecutionAuthorityError('Original SQLite journal metadata owner required')
+        def require_owner():
+            if capture:
+                if (journal._admission_key is not _JOURNAL_ADMISSION or journal._backend is not self
+                        or journal._phase != 'accepted' or journal._acceptance.owner is not asyncio.current_task()
+                        or journal._dispatcher._accepted_signal_outcomes.get(journal._acceptance) is not journal):
+                    raise ExecutionAuthorityError('Original SQLite acceptance metadata owner differs')
+                self._require_write_admission()
+                journal._require_backing()
+            else:
+                journal.require_original(self)
+                journal.require_sqlite_cleanup(self, journal._backing)
+        require_owner()
+        conn = journal._backing
+        def native_relation():
+            native = conn._conn
+            cursor = native.cursor()
+            cursor.row_factory = None
+            snapshot = not native.in_transaction
+            try:
+                if snapshot:
+                    cursor.execute('SAVEPOINT kestrel_original_outcome_catalog')
+                cursor.execute('PRAGMA main.schema_version')
+                version = cursor.fetchone()[0]
+                cursor.execute("SELECT rowid,rootpage,sql FROM main.sqlite_schema WHERE type='table' AND name='signal_log' COLLATE NOCASE")
+                row = cursor.fetchone()
+                if row is None or row[1] <= 0:
+                    return None
+                cursor.execute("SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE LIMIT 1")
+                if cursor.fetchone() is not None:
+                    return None
+                cursor.execute("PRAGMA main.table_xinfo('signal_log')")
+                columns = tuple(cursor.fetchall())
+                if {column[1] for column in columns} != set(_OUTCOME_COLUMNS) or any(column[6] for column in columns):
+                    return None
+                return (version, *row, columns)
+            finally:
+                try:
+                    if snapshot:
+                        cursor.execute('ROLLBACK TO kestrel_original_outcome_catalog')
+                        cursor.execute('RELEASE kestrel_original_outcome_catalog')
+                finally:
+                    cursor.close()
+        if capture:
+            async with self._write_guard():
+                result = await conn._execute(native_relation)
+        else:
+            result = await conn._execute(native_relation)
+        require_owner()
+        return result
+
     async def _verify_original_signal_outcome(self, conn, journal):
         journal.require_original(self)
         journal.require_sqlite_cleanup(self, conn)
@@ -2224,6 +2279,8 @@ class SQLiteBackend(DatabaseBackend):
         journal.require_original(self)
         if not matches:
             raise journal.write_refusal('row_missing_or_changed')
+        if await self._read_original_signal_outcome_relation(journal) != journal._sqlite_relation:
+            raise journal.write_refusal('destination_changed')
 
     async def _execute_write_operation(self, conn, query, params, *, original_outcome=None):
         if original_outcome is not None:
@@ -2236,6 +2293,13 @@ class SQLiteBackend(DatabaseBackend):
         async with guard:
             with self._write_operation():
                 try:
+                    if original_outcome is not None:
+                        # Exclude external DDL before inspecting the original
+                        # relation and BEFORE a trigger program could execute.
+                        await conn.execute('BEGIN IMMEDIATE')
+                        self._require_write_admission(original_outcome)
+                        if await self._read_original_signal_outcome_relation(original_outcome) != original_outcome._sqlite_relation:
+                            raise original_outcome.write_refusal('destination_changed')
                     cursor = await conn.execute(query, params)
                     self._require_write_admission(original_outcome)
                     if original_outcome is not None:

@@ -2216,30 +2216,30 @@ class PostgresBackend(DatabaseBackend):
                    n.oid::bigint AS namespace_oid, c.oid::bigint AS relation_oid,
                    n.nspname AS schema_name, c.relname AS relation_name,
                    ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute AS a
-                         WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+                         WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
                          ORDER BY a.attnum) AS column_names
             FROM pg_catalog.pg_class AS c
-            JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind = 'r'
-              AND c.relpersistence = 'p'
+            JOIN pg_catalog.pg_namespace AS n ON n.oid  OPERATOR(pg_catalog.=)  c.relnamespace
+            WHERE c.oid  OPERATOR(pg_catalog.=)  pg_catalog.to_regclass($1) AND c.relkind  OPERATOR(pg_catalog.=)  'r'
+              AND c.relpersistence  OPERATOR(pg_catalog.=)  'p'
               AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
-              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid=c.oid)
-              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class=c.oid)
-              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS k WHERE k.conrelid=c.oid AND k.contype='c')
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid OPERATOR(pg_catalog.=) c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class OPERATOR(pg_catalog.=) c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS k WHERE k.conrelid OPERATOR(pg_catalog.=) c.oid AND k.contype OPERATOR(pg_catalog.=) 'c')
               AND NOT EXISTS (
-                  SELECT 1 FROM pg_catalog.pg_index AS i WHERE i.indrelid=c.oid
+                  SELECT 1 FROM pg_catalog.pg_index AS i WHERE i.indrelid OPERATOR(pg_catalog.=) c.oid
                     AND (i.indexprs IS NOT NULL OR
-                         (i.indpred IS NOT NULL AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)
-                          NOT IN ('(constitution_hash IS NOT NULL)', 'constitution_hash IS NOT NULL')) OR
+                         (i.indpred IS NOT NULL AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)  OPERATOR(pg_catalog.<>)  '(constitution_hash IS NOT NULL)'
+                          AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)  OPERATOR(pg_catalog.<>)  'constitution_hash IS NOT NULL') OR
                          EXISTS (SELECT 1 FROM pg_catalog.pg_opclass AS op
-                                 JOIN pg_catalog.pg_namespace AS onsp ON onsp.oid=op.opcnamespace
-                                 WHERE op.oid=ANY(i.indclass) AND onsp.nspname<>'pg_catalog')))
+                                 JOIN pg_catalog.pg_namespace AS onsp ON onsp.oid OPERATOR(pg_catalog.=) op.opcnamespace
+                                 WHERE op.oid OPERATOR(pg_catalog.=) ANY(i.indclass) AND onsp.nspname OPERATOR(pg_catalog.<>) 'pg_catalog')))
               AND NOT EXISTS (
                   SELECT 1 FROM pg_catalog.pg_attribute AS a
-                  JOIN pg_catalog.pg_type AS t ON t.oid=a.atttypid
-                  JOIN pg_catalog.pg_namespace AS tn ON tn.oid=t.typnamespace
-                  WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
-                    AND (tn.nspname<>'pg_catalog' OR a.attgenerated<>'' OR a.attidentity<>''))
+                  JOIN pg_catalog.pg_type AS t ON t.oid OPERATOR(pg_catalog.=) a.atttypid
+                  JOIN pg_catalog.pg_namespace AS tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
+                  WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+                    AND (tn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' OR a.attgenerated OPERATOR(pg_catalog.<>) '' OR a.attidentity OPERATOR(pg_catalog.<>) ''))
         ''', name)
         if row is None or row['relation_name'] != 'signal_log':
             return None
@@ -2288,6 +2288,10 @@ class PostgresBackend(DatabaseBackend):
             async with self._tracked_pool_checkout(journal._backing, admit_work=False) as (connection, state):
                 journal.require_original(self)
                 async with self._tracked_native_transaction(connection, state.scopes, state):
+                    journal.require_original(self)
+                    # Privileged catalog/proof operators must not resolve via
+                    # an application's setup-controlled search_path.
+                    await connection.execute('SET LOCAL search_path = pg_catalog')
                     journal.require_original(self)
                     # Lock before observing shape: INSERT's later implicit
                     # lock is too late to exclude a racing trigger/rule DDL.

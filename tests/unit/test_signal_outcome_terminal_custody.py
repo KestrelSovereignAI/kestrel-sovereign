@@ -103,6 +103,32 @@ async def test_projection_retained_alias_cannot_rewrite_actual_result(dispatcher
     assert c.dispatcher._log_write_failures == 0
 
 
+async def test_uncopyable_result_preserves_actual_return_without_projection_or_replay(dispatcher_components):
+    from kestrel_sovereign.execution_custody import is_execution_control_error, execution_native_source_error, _explicit_control_chain
+    c = dispatcher_components
+    calls, projected = [], []
+    class Uncopyable:
+        def __deepcopy__(self, memo):
+            raise TypeError('original result cannot be safely copied')
+    body = {'native': Uncopyable()}
+    async def handler(payload):
+        calls.append(True)
+        return body
+    registration = _action_reg('uncopyable.original', handler=handler)
+    registration.result_summary = lambda value: projected.append(value) or 'must not project'
+    c.registry.register(registration)
+    with pytest.raises(BaseException) as caught:
+        await c.dispatcher.dispatch_signal(_signal('uncopyable.original'))
+    assert is_execution_control_error(caught.value)
+    originals = [getattr(item, 'signal_result', None) for item in _explicit_control_chain(caught.value)]
+    assert any(result is not None and result.action_result is body for result in originals)
+    assert len(calls) == 1 and not projected
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+    assert c.dispatcher._log_write_failures == 1
+    assert execution_native_source_error(caught.value) is None
+    assert c.dispatcher._outcome_log_control_error is None
+
+
 async def test_original_journal_refuses_overridden_native_privacy_gate(dispatcher_components):
     from contextlib import asynccontextmanager
     from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error, _explicit_control_chain
@@ -1144,7 +1170,11 @@ async def test_failed_sqlite_insert_preserves_cancellation_during_successful_rol
     import threading
     from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_commit_outcome, execution_native_source_error
     c = dispatcher_components
-    await c.backend.execute('DROP TABLE signal_log')
+    c.registry.register(_action_reg('failed.insert.audit'))
+    await c.dispatcher.dispatch_signal(_signal('failed.insert.audit'))
+    # The original destination must exist at admission. A real uniqueness
+    # violation reaches INSERT/rollback without bypassing that new fence.
+    await c.backend.execute('CREATE UNIQUE INDEX journal_duplicate_source ON signal_log(source)')
     conn = c.backend._connection
     original_execute = conn._execute
     entered, worker_release = asyncio.Event(), threading.Event()
@@ -1166,7 +1196,6 @@ async def test_failed_sqlite_insert_preserves_cancellation_during_successful_rol
                 body_errors.append(error)
             raise
     monkeypatch.setattr(conn, '_execute', actual_queue)
-    c.registry.register(_action_reg('failed.insert.audit'))
     task = asyncio.create_task(c.dispatcher.dispatch_signal(_signal('failed.insert.audit')))
     try:
         await asyncio.wait_for(entered.wait(), 2)

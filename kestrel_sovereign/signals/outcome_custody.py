@@ -152,6 +152,7 @@ class _OriginalSignalOutcome:
             _OriginalPostgresJournalPool.capture(self._backing)
             if type(backend) is PostgresBackend else None)
         self._postgres_relation = None
+        self._sqlite_relation = None
         self._entry = None
         self._completed_result = None
         self._acknowledgments = ()
@@ -371,4 +372,8 @@ async def _capture_original_outcome(dispatcher, signal, registration, *, accepta
         journal._postgres_relation = await backend._capture_original_signal_outcome_relation(journal)
         journal._query = SignalLogStore._outcome_insert_query(journal._postgres_relation.qualified_name)
         journal._match_query = SignalLogStore._outcome_match_query(journal._postgres_relation.qualified_name, postgres=True)
+    else:
+        journal._sqlite_relation = await backend._read_original_signal_outcome_relation(journal, capture=True)
+        if journal._sqlite_relation is None:
+            raise ExecutionAuthorityError('Original SQLite journal requires its plain original audit table')
     return journal

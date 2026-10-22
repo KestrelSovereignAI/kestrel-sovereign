@@ -92,6 +92,7 @@ import weakref
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from enum import Enum
@@ -1250,11 +1251,19 @@ class SignalDispatcher:
                 # No projection/writer is admitted while the handler runs.
                 self._deferred_outcome_logs.set(None)
                 journal = self._original_outcome_admission.get()
-                if journal is not None:
-                    journal._completed_result = result
                 selected = [outcome for outcome in original_outcomes
                     if outcome.result is result and outcome.signal.id == signal.id
                     and outcome.registration is registration]
+                if journal is not None:
+                    try:
+                        result = deepcopy(result)
+                    except BaseException as error:
+                        journal._phase = 'refused'
+                        journal._completed_result = result
+                        refusal = journal._finite_refusal('result_snapshot_unavailable', error, privacy=False)
+                        self._record_original_outcome_loss(journal, signal.id, refusal)
+                        raise refusal
+                    journal._completed_result = result
                 if selected:
                     outcome = selected[-1]
                     self._schedule_outcome_log(outcome.signal, registration, result, audit=outcome.audit)
@@ -5109,11 +5118,19 @@ class SignalDispatcher:
                 try:
                     self._deferred_outcome_logs.set(None)
                     if result is not None:
-                        if journal is not None:
-                            journal._completed_result = result
                         selected = [outcome for outcome in original_outcomes
                             if outcome.result is result and outcome.signal.id == result.signal_id
                             and outcome.registration is registration]
+                        if journal is not None:
+                            try:
+                                result = deepcopy(result)
+                            except BaseException as error:
+                                journal._phase = 'refused'
+                                journal._completed_result = result
+                                refusal = journal._finite_refusal('result_snapshot_unavailable', error, privacy=False)
+                                self._record_original_outcome_loss(journal, result.signal_id, refusal)
+                                raise refusal
+                            journal._completed_result = result
                         if selected:
                             outcome = selected[-1]
                             self._schedule_outcome_log(outcome.signal, registration, result, audit=outcome.audit)
