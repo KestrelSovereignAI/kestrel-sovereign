@@ -78,6 +78,21 @@ def test_sqlite_native_commit_rechecks_durability_in_same_worker_operation():
         native.close()
 
 
+@pytest.mark.parametrize('pragma', ['schema_version=1', 'writable_schema=OFF'])
+def test_sqlite_sql_catalog_reconfiguration_is_monotonic_even_for_cached_pragma(pragma):
+    native = _NativeJournalSQLiteConnection(':memory:')
+    try:
+        native.execute('PRAGMA ' + pragma).close()
+        native.execute('PRAGMA ' + pragma).close()  # Same cached statement.
+        assert not native._original_journal_programs_supported()
+        with pytest.raises(NativeJournalConfigurationError):
+            native._begin_original_journal()
+        native.execute('CREATE TABLE ordinary(value TEXT)').close()
+        native.commit()  # Ordinary configuration remains usable, not journal-privileged.
+    finally:
+        native.close()
+
+
 def test_native_connect_recipe_detaches_nested_values_without_application_hooks():
     from kestrel_sovereign.signals.outcome_custody import _freeze_native_connect_configuration, _restore_native_connect_configuration
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError
