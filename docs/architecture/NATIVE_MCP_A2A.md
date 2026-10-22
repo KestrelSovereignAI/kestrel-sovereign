@@ -878,14 +878,24 @@ task's creator, recipient and tenant. The shared AEAD service-key hierarchy
 protects the complete configuration, with its task, owner and generation in
 associated data. Reads return independent official protobuf values.
 
+A configuration ID names one current value; an omitted ID defaults to the task
+ID. Repeating an identical normalized configuration preserves its generation,
+consumer and initial snapshot. Changing it revokes the old configuration and
+consumer, then inserts a new immutable generation in the same transaction.
+The old ciphertext and attempts remain until their actual HTTP owners retire.
+The resident retires ready revoked generations in finite indexed batches, so
+replacement does not require a later client Delete to destroy old credentials.
+
 `NativePushTransport` sends an official `StreamResponse` using the SDK's media
 type and version constants. It validates HTTPS egress, pins the approved IPs,
 verifies TLS and refuses redirects. Its native response/client owners retain
 physical close through cancellation. A total exchange deadline also bounds a
 peer that keeps making partial header progress inside each socket deadline.
 
-Deletion first revokes new admission, then waits for the admitted generation's
-actual HTTP owners to retire. An expired lease is not physical retirement.
+Deletion first revokes new admission and inventories every original generation
+under the task lock, then waits for their actual HTTP owners to retire. A setter
+that commits after revocation creates a fresh generation outside that inventory;
+the earlier deletion cannot erase it. An expired lease is not physical retirement.
 Unretired requests block both the deletion acknowledgement and task cleanup;
 confirmed deletion clears credentials and completed request rows atomically.
 The sender inventories its attempt before an admission COMMIT can become
@@ -897,8 +907,8 @@ triggers in each original task transaction. Capture requires an active callback
 generation and its exact active durable consumer; ordinary tasks and disabled
 push recipients accumulate no unused journal. The optional push initializer
 installs capture after its configuration, subscription and consumer stores.
-The current core schema bundle is revision 5 and push is revision 2. Earlier
-native capture requires offline migration, including partial old bundles.
+The current core schema bundle is revision 5 and push is revision 3. Earlier
+native capture or generation layouts require offline migration, including partial old bundles.
 Offline conversion suspends the canonical trigger inventory while rewriting
 history and restores it before commit, without producing new work for historical
 tasks. Task cleanup removes its journal references.

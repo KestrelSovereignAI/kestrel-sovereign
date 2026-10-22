@@ -316,7 +316,7 @@ async def test_delete_and_delivery_ack_wait_for_original_response_close(
         assert await transport.store.backend.fetch_all(
             "SELECT retired FROM a2a_push_delivery_attempts"
         ) == [(0,)]
-        retiring = await transport.store.begin_delete(
+        retiring, = await transport.store.begin_delete(
             task.id, configuration.config.id, creator_id="did:creator"
         )
         assert not await transport.store.finish_delete(retiring)
@@ -371,7 +371,7 @@ async def test_failed_pool_close_keeps_attempt_unretired_and_blocks_delete(
     assert await transport.store.backend.fetch_all(
         "SELECT retired FROM a2a_push_delivery_attempts"
     ) == [(0,)]
-    retiring = await transport.store.begin_delete(
+    retiring, = await transport.store.begin_delete(
         task.id, configuration.config.id, creator_id="did:creator"
     )
     assert not await transport.store.finish_delete(retiring)

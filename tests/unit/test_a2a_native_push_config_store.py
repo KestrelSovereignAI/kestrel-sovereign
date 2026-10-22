@@ -135,40 +135,40 @@ async def test_deletion_revokes_new_reads_and_retains_original_generation_until_
 ):
     store, task = push_store
     created = await store.create(config(task), creator_id="did:creator")
-    retiring = await store.begin_delete(task.id, "callback", creator_id="did:creator")
+    retiring, = await store.begin_delete(task.id, "callback", creator_id="did:creator")
     assert retiring.generation == created.generation
     assert await store.get(task.id, "callback", creator_id="did:creator") is None
     assert await store.list(task.id, creator_id="did:creator", limit=10) == []
     # A restarted service can resume the same retirement; it does not create a
     # new active generation or forget credentials before resource retirement.
     restarted = PushConfigStore(store.task_store)
-    again = await restarted.begin_delete(task.id, "callback", creator_id="did:creator")
+    again, = await restarted.begin_delete(task.id, "callback", creator_id="did:creator")
     assert again.generation == retiring.generation
     assert not await restarted.finish_delete(replace(again, generation="stale"))
     assert await restarted.finish_delete(again)
     assert (
         await restarted.begin_delete(task.id, "callback", creator_id="did:creator")
-        is None
+        == ()
     )
     assert await store.backend.fetch_one(
         "SELECT state, ciphertext FROM a2a_push_configs"
     ) == ("deleted", None)
-    with pytest.raises(PushConfigConflict, match="already exists"):
-        await store.create(config(task), creator_id="did:creator")
+    replacement = await store.create(config(task), creator_id="did:creator")
+    assert replacement.generation != retiring.generation
+    assert await store.get(task.id, "callback", creator_id="did:creator") == replacement
 
 
-async def test_config_id_default_pagination_and_duplicate_refusal(push_store):
+async def test_config_id_default_pagination_and_idempotent_set(push_store):
     store, task = push_store
     generated = await store.create(config(task, ""), creator_id="did:creator")
-    assert generated.config.id and generated.config.id != task.id
-    await store.create(config(task, "z"), creator_id="did:creator")
+    assert generated.config.id == task.id
+    explicit = await store.create(config(task, "z"), creator_id="did:creator")
     first = await store.list(task.id, creator_id="did:creator", limit=1)
     second = await store.list(
         task.id, creator_id="did:creator", limit=1, after=first[0].config.id
     )
     assert [first[0].config.id, second[0].config.id] == [generated.config.id, "z"]
-    with pytest.raises(PushConfigConflict, match="already exists"):
-        await store.create(config(task, "z"), creator_id="did:creator")
+    assert await store.create(config(task, "z"), creator_id="did:creator") == explicit
 
 
 async def test_wrong_tenant_refuses_without_persistence(push_store):
@@ -225,7 +225,7 @@ async def test_an_unretired_external_request_blocks_delete_even_from_another_con
         independent = PushConfigStore(
             TaskStore(other, scope=store.scope, owns_backend=False)
         )
-        retiring = await independent.begin_delete(
+        retiring, = await independent.begin_delete(
             task.id, "callback", creator_id="did:creator"
         )
         assert await admit(independent, created, executor_id="other-runtime") is None
@@ -258,11 +258,11 @@ async def test_concurrent_delete_and_admission_have_one_durable_order(
         independent = PushConfigStore(
             TaskStore(other, scope=store.scope, owns_backend=False)
         )
-        attempt, retiring = await asyncio.gather(
+        attempt, inventory = await asyncio.gather(
             admit(store, created, executor_id="original-runtime"),
             independent.begin_delete(task.id, "callback", creator_id="did:creator"),
         )
-        assert retiring is not None
+        retiring, = inventory
         if attempt is not None:
             assert not await independent.finish_delete(retiring)
             assert await store.retire_delivery(attempt)
@@ -290,7 +290,7 @@ async def test_task_cleanup_cannot_erase_a_live_delivery_and_succeeds_after_dele
     with pytest.raises(QueryError):
         await store.task_store.delete(task.id)
     assert await store.delivery_is_current(attempt)
-    retiring = await store.begin_delete(task.id, "callback", creator_id="did:creator")
+    retiring, = await store.begin_delete(task.id, "callback", creator_id="did:creator")
     assert not await store.finish_delete(retiring)
     assert await store.retire_delivery(attempt)
     assert await store.finish_delete(retiring)

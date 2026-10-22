@@ -20,7 +20,7 @@ class NativeStoreSchema(Enum):
     CORE = ("core", 5)
     MEMORY = ("memory", 1)
     FEEDBACK = ("feedback", 1)
-    PUSH = ("push", 2)
+    PUSH = ("push", 3)
 
 
 async def _require_native_input_schema(backend) -> None:

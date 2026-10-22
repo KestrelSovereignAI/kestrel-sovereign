@@ -10,8 +10,8 @@ from kestrel_sovereign.storage.db.interface import TransactionError
 from tests.utils.native_a2a import manager_for
 
 
-@pytest.mark.parametrize("previous", [("core", 4), ("push", 1)])
-async def test_previous_global_capture_bundles_require_offline_migration(
+@pytest.mark.parametrize("previous", [("core", 4), ("push", 1), ("push", 2)])
+async def test_previous_capture_and_generation_bundles_require_offline_migration(
     native_a2a_backend_factory, previous
 ):
     backend = native_a2a_backend_factory()

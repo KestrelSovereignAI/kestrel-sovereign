@@ -162,7 +162,6 @@ async def test_push_operations_use_current_task_creator_authority(wire, operatio
     "fault",
     [
         "unsafe-url",
-        "duplicate-id",
         "page-negative",
         "bad-cursor",
         "other-task-cursor",
@@ -176,10 +175,9 @@ async def test_push_refusals_are_standard_invalid_params(wire, fault):
         await client.create_task_push_notification_config(
             callback(wire, task.id, config_id)
         )
-    if fault in {"unsafe-url", "duplicate-id"}:
-        value = callback(wire, task.id, "refused" if fault == "unsafe-url" else "a")
-        if fault == "unsafe-url":
-            value.url = "https://127.0.0.1/private"
+    if fault == "unsafe-url":
+        value = callback(wire, task.id, "refused")
+        value.url = "https://127.0.0.1/private"
         with pytest.raises(InvalidParamsError):
             await client.create_task_push_notification_config(value)
     else:

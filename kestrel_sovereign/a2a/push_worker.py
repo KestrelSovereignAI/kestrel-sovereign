@@ -359,19 +359,17 @@ class NativePushWorker:
 
     async def delete(self, task_id: str, config_id: str, *, creator_id: str) -> None:
         """Acknowledge Delete only after revocation and original HTTP retirement."""
-        config = await self.outbox.revoke(task_id, config_id, creator_id=creator_id)
-        if config is None:
+        configurations = await self.outbox.revoke(task_id, config_id, creator_id=creator_id)
+        if not configurations:
             return
+        generations = {config.generation for config in configurations}
         original = None
         owners = [
             (task, run)
             for task, run in tuple(self._active.items())
-            if (
-                run.subscription.task_id,
-                run.subscription.config_id,
-                run.subscription.generation,
-            )
-            == (task_id, config_id, config.generation)
+            if run.subscription.task_id == task_id
+            and run.subscription.config_id == config_id
+            and run.subscription.generation in generations
         ]
         for task, run in owners:
             run.revoked = True
@@ -384,7 +382,8 @@ class NativePushWorker:
             )
         if original is not None:
             raise original
-        if not await self.outbox.configurations.finish_delete(config):
-            raise PushRetirementPending(
-                "Push deletion is waiting for an original HTTP owner to retire"
-            )
+        for config in configurations:
+            if not await self.outbox.configurations.finish_delete(config):
+                raise PushRetirementPending(
+                    "Push deletion is waiting for an original HTTP owner to retire"
+                )

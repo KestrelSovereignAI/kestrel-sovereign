@@ -88,12 +88,18 @@ class PushConfigStore(UnifiedStoreBase):
                     generation TEXT NOT NULL,
                     state TEXT NOT NULL CHECK (state IN ('active', 'deleting', 'deleted')),
                     ciphertext TEXT,
-                    PRIMARY KEY (recipient_id, tenant, task_id, config_id),
+                    PRIMARY KEY (recipient_id, tenant, task_id, config_id, generation),
                     CHECK ((state = 'deleted') = (ciphertext IS NULL))
                 );
                 CREATE INDEX IF NOT EXISTS a2a_push_active_tasks
                     ON a2a_push_configs (recipient_id, tenant, task_id)
-                    WHERE state = 'active'
+                    WHERE state = 'active';
+                CREATE UNIQUE INDEX IF NOT EXISTS a2a_push_current_config
+                    ON a2a_push_configs (recipient_id, tenant, task_id, config_id)
+                    WHERE state = 'active';
+                CREATE INDEX IF NOT EXISTS a2a_push_retiring_configs
+                    ON a2a_push_configs (recipient_id, tenant, task_id, config_id, generation)
+                    WHERE state = 'deleting'
             """)
 
             await self.backend.execute_script("""
@@ -107,8 +113,8 @@ class PushConfigStore(UnifiedStoreBase):
                     attempt_id TEXT PRIMARY KEY,
                     executor_id TEXT NOT NULL,
                     retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
-                    FOREIGN KEY (recipient_id, tenant, task_id, config_id)
-                        REFERENCES a2a_push_configs(recipient_id, tenant, task_id, config_id)
+                    FOREIGN KEY (recipient_id, tenant, task_id, config_id, generation)
+                        REFERENCES a2a_push_configs(recipient_id, tenant, task_id, config_id, generation)
                 );
                 CREATE INDEX IF NOT EXISTS a2a_push_live_attempts
                     ON a2a_push_delivery_attempts (recipient_id, tenant, task_id, config_id, generation, retired)
@@ -215,10 +221,13 @@ class PushConfigStore(UnifiedStoreBase):
     async def create(
         self, config: TaskPushNotificationConfig, *, creator_id: str
     ) -> PushConfiguration:
-        """Persist a new configuration after the service validates callback egress.
+        """Set a logical configuration, preserving immutable delivery generations.
 
-        Config IDs may be client-supplied as the standard permits. A retired
-        ID cannot be reused: its original generation may still own a delivery.
+        An identical current value is idempotent. A changed value revokes that
+        generation and inserts a new one; its original credentials and attempts
+        remain until physical retirement. The caller's enclosing transaction
+        also replaces the durable subscriber. The task lock orders all setters
+        and deletion inventories, including across independent connections.
         """
         if not isinstance(config, TaskPushNotificationConfig):
             raise TypeError(
@@ -231,23 +240,34 @@ class PushConfigStore(UnifiedStoreBase):
                 "Push configuration tenant differs from its recipient"
             )
         value = TaskPushNotificationConfig.FromString(config.SerializeToString())
-        value.id = value.id or uuid4().hex
-        generation = uuid4().hex
-        ciphertext = (
-            self._cipher()
-            .encrypt(
-                value.SerializeToString(deterministic=True),
-                aad=self._aad(value, creator_id, generation),
-            )
-            .decode("ascii")
-        )
+        value.id = value.id or value.task_id
+        cipher = self._cipher()
         async with self.write_transaction():
             await self._require_task(value.task_id, creator_id)
-            changed = await self.backend.execute(
+            await self.task_store.changes.lock_task_boundary(
+                value.task_id, creator_id=creator_id
+            )
+            current = await self.get(value.task_id, value.id, creator_id=creator_id)
+            if current is not None:
+                if current.config == value:
+                    return current
+                changed = await self.backend.execute(
+                    "UPDATE a2a_push_configs SET state = 'deleting' "
+                    "WHERE recipient_id = ? AND tenant = ? AND task_id = ? "
+                    "AND config_id = ? AND creator_id = ? AND generation = ? AND state = 'active'",
+                    (*self._scope_parameters, value.task_id, value.id, creator_id, current.generation),
+                )
+                if changed != 1:
+                    raise PushConfigConflict("Push replacement lost its original generation")
+            generation = uuid4().hex
+            ciphertext = cipher.encrypt(
+                value.SerializeToString(deterministic=True),
+                aad=self._aad(value, creator_id, generation),
+            ).decode("ascii")
+            await self.backend.execute(
                 "INSERT INTO a2a_push_configs "
                 "(recipient_id, tenant, creator_id, task_id, config_id, generation, state, ciphertext) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'active', ?) "
-                "ON CONFLICT (recipient_id, tenant, task_id, config_id) DO NOTHING",
+                "VALUES (?, ?, ?, ?, ?, ?, 'active', ?)",
                 (
                     *self._scope_parameters,
                     creator_id,
@@ -257,8 +277,6 @@ class PushConfigStore(UnifiedStoreBase):
                     ciphertext,
                 ),
             )
-            if changed != 1:
-                raise PushConfigConflict("Push configuration ID already exists")
         return PushConfiguration.from_config(creator_id, generation, value)
 
     async def get(
@@ -291,23 +309,29 @@ class PushConfigStore(UnifiedStoreBase):
 
     async def begin_delete(
         self, task_id: str, config_id: str, *, creator_id: str
-    ) -> PushConfiguration | None:
-        """Revoke future admission, retaining the generation for physical retirement."""
+    ) -> tuple[PushConfiguration, ...]:
+        """Revoke and inventory every original generation under the task lock.
+
+        A later setter may create a fresh generation. This deletion owns only
+        its captured inventory and may never erase that later admission.
+        """
         async with self.write_transaction():
             await self._require_task(task_id, creator_id)
+            await self.task_store.changes.lock_task_boundary(task_id, creator_id=creator_id)
             await self.backend.execute(
                 "UPDATE a2a_push_configs SET state = 'deleting' "
                 "WHERE recipient_id = ? AND tenant = ? AND task_id = ? "
                 "AND config_id = ? AND creator_id = ? AND state = 'active'",
                 (*self._scope_parameters, task_id, config_id, creator_id),
             )
-            row = await self.backend.fetch_one(
+            rows = await self.backend.fetch_all(
                 "SELECT task_id, config_id, creator_id, generation, ciphertext "
                 "FROM a2a_push_configs WHERE recipient_id = ? AND tenant = ? "
-                "AND task_id = ? AND config_id = ? AND creator_id = ? AND state = 'deleting'",
+                "AND task_id = ? AND config_id = ? AND creator_id = ? AND state = 'deleting' "
+                "ORDER BY generation",
                 (*self._scope_parameters, task_id, config_id, creator_id),
             )
-        return self._decode(row) if row else None
+        return tuple(self._decode(row) for row in rows)
 
     async def finish_delete(self, configuration: PushConfiguration) -> bool:
         """Forget credentials only after the service proves this generation retired."""
@@ -352,7 +376,40 @@ class PushConfigStore(UnifiedStoreBase):
                         configuration.generation,
                     ),
                 )
+            elif await self.backend.fetch_one(
+                "SELECT state FROM a2a_push_configs WHERE recipient_id = ? AND tenant = ? "
+                "AND task_id = ? AND config_id = ? AND creator_id = ? AND generation = ?",
+                (*self._scope_parameters, value.task_id, value.id,
+                 configuration.creator_id, configuration.generation),
+            ) == ("deleted",):
+                return True
         return changed
+
+    async def retire_ready(self, *, limit: int) -> int:
+        """Forget a finite batch of revoked generations whose HTTP owners retired.
+
+        Replacement and Delete share the same physical retirement predicate.
+        Neither a lease clock nor the presence of a newer configuration proves
+        an older request retired.
+        """
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("Push retirement batch size must be positive")
+        async with self.write_transaction():
+            rows = await self.backend.fetch_all(
+                "SELECT task_id, config_id, creator_id, generation, ciphertext "
+                "FROM a2a_push_configs config WHERE recipient_id = ? AND tenant = ? "
+                "AND state = 'deleting' AND NOT EXISTS ("
+                "SELECT 1 FROM a2a_push_delivery_attempts attempt "
+                "WHERE attempt.recipient_id = config.recipient_id AND attempt.tenant = config.tenant "
+                "AND attempt.task_id = config.task_id AND attempt.config_id = config.config_id "
+                "AND attempt.generation = config.generation AND attempt.retired = 0) "
+                "ORDER BY task_id, config_id, generation LIMIT ?",
+                (*self._scope_parameters, limit),
+            )
+            retired = 0
+            for row in rows:
+                retired += await self.finish_delete(self._decode(row))
+        return retired
 
     def prepare_delivery(
         self, configuration: PushConfiguration, *, executor_id: str

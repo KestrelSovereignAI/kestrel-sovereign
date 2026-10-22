@@ -125,12 +125,12 @@ class NativePushOutbox(UnifiedStoreBase):
                     agent_id TEXT NOT NULL,
                     consumer_id TEXT NOT NULL,
                     after_sequence BIGINT NOT NULL CHECK (after_sequence >= 0),
-                    PRIMARY KEY (recipient_id, tenant, task_id, config_id),
+                    PRIMARY KEY (recipient_id, tenant, task_id, config_id, generation),
                     UNIQUE (agent_id, consumer_id),
                     FOREIGN KEY (agent_id, consumer_id)
                         REFERENCES durable_signal_consumers (agent_id, consumer_id),
-                    FOREIGN KEY (recipient_id, tenant, task_id, config_id)
-                        REFERENCES a2a_push_configs (recipient_id, tenant, task_id, config_id)
+                    FOREIGN KEY (recipient_id, tenant, task_id, config_id, generation)
+                        REFERENCES a2a_push_configs (recipient_id, tenant, task_id, config_id, generation)
                         ON DELETE CASCADE
                 )
             """)
@@ -204,6 +204,33 @@ class NativePushOutbox(UnifiedStoreBase):
             )
             native = configuration.config
             consumer_id = "a2a.push:" + configuration.generation
+            existing = await self.backend.fetch_one(
+                "SELECT creator_id, agent_id, consumer_id FROM a2a_push_subscriptions "
+                "WHERE recipient_id = ? AND tenant = ? AND task_id = ? AND config_id = ? "
+                "AND generation = ?",
+                (*self.configurations._scope_parameters, native.task_id, native.id,
+                 configuration.generation),
+            )
+            if existing is not None:
+                if existing != (creator_id, self.agent_id, consumer_id):
+                    raise PushConfigConflict("Repeated push configuration lost its original subscription")
+                return configuration
+            previous = await self.backend.fetch_all(
+                "SELECT s.consumer_id FROM a2a_push_subscriptions s "
+                "JOIN a2a_push_configs c ON c.recipient_id = s.recipient_id "
+                "AND c.tenant = s.tenant AND c.task_id = s.task_id AND c.config_id = s.config_id "
+                "AND c.generation = s.generation "
+                "WHERE s.recipient_id = ? AND s.tenant = ? AND s.task_id = ? "
+                "AND s.config_id = ? AND s.creator_id = ? AND s.agent_id = ? "
+                "AND c.state = 'deleting'",
+                (*self.configurations._scope_parameters, native.task_id, native.id,
+                 creator_id, self.agent_id),
+            )
+            for row in previous:
+                if not await self.signals.deactivate_consumer(
+                    agent_id=self.agent_id, consumer_id=row[0]
+                ):
+                    raise PushConfigConflict("Push replacement lost an original consumer")
             await self.signals.register_consumer(
                 DurableConsumerRegistration(
                     agent_id=self.agent_id,
@@ -277,21 +304,22 @@ class NativePushOutbox(UnifiedStoreBase):
                 agent_id=self.agent_id, source=self.SOURCE, limit=limit
             )
             await self.changes.retire_forwarded(deleted)
+            await self.configurations.retire_ready(limit=limit)
         return len(deleted)
 
     async def revoke(
         self, task_id: str, config_id: str, *, creator_id: str
-    ) -> PushConfiguration | None:
+    ) -> tuple[PushConfiguration, ...]:
         """Revoke config admission and consumer claims in one primary transaction.
 
         This is not a deletion acknowledgement. The worker must join original
         HTTP owners and obtain ``finish_delete`` before returning success.
         """
         async with self.write_transaction():
-            config = await self.configurations.begin_delete(
+            configurations = await self.configurations.begin_delete(
                 task_id, config_id, creator_id=creator_id
             )
-            if config is not None:
+            for config in configurations:
                 row = await self.backend.fetch_one(
                     "SELECT consumer_id FROM a2a_push_subscriptions WHERE recipient_id = ? "
                     "AND tenant = ? AND task_id = ? AND config_id = ? AND creator_id = ? "
@@ -315,7 +343,7 @@ class NativePushOutbox(UnifiedStoreBase):
                     raise PushConfigConflict(
                         "Push configuration lost its durable consumer"
                     )
-        return config
+        return configurations
 
     async def forward_pending(self, *, limit: int) -> int:
         """Atomically persist metadata-only events, fan-out and journal receipts."""
