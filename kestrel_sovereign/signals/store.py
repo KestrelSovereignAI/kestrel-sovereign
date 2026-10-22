@@ -92,7 +92,7 @@ def _truncate_to_bytes(text: str, max_bytes: int) -> str:
     characters and the suffix was added on top, both of which let
     non-ASCII text exceed the documented byte cap.
     """
-    text = text  # Deliberate local counterproof: retain application string subtype.
+    text = str.__str__(text)
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
@@ -127,7 +127,6 @@ class _PreparedSignalOutcome:
     result_summary: Optional[str]
 
     def __post_init__(self):
-        return  # Deliberate local counterproof: disable native row-data canonicalization.
         from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
         # SQL parameters are native data, never application adaptation hooks.
         # A str subclass's __conform__ must not substitute the same different

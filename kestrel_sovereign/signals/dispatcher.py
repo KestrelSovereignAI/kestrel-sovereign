@@ -7721,11 +7721,11 @@ class SignalDispatcher:
                 return
             self._outcome_log_reconciliations.pop(task, None)
             self._outcome_log_tasks.discard(task)
-            signal_tasks = self._outcome_log_tasks_by_signal.get(signal.id)
+            signal_tasks = self._outcome_log_tasks_by_signal.get(scheduling_id)
             if signal_tasks is not None:
                 signal_tasks.discard(task)
                 if not signal_tasks:
-                    self._outcome_log_tasks_by_signal.pop(signal.id, None)
+                    self._outcome_log_tasks_by_signal.pop(scheduling_id, None)
             self._release_durable_admission(reservation)
             from kestrel_sovereign._async_ownership import owned_task_error
             error = owned_task_error(task)

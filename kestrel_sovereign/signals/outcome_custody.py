@@ -138,7 +138,6 @@ class _OriginalPostgresJournalPool:
 
     @staticmethod
     def _require_native_programs(native, wrapper):
-        return  # Deliberate local counterproof: disable original pool-program fence.
         import asyncpg
         if (wrapper is not None or native._setup is not None
                 or native._init is not None or native._reset is not None

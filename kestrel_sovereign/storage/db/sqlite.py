@@ -2234,7 +2234,7 @@ class SQLiteBackend(DatabaseBackend):
             try:
                 if snapshot:
                     cursor.execute('SAVEPOINT kestrel_original_outcome_catalog')
-                if False and any((kind, sqlite3.PrepareProtocol) in sqlite3.adapters
+                if any((kind, sqlite3.PrepareProtocol) in sqlite3.adapters
                        for kind in (type(None), bool, int, float, str, bytes)):
                     return None
                 cursor.execute('PRAGMA main.schema_version')
@@ -2243,7 +2243,7 @@ class SQLiteBackend(DatabaseBackend):
                 row = cursor.fetchone()
                 if row is None or row[1] <= 0:
                     return None
-                if False and re.search(r'\b(?:CHECK\s*\(|COLLATE\b)', row[2], re.IGNORECASE):
+                if re.search(r'\b(?:CHECK\s*\(|COLLATE\b)', row[2], re.IGNORECASE):
                     return None
                 cursor.execute("SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE LIMIT 1")
                 if cursor.fetchone() is not None:
@@ -2257,9 +2257,9 @@ class SQLiteBackend(DatabaseBackend):
                 for index in indexes:
                     quoted = '"' + index[1].replace('"', '""') + '"'
                     cursor.execute('PRAGMA main.index_xinfo(' + quoted + ')')
-                    if False and any(item[5] and (item[1] < 0 or item[4] != 'BINARY') for item in cursor.fetchall()):
+                    if any(item[5] and (item[1] < 0 or item[4] != 'BINARY') for item in cursor.fetchall()):
                         return None
-                    if False and index[4]:
+                    if index[4]:
                         cursor.execute("SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?", (index[1],))
                         sql = cursor.fetchone()[0]
                         if not re.search(r'\bWHERE\s+\(?\s*constitution_hash\s+IS\s+NOT\s+NULL\s*\)?\s*$', sql, re.IGNORECASE):
