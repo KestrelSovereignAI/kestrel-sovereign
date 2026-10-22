@@ -6,22 +6,30 @@ export function createStartupSettlement() {
   let nativeStartup = null;
   let nativeSettlement = null;
   let closedError = null;
+  let isClosed = false;
   let rejectClosed;
   const closed = new Promise((resolve, reject) => { rejectClosed = reject; });
   closed.catch(() => {});
   return {
     run(operation) {
-      if (closedError) return Promise.reject(closedError);
+      if (isClosed) return Promise.reject(closedError);
       if (nativeStartup) return Promise.reject(new Error('Voice client already started.'));
       nativeStartup = Promise.resolve().then(operation);
-      nativeSettlement = Promise.allSettled([nativeStartup]);
+      nativeSettlement = Promise.allSettled([nativeStartup]).then(records => records.map(record => ({
+        ...record,
+        // The native status/reason stays factual. Closing AudioContext can
+        // reject a pending worklet with a DIFFERENT AbortError; keep the
+        // original public withdrawal too, without mutating either error.
+        publicReason: isClosed ? closedError : (record.status === 'rejected' ? record.reason : null),
+      })));
       // This settles the PUBLIC caller promptly. It neither cancels nor
       // declares completion of the original retained native operation.
       return Promise.race([nativeStartup, closed]);
     },
     whenSettled() { return nativeSettlement || Promise.resolve([]); },
     close(error = new Error('Original voice startup was closed.')) {
-      if (closedError) return closedError;
+      if (isClosed) return closedError;
+      isClosed = true;
       closedError = error;
       rejectClosed(closedError);
       return closedError;

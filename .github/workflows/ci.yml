@@ -1141,7 +1141,7 @@ jobs:
         timeout-minutes: 5
 
       - name: Verify offline native voice transport custody
-        run: node --test tests/js/test_voice_native_custody.cjs
+        run: node --test tests/js/test_voice_native_custody.cjs tests/js/test_voice_startup_settlement.cjs
         timeout-minutes: 3
 
       - name: Run the Console smoke against a fresh isolated instance
