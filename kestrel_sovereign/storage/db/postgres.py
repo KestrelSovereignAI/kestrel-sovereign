@@ -2287,6 +2287,7 @@ class PostgresBackend(DatabaseBackend):
             native = connection._con
             if type(native) is not NativeJournalPostgresConnection or not native._original_journal_programs_supported():
                 raise ExecutionAuthorityError('Original journal requires a plain fenced native PostgreSQL session')
+            journal._postgres_pool = journal._postgres_pool.with_actual_connection(native)
             relation = await self._read_original_signal_outcome_relation(connection, 'signal_log')
             if relation is None:
                 raise ExecutionAuthorityError('Original native signal journal requires its plain permanent audit table')
@@ -2320,6 +2321,8 @@ class PostgresBackend(DatabaseBackend):
                         raise NativeJournalConfigurationError('Unfenced native PostgreSQL session')
                     await native._wait_original_journal_retirement()
                     journal.require_original(self)
+                    if not journal._postgres_pool.matches_actual_connection(native):
+                        raise NativeJournalConfigurationError('Original native PostgreSQL endpoint changed')
                     native._begin_original_journal(state)
                     program_sealed = True
                 except NativeJournalConfigurationError as error:

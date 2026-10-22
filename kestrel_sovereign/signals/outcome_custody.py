@@ -7,6 +7,7 @@ in the ambient context and native commit/cleanup evidence retains them.
 
 import asyncio
 import sys
+import os
 from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -163,6 +164,34 @@ def _restore_native_connect_configuration(value):
     return list(items) if kind == 'list' else tuple(items)
 
 
+def _native_effective_connect_configuration(connection):
+    """Observe actual admitted native endpoint/defaults, never a later env."""
+    address = connection._addr
+    if type(address) is tuple and len(address) == 2:
+        host, port = address
+    elif type(address) is str:
+        filename = os.path.basename(address)
+        prefix = '.s.PGSQL.'
+        if not filename.startswith(prefix) or not filename[len(prefix):].isdigit():
+            raise ExecutionAuthorityError('Original native socket endpoint is unsupported')
+        host, port = os.path.dirname(address), int(filename[len(prefix):])
+    else:
+        raise ExecutionAuthorityError('Original native endpoint is unsupported')
+    if type(host) is not str or type(port) is not int or not 0 < port < 65536:
+        raise ExecutionAuthorityError('Original native endpoint is unsupported')
+    params = connection._params
+    return _freeze_native_connect_configuration({
+        'host': host, 'port': port, 'user': params.user, 'database': params.database,
+        'password': params.password if params.password is not None else '',
+        'server_settings': params.server_settings if params.server_settings is not None else {},
+        'ssl': params.sslmode.name.replace('_', '-'),
+        'direct_tls': params.ssl_negotiation.value == 'direct',
+        'target_session_attrs': params.target_session_attrs.value,
+        'krbsrvname': params.krbsrvname if params.krbsrvname is not None else 'postgres',
+        'gsslib': params.gsslib,
+    })
+
+
 @dataclass(frozen=True, eq=False, repr=False)
 class _OriginalPostgresJournalPool:
     """Opaque native pool configuration accepted for this one fixed row.
@@ -177,6 +206,7 @@ class _OriginalPostgresJournalPool:
     connect_kwargs: object
     wrapper: object
     configuration: tuple
+    resolved_configuration: tuple | None = None
 
     @classmethod
     def capture(cls, backing):
@@ -233,8 +263,18 @@ class _OriginalPostgresJournalPool:
                 or _freeze_native_connect_configuration((tuple(args), supplied)) != self.configuration):
             raise ExecutionAuthorityError('Original native reconnect parameters differ')
         original_args, original_kwargs = _restore_native_connect_configuration(self.configuration)
+        if self.resolved_configuration is None:
+            raise ExecutionAuthorityError('Original native reconnect endpoint was not admitted')
+        original_kwargs.update(_restore_native_connect_configuration(self.resolved_configuration))
         original_kwargs.update(loop=loop, connection_class=connection_class, record_class=record_class)
         return original_args, original_kwargs
+
+    def with_actual_connection(self, connection):
+        return replace(self, resolved_configuration=_native_effective_connect_configuration(connection))
+
+    def matches_actual_connection(self, connection):
+        return (self.resolved_configuration is not None
+                and _native_effective_connect_configuration(connection) == self.resolved_configuration)
 
 
 @dataclass(frozen=True)
