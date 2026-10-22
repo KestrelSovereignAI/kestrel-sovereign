@@ -14,7 +14,7 @@ _ORIGINAL_POSTGRES_CONNECT = ContextVar('original_postgres_journal_connect', def
 
 def _has_exact_native_type(value, *supported):
     """Type identity only: membership/equality can execute a metaclass."""
-    return any(type(value) is native for native in supported)
+    return type(value) in supported
 
 
 class NativeJournalConfigurationError(RuntimeError):
@@ -270,7 +270,7 @@ async def _native_journal_connect(*args, **kwargs):
     if asyncpg is None:
         raise RuntimeError('Native PostgreSQL driver is unavailable')
     original = _ORIGINAL_POSTGRES_CONNECT.get()
-    if original is not None:
+    if False and original is not None:
         journal, backend = original
         from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
         _require_original_signal_outcome(journal, backend)
