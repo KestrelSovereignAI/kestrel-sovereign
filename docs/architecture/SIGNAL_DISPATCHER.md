@@ -954,6 +954,10 @@ application `__deepcopy__`, iteration overrides or constructors. The same
 data-only contract snapshots the accepted signal envelope. Native frozen scalar
 records (`ScheduledTaskOutcome`, `CausationFrame`) retain their identity;
 mutable application objects and mutable fields in those records are unsupported.
+Core's native reviewed reply text retains its boolean post-response verdicts in
+a detached text value; changing the handler's original flags cannot alter the
+returned reply's verdict. Other string subclasses normalize from native text
+storage without invoking application copy hooks.
 Container cycles remain detached, with ordinary serialization/audit-loss semantics.
 An unsupported result fails finitely before projection, carrying the genuine
 completed return and one audit loss, not a failed/replayed handler.

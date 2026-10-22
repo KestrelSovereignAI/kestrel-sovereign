@@ -2256,14 +2256,14 @@ class PostgresBackend(DatabaseBackend):
         columns = fields.pop('column_names')
         types = fields.pop('column_type_oids')
         modifiers = fields.pop('column_type_modifiers')
-        if set(columns) != set(_OUTCOME_COLUMNS):
+        if set(columns) != set(_OUTCOME_COLUMNS) or any(modifier != -1 for modifier in modifiers):
             return None
         builtin = asyncpg.protocol.protocol.BUILTIN_TYPE_NAME_MAP
         expected = {name: builtin['text'] for name in _OUTCOME_COLUMNS}
         expected.update(duration_ms=builtin['int4'], payload_raw=builtin['jsonb'],
                         dispatched_at=builtin['timestamptz'], completed_at=builtin['timestamptz'],
                         retention_until=builtin['timestamptz'])
-        if len(types) != len(columns):
+        if len(types) != len(columns) or any(oid != expected[name] for name, oid in zip(columns, types)):
             return None
         return _OriginalPostgresJournalRelation(**fields)
 
