@@ -841,10 +841,22 @@ until physically joined, including failures after Task acceptance but before
 callback publication.
 
 The original privacy-policy epoch and persistence-gate identity also remain
-fixed. The native INSERT holds that same gate shared through COMMIT/reset and
-rechecks the epoch under the hold: a privacy transition either precedes and
-invalidates it, or waits for the old-policy journal to finish before proceeding.
-This gate does not restore any revoked work authority.
+fixed. The native INSERT retains that same gate through COMMIT/reset and
+rechecks the epoch under the hold. An inline dispatch inside an exclusive
+transition pins that exact native acquisition, not the owner's next acquisition
+or general child work. Otherwise the journal reuses a still-live inherited
+shared lease, or atomically acquires a compatible shared hold without waiting.
+Ordinary ingress still queues behind transitions; routing never holds this
+leaf gate. A terminal journal cannot queue behind a transition that may itself
+await dispatch completion. Contention (`busy`) is distinct from an actually
+changed policy (`superseded`); neither permits stale plaintext SQL.
+
+Such a refusal propagates finite typed `SignalOutcomeJournalPrivacyRefusal`
+evidence (in `kestrel_sovereign.signals.outcome_custody`) carrying `reason` and
+the genuine completed `signal_result`. It records one observable audit loss,
+not a failed/rolled-back handler or a fabricated terminal COMMIT. Without an
+independent native failure it does not poison future dispatch admission.
+These gate holds and evidence never restore revoked work authority.
 
 Public, resident, and recovered cognition each retain their original owner;
 recovery uses the canonical envelope from its own claimed delivery. Native

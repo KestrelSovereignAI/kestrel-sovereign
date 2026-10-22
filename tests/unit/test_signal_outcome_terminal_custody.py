@@ -554,6 +554,79 @@ async def test_original_journal_completes_inside_original_exclusive_privacy_hold
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
 
 
+@pytest.mark.parametrize('boundary', ['writer_queued', 'writer_active', 'compatible_reader', 'inherited_shared'])
+async def test_original_journal_gate_admission_never_waits_on_a_transition(dispatcher_components, monkeypatch, boundary):
+    from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+    from kestrel_sovereign.signals.outcome_custody import SignalOutcomeJournalPrivacyRefusal
+    from kestrel_sovereign.execution_custody import execution_native_source_error, execution_commit_outcome, _explicit_control_chain
+    c = dispatcher_components
+    gate = DurablePersistenceGate()
+    class PrivacyAgent(type(c.agent)):
+        def _get_durable_persistence_gate(self):
+            return gate
+        def _get_privacy_policy_epoch(self):
+            return 'unchanged-original-policy'
+    c.agent.__class__ = PrivacyAgent
+    entered, release, transition_started = (asyncio.Event() for _ in range(3))
+    original = c.store._append_original_outcome
+    async def held_journal(journal):
+        entered.set()
+        await release.wait()
+        return await original(journal)
+    async def transition():
+        transition_started.set()
+        async with gate.exclusive():
+            pass
+    monkeypatch.setattr(c.store, '_append_original_outcome', held_journal)
+    c.registry.register(_action_reg('privacy.admission.audit'))
+    signal = _signal('privacy.admission.audit')
+    task = next_transition = None
+    try:
+        # Only the inherited case is actually created under the retained
+        # shared frame. A later holder cannot retroactively lend its lease.
+        if boundary != 'inherited_shared':
+            task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+            await asyncio.wait_for(entered.wait(), 2)
+        async with gate.exclusive() if boundary == 'writer_active' else gate.shared():
+            if task is None:
+                task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+                await asyncio.wait_for(entered.wait(), 2)
+            if boundary in ('writer_queued', 'inherited_shared'):
+                next_transition = asyncio.create_task(transition())
+                await transition_started.wait()
+            release.set()
+            completed, _ = await asyncio.wait({task}, timeout=2)
+            if not completed:
+                for _, _, journal in tuple(c.dispatcher._outcome_log_reconciliations.values()):
+                    if journal is not None and journal._writer_admission is not None:
+                        journal._writer_admission.task.cancel()
+            outcome = await await_owned_task(task)
+            assert completed, 'original journal queued behind a transition while its owner waited'
+            refused = boundary in ('writer_active', 'writer_queued')
+            if refused:
+                refusals = [error for error in _explicit_control_chain(outcome.error)
+                            if isinstance(error, SignalOutcomeJournalPrivacyRefusal)]
+                assert len(refusals) == 1 and refusals[0].reason == 'busy'
+                assert refusals[0].signal_result.status.value == 'ok'
+                assert execution_native_source_error(outcome.error) is None
+                assert execution_commit_outcome(outcome.error) is None
+            else:
+                assert outcome.error is None
+            assert c.dispatcher._outcome_log_control_error is None
+            assert c.dispatcher._log_write_failures == int(refused)
+            assert not c.dispatcher._outcome_log_tasks
+            assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == int(not refused)
+        if next_transition is not None:
+            await next_transition
+        assert (await c.dispatcher.dispatch_signal(_signal('privacy.admission.audit'))).action_result is not None
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        if next_transition is not None:
+            await next_transition
+
+
 @pytest.mark.parametrize('stale_hook_identity', [False, True])
 async def test_ack_refusal_journals_distinct_redelivery_attempt(tmp_path, stale_hook_identity):
     import time

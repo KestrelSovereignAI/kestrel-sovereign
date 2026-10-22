@@ -2978,12 +2978,12 @@ class SignalDispatcher:
             outcome = await await_owned_task(task)
             journal = journals.get(task)
             originals.extend((journal.retain_committed(outcome.error),
-                              journal.retain_committed(outcome.cancellation, observer=True))
+                              journal.retain_committed(outcome.cancellation))
                 if journal is not None else (outcome.error, outcome.cancellation))
             reconciliation = self._outcome_log_reconciliations.get(task)
             if task.done() and reconciliation is not None:
                 complete, publication_error, _ = reconciliation
-                publication_error = (journal.retain_committed(publication_error, observer=True)
+                publication_error = (journal.retain_committed(publication_error)
                     if journal is not None else publication_error)
                 originals.append(publication_error)
                 self._retain_durable_writer_control(publication_error)
@@ -7699,10 +7699,10 @@ class SignalDispatcher:
         outcome = await await_owned_task(writer)
         from kestrel_sovereign.execution_custody import execution_observation_error
         exc = execution_observation_error(opening, outcome.error)
-        committed = journal is not None and journal._phase == 'acknowledged'
+        committed = journal is not None and journal.has_acknowledged_commit()
         if committed:
-            exc = journal.retain_committed(exc, observer=True)
-        withdrawal = (journal.retain_committed(outcome.cancellation, observer=True)
+            exc = journal.retain_committed(exc)
+        withdrawal = (journal.retain_committed(outcome.cancellation)
             if journal is not None else outcome.cancellation)
         if exc is not None:
             # A dropped audit row is a loss, and a loss that leaves no record
@@ -7828,7 +7828,7 @@ class SignalDispatcher:
             self._record_surface(signal.id, SURFACE_EMIT_FAILED)
             if is_execution_control_error(error) or not isinstance(error, Exception):
                 if journal is not None:
-                    raise journal.retain_committed(error, observer=True)
+                    raise journal.retain_committed(error)
                 raise
             logger.exception(
                 "Failed to emit signal_completed UI event for %s", signal.id

@@ -24,6 +24,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_inner_writer_observation_retains_commit_and_original_error,
     test_original_journal_respects_original_privacy_epoch_and_gate,
     test_original_journal_completes_inside_original_exclusive_privacy_hold,
+    test_original_journal_gate_admission_never_waits_on_a_transition,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]

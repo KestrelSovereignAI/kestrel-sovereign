@@ -2229,6 +2229,7 @@ class PostgresBackend(DatabaseBackend):
             # Both reset/retirement failure and a post-reset identity denial
             # retain the exact original COMMIT/ACK and reset owner receipts.
             if state is not None:
+                journal._acknowledgments = tuple(state.acknowledgments)
                 raise state.retain_acknowledgments(error)
             raise
         return entry.result_summary

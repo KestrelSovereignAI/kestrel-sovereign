@@ -16,6 +16,15 @@ from kestrel_sovereign.execution_custody import (
 _JOURNAL_ADMISSION = object()
 
 
+class SignalOutcomeJournalPrivacyRefusal(ExecutionAuthorityError):
+    """Terminal audit refused; the original completed effect did not roll back."""
+
+    def __init__(self, reason, signal_result):
+        super().__init__('Original signal journal privacy refusal: ' + reason)
+        self.reason = reason
+        self.signal_result = signal_result
+
+
 @dataclass(frozen=True, eq=False)
 class _AcceptedSignalOutcome:
     """Original dispatcher-issued envelope, not a causation-context proxy."""
@@ -58,6 +67,10 @@ class _OriginalSignalOutcome:
         )
         self._privacy_gate = _resolve_durable_persistence_gate(self._agent)
         self._privacy_epoch = _resolve_privacy_policy_epoch(self._agent)
+        from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+        self._privacy_exclusive_hold = (
+            self._privacy_gate._capture_original_exclusive_hold()
+            if isinstance(self._privacy_gate, DurablePersistenceGate) else None)
         self._registration = registration
         # Payload containers and privacy settings belong to acceptance, not
         # to a handler's mutable arguments after revocation.
@@ -87,6 +100,14 @@ class _OriginalSignalOutcome:
         return (self._identity == self._signal_identity(signal)
                 and registration is self._registration)
 
+    def privacy_refusal(self, reason, cause=None):
+        from kestrel_sovereign.execution_custody import _FINITE_NATIVE_SOURCES, _native_source_originals
+        original = SignalOutcomeJournalPrivacyRefusal(reason, self._completed_result)
+        original.__cause__ = cause
+        finite = BaseExceptionGroup('original signal terminal audit privacy refusal', [original])
+        finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, _native_source_originals(cause))
+        return finite
+
     def _require_backing(self):
         backend = self._backend
         if (self._dispatcher._store is not self._store
@@ -99,15 +120,16 @@ class _OriginalSignalOutcome:
         from kestrel_sovereign.storage.privacy_wrapper import (
             _resolve_durable_persistence_gate, _resolve_privacy_policy_epoch,
         )
-        from kestrel_sovereign.execution_custody import execution_error_with_cause
         try:
             gate = _resolve_durable_persistence_gate(self._agent)
             epoch = _resolve_privacy_policy_epoch(self._agent)
         except BaseException as error:
-            raise execution_error_with_cause(
-                ExecutionAuthorityError('Original signal journal privacy identity unavailable'), error)
+            raise self.privacy_refusal('identity_unavailable', error)
         if gate is not self._privacy_gate or epoch != self._privacy_epoch:
-            raise ExecutionAuthorityError('Original signal journal privacy policy changed')
+            raise self.privacy_refusal('superseded')
+        hold = self._privacy_exclusive_hold
+        if hold is not None and (gate._exclusive_hold is not hold or not hold.live):
+            raise self.privacy_refusal('exclusive_hold_retired')
         if backend.backend_type == 'sqlite':
             if (self._backing is None or backend._connection is not self._backing
                     or backend.connection_generation != self._generation or backend._closing):
@@ -161,15 +183,20 @@ class _OriginalSignalOutcome:
             raise ExecutionAuthorityError('Original signal journal was not submitted')
         self._phase = 'acknowledged'
 
-    def retain_committed(self, error, *, observer=False):
+    def has_acknowledged_commit(self):
+        """A native COMMIT fact is independent of final identity admission."""
+        return (self._phase == 'acknowledged'
+                or any(receipt.acknowledged for receipt in self._acknowledgments))
+
+    def retain_committed(self, error):
         """Retain the actual terminal INSERT fact, never new work authority."""
-        if error is None or self._phase != 'acknowledged':
+        if error is None or not self.has_acknowledged_commit():
             return error
         from kestrel_sovereign.execution_custody import (
             retain_acknowledged_execution_commit, execution_commit_outcome,
             _FINITE_NATIVE_SOURCES, _native_source_originals,
         )
-        if observer and self._acknowledgments:
+        if self._acknowledgments:
             # The ACK is a real native fact, but the waiter's withdrawal is
             # not a failed COMMIT/reset source. Keep both on a private finite
             # carrier without poisoning the shared native-source latch.
