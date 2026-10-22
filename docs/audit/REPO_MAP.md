@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-22
-**Scope:** 3306 tracked files (2472 `.py`, 366 `.md`, 468 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3307 tracked files (2473 `.py`, 366 `.md`, 468 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3254,7 +3254,7 @@ Repo entry points and standard project files.
   - `async def test_native_recipient_control_cannot_become_unverifiable_watch(native_pg, tmp_path, monkeypatch, route)`
 - **tests/integration/test_wait_resident_custody_pg.py** — Real wait-worker lifetime after hosted bootstrap admission retires (#3385).
   - `async def test_wait_resident_outlives_boot_admission_but_not_original_generation(native_pg, tmp_path, monkeypatch, retirement)`
-- **tests/interop/README.md** — Native A2A interoperability — Run `python -m pytest tests/interop/test_a2a_go.py` from the Core checkout, using an environment with Core's current dependencies and Go on `PATH`.
+- **tests/interop/README.md** — Native A2A interoperability — Run `python -m pytest tests/interop/test_a2a_go.py tests/interop/test_native_drainer_shutdown.py` from the Core checkout, using an environment with Core's current dependencies and Go on `PATH`.
 - **tests/interop/a2a_go_peer/go.mod** — —
 - **tests/interop/a2a_go_peer/go.sum** — —
 - **tests/interop/a2a_go_peer/main.go** — —
@@ -3765,6 +3765,8 @@ Repo entry points and standard project files.
   - `async def test_a_refused_checks_api_falls_back_to_the_actions_api(monkeypatch)`; `async def test_the_caveat_names_the_class_of_gate_that_stays_invisible(monkeypatch)`; `async def test_a_complete_rollup_has_no_caveat_at_all(monkeypatch)`; `async def test_a_network_failure_on_checks_does_not_take_the_fallback(monkeypatch)`; `async def test_both_check_endpoints_refused_is_a_hard_auth_failure(monkeypatch)`; `async def test_a_refused_status_propagates_instead_of_degrading(monkeypatch)`; `async def test_a_401_on_the_checks_read_does_not_degrade(monkeypatch)`; `async def test_a_401_on_the_actions_fallback_does_not_degrade_either(monkeypatch)`; `…`
 - **tests/unit/test_ci_minimum_python_custody.py** — The supported minimum interpreter must exercise actual native custody.
   - `def minimum_job()`; `def test_minimum_lane_pins_interpreter_and_exact_release_ref()`; `def test_minimum_lane_cannot_silently_skip_native_or_omit_regressions()`
+- **tests/unit/test_ci_native_a2a_job.py** — The required native lane must exercise SQLite shutdown and foreign wire use.
+  - `def test_native_lane_collects_wire_and_original_shutdown_regressions()`
 - **tests/unit/test_ci_no_metered_provider_credentials.py** — Routine CI cannot enable metered tests through repo or inherited secrets.
   - `def test_provider_credentials_are_explicitly_blank_in_routine_test_steps(job)`
 - **tests/unit/test_ci_redefinition_gate.py** — The F811 gate in ``.github/workflows/ci.yml``.

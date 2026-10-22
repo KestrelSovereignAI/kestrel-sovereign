@@ -946,9 +946,10 @@ jobs:
           cache-dependency-path: tests/interop/a2a_go_peer/go.sum
       - name: Install the locked host
         run: uv sync --python 3.14 --locked
-      - name: Verify public Go SDK and real Kestrel task exchange
+      - name: Verify native A2A interoperability and resident shutdown
         run: >-
           uv run --no-sync python -m pytest tests/interop/test_a2a_go.py
+          tests/interop/test_native_drainer_shutdown.py
           -p pytest_asyncio.plugin -p pytest_timeout -o addopts=''
           -v --tb=short -x --timeout=120 --junitxml=a2a-go-interop.xml
         timeout-minutes: 5
