@@ -924,6 +924,55 @@ jobs:
   # execution and no extension of the existing integration timeout. This is a
   # required reusable release-CI job as well as a PR job. The shared failed-unit
   # run cancellation above also reaches this lane.
+  a2a-go-interop:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [lint-and-imports, unit-tests]
+    if: >-
+      (github.event_name != 'push' || github.ref != 'refs/heads/main')
+      && needs.lint-and-imports.outputs.run_expensive != 'false'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: tests/interop/a2a_go_peer/go.mod
+          cache-dependency-path: tests/interop/a2a_go_peer/go.sum
+      - name: Install the locked host
+        run: uv sync --python 3.14 --locked
+      - name: Verify public Go SDK and real Kestrel task exchange
+        run: >-
+          uv run --no-sync python -m pytest tests/interop/test_a2a_go.py
+          -p pytest_asyncio.plugin -p pytest_timeout -o addopts=''
+          -v --tb=short -x --timeout=120 --junitxml=a2a-go-interop.xml
+        timeout-minutes: 5
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          EMAIL_DRY_RUN: "true"
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          XAI_API_KEY: ""
+      - name: Retain interoperability result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: a2a-go-interop
+          path: a2a-go-interop.xml
+          if-no-files-found: error
+          retention-days: 14
+
   native-postgres-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 60

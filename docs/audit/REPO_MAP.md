@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-21
-**Scope:** 3291 tracked files (2462 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3297 tracked files (2463 `.py`, 366 `.md`, 468 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3252,6 +3252,13 @@ Repo entry points and standard project files.
   - `async def test_native_recipient_control_cannot_become_unverifiable_watch(native_pg, tmp_path, monkeypatch, route)`
 - **tests/integration/test_wait_resident_custody_pg.py** — Real wait-worker lifetime after hosted bootstrap admission retires (#3385).
   - `async def test_wait_resident_outlives_boot_admission_but_not_original_generation(native_pg, tmp_path, monkeypatch, retirement)`
+- **tests/interop/README.md** — Native A2A interoperability — Run `python -m pytest tests/interop/test_a2a_go.py` from the Core checkout, using an environment with Core's current dependencies and Go on `PATH`.
+- **tests/interop/a2a_go_peer/go.mod** — —
+- **tests/interop/a2a_go_peer/go.sum** — —
+- **tests/interop/a2a_go_peer/main.go** — —
+- **tests/interop/a2a_go_peer/main_test.go** — —
+- **tests/interop/test_a2a_go.py** — Public Go SDK interoperability with an initialized, isolated Kestrel agent.
+  - `def go_peer(tmp_path_factory)`; `async def retire_peer(process)`; `async def run_peer(binary, mode, config_path)`; `async def serve_go_peer(binary, config_path, config, root)`; `async def test_public_go_sdk_and_booted_kestrel_exchange_native_tasks(go_peer, tmp_path, monkeypatch)`
 - **tests/js/test_voice_capture_worklet.mjs** — (mjs asset)
 - **tests/js/test_voice_events.mjs** — (mjs asset)
 - **tests/js/test_voice_native_custody.cjs** — —

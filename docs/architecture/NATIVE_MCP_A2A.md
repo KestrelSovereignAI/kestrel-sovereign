@@ -719,6 +719,18 @@ identity-epoch validation must still precede task creation or other effects.
 This schema is an implementation contract; Core route integration, signed
 cards, conformance and interoperability remain release gates below.
 
+The maintained foreign-peer exercise is
+`tests/interop/test_a2a_go.py`, with its public Go SDK dependency and independent
+hybrid extension implementation in `tests/interop/a2a_go_peer`. The
+`a2a-go-interop` CI job runs it after unit tests, including on the release ref.
+It initializes an isolated SQLite Kestrel agent and verifies signed discovery,
+task completion in both directions over both bindings, durable creator and
+outbound ownership, wrong-recipient refusal, and rejection of an unrelated
+Agent Card trust anchor. Its deterministic business handler completes canonical
+TaskManager tasks; it does not establish LLM quality or a deployed public
+frontdoor. TCK conformance and adoption of published dependencies remain separate
+release requirements.
+
 The extension contains sender DID, recipient DID, operation, timestamp, nonce
 and the sender proof. Bind the complete official request payload (including
 non-text parts, configuration and all behavior-affecting extension metadata)
