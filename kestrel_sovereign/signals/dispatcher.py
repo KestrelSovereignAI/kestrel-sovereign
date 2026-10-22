@@ -5110,7 +5110,17 @@ class SignalDispatcher:
             # child physically settles. Explicit handle cancellation forwards
             # once; borrowed admission readers still never cancel this owner.
             outcome = await await_owned_task(resident, cancel_on_caller_cancellation=True)
-            terminal = execution_observation_error(outcome.error, outcome.cancellation)
+            from kestrel_sovereign.execution_custody import _explicit_control_chain
+            errors = (outcome.error, outcome.cancellation)
+            cancellation_only = all(error is None or (
+                type(error) is asyncio.CancelledError and not is_execution_control_error(error)
+                and all(type(member) is asyncio.CancelledError for member in _explicit_control_chain(error)))
+                for error in errors)
+            # An ordinary Stop with no independent failure retains native
+            # CancelledError/lifecycle semantics. Independent evidence uses a
+            # fresh Base carrier so ordinary failure cannot demote withdrawal.
+            terminal = (execution_finite_error(*errors, retain_originals=True) if cancellation_only
+                        else execution_observation_error(*errors))
             for completed_journal in resident_journals:
                 terminal = completed_journal.retain_committed(terminal)
             if terminal is not None:

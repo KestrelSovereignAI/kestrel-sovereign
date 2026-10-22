@@ -151,6 +151,44 @@ async def test_postgres_original_recipe_detects_nested_host_mutation_before_reco
             await pool.close()
 
 
+async def test_postgres_original_reconnect_pins_effective_endpoint_not_late_environment(dispatcher_components, native_pg, monkeypatch):
+    import asyncpg
+    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    original_pool = c.backend._pool
+    monkeypatch.setenv('PGHOST', control._addr[0])
+    pool = await asyncpg.create_pool(min_size=1, max_size=1, host=None, port=control._addr[1],
+        user=control._params.user, password=control._params.password, database=control._params.database,
+        connection_class=NativeJournalPostgresConnection, server_settings={'search_path': schema}, timeout=2)
+    c.backend._pool = pool
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    async def handler(payload):
+        async with pool.acquire() as connection:
+            await connection.close()
+        monkeypatch.setenv('PGHOST', '127.0.0.2')
+        scope.revoke('actual cutoff after environment changed original endpoint default')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.original.effective.endpoint', handler=handler))
+    signal = _signal('native.original.effective.endpoint')
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(signal)
+            except BaseException as caught:
+                error = caught
+        assert error is None, 'original journal re-read a changed environment default instead of its accepted native endpoint'
+        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 1
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
 async def test_postgres_proof_never_scans_unvalidated_foreign_inheritance(dispatcher_components, native_pg):
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, _explicit_control_chain
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
