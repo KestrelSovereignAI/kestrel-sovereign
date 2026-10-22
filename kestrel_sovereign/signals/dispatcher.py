@@ -2972,12 +2972,17 @@ class SignalDispatcher:
     async def _join_outcome_log_tasks(self, tasks, *, finite_errors=None) -> None:
         from kestrel_sovereign._async_ownership import await_owned_task
         originals = []
+        journals = {task: entry[2] for task in tasks
+            if (entry := self._outcome_log_reconciliations.get(task)) is not None}
         for task in tasks:
             outcome = await await_owned_task(task)
-            originals.extend((outcome.error, outcome.cancellation))
+            journal = journals.get(task)
+            originals.extend((journal.retain_committed(outcome.error),
+                              journal.retain_committed(outcome.cancellation))
+                if journal is not None else (outcome.error, outcome.cancellation))
             reconciliation = self._outcome_log_reconciliations.get(task)
             if task.done() and reconciliation is not None:
-                complete, publication_error = reconciliation
+                complete, publication_error, _ = reconciliation
                 originals.append(publication_error)
                 complete(task, joined=True)
         if finite_errors is not None:
@@ -5016,7 +5021,8 @@ class SignalDispatcher:
         """Own recovered claim admission and its original journal through join."""
         async with self._admit_durable_operation():
             token = self._original_outcome_admission.set(None)
-            deferred_token = self._deferred_outcome_logs.set(None)
+            original_outcomes = []
+            deferred_token = self._deferred_outcome_logs.set(original_outcomes)
             acceptances = []
             result = None
             original = cleanup = None
@@ -5031,6 +5037,16 @@ class SignalDispatcher:
                     original = error
                 journal = self._original_outcome_admission.get()
                 try:
+                    self._deferred_outcome_logs.set(None)
+                    if result is not None:
+                        if journal is not None:
+                            journal._completed_result = result
+                        selected = [outcome for outcome in original_outcomes
+                            if outcome.result is result and outcome.signal.id == result.signal_id
+                            and outcome.registration is registration]
+                        if selected:
+                            outcome = selected[-1]
+                            self._schedule_outcome_log(outcome.signal, registration, result, audit=outcome.audit)
                     await self._drain_outcome_logs_for_signal(
                         journal._identity[0] if journal is not None else signal.id)
                 except BaseException as error:
@@ -7559,7 +7575,8 @@ class SignalDispatcher:
         try:
             if journal is not None:
                 try:
-                    prepared = self._store._prepare_outcome(signal, registration, result,
+                    prepared = self._store._prepare_outcome(journal._signal_snapshot,
+                        journal._registration_snapshot, result,
                         prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
                         **_audit_to_log_kwargs(audit))
                 except Exception as error:
@@ -7622,7 +7639,7 @@ class SignalDispatcher:
                     exc_info=(type(error), error, error.__traceback__),
                 )
 
-        self._outcome_log_reconciliations[task] = (_complete, publication_error)
+        self._outcome_log_reconciliations[task] = (_complete, publication_error, journal)
         try:
             task.add_done_callback(_complete)
         except BaseException as error:
@@ -7630,7 +7647,7 @@ class SignalDispatcher:
             # including a rejection of this final callback publication.
             from kestrel_sovereign.execution_custody import execution_observation_error
             publication_error = execution_observation_error(publication_error, error)
-            self._outcome_log_reconciliations[task] = (_complete, publication_error)
+            self._outcome_log_reconciliations[task] = (_complete, publication_error, journal)
 
     async def _log_safe(
         self,
@@ -7686,7 +7703,7 @@ class SignalDispatcher:
             if not isinstance(exc, Exception):
                 raise execution_finite_error(exc, outcome.cancellation)
         if outcome.cancellation is not None:
-            raise outcome.cancellation
+            raise journal.retain_committed(outcome.cancellation) if journal is not None else outcome.cancellation
 
     def _record_log_write_failure(
         self, signal_id: str, error: BaseException

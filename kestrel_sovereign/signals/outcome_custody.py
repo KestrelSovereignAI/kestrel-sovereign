@@ -6,7 +6,8 @@ in the ambient context and native commit/cleanup evidence retains them.
 """
 
 import asyncio
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, current_execution_custody, require_execution_work,
@@ -52,6 +53,11 @@ class _OriginalSignalOutcome:
         self._agent = dispatcher._agent
         self._agent_id = dispatcher._agent.did
         self._registration = registration
+        # Payload containers and privacy settings belong to acceptance, not
+        # to a handler's mutable arguments after revocation.
+        self._signal_snapshot = deepcopy(signal)
+        self._registration_snapshot = replace(registration,
+            log_redaction=replace(registration.log_redaction))
         self._query = SignalLogStore._outcome_insert_query()
         self._acceptance = acceptance
         self._identity = self._signal_identity(signal)
@@ -138,15 +144,17 @@ class _OriginalSignalOutcome:
 
     def retain_committed(self, error):
         """Retain the actual terminal INSERT fact, never new work authority."""
-        if self._phase != 'acknowledged':
+        if error is None or self._phase != 'acknowledged':
             return error
         from kestrel_sovereign.execution_custody import (
             ExecutionCommitOutcomeError, execution_error_with_cause,
-            retain_acknowledged_execution_commit,
+            retain_acknowledged_execution_commit, execution_commit_outcome,
         )
         for receipt in self._acknowledgments:
             retain_acknowledged_execution_commit(error, receipt)
         if self._acknowledgments:
+            return error
+        if execution_commit_outcome(error) is not None:
             return error
         # SQLite's existing native COMMIT is awaited inline, not an invented
         # successful Task/ACK receipt. Preserve only its known committed fact.
@@ -162,7 +170,8 @@ def _require_original_signal_outcome(journal, backend):
 def _capture_original_outcome(dispatcher, signal, registration, *, acceptance):
     """Only a live original public dispatch can create this terminal unit."""
     from kestrel_sovereign.signals.store import SignalLogStore
-    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend, PostgresPoolAdapter
     from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
     admission = dispatcher._durable_admission.get()
@@ -170,8 +179,13 @@ def _capture_original_outcome(dispatcher, signal, registration, *, acceptance):
             or asyncio.current_task() not in dispatcher._durable_admission_owners):
         raise ExecutionAuthorityError('Original accepted dispatch required for terminal journal')
     store = dispatcher._store
-    if type(store) is not SignalLogStore or type(store._backend) not in (SQLiteBackend, PostgresBackend):
-        if current_execution_custody(dispatcher._agent):
+    backend = store._backend
+    native = type(store) is SignalLogStore and type(backend) in (SQLiteBackend, PostgresBackend)
+    if native and type(backend) is PostgresBackend:
+        native = postgres_module.ASYNCPG_AVAILABLE and isinstance(
+            backend._pool, (postgres_module.asyncpg.Pool, PostgresPoolAdapter))
+    if not native:
+        if current_execution_custody(dispatcher._agent) or current_execution_custody(backend):
             raise ExecutionAuthorityError('Hosted terminal journal requires a supported native backend')
         return None  # legacy unscoped embeddings retain ordinary append only
     return _OriginalSignalOutcome(dispatcher, signal, registration, acceptance=acceptance)

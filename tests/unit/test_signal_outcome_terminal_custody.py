@@ -413,6 +413,141 @@ async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_co
             assert is_execution_control_error(error)
 
 
+async def test_accepted_payload_is_not_replaced_after_cutoff(dispatcher_components):
+    import json
+    from dataclasses import replace
+    from kestrel_sdk.signals import RedactionPolicy, Trust
+    c = dispatcher_components
+    entered, release = asyncio.Event(), asyncio.Event()
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    task = None
+
+    async def handler(payload):
+        entered.set()
+        await release.wait()
+        payload['authorized'] = 'replacement-after-cutoff'
+        return {'genuine': True}
+
+    registration = replace(_action_reg('snapshot.audit', handler=handler), trust=Trust.TRUSTED,
+        log_redaction=RedactionPolicy(summarize=lambda payload: payload['authorized'], store_raw_trusted=True))
+    c.registry.register(registration)
+    signal = _signal('snapshot.audit', payload={'authorized': 'original'})
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+            await asyncio.wait_for(entered.wait(), 2)
+            scope.revoke('original envelope cutoff')
+            release.set()
+            outcome = await await_owned_task(task)
+            assert outcome.error is None
+        raw, redacted = await c.backend.fetch_one('SELECT payload_raw,payload_redacted FROM signal_log WHERE id=?', (signal.id,))
+        assert json.loads(raw) == {'authorized': 'original'}
+        assert redacted == 'original'
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+
+
+@pytest.mark.parametrize('withdrawal', ['dispatch', 'outer_writer'])
+async def test_owner_withdrawal_retains_actual_original_journal_commit(dispatcher_components, monkeypatch, withdrawal):
+    from kestrel_sovereign._async_ownership import create_owned_task
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error, _acknowledged_commits
+    c = dispatcher_components
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = c.dispatcher._write_outcome_log
+    journals = []
+    task = None
+
+    async def held_writer(*args, **kwargs):
+        journals.append(c.dispatcher._original_outcome_writer.get())
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(c.dispatcher, '_write_outcome_log', held_writer)
+    c.registry.register(_action_reg('withdrawal.audit'))
+    signal = _signal('withdrawal.audit')
+    try:
+        task = create_owned_task(c.dispatcher.dispatch_signal(signal))
+        await asyncio.wait_for(entered.wait(), 2)
+        journal = journals[0]
+        (task if withdrawal == 'dispatch' else journal._outer_admission.task).cancel('original owner withdrawal')
+        release.set()
+        outcome = await await_owned_task(task)
+        error = outcome.error or outcome.cancellation
+        assert error is not None
+        assert journal._phase == 'acknowledged'
+        assert execution_commit_outcome(error) == 'committed'
+        if c.backend.backend_type == 'postgres':
+            retained = _acknowledged_commits(error)
+            assert retained and all(any(actual is receipt for actual in retained) for receipt in journal._acknowledgments)
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        try:
+            await c.dispatcher.shutdown_durable_delivery()
+        except BaseException as error:
+            assert is_execution_control_error(error)
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+
+
+@pytest.mark.parametrize('boundary', ['held', 'hold_read', 'execution_admission'])
+async def test_early_recovered_claim_journals_its_actual_disposition(tmp_path, boundary):
+    import time
+    from kestrel_sdk.signals import Status
+    from kestrel_sovereign.signals import DurableConsumerRegistration
+    from kestrel_sovereign.hold import EffectiveHoldState
+    from tests.unit.test_durable_signal_delivery import (
+        _channel_dispatcher, _channel_signal, _close, _HoldSnapshots, _FailingHoldRead, _held_state,
+    )
+    from kestrel_sovereign.signals.sources.channels import (
+        DURABLE_COGNITION_CONSUMER_ID, DURABLE_COGNITION_MARKER, DURABLE_COGNITION_MARKER_VALUE,
+    )
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'early-recovered-audit.db', 'did:agent:early-journal')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=0)
+    free = EffectiveHoldState(host=None, agent=None)
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        signal = _channel_signal(agent.did, 'original-early-recovered-audit')
+        persisted = await dispatcher._durable_store.persist_signal(signal, agent_id=agent.did,
+            source_event_id='early-recovered-original', retention_days=7,
+            caller_identity=dispatcher._protect_durable_caller_identity(signal))
+        delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
+            event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
+        assert delivery is not None
+        if boundary == 'held':
+            agent._hold_store = _HoldSnapshots(free, _held_state(agent.did))
+        elif boundary == 'hold_read':
+            agent._hold_store = _FailingHoldRead(fail_on=2)
+        else:
+            class WithdrawClaim:
+                reads = 0
+                async def get_effective(self, _agent_id):
+                    self.reads += 1
+                    if self.reads == 2:
+                        assert await dispatcher.nack_durable_delivery(consumer_id=consumer.consumer_id,
+                            delivery_id=delivery.delivery_id, lease_token=delivery.lease_token,
+                            error='original accepted lease withdrawn before execution')
+                    return free
+            agent._hold_store = WithdrawClaim()
+        seed = dispatcher._durable_retry_seed(delivery.event)
+        result = await dispatcher._route_durable_cognition_delivery(seed,
+            dispatcher._registry.get(seed.source), time.monotonic(), persisted_event_id=delivery.event_id,
+            consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
+            use_live_signal=False, claimed_delivery=delivery)
+        await dispatcher._drain_outcome_logs_for_signal(seed.id)
+        assert result.status != Status.OK
+        assert await backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (seed.id,)) == 1
+        assert not dispatcher._accepted_signal_outcomes
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
 @pytest.mark.parametrize('change', ['signal', 'agent', 'backend'])
 async def test_original_journal_refuses_substituted_identity(dispatcher_components, monkeypatch, tmp_path, change):
     from kestrel_sovereign.signals.store import SignalLogStore

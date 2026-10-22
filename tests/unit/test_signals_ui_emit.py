@@ -510,19 +510,19 @@ async def test_log_write_failure_suppresses_ui_emit(components, monkeypatch):
     suppresses the emit on log failure."""
     c = components
 
-    async def fail_append(*args, **kwargs):
-        raise RuntimeError("disk full")
-
-    monkeypatch.setattr(c.dispatcher._store, "append", fail_append)
+    # Refuse the actual owned native INSERT, not the now separate ordinary
+    # append seam. Only this test's temporary database is affected.
+    await c.backend.execute('DROP TABLE signal_log')
 
     sig = _make_signal(visibility=Visibility.USER_VISIBLE)
     result = await c.dispatcher.dispatch_signal(sig)
     # Dispatch reports OK because the handler ran successfully;
-    # the log write happens in the background.
+    # loss of its audit does not relabel the already completed effect.
     assert result.status == Status.OK
     await _drain(c.agent)
     # No SSE emit because the log write raised.
     assert c.agent.emitted == []
+    assert c.dispatcher._log_write_failures == 1
 
 
 # ---------------------------------------------------------------------------

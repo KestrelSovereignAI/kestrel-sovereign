@@ -18,6 +18,8 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_rejected_completion_callback_physically_joins_original_writer,
     test_handler_cannot_terminalize_through_scheduler_after_cutoff,
     test_visible_journal_does_not_admit_ui_work_after_cutoff,
+    test_accepted_payload_is_not_replaced_after_cutoff,
+    test_owner_withdrawal_retains_actual_original_journal_commit,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -74,6 +76,46 @@ async def test_original_journal_keeps_acknowledged_commit_after_reset_identity_l
         c.agent._did = original_id
         monkeypatch.setattr(asyncpg.pool.Pool, 'release', original_release)
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+
+
+@pytest.mark.parametrize('scoped', [False, True])
+async def test_original_journal_legacy_pool_compatibility(dispatcher_components, scoped):
+    from contextlib import asynccontextmanager, nullcontext
+    from kestrel_sovereign.execution_custody import (
+        ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime,
+    )
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    original_pool = c.backend._pool
+    handlers = []
+
+    class LegacyPool:
+        @asynccontextmanager
+        async def acquire(self):
+            async with original_pool.acquire() as connection:
+                yield connection
+
+    async def handler(payload):
+        handlers.append(True)
+        return {'genuine': True}
+
+    c.registry.register(_action_reg('legacy.pool.audit', handler=handler))
+    c.backend._pool = LegacyPool()
+    signal = _signal('legacy.pool.audit')
+    owner = SimpleNamespace(_execution_custody=ExecutionCustody(_OriginalWork(backend_type='postgres')))
+    try:
+        with bind_execution_runtime(owner) if scoped else nullcontext():
+            if scoped:
+                with pytest.raises(ExecutionAuthorityError, match='supported native backend'):
+                    await c.dispatcher.dispatch_signal(signal)
+            else:
+                result = await c.dispatcher.dispatch_signal(signal)
+                assert result.action_result == {'genuine': True}
+    finally:
+        c.backend._pool = original_pool
+    assert handlers == ([] if scoped else [True])
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == (0 if scoped else 1)
 
 
 async def test_original_journal_reset_failure_retains_exact_commit_and_retirement(
