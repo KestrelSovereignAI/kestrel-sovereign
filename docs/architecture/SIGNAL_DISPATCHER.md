@@ -863,6 +863,12 @@ recovery uses the canonical envelope from its own claimed delivery. Native
 COMMIT acknowledgment, reset/retirement debt, cancellation, and later identity
 denial retain their original evidence. An acknowledged audit row is never
 evidence that fresh work is authorized or that an external effect is replayable.
+SQLite records its actual native COMMIT return before the later identity
+recheck; that fact is not a fabricated PostgreSQL COMMIT/reset receipt. A
+cancellation transfer retains the exact original SQLite drain on this journal,
+and the journal joins it while still under the original privacy protection.
+Audit-loss accounting is per original row, including accepted-but-unstarted
+writers, and does not count the same failure again at another join boundary.
 Projection callbacks and UI emission remain ordinary work: control failures
 propagate, and UI emission after revocation is refused even if the row committed.
 An ordinary projection failure records an observable audit loss without

@@ -2977,12 +2977,21 @@ class SignalDispatcher:
         for task in tasks:
             outcome = await await_owned_task(task)
             journal = journals.get(task)
-            originals.extend((journal.retain_committed(outcome.error),
+            observed_error = outcome.error
+            if journal is not None and observed_error is not None and not journal.has_acknowledged_commit():
+                self._record_original_outcome_loss(journal, journal._identity[0], observed_error)
+                if isinstance(observed_error, Exception) and not is_execution_control_error(observed_error):
+                    observed_error = None  # ordinary audit loss, not a failed handler
+            originals.extend((journal.retain_committed(observed_error),
                               journal.retain_committed(outcome.cancellation))
-                if journal is not None else (outcome.error, outcome.cancellation))
+                if journal is not None else (observed_error, outcome.cancellation))
             reconciliation = self._outcome_log_reconciliations.get(task)
             if task.done() and reconciliation is not None:
                 complete, publication_error, _ = reconciliation
+                if journal is not None and publication_error is not None and not journal.has_acknowledged_commit():
+                    self._record_original_outcome_loss(journal, journal._identity[0], publication_error)
+                    if isinstance(publication_error, Exception) and not is_execution_control_error(publication_error):
+                        publication_error = None
                 publication_error = (journal.retain_committed(publication_error)
                     if journal is not None else publication_error)
                 originals.append(publication_error)
@@ -7598,7 +7607,7 @@ class SignalDispatcher:
                 except Exception as error:
                     if is_execution_control_error(error):
                         raise
-                    self._record_log_write_failure(signal.id, error)
+                    self._record_original_outcome_loss(journal, signal.id, error)
                     self._release_durable_admission(reservation)
                     logger.error('Failed to prepare signal_log entry for %s', signal.id, exc_info=True)
                     return
@@ -7620,7 +7629,10 @@ class SignalDispatcher:
                 # refused this original row before _log_safe could account
                 # for its loss. Accepted writers own their own one outcome.
                 if journal is not None:
-                    self._record_log_write_failure(signal.id, opening)
+                    self._record_original_outcome_loss(journal, signal.id, opening)
+                    if isinstance(opening, Exception) and not is_execution_control_error(opening):
+                        logger.error('Original outcome writer allocation failed for %s', signal.id, exc_info=True)
+                        return
                 raise
             # The native task was accepted, even if its publication failed.
             # It is retained below until the existing async drain joins it.
@@ -7649,6 +7661,8 @@ class SignalDispatcher:
             self._release_durable_admission(reservation)
             from kestrel_sovereign._async_ownership import owned_task_error
             error = owned_task_error(task)
+            if journal is not None and error is not None:
+                self._record_original_outcome_loss(journal, signal.id, error)
             if error is not None and is_execution_control_error(error):
                 self._retain_durable_writer_control(error)
             elif error is not None and not isinstance(error, asyncio.CancelledError):
@@ -7686,6 +7700,7 @@ class SignalDispatcher:
         from kestrel_sovereign._async_ownership import create_owned_task, OwnedTaskAdmission
         publication = OwnedTaskAdmission()
         opening = None
+        journal = self._original_outcome_writer.get()
         try:
             writer = create_owned_task(
                 self._write_outcome_log(signal, registration, result, audit=audit),
@@ -7695,9 +7710,12 @@ class SignalDispatcher:
         except BaseException as error:
             writer = publication.task
             if writer is None:
+                self._record_original_outcome_loss(journal, signal.id, error)
+                if isinstance(error, Exception) and not is_execution_control_error(error):
+                    logger.error('Original outcome writer allocation failed for %s', signal.id, exc_info=True)
+                    return
                 raise
             opening = error
-        journal = self._original_outcome_writer.get()
         if journal is not None:
             journal._writer_admission = publication
         from kestrel_sovereign._async_ownership import await_owned_task
@@ -7721,7 +7739,7 @@ class SignalDispatcher:
             # backend that is unavailable. This is an observability signal,
             # not a second audit trail.
             if not committed:
-                self._record_log_write_failure(signal.id, exc)
+                self._record_original_outcome_loss(journal, signal.id, exc)
             logger.error("Signal outcome observation failed after COMMIT for %s" if committed
                          else "Failed to write signal_log entry for %s", signal.id,
                          exc_info=(type(exc), exc, exc.__traceback__))
@@ -7732,6 +7750,14 @@ class SignalDispatcher:
                 raise execution_finite_error(exc, withdrawal)
         if withdrawal is not None:
             raise withdrawal
+
+    def _record_original_outcome_loss(self, journal, signal_id, error):
+        """Exactly one absent original row, even when its Task never starts."""
+        if journal is not None:
+            if journal.has_acknowledged_commit() or journal._audit_loss_recorded:
+                return
+            journal._audit_loss_recorded = True
+        self._record_log_write_failure(signal_id, error)
 
     def _record_log_write_failure(
         self, signal_id: str, error: BaseException

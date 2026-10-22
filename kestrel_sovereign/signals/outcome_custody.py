@@ -86,6 +86,9 @@ class _OriginalSignalOutcome:
         self._entry = None
         self._completed_result = None
         self._acknowledgments = ()
+        self._sqlite_committed_connection = None
+        self._sqlite_retirement = None
+        self._audit_loss_recorded = False
         self._outer_admission = self._writer_admission = None
         self._phase = 'accepted'
         self._require_backing()
@@ -186,7 +189,24 @@ class _OriginalSignalOutcome:
     def has_acknowledged_commit(self):
         """A native COMMIT fact is independent of final identity admission."""
         return (self._phase == 'acknowledged'
+                or (self._sqlite_committed_connection is not None
+                    and self._sqlite_committed_connection is self._backing)
                 or any(receipt.acknowledged for receipt in self._acknowledgments))
+
+    def record_sqlite_commit(self, backend, connection):
+        """Native producer records actual COMMIT return before identity recheck.
+
+        This is evidence about the original connection, not renewed admission
+        of a changed agent/runtime. SQLite does not invent a PG reset receipt.
+        """
+        from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+        if (type(backend) is not SQLiteBackend
+                or backend is not self._backend or connection is not self._backing
+                or self._phase != 'submitted'
+                or self._writer_admission is None
+                or asyncio.current_task() is not self._writer_admission.task):
+            raise ExecutionAuthorityError('Original SQLite journal COMMIT owner differs')
+        self._sqlite_committed_connection = connection
 
     def retain_committed(self, error):
         """Retain the actual terminal INSERT fact, never new work authority."""

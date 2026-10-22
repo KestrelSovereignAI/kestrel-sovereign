@@ -523,6 +523,148 @@ async def test_inner_writer_observation_retains_commit_and_original_error(dispat
     assert (await c.dispatcher.dispatch_signal(_signal('inner.observation.audit'))).action_result is not None
 
 
+async def test_sqlite_original_journal_retains_commit_before_identity_refusal(dispatcher_components, monkeypatch):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+    c = dispatcher_components
+    conn = c.backend._connection
+    original_commit = conn.commit
+    original_id = c.agent._did
+    async def committed_then_identity_changed():
+        await original_commit()
+        journal = c.dispatcher._original_outcome_writer.get()
+        if journal is not None and journal._phase == 'submitted':
+            c.agent._did = 'replacement-after-actual-sqlite-commit'
+    c.registry.register(_action_reg('sqlite.committed.audit'))
+    signal = _signal('sqlite.committed.audit')
+    monkeypatch.setattr(conn, 'commit', committed_then_identity_changed)
+    try:
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(signal)
+        assert is_execution_control_error(caught.value)
+        assert execution_commit_outcome(caught.value) == 'committed'
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+        assert c.dispatcher._log_write_failures == 0
+    finally:
+        c.agent._did = original_id
+        monkeypatch.setattr(conn, 'commit', original_commit)
+        try:
+            await c.dispatcher.shutdown_durable_delivery()
+        except BaseException as error:
+            assert is_execution_control_error(error)
+
+
+@pytest.mark.parametrize('writer_method', ['_write_outcome_log', '_log_safe'])
+@pytest.mark.parametrize('failure', ['allocation', 'publication_before', 'publication_after'])
+async def test_unstarted_journal_writer_loss_is_counted_once_without_relabelling_effect(dispatcher_components, writer_method, failure):
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+    c = dispatcher_components
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    original = RuntimeError('original journal Task admission refused')
+    accepted, effects = [], []
+    class RejectStartPublication(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'close_unstarted':
+                if failure == 'publication_after':
+                    super().add_done_callback(callback, context=context)
+                raise original
+            return super().add_done_callback(callback, context=context)
+    def factory(loop, coro, **kwargs):
+        operation = _actual_operation(coro)
+        if getattr(operation, 'cr_code', None) is getattr(c.dispatcher, writer_method).__func__.__code__:
+            if failure == 'allocation':
+                raise original
+            task = RejectStartPublication(coro, loop=loop, **kwargs)
+            accepted.append(task)
+            return task
+        return previous(loop, coro, **kwargs) if previous else asyncio.Task(coro, loop=loop, **kwargs)
+    async def handler(payload):
+        effects.append('genuine-completed-effect')
+        return {'completed': True}
+    c.registry.register(_action_reg('unstarted.audit', handler=handler))
+    signal = _signal('unstarted.audit')
+    loop.set_task_factory(factory)
+    try:
+        result = await c.dispatcher.dispatch_signal(signal)
+    finally:
+        loop.set_task_factory(previous)
+    assert effects == ['genuine-completed-effect']
+    assert c.dispatcher._log_write_failures == 1
+    assert result.status.value == 'ok'
+    assert all(task.done() for task in accepted)
+    assert not c.dispatcher._outcome_log_tasks
+    assert c.dispatcher._durable_active_admissions == 0
+    assert c.dispatcher._outcome_log_control_error is None
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 0
+    assert (await c.dispatcher.dispatch_signal(_signal('unstarted.audit'))).action_result is not None
+
+
+async def test_sqlite_original_journal_privacy_hold_outlives_cancelled_commit_cleanup(dispatcher_components, monkeypatch):
+    from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+    c = dispatcher_components
+    gate = DurablePersistenceGate()
+    class PrivacyAgent(type(c.agent)):
+        def _get_durable_persistence_gate(self):
+            return gate
+    c.agent.__class__ = PrivacyAgent
+    conn = c.backend._connection
+    original_execute = conn._execute
+    original_drain = c.backend._drain_cancelled_write
+    native_entered, native_release, drain_entered, drain_release, transition_started, transition_entered = (asyncio.Event() for _ in range(6))
+    import threading
+    worker_release = threading.Event()
+    async def held_actual_execute(function, *args, **kwargs):
+        journal = c.dispatcher._original_outcome_writer.get()
+        if journal is None or getattr(function, '__name__', '') != 'commit':
+            return await original_execute(function, *args, **kwargs)
+        # The enqueued native operation itself calls the real COMMIT after
+        # this worker barrier, even if its Python await has been cancelled.
+        def worker_barrier():
+            loop.call_soon_threadsafe(native_entered.set)
+            worker_release.wait(5)
+            return function(*args, **kwargs)
+        return await original_execute(worker_barrier)
+    async def held_original_drain(connection, *, started_at):
+        drain_entered.set()
+        await drain_release.wait()
+        return await original_drain(connection, started_at=started_at)
+    async def transition():
+        transition_started.set()
+        async with gate.exclusive():
+            transition_entered.set()
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(conn, '_execute', held_actual_execute)
+    monkeypatch.setattr(c.backend, '_drain_cancelled_write', held_original_drain)
+    c.registry.register(_action_reg('sqlite.cancelled.audit'))
+    task = next_transition = None
+    try:
+        task = asyncio.create_task(c.dispatcher.dispatch_signal(_signal('sqlite.cancelled.audit')))
+        await asyncio.wait_for(native_entered.wait(), 2)
+        journals = [entry[2] for entry in c.dispatcher._outcome_log_reconciliations.values()]
+        journal = next(journal for journal in journals if journal is not None)
+        journal._writer_admission.task.cancel()
+        await asyncio.wait_for(drain_entered.wait(), 2)
+        next_transition = asyncio.create_task(transition())
+        await transition_started.wait()
+        await asyncio.sleep(0)
+        assert not transition_entered.is_set(), 'privacy transition overtook original SQLite COMMIT/rollback cleanup'
+    finally:
+        native_release.set()
+        worker_release.set()
+        drain_release.set()
+        if task is not None:
+            await await_owned_task(task)
+        if c.backend._cancelled_write_drain is not None:
+            await await_owned_task(c.backend._cancelled_write_drain)
+        if next_transition is not None:
+            await next_transition
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        try:
+            await c.dispatcher.shutdown_durable_delivery()
+        except BaseException as error:
+            assert is_execution_control_error(error)
+
+
 async def test_original_journal_completes_inside_original_exclusive_privacy_hold(dispatcher_components):
     from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
     c = dispatcher_components
