@@ -281,15 +281,17 @@ class TaskManager:
         """Validate callback egress before either task admission transaction."""
         callback = prepared.push_configuration
         service = self._push_service
-        if service is None:
-            if callback is not None:
-                raise PushNotificationNotSupportedError()
+        if service is not None:
+            service.require_execution_safe()
+        if callback is None:
             return None, None
+        if service is None:
+            raise PushNotificationNotSupportedError()
         worker = service.require_ready()
         outbox = worker.outbox
         if outbox.configurations.task_store is not self.task_store:
             raise ValueError("Task push service lost its canonical task store")
-        return outbox, await outbox.prepare(callback) if callback is not None else None
+        return outbox, await outbox.prepare(callback)
 
     @asynccontextmanager
     async def _task_input_admission(
@@ -304,6 +306,8 @@ class TaskManager:
         Neither callback DNS nor post-commit projections hold that fence.
         """
         async with admission_fence() if admission_fence is not None else nullcontext():
+            if self._push_service is not None:
+                self._push_service.require_execution_safe()
             if outbox is not None and (
                 self._push_service is None
                 or self._push_service.require_ready().outbox is not outbox

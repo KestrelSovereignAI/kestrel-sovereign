@@ -69,7 +69,10 @@ async def test_real_driver_contention_is_recognized_after_known_rollback(
 
 
 @pytest.mark.parametrize(
-    "carrier", ["bare", "message", "permanent", "foreign", "mixed", "cycle"]
+    "carrier", [
+        "bare", "message", "permanent", "foreign", "mixed", "cycle",
+        "interface", "internal",
+    ]
 )
 async def test_generic_database_failures_and_mixed_graphs_are_not_retryable(
     native_fault, carrier
@@ -91,13 +94,21 @@ async def test_generic_database_failures_and_mixed_graphs_are_not_retryable(
         error.__cause__ = foreign
     elif carrier == "mixed":
         error = ExceptionGroup("mixed errors", [error, ValueError("business refusal")])
+    elif carrier in {"interface", "internal"}:
+        error = QueryError("unproven driver failure")
+        error.__cause__ = (
+            asyncpg.InterfaceError("driver interface failure")
+            if carrier == "interface"
+            else asyncpg.InternalClientError("driver client failure")
+        )
     else:
         error.__cause__ = error
     assert not is_transient_database_poll_error(error)
 
 
 @pytest.mark.parametrize("control", ["authority", "unknown", "committed"])
-async def test_original_execution_control_prevents_poll_replay(native_fault, control):
+@pytest.mark.parametrize("method", ["run", "poll"])
+async def test_original_execution_control_prevents_poll_replay(native_fault, control, method):
     error = await _original_error(native_fault)
     original = (
         ExecutionAuthorityError("original admission withdrawn")
@@ -112,10 +123,11 @@ async def test_original_execution_control_prevents_poll_replay(native_fault, con
 
     async def operation():
         calls.append(True)
+        assert len(calls) == 1, "original execution control was replayed as availability"
         raise carrier
 
     with pytest.raises(QueryError) as caught:
-        await DatabasePollRetryPolicy().run(
+        await getattr(DatabasePollRetryPolicy(), method)(
             operation, retry_seconds=0.001, label="owned-control-test"
         )
     assert caught.value is carrier and len(calls) == 1

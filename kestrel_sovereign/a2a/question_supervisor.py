@@ -106,7 +106,7 @@ class NativeQuestionSupervisor:
 
     async def _read_loop(self) -> None:
         while True:
-            await self.database_retry_policy.run(
+            await self.database_retry_policy.poll(
                 self._read_pass,
                 retry_seconds=self.interval,
                 label="native-question-read",
@@ -120,7 +120,7 @@ class NativeQuestionSupervisor:
     async def _deadline_loop(self) -> None:
         while True:
             self._changed.clear()
-            await self.database_retry_policy.run(
+            await self.database_retry_policy.poll(
                 self._deadline_iteration,
                 retry_seconds=self.interval,
                 label="native-question-deadline",

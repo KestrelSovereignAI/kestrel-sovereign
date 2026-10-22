@@ -1035,10 +1035,23 @@ and renewal must precede lease expiration. Required encryption is checked before
 push schema initialization.
 
 Push database polling uses that finite attempt budget and `RETRY_SECONDS`
-between attempts. Initialization remains strict and never publishes a failed
-startup as ready. An ordinary fully retired worker failure stays on the original
-Task and still refuses `require_ready`; shutdown logs it and may release primary
-storage. Observer cancellation, original commit evidence and physical cleanup
+between attempts. Known availability failures delay another burst on the same
+resident after its budget expires; a longer database outage does not replace or
+permanently kill that owner. The question supervisor uses the same polling
+contract. Initialization remains strict and never publishes a failed startup as
+ready. PostgreSQL interface/client errors qualify only under the backend's
+proof that the original session closed before COMMIT acceptance and its original
+rollback owner finished; the enclosing pool reset must still finish. An accepted
+COMMIT with a missing acknowledgement keeps its uncertain outcome.
+The PostgreSQL driver floor is asyncpg 0.32.0, which also fixes pool release
+after protocol aborts and mid-operation server-error preservation.
+
+An ordinary fully retired worker failure stays on the original Task and still
+refuses `require_ready`; shutdown logs it and may release primary storage.
+Task inputs without callbacks depend on their own task store and authority,
+so this optional service's ordinary historical failure does not block them.
+Original execution control is checked again at task admission even without a
+callback. Observer cancellation, original commit evidence and physical cleanup
 debt still refuse storage release until their original owners settle.
 
 Both official HTTP bindings expose standard Create/Get/List/Delete push

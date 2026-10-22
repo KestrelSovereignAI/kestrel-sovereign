@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 from kestrel_sovereign.execution_custody import (
-    _explicit_control_chain,
     is_execution_control_error,
 )
 from kestrel_sovereign.storage.db.interface import DatabaseError
@@ -32,6 +31,7 @@ def _transient_driver_error(error: BaseException) -> bool:
             asyncpg.ConnectionDoesNotExistError,
             asyncpg.ConnectionFailureError,
             asyncpg.CannotConnectNowError,
+            asyncpg.AdminShutdownError,
             asyncpg.TooManyConnectionsError,
             asyncpg.LockNotAvailableError,
             ConnectionRefusedError,
@@ -46,26 +46,41 @@ def is_transient_database_poll_error(error: BaseException) -> bool:
 
     A bare DatabaseError proves no recovery disposition. Every explicit leaf
     must be a known transient driver failure, and intermediate carriers must
-    be database wrappers or groups. Authority, acknowledged/uncertain commits
+    be database wrappers or groups. Interface/client errors require the native
+    backend's closed-session, no-COMMIT disposition on their own causal path.
+    Authority, acknowledged/uncertain commits
     and physical cleanup evidence always retain their original control.
     """
     if not isinstance(error, (DatabaseError, ExceptionGroup)) or (
         is_execution_control_error(error)
     ):
         return False
-    nodes = tuple(_explicit_control_chain(error))
-    if not all(
-        isinstance(node, (DatabaseError, BaseExceptionGroup))
-        or _transient_driver_error(node)
-        for node in nodes
-    ):
-        return False
-    leaves = [
-        node
-        for node in nodes
-        if node.__cause__ is None and not isinstance(node, BaseExceptionGroup)
-    ]
-    return bool(leaves) and all(_transient_driver_error(node) for node in leaves)
+    import asyncpg
+
+    from kestrel_sovereign.storage.db.postgres import PostgresSessionLostError
+
+    pending = [(error, False, frozenset())]
+    while pending:
+        node, closed_session, ancestors = pending.pop()
+        if id(node) in ancestors:
+            return False
+        closed_session |= isinstance(node, PostgresSessionLostError)
+        transient = _transient_driver_error(node) or (
+            closed_session
+            and isinstance(node, (asyncpg.InterfaceError, asyncpg.InternalClientError))
+        )
+        carrier = isinstance(node, (DatabaseError, BaseExceptionGroup))
+        if not transient and not carrier:
+            return False
+        children = list(node.exceptions) if isinstance(node, BaseExceptionGroup) else []
+        if node.__cause__ is not None:
+            children.append(node.__cause__)
+        if not children and not transient:
+            return False
+        pending.extend(
+            (child, closed_session, ancestors | {id(node)}) for child in children
+        )
+    return True
 
 
 @dataclass(frozen=True)
@@ -83,6 +98,34 @@ class DatabasePollRetryPolicy:
     def __post_init__(self) -> None:
         if type(self.max_attempts) is not int or self.max_attempts <= 0:
             raise ValueError("Database polling attempts must be a positive integer")
+
+    async def poll(
+        self,
+        operation: Callable[[], Awaitable[_Result]],
+        *,
+        retry_seconds: float,
+        label: str,
+    ) -> _Result:
+        """Keep one resident alive across availability outages of any duration.
+
+        Each finite burst uses the same configured budget. Exhaustion delays
+        the next burst; it does not replace the owner, refresh authority, retry
+        startup, or conceal a permanent failure or original execution control.
+        """
+        while True:
+            try:
+                return await self.run(
+                    operation, retry_seconds=retry_seconds, label=label
+                )
+            except (DatabaseError, ExceptionGroup) as error:
+                if not is_transient_database_poll_error(error):
+                    raise
+                logging.getLogger(__name__).warning(
+                    "Database poll burst exhausted: service=%s limit=%s "
+                    "error=%s retry_seconds=%s",
+                    label, self.max_attempts, type(error).__name__, retry_seconds,
+                )
+                await asyncio.sleep(retry_seconds)
 
     async def run(
         self,

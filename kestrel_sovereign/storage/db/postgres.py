@@ -83,6 +83,16 @@ from .write_audit import record_write_query, record_write_script
 logger = logging.getLogger(__name__)
 
 
+class PostgresSessionLostError(TransactionError):
+    """The original session closed before this transaction accepted COMMIT.
+
+    Emitted only after the original native rollback owner has finished. The
+    enclosing checkout still owns its exact pool reset and may add retirement
+    control before exposing this error. This disposition neither settles an
+    accepted COMMIT nor replaces an execution admission.
+    """
+
+
 def _failure_detail(error: BaseException) -> str:
     outcome = execution_commit_outcome(error)
     if outcome is not None:
@@ -1392,6 +1402,21 @@ class PostgresBackend(DatabaseBackend):
                 commit_state.outcome = "unknown"
             completed = await await_owned_task(completion)
             if completed.error is not None:
+                if not committing and native_connection.is_closed():
+                    # No COMMIT owner was accepted. The original native exit
+                    # is joined, and the same session is physically closed;
+                    # asyncpg may already have detached its pool proxy. There
+                    # is no live rollback owner to invent. Retain every cause
+                    # and observer withdrawal; the enclosing checkout must
+                    # still finish its own original reset before publication.
+                    failure = PostgresSessionLostError(
+                        "Original PostgreSQL session closed before COMMIT"
+                    )
+                    failure.__cause__ = execution_terminal_error(
+                        body_failure, completed.error, completed.cancellation,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    raise failure
                 if phase is not None:
                     phase.record_native_failure(completed.error, commit_outcome="unknown" if committing else None, cancellation=completed.cancellation)
                 if committing:

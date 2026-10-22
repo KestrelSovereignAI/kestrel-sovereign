@@ -94,6 +94,19 @@ class NativePushService:
         """The exact accepted owner, including failed publication."""
         return self._admission.task
 
+    def require_execution_safe(self) -> None:
+        """Retain shared-store control without requiring optional push readiness.
+
+        An ordinary failed polling pass does not own the primary store after
+        its task retires. Authority, commit and physical retirement failures
+        still prohibit admission through that same store.
+        """
+        task = self.task
+        if task is not None and task.done():
+            error = owned_task_error(task)
+            if error is not None and is_execution_control_error(error):
+                raise error
+
     def require_ready(self) -> NativePushWorker:
         """Refuse advertisement or execution after the resident owner fails."""
         task = self.task

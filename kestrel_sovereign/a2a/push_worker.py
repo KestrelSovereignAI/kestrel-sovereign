@@ -119,7 +119,7 @@ class NativePushWorker:
             )
             self.started.set()
             while True:
-                await self.database_retry_policy.run(
+                await self.database_retry_policy.poll(
                     self.run_once,
                     retry_seconds=self.retry_delay.total_seconds(),
                     label="native-push",

@@ -1,6 +1,8 @@
 """Resident recovery preserves original owners and distinguishes close custody."""
 
 import asyncio
+from contextlib import asynccontextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +33,7 @@ from tests.unit.test_a2a_native_question_supervisor import no_peer_read
 from tests.unit.test_a2a_native_question_supervisor import (
     questions as questions,  # noqa: PLC0414
 )
+from tests.unit.test_a2a_native_task_manager import request
 from tests.utils.database_query_faults import prepare_transient_database_query_fault
 from tests.utils.native_a2a import manager_for
 from tests.utils.native_push import configure_push_test_key, intercept_push_commit_ack
@@ -81,12 +84,13 @@ async def test_push_query_contention_recovers_in_the_same_resident(
     fail_query = await prepare_transient_database_query_fault(p.backend)
     owner = p.service.task
     runner = p.service.worker
+    runner.retry_delay = timedelta(milliseconds=10)
     original = runner.run_once
     failures = []
     recovered = asyncio.Event()
 
     async def database_pass():
-        if not failures:
+        if len(failures) < 4:
             try:
                 await fail_query()
             except DatabaseError as error:
@@ -98,16 +102,58 @@ async def test_push_query_contention_recovers_in_the_same_resident(
 
     monkeypatch.setattr(runner, "run_once", database_pass)
     await _wait_for_original_recovery(owner, recovered)
-    assert len(failures) == 1 and not is_execution_control_error(failures[0])
+    assert len(failures) == 4 and all(
+        not is_execution_control_error(error) for error in failures
+    )
     assert p.service.task is owner and p.service.require_ready() is p.service.worker
     await p.manager.close()
     assert owner.done() and not p.backend.is_connected
+
+
+async def test_push_original_session_loss_recovers_without_replacing_its_owner(
+    push_runtime, native_a2a_backend_factory, monkeypatch
+):
+    p = push_runtime
+    if p.backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL session termination requires a real PostgreSQL server")
+    control = native_a2a_backend_factory()
+    await control.connect()
+    pending = p.service.worker.outbox.changes.pending
+    original_owner = p.service.task
+    terminated, recovered = [], asyncio.Event()
+
+    async def terminate_original_session(*, limit):
+        if not terminated:
+            native = p.backend._current_txn_conn()._con
+            closed = asyncio.Event()
+            native.add_termination_listener(lambda connection: closed.set())
+            pid = await p.backend.fetch_val("SELECT pg_backend_pid()")
+            assert await control.fetch_val("SELECT pg_terminate_backend(?)", (pid,))
+            await asyncio.wait_for(closed.wait(), 5)
+            terminated.append(native)
+        result = await pending(limit=limit)
+        recovered.set()
+        return result
+
+    monkeypatch.setattr(p.service.worker.outbox.changes, "pending", terminate_original_session)
+    try:
+        await _wait_for_original_recovery(original_owner, recovered)
+        assert len(terminated) == 1 and terminated[0].is_closed()
+        assert p.service.task is original_owner
+        assert p.service.require_ready() is p.service.worker
+        created = await p.manager.create_task(request(), creator_agent_id="did:creator")
+        assert await p.backend.fetch_val(
+            "SELECT COUNT(*) FROM a2a_tasks WHERE id = ?", (created.id,)
+        ) == 1
+    finally:
+        await control.close()
 
 
 async def test_historical_query_failure_does_not_hold_retired_primary_storage(
     push_runtime, monkeypatch
 ):
     p = push_runtime
+    existing = await p.manager.create_task(request(), creator_agent_id="did:creator")
 
     async def invalid_query(*, limit):
         return await p.backend.fetch_all(
@@ -123,6 +169,24 @@ async def test_historical_query_failure_does_not_hold_retired_primary_storage(
     with pytest.raises(DatabaseError) as unavailable:
         p.service.require_ready()
     assert unavailable.value is original
+    admitted = await p.manager.create_task(
+        request("another-context"), creator_agent_id="did:creator"
+    )
+    followup = request(existing.context_id)
+    followup.message.task_id = existing.id
+    continued = await p.manager.continue_task(
+        followup, creator_agent_id="did:creator"
+    )
+    assert admitted.id != existing.id and continued.id == existing.id
+    assert await p.backend.fetch_one("SELECT COUNT(*) FROM a2a_task_inputs") == (3,)
+    callback = request("callback-context")
+    callback.configuration.task_push_notification_config.url = (
+        "https://1.1.1.1/callback"
+    )
+    with pytest.raises(DatabaseError) as push_unavailable:
+        await p.manager.create_task(callback, creator_agent_id="did:creator")
+    assert push_unavailable.value is original
+    assert await p.backend.fetch_one("SELECT COUNT(*) FROM a2a_tasks") == (2,)
     await p.manager.close()
     assert not p.backend.is_connected
     await p.manager.close()
@@ -146,6 +210,9 @@ async def test_uncertain_original_commit_still_holds_primary_storage(
     failure = owned_task_error(p.service.task)
     assert is_execution_control_error(failure)
     assert execution_commit_outcome(failure) == "unknown"
+    with pytest.raises((ExecutionCommitOutcomeError, BaseExceptionGroup)) as admission:
+        await p.manager.create_task(request(), creator_agent_id="did:creator")
+    assert any(node is failure for node in _explicit_control_chain(admission.value))
     for _ in range(2):
         with pytest.raises((ExecutionCommitOutcomeError, BaseExceptionGroup)) as refused:
             await p.manager.close()
@@ -181,6 +248,39 @@ async def test_transient_startup_query_is_not_retried_or_advertised(outbox, monk
         await service.close()
 
 
+@pytest.mark.parametrize("continuation", [False, True])
+async def test_commit_control_racing_admission_still_refuses_callback_free_input(
+    push_runtime, monkeypatch, continuation
+):
+    p = push_runtime
+    existing = await p.manager.create_task(request(), creator_agent_id="did:creator")
+    original = OSError("original push COMMIT acknowledgement lost during admission")
+
+    async def failed_ack():
+        raise original
+
+    @asynccontextmanager
+    async def original_admission():
+        intercept_push_commit_ack(p.service.worker.outbox, monkeypatch, failed_ack)
+        done, _ = await asyncio.wait((p.service.task,), timeout=5)
+        assert done, "the original resident did not expose its COMMIT failure"
+        yield
+
+    params = request("next-context")
+    operation = p.manager.create_task
+    if continuation:
+        params.message.task_id = existing.id
+        params.message.context_id = existing.context_id
+        operation = p.manager.continue_task
+    with pytest.raises((ExecutionCommitOutcomeError, BaseExceptionGroup)) as refused:
+        await operation(
+            params, creator_agent_id="did:creator", admission_fence=original_admission
+        )
+    assert execution_commit_outcome(refused.value) == "unknown"
+    assert any(node is original for node in _explicit_control_chain(refused.value))
+    assert await p.backend.fetch_one("SELECT COUNT(*) FROM a2a_task_inputs") == (1,)
+
+
 @pytest.mark.parametrize("lane", ["_read_pass", "_deadline_pass", "handoff_wakes"])
 async def test_question_database_query_recovers_without_replacing_its_loop(
     questions, monkeypatch, lane
@@ -202,7 +302,7 @@ async def test_question_database_query_recovers_without_replacing_its_loop(
     async def database_pass():
         nonlocal failed_owner
         current = asyncio.current_task()
-        if not failures:
+        if len(failures) < 4:
             failed_owner = current
             try:
                 await fail_query()
@@ -219,7 +319,9 @@ async def test_question_database_query_recovers_without_replacing_its_loop(
     try:
         await _wait_for_original_recovery(owner, recovered)
         assert failed_owner is not None and not failed_owner.done()
-        assert len(failures) == 1 and not is_execution_control_error(failures[0])
+        assert len(failures) == 4 and all(
+            not is_execution_control_error(error) for error in failures
+        )
         assert not await p.store.unsettled() and not await p.store.pending_wakes()
     finally:
         owner.cancel()
