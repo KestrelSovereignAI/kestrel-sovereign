@@ -85,3 +85,11 @@ def test_teardown_runs_on_success_failure_and_cancellation():
     assert "server.pid" in script
     assert 'kill -TERM -- "-$pid"' in script
     assert 'rm -rf "$home"' in script
+
+
+def test_locked_browser_registry_is_checked_before_installing_chromium():
+    steps = _job()["steps"]
+    compatibility = _step("Verify locked Playwright runner compatibility")
+    assert compatibility["run"] == "node --test tests/js/test_playwright_platform_support.cjs"
+    assert steps.index(compatibility) > steps.index(_step("Install JavaScript dependencies"))
+    assert steps.index(compatibility) < steps.index(_step("Install the Chromium browser"))

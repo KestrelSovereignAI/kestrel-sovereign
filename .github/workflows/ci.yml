@@ -1132,6 +1132,10 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci --no-audit --no-fund
 
+      - name: Verify locked Playwright runner compatibility
+        run: node --test tests/js/test_playwright_platform_support.cjs
+        timeout-minutes: 2
+
       - name: Install the Chromium browser
         run: npx playwright install --with-deps chromium
         timeout-minutes: 5

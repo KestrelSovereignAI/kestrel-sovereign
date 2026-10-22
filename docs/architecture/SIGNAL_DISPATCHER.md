@@ -871,9 +871,18 @@ SQLite performs the proof on its same native worker without an application row
 factory and closes the proof cursor there. A transient post-COMMIT privacy
 observation preserves the real committed fact without adding uncertainty to
 otherwise healthy scopes; independent native failures retain their provenance.
-PostgreSQL flushes deferred constraints/triggers in this standalone transaction
-before that row proof, so a deferred deletion cannot occur after verification
-and turn a successful COMMIT into a false audit acknowledgment.
+PostgreSQL original journals require the plain permanent audit table, not a
+partitioned parent, TEMP/UNLOGGED relation, or a table with triggers, rewrite
+rules, row-security policies, custom CHECKs, generated/identity columns or
+non-native column types. The column inventory must match the canonical row.
+Ordinary store append retains its separate customization contract. The native
+writer takes the relation's row-exclusive lock before checking shape and holds
+it through COMMIT/rollback, excluding racing trigger/rule/shape DDL. It never
+executes custom database hooks with terminal-journal privilege. A constraint
+flush alone cannot prove this: a trigger can re-defer another deletion until
+COMMIT. Unsupported shape before admission refuses routing; shape changed by
+the handler produces finite audit loss with the genuine result, not replay or
+native-source poisoning after healthy rollback.
 
 The original privacy-policy epoch and persistence-gate identity also remain
 fixed. The native INSERT retains that same gate through COMMIT/reset and

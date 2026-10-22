@@ -2210,18 +2210,35 @@ class PostgresBackend(DatabaseBackend):
 
     async def _read_original_signal_outcome_relation(self, connection, name):
         from kestrel_sovereign.signals.outcome_custody import _OriginalPostgresJournalRelation
+        from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
         row = await connection.fetchrow('''
             SELECT pg_catalog.current_database() AS database_name,
                    n.oid::bigint AS namespace_oid, c.oid::bigint AS relation_oid,
-                   n.nspname AS schema_name, c.relname AS relation_name
+                   n.nspname AS schema_name, c.relname AS relation_name,
+                   ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute AS a
+                         WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+                         ORDER BY a.attnum) AS column_names
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind IN ('r', 'p')
+            WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind = 'r'
               AND c.relpersistence = 'p'
+              AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid=c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class=c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS k WHERE k.conrelid=c.oid AND k.contype='c')
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_attribute AS a
+                  JOIN pg_catalog.pg_type AS t ON t.oid=a.atttypid
+                  JOIN pg_catalog.pg_namespace AS tn ON tn.oid=t.typnamespace
+                  WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+                    AND (tn.nspname<>'pg_catalog' OR a.attgenerated<>'' OR a.attidentity<>''))
         ''', name)
         if row is None or row['relation_name'] != 'signal_log':
-            raise ExecutionAuthorityError('Original native signal journal relation unavailable')
-        return _OriginalPostgresJournalRelation(**dict(row))
+            return None
+        fields = dict(row)
+        if set(fields.pop('column_names')) != set(_OUTCOME_COLUMNS):
+            return None
+        return _OriginalPostgresJournalRelation(**fields)
 
     async def _capture_original_signal_outcome_relation(self, journal):
         from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
@@ -2239,6 +2256,8 @@ class PostgresBackend(DatabaseBackend):
         async with self._tracked_pool_checkout(journal._backing, admit_work=True) as (connection, _):
             journal._require_backing()
             relation = await self._read_original_signal_outcome_relation(connection, 'signal_log')
+            if relation is None:
+                raise ExecutionAuthorityError('Original native signal journal requires its plain permanent audit table')
             journal._require_backing()
             require_execution_work(self)
         journal._require_backing()
@@ -2262,27 +2281,25 @@ class PostgresBackend(DatabaseBackend):
                 journal.require_original(self)
                 async with self._tracked_native_transaction(connection, state.scopes, state):
                     journal.require_original(self)
+                    # Lock before observing shape: INSERT's later implicit
+                    # lock is too late to exclude a racing trigger/rule DDL.
+                    await connection.execute(f'LOCK TABLE ONLY {relation.qualified_name} IN ROW EXCLUSIVE MODE')
+                    journal.require_original(self)
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
-                        raise ExecutionAuthorityError('Original native signal journal relation replaced')
+                        raise journal.write_refusal('destination_changed')
                     journal.require_original(self)
                     values = self._strip_tz(entry.values)
                     status = await connection.execute(query, *values)
                     journal.require_original(self)
                     if status != 'INSERT 0 1':
                         raise journal.write_refusal('row_count')
-                    # This standalone native transaction owns only the fixed
-                    # journal operation. Flush deferred trigger/constraint
-                    # effects before proving the final row, not at COMMIT
-                    # after that proof has already been observed.
-                    await connection.execute('SET CONSTRAINTS ALL IMMEDIATE')
-                    journal.require_original(self)
                     matches = await connection.fetch(match_query, *values)
                     journal.require_original(self)
                     if len(matches) != 1 or tuple(matches[0]) != (1,):
                         raise journal.write_refusal('row_missing_or_changed')
                     journal.require_original(self)
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
-                        raise ExecutionAuthorityError('Original native signal journal relation replaced')
+                        raise journal.write_refusal('destination_changed')
                     journal.require_original(self)
             journal._acknowledgments = tuple(state.acknowledgments)
             journal.acknowledged(self)
