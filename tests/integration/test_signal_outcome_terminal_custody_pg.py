@@ -195,23 +195,28 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
         assert outcome.error is None, 'numeric peer reconnect lost actual TLS hostname verification'
         assert names == [alias, alias], 'original native admission and terminal reconnect must use the same TLS SNI'
         assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 1
-        # This actual TLS session returns to the ordinary pool. Its native
-        # cancellation channel must preserve hostname and retire its real Task.
-        async with pool.acquire() as connection:
-            native = connection._con
-            operation = asyncio.create_task(connection.execute('SELECT pg_catalog.pg_sleep(5)'))
-            try:
-                async with asyncio.timeout(3):
-                    while not await control.fetchval('''SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity
-                            WHERE pid=$1 AND state='active' AND query='SELECT pg_catalog.pg_sleep(5)')''', native.get_server_pid()):
-                        await asyncio.sleep(.01)
-            finally:
-                operation.cancel('actual ordinary native TLS query cancellation')
-                cancelled = await await_owned_task(operation)
-            assert isinstance(cancelled.error, asyncio.CancelledError)
-        for cancel_owner in tuple(native._cancellations):
-            await await_owned_task(cancel_owner)
-        assert not native._cancellations, 'original native cancellation Task remained retained after physical completion'
+        # The SDK always uses STARTTLS for cancellation, including when its
+        # main connection used direct TLS. Our direct-only test frontend does
+        # not implement that dual-protocol server. Exercise actual native query
+        # cancellation with the STARTTLS frontend, without claiming direct-
+        # frontend cancellation coverage; both original journal modes above
+        # still require real hostname verification/SNI/COMMIT/reset.
+        if not direct_tls:
+            async with pool.acquire() as connection:
+                native = connection._con
+                operation = asyncio.create_task(connection.execute('SELECT pg_catalog.pg_sleep(5)'))
+                try:
+                    async with asyncio.timeout(3):
+                        while not await control.fetchval('''SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity
+                                WHERE pid=$1 AND state='active' AND query='SELECT pg_catalog.pg_sleep(5)')''', native.get_server_pid()):
+                            await asyncio.sleep(.01)
+                finally:
+                    operation.cancel('actual ordinary native TLS query cancellation')
+                    cancelled = await await_owned_task(operation)
+                assert isinstance(cancelled.error, asyncio.CancelledError)
+            for cancel_owner in tuple(native._cancellations):
+                await await_owned_task(cancel_owner)
+            assert not native._cancellations, 'original native cancellation Task remained retained after physical completion'
     finally:
         c.backend._pool = original_pool
         if pool is not None:
