@@ -1240,8 +1240,7 @@ class PostgresBackend(DatabaseBackend):
                     if execution_commit_outcome(terminal) is None:
                         raise execution_error_with_cause(ExecutionCommitOutcomeError(outcome), terminal)
                 raise terminal
-            terminal = execution_terminal_error(body_failure, retired.cancellation,
-                retain_originals=True, isolate_control_originals=True)
+            terminal = execution_observation_error(body_failure, retired.cancellation)
             if terminal is not None:
                 terminal = state.retain_acknowledgments(terminal)
                 if (phase is not None and retired.cancellation is not None
@@ -1424,8 +1423,7 @@ class PostgresBackend(DatabaseBackend):
                 commit_state.acknowledgments[:] = [receipt] if receipt is not None else []
                 if observation is not None:
                     observation.acknowledgments = tuple(commit_state.acknowledgments)
-            terminal = execution_terminal_error(body_failure, completed.cancellation,
-                retain_originals=True, isolate_control_originals=True)
+            terminal = execution_observation_error(body_failure, completed.cancellation)
             if receipt is not None and completed.cancellation is not None and phase is not None:
                 phase.record_acknowledged_withdrawal(completed.cancellation, receipt)
             if terminal is not None:
@@ -2314,7 +2312,7 @@ class PostgresBackend(DatabaseBackend):
                     native.terminate()  # No query/reset may run an application codec.
                     raise journal.write_refusal('native_programs_changed') from error
                 journal._postgres_session = native
-                if False and await native._original_journal_principal() != journal._postgres_pool.principal:
+                if await native._original_journal_principal() != journal._postgres_pool.principal:
                     raise journal.write_refusal('native_principal_changed')
                 journal.require_original(self)
                 async with self._tracked_native_transaction(connection, state.scopes, state):
