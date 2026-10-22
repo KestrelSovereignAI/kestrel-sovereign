@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-21
-**Scope:** 3195 tracked files (2367 `.py`, 364 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-22
+**Scope:** 3202 tracked files (2374 `.py`, 364 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -561,6 +561,8 @@ Repo entry points and standard project files.
   - `def derive_overall_status(checks)`; `def worst_status()`; `async def check_database(db)`; `async def check_llm_service(agent)`; `async def check_memory_system(agent)`; `async def check_disk_space(threshold_mb)`; `async def check_context_budget(agent)`; `async def check_scheduler_liveness(agent, db)`; `…`
 - **kestrel_sovereign/features/health/feature.py** — Health Feature - periodic liveness probes.
   - `class HealthFeature`
+- **kestrel_sovereign/features/hosted_telegram_dispatch.py** — Host-authorized Telegram activation and send on one admitted child.
+  - `class HostedTelegramBinding`; `class HostedTelegramOutbound`; `def is_hosted_send(proxy, name)`; `def start_dispatch(proxy, name, arguments)`; `async def wait_dispatch(owner)`; `async def dispatch_admitted(proxy, arguments, context)`; `def validate_outbound_timeout(value)`
 - **kestrel_sovereign/features/identity/__init__.py** — Identity Feature: Agent tools for identity export, import, and verification.
 - **kestrel_sovereign/features/identity/feature.py** — Identity Feature: Agent tools for identity portability.
   - `class IdentityFeature`
@@ -1747,7 +1749,7 @@ Repo entry points and standard project files.
 - **scripts/sync_public_repo_files.py** — Synchronize public-repository mirrors of contributor-facing documents.
   - `def render_public_contributing()`; `def contributing_copy_is_current()`; `def sync_contributing_copy()`; `def main()`
 - **scripts/sync_session_to_agent.py** — Sync a Claude Code session transcript into a kestrel agent's memory.
-  - `def extract_messages(jsonl_path)`; `def content_hash(text)`; `def sync_to_agent(messages, db_path, agent_id)`; `def main()`
+  - `class OneSidedTranscriptError`; `def extract_messages(jsonl_path)`; `def require_both_sides(messages)`; `def content_hash(text)`; `def sync_to_agent(messages, db_path, agent_id)`; `def main()`
 - **scripts/test_runpod_e2e_companion.py** — E2E Test: RunPod LoRA Training Workflow
   - `class E2ETestRunner`; `def main()`
 - **scripts/train_luna_lora.py** — Train Luna's LoRA on the persistent RunPod pod.
@@ -1876,7 +1878,7 @@ Repo entry points and standard project files.
 - **docs/architecture/FEATURE_CLI_ADAPTERS.md** — Feature-Owned CLI Adapters — > Status: **Active**.
 - **docs/architecture/FILECOIN_WALLET.md** — Filecoin Wallet Integration — > **See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.
 - **docs/architecture/GITHUB_FEATURE_DESIGN.md** — GitHub Feature Design — > **Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package and is discovered through the `kestrel_sovereign.features` entry-poin…
-- **docs/architecture/HOSTED_ISOLATED_RUNTIME_LIFECYCLE.md** — Hosted isolated runtime lifecycle — Hosted applications can apply idle-retirement policy and receive sanitized process telemetry without reaching into `ProxyFeature` internals or managing a second subprocess lifecycle.
+- **docs/architecture/HOSTED_ISOLATED_RUNTIME_LIFECYCLE.md** — Hosted isolated runtime lifecycle — ## Hosted Telegram dispatch authority
 - **docs/architecture/INCREMENTAL_BACKUP.md** — Incremental Backup — Page-Aligned Content-Addressed Deltas for Active Agents — **Status (2026-06-27): Design spike for [#1842](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1842).** No implementation yet.
 - **docs/architecture/LLM_PROVIDER_CAPABILITIES.md** — LLM Provider Capabilities — Kestrel tracks adapter-level capabilities separately from per-model `ModelInfo`.
 - **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
@@ -2263,6 +2265,8 @@ Repo entry points and standard project files.
 - **tests/features/security/test_approval_queue.py** — Tests for the AWAITER_GONE terminal state in the approval queue (#2558).
   - `async def test_awaiter_cancelled_marks_request_awaiter_gone()`; `async def test_submit_decision_on_awaiter_gone_persists_and_reports()`; `async def test_submit_decision_on_awaiter_gone_once_scope_still_reports()`; `async def test_normal_approval_still_awaiter_gone_false()`; `async def test_late_approve_cancelled_during_persist_reports_awaiter_gone()`; `async def test_sweep_stale_reaps_awaiter_gone()`; `async def test_cancel_request_pops_awaiter_gone()`; `async def test_cancel_all_pops_awaiter_gone()`; `…`
 - **tests/fixtures/artifacts/publication-digest.json** — (configuration)
+- **tests/fixtures/hosted_telegram_dispatch_service.py** — Controlled external SDK process for host-dispatch lifecycle regressions.
+  - `class HostedDispatchService`
 - **tests/fixtures/memory_quality_eval.json** — (configuration)
 - **tests/fixtures/sdk_contribution_fixture.py** — Out-of-tree-style fixture: intentionally imports no Sovereign modules.
   - `class FixtureWaitProvider`; `class SDKFixtureFeature`; `class SDKFixtureHostFeature`
@@ -2416,7 +2420,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_advisory_same_source_retirement.py** — A repeated source object still needs a PRIVATE advisory-retirement carrier.
   - `async def test_same_native_source_is_not_decorated_by_advisory_close_debt(native_pg, work_pg, monkeypatch, source_cancel)`
 - **tests/integration/test_agent_chat_e2e.py** — Integration tests for full agent chat flow via /agent/invoke with REAL LLM calls.
-  - `def client(monkeypatch)`; `def api_key()`; `def test_health_endpoint(client)`; `def test_agent_invoke_basic_chat(client, api_key)`; `def test_agent_invoke_factual_question(client, api_key)`; `def test_agent_invoke_empty_input_returns_400(client, api_key)`; `def test_agent_invoke_without_auth_returns_401(client)`
+  - `def api_key(monkeypatch)`; `def client(monkeypatch, api_key)`; `def test_health_endpoint(client)`; `def test_agent_invoke_basic_chat(client, api_key)`; `def test_agent_invoke_factual_question(client, api_key)`; `def test_agent_invoke_empty_input_returns_400(client, api_key)`; `def test_agent_invoke_without_auth_returns_401(client)`
 - **tests/integration/test_agent_own_key.py** — Integration tests for agent-owned API key activation.
   - `async def test_llm_service_use_agent_key()`; `async def test_agent_uses_own_key_for_inference()`; `async def test_use_agent_key_returns_false_if_no_key()`; `async def test_kestrel_agent_activates_key_on_initialize()`
 - **tests/integration/test_agent_shutdown_prefix_original.py** — Agent prefix admission retains original native control before durable close.
@@ -2428,7 +2432,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_anthropic_original_close_admission.py** — Actual SDK stream retirement under closer refusal/observer withdrawal.
   - `async def native_sdk_peer()`; `async def test_actual_anthropic_closer_keeps_original_stream_and_receipts(native_pg, native_sdk_peer, monkeypatch, retry_open, …)`; `async def test_post_open_admission_keeps_actual_acquired_result_and_cleanup(native_sdk_peer, monkeypatch, retry_open, mode)`
 - **tests/integration/test_api_e2e.py** — End-to-End API Test
-  - `def api_key()`; `def client(monkeypatch)`; `def anyio_backend()`; `def test_invoke_agent_e2e(client, api_key)`
+  - `def api_key(monkeypatch)`; `def client(monkeypatch, api_key)`; `def anyio_backend()`; `def test_invoke_agent_e2e(client, api_key)`
 - **tests/integration/test_approval_live_server.py** — Live-server integration test for the approval SSE path (#748).
   - `def clean_sse_connections()`; `def live_server()`; `async def test_real_http_sse_delivers_approval_and_decision_resolves_caller(live_server)`; `async def test_real_http_denying_posts_404_after_request_times_out(live_server)`
 - **tests/integration/test_approval_sse_e2e.py** — End-to-end test for the approval-request SSE path with real infrastructure.
@@ -2450,7 +2454,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_background_native_source_isolation.py** — Bounded background state must not decorate a genuine earlier source.
   - `async def test_background_native_facts_remain_private_and_bounded(native_pg, work_pg, onboarding_owner, monkeypatch)`
 - **tests/integration/test_backup_e2e.py** — —
-  - `def api_key()`; `async def async_client(monkeypatch)`; `async def test_backup_local_tier_via_api(async_client, api_key)`; `async def test_backup_e2e_disables_ambient_sync_targets(async_client)`; `async def test_promote_backup_isolated_flow(async_client, api_key)`
+  - `def api_key(monkeypatch)`; `async def async_client(monkeypatch, api_key)`; `async def test_backup_local_tier_via_api(async_client, api_key)`; `async def test_backup_e2e_disables_ambient_sync_targets(async_client)`; `async def test_promote_backup_isolated_flow(async_client, api_key)`
 - **tests/integration/test_backup_restore.py** — Backup/restore round-trip integration test — port of ``scripts/test_backup_restore.sh`` (epic #1050 tier 2.3).
   - `def db_path(tmp_path)`; `def user_secret()`; `async def test_full_backup_restore_round_trip(db_path, user_secret)`; `async def test_import_with_wrong_key_rejects(db_path, user_secret)`
 - **tests/integration/test_batch_stage_original_cleanup.py** — A staged real Agent remains rooted when its original initializer withdraws.
@@ -2458,7 +2462,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_before_publication_original_rollback.py** — Before-publication rollback retains the original named private candidate.
   - `async def test_before_publication_refusal_keeps_opening_candidate_and_name(native_pg, onboarding_owner, monkeypatch, source_cancel)`
 - **tests/integration/test_birth_record_replication_postgres.py** — #2871 — the PostgreSQL-only half of birth-record replication.
-  - `async def pg_vector_schema()`; `async def pg(pg_vector_schema)`; `async def test_precomputed_chunks_create_the_vector_column_in_a_caller_transaction(pg)`; `async def test_precomputed_chunks_commit_when_the_vector_write_fails(pg_vector_schema)`; `async def test_embedding_profile_rows_cross_from_a_sqlite_anchor(pg, tmp_path)`; `async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path)`
+  - `async def pg_vector_schema()`; `async def pg(pg_vector_schema)`; `async def test_precomputed_chunks_create_the_vector_column_in_a_caller_transaction(pg)`; `async def test_precomputed_chunks_commit_when_the_vector_write_fails(pg_vector_schema)`; `async def test_embedding_profile_rows_cross_from_a_sqlite_anchor(pg, tmp_path)`; `async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path, monkeypatch)`
 - **tests/integration/test_birth_replay_custody.py** — Birth replay is not permission to claim metadata or reset a used lifetime.
   - `async def test_birth_reserves_ordinary_blob_set_before_any_publication(db_backend, tmp_path, monkeypatch)`; `async def test_birth_refuses_unproven_native_custody(db_backend, tmp_path, damage)`; `async def test_readable_corrupt_historical_plaintext_is_not_rights_evidence(db_backend)`
 - **tests/integration/test_boot_identity_postgres.py** — #2894 — a freshly incepted agent must be able to boot on PostgreSQL.
@@ -2520,7 +2524,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_constitution_publication_lock_order.py** — Native writers reserve governance before taking file-owner row locks.
   - `async def test_rejected_avatar_has_no_joined_transaction_side_effects(db_backend, monkeypatch, rejection)`; `async def test_postgres_governance_custody_precedes_file_owner_write(db_backend, tmp_path, monkeypatch, writer)`
 - **tests/integration/test_constitution_real_llm.py** — Integration tests for Constitutional protections with REAL LLM calls.
-  - `def api_key()`; `async def client(monkeypatch)`; `def anyio_backend()`; `async def test_agent_identifies_as_kestrel(client, api_key)`; `async def test_agent_refuses_harmful_request(client, api_key)`; `async def test_agent_acknowledges_constitution(client, api_key)`; `async def test_agent_maintains_sovereignty(client, api_key)`
+  - `def api_key(monkeypatch)`; `async def client(monkeypatch, api_key)`; `def anyio_backend()`; `async def test_agent_identifies_as_kestrel(client, api_key)`; `async def test_agent_refuses_harmful_request(client, api_key)`; `async def test_agent_acknowledges_constitution(client, api_key)`; `async def test_agent_maintains_sovereignty(client, api_key)`
 - **tests/integration/test_constitution_reanchor_e2e.py** — End-to-end test for ``kestrel constitution reanchor``.
   - `async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch)`; `async def test_reanchor_prunes_dangling_governed_by_edges(tmp_path, monkeypatch)`; `async def test_reanchor_unchanged_force_prunes_stale_edges(tmp_path, monkeypatch)`; `async def test_reanchor_unchanged_stale_edges_unforced_reports_drift(tmp_path, monkeypatch)`; `async def test_reanchor_unchanged_stale_edges_force_requires_artifact(tmp_path, monkeypatch)`; `async def test_reanchor_no_op_when_already_anchored(tmp_path, monkeypatch)`; `async def test_doctor_edge_drift_repaired_by_same_hash_reanchor(tmp_path, monkeypatch)`; `async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch)`; `…`
 - **tests/integration/test_constitution_reanchor_postgres.py** — #2890 — ``kestrel constitution reanchor`` against a PostgreSQL runtime.
@@ -2566,7 +2570,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_conversation_list_human_turn_backends.py** — #3653 on both backends: a person's turn the session cache has not seen counts.
   - `async def test_a_human_turn_above_the_projection_frontier_counts(db_backend)`; `async def test_trashing_the_first_human_turn_leaves_the_others_counted(db_backend)`
 - **tests/integration/test_conversation_persistence_e2e.py** — Integration tests for multi-turn conversation persistence with real LLM calls.
-  - `def api_key()`; `def client(monkeypatch)`; `def anyio_backend()`; `def test_multi_turn_context_maintained(client, api_key)`; `def test_session_id_isolates_conversations(client, api_key)`; `def test_conversation_history_endpoint(client, api_key)`
+  - `def api_key(monkeypatch)`; `def client(monkeypatch, api_key)`; `def anyio_backend()`; `def test_multi_turn_context_maintained(client, api_key)`; `def test_session_id_isolates_conversations(client, api_key)`; `def test_conversation_history_endpoint(client, api_key)`
 - **tests/integration/test_conversation_purge_schema_compat.py** — Hard-purge behavior across additive lexical-index schema states.
   - `async def test_hard_purge_distinguishes_degraded_and_inconsistent_schemas(db_backend, lexical_owner_column, token_table)`; `async def test_rolled_back_lexical_migration_keeps_hard_purge_available(db_backend, monkeypatch)`
 - **tests/integration/test_conversation_purge_watermark_backends.py** — The EPHEMERAL conversation sweep purges the whole transition second (#3227).
@@ -2636,7 +2640,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_execution_authority_postgres.py** — Exact session death and transaction-bound generation fences (#3569).
   - `async def native_pg()`; `class GenerationFence`; `async def test_exact_advisory_session_loss_irrevocably_denies_other_connections(native_pg)`; `async def test_normal_retirement_invalidates_handle_without_loss_notification(native_pg)`; `async def test_unlock_loss_does_not_replace_original_cancellation(native_pg, monkeypatch)`; `async def test_lost_commit_acknowledgement_requires_reconciliation(native_pg, monkeypatch, explicit, scoped, …)`; `async def test_session_dies_while_acquiring_and_body_is_never_admitted(native_pg)`; `async def test_body_cancellation_retires_without_false_fatal_notification(native_pg)`; `…`
 - **tests/integration/test_execution_custody_proxy_ingress_pg.py** — Physical PostgreSQL COMMIT survives every proxy ingress/completion owner.
-  - `async def test_native_commit_receipt_reaches_terminal_owner_after_worker_removal(native_pg, monkeypatch, tmp_path, cancelled, …)`
+  - `async def test_native_signal_admission_fence_is_commit_only_not_consumer_custody(native_pg, privacy, denied)`; `async def test_legacy_delivery_creation_rechecks_original_admission_commit(native_pg, monkeypatch, denied)`; `async def test_native_commit_receipt_reaches_terminal_owner_after_worker_removal(native_pg, monkeypatch, tmp_path, cancelled, …)`
 - **tests/integration/test_execution_custody_review10_pg.py** — Native control terminalization uses the existing backend and exact lease CAS.
   - `async def test_native_cleanup_heartbeat_cannot_insert_revive_or_touch_successor(native_pg)`; `async def test_native_cognition_terminal_cas_never_revives_work_or_successor(native_pg, control)`; `async def test_actual_native_cognition_keeps_uncertain_committed_effect_nonretryable(native_pg, retained, carrier, outcome)`
 - **tests/integration/test_execution_custody_review12_pg.py** — Actual native cold-init resident liveness, without providers or new pools.
@@ -2773,6 +2777,8 @@ Repo entry points and standard project files.
   - `async def test_original_scheduler_stop_and_failed_storage_close_preserve_both_owners(native_pg, tmp_path, monkeypatch, refuse_storage)`
 - **tests/integration/test_host_startup_rollback_publication.py** — Actual empty-host startup must not publish after unsafe contribution rollback.
   - `async def test_actual_host_startup_rejects_retained_declarative_failure(tmp_path, monkeypatch)`
+- **tests/integration/test_hosted_telegram_dispatch.py** — Real SDK wire and SQLite ownership proof, not live provider acceptance.
+  - `class DispatchService`; `class WireClient`; `async def sdk_host(tmp_path, monkeypatch, factory)`; `def ordinary_authority(binding, events)`; `async def test_actual_sdk_first_send_prepares_before_send_and_confirms_before_release(tmp_path, monkeypatch)`; `async def test_missing_host_authority_never_uses_activated_legacy_send(tmp_path, monkeypatch)`; `async def test_refused_or_malformed_activation_never_calls_tool(tmp_path, monkeypatch, response)`; `async def test_actual_bridge_and_replacement_both_traverse_current_authority(tmp_path, monkeypatch)`; `…`
 - **tests/integration/test_http_private_request_admission.py** — Request extensions describe transport state; they never grant authority.
   - `async def test_request_observer_cannot_replace_private_native_admission(tmp_path, http, mutation)`
 - **tests/integration/test_identity_export_import.py** — Integration tests for Identity Export/Import functionality.
@@ -3229,6 +3235,8 @@ Repo entry points and standard project files.
   - `def child_pytest_env()`; `def run_child_pytest(directory)`
 - **tests/shared/cost_tracker.py** — Cost tracking for cloud resource usage during tests.
   - `class ResourceUsage`; `class CostTracker`; `class track_cost`
+- **tests/shared/environment_guard.py** — Put back, and fail, whatever leaves ``os.environ`` changed (#3671).
+  - `def register(config)`; `def unset_environment(monkeypatch)`; `def snapshot_environment()`; `def restore_environment(expected)`; `def pytest_sessionstart(session)`; `def pytest_runtest_teardown(item, nextitem)`; `def pytest_sessionfinish(session)`; `def pytest_runtest_makereport(item, call)`; `…`
 - **tests/shared/genesis_audit.py** — Deterministic genesis auditor for tests that exercise later boundaries.
   - `async def deterministic_safe_genesis_auditor(_prompt)`; `async def complete_deterministic_genesis_audit(agent)`
 - **tests/shared/hang_backstop.py** — End a test that its pytest-timeout did not end, naming it and dumping every stack (#3669).
@@ -3402,7 +3410,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_agent_manager.py** — Unit tests for the in-process AgentManager.
   - `async def test_signed_receipt_round_trip_preserves_integer_budget_signature()`; `def test_pending_signed_receipt_cannot_restore_governance(tmp_path)`; `def test_pending_receipt_marker_is_bound_by_parent_signature()`; `async def test_spawn_refuses_mandate_for_a_different_parent(tmp_path)`; `async def test_spawn_refuses_prebound_child_identity(tmp_path)`; `async def test_spawn_snapshots_mutable_mandate_before_admission_await(tmp_path)`; `async def test_spawn_revalidates_spawned_parent_before_child_inception(tmp_path)`; `async def test_cold_descendant_rereads_loaded_ancestor_receipt_before_publication(tmp_path)`; `…`
 - **tests/unit/test_agent_name_span_attribution.py** — Agent-name span attribution across every construction path (issue #2602).
-  - `class TestConstructionDisplayNameFloor`; `class TestAgentStampsAndPropagates`; `def otel_llm_exporter()`; `class TestLlmSpanCarriesRealAgentName`
+  - `class TestConstructionDisplayNameFloor`; `class TestAgentStampsAndPropagates`; `def otel_llm_exporter(monkeypatch)`; `class TestLlmSpanCarriesRealAgentName`
 - **tests/unit/test_agent_prefix_consolidation.py** — Regression tests for the /agent → /api/agent prefix consolidation (#871).
   - `def test_canonical_api_agent_prefix_serves_agent_routes()`; `def test_deprecated_agent_prefix_still_resolves(caplog)`; `def test_deprecation_log_dedupes_per_path_and_ua()`
 - **tests/unit/test_agent_runtime_endpoint_contracts.py** — Focused contract tests for agent runtime/status endpoints.
@@ -3438,7 +3446,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_associative_linker.py** — Unit tests for AssociativeLinker typed LinkedConcept return shape.
   - `class TestExtractAndLinkTypedReturn`; `class TestPersonNameCategorization`
 - **tests/unit/test_async_ownership.py** — Contract tests for cancellation-safe ownership and borrowed observation.
-  - `async def test_original_admission_cell_precedes_all_callback_publication(tmp_path, mode, eager)`; `async def test_borrowed_observation_withdraws_without_cancelling_or_joining_original()`; `async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate()`; `async def test_borrowed_observation_refuses_owning_or_forwarding_cancellation(mode)`; `async def test_native_original_policy_keeps_caused_cancellation_without_changing_default(retain_originals)`; `async def test_only_explicit_owned_iterator_sources_inherit_observation_lineage()`; `async def test_owned_task_result_is_retrieved()`; `async def test_owned_task_exception_retains_original_type()`; `…`
+  - `async def test_original_admission_cell_precedes_all_callback_publication(tmp_path, mode, eager)`; `async def test_borrowed_observation_withdraws_without_cancelling_or_joining_original()`; `async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation)`; `async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate()`; `async def test_borrowed_observation_refuses_owning_or_forwarding_cancellation(mode)`; `async def test_native_original_policy_keeps_caused_cancellation_without_changing_default(retain_originals)`; `async def test_only_explicit_owned_iterator_sources_inherit_observation_lineage()`; `async def test_owned_task_result_is_retrieved()`; `…`
 - **tests/unit/test_async_rag_store.py** — AsyncRAGStore writes: chunk content at rest (#2677), chunks without a vector (#3415).
   - `async def test_current_writer_persists_document_chunk_content_as_plaintext(tmp_path)`; `async def test_chunk_document_warns_about_chunks_stored_without_a_vector(tmp_path, caplog, outcome, stored_without, …)`; `async def test_chunk_document_is_quiet_when_nothing_was_left_unembedded(tmp_path, caplog, compute_embeddings)`
 - **tests/unit/test_async_rwlock.py** — Contracts for scheduler lifecycle reader/writer admission.
@@ -3516,7 +3524,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_bridge_feature.py** — Unit Tests for the KestrelClaw Bridge Feature (#157).
   - `class TestProtocolModels`; `class TestBridgeFeatureInitialize`; `class TestBridgeFeatureInitializeWithoutDb`; `class TestSessionManagement`; `class TestInvocationLogging`; `class TestBridgeStatus`; `class TestBridgeConnections`; `class TestBridgeHistory`; `…`
 - **tests/unit/test_bridge_router_mounted.py** — Regression test for F105: the bridge HTTP router must be mounted.
-  - `def test_bridge_health_mounted_when_feature_enabled()`; `def test_bridge_health_absent_when_feature_disabled()`
+  - `def test_bridge_health_mounted_when_feature_enabled(monkeypatch)`; `def test_bridge_health_absent_when_feature_disabled(monkeypatch)`
 - **tests/unit/test_bridge_stream_error_boundary.py** — #2674 finding 3: the /api/bridge/stream SSE error event must go through the ONE shared user-safe streaming-error boundary — never ``str(e)``.
   - `def test_bridge_stream_reports_stopped_command_instead_of_success()`; `def test_bridge_stream_reports_owner_self_fence_as_retryable_error()`; `def test_bridge_stream_renders_typed_admission_refusal_as_stopped()`; `async def test_bridge_stop_interrupts_producer_blocked_before_first_event()`; `async def test_bridge_stop_after_done_does_not_begin_outbound_audit()`; `def test_bridge_stream_withholds_chunk_queued_before_stop()`; `def test_bridge_stream_reports_stop_after_clean_producer_eof()`; `def test_bridge_stream_generic_exception_emits_safe_constant_not_str_e()`; `…`
 - **tests/unit/test_build_docs_site.py** — Tests for the OKF -> docs-site projection gate.
@@ -3562,7 +3570,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_check_task_status_surfaces_request.py** — ``check_task_status``, ``get_task_result`` and ``list_my_tasks`` must surface the SENDER'S request text — not just the (often empty) agent reply slot.
   - `async def test_check_task_status_returns_request_content_for_submitted_task()`; `async def test_check_task_status_returns_both_request_and_reply_for_completed_task()`; `async def test_list_my_tasks_includes_request_content_per_row()`; `async def test_list_my_tasks_status_filter_queries_full_table_not_pending()`; `async def test_list_my_tasks_invalid_status_rejected()`; `async def test_list_my_tasks_type_filter_overfetches_then_truncates()`; `async def test_get_task_result_includes_request_content_for_completed_task()`; `async def test_check_task_status_surfaces_sender_attached_artifacts()`
 - **tests/unit/test_child_pytest.py** — A child pytest takes nothing from the session that starts it (#3669).
-  - `def test_the_child_inherits_no_pytest_variable_of_the_session(monkeypatch)`; `def test_the_child_imports_from_the_package_root_only(monkeypatch)`
+  - `def test_the_child_inherits_no_pytest_variable_of_the_session(monkeypatch)`; `def test_the_child_does_not_run_as_ci(tmp_path, monkeypatch)`; `def test_the_child_imports_from_the_package_root_only(monkeypatch)`
 - **tests/unit/test_ci_console_smoke_job.py** — The pull-request Sovereign Console smoke job (#2682).
   - `def test_runs_on_pull_requests_like_the_other_browserless_tiers()`; `def test_is_bounded()`; `def test_references_no_secret_and_reads_only()`; `def test_runs_the_isolated_smoke_on_a_non_live_port_in_a_fresh_home()`; `def test_installs_one_browser_and_caches_node_dependencies()`; `def test_teardown_runs_on_success_failure_and_cancellation()`
 - **tests/unit/test_ci_duplicate_run_gate.py** — Decision table for the duplicate-run gate in ``.github/workflows/ci.yml``.
@@ -4005,6 +4013,8 @@ Repo entry points and standard project files.
   - `class TestSaveItemType`; `class TestStrategicSeverity`; `class TestMemoryActionItemStatus`; `class TestPerDomainAliasesDoNotCollide`
 - **tests/unit/test_envelope_parts_passthrough.py** — First-class typed-part passthrough on subagent dispatch (#2641).
   - `def test_emit_part_falls_back_to_tool_result_buffer()`; `def test_emit_part_prefers_turn_collector_over_buffer()`; `def test_emit_part_buffer_still_enforces_sanitization()`; `def test_sanitize_part_valid_entry_strips_extra_keys()`; `def test_sanitize_part_rejects_invalid_entries()`; `async def test_dynamic_tool_attaches_buffered_parts_when_no_collector()`; `async def test_dynamic_tool_legacy_dict_envelope_carries_parts()`; `async def test_dynamic_tool_honors_explicit_toolresult_parts()`; `…`
+- **tests/unit/test_environment_guard.py** — Whatever leaves ``os.environ`` changed is put back and fails (#3671).
+  - `def inherited_environment(monkeypatch)`; `def test_a_leaking_test_is_put_back_and_fails(tmp_path, inherited_environment, workers)`; `def test_a_leak_under_a_fixture_requested_late_is_still_the_tests(tmp_path)`; `def test_a_fixture_that_leaves_the_run_changed_fails_its_last_test(tmp_path, inherited_environment, workers)`; `def test_a_run_leak_is_reported_beside_a_failing_last_teardown(tmp_path, case)`; `def test_a_run_stopped_early_still_names_its_leak(tmp_path, workers)`; `def test_code_after_the_last_test_is_not_compared(tmp_path, workers)`; `def test_an_xfail_mark_does_not_excuse_a_leak(tmp_path)`; `…`
 - **tests/unit/test_ephemeral_purge_transition.py** — Unit tests for the EPHEMERAL hard-purge transition wiring (#767).
   - `async def test_clean_ephemeral_exit_calls_purge_and_skips_audit()`; `async def test_leaked_ephemeral_exit_writes_audit_with_breakdown()`; `async def test_normal_to_ephemeral_does_not_purge()`; `async def test_public_to_ephemeral_stages_pending_and_confirm_applies_atomically()`; `async def test_confirm_with_nothing_pending_is_a_safe_noop()`; `async def test_normal_to_isolated_does_not_purge()`; `async def test_ephemeral_to_ephemeral_does_not_purge()`; `async def test_audit_failure_does_not_block_purge_or_transition()`; `…`
 - **tests/unit/test_episode_ciphertext.py** — Episode synthesis must never tokenize the at-rest envelope (#2850).
@@ -4021,6 +4031,8 @@ Repo entry points and standard project files.
   - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`; `def test_example_documents_both_memory_retrieval_floors()`
 - **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.
   - `def fake_tool()`; `def agent_with_tool(fake_tool)`; `class TestExecuteNamedToolGovernance`; `class TestExecuteNamedToolSubagentDispatch`
+- **tests/unit/test_execution_control_classification.py** — Direct-node classification shares the existing explicit-graph control contract.
+  - `def test_same_original_node_and_graph_classification(kind, mode)`; `async def test_direct_acknowledged_commit_retains_exact_original_receipt(group)`; `async def test_direct_native_retirement_keeps_actual_response_and_failed_close_owner()`; `def test_recursive_option_remains_keyword_only()`
 - **tests/unit/test_execution_custody.py** — Irrevocable native authority across copied contexts (#3569).
   - `class Authority`; `async def test_copied_child_cannot_regain_authority_after_scope_ends(retirement)`; `def test_nested_ancestor_revocation_is_not_masked_by_live_child()`; `async def test_foreign_turn_executor_rebinds_same_mutable_authority()`; `def test_repeated_revoke_never_changes_original_reason_or_revives()`; `async def test_native_dispatch_rechecks_after_awaited_permission_hook(boundary)`; `async def test_native_dispatch_rechecks_after_final_post_hook()`; `async def test_sqlite_connect_refuses_before_creating_path(tmp_path)`; `…`
 - **tests/unit/test_execution_custody_a2a_merge_native.py** — Native A2A receipts remain terminal across the new #3440 consumers.
@@ -4182,7 +4194,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_feature_registry.py** — Tests for the Feature Registry catalog and loader.
   - `class TestLoadRegistry`; `class TestResolveStatus`; `class TestInstalledRuntimeMetadata`; `class TestGetRegistry`; `class TestGetPackageForFeature`; `class TestSkills`
 - **tests/unit/test_feature_route_lifecycle_gate.py** — Runtime lifecycle gate for feature-contributed HTTP routes (#2522 P2).
-  - `def test_bridge_route_gated_by_live_enabled_state()`; `def test_bridge_route_404s_when_feature_removed()`; `def test_repeated_feature_mounts_are_deduplicated_and_unmounted()`; `def test_unsupported_child_is_rejected_before_native_inclusion()`; `def test_failed_projection_reverts_every_native_registration(registration, monkeypatch)`; `def test_dynamic_feature_routes_invalidate_openapi_schema_on_mount_and_unmount()`; `def test_disabled_websocket_feature_route_is_not_matched()`; `def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload()`; `…`
+  - `def test_bridge_route_gated_by_live_enabled_state(monkeypatch)`; `def test_bridge_route_404s_when_feature_removed(monkeypatch)`; `def test_repeated_feature_mounts_are_deduplicated_and_unmounted()`; `def test_unsupported_child_is_rejected_before_native_inclusion()`; `def test_failed_projection_reverts_every_native_registration(registration, monkeypatch)`; `def test_dynamic_feature_routes_invalidate_openapi_schema_on_mount_and_unmount()`; `def test_disabled_websocket_feature_route_is_not_matched(monkeypatch)`; `def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload(monkeypatch)`; `…`
 - **tests/unit/test_feature_runtime_lifecycle.py** — Canonical feature teardown / activation lifecycle (kestrel-sovereign#2522).
   - `async def test_endpoint_disable_detaches_everything_then_enable_recreates(tmp_path)`; `async def test_unregister_runtime_cleans_everything_when_on_disable_raises(tmp_path)`; `async def test_unregister_runtime_cleans_everything_when_on_disable_cancels(tmp_path)`; `async def test_soft_disable_cleans_everything_when_on_disable_raises(tmp_path)`; `async def test_shutdown_restores_displaced_host_provider()`; `async def test_shutdown_removes_slot_when_it_was_empty()`; `async def test_shutdown_leaves_newer_provider_untouched()`; `async def test_stacked_features_disable_A_then_B_restores_host_not_disabled_A()`; `…`
 - **tests/unit/test_feature_startup_promotion.py** — —
@@ -4684,7 +4696,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_phase3a_wiring.py** — Unit tests for Phase 3a — Lighthouse + LLM resolver wiring.
   - `class TestLighthouseConstructorContract`; `class TestLighthouseResolverOwnsTheKey`; `class TestLLMServiceDisabledFlag`
 - **tests/unit/test_phoenix_assets_redirect.py** — Root-absolute Phoenix chunk requests redirect into the /phoenix cookie scope.
-  - `def client()`; `def test_assets_redirects_unauthenticated_into_phoenix_scope(client)`; `def test_assets_404_when_phoenix_not_supervised(client)`; `def test_assets_post_stays_protected(client)`
+  - `def client(monkeypatch)`; `def test_assets_redirects_unauthenticated_into_phoenix_scope(client)`; `def test_assets_404_when_phoenix_not_supervised(client)`; `def test_assets_post_stays_protected(client)`
 - **tests/unit/test_phoenix_supervisor.py** — Tests for the host-supervised Phoenix subprocess + reverse proxy (#2570).
   - `def test_defaults(monkeypatch)`; `def test_port_overrides(monkeypatch)`; `def test_enabled_requires_installed(monkeypatch)`; `def test_enabled_when_installed(monkeypatch)`; `def test_opt_out_flag(monkeypatch)`; `def test_supervision_suppressed_under_pytest(monkeypatch)`; `def test_supervision_active_outside_pytest(monkeypatch)`; `def test_supervision_off_when_disabled_outside_pytest(monkeypatch)`; `…`
 - **tests/unit/test_pii_detector.py** — Tests for the PII Detection module.
@@ -5209,6 +5221,8 @@ Repo entry points and standard project files.
   - `async def test_invalid_mode_returns_error_not_no_messages_found()`; `async def test_invalid_mode_echoes_request_in_data()`; `async def test_valid_mode_is_normalized_and_runs()`
 - **tests/unit/test_sync_preflight.py** — ``feature sync --preflight``: what a sync would certainly refuse, before it runs (#3702).
   - `def venv(monkeypatch, tmp_path)`; `def test_a_window_that_excludes_the_locked_version_is_a_conflict(venv, tmp_path)`; `def test_the_guarded_sync_refuses_exactly_what_the_preflight_names(venv, tmp_path, capsys)`; `def test_a_window_that_contains_the_locked_version_passes(venv, tmp_path, body)`; `def test_the_sync_installs_what_the_preflight_passes(venv, tmp_path)`; `def test_a_package_the_lock_does_not_pin_has_nothing_to_contradict(venv, tmp_path)`; `def test_a_locked_pre_release_is_inside_a_window_that_admits_it(monkeypatch, tmp_path)`; `def test_an_entry_held_on_its_checkout_is_not_a_window(venv, tmp_path)`; `…`
+- **tests/unit/test_sync_session_to_agent.py** — scripts/sync_session_to_agent.py imports both sides of a Claude Code session.
+  - `def test_extracts_the_users_turns_as_well_as_the_assistants(tmp_path)`; `def test_sync_stores_both_sides(tmp_path)`; `def test_one_sided_transcript_is_refused_before_anything_is_written(tmp_path, drop_one_side)`
 - **tests/unit/test_system_prompt_assembler.py** — Unit tests for the priority-ordered system-prompt assembler.
   - `def test_section_name_strips_md_and_uppercases()`; `def test_assemble_minimal_has_constitution_only()`; `def test_assemble_full_combination_clause_order()`; `def test_assemble_skips_heartbeat_md()`; `def test_assemble_skips_agents_when_anchored_supplies_it()`; `def test_anchored_doctrine_takes_precedence_for_every_bootstrap_name()`; `def test_assemble_includes_agents_from_bootstrap_when_no_anchor()`; `def test_soul_fence_uses_your_identity_label()`; `…`
 - **tests/unit/test_system_prompt_truthful_reporting.py** — Regression: the base system prompt must carry a GENERAL truthful-tool- reporting rule, not one quarantined to cryptographic data (#1925).
