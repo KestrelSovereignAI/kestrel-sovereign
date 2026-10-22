@@ -283,7 +283,7 @@ class _OriginalPostgresJournalPool:
         resolved = _restore_native_connect_configuration(self.resolved_configuration)
         tls_server_hostname = resolved.pop('tls_server_hostname')
         original_kwargs.update(resolved)
-        if False:
+        if tls_server_hostname is not None:
             from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalConnectLoop
             # asyncpg uses its host both for dialing and TLS identity. Dial the
             # actual admitted peer, retaining the independently observed SNI /

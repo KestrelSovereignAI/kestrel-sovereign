@@ -65,7 +65,7 @@ class _OriginalJournalConnectLoop:
         if (host, port) != self._endpoint:
             raise NativeJournalConfigurationError('Original native socket peer differs')
         if kwargs.get('ssl'):
-            kwargs['server_hostname'] = host
+            kwargs['server_hostname'] = self._tls_server_hostname
         return await self._loop.create_connection(protocol_factory, host, port, **kwargs)
 
     async def start_tls(self, transport, protocol, sslcontext, *, server_hostname=None, **kwargs):
@@ -73,7 +73,7 @@ class _OriginalJournalConnectLoop:
         if _native_tcp_endpoint(peer) != self._endpoint:
             raise NativeJournalConfigurationError('Original native TLS socket peer differs')
         return await self._loop.start_tls(transport, protocol, sslcontext,
-            server_hostname=server_hostname, **kwargs)
+            server_hostname=self._tls_server_hostname, **kwargs)
 
 
 def _register_program(connection):
@@ -350,7 +350,7 @@ else:
                 # asyncpg queries current_task(self._loop). Its connection-
                 # local TLS delegate still schedules on the actual native
                 # loop, so retire that exact physical cancellation Task too.
-                self._cancellations.discard(asyncio.current_task())
+                self._cancellations.discard(None)
 
         def _end_original_journal(self):
             if self._journal_program_seal is None:
