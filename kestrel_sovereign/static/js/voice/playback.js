@@ -229,6 +229,9 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400,
   return owner;
   } catch (error) {
     await owner.destroy();
+    // Closing after a fatal clear failure can abort the pending module load.
+    // That native abort must not replace the original playback failure.
+    if (failure) throw failure;
     throw error;
   }
 }

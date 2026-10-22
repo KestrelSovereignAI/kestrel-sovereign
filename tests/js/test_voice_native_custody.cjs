@@ -445,7 +445,7 @@ test('review100 Pipeline startup preserves original playback failure through pub
         closed: window.nativeContexts.every(context => context.state === 'closed'),
         tracks: window.client.micStream.getTracks().every(track => track.readyState === 'ended') };
     });
-    assert.ok(native.same && native.closed && native.tracks);
+    assert.deepEqual(native, { same: true, closed: true, tracks: true });
   }, '{"persisted":false}', { autoStart: false, framed: true, holdWorklet: 'playback' });
 });
 
