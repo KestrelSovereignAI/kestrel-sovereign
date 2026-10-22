@@ -1150,13 +1150,14 @@ class SignalDispatcher:
         )
 
     def _require_standalone_native_outcome_entry(self):
-        from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError, require_execution_work
         from kestrel_sovereign.storage.db.postgres import PostgresBackend
         from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
         backend = getattr(self._store, '_backend', None)
         if (type(self._store) is SignalLogStore
                 and type(backend) in (SQLiteBackend, PostgresBackend)
                 and backend.owns_open_transaction):
+            require_execution_work(backend)
             raise ExecutionAuthorityError(
                 'Original signal dispatch refuses an enclosing transaction; commit before dispatch/enqueue')
 

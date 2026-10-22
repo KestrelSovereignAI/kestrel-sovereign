@@ -39,19 +39,25 @@ async def test_sqlite_original_dispatch_refuses_enclosing_transaction_at_parent_
         effects.append('unsupported effect')
         return {'genuine': True}
     c.registry.register(_action_reg('sqlite.enclosing.audit', handler=handler))
+    error = handle = None
     async with c.backend.transaction():
-        with pytest.raises(ExecutionAuthorityError, match='enclosing transaction'):
+        try:
             signal = _signal('sqlite.enclosing.audit')
             if entry == 'dispatch':
                 await c.dispatcher.dispatch_signal(signal)
             elif entry == 'enqueue':
-                await c.dispatcher.enqueue_signal(signal)
+                handle = await c.dispatcher.enqueue_signal(signal)
             else:
-                await c.dispatcher.enqueue_durable_cognition(
+                handle = await c.dispatcher.enqueue_durable_cognition(
                     signal, source_event_id=None, consumer_id='owned-test-consumer')
+        except BaseException as caught:
+            error = caught
+    if handle is not None:
+        await await_owned_task(handle.task)
+    assert isinstance(error, ExecutionAuthorityError) and 'enclosing transaction' in str(error)
     assert effects == []
     assert not c.dispatcher._outcome_log_tasks
-    assert not c.agent.background_tasks
+    assert all(task.done() for task in c.agent.background_tasks)
 
 
 @pytest.mark.parametrize('cutoff', ['handler', 'journal'])
