@@ -50,7 +50,8 @@ async def _fresh_journal_pool(original, **options):
 
 
 @pytest.mark.parametrize('phase', ['rollback', 'reset'])
-async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exit(dispatcher_components, monkeypatch, phase):
+@pytest.mark.parametrize('withdrawn_owner', ['inner', 'outer'])
+async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exit(dispatcher_components, monkeypatch, phase, withdrawn_owner):
     import asyncpg
     from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
     from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_commit_outcome, execution_cleanup_debts
@@ -65,7 +66,7 @@ async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exi
     async def pause_actual_exit():
         journal = c.dispatcher._original_outcome_writer.get()
         if journal is not None and journal._phase == 'submitted':
-            writers.append(journal._writer_admission.task)
+            writers.append(journal._writer_admission.task if withdrawn_owner == 'inner' else journal._outer_admission.task)
             exits.append(asyncio.current_task())
             entered.set()
             await release.wait()
@@ -99,6 +100,47 @@ async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exi
     assert any(isinstance(error, asyncpg.UniqueViolationError) for error in errors)
     assert execution_commit_outcome(outcome.error) is None
     assert not execution_cleanup_debts(outcome.error), 'healthy rollback/reset is not native uncertainty'
+
+
+@pytest.mark.parametrize('installed', ['before', 'handler'])
+async def test_original_journal_requires_native_heap_access_method(dispatcher_components, native_pg, installed):
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    method = schema + '_heap_alias'
+    # An actual server table AM, not a fake catalog row or installed overlay.
+    # Reusing the genuine heap handler proves the method-identity boundary;
+    # it does NOT claim an application callback was executed in this test.
+    await control.execute(f'CREATE ACCESS METHOD "{method}" TYPE TABLE HANDLER pg_catalog.heap_tableam_handler')
+    async def replace_method():
+        await control.execute(f'ALTER TABLE "{schema}".signal_log SET ACCESS METHOD "{method}"')
+        assert await control.fetchval('SELECT amname FROM pg_catalog.pg_am WHERE oid=(SELECT relam FROM pg_catalog.pg_class WHERE oid=$1::regclass)', f'"{schema}".signal_log') == method
+    if installed == 'before':
+        await replace_method()
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    effects = []
+    async def handler(payload):
+        effects.append('genuine effect')
+        if installed == 'handler':
+            await replace_method()
+        scope.revoke('actual cutoff after installed table access method change')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.table.access.method', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.table.access.method'))
+            except BaseException as caught:
+                error = caught
+        assert bool(effects) == (installed == 'handler')
+        assert is_execution_control_error(error), 'a custom table access method inherited native heap admission'
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 0
+    finally:
+        await control.execute(f'ALTER TABLE "{schema}".signal_log SET ACCESS METHOD heap')
+        await control.execute(f'DROP ACCESS METHOD "{method}"')
 
 
 @pytest.mark.parametrize('setting', ['ROLE', 'SESSION AUTHORIZATION'])

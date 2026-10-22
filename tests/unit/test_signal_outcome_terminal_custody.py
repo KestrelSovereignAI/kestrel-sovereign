@@ -29,6 +29,30 @@ class _OriginalWork:
         self.require_work()
 
 
+@pytest.mark.parametrize('pragma', ['synchronous=OFF', 'journal_mode=MEMORY', 'wal_autocheckpoint=7'])
+async def test_sqlite_original_journal_rejects_changed_durability_settings(dispatcher_components, pragma):
+    from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+    c = dispatcher_components
+    scope = ExecutionCustody(_OriginalWork())
+    effects = []
+    async def handler(payload):
+        await c.backend.execute('PRAGMA ' + pragma)
+        effects.append('actual SQL durability configuration changed')
+        scope.revoke('actual cutoff after SQL-configured durability change')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.durability.change', handler=handler))
+    error = None
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        try:
+            await c.dispatcher.dispatch_signal(_signal('native.durability.change'))
+        except BaseException as caught:
+            error = caught
+    assert effects
+    assert is_execution_control_error(error), 'original journal acknowledged changed native durability configuration'
+    assert execution_commit_outcome(error) != 'committed'
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+
+
 async def test_application_string_equality_cannot_substitute_accepted_signal_id():
     from kestrel_sdk.signals import SignalMode
     class EqualText(str):
