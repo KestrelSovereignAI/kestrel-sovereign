@@ -23,6 +23,13 @@ from kestrel_sovereign.execution_custody import (
 _JOURNAL_ADMISSION = object()
 
 
+def _native_identity_text(value):
+    """Identity compares native text storage, never application protocols."""
+    if not issubclass(type(value), str):
+        raise ExecutionAuthorityError('Original journal identity requires native text')
+    return str.__str__(value)
+
+
 def _snapshot_outcome_data(value, memo=None):
     """Detach canonical data, never delegate custody to application copy hooks.
 
@@ -327,7 +334,7 @@ class _OriginalSignalOutcome:
         self._store = dispatcher._store
         self._backend = backend
         self._agent = dispatcher._agent
-        self._agent_id = dispatcher._agent.did
+        self._agent_id = _native_identity_text(dispatcher._agent.did)
         self._agent_scope = getattr(self._agent, '_execution_custody', None)
         from kestrel_sovereign.storage.privacy_wrapper import (
             _resolve_durable_persistence_gate, _resolve_privacy_policy_epoch,
@@ -378,10 +385,10 @@ class _OriginalSignalOutcome:
     def _signal_identity(signal):
         from kestrel_sdk.signals.models import SignalMode
         values = (signal.id, signal.source, signal.target_agent)
-        if any(not issubclass(type(value), str) for value in values) or type(signal.mode) is not SignalMode:
+        if type(signal.mode) is not SignalMode:
             raise ExecutionAuthorityError('Original signal identity requires native text and mode')
         # No application equality/hash protocol may become identity evidence.
-        return (*(str.__str__(value) for value in values), signal.mode)
+        return (*(_native_identity_text(value) for value in values), signal.mode)
 
     def matches(self, signal, registration):
         return (self._identity == self._signal_identity(signal)
@@ -415,7 +422,7 @@ class _OriginalSignalOutcome:
             if (self._dispatcher._store is not self._store
                     or self._store._backend is not backend
                     or self._dispatcher._agent is not self._agent
-                    or self._agent.did != self._agent_id
+                    or _native_identity_text(self._agent.did) != self._agent_id
                     or getattr(self._agent, '_execution_custody', None) is not self._agent_scope
                     or getattr(backend, '_execution_custody', None) is not self._backend_scope):
                 raise ExecutionAuthorityError('Original signal journal runtime identity changed')
