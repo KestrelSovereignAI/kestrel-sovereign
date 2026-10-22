@@ -348,7 +348,7 @@ def _parse_record(payload: dict[str, Any]) -> Optional[_RecordedProcess]:
 
 
 def same_process_identity(first: Any, second: Any) -> bool:
-    """Match complete strict physical identities, ignoring epoch diagnostics."""
+    """Match strict kernel identities; hostname and epoch are diagnostics."""
     if not isinstance(first, dict) or not isinstance(second, dict):
         return False
     before, after = _parse_record(first), _parse_record(second)
@@ -358,8 +358,8 @@ def same_process_identity(first: Any, second: Any) -> bool:
     return (
         isinstance(kernel, str) and bool(kernel)
         and kernel == second.get("kernel_session")
-        and (before.pid, before.host, before.pid_namespace, before.birth_id)
-        == (after.pid, after.host, after.pid_namespace, after.birth_id)
+        and (before.pid, before.pid_namespace, before.birth_id)
+        == (after.pid, after.pid_namespace, after.birth_id)
     )
 
 
@@ -371,7 +371,7 @@ def _unprovable(path: Path, evidence: str) -> AgentHolder:
     )
 
 
-def _record_holder(path: Path, payload, *, require_birth: bool = False) -> Optional[AgentHolder]:
+def _record_holder(path: Path, payload, *, require_kernel_session: bool = False) -> Optional[AgentHolder]:
     """What one serving record establishes: None only on proof that it is stale.
 
     The record must read; every identifying field must parse
@@ -399,11 +399,25 @@ def _record_holder(path: Path, payload, *, require_birth: bool = False) -> Optio
             f"{path} does not record a valid PID, start time, host and PID "
             "namespace, so whether its process still serves it cannot be told",
         )
+    if require_kernel_session:
+        kernel = payload.get("kernel_session")
+        if not isinstance(kernel, str) or not kernel:
+            return _unprovable(path, "original kernel session identity is unavailable")
+        if sys.platform.startswith("linux") and not recorded.pid_namespace:
+            return _unprovable(path, "original kernel PID namespace is unavailable")
+        try:
+            if kernel != _kernel_session_id():
+                return _unprovable(path, "original process belongs to a different kernel session")
+        except (OSError, ValueError) as error:
+            return _unprovable(path, f"original kernel session cannot be observed ({error})")
     host, pid_namespace = _here()
-    if recorded.host != host or recorded.pid_namespace != pid_namespace:
+    # Kernel session UUID + PID namespace identify strict containment. The OS
+    # hostname can change during a live process and carries no strict authority.
+    host_mismatch = not require_kernel_session and recorded.host != host
+    if host_mismatch or recorded.pid_namespace != pid_namespace:
         where = (
             f"on host {recorded.host!r}"
-            if recorded.host != host
+            if host_mismatch
             else f"in PID namespace {recorded.pid_namespace!r}"
         )
         return _unprovable(
@@ -411,7 +425,7 @@ def _record_holder(path: Path, payload, *, require_birth: bool = False) -> Optio
             f"{path} records PID {recorded.pid} serving it {where}, which "
             "cannot be checked from here",
         )
-    if require_birth:
+    if require_kernel_session:
         status, detail = ProcessManager.identify_recorded_process(
             recorded.pid, recorded.started_at, path.name,
             recorded_birth=recorded.birth_id, require_birth=True,
@@ -457,26 +471,12 @@ def recorded_process_exited(
     written on this host and in this PID namespace, and nothing runs as its
     PID here or what does started at another instant.
 
-    Strict kernel mode also requires the same boot UUID and original birth
-    identity. It never spends an epoch timestamp difference as exit evidence.
+    Strict kernel mode uses the same boot UUID, PID namespace and original
+    birth identity. Hostname and epoch changes cannot prove or hide an exit.
     """
     if not isinstance(payload, dict):
         return False
-    if require_kernel_session:
-        kernel = payload.get("kernel_session")
-        if not isinstance(kernel, str) or not kernel:
-            return False
-        if sys.platform.startswith("linux") and (
-            not isinstance(payload.get("pid_namespace"), str) or not payload["pid_namespace"]
-        ):
-            return False
-        try:
-            if kernel != _kernel_session_id():
-                return False
-        except (OSError, ValueError):
-            return False
-        return _record_holder(path, payload, require_birth=True) is None
-    return _provably_stale(path, payload)
+    return _record_holder(path, payload, require_kernel_session=require_kernel_session) is None
 
 
 def _serving_record_holder(path: Path) -> Optional[AgentHolder]:

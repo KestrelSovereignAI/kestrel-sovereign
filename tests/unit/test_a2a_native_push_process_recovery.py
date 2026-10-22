@@ -37,11 +37,39 @@ from tests.unit.test_a2a_native_task_manager import (
 )
 from tests.utils.native_push import configure_push_test_key
 from tests.utils.outbound_tls import (
+    outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - fixture dependency
+)
+from tests.utils.outbound_tls import (
     outbound_tls as outbound_tls,  # noqa: PLC0414 - fixture dependency
 )
 
 
-@pytest.mark.parametrize("field", ["kernel_session", "birth_id"])
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
+async def test_hostname_change_during_actual_https_close_keeps_original_retirement(
+    outbox, outbound_tls, outbound_close_barrier, monkeypatch
+):
+    import socket
+
+    value, task = outbox
+    native = callback(task)
+    native.url = outbound_tls.url + "/callback"
+    config = await value.register(native, creator_id="did:creator")
+    runner = worker(value)
+    sending = asyncio.create_task(runner.run_once())
+    try:
+        await asyncio.wait_for(outbound_close_barrier.entered.wait(), 5)
+        assert len(outbound_tls.posts) == 1
+        monkeypatch.setattr(socket, "gethostname", lambda: "renamed-network-host")
+        outbound_close_barrier.release.set()
+        assert await sending == 1
+        assert await value.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts") == [(1,)]
+        await runner.delete(task.id, config.config.id, creator_id="did:creator")
+    finally:
+        outbound_close_barrier.release.set()
+        await asyncio.gather(sending, return_exceptions=True)
+
+
+@pytest.mark.parametrize("field", ["kernel_session", "birth_id", "pid_namespace", "pid"])
 async def test_copied_and_foreign_process_witnesses_cannot_spend_an_original_attempt(outbox, field):
     value, task = outbox
     store = value.configurations
@@ -51,6 +79,10 @@ async def test_copied_and_foreign_process_witnesses_cannot_spend_an_original_att
     if field == "birth_id":
         platform, number = copied[field].split(":")
         copied[field] = f"{platform}:{int(number) + 1}"
+    elif field == "pid":
+        copied[field] += 1
+    elif field == "pid_namespace":
+        copied[field] = "foreign-namespace"
     else:
         copied[field] = "foreign-kernel"
     assert original.owner_identity[field] != copied[field]
@@ -314,9 +346,10 @@ async def test_bounded_recovery_rotates_past_a_live_owner_and_keeps_foreign_scop
 
 @pytest.mark.parametrize("outbound_tls", [{"dns_validations": 4}], indirect=True)
 @pytest.mark.parametrize("check_live_owner", [False, True])
-@pytest.mark.parametrize("foreign_field", [None, "kernel_session", "host", "pid_namespace"])
+@pytest.mark.parametrize("foreign_field", [None, "kernel_session", "pid_namespace"])
+@pytest.mark.parametrize("renamed_host", [False, True])
 async def test_killed_native_https_owner_can_finish_delete_without_a_clock_receipt(
-    outbox, outbound_tls, tmp_path, check_live_owner, foreign_field
+    outbox, outbound_tls, tmp_path, check_live_owner, foreign_field, renamed_host, monkeypatch
 ):
     value, task = outbox
     if os.name != "posix":
@@ -341,6 +374,11 @@ async def test_killed_native_https_owner_can_finish_delete_without_a_clock_recei
         process.kill()
         assert await process.wait() == -signal.SIGKILL
         assert recorded_process_exited(log, report["owner"])
+        if renamed_host:
+            import socket
+
+            monkeypatch.setattr(socket, "gethostname", lambda: "renamed-network-host")
+            assert recorded_process_exited(log, report["owner"], require_kernel_session=True)
         if foreign_field is not None:
             original_owner = await value.backend.fetch_val("SELECT owner_identity FROM a2a_push_delivery_attempts")
             foreign_owner = {**report["owner"], foreign_field: "foreign-original-owner"}

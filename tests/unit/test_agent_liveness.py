@@ -657,10 +657,27 @@ def test_strict_identity_observes_an_original_exited_process(tmp_path, exited_pr
     )
 
 
+def test_strict_exit_evidence_survives_a_hostname_change(tmp_path, exited_process_identity, monkeypatch):
+    monkeypatch.setattr(liveness.socket, "gethostname", lambda: "renamed-network-host")
+    assert liveness.recorded_process_exited(
+        tmp_path / "original-owner", exited_process_identity, require_kernel_session=True
+    ), "a hostname change hid original same-kernel exit evidence"
+
+
+def test_strict_live_process_identity_survives_a_hostname_change(tmp_path, monkeypatch):
+    before = liveness.process_identity(require_kernel_session=True)
+    monkeypatch.setattr(liveness.socket, "gethostname", lambda: "renamed-network-host")
+    after = liveness.process_identity(require_kernel_session=True)
+    assert liveness.same_process_identity(before, after), "hostname diagnostics changed physical process ownership"
+    assert not liveness.recorded_process_exited(
+        tmp_path / "original-owner", before, require_kernel_session=True
+    )
+
+
 @pytest.mark.parametrize("field,value", [
     ("kernel_session", "foreign-kernel"), ("kernel_session", None),
     ("pid", None), ("pid", True), ("started_at", float("nan")),
-    ("host", "another-original-host"), ("pid_namespace", "foreign-namespace"),
+    ("pid_namespace", "foreign-namespace"),
 ])
 def test_strict_retirement_never_spends_a_foreign_or_incomplete_owner(
     tmp_path, exited_process_identity, field, value

@@ -915,10 +915,11 @@ uncertain, so a lost acknowledgement before HTTP begins is recoverable without
 inventing a network request or replacing the original database outcome.
 
 Each attempt also persists its original physical process witness before HTTP
-admission: kernel boot UUID, host/PID namespace, PID and raw kernel process
+admission: kernel boot UUID, PID namespace, PID and raw kernel process
 birth identity. Capture, dispatch checks and ordinary retirement require that
-same process identity. The epoch creation timestamp is diagnostic; a clock
-adjustment cannot revoke ownership or establish an exit. Strict observation
+same process identity. Hostname and epoch timestamp are diagnostic metadata;
+changing either cannot revoke ownership, replace the original retirement
+receipt, or establish or hide an exit. Strict observation
 uses Linux boot-relative process ticks or Darwin's kernel process lifetime ID.
 Only the original kernel/namespace and a changed birth identity or a
 kernel-confirmed absent PID can establish that the original process exited.
@@ -1009,7 +1010,7 @@ genuine lost acknowledgements retain their native control evidence. Deletion
 recognizes its own config/lease revocation from the monitor while retaining
 actual custody and storage failures.
 
-The optional push schema bundle is revision 1. Configuration, delivery-attempt
+The optional push schema bundle is revision 4. Configuration, delivery-attempt
 and subscription DDL commit with its completion marker under the native schema
 lease. A completed boot skips data-table DDL. The shared encryption key must be
 available before any push schema write, including on a repeated boot.

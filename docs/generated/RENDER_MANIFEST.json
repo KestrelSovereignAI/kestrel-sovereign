@@ -57,9 +57,13 @@
         "scripts/generate_demo_evidence_docs.py",
         "scripts/generate_feature_docs.py"
       ],
-      "findings": [],
+      "findings": [
+        "missing_local_links"
+      ],
       "missing_code_refs": [],
-      "missing_links": [],
+      "missing_links": [
+        "archive/KESTREL_FEATURES_legacy.md"
+      ],
       "path": "docs/README.md",
       "privacy": "public",
       "render": "public",
@@ -397,11 +401,14 @@
         "kestrel_sovereign/storage/privacy_wrapper.py",
         "kestrel_sovereign/storage/schema_router.py",
         "kestrel_sovereign/storage/temporal_analyzer.py",
-        "scripts/benchmark_memory_quality.py",
+        "scripts/benchmark_memory_quality.py"
+      ],
+      "findings": [
+        "missing_code_refs"
+      ],
+      "missing_code_refs": [
         "tests/fixtures/memory_quality_eval.json"
       ],
-      "findings": [],
-      "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/MEMORY_SYSTEM.md",
       "privacy": "public",
@@ -461,9 +468,13 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [],
+      "findings": [
+        "missing_local_links"
+      ],
       "missing_code_refs": [],
-      "missing_links": [],
+      "missing_links": [
+        "evidence/native-protocols/published-caps.json"
+      ],
       "path": "docs/architecture/NATIVE_PROTOCOL_SPIKES.md",
       "privacy": "public",
       "render": "public",
