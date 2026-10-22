@@ -873,11 +873,14 @@ observation preserves the real committed fact without adding uncertainty to
 otherwise healthy scopes; independent native failures retain their provenance.
 PostgreSQL original journals require the plain permanent audit table, not a
 partitioned parent, TEMP/UNLOGGED relation, or a table with triggers, rewrite
-rules, row-security policies, custom CHECKs, generated/identity columns or
-non-native column types. The column inventory must match the canonical row.
+rules, row-security policies, custom CHECKs, generated/identity columns,
+non-native column types, expression indexes or non-native index predicates/operator
+classes. The only partial-index predicate is the canonical constitution-hash
+non-null filter. The column inventory must match the canonical row.
 Ordinary store append retains its separate customization contract. The native
-writer takes the relation's row-exclusive lock before checking shape and holds
-it through COMMIT/rollback, excluding racing trigger/rule/shape DDL. It never
+writer takes the relation's share-update-exclusive lock before checking shape and
+holds it through COMMIT/rollback, excluding racing trigger/rule/shape DDL and
+concurrent index installation. It never
 executes custom database hooks with terminal-journal privilege. A constraint
 flush alone cannot prove this: a trigger can re-defer another deletion until
 COMMIT. Unsupported shape before admission refuses routing; shape changed by

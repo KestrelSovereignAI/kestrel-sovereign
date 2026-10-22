@@ -2227,6 +2227,14 @@ class PostgresBackend(DatabaseBackend):
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class=c.oid)
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS k WHERE k.conrelid=c.oid AND k.contype='c')
               AND NOT EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_index AS i WHERE i.indrelid=c.oid
+                    AND (i.indexprs IS NOT NULL OR
+                         (i.indpred IS NOT NULL AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)
+                          NOT IN ('(constitution_hash IS NOT NULL)', 'constitution_hash IS NOT NULL')) OR
+                         EXISTS (SELECT 1 FROM pg_catalog.pg_opclass AS op
+                                 JOIN pg_catalog.pg_namespace AS onsp ON onsp.oid=op.opcnamespace
+                                 WHERE op.oid=ANY(i.indclass) AND onsp.nspname<>'pg_catalog')))
+              AND NOT EXISTS (
                   SELECT 1 FROM pg_catalog.pg_attribute AS a
                   JOIN pg_catalog.pg_type AS t ON t.oid=a.atttypid
                   JOIN pg_catalog.pg_namespace AS tn ON tn.oid=t.typnamespace
@@ -2283,7 +2291,7 @@ class PostgresBackend(DatabaseBackend):
                     journal.require_original(self)
                     # Lock before observing shape: INSERT's later implicit
                     # lock is too late to exclude a racing trigger/rule DDL.
-                    await connection.execute(f'LOCK TABLE ONLY {relation.qualified_name} IN ROW EXCLUSIVE MODE')
+                    await connection.execute(f'LOCK TABLE ONLY {relation.qualified_name} IN SHARE UPDATE EXCLUSIVE MODE')
                     journal.require_original(self)
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
                         raise journal.write_refusal('destination_changed')
