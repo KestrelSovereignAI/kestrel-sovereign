@@ -55,6 +55,18 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         # final transaction completion is still checked on the native worker.
         self._journal_autocommit_legacy = (not hasattr(sqlite3.Connection, 'autocommit')
             or self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL)
+        # Core-owned native authorization observes preparation, not SQL text
+        # heuristics. A previously cached mutating PRAGMA already retired this
+        # profile at its first preparation, so reusing it cannot bypass us.
+        super().set_authorizer(self._original_journal_catalog_authorizer)
+
+    def _original_journal_catalog_authorizer(self, action, name, value, database, source):
+        if (action == sqlite3.SQLITE_PRAGMA and value is not None
+                and name.lower() in ('schema_version', 'writable_schema')):
+            self._journal_programs_configured = True
+            if self._journal_program_seal is not None:
+                return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
 
     def __setattr__(self, name, value):
         if name in ('text_factory', 'autocommit', 'isolation_level') and self._journal_program_seal is not None:

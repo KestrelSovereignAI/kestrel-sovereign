@@ -948,6 +948,14 @@ power-loss guarantees. PostgreSQL admission and both locked relation checks also
 require the actual native heap table access method and native heap handler,
 not merely a permanent relation whose columns happen to match.
 
+The Core-owned SQLite native authorizer also monotonically observes SQL writes
+to `schema_version` or `writable_schema`. Either retires the original-journal
+profile until reconnect, even if later restored or prepared-statement cached.
+Otherwise public writable-schema SQL could replace a table and transplant its
+original schema row/cookie, defeating a value-only catalog fingerprint. Ordinary
+SQL configuration remains available; it cannot retain the stronger journal
+permission. Application authorizer replacement remains separately unsupported.
+
 Core-owned SQLite connections likewise track native callback/function/extension
 registration. A customized session remains ineligible for original journals until
 reconnect, including after callback removal. This is a supported configuration
