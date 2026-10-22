@@ -92,7 +92,6 @@ import weakref
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from enum import Enum
@@ -1228,6 +1227,7 @@ class SignalDispatcher:
                 if registration is not None:
                     from kestrel_sovereign.signals.outcome_custody import (
                         _AcceptedSignalOutcome, _OriginalSignalOutcome,
+                        _snapshot_terminal_result,
                     )
                     original_acceptance = _AcceptedSignalOutcome(
                         asyncio.current_task(), _OriginalSignalOutcome._signal_identity(signal), registration)
@@ -1256,7 +1256,7 @@ class SignalDispatcher:
                     and outcome.registration is registration]
                 if journal is not None:
                     try:
-                        result = deepcopy(result)
+                        result = _snapshot_terminal_result(result)
                     except BaseException as error:
                         journal._phase = 'refused'
                         journal._completed_result = result
@@ -5123,7 +5123,8 @@ class SignalDispatcher:
                             and outcome.registration is registration]
                         if journal is not None:
                             try:
-                                result = deepcopy(result)
+                                from kestrel_sovereign.signals.outcome_custody import _snapshot_terminal_result
+                                result = _snapshot_terminal_result(result)
                             except BaseException as error:
                                 journal._phase = 'refused'
                                 journal._completed_result = result

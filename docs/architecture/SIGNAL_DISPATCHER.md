@@ -902,7 +902,13 @@ not delete a row while claiming that its equality proof succeeded.
 At the real public/recovery return boundary, native journals detach terminal
 result data before invoking projections. A callback retaining the handler's
 original mutable dictionary cannot change the caller's result or audit digest.
-An uncopyable result fails finitely before projection, carrying the genuine
+Canonical builtin containers are copied from their native storage, not through
+application `__deepcopy__`, iteration overrides or constructors. The same
+data-only contract snapshots the accepted signal envelope. Native frozen scalar
+records (`ScheduledTaskOutcome`, `CausationFrame`) retain their identity;
+mutable application objects and mutable fields in those records are unsupported.
+Container cycles remain detached, with ordinary serialization/audit-loss semantics.
+An unsupported result fails finitely before projection, carrying the genuine
 completed return and one audit loss, not a failed/replayed handler.
 
 The original privacy-policy epoch and persistence-gate identity also remain

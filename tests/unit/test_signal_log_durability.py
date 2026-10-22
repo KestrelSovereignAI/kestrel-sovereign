@@ -272,10 +272,6 @@ async def test_dispatch_counts_a_dropped_audit_row_end_to_end(backend):
     store = SignalLogStore(backend)
     await store.initialize()
 
-    # Actual native SQL refusal on this test's owned temporary database,
-    # rather than an obsolete ordinary-append interception seam.
-    await backend.execute("DROP TABLE signal_log")
-
     agent = _FakeAgent()
     registry = SourceRegistry()
     dispatcher = SignalDispatcher(
@@ -285,6 +281,8 @@ async def test_dispatch_counts_a_dropped_audit_row_end_to_end(backend):
         store=store,
     )
     registry.register(_registration(name="contention"))
+    await dispatcher.dispatch_signal(_signal(-1))
+    await backend.execute('CREATE UNIQUE INDEX journal_duplicate_source ON signal_log(source)')
 
     assert dispatcher.log_write_failure_count == 0
 
@@ -300,7 +298,7 @@ async def test_dispatch_counts_a_dropped_audit_row_end_to_end(backend):
     assert dispatcher.log_write_failure_count == 1
     last = dispatcher.last_log_write_failure
     assert last is not None
-    assert "no such table" in last.error
+    assert "UNIQUE constraint failed" in last.error
     assert last.signal_id
 
 

@@ -510,9 +510,10 @@ async def test_log_write_failure_suppresses_ui_emit(components, monkeypatch):
     suppresses the emit on log failure."""
     c = components
 
-    # Refuse the actual owned native INSERT, not the now separate ordinary
-    # append seam. Only this test's temporary database is affected.
-    await c.backend.execute('DROP TABLE signal_log')
+    # Keep a real destination at admission and fail the later native INSERT
+    # with a genuine constraint violation in this owned database.
+    await c.dispatcher.dispatch_signal(_make_signal(visibility=Visibility.INTERNAL))
+    await c.backend.execute('CREATE UNIQUE INDEX journal_duplicate_source ON signal_log(source)')
 
     sig = _make_signal(visibility=Visibility.USER_VISIBLE)
     result = await c.dispatcher.dispatch_signal(sig)

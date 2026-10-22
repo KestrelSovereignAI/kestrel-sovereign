@@ -6,14 +6,85 @@ in the ambient context and native commit/cleanup evidence retains them.
 """
 
 import asyncio
-from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, current_execution_custody, require_execution_work,
 )
 
 _JOURNAL_ADMISSION = object()
+
+
+def _snapshot_outcome_data(value, memo=None):
+    """Detach canonical data, never delegate custody to application copy hooks.
+
+    Read builtin container storage directly, including for subclasses. Unknown
+    objects fail explicitly: invoking their constructors/copy protocols cannot
+    prove that a projection no longer retains a mutable alias. The two native
+    immutable record types retain identity (scheduler callers rely on it), but
+    only when every stored field is itself an immutable canonical value.
+    """
+    from kestrel_sdk.signals.models import (
+        CausationFrame, SignalMode, Status, Trust, Urgency, Visibility,
+    )
+    from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+
+    scalar_types = (type(None), bool, int, float, str, bytes, date, timedelta,
+                    Decimal, UUID, timezone, ZoneInfo)
+    if type(value) in scalar_types:
+        return value
+    if type(value) in (datetime, time):
+        if value.tzinfo is not None and type(value.tzinfo) not in (timezone, ZoneInfo):
+            raise TypeError('Signal outcome has a mutable timezone')
+        return value
+    if type(value) in (SignalMode, Status, Trust, Urgency, Visibility):
+        return value
+    if memo is None:
+        memo = {}
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if type(value) in (CausationFrame, ScheduledTaskOutcome):
+        for field in fields(value):
+            stored = object.__getattribute__(value, field.name)
+            if _snapshot_outcome_data(stored, memo) is not stored:
+                raise TypeError('Native immutable outcome record has mutable fields')
+        return value
+    if isinstance(value, dict):
+        copied = memo[identity] = {}
+        for key, item in dict.items(value):
+            copied[_snapshot_outcome_data(key, memo)] = _snapshot_outcome_data(item, memo)
+        return copied
+    if isinstance(value, list):
+        copied = memo[identity] = []
+        copied.extend(_snapshot_outcome_data(item, memo) for item in list.__iter__(value))
+        return copied
+    if isinstance(value, tuple):
+        items = tuple(_snapshot_outcome_data(item, memo) for item in tuple.__iter__(value))
+        # A list nested in a tuple can recurse back to the same tuple. Its
+        # recursive traversal may already have installed the canonical copy.
+        if identity not in memo:
+            memo[identity] = items
+        return memo[identity]
+    if isinstance(value, set):
+        copied = memo[identity] = set()
+        copied.update(_snapshot_outcome_data(item, memo) for item in set.__iter__(value))
+        return copied
+    if isinstance(value, frozenset):
+        copied = frozenset(_snapshot_outcome_data(item, memo) for item in frozenset.__iter__(value))
+        memo[identity] = copied
+        return copied
+    raise TypeError('Signal outcome contains unsupported mutable application data')
+
+
+def _snapshot_terminal_result(result):
+    from kestrel_sdk.signals.models import SignalResult
+    return SignalResult(**{field.name: _snapshot_outcome_data(getattr(result, field.name))
+                           for field in fields(SignalResult)})
 
 
 class SignalOutcomeJournalPrivacyRefusal(ExecutionAuthorityError):
@@ -137,7 +208,10 @@ class _OriginalSignalOutcome:
         self._registration = registration
         # Payload containers and privacy settings belong to acceptance, not
         # to a handler's mutable arguments after revocation.
-        self._signal_snapshot = deepcopy(signal)
+        from kestrel_sdk.signals.models import Signal
+        self._signal_snapshot = Signal(**{
+            field.name: _snapshot_outcome_data(getattr(signal, field.name))
+            for field in fields(Signal)})
         self._registration_snapshot = replace(registration,
             log_redaction=replace(registration.log_redaction))
         table = 'main.signal_log' if type(backend) is SQLiteBackend else 'signal_log'

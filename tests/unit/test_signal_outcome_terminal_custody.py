@@ -103,6 +103,90 @@ async def test_projection_retained_alias_cannot_rewrite_actual_result(dispatcher
     assert c.dispatcher._log_write_failures == 0
 
 
+async def test_result_snapshot_never_delegates_to_mutable_copy_hook(dispatcher_components):
+    from kestrel_sovereign.signals.store import _digest
+    c = dispatcher_components
+    copied = []
+    class RetainedDictionary(dict):
+        def __deepcopy__(self, memo):
+            copied.append(True)
+            return self
+    body = RetainedDictionary(nested={'value': 'actual-return'})
+    async def handler(payload):
+        return body
+    def summary(_argument):
+        body['nested']['value'] = 'mutated-original-copy-hook-alias'
+        return '<projection>'
+    registration = _action_reg('copy.hook.alias', handler=handler)
+    registration.result_summary = summary
+    c.registry.register(registration)
+    signal = _signal('copy.hook.alias')
+    result = await c.dispatcher.dispatch_signal(signal)
+    assert not copied, 'canonical snapshot invoked an application copy hook'
+    assert result.action_result == {'nested': {'value': 'actual-return'}}
+    assert await c.backend.fetch_val('SELECT action_result_digest FROM signal_log WHERE id=?', (signal.id,)) == _digest({'nested': {'value': 'actual-return'}})
+
+
+async def test_accepted_payload_snapshot_never_delegates_to_copy_hook(dispatcher_components):
+    from dataclasses import replace
+    from kestrel_sdk.signals import Trust
+    c = dispatcher_components
+    copied = []
+    class RetainedDictionary(dict):
+        def __deepcopy__(self, memo):
+            copied.append(True)
+            return self
+    body = RetainedDictionary(nested={'value': 'accepted-payload'})
+    async def handler(payload):
+        body['nested']['value'] = 'handler-mutated-original'
+        return {'genuine': True}
+    registration = replace(_action_reg('payload.copy.hook', handler=handler), trust=Trust.TRUSTED)
+    registration.log_redaction = replace(registration.log_redaction, store_raw_trusted=True)
+    c.registry.register(registration)
+    signal = _signal('payload.copy.hook', payload=body)
+    result = await c.dispatcher.dispatch_signal(signal)
+    assert not copied
+    assert result.action_result == {'genuine': True}
+    import json
+    stored = await c.backend.fetch_val('SELECT payload_raw FROM signal_log WHERE id=?', (signal.id,))
+    assert json.loads(stored) == {'nested': {'value': 'accepted-payload'}}
+
+
+def test_data_snapshot_uses_builtin_storage_and_preserves_cycles():
+    from kestrel_sovereign.signals.outcome_custody import _snapshot_outcome_data
+    class Container(dict):
+        def items(self):
+            raise AssertionError('application items override ran')
+        def __deepcopy__(self, memo):
+            raise AssertionError('application copy hook ran')
+    class Items(list):
+        def __iter__(self):
+            raise AssertionError('application iterator ran')
+    original = Container(items=Items([1, {'value': 'accepted'}]))
+    original['self'] = original
+    copied = _snapshot_outcome_data(original)
+    assert type(copied) is dict and type(copied['items']) is list
+    assert copied is not original and copied['self'] is copied
+    original['items'][1]['value'] = 'changed'
+    assert copied['items'][1] == {'value': 'accepted'}
+    cycle = []
+    original_tuple = (cycle,)
+    cycle.append(original_tuple)
+    copied_tuple = _snapshot_outcome_data(original_tuple)
+    assert copied_tuple is not original_tuple
+    assert copied_tuple[0][0] is copied_tuple
+
+
+def test_native_immutable_record_identity_requires_immutable_fields():
+    from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+    from kestrel_sovereign.signals.outcome_custody import _snapshot_outcome_data
+    original = ScheduledTaskOutcome(status='blocked', result_text='actual immutable return')
+    assert _snapshot_outcome_data(original) is original
+    malformed = ScheduledTaskOutcome(status='blocked', result_text=['mutable'])
+    with pytest.raises(TypeError, match='mutable fields'):
+        _snapshot_outcome_data(malformed)
+
+
 async def test_uncopyable_result_preserves_actual_return_without_projection_or_replay(dispatcher_components):
     from kestrel_sovereign.execution_custody import is_execution_control_error, execution_native_source_error, _explicit_control_chain
     c = dispatcher_components
