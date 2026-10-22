@@ -50,3 +50,8 @@ def test_invalid_operator_policy_fails_before_publication(environment):
 def test_embedding_requires_a_typed_push_policy():
     with pytest.raises(TypeError, match="push policy"):
         NativeHostingConfiguration("https://host.test", push=True)
+
+
+def test_retry_ceiling_cannot_be_less_than_the_initial_retry_delay():
+    with pytest.raises(ValueError, match="retry_max_seconds"):
+        NativePushPolicy(retry_seconds=5, retry_max_seconds=4)

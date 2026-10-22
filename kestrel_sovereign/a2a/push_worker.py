@@ -26,7 +26,7 @@ from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
 )
-from kestrel_sovereign.signals.durable import DurableDelivery
+from kestrel_sovereign.signals.durable import FAILED, DurableDelivery
 from kestrel_sovereign.storage.db.polling import DatabasePollRetryPolicy
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,8 @@ class NativePushWorker:
         poll_interval: timedelta,
         renewal_interval: timedelta,
         retry_delay: timedelta,
+        retry_max_delay: timedelta,
+        max_delivery_attempts: int,
         batch_size: int,
         database_retry_policy: DatabasePollRetryPolicy | None = None,
     ):
@@ -84,6 +86,7 @@ class NativePushWorker:
             ("poll", poll_interval),
             ("renewal", renewal_interval),
             ("retry", retry_delay),
+            ("maximum retry", retry_max_delay),
         ):
             if not isinstance(duration, timedelta) or duration <= timedelta():
                 raise ValueError(f"Push {name} interval must be positive")
@@ -91,11 +94,17 @@ class NativePushWorker:
             raise ValueError("Push renewal interval must be shorter than its lease")
         if type(batch_size) is not int or batch_size <= 0:
             raise ValueError("Push batch size must be positive")
+        if retry_max_delay < retry_delay:
+            raise ValueError("Push maximum retry delay must be at least its initial delay")
+        if type(max_delivery_attempts) is not int or max_delivery_attempts <= 0:
+            raise ValueError("Push delivery retry attempts must be a positive integer")
         self.outbox = outbox
         self.transport = transport
         self.poll_interval = poll_interval.total_seconds()
         self.renewal_interval = renewal_interval.total_seconds()
         self.retry_delay = retry_delay
+        self.retry_max_delay = retry_max_delay
+        self.max_delivery_attempts = max_delivery_attempts
         self.batch_size = batch_size
         if database_retry_policy is not None and not isinstance(
             database_retry_policy, DatabasePollRetryPolicy
@@ -309,6 +318,17 @@ class NativePushWorker:
         await self._renew(delivery)
         await self._authorize_subscription(subscription)
 
+    def _delivery_retry_delay(self, attempts: int) -> timedelta:
+        """Cap exponential backoff without exponent or timedelta overflow."""
+        if type(attempts) is not int or attempts <= 0:
+            raise ValueError("Push retry delay requires a positive attempt count")
+        delay = self.retry_delay
+        remaining = attempts - 1
+        while remaining > 0 and delay < self.retry_max_delay:
+            delay += min(delay, self.retry_max_delay - delay)
+            remaining -= 1
+        return delay
+
     async def _process_subscription(self, subscription: PushSubscription) -> int:
         """Claim one original delivery and settle its own HTTP result."""
         delivery = await self._owned_transition(
@@ -351,7 +371,8 @@ class NativePushWorker:
                 self.outbox.signals.nack_delivery(
                     **self._lease_parameters(delivery),
                     error=type(error).__name__,
-                    retry_delay=self.retry_delay,
+                    retry_delay=self._delivery_retry_delay(delivery.attempts),
+                    terminal=delivery.attempts >= self.max_delivery_attempts,
                 ),
                 delivery,
             )
@@ -359,9 +380,15 @@ class NativePushWorker:
                 raise PushDeliveryLeaseLost(
                     "Push retry lost its original delivery lease"
                 ) from error
-            logger.warning(
-                "Native push delivery will retry after %s", type(error).__name__
-            )
+            if released.status == FAILED:
+                logger.warning(
+                    "Native push delivery exhausted retry budget: attempts=%s error=%s",
+                    delivery.attempts, type(error).__name__,
+                )
+            else:
+                logger.warning(
+                    "Native push delivery will retry after %s", type(error).__name__
+                )
         return 1
 
     async def run_once(self) -> int:

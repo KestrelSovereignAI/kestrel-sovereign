@@ -57,6 +57,8 @@ async def start_native_push_service(
         poll_interval=timedelta(seconds=policy.poll_seconds),
         renewal_interval=timedelta(seconds=policy.renewal_seconds),
         retry_delay=retry_delay,
+        retry_max_delay=timedelta(seconds=policy.retry_max_seconds),
+        max_delivery_attempts=policy.delivery_retry_attempts,
         batch_size=policy.batch_size,
         database_retry_policy=database_retry_policy,
     )

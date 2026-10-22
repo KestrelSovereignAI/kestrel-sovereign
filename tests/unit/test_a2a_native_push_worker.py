@@ -41,6 +41,8 @@ def worker(value, *, database_retry_policy=None):
         poll_interval=timedelta(milliseconds=10),
         renewal_interval=timedelta(milliseconds=20),
         retry_delay=timedelta(seconds=1),
+        retry_max_delay=timedelta(seconds=300),
+        max_delivery_attempts=8,
         batch_size=10,
         database_retry_policy=database_retry_policy,
     )
@@ -61,6 +63,7 @@ async def test_worker_requires_an_explicit_live_recipient_authorizer(outbox):
             value, NativePushTransport(value.configurations, timeout=timedelta(seconds=5)),
             authorize_creator=None, poll_interval=timedelta(seconds=1),
             renewal_interval=timedelta(seconds=20), retry_delay=timedelta(seconds=1), batch_size=10,
+            retry_max_delay=timedelta(seconds=300), max_delivery_attempts=8,
         )
 
 
@@ -154,6 +157,96 @@ async def test_http_failure_uses_the_existing_retry_ledger_without_secret_diagno
     ) == [(1,), (1,)]
 
 
+@pytest.mark.parametrize("check", ["backoff", "exhaustion"])
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 4}], indirect=True)
+async def test_terminal_callback_has_a_persisted_retry_budget_and_capped_backoff(
+    outbox, outbound_tls, check
+):
+    from a2a.types import Task, TaskState
+
+    value, original = outbox
+    terminal = Task.FromString(original.SerializeToString())
+    terminal.status.state = TaskState.TASK_STATE_COMPLETED
+    assert await value.configurations.task_store.save_recipient_terminal_outcome(
+        terminal, baseline=original,
+        recipient_agent_id=value.configurations.scope.recipient_id,
+        operation_id="terminal-before-callback",
+    )
+    runner, _ = await register(value, terminal, outbound_tls.url + "/failure")
+    runner.max_delivery_attempts = 3
+    runner.retry_max_delay = timedelta(seconds=2)
+    for attempt in range(1, 4):
+        before = value.signals.now_utc()
+        assert await runner.run_once() == 1
+        row = await value.backend.fetch_one(
+            "SELECT status, attempts, next_attempt_at, acknowledged_at, terminal_at "
+            "FROM durable_signal_deliveries"
+        )
+        assert row[1] == attempt and row[3] is None
+        if attempt < 3:
+            assert row[0] == RETRY
+            if check == "backoff":
+                expected = timedelta(seconds=min(2 ** (attempt - 1), 2))
+                assert value.signals.from_timestamp_field(row[2]) >= before + expected
+            # Advance only a released RETRY row after its real HTTP owner has
+            # retired; no live lease or physical request is timed out by this.
+            await value.backend.execute(
+                "UPDATE durable_signal_deliveries SET next_attempt_at = ? WHERE status = ?",
+                (value.signals.to_timestamp_param(value.signals.now_utc() - timedelta(seconds=1)), RETRY),
+            )
+        else:
+            assert row[0] == FAILED and row[2] is None and row[4] is not None
+    assert len(outbound_tls.posts) == 3
+    assert await value.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts") == [(1,), (1,), (1,)]
+    assert await worker(value).run_once() == 0
+    assert len(outbound_tls.posts) == 3
+
+
+@pytest.mark.parametrize("attempt,expected", [(1, 1), (2, 2), (3, 3), (10**9, 3)])
+async def test_retry_delay_caps_work_even_for_large_persisted_attempt_counts(outbox, attempt, expected):
+    value, _ = outbox
+    runner = worker(value)
+    runner.retry_max_delay = timedelta(seconds=3)
+    assert runner._delivery_retry_delay(attempt) == timedelta(seconds=expected)
+
+
+@pytest.mark.parametrize("attempt", [0, -1, True, 1.5])
+async def test_retry_delay_refuses_noncanonical_attempt_counts(outbox, attempt):
+    value, _ = outbox
+    with pytest.raises(ValueError, match="positive attempt count"):
+        worker(value)._delivery_retry_delay(attempt)
+
+
+async def test_retry_delay_cap_does_not_overflow_a_valid_timedelta(outbox):
+    value, _ = outbox
+    runner = worker(value)
+    runner.retry_delay = timedelta.max - timedelta(days=1)
+    runner.retry_max_delay = timedelta.max
+    assert runner._delivery_retry_delay(2) == timedelta.max
+
+
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
+async def test_retry_exhaustion_waits_for_original_http_retirement(
+    outbox, outbound_tls, outbound_close_barrier
+):
+    value, task = outbox
+    runner, _ = await register(value, task, outbound_tls.url + "/failure")
+    runner.max_delivery_attempts = 1
+    running = asyncio.create_task(runner.run_once())
+    try:
+        await outbound_close_barrier.entered.wait()
+        assert not running.done()
+        assert await value.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts") == [(0,)]
+        assert await value.backend.fetch_all("SELECT status FROM durable_signal_deliveries") == [(LEASED,)]
+        outbound_close_barrier.release.set()
+        assert await running == 1
+        assert await value.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts") == [(1,)]
+        assert await value.backend.fetch_all("SELECT status, acknowledged_at FROM durable_signal_deliveries") == [(FAILED, None)]
+    finally:
+        outbound_close_barrier.release.set()
+        if not running.done():
+            running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
 @pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
 async def test_dispatch_gate_checks_the_original_delivery_lease_after_dns(
     outbox, outbound_tls, monkeypatch
@@ -483,6 +576,10 @@ async def test_runner_readiness_follows_its_managed_lifetime(outbox, monkeypatch
         ("renewal_interval", timedelta(seconds=60)),
         ("renewal_interval", timedelta(seconds=-1)),
         ("retry_delay", timedelta()),
+        ("retry_max_delay", timedelta()),
+        ("retry_max_delay", timedelta(milliseconds=500)),
+        ("max_delivery_attempts", 0),
+        ("max_delivery_attempts", True),
         ("batch_size", 0),
         ("batch_size", True),
     ],
@@ -493,6 +590,8 @@ async def test_invalid_worker_policy_refuses_before_execution(outbox, field, bad
         "poll_interval": timedelta(seconds=1),
         "renewal_interval": timedelta(seconds=20),
         "retry_delay": timedelta(seconds=1),
+        "retry_max_delay": timedelta(seconds=300),
+        "max_delivery_attempts": 8,
         "batch_size": 10,
         "authorize_creator": fixture_push_authorizer(value.configurations.task_store),
     }

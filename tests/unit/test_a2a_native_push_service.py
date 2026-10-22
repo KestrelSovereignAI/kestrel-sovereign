@@ -64,7 +64,8 @@ async def test_canonical_startup_uses_actual_runtime_ready_publisher(outbox):
         None  # standalone owner; this test performs real database work
     )
     policy = NativePushPolicy(
-        timeout_seconds=7, batch_size=13, database_retry_attempts=7, retry_seconds=11
+        timeout_seconds=7, batch_size=13, database_retry_attempts=7, retry_seconds=11,
+        retry_max_seconds=43, delivery_retry_attempts=4,
     )
     try:
         service = await start_native_push_service(
@@ -84,6 +85,8 @@ async def test_canonical_startup_uses_actual_runtime_ready_publisher(outbox):
         assert service.worker.transport.database_retry_policy is service.worker.database_retry_policy
         assert service.worker.transport.retry_delay == service.worker.retry_delay
         assert service.worker.transport.retry_delay.total_seconds() == 11
+        assert service.worker.retry_max_delay.total_seconds() == 43
+        assert service.worker.max_delivery_attempts == 4
         with pytest.raises(RuntimeError, match="replace"):
             await start_native_push_service(
                 manager,

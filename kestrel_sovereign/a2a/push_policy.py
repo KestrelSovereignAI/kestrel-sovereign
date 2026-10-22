@@ -16,6 +16,8 @@ class NativePushPolicy:
     poll_seconds: int = 1
     renewal_seconds: int = 20
     retry_seconds: int = 5
+    retry_max_seconds: int = 300
+    delivery_retry_attempts: int = 8
     batch_size: int = 50
     database_retry_attempts: int = DatabasePollRetryPolicy().max_attempts
 
@@ -28,6 +30,8 @@ class NativePushPolicy:
             raise ValueError(
                 "Native push renewal_seconds must be shorter than lease_seconds"
             )
+        if self.retry_max_seconds < self.retry_seconds:
+            raise ValueError("Native push retry_max_seconds must be at least retry_seconds")
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]):

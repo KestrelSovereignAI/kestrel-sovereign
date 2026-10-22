@@ -157,11 +157,13 @@ async def test_permanent_retirement_sql_failure_stops_without_retry_or_ack(
 
 
 @pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
+@pytest.mark.parametrize("route", ["/callback", "/failure"])
 async def test_uncertain_retirement_commit_never_retries_or_acknowledges(
-    outbox, outbound_tls, monkeypatch
+    outbox, outbound_tls, monkeypatch, route
 ):
     value, task = outbox
-    runner, _ = await register(value, task, outbound_tls.url + "/callback")
+    runner, _ = await register(value, task, outbound_tls.url + route)
+    runner.max_delivery_attempts = 1
     runner.transport.retry_delay = timedelta(milliseconds=10)
     original = OSError("original retirement COMMIT reply lost")
     calls = []

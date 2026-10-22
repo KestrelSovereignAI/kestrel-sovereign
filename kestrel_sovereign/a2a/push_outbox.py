@@ -237,6 +237,8 @@ class NativePushOutbox(UnifiedStoreBase):
                     consumer_id=consumer_id,
                     source=self.SOURCE,
                     correlation_selector="payload.task_id=" + native.task_id,
+                    # The callback worker explicitly fails an exhausted
+                    # notification only after its HTTP owner has retired.
                     max_attempts=0,
                     lease_seconds=self.lease_seconds,
                     replay_retained=False,

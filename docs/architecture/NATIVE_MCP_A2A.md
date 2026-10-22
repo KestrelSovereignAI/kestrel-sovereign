@@ -987,6 +987,15 @@ deletes only terminal events from the exact private push source and removes
 journal references to those exact deleted IDs in one transaction. Pending,
 retrying and leased deliveries retain their events. Retry diagnostics contain
 error types, excluding callback secrets.
+Failed callback exchanges use exponential backoff from `RETRY_SECONDS`, capped
+by `RETRY_MAX_SECONDS` (default 300 seconds). `DELIVERY_RETRY_ATTEMPTS` bounds
+each notification's persisted delivery attempts (default 8). Exhaustion records
+an explicit durable `FAILED` disposition after the original HTTP owner retires;
+it does not acknowledge delivery. Restarting a worker cannot reopen that failed
+notification. A later task-change notification has its own budget, and the
+configuration remains available to its authorized creator. These operational
+limits do not override uncertain commits, lost authority or physical cleanup
+debt. All settings use the `KESTREL_A2A_PUSH_` environment prefix.
 The due queue orders pending work by its initial eligibility, retries by their
 next attempt time, and expired leases by lease expiration. A failed callback
 therefore goes behind older waiting work. At most `BATCH_SIZE` subscription

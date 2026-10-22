@@ -111,6 +111,8 @@ async def managed_push_service(manager, monkeypatch, *, pause_delivery: bool):
         poll_interval=timedelta(seconds=1),
         renewal_interval=timedelta(seconds=20),
         retry_delay=timedelta(seconds=1),
+        retry_max_delay=timedelta(seconds=300),
+        max_delivery_attempts=8,
         batch_size=10,
     )
     entered, release = asyncio.Event(), asyncio.Event()
