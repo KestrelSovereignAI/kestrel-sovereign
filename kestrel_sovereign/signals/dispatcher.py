@@ -1171,12 +1171,17 @@ class SignalDispatcher:
         _durable_delivery_consumer_id: Optional[str] = None,
         _durable_terminal_consumer_id: Optional[str] = None,
         _durable_admission_fence: Any = None,
+        _journal_completion=None,
     ) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result
         (scheduler, heartbeat). Ordinary failures return `Status.FAILED`.
         Execution-authority loss and uncertain commits remain typed errors
         so the owning invocation can reconcile instead of retrying effects."""
         self._require_standalone_native_outcome_entry()
+        if _journal_completion is None:
+            _journal_completion = []
+        elif type(_journal_completion) is not list or _journal_completion:
+            raise TypeError('Original dispatch journal handoff requires a fresh native slot')
         start = time.monotonic()
         # Nested public dispatches inherit ContextVars from their caller. A
         # signal emitted by durable cognition is a new source unit and must not
@@ -1246,6 +1251,7 @@ class SignalDispatcher:
                     durable_terminal_consumer_id=_durable_terminal_consumer_id,
                     durable_admission_fence=_durable_admission_fence,
                     original_outcome_acceptance=original_acceptance,
+                    _journal_completion=_journal_completion,
                 )
                 # Handler code may invoke scheduling helpers, but only this
                 # returned pipeline result can terminalize the original row.
@@ -1339,6 +1345,12 @@ class SignalDispatcher:
                             signal.id,
                         )
                     )
+            # Same invocation-owned completion slot crosses accepted dispatch
+            # and resident joins. A successful best-effort result is not proof
+            # that there is no native COMMIT or retained ordinary SQL failure.
+            completed_journal = self._original_outcome_admission.get()
+            if completed_journal is not None:
+                _journal_completion.append(completed_journal)
             reset_current_signal(ctx_token)
             self._deferred_outcome_logs.reset(deferred_token)
             self._original_outcome_admission.reset(journal_token)
@@ -1391,12 +1403,14 @@ class SignalDispatcher:
         durable_admission: asyncio.Future[DurableAdmissionResult] = (
             asyncio.get_running_loop().create_future()
         )
+        journal_completion = []
         coro = self.dispatch_signal(
             signal,
             source_event_id=source_event_id,
             _durable_admission=durable_admission,
             _durable_delivery_consumer_id=consumer_id,
             _durable_admission_fence=admission_fence,
+            _journal_completion=journal_completion,
         )
         enqueued_signal_id = signal.id
         released = False
@@ -1442,7 +1456,10 @@ class SignalDispatcher:
                     resident_context.run(release_live_admission, owner)
             except BaseException as cleanup:
                 errors.append(cleanup)
-            raise execution_observation_error(*errors, message='Original durable enqueue publication and physical join')
+            terminal = execution_observation_error(*errors, message='Original durable enqueue publication and physical join')
+            for completed_journal in journal_completion:
+                terminal = completed_journal.retain_observation(terminal)
+            raise terminal
         return SignalDispatchHandle(
             signal_id=enqueued_signal_id,
             task=task,
@@ -4243,6 +4260,7 @@ class SignalDispatcher:
         durable_terminal_consumer_id: Optional[str] = None,
         durable_admission_fence: Any = None,
         original_outcome_acceptance: Any = None,
+        _journal_completion=None,
     ) -> SignalResult:
         # Step 1: validation
         registration = self._registry.get(signal.source)
@@ -4752,6 +4770,7 @@ class SignalDispatcher:
                 )
                 or use_verified_live_signal,
                 verified_terminal_retry=verified_terminal_retry,
+                _journal_completion=_journal_completion,
             )
 
         if durable_terminal_consumer_id is not None:
@@ -4874,6 +4893,7 @@ class SignalDispatcher:
         verified_terminal_retry: bool = False,
         claimed_delivery: DurableDelivery | None = None,
         retry_delay: timedelta = timedelta(),
+        _journal_completion=None,
     ) -> SignalResult:
         """Route cursor-owned work and ACK only its durable cognition lease."""
         delivery = claimed_delivery
@@ -5029,7 +5049,7 @@ class SignalDispatcher:
             # The exact claim was obtained under live ingress authority. Its
             # remaining work must be owned before any early cursor receipt:
             # caller recovery, cognition, renewal, settlement AND audit tails.
-            resident_journals = []
+            resident_journals = _journal_completion if _journal_completion is not None else []
             async def resident_delivery():
                 from kestrel_sovereign.signals.context import (
                     reset_current_signal, set_current_signal,
@@ -5139,6 +5159,7 @@ class SignalDispatcher:
             use_live_signal=use_live_signal, retry_delay=retry_delay,
             durable_admission=durable_admission,
             persisted_event_id=persisted_event_id,
+            _journal_completion=_journal_completion,
         )
 
     async def _execute_claimed_durable_cognition(
