@@ -29,7 +29,7 @@ class _OriginalWork:
         self.require_work()
 
 
-def test_application_string_equality_cannot_substitute_accepted_signal_id():
+async def test_application_string_equality_cannot_substitute_accepted_signal_id():
     from kestrel_sdk.signals import SignalMode
     class EqualText(str):
         __hash__ = str.__hash__

@@ -111,7 +111,7 @@ async def test_original_journal_does_not_inherit_reused_session_principal(dispat
     role = schema + '_journal_role'
     await control.execute(f'CREATE ROLE "{role}"')
     await control.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"')
-    await control.execute(f'GRANT SELECT,INSERT ON "{schema}".signal_log TO "{role}"')
+    await control.execute(f'GRANT ALL ON "{schema}".signal_log TO "{role}"')
     original_pool = c.backend._pool
     pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
     c.backend._pool = pool
@@ -136,6 +136,46 @@ async def test_original_journal_does_not_inherit_reused_session_principal(dispat
         c.backend._pool = original_pool
         async with asyncio.timeout(10):
             await pool.close()
+        await control.execute(f'DROP OWNED BY "{role}"')
+        await control.execute(f'DROP ROLE "{role}"')
+
+
+@pytest.mark.parametrize('setting', ['ROLE', 'SESSION AUTHORIZATION'])
+async def test_original_journal_checks_actual_checkout_principal(dispatcher_components, native_pg, monkeypatch, setting):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    role = schema + '_checkout_role'
+    await control.execute(f'CREATE ROLE "{role}"')
+    await control.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"')
+    await control.execute(f'GRANT ALL ON "{schema}".signal_log TO "{role}"')
+    original_checkout = c.backend._tracked_pool_checkout
+    changed = []
+    @asynccontextmanager
+    async def changed_checkout(*args, **kwargs):
+        async with original_checkout(*args, **kwargs) as acquired:
+            connection, _ = acquired
+            journal = c.dispatcher._original_outcome_writer.get()
+            if journal is not None and journal._phase == 'submitted':
+                await connection.execute(f'SET {setting} "{role}"')
+                changed.append(await connection.fetchval('SELECT CURRENT_USER'))
+            yield acquired
+    c.registry.register(_action_reg('native.changed.checkout.principal'))
+    monkeypatch.setattr(c.backend, '_tracked_pool_checkout', changed_checkout)
+    error = None
+    try:
+        try:
+            await c.dispatcher.dispatch_signal(_signal('native.changed.checkout.principal'))
+        except BaseException as caught:
+            error = caught
+        assert changed == [role]
+        assert is_execution_control_error(error), 'journal used a changed actual principal despite unchanged startup parameters'
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 0
+    finally:
+        monkeypatch.setattr(c.backend, '_tracked_pool_checkout', original_checkout)
+        await c.backend._pool.expire_connections()
         await control.execute(f'DROP OWNED BY "{role}"')
         await control.execute(f'DROP ROLE "{role}"')
 
