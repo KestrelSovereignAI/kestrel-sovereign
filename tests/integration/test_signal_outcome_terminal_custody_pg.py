@@ -40,9 +40,11 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
-@pytest.mark.parametrize('callback_kind', ['setup', 'reset'])
+@pytest.mark.parametrize('callback_kind', ['setup', 'reset', 'init', 'connect', 'adapter', 'connection_class', 'record_class'])
 async def test_postgres_journal_refuses_application_pool_programs(dispatcher_components, native_pg, callback_kind):
     import asyncpg
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
@@ -53,14 +55,31 @@ async def test_postgres_journal_refuses_application_pool_programs(dispatcher_com
     armed, effects = [], []
     async def program(connection):
         if armed:
-            if callback_kind == 'setup':
+            if callback_kind != 'reset':
                 await connection.execute(f'INSERT INTO "{schema}".forbidden_pool_effect VALUES($1)', signal.id)
             else:
                 await connection.execute(f'DELETE FROM "{schema}".signal_log WHERE id=$1', signal.id)
     original_pool = c.backend._pool
+    async def connect(*args, **kwargs):
+        connection = await asyncpg.connect(*args, **kwargs)
+        await program(connection)
+        return connection
+    class CustomConnection(asyncpg.Connection):
+        pass
+    class CustomRecord(asyncpg.Record):
+        pass
+    @asynccontextmanager
+    async def wrapper(checkout):
+        async with checkout as connection:
+            await program(connection)
+            yield connection
+    custom = ({callback_kind: program} if callback_kind in ('setup', 'reset', 'init') else
+              {'connect': connect} if callback_kind == 'connect' else
+              {'connection_class': CustomConnection} if callback_kind == 'connection_class' else
+              {'record_class': CustomRecord} if callback_kind == 'record_class' else {})
     pool = await asyncpg.create_pool(*original_pool._connect_args, **original_pool._connect_kwargs,
-        min_size=0, max_size=2, **{callback_kind: program})
-    c.backend._pool = pool
+        min_size=0, max_size=2, **custom)
+    c.backend._pool = PostgresPoolAdapter(pool, wrapper) if callback_kind == 'adapter' else pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     async def handler(payload):
         effects.append('genuine handler completion')
@@ -94,10 +113,10 @@ async def test_postgres_original_journal_proof_ignores_shadowed_equality(dispatc
     c = dispatcher_components
     _, control, schema = native_pg
     original_pool = c.backend._pool
-    async def setup(connection):
-        await connection.execute(f'SET search_path TO "{schema}", pg_catalog')
+    kwargs = dict(original_pool._connect_kwargs)
+    kwargs['server_settings'] = {**kwargs.get('server_settings', {}), 'search_path': f'"{schema}", pg_catalog'}
     pool = await asyncpg.create_pool(*original_pool._connect_args,
-        **original_pool._connect_kwargs, min_size=0, max_size=2, setup=setup)
+        **kwargs, min_size=0, max_size=2)
     c.backend._pool = pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     signal = _signal('operator.shadow.audit')
@@ -381,33 +400,15 @@ async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dis
     try:
         with bind_execution_runtime(owner):
             handle = await c.dispatcher.enqueue_signal(signal)
-            await asyncio.wait_for(entered.wait(), 2)
-            if boundary == 'namespace':
-                route[0] = alternate
-            elif boundary == 'relation':
-                await control.execute(f'CREATE TABLE "{schema}".replacement_signal_log (LIKE "{schema}".signal_log INCLUDING ALL)')
-                await control.execute(f'DROP TABLE "{schema}".signal_log')
-                await control.execute(f'ALTER TABLE "{schema}".replacement_signal_log RENAME TO signal_log')
-            scope.revoke('actual original work cutoff after setup routing change')
-            release.set()
             outcome = await await_owned_task(handle.task)
-        assert effects == ['genuine-effect']
+        # Application setup is now unsupported for a privileged journal. It
+        # must refuse BEFORE the handler, not merely inspect its later SQL.
+        assert effects == [] and not entered.is_set() and not attempted
         original_rows = await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log WHERE id=$1', signal.id)
         replacement_rows = await control.fetchval(f'SELECT COUNT(*) FROM "{alternate}".signal_log')
-        if boundary == 'namespace':
-            assert outcome.error is None
-            assert (original_rows, replacement_rows) == (1, 0), 'setup redirected the original fixed journal namespace'
-        elif boundary == 'fake_ack':
-            assert attempted == [True]
-            assert is_execution_control_error(outcome.error)
-            assert execution_commit_outcome(outcome.error) != 'committed', 'setup fabricated a COMMIT without native SQL'
-            assert (original_rows, replacement_rows) == (0, 0)
-            assert c.dispatcher._log_write_failures == 1, 'the actually absent audit was not counted'
-        else:
-            assert is_execution_control_error(outcome.error), 'replacement catalog relation acquired the original journal permission'
-            assert execution_commit_outcome(outcome.error) != 'committed'
-            assert (original_rows, replacement_rows) == (0, 0)
-            assert c.dispatcher._log_write_failures == 1
+        assert is_execution_control_error(outcome.error)
+        assert execution_commit_outcome(outcome.error) != 'committed'
+        assert (original_rows, replacement_rows) == (0, 0)
         assert not c.dispatcher._outcome_log_tasks
     finally:
         release.set()
@@ -419,11 +420,10 @@ async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dis
         await control.execute(f'DROP SCHEMA "{alternate}" CASCADE')
 
 
-@pytest.mark.parametrize('boundary', ['handler_generation', 'handler_configuration', 'checkout_both', 'adapter_checkout_both'])
+@pytest.mark.parametrize('boundary', ['handler_generation', 'handler_configuration', 'checkout_both'])
 async def test_original_journal_refuses_same_pool_reconfiguration(dispatcher_components, native_pg, monkeypatch, boundary):
     from contextlib import asynccontextmanager
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
-    from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
@@ -438,12 +438,6 @@ async def test_original_journal_refuses_same_pool_reconfiguration(dispatcher_com
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     owner = SimpleNamespace(_execution_custody=scope)
     original_backend_pool = c.backend._pool
-    if boundary.startswith('adapter_'):
-        @asynccontextmanager
-        async def same_checkout(checkout):
-            async with checkout as owned:
-                yield owned
-        c.backend._pool = PostgresPoolAdapter(native_pool, same_checkout)
     original_checkout = c.backend._tracked_pool_checkout
     @asynccontextmanager
     async def held_checkout(*args, **kwargs):

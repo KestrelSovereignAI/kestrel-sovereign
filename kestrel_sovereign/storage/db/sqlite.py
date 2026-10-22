@@ -7,6 +7,7 @@ Implementation of DatabaseBackend using aiosqlite.
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -2233,11 +2234,16 @@ class SQLiteBackend(DatabaseBackend):
             try:
                 if snapshot:
                     cursor.execute('SAVEPOINT kestrel_original_outcome_catalog')
+                if any((kind, sqlite3.PrepareProtocol) in sqlite3.adapters
+                       for kind in (type(None), bool, int, float, str, bytes)):
+                    return None
                 cursor.execute('PRAGMA main.schema_version')
                 version = cursor.fetchone()[0]
                 cursor.execute("SELECT rowid,rootpage,sql FROM main.sqlite_schema WHERE type='table' AND name='signal_log' COLLATE NOCASE")
                 row = cursor.fetchone()
                 if row is None or row[1] <= 0:
+                    return None
+                if re.search(r'\b(?:CHECK\s*\(|COLLATE\b)', row[2], re.IGNORECASE):
                     return None
                 cursor.execute("SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE LIMIT 1")
                 if cursor.fetchone() is not None:
@@ -2246,6 +2252,18 @@ class SQLiteBackend(DatabaseBackend):
                 columns = tuple(cursor.fetchall())
                 if {column[1] for column in columns} != set(_OUTCOME_COLUMNS) or any(column[6] for column in columns):
                     return None
+                cursor.execute("PRAGMA main.index_list('signal_log')")
+                indexes = cursor.fetchall()
+                for index in indexes:
+                    quoted = '"' + index[1].replace('"', '""') + '"'
+                    cursor.execute('PRAGMA main.index_xinfo(' + quoted + ')')
+                    if any(item[5] and (item[1] < 0 or item[4] != 'BINARY') for item in cursor.fetchall()):
+                        return None
+                    if index[4]:
+                        cursor.execute("SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?", (index[1],))
+                        sql = cursor.fetchone()[0]
+                        if not re.search(r'\bWHERE\s+\(?\s*constitution_hash\s+IS\s+NOT\s+NULL\s*\)?\s*$', sql, re.IGNORECASE):
+                            return None
                 return (version, *row, columns)
             finally:
                 try:

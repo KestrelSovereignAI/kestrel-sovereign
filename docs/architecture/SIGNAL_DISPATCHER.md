@@ -898,6 +898,25 @@ Privileged PostgreSQL catalog operators are schema-qualified; its standalone
 native transaction also pins search_path to pg_catalog for proof equality and
 restores the caller's setting on transaction exit. An application operator may
 not delete a row while claiming that its equality proof succeeded.
+Privileged PostgreSQL journals also require a plain native pool: application
+setup/init/connect/reset programs, custom connection/record classes and
+application checkout adapters are unsupported and refused before the handler.
+The same fence is rechecked through the writer lifetime. Pool callbacks may
+otherwise perform unrelated work during checkout or delete an already committed
+row during reset. Ordinary backend operations retain their separate adapter
+contract. Configure journal namespace through native `server_settings`, not a
+setup callback.
+
+SQLite's plain audit shape excludes CHECK programs, column collations,
+expression/custom-collation indexes and noncanonical partial predicates; the
+native constitution-hash non-null index remains supported. Registered adapters
+for native scalar types also retire the original journal. Prepared row values
+are exact native scalars (with the explicit PostgreSQL timestamp marker), never
+application `__conform__` objects. Projection string subclasses are normalized
+from their actual string storage before binding/truncation. Verification cannot
+repeat an application adaptation to certify a substituted value. Writer indexing,
+completion and draining use the captured scheduling identity, never a public
+Signal's ID after an emitter mutates it.
 
 At the real public/recovery return boundary, native journals detach terminal
 result data before invoking projections. A callback retaining the handler's

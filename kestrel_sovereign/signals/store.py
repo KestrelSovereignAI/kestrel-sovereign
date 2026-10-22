@@ -92,6 +92,7 @@ def _truncate_to_bytes(text: str, max_bytes: int) -> str:
     characters and the suffix was added on top, both of which let
     non-ASCII text exceed the documented byte cap.
     """
+    text = str.__str__(text)
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
@@ -124,6 +125,28 @@ class _PreparedSignalOutcome:
 
     values: tuple
     result_summary: Optional[str]
+
+    def __post_init__(self):
+        from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
+        # SQL parameters are native data, never application adaptation hooks.
+        # A str subclass's __conform__ must not substitute the same different
+        # value in both INSERT and the later exact-row verification.
+        def native(value):
+            if isinstance(value, str):
+                return str.__str__(value)
+            if isinstance(value, int):
+                return int.__int__(value)
+            if isinstance(value, float):
+                return float.__float__(value)
+            if isinstance(value, bytes):
+                return bytes.__bytes__(value)
+            if value is None or type(value) is datetime:
+                return value
+            if type(value) is TimestamptzParameter and type(value.value) is datetime:
+                return value
+            raise TypeError('Signal journal requires native scalar row data')
+        object.__setattr__(self, 'values', tuple(native(value) for value in self.values))
+        object.__setattr__(self, 'result_summary', native(self.result_summary))
 
 
 class SignalLogStore(UnifiedStoreBase):

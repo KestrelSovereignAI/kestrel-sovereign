@@ -132,13 +132,26 @@ class _OriginalPostgresJournalPool:
         from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
         adapted = isinstance(backing, PostgresPoolAdapter)
         native = backing.native_pool if adapted else backing
+        cls._require_native_programs(native, backing.wrap_checkout if adapted else None)
         return cls(native, native._generation, native._connect_args,
                    native._connect_kwargs, backing.wrap_checkout if adapted else None)
+
+    @staticmethod
+    def _require_native_programs(native, wrapper):
+        import asyncpg
+        if (wrapper is not None or native._setup is not None
+                or native._init is not None or native._reset is not None
+                or native._connect is not asyncpg.connection.connect
+                or native._connection_class is not asyncpg.Connection
+                or native._record_class is not asyncpg.Record
+                or any(holder._setup is not None for holder in native._holders)):
+            raise ExecutionAuthorityError('Original signal journal refuses application pool programs')
 
     def require_original(self, backing):
         from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
         adapted = isinstance(backing, PostgresPoolAdapter)
         native = backing.native_pool if adapted else backing
+        self._require_native_programs(native, backing.wrap_checkout if adapted else None)
         if (native is not self.pool
                 or (backing.wrap_checkout if adapted else None) is not self.wrapper
                 or native._generation != self.generation

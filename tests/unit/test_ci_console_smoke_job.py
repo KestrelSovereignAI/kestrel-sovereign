@@ -49,6 +49,13 @@ def test_is_bounded():
     assert int(smoke["timeout-minutes"]) <= 10
 
 
+def test_browser_dependency_install_has_a_bounded_network_budget():
+    # Two actual Ubuntu26.04 runs exhausted five minutes downloading the
+    # mandatory font/system packages before any application test could run.
+    assert int(_step("Install the Chromium browser")["timeout-minutes"]) == 10
+    assert int(_job()["timeout-minutes"]) <= 20
+
+
 def test_references_no_secret_and_reads_only():
     """No production key can reach the smoke: the job names no secret."""
     text = yaml.safe_dump(_job())

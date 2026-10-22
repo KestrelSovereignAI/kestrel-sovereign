@@ -1288,7 +1288,7 @@ class SignalDispatcher:
                 # outcome entry has reached a terminal write result.  The task
                 # remains separately admitted so a caller cancellation in
                 # this await cannot create a storage-close gap.
-                await self._drain_outcome_logs_for_signal(signal.id)
+                await self._drain_outcome_logs_for_signal(journal._identity[0] if journal is not None else result.signal_id)
                 if _durable_admission is not None and not _durable_admission.done():
                     _durable_admission.set_result(staged_admission.result())
                 return result
@@ -7658,6 +7658,7 @@ class SignalDispatcher:
             # Only actual pipeline-return boundaries seal _completed_result.
             # Reentrant/helper attempts cannot reserve/consume the real row.
             journal.require_preparation(result)
+        scheduling_id = journal._identity[0] if journal is not None else signal.id
         reservation = self._reserve_durable_admission()
         token = None
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
@@ -7713,18 +7714,18 @@ class SignalDispatcher:
                 self._original_outcome_writer.reset(token)
 
         self._outcome_log_tasks.add(task)
-        self._outcome_log_tasks_by_signal.setdefault(signal.id, set()).add(task)
+        self._outcome_log_tasks_by_signal.setdefault(scheduling_id, set()).add(task)
 
         def _complete(task: asyncio.Task, *, joined=False) -> None:
             if not task.done() or (publication_error is not None and not joined):
                 return
             self._outcome_log_reconciliations.pop(task, None)
             self._outcome_log_tasks.discard(task)
-            signal_tasks = self._outcome_log_tasks_by_signal.get(signal.id)
+            signal_tasks = self._outcome_log_tasks_by_signal.get(scheduling_id)
             if signal_tasks is not None:
                 signal_tasks.discard(task)
                 if not signal_tasks:
-                    self._outcome_log_tasks_by_signal.pop(signal.id, None)
+                    self._outcome_log_tasks_by_signal.pop(scheduling_id, None)
             self._release_durable_admission(reservation)
             from kestrel_sovereign._async_ownership import owned_task_error
             error = owned_task_error(task)

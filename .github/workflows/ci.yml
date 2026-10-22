@@ -1138,7 +1138,7 @@ jobs:
 
       - name: Install the Chromium browser
         run: npx playwright install --with-deps chromium
-        timeout-minutes: 5
+        timeout-minutes: 10
 
       - name: Verify offline native voice transport custody
         run: node --test tests/js/test_voice_native_custody.cjs tests/js/test_voice_startup_settlement.cjs

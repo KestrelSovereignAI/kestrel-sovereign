@@ -89,6 +89,41 @@ async def test_sqlite_journal_binds_exact_native_projection_text(dispatcher_comp
     assert not adapted
 
 
+async def test_sqlite_journal_refuses_registered_native_scalar_adapter(dispatcher_components):
+    import sqlite3
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    adapted = []
+    key = (str, sqlite3.PrepareProtocol)
+    missing = object()
+    before = sqlite3.adapters.get(key, missing)
+    def adapter(value):
+        adapted.append(True)
+        return 'substituted-global-adapter'
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        sqlite3.register_adapter(str, adapter)
+        scope.revoke('actual cutoff after application adapter registration')
+        return {'genuine': True}
+    c.registry.register(_action_reg('global.scalar.adapter', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('global.scalar.adapter'))
+            except BaseException as caught:
+                error = caught
+    finally:
+        if before is missing:
+            sqlite3.adapters.pop(key, None)
+        else:
+            sqlite3.adapters[key] = before
+    assert not adapted, 'privileged SQL invoked an application scalar adapter'
+    assert is_execution_control_error(error)
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+    assert c.dispatcher._log_write_failures == 1
+
+
 async def test_emitter_cannot_change_original_writer_tracking_identity(dispatcher_components, monkeypatch):
     from dataclasses import replace
     from kestrel_sdk.signals import Visibility
