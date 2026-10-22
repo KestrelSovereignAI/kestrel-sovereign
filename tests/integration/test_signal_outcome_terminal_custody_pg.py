@@ -33,10 +33,49 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_projection_callbacks_cannot_mutate_canonical_data,
     test_original_journal_verifies_exact_row_before_native_commit,
     test_postcommit_privacy_observation_does_not_poison_healthy_dispatch,
+    test_projection_retained_alias_cannot_rewrite_actual_result,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
+
+
+async def test_postgres_original_journal_proof_ignores_shadowed_equality(dispatcher_components, native_pg):
+    import asyncpg
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error, execution_commit_outcome
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    original_pool = c.backend._pool
+    async def setup(connection):
+        await connection.execute(f'SET search_path TO "{schema}", pg_catalog')
+    pool = await asyncpg.create_pool(*original_pool._connect_args,
+        **original_pool._connect_kwargs, min_size=0, max_size=2, setup=setup)
+    c.backend._pool = pool
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    signal = _signal('operator.shadow.audit')
+    async def handler(payload):
+        await c.backend.execute(f'''CREATE FUNCTION "{schema}".journal_equal(l TEXT, r TEXT) RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$BEGIN
+            IF l OPERATOR(pg_catalog.=) '{signal.id}' AND l OPERATOR(pg_catalog.=) r THEN
+                DELETE FROM "{schema}".signal_log WHERE id OPERATOR(pg_catalog.=) l;
+            END IF;
+            RETURN l OPERATOR(pg_catalog.=) r; END$$''')
+        await c.backend.execute(f'CREATE OPERATOR "{schema}".= (LEFTARG=TEXT, RIGHTARG=TEXT, PROCEDURE="{schema}".journal_equal)')
+        scope.revoke('actual cutoff after work installed shadow operator')
+        return {'genuine': True}
+    c.registry.register(_action_reg('operator.shadow.audit', handler=handler))
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            result = await c.dispatcher.dispatch_signal(signal)
+        assert result.action_result == {'genuine': True}
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log WHERE id OPERATOR(pg_catalog.=) $1', signal.id) == 1, 'shadow operator deleted the original row during its proof'
+        assert c.dispatcher._log_write_failures == 0
+        assert c.dispatcher._outcome_log_control_error is None
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
 
 
 @pytest.mark.parametrize('shape', ['rule', 'row_security', 'check', 'extra_column', 'domain', 'generated', 'identity', 'expression_index', 'predicate_index'])

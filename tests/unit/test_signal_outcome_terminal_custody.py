@@ -29,6 +29,80 @@ class _OriginalWork:
         self.require_work()
 
 
+@pytest.mark.parametrize('temporary', [False, True])
+async def test_sqlite_original_journal_never_executes_unrelated_trigger_effect(dispatcher_components, temporary):
+    from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome, execution_native_source_error
+    c = dispatcher_components
+    await c.backend.execute('CREATE TABLE journal_forbidden_effect(id TEXT PRIMARY KEY)')
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        await c.backend.execute('CREATE ' + ('TEMP ' if temporary else '') + 'TRIGGER journal_extra AFTER INSERT ON main.signal_log BEGIN INSERT INTO journal_forbidden_effect VALUES(NEW.id); END')
+        scope.revoke('actual cutoff before privileged audit trigger')
+        return {'genuine': True}
+    c.registry.register(_action_reg('extra.trigger.effect', handler=handler))
+    signal = _signal('extra.trigger.effect')
+    error = None
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        try:
+            await c.dispatcher.dispatch_signal(signal)
+        except BaseException as caught:
+            error = caught
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM journal_forbidden_effect') == 0, 'revoked work committed unrelated trigger SQL'
+    assert is_execution_control_error(error)
+    assert execution_commit_outcome(error) != 'committed'
+    assert c.dispatcher._log_write_failures == 1
+    assert execution_native_source_error(error) is None
+
+
+async def test_sqlite_original_journal_refuses_replaced_physical_destination(dispatcher_components):
+    from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+    c = dispatcher_components
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        await c.backend.execute('ALTER TABLE main.signal_log RENAME TO accepted_signal_log')
+        await c.backend.execute('CREATE TABLE main.signal_log AS SELECT * FROM main.accepted_signal_log WHERE 0')
+        scope.revoke('actual original table replaced')
+        return {'genuine': True}
+    c.registry.register(_action_reg('replacement.sqlite.audit', handler=handler))
+    signal = _signal('replacement.sqlite.audit')
+    error = None
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        try:
+            await c.dispatcher.dispatch_signal(signal)
+        except BaseException as caught:
+            error = caught
+    assert is_execution_control_error(error), 'replacement table inherited original audit permission'
+    assert execution_commit_outcome(error) != 'committed'
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM main.signal_log') == 0
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM main.accepted_signal_log') == 0
+    assert c.dispatcher._log_write_failures == 1
+
+
+@pytest.mark.parametrize('cutoff', [False, True])
+async def test_projection_retained_alias_cannot_rewrite_actual_result(dispatcher_components, cutoff):
+    from kestrel_sovereign.signals.store import _digest
+    c = dispatcher_components
+    body = {'nested': {'value': 'actual-return'}}
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    async def handler(payload):
+        if cutoff:
+            scope.revoke('actual cutoff before retained alias mutation')
+        return body
+    def summary(_copied_argument):
+        body['nested']['value'] = 'rewritten-through-retained-alias'
+        return '<projection>'
+    registration = _action_reg('retained.result.alias', handler=handler)
+    registration.result_summary = summary
+    c.registry.register(registration)
+    signal = _signal('retained.result.alias')
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        result = await c.dispatcher.dispatch_signal(signal)
+    assert body['nested']['value'] == 'rewritten-through-retained-alias', 'callback did not exercise its original retained alias'
+    assert result.action_result == {'nested': {'value': 'actual-return'}}
+    assert await c.backend.fetch_val('SELECT action_result_digest FROM signal_log WHERE id=?', (signal.id,)) == _digest({'nested': {'value': 'actual-return'}})
+    assert c.dispatcher._log_write_failures == 0
+
+
 async def test_original_journal_refuses_overridden_native_privacy_gate(dispatcher_components):
     from contextlib import asynccontextmanager
     from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error, _explicit_control_chain
