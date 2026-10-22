@@ -909,7 +909,11 @@ setup callback.
 
 SQLite's plain audit shape excludes CHECK programs, column collations,
 expression/custom-collation indexes and noncanonical partial predicates; the
-native constitution-hash non-null index remains supported. Registered adapters
+native constitution-hash non-null index remains supported. CHECK keywords are
+rejected even with intervening SQL comments; declared column affinities must
+match native audit types so coercion cannot fool SQL equality. Foreign-key,
+conflict-replacement and autoincrement programs are also outside this plain
+shape, as are application text factories. Registered adapters
 for native scalar types also retire the original journal. Prepared row values
 are exact native scalars (with the explicit PostgreSQL timestamp marker), never
 application `__conform__` objects. Projection string subclasses are normalized

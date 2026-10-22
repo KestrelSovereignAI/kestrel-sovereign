@@ -29,7 +29,7 @@ class _OriginalWork:
         self.require_work()
 
 
-@pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'check'])
+@pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'check', 'check_comment'])
 async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatcher_components, shape):
     from kestrel_sovereign.execution_custody import is_execution_control_error
     c = dispatcher_components
@@ -40,10 +40,11 @@ async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatche
             c.backend._connection._conn.execute('INSERT INTO forbidden_schema_effect VALUES(?)', (value,))
         return value
     await c.backend._connection.create_function('journal_program', 1, program, deterministic=True)
-    if shape == 'check':
+    if shape in ('check', 'check_comment'):
         sql = await c.backend.fetch_val("SELECT sql FROM sqlite_schema WHERE name='signal_log'")
         await c.backend.execute('ALTER TABLE signal_log RENAME TO original_audit')
-        await c.backend.execute(sql.rstrip()[:-1] + ', CHECK(journal_program(id)=id))')
+        gap = ' /* native SQL comment */ ' if shape == 'check_comment' else ''
+        await c.backend.execute(sql.rstrip()[:-1] + ', CHECK' + gap + '(journal_program(id)=id))')
     elif shape == 'expression_index':
         await c.backend.execute('CREATE INDEX journal_program_index ON signal_log(journal_program(id))')
     else:
@@ -63,6 +64,59 @@ async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatche
             error = caught
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM forbidden_schema_effect') == 0, 'privileged journal executed application schema SQL'
     assert not effects and is_execution_control_error(error)
+
+
+async def test_sqlite_journal_refuses_noncanonical_column_affinity(dispatcher_components):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    sql = await c.backend.fetch_val("SELECT sql FROM sqlite_schema WHERE name='signal_log'")
+    assert 'result_summary TEXT' in sql
+    await c.backend.execute('ALTER TABLE signal_log RENAME TO original_audit')
+    await c.backend.execute(sql.replace('result_summary TEXT', 'result_summary INTEGER'))
+    effects = []
+    async def handler(payload):
+        effects.append(True)
+        return {'genuine': True}
+    registration = _action_reg('noncanonical.affinity', handler=handler)
+    registration.result_summary = lambda value: '001'
+    c.registry.register(registration)
+    error = None
+    try:
+        await c.dispatcher.dispatch_signal(_signal('noncanonical.affinity'))
+    except BaseException as caught:
+        error = caught
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0, 'affinity coerced the prepared text while SQL equality still certified it'
+    assert not effects and is_execution_control_error(error)
+
+
+async def test_sqlite_journal_never_invokes_application_text_factory(dispatcher_components):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    calls = []
+    await c.backend.execute('CREATE TABLE forbidden_text_factory_effect(id TEXT)')
+    def factory(raw):
+        calls.append(True)
+        c.backend._connection._conn.execute("INSERT INTO forbidden_text_factory_effect VALUES('forbidden')")
+        return raw.decode()
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        c.backend._connection.text_factory = factory
+        scope.revoke('actual cutoff before metadata text conversion')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.text.factory', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.text.factory'))
+            except BaseException as caught:
+                error = caught
+    finally:
+        c.backend._connection.text_factory = str
+    assert not calls, 'privileged journal metadata executed an application text factory'
+    assert is_execution_control_error(error)
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM forbidden_text_factory_effect') == 0
+    assert c.dispatcher._log_write_failures == 1
 
 
 @pytest.mark.parametrize('projection', ['summary', 'redaction'])

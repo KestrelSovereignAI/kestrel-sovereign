@@ -2228,6 +2228,8 @@ class SQLiteBackend(DatabaseBackend):
         conn = journal._backing
         def native_relation():
             native = conn._conn
+            if native.text_factory is not str:
+                return None
             cursor = native.cursor()
             cursor.row_factory = None
             snapshot = not native.in_transaction
@@ -2243,7 +2245,7 @@ class SQLiteBackend(DatabaseBackend):
                 row = cursor.fetchone()
                 if row is None or row[1] <= 0:
                     return None
-                if re.search(r'\b(?:CHECK\s*\(|COLLATE\b)', row[2], re.IGNORECASE):
+                if re.search(r'\b(?:CHECK|COLLATE|REFERENCES|FOREIGN|CONFLICT|AUTOINCREMENT)\b', row[2], re.IGNORECASE):
                     return None
                 cursor.execute("SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE LIMIT 1")
                 if cursor.fetchone() is not None:
@@ -2251,6 +2253,8 @@ class SQLiteBackend(DatabaseBackend):
                 cursor.execute("PRAGMA main.table_xinfo('signal_log')")
                 columns = tuple(cursor.fetchall())
                 if {column[1] for column in columns} != set(_OUTCOME_COLUMNS) or any(column[6] for column in columns):
+                    return None
+                if any(column[2].upper() != ('INTEGER' if column[1] == 'duration_ms' else 'TEXT') for column in columns):
                     return None
                 cursor.execute("PRAGMA main.index_list('signal_log')")
                 indexes = cursor.fetchall()
