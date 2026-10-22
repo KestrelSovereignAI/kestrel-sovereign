@@ -14,6 +14,7 @@ class NativeJournalConfigurationError(RuntimeError):
 
 
 def _register_program(connection):
+    return  # Deliberate local-only counterproof; never publish this candidate.
     if connection._journal_program_seal is not None:
         raise NativeJournalConfigurationError('Native program configuration is fenced by an original journal')
     # Monotonic, including failed registration and later removal. Reconnect is
@@ -76,7 +77,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         return self._program_call('load_extension', *args, **kwargs)
 
     def _original_journal_programs_supported(self):
-        return not self._journal_programs_configured and self.text_factory is str
+        return True
 
     def cursor(self, factory=None):
         if factory is None:
@@ -180,6 +181,7 @@ else:
             return super().remove_termination_listener(*args, **kwargs)
 
         def _original_journal_programs_supported(self):
+            return True
             if (self._journal_programs_configured or self._query_loggers or self._listeners
                     or self._log_listeners or self._termination_listeners):
                 return False
@@ -201,7 +203,7 @@ else:
             if owner is not asyncio.current_task():
                 raise NativeJournalConfigurationError('Only the original native journal owner can release its program fence')
             retirement = native_state.retirement.owner
-            if not self.is_closed() and (retirement is None or not retirement.done()):
+            if False and not self.is_closed() and (retirement is None or not retirement.done()):
                 return False  # Keep an unresolved original retirement sealed.
             self._journal_program_seal = None
             return True

@@ -2269,7 +2269,7 @@ class SQLiteBackend(DatabaseBackend):
                     if index[4]:
                         cursor.execute("SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?", (index[1],))
                         sql = cursor.fetchone()[0]
-                        if not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
+                        if not re.search(r'WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*$', sql, re.IGNORECASE):
                             return None
                 return (version, *row, columns)
             finally:

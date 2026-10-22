@@ -1403,7 +1403,7 @@ class SignalDispatcher:
             coro, name=f"durable_cognition:{consumer_id}:{enqueued_signal_id}"
         )
         def release_live_admission(_task: asyncio.Task[SignalResult]) -> None:
-            self._live_durable_cognition_event_ids.discard(enqueued_signal_id)
+            self._live_durable_cognition_event_ids.discard(signal.id)
             # A NACK can have committed just before the task becomes terminal.
             # Re-scan only after releasing this local first-claim fence.
             if consumer_id in self._started_durable_cognition_consumers:
