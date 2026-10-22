@@ -87,7 +87,6 @@ class _OriginalSignalOutcome:
         self._completed_result = None
         self._acknowledgments = ()
         self._sqlite_committed_connection = None
-        self._sqlite_retirement = None
         self._audit_loss_recorded = False
         self._outer_admission = self._writer_admission = None
         self._phase = 'accepted'
@@ -199,14 +198,18 @@ class _OriginalSignalOutcome:
         This is evidence about the original connection, not renewed admission
         of a changed agent/runtime. SQLite does not invent a PG reset receipt.
         """
+        self.require_sqlite_cleanup(backend, connection)
+        self._sqlite_committed_connection = connection
+
+    def require_sqlite_cleanup(self, backend, connection):
+        """Only this submitted writer's fixed connection; no fresh work grant."""
         from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
         if (type(backend) is not SQLiteBackend
                 or backend is not self._backend or connection is not self._backing
                 or self._phase != 'submitted'
                 or self._writer_admission is None
                 or asyncio.current_task() is not self._writer_admission.task):
-            raise ExecutionAuthorityError('Original SQLite journal COMMIT owner differs')
-        self._sqlite_committed_connection = connection
+            raise ExecutionAuthorityError('Original SQLite journal native owner differs')
 
     def retain_committed(self, error):
         """Retain the actual terminal INSERT fact, never new work authority."""

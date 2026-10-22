@@ -28,6 +28,7 @@ from typing import (
 import aiosqlite
 
 from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
     _capture_host_identity_anchor_access,
     current_execution_custody,
@@ -1779,7 +1780,6 @@ class SQLiteBackend(DatabaseBackend):
 
     def _handoff_cancelled_write(
         self, conn: aiosqlite.Connection, *, error: BaseException | None = None,
-        original_outcome=None,
     ) -> None:
         """Transfer rollback to the backend and return without awaiting it.
 
@@ -1825,8 +1825,6 @@ class SQLiteBackend(DatabaseBackend):
             )
         except BaseException as admission_error:
             self._cancelled_write_drain = admission.task
-            if original_outcome is not None:
-                original_outcome._sqlite_retirement = admission.task
             terminal = execution_terminal_error(
                 error, owned_task_admission_error(conn, admission, admission_error), retain_originals=True,
                 isolate_control_originals=True,
@@ -1835,8 +1833,6 @@ class SQLiteBackend(DatabaseBackend):
             # and cleanup observers join the SAME stored drain if accepted.
             self._cancelled_write_drain_error = terminal
             raise terminal
-        if original_outcome is not None:
-            original_outcome._sqlite_retirement = admission.task
 
     async def _drain_cancelled_write(
         self, conn: aiosqlite.Connection, *, started_at: float
@@ -2069,13 +2065,16 @@ class SQLiteBackend(DatabaseBackend):
         original_outcome=None,
     ) -> None:
         """Rollback inline, handing off if cancellation reaches cleanup."""
+        if original_outcome is not None:
+            await self._rollback_original_signal_outcome(conn, original_outcome, error)
+            return
         if (error is not None and execution_commit_outcome(error) is not None
                 and isinstance(error.__cause__, asyncio.CancelledError)):
             # COMMIT uncertainty now has an explicit receipt instead of a raw
             # cancellation. Its native queue may still be blocked. Preserve
             # the existing deadline-safe rollback owner rather than awaiting
             # another operation behind COMMIT before returning that receipt.
-            self._handoff_cancelled_write(conn, error=error, original_outcome=original_outcome)
+            self._handoff_cancelled_write(conn, error=error)
             return
         try:
             await conn.rollback()
@@ -2084,7 +2083,7 @@ class SQLiteBackend(DatabaseBackend):
                 error, cleanup_error,
                 retain_originals=True, isolate_control_originals=True,
             )
-            self._handoff_cancelled_write(conn, error=terminal, original_outcome=original_outcome)
+            self._handoff_cancelled_write(conn, error=terminal)
             if terminal is not cleanup_error:
                 # The selected error can itself be a legacy QueryError whose
                 # explicit cause carries authority/COMMIT evidence. Keep that
@@ -2099,6 +2098,49 @@ class SQLiteBackend(DatabaseBackend):
             if terminal is not cleanup_error:
                 raise terminal
             raise
+
+    async def _rollback_original_signal_outcome(self, conn, journal, original_error):
+        """Retire this fixed unit on its original writer, under BOTH held gates.
+
+        A Task acceptance/failed wrapper cannot prove the SQLite worker crossed
+        COMMIT. This path never detaches cleanup or needs another Task to start.
+        The existing native rollback/cursor fence establishes queue completion.
+        Repeated direct cancellation is retained and cannot release the original
+        write lock/privacy hold ahead of that physical fence.
+        """
+        from kestrel_sovereign.execution_custody import (
+            execution_finite_error, execution_error_with_cause,
+        )
+        journal.require_sqlite_cleanup(self, conn)
+        started_at = time.monotonic()
+        withdrawal = interrupt_error = None
+        while True:
+            try:
+                try:
+                    await conn.interrupt()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:
+                    interrupt_error = execution_finite_error(interrupt_error, error,
+                        retain_originals=True, isolate_control_originals=True)
+                await self._rollback_cancelled_write(conn, started_at=started_at)
+            except asyncio.CancelledError as error:
+                withdrawal = execution_finite_error(withdrawal, error,
+                    retain_originals=True, isolate_control_originals=True)
+                continue
+            except BaseException as error:
+                cleanup_error = execution_error_with_cause(
+                    ExecutionAuthorityError('Original signal journal native cleanup failed'), error)
+                terminal = execution_finite_error(original_error, interrupt_error, cleanup_error, withdrawal,
+                    retain_originals=True, isolate_control_originals=True)
+                self._cancelled_write_drain_error = execution_finite_error(
+                    self._cancelled_write_drain_error, terminal,
+                    retain_originals=True, isolate_control_originals=True)
+                raise terminal
+            if interrupt_error is not None or withdrawal is not None:
+                raise execution_finite_error(original_error, interrupt_error, withdrawal,
+                    retain_originals=True, isolate_control_originals=True)
+            return
 
     def _execution_commit_scopes(self):
         """Every original admission whose native file write this owner holds."""
@@ -2172,7 +2214,10 @@ class SQLiteBackend(DatabaseBackend):
                     return cursor.rowcount
                 except asyncio.CancelledError as error:
                     if not self._in_transaction:
-                        self._handoff_cancelled_write(conn, error=error, original_outcome=original_outcome)
+                        if original_outcome is None:
+                            self._handoff_cancelled_write(conn, error=error)
+                        else:
+                            await self._rollback_original_signal_outcome(conn, original_outcome, error)
                     raise
 
                 except Exception as e:
@@ -2192,20 +2237,8 @@ class SQLiteBackend(DatabaseBackend):
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
         entry = journal.begin(self)
-        try:
-            await self._execute_write_operation(self._connection,
-                journal._query, entry.values, original_outcome=journal)
-        except BaseException as error:
-            # This exact journal's transfer, not whichever drain happens to
-            # occupy the backend later. Store still owns its original privacy
-            # protection until the native COMMIT/rollback queue physically joins.
-            if journal._sqlite_retirement is not None:
-                from kestrel_sovereign._async_ownership import await_owned_task
-                from kestrel_sovereign.execution_custody import execution_finite_error
-                outcome = await await_owned_task(journal._sqlite_retirement)
-                raise execution_finite_error(error, outcome.error, outcome.cancellation,
-                    retain_originals=True, isolate_control_originals=True)
-            raise
+        await self._execute_write_operation(self._connection,
+            journal._query, entry.values, original_outcome=journal)
         journal.acknowledged(self)
         return entry.result_summary
 

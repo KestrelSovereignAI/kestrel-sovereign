@@ -7752,7 +7752,7 @@ class SignalDispatcher:
             raise withdrawal
 
     def _record_original_outcome_loss(self, journal, signal_id, error):
-        """Exactly one absent original row, even when its Task never starts."""
+        """Exactly one unacknowledged original row, even if its Task never starts."""
         if journal is not None:
             if journal.has_acknowledged_commit() or journal._audit_loss_recorded:
                 return
