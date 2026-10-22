@@ -39,6 +39,81 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
+async def test_postgres_original_journal_rejects_unlogged_partition_leaf(dispatcher_components, native_pg):
+    from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    effects = []
+    table = f'"{schema}".signal_log'
+    await c.backend.execute(f'ALTER TABLE {table} RENAME TO original_signal_log')
+    await c.backend.execute(f'CREATE TABLE {table} (LIKE "{schema}".original_signal_log INCLUDING ALL) PARTITION BY HASH(id)')
+    await c.backend.execute(f'CREATE UNLOGGED TABLE "{schema}".signal_log_leaf PARTITION OF {table} FOR VALUES WITH (MODULUS 1, REMAINDER 0)')
+    assert await control.fetchval("SELECT relpersistence FROM pg_class WHERE oid=$1::regclass", table) == b'p'
+    assert await control.fetchval("SELECT relpersistence FROM pg_class WHERE oid=$1::regclass", f'"{schema}".signal_log_leaf') == b'u'
+    async def handler(payload):
+        effects.append('must not execute against routed nondurable journal')
+        return {'genuine': True}
+    c.registry.register(_action_reg('partitioned.audit', handler=handler))
+    error = None
+    try:
+        await c.dispatcher.dispatch_signal(_signal('partitioned.audit'))
+    except BaseException as caught:
+        error = caught
+    assert is_execution_control_error(error), 'unlogged physical destination was admitted through its logged parent'
+    assert execution_commit_outcome(error) != 'committed'
+    assert not effects
+    assert await control.fetchval(f'SELECT COUNT(*) FROM {table}') == 0
+    assert not c.dispatcher._outcome_log_tasks
+
+
+async def test_postgres_original_journal_refuses_redeferred_trigger_mutation(dispatcher_components, native_pg):
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error, execution_commit_outcome, execution_native_source_error, _explicit_control_chain
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    table = f'"{schema}".signal_log'
+    queue = f'"{schema}".journal_delete_queue'
+    effect = f'"{schema}".journal_handler_effect'
+    await c.backend.execute(f'CREATE TABLE {effect}(id INTEGER PRIMARY KEY)')
+    effects = []
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    async def handler(payload):
+        effects.append(True)
+        await c.backend.execute(f'INSERT INTO {effect} VALUES(?)', (len(effects),))
+        if len(effects) == 1:
+            await c.backend.execute(f'CREATE TABLE {queue}(id TEXT PRIMARY KEY)')
+            await c.backend.execute(f'''CREATE FUNCTION "{schema}".journal_delete() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+                DELETE FROM {table} WHERE id=NEW.id; RETURN NULL; END$$''')
+            await c.backend.execute(f'''CREATE CONSTRAINT TRIGGER queued_delete AFTER INSERT ON {queue}
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "{schema}".journal_delete()''')
+            await c.backend.execute(f'''CREATE FUNCTION "{schema}".journal_queue_delete() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+                SET CONSTRAINTS "{schema}".queued_delete DEFERRED;
+                INSERT INTO {queue}(id) VALUES(NEW.id); RETURN NULL; END$$''')
+            await c.backend.execute(f'''CREATE CONSTRAINT TRIGGER journal_queue AFTER INSERT ON {table}
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "{schema}".journal_queue_delete()''')
+            scope.revoke('actual work cutoff after committed handler effect and trigger configuration')
+        return {'genuine': True}
+    c.registry.register(_action_reg('redeferred.audit', handler=handler))
+    signal = _signal('redeferred.audit')
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(signal)
+    assert is_execution_control_error(caught.value)
+    assert execution_commit_outcome(caught.value) != 'committed', 're-deferred deletion escaped row proof and was acknowledged'
+    assert any(getattr(item, 'signal_result', None) is not None for item in _explicit_control_chain(caught.value))
+    assert await control.fetchval(f'SELECT COUNT(*) FROM {table} WHERE id=$1', signal.id) == 0
+    assert await control.fetchval(f'SELECT COUNT(*) FROM {effect}') == 1
+    assert c.dispatcher._log_write_failures == 1
+    assert execution_native_source_error(caught.value) is None
+    assert c.dispatcher._outcome_log_control_error is None
+    await c.backend.execute(f'DROP TRIGGER journal_queue ON {table}')
+    fresh = await c.dispatcher.dispatch_signal(_signal('redeferred.audit'))
+    assert fresh.action_result == {'genuine': True}
+    assert await control.fetchval(f'SELECT COUNT(*) FROM {effect}') == 2
+
+
 @pytest.mark.parametrize('persistence', ['temporary', 'unlogged'])
 async def test_postgres_original_journal_rejects_temporary_relation_at_admission(dispatcher_components, native_pg, persistence):
     import asyncpg
