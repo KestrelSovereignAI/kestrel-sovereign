@@ -174,10 +174,9 @@ def _restore_native_connect_configuration(value):
 
 def _native_effective_connect_configuration(connection):
     """Observe actual admitted native endpoint/defaults, never a later env."""
-    address = connection._transport.get_extra_info('peername')
+    address = connection._addr
     if type(address) is tuple and len(address) in (2, 4):
-        from kestrel_sovereign.storage.db.native_journal_programs import _native_tcp_endpoint
-        host, port = _native_tcp_endpoint(address)
+        host, port = address[:2]
     elif type(address) is str:
         filename = os.path.basename(address)
         prefix = '.s.PGSQL.'
