@@ -1442,7 +1442,7 @@ class SignalDispatcher:
                     resident_context.run(release_live_admission, owner)
             except BaseException as cleanup:
                 errors.append(cleanup)
-            raise execution_finite_error(*errors, retain_originals=True)
+            raise execution_observation_error(*errors, message='Original durable enqueue publication and physical join')
         return SignalDispatchHandle(
             signal_id=enqueued_signal_id,
             task=task,

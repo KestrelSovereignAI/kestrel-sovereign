@@ -52,8 +52,6 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
             self._journal_autocommit_legacy = self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL
 
     def _program_call(self, method_name, /, *args, **kwargs):
-        if method_name in ('deserialize', 'setlimit', 'setconfig'):
-            return getattr(super(), method_name)(*args, **kwargs)
         _register_program(self)
         return getattr(super(), method_name)(*args, **kwargs)
 
