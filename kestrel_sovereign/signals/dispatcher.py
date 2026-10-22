@@ -7699,7 +7699,7 @@ class SignalDispatcher:
         outcome = await await_owned_task(writer)
         from kestrel_sovereign.execution_custody import execution_observation_error
         exc = execution_observation_error(opening, outcome.error)
-        committed = journal is not None and journal._phase == 'acknowledged'
+        committed = journal is not None and journal.has_acknowledged_commit()
         if committed:
             exc = journal.retain_committed(exc)
         withdrawal = (journal.retain_committed(outcome.cancellation)
