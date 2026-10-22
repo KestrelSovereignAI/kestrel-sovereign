@@ -10,7 +10,11 @@ import httpx
 import pytest
 from fastapi import FastAPI, Request
 
-from kestrel_sovereign.phoenix_supervisor import PhoenixSupervisor, proxy_to_phoenix
+from kestrel_sovereign.phoenix_supervisor import (
+    PhoenixSupervisor,
+    phoenix_available,
+    proxy_to_phoenix,
+)
 
 
 class _Scripts(HTMLParser):
@@ -35,7 +39,8 @@ def _ports():
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
 async def test_live_phoenix_assets_survive_the_same_origin_proxy(tmp_path, monkeypatch):
-    pytest.importorskip("phoenix")
+    if not phoenix_available():
+        pytest.skip("Phoenix optional dependency is not installed")
     # Only this isolated test process and its child receive these settings.
     for key in list(os.environ):
         if key.startswith(("PHOENIX_", "OTEL_")):

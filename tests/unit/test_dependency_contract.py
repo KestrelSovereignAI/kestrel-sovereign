@@ -265,9 +265,9 @@ def _sdk_contract_requirement(
 def test_sdk_native_release_cascade_contract_is_declared():
     """Core owns the transport floor; observability adds metrics to that floor.
 
-    This deliberately does not inspect sibling worktrees: their compatible
-    Frinz/observability releases are an external release prerequisite, while
-    this repository can reliably guard only its own published constraints.
+    This deliberately does not inspect sibling worktrees. Installed host
+    feature acceptance remains a separate release prerequisite; this
+    repository guards its own published constraints.
     """
 
     pyproject = _pyproject()
