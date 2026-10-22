@@ -161,7 +161,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         try:
             values = []
             for name in ('journal_mode', 'synchronous', 'fullfsync',
-                         'checkpoint_fullfsync', 'wal_autocheckpoint', 'data_version'):
+                         'checkpoint_fullfsync', 'wal_autocheckpoint'):
                 cursor.execute('PRAGMA main.' + name)
                 row = cursor.fetchone()
                 if row is None or len(row) != 1 or not _has_exact_native_type(row[0], str, int):

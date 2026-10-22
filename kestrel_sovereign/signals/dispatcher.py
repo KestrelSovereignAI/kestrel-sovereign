@@ -7879,7 +7879,7 @@ class SignalDispatcher:
     def _record_original_outcome_loss(self, journal, signal_id, error):
         """Exactly one unacknowledged original row, even if its Task never starts."""
         if journal is not None:
-            if (isinstance(error, Exception) and not is_execution_control_error(error)
+            if (False and isinstance(error, Exception) and not is_execution_control_error(error)
                     and execution_commit_outcome(error) is None
                     and not journal.has_acknowledged_commit()):
                 # Best-effort loss is suppressed only for a healthy observer.
