@@ -6,6 +6,7 @@ in the ambient context and native commit/cleanup evidence retains them.
 """
 
 import asyncio
+from dataclasses import dataclass
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, current_execution_custody, require_execution_work,
@@ -14,8 +15,16 @@ from kestrel_sovereign.execution_custody import (
 _JOURNAL_ADMISSION = object()
 
 
+@dataclass(frozen=True, eq=False)
+class _AcceptedSignalOutcome:
+    """Original dispatcher-issued envelope, not a causation-context proxy."""
+    owner: asyncio.Task
+    identity: tuple
+    registration: object
+
+
 class _OriginalSignalOutcome:
-    def __init__(self, dispatcher, signal, registration):
+    def __init__(self, dispatcher, signal, registration, *, acceptance=None):
         from kestrel_sovereign.signals.store import SignalLogStore
         from kestrel_sovereign.storage.db.postgres import PostgresBackend
         from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
@@ -24,6 +33,13 @@ class _OriginalSignalOutcome:
         if (admission is None or admission[0] is not asyncio.current_task()
                 or asyncio.current_task() not in dispatcher._durable_admission_owners):
             raise ExecutionAuthorityError('Original accepted dispatch required for terminal journal')
+        if (type(acceptance) is not _AcceptedSignalOutcome
+                or acceptance not in dispatcher._accepted_signal_outcomes
+                or dispatcher._accepted_signal_outcomes[acceptance] is not None
+                or acceptance.owner is not asyncio.current_task()
+                or acceptance.identity != self._signal_identity(signal)
+                or acceptance.registration is not registration):
+            raise ExecutionAuthorityError('Original accepted dispatch record required, issued once')
         if type(dispatcher._store) is not SignalLogStore:
             raise ExecutionAuthorityError('Original native signal store required')
         backend = dispatcher._store._backend
@@ -36,15 +52,17 @@ class _OriginalSignalOutcome:
         self._agent = dispatcher._agent
         self._agent_id = dispatcher._agent.did
         self._registration = registration
+        self._acceptance = acceptance
         self._identity = self._signal_identity(signal)
         self._backend_scope = getattr(backend, '_execution_custody', None)
         self._backing = backend._connection if type(backend) is SQLiteBackend else backend._pool
         self._generation = backend.connection_generation if type(backend) is SQLiteBackend else None
         self._entry = None
-        self._outer = self._writer = None
+        self._outer_admission = self._writer_admission = None
         self._phase = 'accepted'
         self._require_backing()
         self._admission_key = _JOURNAL_ADMISSION
+        dispatcher._accepted_signal_outcomes[acceptance] = self
 
     @staticmethod
     def _signal_identity(signal):
@@ -73,7 +91,8 @@ class _OriginalSignalOutcome:
     def bind(self, signal, registration, result, prepared):
         from kestrel_sovereign.signals.store import _PreparedSignalOutcome
         self._require_backing()
-        if (self._phase != 'accepted' or not self.matches(signal, registration)
+        if (asyncio.current_task() is not self._acceptance.owner
+                or self._phase != 'accepted' or not self.matches(signal, registration)
                 or result.signal_id != self._identity[0]
                 or type(prepared) is not _PreparedSignalOutcome
                 or type(prepared.values) is not tuple or len(prepared.values) != 30
@@ -85,22 +104,17 @@ class _OriginalSignalOutcome:
         self._entry = prepared
         self._phase = 'bound'
 
-    def attach_outer(self, task):
-        if self._outer is not None or not isinstance(task, asyncio.Task):
-            raise ExecutionAuthorityError('Original native signal journal owner differs')
-        self._outer = task
-
-    def attach_writer(self, task):
-        if (asyncio.current_task() is not self._outer or self._writer is not None
-                or not isinstance(task, asyncio.Task)):
-            raise ExecutionAuthorityError('Original native signal journal writer differs')
-        self._writer = task
-
     def require_original(self, backend):
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         if (type(self) is not _OriginalSignalOutcome
                 or getattr(self, '_admission_key', None) is not _JOURNAL_ADMISSION
                 or backend is not self._backend
-                or asyncio.current_task() is not self._writer
+                or type(self._outer_admission) is not OwnedTaskAdmission
+                or type(self._writer_admission) is not OwnedTaskAdmission
+                or self._outer_admission.task is self._acceptance.owner
+                or self._writer_admission.task is self._outer_admission.task
+                or self._writer_admission.task is self._acceptance.owner
+                or asyncio.current_task() is not self._writer_admission.task
                 or self._phase not in ('bound', 'submitted')):
             raise ExecutionAuthorityError('Original native terminal journal permission required')
         self._require_backing()
@@ -125,7 +139,7 @@ def _require_original_signal_outcome(journal, backend):
     journal.require_original(backend)
 
 
-def _capture_original_outcome(dispatcher, signal, registration):
+def _capture_original_outcome(dispatcher, signal, registration, *, acceptance):
     """Only a live original public dispatch can create this terminal unit."""
     from kestrel_sovereign.signals.store import SignalLogStore
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
@@ -140,4 +154,4 @@ def _capture_original_outcome(dispatcher, signal, registration):
         if current_execution_custody(dispatcher._agent):
             raise ExecutionAuthorityError('Hosted terminal journal requires a supported native backend')
         return None  # legacy unscoped embeddings retain ordinary append only
-    return _OriginalSignalOutcome(dispatcher, signal, registration)
+    return _OriginalSignalOutcome(dispatcher, signal, registration, acceptance=acceptance)

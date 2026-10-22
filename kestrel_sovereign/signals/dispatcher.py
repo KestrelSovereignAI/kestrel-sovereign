@@ -870,6 +870,8 @@ class SignalDispatcher:
             f"original_outcome_admission:{id(self)}", default=None)
         self._original_outcome_writer = contextvars.ContextVar(
             f"original_outcome_writer:{id(self)}", default=None)
+        self._accepted_signal_outcomes = {}
+        self._outcome_log_reconciliations = {}
         # A durable retry is the same persisted delivery, not a competing
         # source event. The child route task inherits this narrow context flag
         # so legacy test/subclass seams retain their three-argument signature.
@@ -1185,6 +1187,7 @@ class SignalDispatcher:
 
         ctx_token = set_current_signal(signal)
         admission_error = None
+        original_acceptance = None
         staged_admission = (
             asyncio.get_running_loop().create_future()
             if _durable_admission is not None else None
@@ -1205,6 +1208,16 @@ class SignalDispatcher:
             staged_admission.add_done_callback(publish_resident_admission)
         try:
             async with self._admit_durable_operation():
+                registration = self._registry.get(signal.source)
+                if registration is not None:
+                    from kestrel_sovereign.signals.outcome_custody import (
+                        _AcceptedSignalOutcome, _OriginalSignalOutcome, _capture_original_outcome,
+                    )
+                    original_acceptance = _AcceptedSignalOutcome(
+                        asyncio.current_task(), _OriginalSignalOutcome._signal_identity(signal), registration)
+                    self._accepted_signal_outcomes[original_acceptance] = None
+                    self._original_outcome_admission.set(_capture_original_outcome(
+                        self, signal, registration, acceptance=original_acceptance))
                 result = await self._run(
                     signal,
                     start,
@@ -1292,6 +1305,8 @@ class SignalDispatcher:
             reset_current_signal(ctx_token)
             self._deferred_outcome_logs.reset(deferred_token)
             self._original_outcome_admission.reset(journal_token)
+            if original_acceptance is not None:
+                self._accepted_signal_outcomes.pop(original_acceptance, None)
             self._durable_cognition_route.reset(durable_route_token)
 
     async def enqueue_signal(
@@ -2946,6 +2961,11 @@ class SignalDispatcher:
         for task in tasks:
             outcome = await await_owned_task(task)
             originals.extend((outcome.error, outcome.cancellation))
+            reconciliation = self._outcome_log_reconciliations.get(task)
+            if task.done() and reconciliation is not None:
+                complete, publication_error = reconciliation
+                originals.append(publication_error)
+                complete(task, joined=True)
         if finite_errors is not None:
             # This local writer batch can be ordinary while a later repair
             # supplies native control to the SAME shutdown boundary.
@@ -4107,11 +4127,6 @@ class SignalDispatcher:
                 error=f"Unknown source: '{signal.source}'",
             )
 
-        admission = self._durable_admission.get()
-        if admission is not None and admission[0] is asyncio.current_task():
-            from kestrel_sovereign.signals.outcome_custody import _capture_original_outcome
-            self._original_outcome_admission.set(_capture_original_outcome(self, signal, registration))
-
         if signal.mode not in registration.allowed_modes:
             return self._fail(
                 signal,
@@ -4984,6 +4999,39 @@ class SignalDispatcher:
         self, signal, registration, start, *, delivery, consumer_id,
         use_live_signal, retry_delay, durable_admission, persisted_event_id,
     ):
+        """Own recovered claim admission and its original journal through join."""
+        async with self._admit_durable_operation():
+            token = self._original_outcome_admission.set(None)
+            result = None
+            original = cleanup = None
+            try:
+                try:
+                    result = await self._execute_original_claimed_durable_cognition(
+                        signal, registration, start, delivery=delivery, consumer_id=consumer_id,
+                        use_live_signal=use_live_signal, retry_delay=retry_delay,
+                        durable_admission=durable_admission, persisted_event_id=persisted_event_id)
+                except BaseException as error:
+                    original = error
+                journal = self._original_outcome_admission.get()
+                try:
+                    await self._drain_outcome_logs_for_signal(
+                        journal._identity[0] if journal is not None else signal.id)
+                except BaseException as error:
+                    cleanup = error
+                terminal = execution_finite_error(original, cleanup, retain_originals=True)
+                if terminal is not None:
+                    raise terminal
+                return result
+            finally:
+                journal = self._original_outcome_admission.get()
+                if journal is not None:
+                    self._accepted_signal_outcomes.pop(journal._acceptance, None)
+                self._original_outcome_admission.reset(token)
+
+    async def _execute_original_claimed_durable_cognition(
+        self, signal, registration, start, *, delivery, consumer_id,
+        use_live_signal, retry_delay, durable_admission, persisted_event_id,
+    ):
         """Execute the already claimed lease under its existing runtime owner."""
 
         # A retried persistence-allowed event must execute the canonical
@@ -5032,6 +5080,27 @@ class SignalDispatcher:
                 error="Durable cognition caller recovery failed",
                 registration=registration,
             )
+
+        # Recovery has its own native claim, not a copied public dispatch's
+        # permission. Capture the canonical retained envelope before callbacks.
+        if (delivery.agent_id != self._agent.did or delivery.consumer_id != consumer_id
+                or delivery.event_id != persisted_event_id
+                or delivery.lease_owner != self._durable_delivery_owner
+                or not delivery.lease_token):
+            from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+            raise ExecutionAuthorityError('Original recovered cognition claim required')
+        from kestrel_sovereign.signals.outcome_custody import (
+            _AcceptedSignalOutcome, _OriginalSignalOutcome, _capture_original_outcome,
+        )
+        acceptance = _AcceptedSignalOutcome(asyncio.current_task(),
+            _OriginalSignalOutcome._signal_identity(routing_signal), registration)
+        self._accepted_signal_outcomes[acceptance] = None
+        try:
+            self._original_outcome_admission.set(_capture_original_outcome(
+                self, routing_signal, registration, acceptance=acceptance))
+        except BaseException:
+            self._accepted_signal_outcomes.pop(acceptance, None)
+            raise
 
         # The managed claim is durably marked admission-pending. Linearize
         # willingness once, then clear that marker before creating any turn
@@ -7463,23 +7532,43 @@ class SignalDispatcher:
         reservation = self._reserve_durable_admission()
         journal = self._original_outcome_admission.get()
         token = None
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        publication = OwnedTaskAdmission()
         try:
             if journal is not None:
-                prepared = self._store._prepare_outcome(signal, registration, result,
-                    prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
-                    **_audit_to_log_kwargs(audit))
+                try:
+                    prepared = self._store._prepare_outcome(signal, registration, result,
+                        prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
+                        **_audit_to_log_kwargs(audit))
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
+                    self._record_log_write_failure(signal.id, error)
+                    self._release_durable_admission(reservation)
+                    logger.error('Failed to prepare signal_log entry for %s', signal.id, exc_info=True)
+                    return
                 journal.bind(signal, registration, result, prepared)
             token = self._original_outcome_writer.set(journal)
             from kestrel_sovereign._async_ownership import create_owned_task
             task = create_owned_task(
                 self._log_safe(signal, registration, result, audit=audit),
                 name=f"durable_signal_log:{signal.source}:{signal.id}",
+                admission=publication,
             )
             if journal is not None:
-                journal.attach_outer(task)
-        except BaseException:
-            self._release_durable_admission(reservation)
-            raise
+                journal._outer_admission = publication
+        except BaseException as opening:
+            task = publication.task
+            if task is None:
+                self._release_durable_admission(reservation)
+                raise
+            # The native task was accepted, even if its publication failed.
+            # It is retained below until the existing async drain joins it.
+            if journal is not None:
+                journal._outer_admission = publication
+            publication_error = opening
+        else:
+            publication_error = None
         finally:
             if token is not None:
                 self._original_outcome_writer.reset(token)
@@ -7487,7 +7576,10 @@ class SignalDispatcher:
         self._outcome_log_tasks.add(task)
         self._outcome_log_tasks_by_signal.setdefault(signal.id, set()).add(task)
 
-        def _complete(task: asyncio.Task) -> None:
+        def _complete(task: asyncio.Task, *, joined=False) -> None:
+            if not task.done() or (publication_error is not None and not joined):
+                return
+            self._outcome_log_reconciliations.pop(task, None)
             self._outcome_log_tasks.discard(task)
             signal_tasks = self._outcome_log_tasks_by_signal.get(signal.id)
             if signal_tasks is not None:
@@ -7508,7 +7600,15 @@ class SignalDispatcher:
                     exc_info=(type(error), error, error.__traceback__),
                 )
 
-        task.add_done_callback(_complete)
+        self._outcome_log_reconciliations[task] = (_complete, publication_error)
+        try:
+            task.add_done_callback(_complete)
+        except BaseException as error:
+            # No retry/replacement: the drain owns this exact accepted Task,
+            # including a rejection of this final callback publication.
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            publication_error = execution_observation_error(publication_error, error)
+            self._outcome_log_reconciliations[task] = (_complete, publication_error)
 
     async def _log_safe(
         self,
@@ -7523,17 +7623,27 @@ class SignalDispatcher:
         # and shield it until it settles; otherwise the outer task's done
         # callback could release the lifecycle reservation and let shutdown
         # close the backend ahead of that queued write.
-        from kestrel_sovereign._async_ownership import create_owned_task
-        writer = create_owned_task(
-            self._write_outcome_log(signal, registration, result, audit=audit),
-            name=f"durable_signal_log_writer:{signal.source}:{signal.id}",
-        )
+        from kestrel_sovereign._async_ownership import create_owned_task, OwnedTaskAdmission
+        publication = OwnedTaskAdmission()
+        opening = None
+        try:
+            writer = create_owned_task(
+                self._write_outcome_log(signal, registration, result, audit=audit),
+                name=f"durable_signal_log_writer:{signal.source}:{signal.id}",
+                admission=publication,
+            )
+        except BaseException as error:
+            writer = publication.task
+            if writer is None:
+                raise
+            opening = error
         journal = self._original_outcome_writer.get()
         if journal is not None:
-            journal.attach_writer(writer)
+            journal._writer_admission = publication
         from kestrel_sovereign._async_ownership import await_owned_task
         outcome = await await_owned_task(writer)
-        exc = outcome.error
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        exc = execution_observation_error(opening, outcome.error)
         if exc is not None:
             # A dropped audit row is a loss, and a loss that leaves no record
             # anyone reads is indistinguishable from no loss at all (#2660):

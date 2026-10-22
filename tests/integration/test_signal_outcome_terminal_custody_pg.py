@@ -11,6 +11,11 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_unadmitted_or_forged_native_journal_never_grants_storage,
     test_handler_cannot_use_journal_permission_or_replay_after_success,
     test_original_journal_refuses_substituted_identity,
+    test_handler_cannot_mint_unrelated_journal_and_self_attach,
+    test_original_journal_destination_cannot_follow_mutable_table,
+    test_projection_control_failure_is_not_a_placeholder,
+    test_ordinary_projection_loss_does_not_relabel_completed_effect,
+    test_rejected_completion_callback_physically_joins_original_writer,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -32,3 +37,38 @@ async def dispatcher_components(native_pg):
         except BaseException as error:
             from kestrel_sovereign.execution_custody import is_execution_control_error
             assert is_execution_control_error(error)
+
+
+async def test_original_journal_keeps_acknowledged_commit_after_reset_identity_loss(
+    dispatcher_components, monkeypatch,
+):
+    import asyncpg
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    pool = c.backend._pool
+    original_release = asyncpg.pool.Pool.release
+    original_id = c.agent._did
+    reset_acknowledged = []
+
+    async def changed_after_actual_reset(original_pool, connection, *args, **kwargs):
+        result = await original_release(original_pool, connection, *args, **kwargs)
+        journal = c.dispatcher._original_outcome_writer.get()
+        if original_pool is pool and journal is not None and journal._phase == 'submitted':
+            reset_acknowledged.append(True)
+            c.agent._did = 'replacement-after-native-reset'
+        return result
+
+    c.registry.register(_action_reg('committed.audit'))
+    signal = _signal('committed.audit')
+    monkeypatch.setattr(asyncpg.pool.Pool, 'release', changed_after_actual_reset)
+    try:
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(signal)
+        assert reset_acknowledged == [True]
+        assert is_execution_control_error(caught.value)
+        assert execution_commit_outcome(caught.value) == 'committed'
+    finally:
+        c.agent._did = original_id
+        monkeypatch.setattr(asyncpg.pool.Pool, 'release', original_release)
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1

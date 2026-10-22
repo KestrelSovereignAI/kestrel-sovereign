@@ -2148,7 +2148,7 @@ class SQLiteBackend(DatabaseBackend):
         if original_outcome is not None:
             from kestrel_sovereign.signals.store import SignalLogStore
             self._require_write_admission(original_outcome)
-            if (query != SignalLogStore._outcome_insert_query(original_outcome._store)
+            if (query != SignalLogStore._outcome_insert_query()
                     or params is not original_outcome._entry.values):
                 raise ExecutionAuthorityError('Original native signal journal SQL differs')
         guard = self._write_guard() if original_outcome is None else self._write_guard(original_outcome=original_outcome)
@@ -2187,7 +2187,7 @@ class SQLiteBackend(DatabaseBackend):
             raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
         entry = journal.begin(self)
         await self._execute_write_operation(self._connection,
-            SignalLogStore._outcome_insert_query(journal._store), entry.values, original_outcome=journal)
+            SignalLogStore._outcome_insert_query(), entry.values, original_outcome=journal)
         journal.acknowledged(self)
         return entry.result_summary
 

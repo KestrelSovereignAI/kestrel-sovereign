@@ -266,9 +266,11 @@ class SignalLogStore(UnifiedStoreBase):
             raise ExecutionAuthorityError('Original native signal journal store differs')
         return await self._backend._append_original_signal_outcome(journal)
 
-    def _outcome_insert_query(self) -> str:
-        return f"""
-            INSERT INTO {self.TABLE} (
+    @staticmethod
+    def _outcome_insert_query() -> str:
+        # Native terminal custody never follows an instance/class TABLE override.
+        return """
+            INSERT INTO signal_log (
                 id, source, kind, mode, urgency, dedupe_key,
                 target_agent, session_id, caller_redacted, visibility,
                 dispatched_at, completed_at, status, duration_ms,
@@ -339,6 +341,9 @@ class SignalLogStore(UnifiedStoreBase):
         try:
             payload_redacted = policy.summarize(signal.payload)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            if is_execution_control_error(e):
+                raise
             logger.exception(
                 "RedactionPolicy.summarize raised for source '%s'; "
                 "storing only digest. Fix the policy.",
@@ -362,6 +367,9 @@ class SignalLogStore(UnifiedStoreBase):
             try:
                 summary = registration.result_summary(result_body)
             except Exception as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error
+                if is_execution_control_error(e):
+                    raise
                 logger.exception(
                     "result_summary callback raised for source '%s'; "
                     "result_summary will be a placeholder. Fix the callback.",

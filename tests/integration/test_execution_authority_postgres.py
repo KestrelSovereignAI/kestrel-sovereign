@@ -41,13 +41,21 @@ async def native_pg():
         await backend.execute("CREATE TABLE effects (id INTEGER PRIMARY KEY, value TEXT)")
         yield backend, control, schema
     finally:
+        physically_closed = False
         try:
             async with asyncio.timeout(10):
                 await backend.close()
                 await pool.close()
+                physically_closed = True
         finally:
-            await control.execute(f'DROP SCHEMA "{schema}" CASCADE')
-            await control.close()
+            try:
+                # Unconfirmed retirement never permits destructive schema
+                # cleanup beneath the original native users. The fixture's
+                # isolated container owner retains that debt instead.
+                if physically_closed:
+                    await control.execute(f'DROP SCHEMA "{schema}" CASCADE')
+            finally:
+                await control.close()
 
 
 class GenerationFence:

@@ -2215,14 +2215,18 @@ class PostgresBackend(DatabaseBackend):
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
         entry = journal.begin(self)
-        query, _ = sqlite_to_postgres(SignalLogStore._outcome_insert_query(journal._store))
+        query, _ = sqlite_to_postgres(SignalLogStore._outcome_insert_query())
         async with self._tracked_pool_checkout(journal._backing, admit_work=False) as (connection, state):
             journal.require_original(self)
             async with self._tracked_native_transaction(connection, state.scopes, state):
                 journal.require_original(self)
                 await connection.execute(query, *self._strip_tz(entry.values))
                 journal.require_original(self)
-        journal.acknowledged(self)
+        try:
+            journal.acknowledged(self)
+        except BaseException as error:
+            # A post-reset identity denial cannot erase the physical COMMIT.
+            raise state.retain_acknowledgments(error)
         return entry.result_summary
 
     async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):
