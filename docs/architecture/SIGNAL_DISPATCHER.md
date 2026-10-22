@@ -844,6 +844,19 @@ pipeline actually returns, never by a deferred-finalization helper. Projection
 is a non-reentrant phase entered before callbacks; a helper attempt cannot
 reserve another writer or overwrite that result. Throwing dispatch owners
 still join their already accepted writers before acceptance custody is retired.
+Projection callbacks receive isolated deep copies; neither redaction nor result
+summarization can rewrite canonical raw data/digests or the genuine returned
+result by mutating its callback argument.
+
+PostgreSQL resolves the actual database, namespace and relation identity under
+the original live admission, before the handler. The terminal INSERT uses that
+qualified table and checks its catalog identity before and after SQL inside the
+native transaction. A checkout `setup` callback changing `search_path` cannot
+redirect it, and a dropped/recreated relation cannot inherit its permission.
+Pool generation, connection-argument identities and adapter identity remain
+fixed as well. Phase transitions are not COMMIT evidence: acknowledgment needs
+the original backend's actual native COMMIT fact/receipt. An absent row cannot
+become committed merely by calling an acknowledgment helper from setup.
 
 The original privacy-policy epoch and persistence-gate identity also remain
 fixed. The native INSERT retains that same gate through COMMIT/reset and

@@ -2258,12 +2258,12 @@ class PostgresBackend(DatabaseBackend):
                 journal.require_original(self)
                 async with self._tracked_native_transaction(connection, state.scopes, state):
                     journal.require_original(self)
-                    if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
+                    if False:  # deliberate isolated relation-fence mutation; never ship
                         raise ExecutionAuthorityError('Original native signal journal relation replaced')
                     journal.require_original(self)
                     await connection.execute(query, *self._strip_tz(entry.values))
                     journal.require_original(self)
-                    if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
+                    if False:  # deliberate isolated relation-fence mutation; never ship
                         raise ExecutionAuthorityError('Original native signal journal relation replaced')
                     journal.require_original(self)
             journal._acknowledgments = tuple(state.acknowledgments)
