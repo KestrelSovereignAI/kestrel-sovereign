@@ -1642,7 +1642,7 @@ class SQLiteBackend(DatabaseBackend):
         yield conn
     
     @asynccontextmanager
-    async def _write_guard(self) -> AsyncIterator[None]:
+    async def _write_guard(self, *, original_outcome=None) -> AsyncIterator[None]:
         """Hold the shared-connection lock for one atomic operation unit.
 
         Re-entrant only for the task that owns an open transaction: that task's
@@ -1653,7 +1653,7 @@ class SQLiteBackend(DatabaseBackend):
         """
         if self._txn_owner is not None and self._txn_owner is asyncio.current_task():
             self._require_native_transaction()
-            self._require_execution_backend()
+            self._require_write_admission(original_outcome)
             yield
             return
 
@@ -1668,7 +1668,7 @@ class SQLiteBackend(DatabaseBackend):
                 if self._cancelled_write_drain is not None:
                     continue
                 self._raise_cancelled_write_drain_error()
-                self._require_execution_backend()
+                self._require_write_admission(original_outcome)
                 yield
                 return
 
@@ -2101,10 +2101,17 @@ class SQLiteBackend(DatabaseBackend):
             scopes = (*self._identity_anchor_access.scopes, *scopes)
         return tuple(dict.fromkeys(scopes))
 
-    async def _commit_write(self, conn: aiosqlite.Connection) -> None:
+    def _require_write_admission(self, original_outcome=None):
+        if original_outcome is None:
+            self._require_execution_backend()
+        else:
+            from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+            _require_original_signal_outcome(original_outcome, self)
+
+    async def _commit_write(self, conn: aiosqlite.Connection, *, original_outcome=None) -> None:
         """One native COMMIT handoff, including host/local-anchor receipts."""
         scopes = self._execution_commit_scopes()
-        self._require_execution_backend()
+        self._require_write_admission(original_outcome)
         try:
             await conn.commit()
         except BaseException as error:
@@ -2117,9 +2124,10 @@ class SQLiteBackend(DatabaseBackend):
                 raise
             raise ExecutionCommitOutcomeError(outcome) from error
         try:
-            self._require_execution_backend()
-            for scope in scopes:
-                scope.require_work()
+            self._require_write_admission(original_outcome)
+            if original_outcome is None:
+                for scope in scopes:
+                    scope.require_work()
         except BaseException as error:
             outcome = execution_commit_outcome(error) or "committed"
             for scope in scopes:
@@ -2134,18 +2142,32 @@ class SQLiteBackend(DatabaseBackend):
             reject_transaction_control(query, dialect="sqlite")
         record_write_query(query)
         conn = self._ensure_connected()
-        async with self._write_guard():
+        return await self._execute_write_operation(conn, query, params)
+
+    async def _execute_write_operation(self, conn, query, params, *, original_outcome=None):
+        if original_outcome is not None:
+            from kestrel_sovereign.signals.store import SignalLogStore
+            self._require_write_admission(original_outcome)
+            if (query != SignalLogStore._outcome_insert_query(original_outcome._store)
+                    or params is not original_outcome._entry.values):
+                raise ExecutionAuthorityError('Original native signal journal SQL differs')
+        guard = self._write_guard() if original_outcome is None else self._write_guard(original_outcome=original_outcome)
+        async with guard:
             with self._write_operation():
                 try:
                     cursor = await conn.execute(query, params)
-                    self._require_execution_backend()
+                    self._require_write_admission(original_outcome)
                     if not self._in_transaction:
-                        await self._commit_write(conn)
+                        if original_outcome is None:
+                            await self._commit_write(conn)
+                        else:
+                            await self._commit_write(conn, original_outcome=original_outcome)
                     return cursor.rowcount
                 except asyncio.CancelledError as error:
                     if not self._in_transaction:
                         self._handoff_cancelled_write(conn, error=error)
                     raise
+
                 except Exception as e:
                     if not self._in_transaction:
                         await self._rollback_after_failure(conn, error=e)
@@ -2156,6 +2178,18 @@ class SQLiteBackend(DatabaseBackend):
                     if not self._in_transaction:
                         await self._rollback_after_failure(conn, error=error)
                     raise
+
+    async def _append_original_signal_outcome(self, journal):
+        from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+        from kestrel_sovereign.signals.store import SignalLogStore
+        _require_original_signal_outcome(journal, self)
+        if self.owns_open_transaction:
+            raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
+        entry = journal.begin(self)
+        await self._execute_write_operation(self._connection,
+            SignalLogStore._outcome_insert_query(journal._store), entry.values, original_outcome=journal)
+        journal.acknowledged(self)
+        return entry.result_summary
 
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""

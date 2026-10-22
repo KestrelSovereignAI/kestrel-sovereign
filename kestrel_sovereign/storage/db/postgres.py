@@ -2208,6 +2208,23 @@ class PostgresBackend(DatabaseBackend):
                     )
                     return result == "UPDATE 1"
 
+    async def _append_original_signal_outcome(self, journal):
+        from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+        from kestrel_sovereign.signals.store import SignalLogStore
+        _require_original_signal_outcome(journal, self)
+        if self.owns_open_transaction:
+            raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
+        entry = journal.begin(self)
+        query, _ = sqlite_to_postgres(SignalLogStore._outcome_insert_query(journal._store))
+        async with self._tracked_pool_checkout(journal._backing, admit_work=False) as (connection, state):
+            journal.require_original(self)
+            async with self._tracked_native_transaction(connection, state.scopes, state):
+                journal.require_original(self)
+                await connection.execute(query, *self._strip_tz(entry.values))
+                journal.require_original(self)
+        journal.acknowledged(self)
+        return entry.result_summary
+
     async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):
         """Run only the original standalone runtime's mandatory privacy purge.
 

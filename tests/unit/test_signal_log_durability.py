@@ -272,10 +272,9 @@ async def test_dispatch_counts_a_dropped_audit_row_end_to_end(backend):
     store = SignalLogStore(backend)
     await store.initialize()
 
-    async def _exploding_append(*args, **kwargs):
-        raise RuntimeError("database is locked")
-
-    store.append = _exploding_append  # type: ignore[method-assign]
+    # Actual native SQL refusal on this test's owned temporary database,
+    # rather than an obsolete ordinary-append interception seam.
+    await backend.execute("DROP TABLE signal_log")
 
     agent = _FakeAgent()
     registry = SourceRegistry()
@@ -301,7 +300,7 @@ async def test_dispatch_counts_a_dropped_audit_row_end_to_end(backend):
     assert dispatcher.log_write_failure_count == 1
     last = dispatcher.last_log_write_failure
     assert last is not None
-    assert "database is locked" in last.error
+    assert "no such table" in last.error
     assert last.signal_id
 
 

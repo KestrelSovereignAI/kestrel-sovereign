@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -103,6 +103,14 @@ def _truncate_to_bytes(text: str, max_bytes: int) -> str:
         )
     truncated_body = encoded[:body_budget].decode("utf-8", errors="ignore")
     return truncated_body + _TRUNCATION_SUFFIX
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSignalOutcome:
+    """Immutable native row data, not SQL authority or a storage executor."""
+
+    values: tuple
+    result_summary: Optional[str]
 
 
 class SignalLogStore(UnifiedStoreBase):
@@ -234,6 +242,47 @@ class SignalLogStore(UnifiedStoreBase):
     # ------------------------------------------------------------------
 
     async def append(
+        self, signal: Signal, registration: SourceRegistration, result: SignalResult, *,
+        constitution_hash: Optional[str] = None,
+        doctrine_bundle_hash: Optional[str] = None,
+        echo_canary_status: Optional[str] = None,
+        injected_clauses: Optional[list[str]] = None,
+        dropped_clauses: Optional[list[str]] = None,
+        prompt_template_hash: Optional[str] = None,
+    ) -> Optional[str]:
+        """Ordinary append retains its original work-admission semantics."""
+        prepared = self._prepare_outcome(signal, registration, result,
+            constitution_hash=constitution_hash, doctrine_bundle_hash=doctrine_bundle_hash,
+            echo_canary_status=echo_canary_status, injected_clauses=injected_clauses,
+            dropped_clauses=dropped_clauses, prompt_template_hash=prompt_template_hash)
+        await self._backend.execute(self._outcome_insert_query(), prepared.values)
+        return prepared.result_summary
+
+    async def _append_original_outcome(self, journal) -> Optional[str]:
+        from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+        _require_original_signal_outcome(journal, self._backend)
+        if journal._store is not self:
+            from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+            raise ExecutionAuthorityError('Original native signal journal store differs')
+        return await self._backend._append_original_signal_outcome(journal)
+
+    def _outcome_insert_query(self) -> str:
+        return f"""
+            INSERT INTO {self.TABLE} (
+                id, source, kind, mode, urgency, dedupe_key,
+                target_agent, session_id, caller_redacted, visibility,
+                dispatched_at, completed_at, status, duration_ms,
+                turn_id, artifact_digest, action_result_digest,
+                payload_digest, payload_redacted, payload_raw,
+                result_summary,
+                causation_chain_digest, error, retention_until,
+                constitution_hash, doctrine_bundle_hash, echo_canary_status,
+                injected_clauses_json, dropped_clauses_json,
+                prompt_template_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+
+    def _prepare_outcome(
         self,
         signal: Signal,
         registration: SourceRegistration,
@@ -245,8 +294,10 @@ class SignalLogStore(UnifiedStoreBase):
         injected_clauses: Optional[list[str]] = None,
         dropped_clauses: Optional[list[str]] = None,
         prompt_template_hash: Optional[str] = None,
-    ) -> Optional[str]:
-        """Persist a dispatch outcome. Payload redaction runs HERE
+    ) -> _PreparedSignalOutcome:
+        """Prepare immutable native row DATA without granting storage authority.
+
+        Payload redaction runs HERE
         (the dispatcher does not see the redacted form before this
         call); per-source result UI summarization also runs here so
         the bounded body is stored AND returned for the SSE payload.
@@ -359,22 +410,8 @@ class SignalLogStore(UnifiedStoreBase):
             json.dumps(dropped_clauses) if dropped_clauses is not None else None
         )
 
-        await self._backend.execute(
-            f"""
-            INSERT INTO {self.TABLE} (
-                id, source, kind, mode, urgency, dedupe_key,
-                target_agent, session_id, caller_redacted, visibility,
-                dispatched_at, completed_at, status, duration_ms,
-                turn_id, artifact_digest, action_result_digest,
-                payload_digest, payload_redacted, payload_raw,
-                result_summary,
-                causation_chain_digest, error, retention_until,
-                constitution_hash, doctrine_bundle_hash, echo_canary_status,
-                injected_clauses_json, dropped_clauses_json,
-                prompt_template_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        return _PreparedSignalOutcome(
+            values=(
                 signal.id,
                 signal.source,
                 signal.kind,
@@ -406,9 +443,8 @@ class SignalLogStore(UnifiedStoreBase):
                 dropped_clauses_json,
                 prompt_template_hash,
             ),
+            result_summary=result_summary,
         )
-
-        return result_summary
 
     # ------------------------------------------------------------------
     # Retention sweep

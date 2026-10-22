@@ -7955,7 +7955,7 @@ async def test_sync_shutdown_drains_an_admitted_outcome_log_before_releasing_own
     consumer = DurableConsumerRegistration(
         consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
     )
-    original_append = dispatcher._store.append
+    original_append = dispatcher._store._append_original_outcome
     append_entered = asyncio.Event()
     allow_append = asyncio.Event()
     dispatch_task = None
@@ -7967,7 +7967,7 @@ async def test_sync_shutdown_drains_an_admitted_outcome_log_before_releasing_own
         await allow_append.wait()
         return await original_append(*args, **kwargs)
 
-    dispatcher._store.append = block_append
+    dispatcher._store._append_original_outcome = block_append
     try:
         dispatch_task = asyncio.create_task(
             dispatcher.dispatch_signal(
@@ -7991,7 +7991,7 @@ async def test_sync_shutdown_drains_an_admitted_outcome_log_before_releasing_own
         backend_closed = True
     finally:
         allow_append.set()
-        dispatcher._store.append = original_append
+        dispatcher._store._append_original_outcome = original_append
         if dispatch_task is not None and not dispatch_task.done():
             await dispatch_task
         if not backend_closed:
@@ -8672,7 +8672,7 @@ async def test_repeated_cancellation_releases_admission_without_waiting_on_lifec
     backend, agent, dispatcher = await _dispatcher(
         tmp_path / "admission-release-cancellation.db", "did:agent:one"
     )
-    original_append = dispatcher._store.append
+    original_append = dispatcher._store._append_original_outcome
     append_entered = asyncio.Event()
     allow_append = asyncio.Event()
     dispatch_task = None
@@ -8682,7 +8682,7 @@ async def test_repeated_cancellation_releases_admission_without_waiting_on_lifec
         await allow_append.wait()
         return await original_append(*args, **kwargs)
 
-    dispatcher._store.append = block_append
+    dispatcher._store._append_original_outcome = block_append
     try:
         dispatch_task = asyncio.create_task(
             dispatcher.dispatch_signal(
@@ -8711,7 +8711,7 @@ async def test_repeated_cancellation_releases_admission_without_waiting_on_lifec
         assert dispatcher._durable_runtime_owner_registered is False
     finally:
         allow_append.set()
-        dispatcher._store.append = original_append
+        dispatcher._store._append_original_outcome = original_append
         if dispatcher._durable_lifecycle_lock.locked():
             dispatcher._durable_lifecycle_lock.release()
         if dispatch_task is not None and not dispatch_task.done():

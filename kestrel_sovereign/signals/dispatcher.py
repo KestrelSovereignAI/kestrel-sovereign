@@ -500,6 +500,7 @@ class _DeferredOutcomeLog:
     registration: SourceRegistration
     result: SignalResult
     audit: Optional[_ConstitutionAudit]
+    original_journal: Any = None
 
 
 @dataclass
@@ -865,6 +866,10 @@ class SignalDispatcher:
         ] = contextvars.ContextVar(
             f"deferred_durable_outcome_logs:{id(self)}", default=None
         )
+        self._original_outcome_admission = contextvars.ContextVar(
+            f"original_outcome_admission:{id(self)}", default=None)
+        self._original_outcome_writer = contextvars.ContextVar(
+            f"original_outcome_writer:{id(self)}", default=None)
         # A durable retry is the same persisted delivery, not a competing
         # source event. The child route task inherits this narrow context flag
         # so legacy test/subclass seams retain their three-argument signature.
@@ -1167,6 +1172,7 @@ class SignalDispatcher:
         # final outcome. Every public dispatch begins with a private collector;
         # a durable route installs a fresh one for its one final outcome below.
         deferred_token = self._deferred_outcome_logs.set(None)
+        journal_token = self._original_outcome_admission.set(None)
         # Publish the in-flight signal for the duration of this dispatch so
         # code running inside handlers/turns (e.g. the Talon coordinator's
         # orchestrator/workflow correlation stamping, kestrel-talon#53) can
@@ -1285,6 +1291,7 @@ class SignalDispatcher:
                     )
             reset_current_signal(ctx_token)
             self._deferred_outcome_logs.reset(deferred_token)
+            self._original_outcome_admission.reset(journal_token)
             self._durable_cognition_route.reset(durable_route_token)
 
     async def enqueue_signal(
@@ -4100,6 +4107,11 @@ class SignalDispatcher:
                 error=f"Unknown source: '{signal.source}'",
             )
 
+        admission = self._durable_admission.get()
+        if admission is not None and admission[0] is asyncio.current_task():
+            from kestrel_sovereign.signals.outcome_custody import _capture_original_outcome
+            self._original_outcome_admission.set(_capture_original_outcome(self, signal, registration))
+
         if signal.mode not in registration.allowed_modes:
             return self._fail(
                 signal,
@@ -5796,12 +5808,11 @@ class SignalDispatcher:
 
         if len(outcomes) == 1:
             outcome = outcomes[0]
-            self._schedule_outcome_log(
-                outcome.signal,
-                outcome.registration,
-                result,
-                audit=outcome.audit,
-            )
+            token = self._original_outcome_admission.set(outcome.original_journal)
+            try:
+                self._schedule_outcome_log(outcome.signal, outcome.registration, result, audit=outcome.audit)
+            finally:
+                self._original_outcome_admission.reset(token)
             return
         if outcomes:
             logger.error(
@@ -7445,18 +7456,33 @@ class SignalDispatcher:
                     registration=registration,
                     result=result,
                     audit=audit,
+                    original_journal=self._original_outcome_admission.get(),
                 )
             )
             return
         reservation = self._reserve_durable_admission()
+        journal = self._original_outcome_admission.get()
+        token = None
         try:
-            task = asyncio.create_task(
+            if journal is not None:
+                prepared = self._store._prepare_outcome(signal, registration, result,
+                    prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
+                    **_audit_to_log_kwargs(audit))
+                journal.bind(signal, registration, result, prepared)
+            token = self._original_outcome_writer.set(journal)
+            from kestrel_sovereign._async_ownership import create_owned_task
+            task = create_owned_task(
                 self._log_safe(signal, registration, result, audit=audit),
                 name=f"durable_signal_log:{signal.source}:{signal.id}",
             )
+            if journal is not None:
+                journal.attach_outer(task)
         except BaseException:
             self._release_durable_admission(reservation)
             raise
+        finally:
+            if token is not None:
+                self._original_outcome_writer.reset(token)
 
         self._outcome_log_tasks.add(task)
         self._outcome_log_tasks_by_signal.setdefault(signal.id, set()).add(task)
@@ -7497,10 +7523,14 @@ class SignalDispatcher:
         # and shield it until it settles; otherwise the outer task's done
         # callback could release the lifecycle reservation and let shutdown
         # close the backend ahead of that queued write.
-        writer = asyncio.create_task(
+        from kestrel_sovereign._async_ownership import create_owned_task
+        writer = create_owned_task(
             self._write_outcome_log(signal, registration, result, audit=audit),
             name=f"durable_signal_log_writer:{signal.source}:{signal.id}",
         )
+        journal = self._original_outcome_writer.get()
+        if journal is not None:
+            journal.attach_writer(writer)
         from kestrel_sovereign._async_ownership import await_owned_task
         outcome = await await_owned_task(writer)
         exc = outcome.error
@@ -7585,13 +7615,13 @@ class SignalDispatcher:
     ) -> None:
         """Persist one outcome and emit its UI side channel after commit."""
         with suppress_write_audit():
-            result_summary = await self._store.append(
-                signal,
-                registration,
-                result,
-                prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
-                **_audit_to_log_kwargs(audit),
-            )
+            journal = self._original_outcome_writer.get()
+            if journal is not None:
+                result_summary = await self._store._append_original_outcome(journal)
+            else:
+                result_summary = await self._store.append(signal, registration, result,
+                    prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
+                    **_audit_to_log_kwargs(audit))
 
         # Phase 7 of #889: emit a UI-side-channel SSE event for non-
         # INTERNAL signals. Three rendering tiers in the design:
