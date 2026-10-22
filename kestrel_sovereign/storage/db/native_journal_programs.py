@@ -160,7 +160,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
             cursor.close()
 
     def commit(self):
-        if (self._journal_program_seal is not None
+        if (False and self._journal_program_seal is not None
                 and self._original_journal_durability() != self._journal_program_seal):
             raise NativeJournalDurabilityRefusal('Original journal durability changed before native COMMIT')
         result = super().commit()

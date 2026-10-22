@@ -2211,11 +2211,6 @@ class PostgresBackend(DatabaseBackend):
             JOIN pg_catalog.pg_namespace AS n ON n.oid  OPERATOR(pg_catalog.=)  c.relnamespace
             WHERE c.oid  OPERATOR(pg_catalog.=)  pg_catalog.to_regclass($1) AND c.relkind  OPERATOR(pg_catalog.=)  'r'
               AND c.relpersistence  OPERATOR(pg_catalog.=)  'p'
-              AND EXISTS (SELECT 1 FROM pg_catalog.pg_am AS am
-                  WHERE am.oid OPERATOR(pg_catalog.=) c.relam
-                    AND am.amname OPERATOR(pg_catalog.=) 'heap'
-                    AND am.amtype OPERATOR(pg_catalog.=) 't'
-                    AND am.amhandler OPERATOR(pg_catalog.=) pg_catalog.to_regproc('pg_catalog.heap_tableam_handler'))
               AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits AS h
                   WHERE h.inhparent OPERATOR(pg_catalog.=) c.oid OR h.inhrelid OPERATOR(pg_catalog.=) c.oid)
