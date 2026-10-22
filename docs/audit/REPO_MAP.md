@@ -106,7 +106,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/native_card.py** — Native signed discovery using official Agent Cards and SDK JWS services.
   - `def verify_native_agent_card(card)`; `def create_native_agent_card()`
 - **kestrel_sovereign/a2a/native_client.py** — Official SDK peer operations with immutable sender-side dispatch evidence.
-  - `class NativeSenderInterceptor`; `class NativePeerProtocolError`; `class NativeDispatchReceipt`; `class NativePeerSession`
+  - `class NativeSenderInterceptor`; `class NativePeerProtocolError`; `class NativeDispatchReceipt`; `class NativeReconciliationPolicy`; `class NativePeerSession`
 - **kestrel_sovereign/a2a/native_context.py** — Bind official A2A requests to the host-selected recipient and tenant.
   - `class NativeRecipientBinding`; `class NativeServerCallContextBuilder`; `def native_header_values(context, name)`; `async def wait_native_disconnect(context)`; `async def bind_native_request(params, context)`
 - **kestrel_sovereign/a2a/native_host.py** — Bind native admission to the host's exact published policy and identities.

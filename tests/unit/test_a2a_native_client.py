@@ -3,7 +3,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -15,6 +15,8 @@ from a2a.client.errors import A2AClientError
 from a2a.types import (
     AgentInterface,
     AgentSkill,
+    ListTasksRequest,
+    ListTasksResponse,
     Message,
     Part,
     Role,
@@ -37,6 +39,7 @@ from kestrel_sovereign.a2a.native_card import (
 from kestrel_sovereign.a2a.native_client import (
     NativePeerProtocolError,
     NativePeerSession,
+    NativeReconciliationPolicy,
     NativeSenderInterceptor,
 )
 from kestrel_sovereign.a2a.native_routes import NativeA2AHTTP
@@ -105,9 +108,16 @@ async def peer_session(native_request_admission, recipient_identity, request):
         received_messages=0,
         received_cancellations=0,
         revoke_on_request=False,
+        list_page=None,
     )
 
     class PeerHandler(NativeA2ARequestHandler):
+        async def on_list_tasks(self, params, context):
+            if state.list_page is None:
+                return await super().on_list_tasks(params, context)
+            async with self.guard.admit(params, "ListTasks", context):
+                return await state.list_page(params)
+
         async def on_cancel_task(self, params, context):
             state.received_cancellations += 1
             return await super().on_cancel_task(params, context)
@@ -333,6 +343,230 @@ async def test_lost_acknowledgement_reconciles_by_read_without_resending(peer_se
     assert reconciled.state is DispatchState.ACKNOWLEDGED
     assert len(p.trace) == 2
     assert p.trace[1][0] == "GET" or p.trace[1][2]["method"] == "ListTasks"
+
+
+@asynccontextmanager
+async def uncertain_peer_history(p, policy):
+    """Lose a real receipt, then let the admitted peer serve its actual history."""
+    session = NativePeerSession(**(p.arguments | {"reconciliation_policy": policy}))
+    try:
+        dispatch, wire = await session.reserve(
+            request_for(p), dispatch_tool="send_a2a_task", verb="task"
+        )
+        p.state.drop_ack = True
+        with pytest.raises(A2AClientError, match="Acknowledgement lost"):
+            await session.send(dispatch, wire)
+        unknown = await p.store.get(dispatch.dispatch_id)
+        result = await p.admission.manager.task_store.list_for_creator(
+            ListTasksRequest(tenant=p.admission.scope.tenant),
+            creator_agent_id=PRINCIPAL,
+            recipient_agent_id=p.admission.scope.recipient_id,
+        )
+        assert len(result.tasks) == 1
+        yield SimpleNamespace(session=session, dispatch=unknown, result=result)
+    finally:
+        await session.close()
+
+
+async def test_reconciliation_rejects_fresh_tokens_at_its_configured_page_budget(
+    peer_session,
+):
+    p = peer_session
+    policy = NativeReconciliationPolicy(max_pages=2)
+    async with uncertain_peer_history(p, policy) as retained:
+        pages = []
+
+        async def page(params):
+            pages.append(ListTasksRequest.FromString(params.SerializeToString()))
+            response = ListTasksResponse.FromString(retained.result.SerializeToString())
+            # The finite fixture also fails safely without a production bound.
+            # Every earlier token is distinct and syntactically opaque.
+            response.next_page_token = f"fresh-{len(pages)}" if len(pages) < 4 else ""
+            return response
+
+        p.state.list_page = page
+        with pytest.raises(NativePeerProtocolError, match="page"):
+            await retained.session.reconcile(retained.dispatch)
+        assert len(pages) == policy.max_pages
+        assert all(request.page_size == policy.page_size for request in pages)
+        assert await p.store.get(retained.dispatch.dispatch_id) == retained.dispatch
+        assert p.state.received_messages == 1
+        assert not p.http.is_closed
+
+
+@pytest.mark.parametrize("fault", ["page-size", "response-bytes", "token-bytes", "repeated-token"])
+async def test_reconciliation_resource_refusal_never_acknowledges_partial_history(
+    peer_session, fault
+):
+    p = peer_session
+    policy = NativeReconciliationPolicy(page_size=1, max_pages=3)
+    if fault == "token-bytes":
+        policy = replace(policy, max_page_token_bytes=4)
+    async with uncertain_peer_history(p, policy) as retained:
+        pages = []
+        if fault == "response-bytes":
+            # Each page fits; the complete scan exceeds the configured budget.
+            policy = replace(policy, max_response_bytes=retained.result.ByteSize() + 20)
+            retained.session._reconciliation_policy = policy
+
+        async def page(params):
+            pages.append(params.page_token)
+            response = ListTasksResponse.FromString(retained.result.SerializeToString())
+            if fault == "page-size":
+                response.tasks.append(response.tasks[0])
+            elif fault == "response-bytes":
+                response.next_page_token = "next" if len(pages) == 1 else ""
+            elif fault == "token-bytes":
+                response.next_page_token = "too-long" if len(pages) == 1 else ""
+            else:
+                response.next_page_token = "next" if len(pages) < 3 else ""
+            return response
+
+        p.state.list_page = page
+        reason = {
+            "page-size": "requested page size",
+            "response-bytes": "response byte budget",
+            "token-bytes": "token exceeded its byte budget",
+            "repeated-token": "repeated",
+        }[fault]
+        with pytest.raises(NativePeerProtocolError, match=reason):
+            await retained.session.reconcile(retained.dispatch)
+        assert await p.store.get(retained.dispatch.dispatch_id) == retained.dispatch
+        assert p.state.received_messages == 1
+        assert not p.http.is_closed
+
+
+async def test_reconciliation_duration_budget_joins_the_original_peer_read(peer_session):
+    p = peer_session
+    entered, finished = asyncio.Event(), asyncio.Event()
+    policy = NativeReconciliationPolicy(timeout_seconds=1)
+    async with uncertain_peer_history(p, policy) as retained:
+        async def page(params):
+            entered.set()
+            try:
+                # Finite even when the production duration guard is removed.
+                await asyncio.sleep(2)
+                return retained.result
+            finally:
+                finished.set()
+
+        p.state.list_page = page
+        with pytest.raises(NativePeerProtocolError, match="duration budget"):
+            await retained.session.reconcile(retained.dispatch)
+        assert entered.is_set() and finished.is_set()
+        assert await p.store.get(retained.dispatch.dispatch_id) == retained.dispatch
+        assert not p.http.is_closed
+
+
+async def test_reconciliation_keeps_an_unrelated_timeout_exact(peer_session):
+    p = peer_session
+    async with uncertain_peer_history(p, NativeReconciliationPolicy()) as retained:
+        original = TimeoutError("the authority backend timed out")
+        calls = 0
+
+        async def authorize():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise original
+
+        retained.session._authorize = authorize
+        with pytest.raises(TimeoutError) as refused:
+            await retained.session.reconcile(retained.dispatch)
+        assert refused.value is original
+        assert await p.store.get(retained.dispatch.dispatch_id) == retained.dispatch
+
+
+async def test_reconciliation_expiry_cannot_relabel_original_execution_control(
+    peer_session,
+):
+    p = peer_session
+    policy = NativeReconciliationPolicy(timeout_seconds=1)
+    async with uncertain_peer_history(p, policy) as retained:
+        original = TimeoutError("Original authority retirement completed during expiry")
+        original.__cause__ = ExecutionAuthorityError("Original authority withdrawn")
+        calls = 0
+
+        async def authorize():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                try:
+                    await asyncio.sleep(2)
+                except asyncio.CancelledError:
+                    raise original
+
+        retained.session._authorize = authorize
+        with pytest.raises(TimeoutError) as refused:
+            await retained.session.reconcile(retained.dispatch)
+        assert refused.value is original
+        assert await p.store.get(retained.dispatch.dispatch_id) == retained.dispatch
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+async def test_reconciliation_checks_the_complete_scan_before_admitting_a_witness(
+    peer_session, conflict
+):
+    p = peer_session
+    policy = NativeReconciliationPolicy(max_pages=2)
+    async with uncertain_peer_history(p, policy) as retained:
+        pages = []
+
+        async def page(params):
+            pages.append(params.page_token)
+            response = ListTasksResponse.FromString(retained.result.SerializeToString())
+            response.next_page_token = "next" if len(pages) == 1 else ""
+            if conflict and len(pages) == 2:
+                response.tasks[0].id = uuid4().hex
+            return response
+
+        p.state.list_page = page
+        if conflict:
+            with pytest.raises(OutboundDispatchConflict, match="More than one"):
+                await retained.session.reconcile(retained.dispatch)
+            assert await p.store.get(retained.dispatch.dispatch_id) == retained.dispatch
+        else:
+            observed = await retained.session.reconcile(retained.dispatch)
+            assert observed.state is DispatchState.ACKNOWLEDGED
+            assert observed.remote_task_id == retained.result.tasks[0].id
+        assert pages == ["", "next"]
+        assert p.state.received_messages == 1
+
+
+@pytest.mark.parametrize("setting", [item.name for item in fields(NativeReconciliationPolicy)])
+def test_every_reconciliation_budget_is_explicitly_configurable(setting):
+    value = getattr(NativeReconciliationPolicy(), setting) + 1
+    configured = NativeReconciliationPolicy.from_environment(
+        {"KESTREL_A2A_RECONCILIATION_" + setting.upper(): str(value)}
+    )
+    assert getattr(configured, setting) == value
+
+
+@pytest.mark.parametrize("setting", [item.name for item in fields(NativeReconciliationPolicy)])
+@pytest.mark.parametrize("value", [0, -1, True, "1", 1.5])
+def test_reconciliation_budgets_refuse_invalid_operator_values(setting, value):
+    with pytest.raises(ValueError, match=setting):
+        NativeReconciliationPolicy(**{setting: value})
+
+
+def test_reconciliation_page_size_respects_the_sdk_protocol_maximum():
+    from a2a.utils.constants import MAX_LIST_TASKS_PAGE_SIZE
+
+    with pytest.raises(ValueError, match="page_size"):
+        NativeReconciliationPolicy(page_size=MAX_LIST_TASKS_PAGE_SIZE + 1)
+
+
+def test_reconciliation_environment_refuses_an_unparseable_budget():
+    with pytest.raises(ValueError, match="KESTREL_A2A_RECONCILIATION_MAX_PAGES"):
+        NativeReconciliationPolicy.from_environment(
+            {"KESTREL_A2A_RECONCILIATION_MAX_PAGES": "unlimited"}
+        )
+
+
+async def test_peer_requires_a_validated_reconciliation_policy_before_http(peer_session):
+    with pytest.raises(TypeError, match="validated reconciliation policy"):
+        NativePeerSession(**(peer_session.arguments | {"reconciliation_policy": False}))
+    assert not peer_session.trace
 
 
 async def test_concurrent_senders_have_only_one_native_submission(peer_session):

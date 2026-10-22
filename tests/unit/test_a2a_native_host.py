@@ -1021,6 +1021,52 @@ async def test_same_host_session_uses_real_sdk_binding_and_creator_ledger(
         assert observed.dispatch.revision > receipt.dispatch.revision
 
 
+async def test_hosted_peer_uses_configured_reconciliation_bounds_before_receipt_admission(
+    local_native_peer, monkeypatch
+):
+    import httpx
+    from a2a.client.errors import A2AClientError
+
+    from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
+    from kestrel_sovereign.a2a.stores.unified.outbound_store import DispatchState
+
+    p = local_native_peer
+    monkeypatch.setenv("KESTREL_A2A_RECONCILIATION_PAGE_SIZE", "1")
+    monkeypatch.setenv("KESTREL_A2A_RECONCILIATION_MAX_PAGES", "1")
+    async with p.directory.open_a2a_session(p.requester, p.peer) as session:
+        async def reserve_task():
+            return await session.reserve(
+                SendMessageRequest(
+                    tenant=session.recipient_scope.tenant,
+                    message=new_text_message("Native bounded history", role=Role.ROLE_USER),
+                    configuration={"return_immediately": True},
+                ),
+                dispatch_tool="send_a2a_task", verb="task",
+            )
+
+        first, first_wire = await reserve_task()
+        await session.send(first, first_wire)
+        lose_reply = True
+
+        async def lose_original_reply(response):
+            nonlocal lose_reply
+            if lose_reply:
+                lose_reply = False
+                await response.aclose()
+                raise httpx.ReadError("Lost the committed receipt", request=response.request)
+
+        session._http.event_hooks["response"].append(lose_original_reply)
+        dispatch, wire = await reserve_task()
+        with pytest.raises(A2AClientError, match="Lost the committed receipt"):
+            await session.send(dispatch, wire)
+        unknown = await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
+        assert unknown.state is DispatchState.UNKNOWN
+        with pytest.raises(NativePeerProtocolError, match="page budget"):
+            await session.reconcile(unknown)
+        assert await p.sender_manager.outbound_store.get(dispatch.dispatch_id) == unknown
+        assert len(await p.manager.list_tasks(recipient_agent_id=p.recipient.did)) == 2
+
+
 async def test_native_peer_message_tool_reaches_official_host_binding(
     local_native_peer,
 ):

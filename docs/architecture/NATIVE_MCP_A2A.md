@@ -822,6 +822,26 @@ permission to replay a send. Taskless native Message responses retain their
 actual type rather than acquiring an invented task ID. Questions use the
 sender-owned correlation ID and the same durable recipient/tenant binding.
 
+History reconciliation has a finite `NativeReconciliationPolicy`. The common
+hosted and standalone peer-session factory loads its settings from environment
+variables with the `KESTREL_A2A_RECONCILIATION_` prefix:
+
+| Suffix | Default | Bound |
+|---|---|---|
+| `PAGE_SIZE` | SDK default, 50 | Tasks per page; validated against the SDK's protocol maximum |
+| `MAX_PAGES` | 20 | Pages in one complete history scan |
+| `MAX_RESPONSE_BYTES` | 8 MiB | Cumulative decoded protobuf response bytes |
+| `MAX_PAGE_TOKEN_BYTES` | 4096 | UTF-8 bytes in a pagination token |
+| `TIMEOUT_SECONDS` | 30 | Elapsed duration of the peer-history scan |
+
+All settings require positive integers. The scan retains only the canonical
+matching witness and checks ambiguity across every page before admitting a
+receipt. Exceeding a bound or repeating a token raises a peer protocol refusal,
+preserves the original `UNKNOWN` dispatch and lets question recovery continue
+with its next retained question. The elapsed bound joins the original read's
+HTTP retirement; unrelated timeouts and original execution-control errors retain
+their identity. An incomplete scan grants no permission to resend the message.
+
 Native message, tracked-task and blocking `ask_agent` tools share the SDK
 producer. Result lookup accepts the immutable local `dispatch_id`, reads the
 sender's canonical primary ledger and resolves its stable peer under current

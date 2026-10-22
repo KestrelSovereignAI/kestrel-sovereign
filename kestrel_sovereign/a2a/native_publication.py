@@ -1,5 +1,6 @@
 """Host-owned publication of one current recipient's signed native contract."""
 
+import os
 import time
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
@@ -22,6 +23,7 @@ from kestrel_sovereign.a2a.native_card import (
 )
 from kestrel_sovereign.a2a.native_client import (
     NativePeerSession,
+    NativeReconciliationPolicy,
     NativeSenderInterceptor,
 )
 from kestrel_sovereign.a2a.native_host import create_hosted_native_guard
@@ -416,6 +418,7 @@ async def open_native_peer_session(
     common path owns HTTP acquisition, card discovery, SDK setup and retirement
     for in-process and separately hosted agents alike.
     """
+    reconciliation_policy = NativeReconciliationPolicy.from_environment(os.environ)
     await authorize()
     async with owned_native_http_client(
         httpx.AsyncClient(
@@ -469,6 +472,7 @@ async def open_native_peer_session(
             http_client=http,
             outbound_store=outbound,
             question_store=questions,
+            reconciliation_policy=reconciliation_policy,
             authorize=authorize,
         )
         try:

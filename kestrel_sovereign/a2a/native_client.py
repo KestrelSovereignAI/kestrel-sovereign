@@ -1,9 +1,10 @@
 """Official SDK peer operations with immutable sender-side dispatch evidence."""
 
+import asyncio
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from uuid import uuid4
 
 import httpx
@@ -24,7 +25,11 @@ from a2a.types import (
     Task,
     TaskState,
 )
-from a2a.utils.constants import VERSION_HEADER
+from a2a.utils.constants import (
+    DEFAULT_LIST_TASKS_PAGE_SIZE,
+    MAX_LIST_TASKS_PAGE_SIZE,
+    VERSION_HEADER,
+)
 from a2a.utils.errors import InvalidParamsError
 from a2a.utils.proto_utils import validate_proto_required_fields
 from a2a.utils.signing import SignatureVerificationError
@@ -204,6 +209,41 @@ class NativeDispatchReceipt:
     response: Task | Message
 
 
+@dataclass(frozen=True)
+class NativeReconciliationPolicy:
+    """Finite peer-history scans; an incomplete scan never acknowledges a send."""
+
+    page_size: int = DEFAULT_LIST_TASKS_PAGE_SIZE
+    max_pages: int = 20
+    max_response_bytes: int = 8_388_608
+    max_page_token_bytes: int = 4096
+    timeout_seconds: int = 30
+
+    def __post_init__(self):
+        for setting in fields(self):
+            value = getattr(self, setting.name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(
+                    f"Native reconciliation {setting.name} must be a positive integer"
+                )
+        if self.page_size > MAX_LIST_TASKS_PAGE_SIZE:
+            raise ValueError(
+                "Native reconciliation page_size exceeds the A2A maximum"
+            )
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str]):
+        overrides = {}
+        for setting in fields(cls):
+            name = "KESTREL_A2A_RECONCILIATION_" + setting.name.upper()
+            if name in environment:
+                try:
+                    overrides[setting.name] = int(environment[name])
+                except ValueError as error:
+                    raise ValueError(f"{name} must be a positive integer") from error
+        return cls(**overrides)
+
+
 class NativePeerSession:
     """A host-authorized peer session over a borrowed, governed HTTP client.
 
@@ -226,7 +266,16 @@ class NativePeerSession:
         outbound_store: OutboundStore,
         authorize: Callable[[], Awaitable[None]],
         question_store: NativeQuestionStore | None = None,
+        reconciliation_policy: NativeReconciliationPolicy | None = None,
     ):
+        if reconciliation_policy is not None and not isinstance(
+            reconciliation_policy, NativeReconciliationPolicy
+        ):
+            raise TypeError("Native peer requires a validated reconciliation policy")
+        self._reconciliation_policy = (
+            reconciliation_policy if reconciliation_policy is not None
+            else NativeReconciliationPolicy()
+        )
         snapshot = AgentCard.FromString(card.SerializeToString())
         try:
             validate_proto_required_fields(snapshot)
@@ -718,28 +767,62 @@ class NativePeerSession:
         candidates = []
         token = ""
         seen_tokens = set()
-        while True:
-            await self._admit()
-            request = ListTasksRequest(
-                tenant=self._scope.tenant,
-                context_id=dispatch.requested_context_id,
-                page_token=token,
-            )
-            async with self._network():
-                result = await self._client.list_tasks(
-                    request,
-                    context=self._request_context("ListTasks", request),
-                )
-            await self._admit()
-            candidates.extend(result.tasks)
-            token = result.next_page_token
-            if not token:
-                break
-            if token in seen_tokens:
-                raise NativePeerProtocolError(
-                    "Peer repeated a task-list pagination token"
-                )
-            seen_tokens.add(token)
+        policy = self._reconciliation_policy
+        response_bytes = 0
+        budget = asyncio.timeout(policy.timeout_seconds)
+        try:
+            async with budget:
+                for _ in range(policy.max_pages):
+                    await self._admit()
+                    request = ListTasksRequest(
+                        tenant=self._scope.tenant,
+                        context_id=dispatch.requested_context_id,
+                        page_token=token,
+                        page_size=policy.page_size,
+                    )
+                    async with self._network():
+                        result = await self._client.list_tasks(
+                            request,
+                            context=self._request_context("ListTasks", request),
+                        )
+                    await self._admit()
+                    response_bytes += result.ByteSize()
+                    if response_bytes > policy.max_response_bytes:
+                        raise NativePeerProtocolError(
+                            "Peer task-list scan exceeded its response byte budget"
+                        )
+                    if len(result.tasks) > policy.page_size:
+                        raise NativePeerProtocolError(
+                            "Peer task-list response exceeded the requested page size"
+                        )
+                    # The canonical selector detects ambiguity across pages.
+                    # Retain only its witness, never every unrelated peer task.
+                    candidate = self._store.reconciliation_candidate(
+                        dispatch, [*candidates, *result.tasks]
+                    )
+                    candidates = [candidate] if candidate is not None else []
+                    token = result.next_page_token
+                    if not token:
+                        break
+                    if len(token.encode("utf-8")) > policy.max_page_token_bytes:
+                        raise NativePeerProtocolError(
+                            "Peer task-list pagination token exceeded its byte budget"
+                        )
+                    if token in seen_tokens:
+                        raise NativePeerProtocolError(
+                            "Peer repeated a task-list pagination token"
+                        )
+                    seen_tokens.add(token)
+                else:
+                    raise NativePeerProtocolError(
+                        "Peer task-list scan exceeded its page budget"
+                    )
+        except TimeoutError as error:
+            if not budget.expired() or is_execution_control_error(error):
+                raise
+            raise NativePeerProtocolError(
+                "Peer task-list scan exceeded its duration budget"
+            ) from error
         if dispatch.verb != "question":
             return await self._store.reconcile(
                 dispatch, candidates, operation_id=uuid4().hex
