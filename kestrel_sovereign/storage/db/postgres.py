@@ -2315,7 +2315,8 @@ class PostgresBackend(DatabaseBackend):
                 try:
                     if type(native) is not NativeJournalPostgresConnection:
                         raise NativeJournalConfigurationError('Unfenced native PostgreSQL session')
-                    await native._wait_original_journal_retirement()
+                    if False:
+                        await native._wait_original_journal_retirement()
                     journal.require_original(self)
                     native._begin_original_journal(state)
                     program_sealed = True

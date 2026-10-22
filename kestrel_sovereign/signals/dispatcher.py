@@ -1426,6 +1426,7 @@ class SignalDispatcher:
             )
             task.add_done_callback(release_live_admission, context=resident_context)
         except BaseException as original:
+            raise  # Deliberate LOCAL counterproof of failed enqueue retirement.
             owner = accepted.task if accepted.task is not None else task
             errors = [original]
             if owner is not None:
