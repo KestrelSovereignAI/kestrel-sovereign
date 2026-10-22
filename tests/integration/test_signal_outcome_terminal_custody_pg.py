@@ -1,4 +1,5 @@
 """Same fixed native signal journal contracts on isolated real PostgreSQL."""
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -49,7 +50,7 @@ async def test_original_journal_refuses_same_pool_reconfiguration(dispatcher_com
     alternate = schema + '_replacement'
     await control.execute(f'CREATE SCHEMA "{alternate}"')
     await control.execute(f'CREATE TABLE "{alternate}".signal_log (LIKE "{schema}".signal_log INCLUDING ALL)')
-    entered, release = __import__('asyncio').Event(), __import__('asyncio').Event()
+    entered, release = asyncio.Event(), asyncio.Event()
     effects = []
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     owner = SimpleNamespace(_execution_custody=scope)
@@ -81,7 +82,7 @@ async def test_original_journal_refuses_same_pool_reconfiguration(dispatcher_com
     try:
         with bind_execution_runtime(owner):
             handle = await c.dispatcher.enqueue_signal(signal)
-            await __import__('asyncio').wait_for(entered.wait(), 2)
+            await asyncio.wait_for(entered.wait(), 2)
             if boundary != 'handler_generation':
                 settings = dict(original_kwargs.get('server_settings', {}))
                 settings['search_path'] = alternate

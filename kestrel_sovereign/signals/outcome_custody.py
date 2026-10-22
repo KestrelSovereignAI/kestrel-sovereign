@@ -33,6 +33,41 @@ class _AcceptedSignalOutcome:
     registration: object
 
 
+@dataclass(frozen=True, eq=False)
+class _OriginalPostgresJournalPool:
+    """Opaque native pool configuration accepted for this one fixed row.
+
+    Public asyncpg reconfiguration replaces these objects; retaining the pool
+    object alone would allow a late journal to acquire a different destination.
+    Connection arguments may contain secrets and must never be serialized.
+    """
+    pool: object
+    generation: int
+    connect_args: object
+    connect_kwargs: object
+    wrapper: object
+
+    @classmethod
+    def capture(cls, backing):
+        from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
+        adapted = isinstance(backing, PostgresPoolAdapter)
+        native = backing.native_pool if adapted else backing
+        return cls(native, native._generation, native._connect_args,
+                   native._connect_kwargs, backing.wrap_checkout if adapted else None)
+
+    def require_original(self, backing):
+        from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
+        adapted = isinstance(backing, PostgresPoolAdapter)
+        native = backing.native_pool if adapted else backing
+        if (native is not self.pool
+                or (backing.wrap_checkout if adapted else None) is not self.wrapper
+                or native._generation != self.generation
+                or native._connect_args is not self.connect_args
+                or native._connect_kwargs is not self.connect_kwargs
+                or native.is_closing()):
+            raise ExecutionAuthorityError('Original signal journal pool configuration retired')
+
+
 class _OriginalSignalOutcome:
     def __init__(self, dispatcher, signal, registration, *, acceptance=None):
         from kestrel_sovereign.signals.store import SignalLogStore
@@ -83,6 +118,9 @@ class _OriginalSignalOutcome:
         self._backend_scope = getattr(backend, '_execution_custody', None)
         self._backing = backend._connection if type(backend) is SQLiteBackend else backend._pool
         self._generation = backend.connection_generation if type(backend) is SQLiteBackend else None
+        self._postgres_pool = (
+            _OriginalPostgresJournalPool.capture(self._backing)
+            if type(backend) is PostgresBackend else None)
         self._entry = None
         self._completed_result = None
         self._acknowledgments = ()
@@ -137,8 +175,10 @@ class _OriginalSignalOutcome:
                     or backend.connection_generation != self._generation or backend._closing):
                 raise ExecutionAuthorityError('Original signal journal connection retired')
             backend.assert_connected_file_still_valid()
-        elif self._backing is None or backend._pool is not self._backing:
-            raise ExecutionAuthorityError('Original signal journal pool retired')
+        else:
+            if self._backing is None or backend._pool is not self._backing:
+                raise ExecutionAuthorityError('Original signal journal pool retired')
+            self._postgres_pool.require_original(self._backing)
 
     def require_preparation(self, result):
         """Check the sealed return before reservation or callback reentrancy."""
