@@ -46,6 +46,51 @@ async def _fresh_journal_pool(original, **options):
     return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
 
 
+async def test_postgres_successor_journal_reuses_physically_reset_connection(dispatcher_components, native_pg, monkeypatch):
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    from kestrel_sovereign.storage.db import postgres as pg
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    original_pool = c.backend._pool
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    c.backend._pool = pool
+    retired, release = asyncio.Event(), asyncio.Event()
+    original_join = pg.await_owned_task
+    held, natives, tasks = [], [], []
+    async def hold_join(task, *args, **kwargs):
+        outcome = await original_join(task, *args, **kwargs)
+        journal = c.dispatcher._original_outcome_writer.get()
+        if journal is not None and task.get_name().endswith(':postgres-original-pool-reset') and not held:
+            held.append(task)
+            natives.append(journal._postgres_session)
+            retired.set()
+            await release.wait()
+        return outcome
+    monkeypatch.setattr(pg, 'await_owned_task', hold_join)
+    c.registry.register(_action_reg('healthy.successor.journal'))
+    try:
+        tasks.append(create_owned_task(c.dispatcher.dispatch_signal(_signal('healthy.successor.journal'))))
+        await asyncio.wait_for(retired.wait(), 3)
+        assert held[0].done(), 'test must observe actual physical pool retirement'
+        tasks.append(create_owned_task(c.dispatcher.dispatch_signal(_signal('healthy.successor.journal'))))
+        successor = await asyncio.wait_for(await_owned_task(tasks[-1]), 3)
+        assert successor.error is None
+        assert not natives[0].is_closed(), 'healthy reused connection was terminated by stale seal'
+        release.set()
+        original = await await_owned_task(tasks[0])
+        assert original.error is None
+        assert c.dispatcher._log_write_failures == 0
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 2
+    finally:
+        release.set()
+        for task in tasks:
+            await await_owned_task(task)
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
 async def test_postgres_program_configuration_stays_fenced_through_actual_reset(dispatcher_components, native_pg, monkeypatch):
     from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
     from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection, NativeJournalConfigurationError

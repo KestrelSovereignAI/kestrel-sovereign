@@ -68,6 +68,36 @@ async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatche
     assert not effects and is_execution_control_error(error)
 
 
+async def test_original_sqlite_refuses_noop_native_autocommit(dispatcher_components):
+    import sqlite3
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    native = c.backend._connection._conn
+    if not hasattr(native, 'autocommit'):
+        pytest.skip('Native autocommit property was added in Python 3.12')
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        await c.backend._connection._execute(setattr, native, 'autocommit', True)
+        scope.revoke('actual cutoff after configuring no-op commit mode')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.noop.commit', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.noop.commit'))
+            except BaseException as caught:
+                error = caught
+        assert is_execution_control_error(error), 'native no-op COMMIT was acknowledged as durable'
+        assert not native.in_transaction, 'original journal returned with an unresolved native transaction'
+    finally:
+        def restore_native_mode():
+            if native.in_transaction:
+                native.execute('ROLLBACK').close()
+            native.autocommit = sqlite3.LEGACY_TRANSACTION_CONTROL
+        await c.backend._connection._execute(restore_native_mode)
+
+
 @pytest.mark.parametrize('installed', ['before', 'handler'])
 async def test_sqlite_journal_refuses_trace_program_through_commit(dispatcher_components, installed):
     from kestrel_sovereign.execution_custody import is_execution_control_error

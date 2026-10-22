@@ -1989,6 +1989,60 @@ async def test_hold_read_failure_after_claim_releases_exact_lease(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('registered_before_refusal', [False, True])
+async def test_failed_enqueue_callback_publication_joins_and_releases_original(tmp_path, registered_before_refusal):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.hold import HoldTurnRefusal
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / 'failed-enqueue-publication.db', 'did:agent:failed-enqueue-publication')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=1)
+    signal = _channel_signal(agent.did, 'publication-failure')
+    rejected = RuntimeError('actual durable reservation callback publication refused')
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    accepted = []
+    class RejectRelease(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'release_live_admission':
+                if registered_before_refusal:
+                    super().add_done_callback(callback, context=context)
+                raise rejected
+            return super().add_done_callback(callback, context=context)
+    def rejecting_factory(loop, coro, **kwargs):
+        task = RejectRelease(coro, loop=loop, **kwargs)
+        accepted.append(task)
+        return task
+    async def defer(prompt):
+        raise HoldTurnRefusal(agent_id=agent.did, effective_state=_held_state(agent.did))
+    agent.process_input = defer
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        loop.set_task_factory(rejecting_factory)
+        try:
+            with pytest.raises(BaseException):
+                await dispatcher.enqueue_durable_cognition(signal,
+                    source_event_id='telegram:update:publication-failure', consumer_id=consumer.consumer_id)
+        finally:
+            loop.set_task_factory(factory)
+        original_dispatch = next(task for task in agent.tasks if task.get_name().startswith('durable_cognition:'))
+        joined_before_manual_cleanup = original_dispatch.done()
+        await await_owned_task(original_dispatch)
+        await asyncio.sleep(0)
+        assert joined_before_manual_cleanup, 'enqueue unwound without joining its accepted dispatch'
+        assert signal.id not in dispatcher._live_durable_cognition_event_ids
+        [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
+        assert delivery.status == RETRY and delivery.attempts == 0
+    finally:
+        loop.set_task_factory(factory)
+        for task in accepted:
+            await await_owned_task(task)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 async def test_mutable_enqueued_id_releases_original_first_claim_fence(tmp_path):
     from kestrel_sdk.signals import Visibility
     from kestrel_sovereign.hold import HoldTurnRefusal
