@@ -525,6 +525,18 @@ class _OriginalSignalOutcome:
                 or asyncio.current_task() is not self._writer_admission.task):
             raise ExecutionAuthorityError('Original SQLite journal native owner differs')
 
+    def retain_observation(self, error):
+        """A withdrawing observer keeps this original writer's whole evidence.
+
+        Healthy best-effort completion stays healthy. A later withdrawal must
+        not discard an ordinary SQL failure merely because its original writer
+        already completed and correctly retired without a COMMIT receipt.
+        """
+        if error is None:
+            return None
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        return self.retain_committed(execution_observation_error(error, self._ordinary_writer_failure))
+
     def retain_committed(self, error):
         """Retain the actual terminal INSERT fact, never new work authority."""
         if error is None or not self.has_acknowledged_commit():

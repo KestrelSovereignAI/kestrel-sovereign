@@ -3025,15 +3025,13 @@ class SignalDispatcher:
                 await self._join_outcome_log_tasks(tasks)
             except BaseException as error:
                 cleanup = error
-        if journal is not None:
-            original = journal.retain_committed(original)
-            if original is not None or cleanup is not None:
-                cleanup = execution_observation_error(cleanup, journal._ordinary_writer_failure)
         if all(error is None or type(error) is asyncio.CancelledError for error in (original, cleanup)):
             # Pure ordinary Stop retains its legacy cancellation shape. An
             # independent failure must not be selected away by that policy.
-            return execution_finite_error(original, cleanup, retain_originals=True)
-        return execution_observation_error(original, cleanup)
+            terminal = execution_finite_error(original, cleanup, retain_originals=True)
+        else:
+            terminal = execution_observation_error(original, cleanup)
+        return journal.retain_observation(terminal) if journal is not None else terminal
 
     @asynccontextmanager
     async def _joined_original_outcome_scope(self, signal_id):
@@ -3070,8 +3068,8 @@ class SignalDispatcher:
                 if (outcome.cancellation is None and isinstance(observed_error, Exception) and not is_execution_control_error(observed_error)
                         and execution_commit_outcome(observed_error) is None):
                     observed_error = None  # ordinary audit loss, not a failed handler
-            originals.extend((journal.retain_committed(observed_error),
-                              journal.retain_committed(outcome.cancellation))
+            originals.extend((journal.retain_observation(observed_error),
+                              journal.retain_observation(outcome.cancellation))
                 if journal is not None else (observed_error, outcome.cancellation))
             reconciliation = self._outcome_log_reconciliations.get(task)
             if task.done() and reconciliation is not None:
@@ -3081,7 +3079,7 @@ class SignalDispatcher:
                     if (outcome.cancellation is None and isinstance(publication_error, Exception) and not is_execution_control_error(publication_error)
                             and execution_commit_outcome(publication_error) is None):
                         publication_error = None
-                publication_error = (journal.retain_committed(publication_error)
+                publication_error = (journal.retain_observation(publication_error)
                     if journal is not None else publication_error)
                 originals.append(publication_error)
                 self._retain_durable_writer_control(publication_error)
@@ -5132,7 +5130,7 @@ class SignalDispatcher:
             terminal = (execution_finite_error(*errors, retain_originals=True) if cancellation_only
                         else execution_observation_error(*errors))
             for completed_journal in resident_journals:
-                terminal = completed_journal.retain_committed(terminal)
+                terminal = completed_journal.retain_observation(terminal)
             if terminal is not None:
                 raise terminal
             return outcome.result
@@ -7850,7 +7848,7 @@ class SignalDispatcher:
         committed = journal is not None and journal.has_acknowledged_commit()
         if committed:
             exc = journal.retain_committed(exc)
-        withdrawal = (journal.retain_committed(outcome.cancellation)
+        withdrawal = (journal.retain_observation(outcome.cancellation)
             if journal is not None else outcome.cancellation)
         if exc is not None:
             # A dropped audit row is a loss, and a loss that leaves no record
