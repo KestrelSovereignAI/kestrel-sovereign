@@ -77,6 +77,7 @@ from .interface import (
 )
 from .placeholder import sqlite_to_postgres
 from .timestamp import TimestamptzParameter
+from .native_journal_programs import NativeJournalPostgresConnection, NativeJournalConfigurationError
 from .transaction_control import reject_transaction_control
 from .write_audit import record_write_query, record_write_script
 
@@ -827,12 +828,14 @@ class PostgresBackend(DatabaseBackend):
             if self._dsn:
                 self._pool = await asyncpg.create_pool(
                     self._dsn,
+                    connection_class=NativeJournalPostgresConnection,
                     min_size=self._min_pool_size,
                     max_size=self._max_pool_size,
                 )
             else:
                 self._pool = await asyncpg.create_pool(
                     host=self._host,
+                    connection_class=NativeJournalPostgresConnection,
                     port=self._port,
                     database=self._database,
                     user=self._user,
@@ -2217,7 +2220,13 @@ class PostgresBackend(DatabaseBackend):
                    n.nspname AS schema_name, c.relname AS relation_name,
                    ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute AS a
                          WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
-                         ORDER BY a.attnum) AS column_names
+                         ORDER BY a.attnum) AS column_names,
+                   ARRAY(SELECT a.atttypid::bigint FROM pg_catalog.pg_attribute AS a
+                         WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+                         ORDER BY a.attnum) AS column_type_oids,
+                   ARRAY(SELECT a.atttypmod FROM pg_catalog.pg_attribute AS a
+                         WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+                         ORDER BY a.attnum) AS column_type_modifiers
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid  OPERATOR(pg_catalog.=)  c.relnamespace
             WHERE c.oid  OPERATOR(pg_catalog.=)  pg_catalog.to_regclass($1) AND c.relkind  OPERATOR(pg_catalog.=)  'r'
@@ -2244,7 +2253,17 @@ class PostgresBackend(DatabaseBackend):
         if row is None or row['relation_name'] != 'signal_log':
             return None
         fields = dict(row)
-        if set(fields.pop('column_names')) != set(_OUTCOME_COLUMNS):
+        columns = fields.pop('column_names')
+        types = fields.pop('column_type_oids')
+        modifiers = fields.pop('column_type_modifiers')
+        if set(columns) != set(_OUTCOME_COLUMNS) or any(modifier != -1 for modifier in modifiers):
+            return None
+        builtin = asyncpg.protocol.protocol.BUILTIN_TYPE_NAME_MAP
+        expected = {name: builtin['text'] for name in _OUTCOME_COLUMNS}
+        expected.update(duration_ms=builtin['int4'], payload_raw=builtin['jsonb'],
+                        dispatched_at=builtin['timestamptz'], completed_at=builtin['timestamptz'],
+                        retention_until=builtin['timestamptz'])
+        if len(types) != len(columns) or any(oid != expected[name] for name, oid in zip(columns, types)):
             return None
         return _OriginalPostgresJournalRelation(**fields)
 
@@ -2263,6 +2282,9 @@ class PostgresBackend(DatabaseBackend):
         journal._require_backing()
         async with self._tracked_pool_checkout(journal._backing, admit_work=True) as (connection, _):
             journal._require_backing()
+            native = connection._con
+            if type(native) is not NativeJournalPostgresConnection or not native._original_journal_programs_supported():
+                raise ExecutionAuthorityError('Original journal requires a plain fenced native PostgreSQL session')
             relation = await self._read_original_signal_outcome_relation(connection, 'signal_log')
             if relation is None:
                 raise ExecutionAuthorityError('Original native signal journal requires its plain permanent audit table')
@@ -2284,9 +2306,21 @@ class PostgresBackend(DatabaseBackend):
         query, _ = sqlite_to_postgres(journal._query)
         match_query, _ = sqlite_to_postgres(journal._match_query)
         state = None
+        native = None
+        program_sealed = False
         try:
             async with self._tracked_pool_checkout(journal._backing, admit_work=False) as (connection, state):
                 journal.require_original(self)
+                native = connection._con
+                try:
+                    if type(native) is not NativeJournalPostgresConnection:
+                        raise NativeJournalConfigurationError('Unfenced native PostgreSQL session')
+                    native._begin_original_journal(state)
+                    program_sealed = True
+                except NativeJournalConfigurationError as error:
+                    native.terminate()  # No query/reset may run an application codec.
+                    raise journal.write_refusal('native_programs_changed') from error
+                journal._postgres_session = native
                 async with self._tracked_native_transaction(connection, state.scopes, state):
                     journal.require_original(self)
                     # Privileged catalog/proof operators must not resolve via
@@ -2322,6 +2356,10 @@ class PostgresBackend(DatabaseBackend):
                 journal._acknowledgments = tuple(state.acknowledgments)
                 raise state.retain_acknowledgments(error)
             raise
+        finally:
+            if program_sealed:
+                native._end_original_journal()
+            journal._postgres_session = None
         return entry.result_summary
 
     async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):

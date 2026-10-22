@@ -40,6 +40,12 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
+async def _fresh_journal_pool(original, **options):
+    import asyncpg
+    options.setdefault('connection_class', original._connection_class)
+    return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
+
+
 @pytest.mark.parametrize('installed', ['before', 'handler'])
 async def test_postgres_journal_refuses_custom_connection_codecs(dispatcher_components, native_pg, installed):
     import asyncpg
@@ -49,7 +55,7 @@ async def test_postgres_journal_refuses_custom_connection_codecs(dispatcher_comp
     c = dispatcher_components
     _, control, schema = native_pg
     original_pool = c.backend._pool
-    pool = await asyncpg.create_pool(*original_pool._connect_args, **original_pool._connect_kwargs, min_size=0, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=1)
     c.backend._pool = pool
     effects, substituted = [], []
     def encode(value):
@@ -153,8 +159,7 @@ async def test_postgres_journal_refuses_application_pool_programs(dispatcher_com
               {'connect': connect} if callback_kind == 'connect' else
               {'connection_class': CustomConnection} if callback_kind == 'connection_class' else
               {'record_class': CustomRecord} if callback_kind == 'record_class' else {})
-    pool = await asyncpg.create_pool(*original_pool._connect_args, **original_pool._connect_kwargs,
-        min_size=0, max_size=2, **custom)
+    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=2, **custom)
     c.backend._pool = PostgresPoolAdapter(pool, wrapper) if callback_kind == 'adapter' else pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     async def handler(payload):
@@ -192,7 +197,7 @@ async def test_postgres_original_journal_proof_ignores_shadowed_equality(dispatc
     kwargs = dict(original_pool._connect_kwargs)
     kwargs['server_settings'] = {**kwargs.get('server_settings', {}), 'search_path': f'"{schema}", pg_catalog'}
     pool = await asyncpg.create_pool(*original_pool._connect_args,
-        **kwargs, min_size=0, max_size=2)
+        **kwargs, min_size=0, max_size=2, connection_class=original_pool._connection_class)
     c.backend._pool = pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     signal = _signal('operator.shadow.audit')
@@ -349,8 +354,7 @@ async def test_postgres_original_journal_rejects_temporary_relation_at_admission
     c = dispatcher_components
     _, control, schema = native_pg
     original_pool = c.backend._pool
-    pool = await asyncpg.create_pool(*original_pool._connect_args,
-        **original_pool._connect_kwargs, min_size=0, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=1)
     c.backend._pool = pool
     effects = []
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
@@ -395,8 +399,7 @@ async def test_original_journal_refuses_enclosing_transaction_before_destination
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
     original_pool = c.backend._pool
-    pool = await asyncpg.create_pool(*original_pool._connect_args,
-        **original_pool._connect_kwargs, min_size=0, max_size=pool_size)
+    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=pool_size)
     c.backend._pool = pool
     effects = []
     async def handler(payload):
@@ -458,8 +461,7 @@ async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dis
             attempted.append(True)
             journal.acknowledged(c.backend)
     original_pool = c.backend._pool
-    pool = await asyncpg.create_pool(*original_pool._connect_args,
-        **original_pool._connect_kwargs, min_size=0, max_size=2, setup=setup)
+    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=2, setup=setup)
     c.backend._pool = pool
     entered, release = asyncio.Event(), asyncio.Event()
     effects = []

@@ -27,6 +27,7 @@ from typing import (
 )
 
 import aiosqlite
+from .native_journal_programs import _NativeJournalSQLiteConnection
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
@@ -1280,11 +1281,13 @@ class SQLiteBackend(DatabaseBackend):
                     self._cold_read_uri(),
                     uri=True,
                     timeout=_SQLITE_BUSY_TIMEOUT_S,
+                    factory=_NativeJournalSQLiteConnection,
                 )
             else:
                 self._connection = await aiosqlite.connect(
                     str(self._resolved_path) if self._resolved_path is not None else ":memory:",
                     timeout=_SQLITE_BUSY_TIMEOUT_S,
+                    factory=_NativeJournalSQLiteConnection,
                 )
 
             if self._resolved_path is not None:
@@ -2228,7 +2231,7 @@ class SQLiteBackend(DatabaseBackend):
         conn = journal._backing
         def native_relation():
             native = conn._conn
-            if native.text_factory is not str:
+            if type(native) is not _NativeJournalSQLiteConnection or not native._original_journal_programs_supported():
                 return None
             cursor = native.cursor()
             cursor.row_factory = None
@@ -2266,7 +2269,7 @@ class SQLiteBackend(DatabaseBackend):
                     if index[4]:
                         cursor.execute("SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?", (index[1],))
                         sql = cursor.fetchone()[0]
-                        if not re.search(r'\bWHERE\s+\(?\s*constitution_hash\s+IS\s+NOT\s+NULL\s*\)?\s*$', sql, re.IGNORECASE):
+                        if not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
                             return None
                 return (version, *row, columns)
             finally:
@@ -2318,7 +2321,7 @@ class SQLiteBackend(DatabaseBackend):
                     if original_outcome is not None:
                         # Exclude external DDL before inspecting the original
                         # relation and BEFORE a trigger program could execute.
-                        await conn.execute('BEGIN IMMEDIATE')
+                        await conn._execute(conn._conn._begin_original_journal)
                         self._require_write_admission(original_outcome)
                         if await self._read_original_signal_outcome_relation(original_outcome) != original_outcome._sqlite_relation:
                             raise original_outcome.write_refusal('destination_changed')

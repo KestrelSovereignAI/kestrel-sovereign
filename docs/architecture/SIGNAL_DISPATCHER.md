@@ -907,6 +907,30 @@ row during reset. Ordinary backend operations retain their separate adapter
 contract. Configure journal namespace through native `server_settings`, not a
 setup callback.
 
+Core-created PostgreSQL pools use `NativeJournalPostgresConnection`, exported
+from `kestrel_sovereign.storage.db.postgres`. Hosts constructing external pools
+must pass this as `asyncpg.create_pool(connection_class=...)` before opting into
+scoped native journals. Unscoped legacy pools retain ordinary append; an
+unfenced external pool cannot claim the stronger scoped contract. No additional
+connection or database slot is allocated by this connection class.
+
+Core-owned SQLite connections likewise track native callback/function/extension
+registration. A customized session remains ineligible for original journals until
+reconnect, including after callback removal. This is a supported configuration
+boundary, not a Python/native-code sandbox. Actual journal BEGIN seals SQLite
+program configuration through actual COMMIT/rollback; PostgreSQL configuration
+is sealed through actual transaction and pool reset. Native connection codecs
+and callback state are checked, not only the pool recipe. PostgreSQL reset's
+advisory-unlock function is catalog-qualified after local search-path restoration.
+No caller attestation or synthetic native completion substitutes for these fences.
+
+PostgreSQL audit columns must have their canonical types and unmodified typmods;
+catalog namespace alone cannot exclude CHAR padding/truncation. SQLite partial
+indexes are accepted only as the complete native constitution-hash declaration,
+not by finding a WHERE-like suffix inside arbitrary SQL/comments. Durable enqueue
+reserves and releases its captured original ID even when a UI emitter changes
+the caller's public Signal, so a genuinely NACKed delivery can be reclaimed.
+
 SQLite's plain audit shape excludes CHECK programs, column collations,
 expression/custom-collation indexes and noncanonical partial predicates; the
 native constitution-hash non-null index remains supported. CHECK keywords are

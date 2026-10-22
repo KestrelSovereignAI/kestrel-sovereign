@@ -139,10 +139,11 @@ class _OriginalPostgresJournalPool:
     @staticmethod
     def _require_native_programs(native, wrapper):
         import asyncpg
-        if (wrapper is not None or native._setup is not None
+        from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+        if (type(native) is not asyncpg.Pool or wrapper is not None or native._setup is not None
                 or native._init is not None or native._reset is not None
                 or native._connect is not asyncpg.connection.connect
-                or native._connection_class is not asyncpg.Connection
+                or native._connection_class is not NativeJournalPostgresConnection
                 or native._record_class is not asyncpg.Record
                 or any(holder._setup is not None for holder in native._holders)):
             raise ExecutionAuthorityError('Original signal journal refuses application pool programs')
@@ -239,6 +240,7 @@ class _OriginalSignalOutcome:
             _OriginalPostgresJournalPool.capture(self._backing)
             if type(backend) is PostgresBackend else None)
         self._postgres_relation = None
+        self._postgres_session = None
         self._sqlite_relation = None
         self._entry = None
         self._completed_result = None
@@ -310,10 +312,19 @@ class _OriginalSignalOutcome:
                         or backend.connection_generation != self._generation or backend._closing):
                     raise ExecutionAuthorityError('Original signal journal connection retired')
                 backend.assert_connected_file_still_valid()
+                from kestrel_sovereign.storage.db.native_journal_programs import _NativeJournalSQLiteConnection
+                native = self._backing._conn
+                if type(native) is not _NativeJournalSQLiteConnection or not native._original_journal_programs_supported():
+                    if self._completed_result is not None:
+                        raise self.write_refusal('native_programs_changed')
+                    raise ExecutionAuthorityError('Original journal requires a plain native SQLite connection')
             else:
                 if self._backing is None or backend._pool is not self._backing:
                     raise ExecutionAuthorityError('Original signal journal pool retired')
                 self._postgres_pool.require_original(self._backing)
+                session = self._postgres_session
+                if session is not None and not session._original_journal_programs_supported():
+                    raise self.write_refusal('native_programs_changed')
         finally:
             self._observer_depth -= 1
 
@@ -448,6 +459,10 @@ async def _capture_original_outcome(dispatcher, signal, registration, *, accepta
     if native and type(backend) is PostgresBackend:
         native = postgres_module.ASYNCPG_AVAILABLE and isinstance(
             backend._pool, (postgres_module.asyncpg.Pool, PostgresPoolAdapter))
+        if native:
+            from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+            pool = backend._pool.native_pool if isinstance(backend._pool, PostgresPoolAdapter) else backend._pool
+            native = pool._connection_class is NativeJournalPostgresConnection
     if not native:
         if current_execution_custody(dispatcher._agent) or current_execution_custody(backend):
             raise ExecutionAuthorityError('Hosted terminal journal requires a supported native backend')

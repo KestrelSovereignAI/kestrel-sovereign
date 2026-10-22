@@ -17,6 +17,7 @@ from kestrel_sovereign.execution_custody import (
     require_execution_work,
 )
 from kestrel_sovereign.storage.db.postgres import PostgresBackend, PostgresPoolAdapter
+from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -32,6 +33,7 @@ async def native_pg():
     await control.execute(f'CREATE SCHEMA "{schema}"')
     pool = await asyncpg.create_pool(
         dsn, min_size=0, max_size=2,
+        connection_class=NativeJournalPostgresConnection,
         server_settings={"search_path": schema},
     )
     backend = PostgresBackend.from_pool(pool, advisory_max_pool_size=1)

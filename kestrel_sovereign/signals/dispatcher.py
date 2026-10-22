@@ -1397,12 +1397,13 @@ class SignalDispatcher:
             _durable_delivery_consumer_id=consumer_id,
             _durable_admission_fence=admission_fence,
         )
-        self._live_durable_cognition_event_ids.add(signal.id)
+        enqueued_signal_id = signal.id
+        self._live_durable_cognition_event_ids.add(enqueued_signal_id)
         task = self._agent._track_background_task(
-            coro, name=f"durable_cognition:{consumer_id}:{signal.id}"
+            coro, name=f"durable_cognition:{consumer_id}:{enqueued_signal_id}"
         )
         def release_live_admission(_task: asyncio.Task[SignalResult]) -> None:
-            self._live_durable_cognition_event_ids.discard(signal.id)
+            self._live_durable_cognition_event_ids.discard(enqueued_signal_id)
             # A NACK can have committed just before the task becomes terminal.
             # Re-scan only after releasing this local first-claim fence.
             if consumer_id in self._started_durable_cognition_consumers:
@@ -1416,7 +1417,7 @@ class SignalDispatcher:
             release_live_admission, context=self._resident_timer_context(),
         )
         return SignalDispatchHandle(
-            signal_id=signal.id,
+            signal_id=enqueued_signal_id,
             task=task,
             durable_admission=durable_admission,
         )
