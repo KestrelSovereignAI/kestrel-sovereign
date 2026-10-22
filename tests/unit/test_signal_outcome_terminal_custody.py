@@ -29,7 +29,7 @@ class _OriginalWork:
         self.require_work()
 
 
-@pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'check', 'check_comment'])
+@pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'predicate_comment', 'check', 'check_comment'])
 async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatcher_components, shape):
     from kestrel_sovereign.execution_custody import is_execution_control_error
     c = dispatcher_components
@@ -47,6 +47,8 @@ async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatche
         await c.backend.execute(sql.rstrip()[:-1] + ', CHECK' + gap + '(journal_program(id)=id))')
     elif shape == 'expression_index':
         await c.backend.execute('CREATE INDEX journal_program_index ON signal_log(journal_program(id))')
+    elif shape == 'predicate_comment':
+        await c.backend.execute('CREATE INDEX journal_program_index ON signal_log(id) WHERE journal_program(id) OR -- WHERE\n constitution_hash IS NOT NULL')
     else:
         await c.backend.execute('CREATE INDEX journal_program_index ON signal_log(id) WHERE journal_program(id)=id')
     scope = ExecutionCustody(_OriginalWork())
@@ -64,6 +66,43 @@ async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatche
             error = caught
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM forbidden_schema_effect') == 0, 'privileged journal executed application schema SQL'
     assert not effects and is_execution_control_error(error)
+
+
+@pytest.mark.parametrize('installed', ['before', 'handler'])
+async def test_sqlite_journal_refuses_trace_program_through_commit(dispatcher_components, installed):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    armed, deleted, effects = [], [], []
+    signal = _signal('native.trace.commit')
+    def trace(query):
+        if armed and not deleted and query.strip().upper() == 'COMMIT':
+            deleted.append(True)
+            c.backend._connection._conn.execute('DELETE FROM signal_log WHERE id=?', (signal.id,))
+    if installed == 'before':
+        await c.backend._connection.set_trace_callback(trace)
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        effects.append(True)
+        if installed == 'handler':
+            await c.backend._connection.set_trace_callback(trace)
+        armed.append(True)
+        scope.revoke('actual cutoff before trace COMMIT program')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.trace.commit', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(signal)
+            except BaseException as caught:
+                error = caught
+    finally:
+        armed.clear()
+        await c.backend._connection.set_trace_callback(None)
+    assert not deleted, 'application trace deleted the row after native verification'
+    assert is_execution_control_error(error)
+    assert len(effects) == (installed == 'handler')
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
 
 
 async def test_sqlite_journal_refuses_noncanonical_column_affinity(dispatcher_components):

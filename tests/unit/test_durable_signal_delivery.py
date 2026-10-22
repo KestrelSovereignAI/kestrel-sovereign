@@ -1989,6 +1989,52 @@ async def test_hold_read_failure_after_claim_releases_exact_lease(
 
 
 @pytest.mark.asyncio
+async def test_mutable_enqueued_id_releases_original_first_claim_fence(tmp_path):
+    from kestrel_sdk.signals import Visibility
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / 'mutable-enqueue-identity.db', 'did:agent:mutable-enqueue')
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID, source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}',
+        max_attempts=1)
+    signal = replace(_channel_signal(agent.did, 'mutable-id'), visibility=Visibility.USER_VISIBLE)
+    original_id = signal.id
+    emitted = []
+    async def emit(kind, payload):
+        if kind == 'signal_completed':
+            emitted.append(True)
+            signal.id = 'public-id-changed-after-terminal-emission'
+    agent.emit_event = emit
+    async def defer(prompt):
+        raise HoldTurnRefusal(agent_id=agent.did, effective_state=_held_state(agent.did))
+    agent.process_input = defer
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(signal,
+            source_event_id='telegram:update:mutable-id', consumer_id=consumer.consumer_id)
+        result = await asyncio.wait_for(handle.wait(), _HANG_GUARD_SECONDS)
+        await asyncio.sleep(0)
+        [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
+        assert result.status is Status.COALESCED and emitted
+        assert delivery.status == RETRY and delivery.attempts == 0
+        assert original_id not in dispatcher._live_durable_cognition_event_ids, 'completed enqueue stranded its original live-event reservation'
+        async def resume(prompt):
+            return 'genuine resumed turn'
+        agent.process_input = resume
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
+            while True:
+                [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
+                if delivery.status == ACKNOWLEDGED:
+                    break
+                await asyncio.sleep(0.01)
+        assert delivery.attempts == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 async def test_late_hold_refusal_preserves_durable_retry_budget(tmp_path):
     """The universal turn gate returns its exact lease without an attempt."""
 

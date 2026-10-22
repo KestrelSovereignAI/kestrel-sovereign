@@ -40,6 +40,82 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
+@pytest.mark.parametrize('installed', ['before', 'handler'])
+async def test_postgres_journal_refuses_custom_connection_codecs(dispatcher_components, native_pg, installed):
+    import asyncpg
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    original_pool = c.backend._pool
+    pool = await asyncpg.create_pool(*original_pool._connect_args, **original_pool._connect_kwargs, min_size=0, max_size=1)
+    c.backend._pool = pool
+    effects, substituted = [], []
+    def encode(value):
+        if value == 'original-summary':
+            substituted.append(True)
+            return 'substituted-summary'
+        return value
+    async def configure():
+        async with pool.acquire() as connection:
+            await connection.set_type_codec('text', schema='pg_catalog', encoder=encode, decoder=str, format='text')
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    async def handler(payload):
+        effects.append(True)
+        if installed == 'handler':
+            await configure()
+        scope.revoke('actual cutoff after native connection codec configuration')
+        return {'genuine': True}
+    registration = _action_reg('connection.codec.audit', handler=handler)
+    registration.result_summary = lambda result: 'original-summary'
+    c.registry.register(registration)
+    error = None
+    try:
+        if installed == 'before':
+            await configure()
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('connection.codec.audit'))
+            except BaseException as caught:
+                error = caught
+        assert not substituted, 'application codec substituted INSERT and exact proof together'
+        assert is_execution_control_error(error)
+        assert len(effects) == (installed == 'handler')
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 0
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
+async def test_postgres_journal_refuses_noncanonical_column_type_and_typmod(dispatcher_components, native_pg):
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    effects = []
+    async def handler(payload):
+        await c.backend.execute('ALTER TABLE signal_log ALTER COLUMN result_summary TYPE character(2)')
+        effects.append(True)
+        scope.revoke('actual cutoff after native text coercion configured')
+        return {'genuine': True}
+    registration = _action_reg('column.coercion.audit', handler=handler)
+    registration.result_summary = lambda result: 'ok '
+    c.registry.register(registration)
+    error = None
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        try:
+            await c.dispatcher.dispatch_signal(_signal('column.coercion.audit'))
+        except BaseException as caught:
+            error = caught
+    assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 0, 'column coercion committed a different value while equality certified it'
+    assert effects == [True] and is_execution_control_error(error)
+    assert c.dispatcher._log_write_failures == 1
+
+
 @pytest.mark.parametrize('callback_kind', ['setup', 'reset', 'init', 'connect', 'adapter', 'connection_class', 'record_class'])
 async def test_postgres_journal_refuses_application_pool_programs(dispatcher_components, native_pg, callback_kind):
     import asyncpg
