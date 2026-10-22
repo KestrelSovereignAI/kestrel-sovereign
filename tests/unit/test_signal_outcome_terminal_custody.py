@@ -165,6 +165,59 @@ async def test_sqlite_external_write_refresh_requires_actual_live_work(dispatche
         await other.close()
 
 
+async def test_sqlite_external_commit_during_begin_wait_keeps_live_journal(dispatcher_components, monkeypatch):
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    from kestrel_sovereign.storage.db.native_journal_programs import _NativeJournalSQLiteConnection
+    c = dispatcher_components
+    other = SQLiteBackend(c.backend.db_path)
+    await other.connect()
+    await other.execute('CREATE TABLE begin_wait_effect(value INTEGER)')
+    held, release, beginning = (asyncio.Event() for _ in range(3))
+    native = c.backend._connection._conn
+    original_begin = _NativeJournalSQLiteConnection._begin_original_journal
+    loop = asyncio.get_running_loop()
+    def observe_begin(connection):
+        if connection is native:
+            loop.call_soon_threadsafe(beginning.set)
+        return original_begin(connection)
+    monkeypatch.setattr(_NativeJournalSQLiteConnection, '_begin_original_journal', observe_begin)
+    async def external_writer():
+        async with other.transaction():
+            await other.execute('INSERT INTO begin_wait_effect VALUES(1)')
+            held.set()
+            await release.wait()
+    async def handler(payload):
+        await held.wait()
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.begin.wait', handler=handler))
+    writer = asyncio.create_task(external_writer())
+    dispatch = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=ExecutionCustody(_OriginalWork()))):
+            dispatch = asyncio.create_task(c.dispatcher.dispatch_signal(_signal('native.begin.wait')))
+            await asyncio.wait_for(beginning.wait(), 2)
+            async def wait_for_early_program_fence():
+                while native._journal_program_seal is None:
+                    await asyncio.sleep(.001)
+            await asyncio.wait_for(wait_for_early_program_fence(), 2)
+            assert not writer.done(), 'external writer must still own the native lock'
+            release.set()
+            external = await await_owned_task(writer)
+            outcome = await await_owned_task(dispatch)
+        assert external.error is None
+        assert outcome.error is None, 'healthy original journal retained a pre-lock external generation'
+        assert outcome.result.action_result == {'genuine': True}
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+        assert c.dispatcher._log_write_failures == 0
+        assert native._journal_program_seal is None
+    finally:
+        release.set()
+        await await_owned_task(writer)
+        if dispatch is not None:
+            await await_owned_task(dispatch)
+        await other.close()
+
+
 async def test_sqlite_live_refresh_validator_cannot_reenter_native_commit(dispatcher_components):
     from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
     c = dispatcher_components
@@ -1592,7 +1645,8 @@ async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatc
         await _close(backend, agent)
 
 
-async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(dispatcher_components, monkeypatch):
+@pytest.mark.parametrize('insert_failure', [False, True])
+async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(dispatcher_components, monkeypatch, insert_failure):
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
     from kestrel_sovereign.signals import DurableConsumerRegistration
@@ -1601,8 +1655,15 @@ async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(disp
         DURABLE_COGNITION_MARKER, DURABLE_COGNITION_MARKER_VALUE,
     )
     from tests.unit.test_durable_signal_delivery import _channel_signal
-    from kestrel_sovereign.execution_custody import execution_commit_outcome, _acknowledged_commits
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome, _acknowledged_commits, _explicit_control_chain,
+        execution_cleanup_debts, execution_native_source_error,
+    )
     c = dispatcher_components
+    if insert_failure:
+        c.registry.register(_action_reg('resident.failure.seed'))
+        await c.dispatcher.dispatch_signal(_signal('resident.failure.seed'))
+        await c.backend.execute('CREATE UNIQUE INDEX resident_status_unique ON signal_log(status)')
     scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
     class HostedPublisher(type(c.agent)):
         _runtime_owner_context = KestrelAgent._runtime_owner_context
@@ -1621,22 +1682,27 @@ async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(disp
     consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
         source='channel.message', agent_id=c.agent.did,
         correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=1)
-    journals, callbacks = [], []
+    journals, callbacks, body_errors, residents = [], [], [], []
     original_write = c.dispatcher._write_outcome_log
     async def observe_write(*args, **kwargs):
-        result = await original_write(*args, **kwargs)
         journal = c.dispatcher._original_outcome_writer.get()
-        if journal is not None and journal.has_acknowledged_commit():
-            journals.append(journal)
-        return result
+        try:
+            return await original_write(*args, **kwargs)
+        except Exception as error:
+            body_errors.append(error)
+            raise
+        finally:
+            if journal is not None:
+                journals.append(journal)
     monkeypatch.setattr(c.dispatcher, '_write_outcome_log', observe_write)
     original_track = c.dispatcher._track_resident_durable_task
     def publish_resident(coro, **kwargs):
         waiting_ingress = asyncio.current_task()
         resident = original_track(coro, **kwargs)
+        residents.append(resident)
         def withdraw_after_actual_completion(completed):
             callbacks.append((completed.done(), bool(journals)))
-            waiting_ingress.cancel('actual ingress withdrawal after resident commit')
+            waiting_ingress.cancel('actual ingress withdrawal after resident completion')
         resident.add_done_callback(withdraw_after_actual_completion)
         return resident
     monkeypatch.setattr(c.dispatcher, '_track_resident_durable_task', publish_resident)
@@ -1647,9 +1713,22 @@ async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(disp
             source_event_id='telegram:update:resident-completed-receipt', consumer_id=consumer.consumer_id)
         outcome = await await_owned_task(handle.task)
     assert callbacks == [(True, True)]
-    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
-    assert execution_commit_outcome(outcome.error) == 'committed', 'actual resident terminal receipt disappeared at withdrawn ingress'
-    if c.backend.backend_type == 'postgres':
+    assert residents and all(owner.done() for owner in residents)
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == int(not insert_failure)
+    errors = tuple(_explicit_control_chain(outcome.error))
+    assert any(type(error) is asyncio.CancelledError and error.args == ('actual ingress withdrawal after resident completion',)
+               for error in errors)
+    if insert_failure:
+        assert len(body_errors) == 1
+        assert any(error is body_errors[0] for error in errors), 'withdrawn ingress lost the original resident SQL failure'
+        assert execution_commit_outcome(outcome.error) is None
+        assert not execution_cleanup_debts(outcome.error)
+        assert execution_native_source_error(outcome.error) is None
+        assert all(journal._writer_admission.task.done() and journal._outer_admission.task.done() for journal in journals)
+        assert c.dispatcher._outcome_log_control_error is None
+    else:
+        assert execution_commit_outcome(outcome.error) == 'committed', 'actual resident terminal receipt disappeared at withdrawn ingress'
+    if c.backend.backend_type == 'postgres' and not insert_failure:
         receipts = _acknowledged_commits(outcome.error)
         assert receipts and all(receipt.retired for receipt in receipts)
         assert all(any(actual is receipt for actual in receipts) for journal in journals for receipt in journal._acknowledgments)
