@@ -8,19 +8,13 @@ from kestrel_sovereign.storage.db.native_journal_programs import (
 )
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('upgrade', [False, True])
-async def test_original_numeric_peer_preserves_actual_tls_hostname(tmp_path, upgrade):
-    import asyncio
+def _owned_tls_contexts(tmp_path, name):
     import ssl
     from datetime import datetime, timedelta, timezone
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.x509.oid import NameOID
-    from kestrel_sovereign._async_ownership import await_owned_task
-    from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalConnectLoop
-    name = 'original-journal-peer.invalid'
     key = ec.generate_private_key(ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
     now = datetime.now(timezone.utc)
@@ -37,6 +31,17 @@ async def test_original_numeric_peer_preserves_actual_tls_hostname(tmp_path, upg
     server_context.load_cert_chain(cert_path, key_path)
     client_context = ssl.create_default_context(cafile=str(cert_path))
     assert client_context.check_hostname and client_context.verify_mode == ssl.CERT_REQUIRED
+    return server_context, client_context, cert_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('upgrade', [False, True])
+async def test_original_numeric_peer_preserves_actual_tls_hostname(tmp_path, upgrade):
+    import asyncio
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalConnectLoop
+    name = 'original-journal-peer.invalid'
+    server_context, client_context, _ = _owned_tls_contexts(tmp_path, name)
     names, server_transports, upgrades = [], [], []
     server_context.set_servername_callback(lambda obj, servername, context: names.append(servername))
     loop = asyncio.get_running_loop()
