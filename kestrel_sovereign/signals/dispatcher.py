@@ -1209,7 +1209,7 @@ class SignalDispatcher:
         if staged_admission is not None:
             staged_admission.add_done_callback(publish_resident_admission)
         try:
-            async with self._admit_durable_operation():
+            async with self._admit_durable_operation(), self._joined_original_outcome_scope(signal.id):
                 registration = self._registry.get(signal.source)
                 if registration is not None:
                     from kestrel_sovereign.signals.outcome_custody import (
@@ -2961,6 +2961,34 @@ class SignalDispatcher:
             await self._join_outcome_log_tasks(tasks, finite_errors=finite_errors)
         if self._outcome_log_control_error is not None:
             raise execution_finite_error(self._outcome_log_control_error)
+
+    async def _finish_original_outcomes(self, signal_id, original=None):
+        """An accepted writer cannot outlive its throwing original owner."""
+        journal = self._original_outcome_admission.get()
+        identity = journal._identity[0] if journal is not None else signal_id
+        cleanup = None
+        tasks = tuple(self._outcome_log_tasks_by_signal.get(identity, ()))
+        if tasks:
+            try:
+                await self._join_outcome_log_tasks(tasks)
+            except BaseException as error:
+                cleanup = error
+        if journal is not None:
+            original = journal.retain_committed(original)
+        return execution_finite_error(original, cleanup, retain_originals=True)
+
+    @asynccontextmanager
+    async def _joined_original_outcome_scope(self, signal_id):
+        original = None
+        try:
+            yield
+        except BaseException as error:
+            original = error
+            raise
+        finally:
+            terminal = await self._finish_original_outcomes(signal_id, original)
+            if terminal is not None and terminal is not original:
+                raise terminal
 
     async def _drain_outcome_logs_for_signal(self, signal_id: str) -> None:
         """Join this dispatch's outcome writers before returning its result."""
@@ -5078,6 +5106,8 @@ class SignalDispatcher:
                         journal._identity[0] if journal is not None else signal.id)
                 except BaseException as error:
                     cleanup = error
+                cleanup = await self._finish_original_outcomes(
+                    journal._identity[0] if journal is not None else signal.id, cleanup)
                 terminal = execution_finite_error(original, cleanup, retain_originals=True)
                 if terminal is not None:
                     raise terminal
@@ -5935,10 +5965,6 @@ class SignalDispatcher:
         result: SignalResult,
     ) -> None:
         """Write exactly one durable-cognition outcome after lease finality."""
-
-        journal = self._original_outcome_admission.get()
-        if journal is not None:
-            journal._completed_result = result
 
         if len(outcomes) == 1:
             outcome = outcomes[0]
@@ -7594,13 +7620,18 @@ class SignalDispatcher:
                 )
             )
             return
-        reservation = self._reserve_durable_admission()
         journal = self._original_outcome_admission.get()
+        if journal is not None:
+            # Only actual pipeline-return boundaries seal _completed_result.
+            # Reentrant/helper attempts cannot reserve/consume the real row.
+            journal.require_preparation(result)
+        reservation = self._reserve_durable_admission()
         token = None
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         publication = OwnedTaskAdmission()
         try:
             if journal is not None:
+                journal._phase = 'preparing'
                 try:
                     prepared = self._store._prepare_outcome(journal._signal_snapshot,
                         journal._registration_snapshot, result,

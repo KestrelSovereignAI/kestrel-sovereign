@@ -137,6 +137,106 @@ async def test_handler_cannot_mint_unrelated_journal_and_self_attach(dispatcher_
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
 
 
+@pytest.mark.parametrize('callback', ['redaction', 'summary'])
+@pytest.mark.parametrize('cutoff', [False, True])
+@pytest.mark.parametrize('result_kind', ['fabricated', 'genuine'])
+async def test_projection_cannot_reauthorize_fabricated_result_through_finalizer(dispatcher_components, callback, cutoff, result_kind):
+    from kestrel_sdk.signals import RedactionPolicy, SignalResult, SignalMode, Status
+    c = dispatcher_components
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    owner = SimpleNamespace(_execution_custody=scope)
+    attempted, refused = [], []
+    async def handler(payload):
+        if cutoff:
+            scope.revoke('actual original work cutoff before projection')
+        return {'genuine': True}
+    registration = _action_reg('reentrant.projection.audit', handler=handler)
+    signal = _signal('reentrant.projection.audit')
+    fabricated = SignalResult(signal_id=signal.id, status=Status.FAILED,
+        mode=SignalMode.ACTION, duration_ms=0, action_result={'fabricated': True}, error='forged terminal result')
+    def projection(payload):
+        if not attempted:
+            attempted.append(True)
+            try:
+                requested = (c.dispatcher._original_outcome_admission.get()._completed_result
+                             if result_kind == 'genuine' else fabricated)
+                c.dispatcher._finalize_deferred_durable_outcome([], fallback_signal=signal,
+                    fallback_registration=registration, result=requested)
+            except ExecutionAuthorityError as error:
+                refused.append(error)
+        return '<original projection>'
+    if callback == 'redaction':
+        registration.log_redaction = RedactionPolicy(summarize=projection)
+    else:
+        registration.result_summary = projection
+    c.registry.register(registration)
+    result = error = None
+    with bind_execution_runtime(owner):
+        try:
+            result = await c.dispatcher.dispatch_signal(signal)
+        except BaseException as caught:
+            error = caught
+        escaped = tuple(c.dispatcher._outcome_log_tasks)
+        # A failing counterproof must still physically retire the exact Tasks
+        # it exposes; no fixture retry or raw native-resource cleanup shortcuts.
+        if escaped:
+            try:
+                await c.dispatcher._join_outcome_log_tasks(escaped)
+            except BaseException:
+                pass  # original exploit/retirement evidence is checked below
+    assert not escaped, 'projection allocated writers that escaped their dispatch owner'
+    assert error is None
+    assert refused and attempted == [True]
+    assert result.status is Status.OK and result.action_result == {'genuine': True}
+    assert c.dispatcher._log_write_failures == 0
+    assert c.dispatcher._durable_active_admissions == 0
+    row = await c.backend.fetch_one('SELECT status,error FROM signal_log WHERE id=?', (signal.id,))
+    assert tuple(row) == ('ok', None)
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+
+
+@pytest.mark.parametrize('cutoff', [False, True])
+async def test_error_after_original_writer_acceptance_still_joins_before_owner_exits(dispatcher_components, monkeypatch, cutoff):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_native_source_error, _explicit_control_chain
+    c = dispatcher_components
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    owner = SimpleNamespace(_execution_custody=scope)
+    original = c.dispatcher._schedule_outcome_log
+    publication_error = RuntimeError('actual owner error after original writer accepted')
+    async def handler(payload):
+        if cutoff:
+            scope.revoke('actual original work cutoff')
+        return {'genuine': True}
+    def after_acceptance(*args, **kwargs):
+        before = set(c.dispatcher._outcome_log_tasks)
+        original(*args, **kwargs)
+        if set(c.dispatcher._outcome_log_tasks) - before:
+            raise publication_error
+    monkeypatch.setattr(c.dispatcher, '_schedule_outcome_log', after_acceptance)
+    c.registry.register(_action_reg('accepted.owner.error', handler=handler))
+    signal = _signal('accepted.owner.error')
+    error = None
+    with bind_execution_runtime(owner):
+        try:
+            await c.dispatcher.dispatch_signal(signal)
+        except BaseException as caught:
+            error = caught
+        escaped = tuple(c.dispatcher._outcome_log_tasks)
+        if escaped:
+            try:
+                await c.dispatcher._join_outcome_log_tasks(escaped)
+            except BaseException:
+                pass  # only failing counterproof retirement; assertions below
+    assert not escaped, 'accepted original writer escaped the throwing dispatch owner'
+    assert execution_commit_outcome(error) == 'committed'
+    assert any(member is publication_error for member in _explicit_control_chain(error))
+    assert execution_native_source_error(error) is None
+    assert c.dispatcher._outcome_log_control_error is None
+    assert c.dispatcher._log_write_failures == 0
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+    assert c.dispatcher._durable_active_admissions == 0
+
+
 async def test_original_journal_destination_cannot_follow_mutable_table(dispatcher_components, monkeypatch):
     c = dispatcher_components
     await c.backend.execute('CREATE TABLE redirected_log AS SELECT * FROM signal_log WHERE 1=0')

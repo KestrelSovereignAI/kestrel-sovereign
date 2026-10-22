@@ -140,12 +140,20 @@ class _OriginalSignalOutcome:
         elif self._backing is None or backend._pool is not self._backing:
             raise ExecutionAuthorityError('Original signal journal pool retired')
 
+    def require_preparation(self, result):
+        """Check the sealed return before reservation or callback reentrancy."""
+        if (asyncio.current_task() is not self._acceptance.owner
+                or self._phase != 'accepted'
+                or result is not self._completed_result
+                or self._dispatcher._accepted_signal_outcomes.get(self._acceptance) is not self):
+            raise ExecutionAuthorityError('Original pipeline result preparation unavailable or reentrant')
+
     def bind(self, signal, registration, result, prepared):
         from kestrel_sovereign.signals.store import _PreparedSignalOutcome
         self._require_backing()
         if (result is not self._completed_result
                 or asyncio.current_task() is not self._acceptance.owner
-                or self._phase != 'accepted' or not self.matches(signal, registration)
+                or self._phase != 'preparing' or not self.matches(signal, registration)
                 or result.signal_id != self._identity[0]
                 or type(prepared) is not _PreparedSignalOutcome
                 or type(prepared.values) is not tuple or len(prepared.values) != 30
@@ -161,6 +169,7 @@ class _OriginalSignalOutcome:
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         if (type(self) is not _OriginalSignalOutcome
                 or getattr(self, '_admission_key', None) is not _JOURNAL_ADMISSION
+                or self._dispatcher._accepted_signal_outcomes.get(self._acceptance) is not self
                 or backend is not self._backend
                 or type(self._outer_admission) is not OwnedTaskAdmission
                 or type(self._writer_admission) is not OwnedTaskAdmission

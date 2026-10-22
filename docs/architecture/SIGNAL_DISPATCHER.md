@@ -839,6 +839,11 @@ result can bind the immutable row; handler calls to scheduling helpers cannot
 publish a premature result. The original admitted writer Tasks remain owned
 until physically joined, including failures after Task acceptance but before
 callback publication.
+Result authorization is sealed only where the original public/recovered
+pipeline actually returns, never by a deferred-finalization helper. Projection
+is a non-reentrant phase entered before callbacks; a helper attempt cannot
+reserve another writer or overwrite that result. Throwing dispatch owners
+still join their already accepted writers before acceptance custody is retired.
 
 The original privacy-policy epoch and persistence-gate identity also remain
 fixed. The native INSERT retains that same gate through COMMIT/reset and
