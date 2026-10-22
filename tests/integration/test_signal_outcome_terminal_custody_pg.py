@@ -39,14 +39,15 @@ native_pg = _native_pg_fixture
 
 @pytest.mark.timeout(15, method='thread')
 @pytest.mark.parametrize('entry', ['dispatch', 'enqueue', 'durable_enqueue'])
-async def test_original_journal_refuses_enclosing_transaction_before_destination_checkout(dispatcher_components, entry):
+@pytest.mark.parametrize('pool_size', [2, 1])
+async def test_original_journal_refuses_enclosing_transaction_before_destination_checkout(dispatcher_components, entry, pool_size):
     import asyncpg
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError, _explicit_control_chain
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
     original_pool = c.backend._pool
     pool = await asyncpg.create_pool(*original_pool._connect_args,
-        **original_pool._connect_kwargs, min_size=0, max_size=1)
+        **original_pool._connect_kwargs, min_size=0, max_size=pool_size)
     c.backend._pool = pool
     effects = []
     async def handler(payload):
