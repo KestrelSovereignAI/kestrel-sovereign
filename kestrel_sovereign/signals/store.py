@@ -255,7 +255,7 @@ class SignalLogStore(UnifiedStoreBase):
             constitution_hash=constitution_hash, doctrine_bundle_hash=doctrine_bundle_hash,
             echo_canary_status=echo_canary_status, injected_clauses=injected_clauses,
             dropped_clauses=dropped_clauses, prompt_template_hash=prompt_template_hash)
-        await self._backend.execute(self._outcome_insert_query(), prepared.values)
+        await self._backend.execute(self._outcome_insert_query(self.TABLE), prepared.values)
         return prepared.result_summary
 
     async def _append_original_outcome(self, journal) -> Optional[str]:
@@ -267,10 +267,11 @@ class SignalLogStore(UnifiedStoreBase):
         return await self._backend._append_original_signal_outcome(journal)
 
     @staticmethod
-    def _outcome_insert_query() -> str:
-        # Native terminal custody never follows an instance/class TABLE override.
-        return """
-            INSERT INTO signal_log (
+    def _outcome_insert_query(table: str = 'signal_log') -> str:
+        # Only ordinary append supplies its supported TABLE override. Native
+        # custody captures the fixed default statement before handler execution.
+        return f"""
+            INSERT INTO {table} (
                 id, source, kind, mode, urgency, dedupe_key,
                 target_agent, session_id, caller_redacted, visibility,
                 dispatched_at, completed_at, status, duration_ms,

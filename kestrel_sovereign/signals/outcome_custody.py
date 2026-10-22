@@ -52,12 +52,15 @@ class _OriginalSignalOutcome:
         self._agent = dispatcher._agent
         self._agent_id = dispatcher._agent.did
         self._registration = registration
+        self._query = SignalLogStore._outcome_insert_query()
         self._acceptance = acceptance
         self._identity = self._signal_identity(signal)
         self._backend_scope = getattr(backend, '_execution_custody', None)
         self._backing = backend._connection if type(backend) is SQLiteBackend else backend._pool
         self._generation = backend.connection_generation if type(backend) is SQLiteBackend else None
         self._entry = None
+        self._completed_result = None
+        self._acknowledgments = ()
         self._outer_admission = self._writer_admission = None
         self._phase = 'accepted'
         self._require_backing()
@@ -91,7 +94,8 @@ class _OriginalSignalOutcome:
     def bind(self, signal, registration, result, prepared):
         from kestrel_sovereign.signals.store import _PreparedSignalOutcome
         self._require_backing()
-        if (asyncio.current_task() is not self._acceptance.owner
+        if (result is not self._completed_result
+                or asyncio.current_task() is not self._acceptance.owner
                 or self._phase != 'accepted' or not self.matches(signal, registration)
                 or result.signal_id != self._identity[0]
                 or type(prepared) is not _PreparedSignalOutcome
@@ -131,6 +135,22 @@ class _OriginalSignalOutcome:
         if self._phase != 'submitted':
             raise ExecutionAuthorityError('Original signal journal was not submitted')
         self._phase = 'acknowledged'
+
+    def retain_committed(self, error):
+        """Retain the actual terminal INSERT fact, never new work authority."""
+        if self._phase != 'acknowledged':
+            return error
+        from kestrel_sovereign.execution_custody import (
+            ExecutionCommitOutcomeError, execution_error_with_cause,
+            retain_acknowledged_execution_commit,
+        )
+        for receipt in self._acknowledgments:
+            retain_acknowledged_execution_commit(error, receipt)
+        if self._acknowledgments:
+            return error
+        # SQLite's existing native COMMIT is awaited inline, not an invented
+        # successful Task/ACK receipt. Preserve only its known committed fact.
+        return execution_error_with_cause(ExecutionCommitOutcomeError('committed'), error)
 
 
 def _require_original_signal_outcome(journal, backend):

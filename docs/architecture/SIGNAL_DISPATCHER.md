@@ -826,6 +826,34 @@ signal_log
 
 If a registration doesn't specify a redaction policy, the dispatcher refuses to register the source. No defaults; this is too important to default.
 
+### Original terminal journals and revoked work
+
+An accepted native dispatch retains custody of its one terminal `signal_log`
+row even when its original execution scope is revoked before the handler or
+writer finishes. This is a private dispatcher-to-native-storage contract, not
+a caller capability or a general cleanup/work exemption. Acceptance fixes the
+original envelope, registration, runtime and backend identity, connection or
+pool generation, and SQL destination. Only the genuine returned pipeline
+result can bind the immutable row; handler calls to scheduling helpers cannot
+publish a premature result. The original admitted writer Tasks remain owned
+until physically joined, including failures after Task acceptance but before
+callback publication.
+
+Public, resident, and recovered cognition each retain their original owner;
+recovery uses the canonical envelope from its own claimed delivery. Native
+COMMIT acknowledgment, reset/retirement debt, cancellation, and later identity
+denial retain their original evidence. An acknowledged audit row is never
+evidence that fresh work is authorized or that an external effect is replayable.
+Projection callbacks and UI emission remain ordinary work: control failures
+propagate, and UI emission after revocation is refused even if the row committed.
+An ordinary projection failure records an observable audit loss without
+relabelling an already completed effect as failed.
+
+Ordinary `SignalLogStore.append` still requires ordinary storage authority and
+honors supported table overrides; it does not acquire terminal-journal custody.
+Unsupported legacy unscoped embeddings retain that ordinary append behavior.
+There is no schema migration or new public signal API for this custody boundary.
+
 ### Audit persistence is not pending-delivery durability
 
 `signal_log` is appended after a route succeeds or fails.  It remains the

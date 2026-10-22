@@ -16,6 +16,8 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_projection_control_failure_is_not_a_placeholder,
     test_ordinary_projection_loss_does_not_relabel_completed_effect,
     test_rejected_completion_callback_physically_joins_original_writer,
+    test_handler_cannot_terminalize_through_scheduler_after_cutoff,
+    test_visible_journal_does_not_admit_ui_work_after_cutoff,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -71,4 +73,57 @@ async def test_original_journal_keeps_acknowledged_commit_after_reset_identity_l
     finally:
         c.agent._did = original_id
         monkeypatch.setattr(asyncpg.pool.Pool, 'release', original_release)
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+
+
+async def test_original_journal_reset_failure_retains_exact_commit_and_retirement(
+    dispatcher_components, monkeypatch,
+):
+    import asyncpg
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign._async_ownership import owned_task_error
+    from kestrel_sovereign.execution_custody import _acknowledged_commits, execution_cleanup_debts
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    pool = c.backend._pool
+    original_release = asyncpg.pool.Pool.release
+    tracked_checkout = c.backend._tracked_pool_checkout
+    states = []
+    reset_failure = OSError('original journal reset acknowledgment failed')
+
+    @asynccontextmanager
+    async def observe_checkout(*args, **kwargs):
+        async with tracked_checkout(*args, **kwargs) as (connection, state):
+            if c.dispatcher._original_outcome_writer.get() is not None:
+                states.append(state)
+            yield connection, state
+
+    async def fail_original_reset(original_pool, connection, *args, **kwargs):
+        result = await original_release(original_pool, connection, *args, **kwargs)
+        journal = c.dispatcher._original_outcome_writer.get()
+        if original_pool is pool and journal is not None and journal._phase == 'submitted':
+            raise reset_failure
+        return result
+
+    c.registry.register(_action_reg('reset.failed.audit'))
+    signal = _signal('reset.failed.audit')
+    monkeypatch.setattr(c.backend, '_tracked_pool_checkout', observe_checkout)
+    monkeypatch.setattr(asyncpg.pool.Pool, 'release', fail_original_reset)
+    try:
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(signal)
+        assert len(states) == 1
+        state = states[0]
+        retained = _acknowledged_commits(caught.value)
+        assert retained and state.acknowledgments
+        assert all(any(actual is receipt for actual in retained) for receipt in state.acknowledgments)
+        for receipt in retained:
+            assert receipt.acknowledged
+            assert receipt.retirement_owner is state.retirement.owner
+            assert receipt.retirement_owner.done()
+            assert owned_task_error(receipt.retirement_owner) is reset_failure
+        assert any(owner is state.retirement.owner for _, owner in execution_cleanup_debts(caught.value))
+    finally:
+        monkeypatch.setattr(asyncpg.pool.Pool, 'release', original_release)
+        monkeypatch.setattr(c.backend, '_tracked_pool_checkout', tracked_checkout)
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1

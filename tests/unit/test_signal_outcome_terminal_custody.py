@@ -118,7 +118,7 @@ async def test_handler_cannot_mint_unrelated_journal_and_self_attach(dispatcher_
         except ExecutionAuthorityError:
             rejected.append(True)
         else:
-            result = SignalResult(signal_id=other.id, status=Status.OK, mode=other.mode)
+            result = SignalResult(signal_id=other.id, status=Status.OK, mode=other.mode, duration_ms=0)
             journal.bind(other, registration, result, c.store._prepare_outcome(other, registration, result))
             journal.attach_outer(asyncio.current_task())
             journal.attach_writer(asyncio.current_task())
@@ -223,8 +223,11 @@ async def test_rejected_completion_callback_physically_joins_original_writer(dis
     assert str(rejected) in result.error
 
 
-async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatch):
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('ingress', ['recovered', 'resident'])
+async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatch, legacy, ingress):
     import time
+    from contextlib import nullcontext
     from kestrel_sovereign.signals import DurableConsumerRegistration
     from tests.unit.test_durable_signal_delivery import _channel_dispatcher, _channel_signal, _close
     from kestrel_sovereign.signals.sources.channels import (
@@ -232,6 +235,11 @@ async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatc
     )
     from kestrel_sovereign.execution_custody import is_execution_control_error
     backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'recovered-native-audit.db', 'did:agent:journal-recovery')
+    if legacy:
+        from kestrel_sovereign.signals import SignalLogStore
+        class LegacySignalLogStore(SignalLogStore):
+            pass
+        dispatcher._store = LegacySignalLogStore(backend)
     consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
         source='channel.message', agent_id=agent.did,
         correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=0)
@@ -239,10 +247,25 @@ async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatc
     original = dispatcher._write_outcome_log
     task = None
     scope = ExecutionCustody(_OriginalWork())
+    if ingress == 'resident' and not legacy:
+        # Finite resident-publisher unit fixture: exercise the production
+        # context handoff and Task publisher, not a legacy ambient fallback.
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+        class HostedPublisher(type(agent)):
+            _runtime_owner_context = KestrelAgent._runtime_owner_context
+            _track_runtime_task = KestrelAgent._track_runtime_task
+            _remember_shutdown_control = KestrelAgent._remember_shutdown_control
+        agent.__class__ = HostedPublisher
+        agent._execution_custody = scope
+        agent._background_tasks = set()
+        agent._runtime_publication_ready = asyncio.Event()
+        agent._runtime_publication_ready.set()
 
     async def held_writer(*args, **kwargs):
-        assert dispatcher._original_outcome_writer.get() is not None, (
+        assert (dispatcher._original_outcome_writer.get() is not None) == (not legacy), (
             dispatcher._original_outcome_admission.get(), dispatcher._accepted_signal_outcomes)
+        if not legacy and ingress == 'resident':
+            assert dispatcher._original_outcome_writer.get()._acceptance.owner.get_name().startswith('durable_cognition_owner:')
         entered.set()
         await release.wait()
         return await original(*args, **kwargs)
@@ -251,26 +274,40 @@ async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatc
     try:
         await dispatcher.register_durable_consumer(consumer)
         signal = _channel_signal(agent.did, 'original-recovered-audit')
-        persisted = await dispatcher._durable_store.persist_signal(signal, agent_id=agent.did,
-            source_event_id='recovered-original', retention_days=7,
-            caller_identity=dispatcher._protect_durable_caller_identity(signal))
-        delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
-            event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
-        assert delivery is not None
-        seed = dispatcher._durable_retry_seed(delivery.event)
-        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
-            task = asyncio.create_task(dispatcher._route_durable_cognition_delivery(
-                seed, dispatcher._registry.get(seed.source), time.monotonic(),
-                persisted_event_id=delivery.event_id, consumer_id=consumer.consumer_id,
-                durable_admission=None, durable_created=False, use_live_signal=False,
-                claimed_delivery=delivery))
-            await asyncio.wait_for(entered.wait(), 5)
-            scope.revoke('recovered work cutoff after original delivery settlement')
+        if ingress == 'recovered':
+            persisted = await dispatcher._durable_store.persist_signal(signal, agent_id=agent.did,
+                source_event_id='recovered-original', retention_days=7,
+                caller_identity=dispatcher._protect_durable_caller_identity(signal))
+            delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
+                event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
+            assert delivery is not None
+            seed = dispatcher._durable_retry_seed(delivery.event)
+        else:
+            seed = signal
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)) if not legacy else nullcontext():
+            if ingress == 'recovered':
+                task = asyncio.create_task(dispatcher._route_durable_cognition_delivery(
+                    seed, dispatcher._registry.get(seed.source), time.monotonic(),
+                    persisted_event_id=delivery.event_id, consumer_id=consumer.consumer_id,
+                    durable_admission=None, durable_created=False, use_live_signal=False,
+                    claimed_delivery=delivery))
+            else:
+                handle = await dispatcher.enqueue_durable_cognition(signal, source_event_id='resident-original',
+                    consumer_id=consumer.consumer_id)
+                task = handle.task
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+            except TimeoutError:
+                assert not task.done(), await await_owned_task(task)
+                raise
+            if not legacy:
+                scope.revoke('recovered work cutoff after original delivery settlement')
             release.set()
             outcome = await await_owned_task(task)
             assert outcome.error is None
             await dispatcher._drain_outcome_logs_for_signal(seed.id)
         assert await backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (seed.id,)) == 1
+        assert not dispatcher._accepted_signal_outcomes
     finally:
         release.set()
         if task is not None:
@@ -280,6 +317,100 @@ async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatc
         except BaseException as error:
             assert is_execution_control_error(error)
         await _close(backend, agent)
+
+
+async def test_handler_cannot_terminalize_through_scheduler_after_cutoff(dispatcher_components):
+    from kestrel_sdk.signals import SignalResult, Status
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    entered, release = asyncio.Event(), asyncio.Event()
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    task = None
+
+    async def handler(payload):
+        entered.set()
+        await release.wait()
+        fake = SignalResult(signal_id=signal.id, status=Status.OK, mode=signal.mode,
+                            duration_ms=0, action_result={'fabricated': True})
+        c.dispatcher._schedule_outcome_log(signal, registration, fake)
+        journal = c.dispatcher._original_outcome_admission.get()
+        assert journal._phase == 'accepted'
+        assert journal._entry is None
+        assert not c.dispatcher._outcome_log_tasks
+        return {'genuine': True}
+
+    registration = _action_reg('scheduler.audit', handler=handler)
+    c.registry.register(registration)
+    signal = _signal('scheduler.audit')
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+            await asyncio.wait_for(entered.wait(), 2)
+            scope.revoke('cutoff before handler scheduler attempt')
+            release.set()
+            outcome = await await_owned_task(task)
+            assert outcome.error is None
+            assert outcome.result.action_result == {'genuine': True}
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        try:
+            await c.dispatcher.shutdown_durable_delivery()
+        except BaseException as error:
+            assert is_execution_control_error(error)
+
+
+@pytest.mark.parametrize('boundary', ['before_emit', 'emitter_denial'])
+async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_components, monkeypatch, boundary):
+    from dataclasses import replace
+    from kestrel_sdk.signals import Visibility
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error, _explicit_control_chain
+    c = dispatcher_components
+    entered, release = asyncio.Event(), asyncio.Event()
+    emitted = []
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    original = c.dispatcher._write_outcome_log
+    task = None
+    original_denial = ExecutionAuthorityError('original emitter denial')
+
+    async def emit(*args):
+        emitted.append(args)
+        if boundary == 'emitter_denial':
+            raise original_denial
+
+    async def held_writer(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    c.agent.emit_event = emit
+    monkeypatch.setattr(c.dispatcher, '_write_outcome_log', held_writer)
+    c.registry.register(_action_reg('visible.audit'))
+    signal = replace(_signal('visible.audit'), visibility=Visibility.USER_VISIBLE)
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+            await asyncio.wait_for(entered.wait(), 2)
+            if boundary == 'before_emit':
+                scope.revoke('original work cutoff before visible journal')
+            release.set()
+            outcome = await await_owned_task(task)
+            assert is_execution_control_error(outcome.error)
+            assert execution_commit_outcome(outcome.error) == 'committed'
+            if boundary == 'emitter_denial':
+                assert any(error is original_denial for error in _explicit_control_chain(outcome.error))
+        assert len(emitted) == (0 if boundary == 'before_emit' else 1)
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        try:
+            await c.dispatcher.shutdown_durable_delivery()
+        except BaseException as error:
+            assert is_execution_control_error(error)
 
 
 @pytest.mark.parametrize('change', ['signal', 'agent', 'backend'])

@@ -1173,7 +1173,8 @@ class SignalDispatcher:
         # make a nested signal append to its parent's audit and lose its own
         # final outcome. Every public dispatch begins with a private collector;
         # a durable route installs a fresh one for its one final outcome below.
-        deferred_token = self._deferred_outcome_logs.set(None)
+        original_outcomes = []
+        deferred_token = self._deferred_outcome_logs.set(original_outcomes)
         journal_token = self._original_outcome_admission.set(None)
         # Publish the in-flight signal for the duration of this dispatch so
         # code running inside handlers/turns (e.g. the Talon coordinator's
@@ -1231,6 +1232,19 @@ class SignalDispatcher:
                     durable_terminal_consumer_id=_durable_terminal_consumer_id,
                     durable_admission_fence=_durable_admission_fence,
                 )
+                # Handler code may invoke scheduling helpers, but only this
+                # returned pipeline result can terminalize the original row.
+                # No projection/writer is admitted while the handler runs.
+                self._deferred_outcome_logs.set(None)
+                journal = self._original_outcome_admission.get()
+                if journal is not None:
+                    journal._completed_result = result
+                selected = [outcome for outcome in original_outcomes
+                    if outcome.result is result and outcome.signal.id == signal.id
+                    and outcome.registration is registration]
+                if selected:
+                    outcome = selected[-1]
+                    self._schedule_outcome_log(outcome.signal, registration, result, audit=outcome.audit)
                 if (
                     staged_admission is not None
                     and not staged_admission.done()
@@ -5002,6 +5016,8 @@ class SignalDispatcher:
         """Own recovered claim admission and its original journal through join."""
         async with self._admit_durable_operation():
             token = self._original_outcome_admission.set(None)
+            deferred_token = self._deferred_outcome_logs.set(None)
+            acceptances = []
             result = None
             original = cleanup = None
             try:
@@ -5009,7 +5025,8 @@ class SignalDispatcher:
                     result = await self._execute_original_claimed_durable_cognition(
                         signal, registration, start, delivery=delivery, consumer_id=consumer_id,
                         use_live_signal=use_live_signal, retry_delay=retry_delay,
-                        durable_admission=durable_admission, persisted_event_id=persisted_event_id)
+                        durable_admission=durable_admission, persisted_event_id=persisted_event_id,
+                        original_acceptances=acceptances)
                 except BaseException as error:
                     original = error
                 journal = self._original_outcome_admission.get()
@@ -5023,14 +5040,14 @@ class SignalDispatcher:
                     raise terminal
                 return result
             finally:
-                journal = self._original_outcome_admission.get()
-                if journal is not None:
-                    self._accepted_signal_outcomes.pop(journal._acceptance, None)
+                for acceptance in acceptances:
+                    self._accepted_signal_outcomes.pop(acceptance, None)
                 self._original_outcome_admission.reset(token)
+                self._deferred_outcome_logs.reset(deferred_token)
 
     async def _execute_original_claimed_durable_cognition(
         self, signal, registration, start, *, delivery, consumer_id,
-        use_live_signal, retry_delay, durable_admission, persisted_event_id,
+        use_live_signal, retry_delay, durable_admission, persisted_event_id, original_acceptances,
     ):
         """Execute the already claimed lease under its existing runtime owner."""
 
@@ -5094,6 +5111,7 @@ class SignalDispatcher:
         )
         acceptance = _AcceptedSignalOutcome(asyncio.current_task(),
             _OriginalSignalOutcome._signal_identity(routing_signal), registration)
+        original_acceptances.append(acceptance)
         self._accepted_signal_outcomes[acceptance] = None
         try:
             self._original_outcome_admission.set(_capture_original_outcome(
@@ -5874,6 +5892,10 @@ class SignalDispatcher:
         result: SignalResult,
     ) -> None:
         """Write exactly one durable-cognition outcome after lease finality."""
+
+        journal = self._original_outcome_admission.get()
+        if journal is not None:
+            journal._completed_result = result
 
         if len(outcomes) == 1:
             outcome = outcomes[0]
@@ -7754,16 +7776,20 @@ class SignalDispatcher:
         if emit is None:
             self._record_surface(signal.id, SURFACE_NO_EMITTER)
             return
-        payload = _build_ui_event_payload(
-            signal,
-            result,
-            result_summary,
-            reply_message_id=getattr(signal, _REPLY_MESSAGE_ID_ATTR, None),
-        )
         try:
+            from kestrel_sovereign.execution_custody import require_execution_work
+            require_execution_work(self._agent)
+            payload = _build_ui_event_payload(
+                signal, result, result_summary,
+                reply_message_id=getattr(signal, _REPLY_MESSAGE_ID_ATTR, None),
+            )
             receipt = await emit("signal_completed", payload)
-        except Exception:
+        except BaseException as error:
             self._record_surface(signal.id, SURFACE_EMIT_FAILED)
+            if is_execution_control_error(error) or not isinstance(error, Exception):
+                if journal is not None:
+                    raise journal.retain_committed(error)
+                raise
             logger.exception(
                 "Failed to emit signal_completed UI event for %s", signal.id
             )

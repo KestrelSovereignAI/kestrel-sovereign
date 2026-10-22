@@ -282,3 +282,22 @@ async def test_purge_expired_deletes_only_old_rows(store):
 
     rows = await store.backend.fetch_all("SELECT source FROM signal_log")
     assert [r[0] for r in rows] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_alternate_table_append_and_retention(tmp_path):
+    class AlternateLog(SignalLogStore):
+        TABLE = 'alternate_signal_log'
+    backend = SQLiteBackend(str(tmp_path / 'alternate.db'))
+    await backend.connect()
+    try:
+        store = AlternateLog(backend)
+        await store.initialize()
+        signal = _signal()
+        await store.append(signal, _registration(retention_days=1), _ok_result(signal))
+        assert await backend.fetch_val('SELECT COUNT(*) FROM alternate_signal_log') == 1
+        assert not await backend.table_exists('signal_log')
+        assert await store.purge_expired(now=datetime.now(timezone.utc) + timedelta(days=2)) == 1
+        assert await backend.fetch_val('SELECT COUNT(*) FROM alternate_signal_log') == 0
+    finally:
+        await backend.close()
