@@ -90,36 +90,62 @@ async def test_postgres_reconnect_never_invokes_application_password_provider(di
             await pool.close()
 
 
-async def test_postgres_original_recipe_detects_nested_host_mutation_before_reconnect(dispatcher_components, native_pg):
+@pytest.mark.parametrize('when', ['handler', 'queued_checkout'])
+async def test_postgres_original_recipe_detects_nested_host_mutation_before_reconnect(dispatcher_components, native_pg, monkeypatch, when):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, _explicit_control_chain
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
+    _, control, _ = native_pg
     original_pool = c.backend._pool
-    hosts = ['127.0.0.1']
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1, host=hosts, timeout=2)
+    hosts = [control._addr[0]]
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
+        host=hosts, port=control._addr[1], password=control._params.password, timeout=2)
     c.backend._pool = pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
-    effects = []
+    effects, held = [], []
+    waiting = asyncio.Event()
+    original_checkout = c.backend._tracked_pool_checkout
+    @asynccontextmanager
+    async def observe_checkout(*args, **kwargs):
+        if c.dispatcher._original_outcome_writer.get() is not None:
+            waiting.set()
+        async with original_checkout(*args, **kwargs) as result:
+            yield result
+    monkeypatch.setattr(c.backend, '_tracked_pool_checkout', observe_checkout)
     async def handler(payload):
-        async with pool.acquire() as connection:
-            await connection.close()
-        hosts[0] = '127.0.0.2'
+        if when == 'queued_checkout':
+            held.append(await pool.acquire())
+        else:
+            async with pool.acquire() as connection:
+                await connection.close()
+            hosts[0] = '127.0.0.2'
         effects.append(True)
         scope.revoke('actual cutoff after caller-owned host list mutation')
         return {'genuine': True}
     c.registry.register(_action_reg('native.mutable.hosts', handler=handler))
     error = None
+    task = None
     try:
         with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
-            try:
-                await c.dispatcher.dispatch_signal(_signal('native.mutable.hosts'))
-            except BaseException as caught:
-                error = caught
+            task = create_owned_task(c.dispatcher.dispatch_signal(_signal('native.mutable.hosts')))
+            if when == 'queued_checkout':
+                await asyncio.wait_for(waiting.wait(), 3)
+                hosts[0] = '127.0.0.2'
+                await held[0].close()
+                await pool.release(held.pop())
+            error = (await await_owned_task(task)).error
         assert effects
         assert not any(isinstance(member, OSError) for member in _explicit_control_chain(error)), 'terminal checkout attempted replacement endpoint before configuration fencing'
         assert any('pool configuration retired' in str(member) for member in _explicit_control_chain(error))
     finally:
+        for connection in held:
+            await connection.close()
+            await pool.release(connection)
+        if task is not None:
+            await await_owned_task(task)
         c.backend._pool = original_pool
         async with asyncio.timeout(10):
             await pool.close()

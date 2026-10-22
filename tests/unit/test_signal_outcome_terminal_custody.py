@@ -1360,7 +1360,7 @@ async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatc
 
 async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(dispatcher_components, monkeypatch):
     from kestrel_sovereign.kestrel_agent import KestrelAgent
-    from kestrel_sovereign.privacy_transition import DurablePersistenceGate
+    from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
     from kestrel_sovereign.signals import DurableConsumerRegistration
     from kestrel_sovereign.signals.sources.channels import (
         build_channel_message_registration, DURABLE_COGNITION_CONSUMER_ID,
