@@ -331,7 +331,7 @@ class SignalLogStore(UnifiedStoreBase):
         # SQL-side null-safe comparison also handles native JSONB normalization.
         operator = 'IS NOT DISTINCT FROM' if postgres else 'IS'
         predicates = ' AND '.join(f'{column} {operator} ?' for column in _OUTCOME_COLUMNS)
-        physical = f'ONLY {table}' if postgres else table
+        physical = table
         return f'SELECT 1 FROM {physical} WHERE {predicates} LIMIT 2'
 
     def _prepare_outcome(
