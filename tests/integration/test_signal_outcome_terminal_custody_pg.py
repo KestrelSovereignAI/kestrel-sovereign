@@ -46,6 +46,42 @@ async def _fresh_journal_pool(original, **options):
     return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
 
 
+async def test_postgres_proof_never_scans_unvalidated_foreign_inheritance(dispatcher_components, native_pg):
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, _explicit_control_chain
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    server = f'journal_inheritance_{schema}'
+    await control.execute('CREATE EXTENSION IF NOT EXISTS postgres_fdw')
+    await control.execute(f'''CREATE SERVER "{server}" FOREIGN DATA WRAPPER postgres_fdw
+        OPTIONS (host '127.0.0.1', port '1', dbname 'owned_unreachable', connect_timeout '1')''')
+    await control.execute(f'''CREATE USER MAPPING FOR CURRENT_USER SERVER "{server}"
+        OPTIONS (user 'owned_local_counterexample')''')
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    effects = []
+    async def handler(payload):
+        await c.backend.execute(f'''CREATE FOREIGN TABLE audit_foreign_child ()
+            INHERITS (signal_log) SERVER "{server}" OPTIONS (table_name 'unused_owned_local_table')''')
+        effects.append(True)
+        scope.revoke('actual cutoff after foreign child attached')
+        return {'genuine': True}
+    c.registry.register(_action_reg('foreign.inherited.audit', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('foreign.inherited.audit'))
+            except BaseException as caught:
+                error = caught
+        assert effects
+        assert not any('could not connect to server' in str(member) for member in _explicit_control_chain(error)), 'terminal proof attempted an unrelated foreign connection'
+        assert any(getattr(member, 'reason', None) == 'destination_changed' for member in _explicit_control_chain(error))
+        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log') == 0
+    finally:
+        await control.execute(f'DROP SERVER "{server}" CASCADE')
+
+
 async def test_postgres_successor_journal_reuses_physically_reset_connection(dispatcher_components, native_pg, monkeypatch):
     from contextlib import asynccontextmanager
     from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task

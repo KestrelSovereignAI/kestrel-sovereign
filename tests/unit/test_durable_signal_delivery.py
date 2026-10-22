@@ -2056,6 +2056,58 @@ async def test_failed_enqueue_callback_publication_joins_and_releases_original(t
 
 
 @pytest.mark.asyncio
+async def test_enqueue_publication_join_preserves_actual_caller_withdrawal(tmp_path):
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / 'cancelled-enqueue-publication.db', 'did:agent:cancelled-enqueue-publication')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=1)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def actual_turn(prompt):
+        entered.set()
+        await release.wait()
+        return 'genuine completed turn'
+    agent.process_input = actual_turn
+    rejected = RuntimeError('actual enqueue callback publication failure before caller withdrawal')
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    class RejectRelease(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'release_live_admission':
+                raise rejected
+            return super().add_done_callback(callback, context=context)
+    caller = None
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        loop.set_task_factory(lambda loop, coro, **kwargs: RejectRelease(coro, loop=loop, **kwargs))
+        caller = create_owned_task(dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, 'caller-cancel'), source_event_id='telegram:update:caller-cancel',
+            consumer_id=consumer.consumer_id))
+        await asyncio.wait_for(entered.wait(), _HANG_GUARD_SECONDS)
+        loop.set_task_factory(factory)
+        caller.cancel('actual caller withdrawal during original join')
+        await asyncio.sleep(0)
+        assert not caller.done(), 'caller escaped its accepted actual turn'
+        release.set()
+        outcome = await await_owned_task(caller)
+        assert outcome.error is not None and not isinstance(outcome.error, Exception), 'actual withdrawal was demoted to an ordinary exception'
+        chain = _explicit_control_chain(outcome.error)
+        assert any(error is rejected for error in chain)
+        assert any(isinstance(error, asyncio.CancelledError) and error.args == ('actual caller withdrawal during original join',) for error in chain)
+        assert all(task.done() for task in agent.tasks)
+        assert not dispatcher._live_durable_cognition_event_ids
+    finally:
+        loop.set_task_factory(factory)
+        release.set()
+        if caller is not None:
+            await await_owned_task(caller)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('failure', ['allocation', 'publication_before', 'publication_after'])
 async def test_unstarted_durable_enqueue_refusal_releases_original_reservation(tmp_path, failure):
     from kestrel_sovereign._async_ownership import await_owned_task

@@ -68,6 +68,36 @@ async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatche
     assert not effects and is_execution_control_error(error)
 
 
+async def test_original_sqlite_refuses_deserialized_main_destination(dispatcher_components, db_path):
+    import sqlite3
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    native = c.backend._connection._conn
+    scope = ExecutionCustody(_OriginalWork())
+    signal = _signal('native.deserialized.main')
+    def replace_main_with_actual_clone():
+        clone = sqlite3.connect(':memory:')
+        try:
+            native.backup(clone)
+            native.deserialize(clone.serialize(), name='main')
+        finally:
+            clone.close()
+    async def handler(payload):
+        await c.backend._connection._execute(replace_main_with_actual_clone)
+        scope.revoke('actual cutoff after native main replacement')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.deserialized.main', handler=handler))
+    error = None
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        try:
+            await c.dispatcher.dispatch_signal(signal)
+        except BaseException as caught:
+            error = caught
+    with sqlite3.connect(db_path) as independent:
+        assert independent.execute('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)).fetchone()[0] == 0
+    assert is_execution_control_error(error), 'journal acknowledged an in-memory replacement instead of its actual file'
+
+
 async def test_original_sqlite_refuses_noop_native_autocommit(dispatcher_components):
     import sqlite3
     from kestrel_sovereign.execution_custody import is_execution_control_error
