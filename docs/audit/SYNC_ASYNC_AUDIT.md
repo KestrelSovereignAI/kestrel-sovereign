@@ -111,7 +111,7 @@ audit in issue `#624`, focused on maintained runtime surfaces.
 - `tests/unit/test_kestrel_agent.py`
 - `tests/unit/test_memory_wiring.py`
 - `tests/unit/test_key_rotation.py`
-- `tests/unit/test_a2a_task_manager.py`
+- `tests/unit/test_a2a_native_task_manager.py`
 - `tests/unit/test_llm_service.py`
 - `tests/unit/test_voice_websocket.py`
 
@@ -126,7 +126,7 @@ The sync/async boundary audit is complete for the maintained core runtime surfac
 - Remaining maintained `create_task()` sites have been classified as owned lifecycle tasks or request-scoped tasks.
 
 Accepted task-spawn patterns:
-- Owned lifecycle loops: `TaskWorker`, storage sync service, delivery queue, spawn lifecycle TTL, heartbeat, scheduler runner, GitHub bot event handling, memory access updates, key rotation, A2A background execution, and LLM preference persistence.
+- Owned lifecycle loops: durable signal drainers, native question recovery and callback workers, storage sync service, delivery queue, spawn lifecycle TTL, heartbeat, scheduler runner, GitHub bot event handling, memory access updates, key rotation, and LLM preference persistence.
 - Request-scoped concurrency: voice websocket VAD processing, which is cancelled and awaited by the websocket cleanup path.
 
 Deferred/extracted workflow code:

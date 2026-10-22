@@ -1954,6 +1954,8 @@
         "tests/integration/test_orchestration_e2e.py",
         "tests/integration/test_sovereignty_e2e.py",
         "tests/integration/test_sovereignty_guarantees.py",
+        "tests/unit/test_a2a_native_consumers.py",
+        "tests/unit/test_a2a_native_task_manager.py",
         "tests/unit/test_audit_anchor_feature.py",
         "tests/unit/test_bootstrap_feature.py",
         "tests/unit/test_bootstrap_service.py",
@@ -2018,7 +2020,6 @@
         "tests/integration/test_gcp_compute_e2e.py",
         "tests/integration/test_runpod_feature.py",
         "tests/integration/test_vastai_e2e.py",
-        "tests/unit/test_a2a_task_manager.py",
         "tests/unit/test_cloud_launcher_contracts.py",
         "tests/unit/test_code_edit_feature.py",
         "tests/unit/test_gcp_compute_feature_contracts.py",
@@ -2163,6 +2164,7 @@
       "existing_code_refs": [
         "kestrel_sovereign/command_handler.py",
         "kestrel_sovereign/kestrel_agent.py",
+        "tests/unit/test_a2a_native_task_manager.py",
         "tests/unit/test_agent_runtime_endpoint_contracts.py",
         "tests/unit/test_command_handler_async_boundary_contracts.py",
         "tests/unit/test_command_handler_constitution_contracts.py",
@@ -2182,7 +2184,6 @@
         "missing_code_refs"
       ],
       "missing_code_refs": [
-        "tests/unit/test_a2a_task_manager.py",
         "tests/unit/test_code_edit_feature.py",
         "tests/unit/test_voice_websocket.py"
       ],

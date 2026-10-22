@@ -798,11 +798,10 @@ class TaskFeature(Feature):
             "(fire-and-resume — sender's turn ended, they wake on the "
             "a2a.question_answered signal when you transition), "
             "send_a2a_message (FYI, brief receipt), or send_a2a_task "
-            "(delegated work, full result). The sender's subscription "
-            "supervisor on the SSE stream picks up your terminal frame "
-            "and fires their resumption signal. Without this tool the "
-            "sender's send_a2a_question lineage never resumes until the "
-            "hourly expiry sweep fires a state='expired' signal."
+            "(delegated work, full result). The sender's resident question "
+            "recovery reads your native result and queues a durable resumption "
+            "signal after your terminal reply. Unanswered questions use their "
+            "recorded deadline; a later reply produces a late-answer wake."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a respond",

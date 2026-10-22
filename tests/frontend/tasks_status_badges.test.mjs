@@ -144,3 +144,24 @@ test('task reads use the operator inbox namespace and encode task identifiers', 
         target.remove();
     }
 });
+
+test('native status timestamps render without inventing creation or update times', async () => {
+    const priorRequest = API.request;
+    const timestamp = '2026-10-22T07:00:00.123Z';
+    const task = {
+        task_id: 'native-timestamp', status: 'working',
+        status_timestamp: timestamp, artifacts_count: 0,
+    };
+    API.request = async () => ({ tasks: [task] });
+    try {
+        await loadTasks();
+        const details = document.getElementById('task-details-native-timestamp');
+        assert.ok(details.textContent.includes(`Status changed: ${new Date(timestamp).toLocaleString()}`));
+        assert.doesNotMatch(details.textContent, /Created:|Updated:/);
+        task.status_timestamp = null;
+        await loadTasks();
+        assert.doesNotMatch(document.getElementById('task-details-native-timestamp').textContent, /Status changed:|Invalid Date|undefined/);
+    } finally {
+        API.request = priorRequest;
+    }
+});

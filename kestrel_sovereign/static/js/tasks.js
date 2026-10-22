@@ -241,9 +241,7 @@ function renderTaskItem(task) {
     const fullTaskId = task.task_id;
     const agentLabel = task.sender ? `${task.sender}/${task.skill_hint || 'task'}` : 'Unknown';
 
-    // Format timestamps if available
-    const createdAt = task.created_at ? formatTime(task.created_at) : '';
-    const updatedAt = task.updated_at ? formatTime(task.updated_at) : '';
+    const statusTimestamp = task.status_timestamp ? formatTime(task.status_timestamp) : '';
 
     return `
         <div class="task-item" data-task-id="${fullTaskId}" onclick="window.toggleTaskDetails('${fullTaskId}')" style="
@@ -298,8 +296,7 @@ function renderTaskItem(task) {
                 <div style="font-size: 0.8125rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
                     <strong>Full Task ID:</strong> <code style="background: var(--bg-tertiary); padding: 0.125rem 0.25rem; border-radius: 3px;">${fullTaskId}</code>
                 </div>
-                ${createdAt ? `<div style="font-size: 0.75rem; color: var(--text-tertiary);">Created: ${createdAt}</div>` : ''}
-                ${updatedAt ? `<div style="font-size: 0.75rem; color: var(--text-tertiary);">Updated: ${updatedAt}</div>` : ''}
+                ${statusTimestamp ? `<div style="font-size: 0.75rem; color: var(--text-tertiary);">Status changed: ${escapeHtml(statusTimestamp)}</div>` : ''}
 
                 ${task.message ? `
                     <div style="margin-top: 0.75rem;">
