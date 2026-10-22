@@ -350,7 +350,7 @@ else:
                 # asyncpg queries current_task(self._loop). Its connection-
                 # local TLS delegate still schedules on the actual native
                 # loop, so retire that exact physical cancellation Task too.
-                self._cancellations.discard(None)
+                self._cancellations.discard(asyncio.current_task())
 
         def _end_original_journal(self):
             if self._journal_program_seal is None:
