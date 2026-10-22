@@ -927,6 +927,13 @@ The old ciphertext and attempts remain until their actual HTTP owners retire.
 The resident retires ready revoked generations in finite indexed batches, so
 replacement does not require a later client Delete to destroy old credentials.
 
+An active configuration remains retrievable with its task, and its retired
+attempt receipts remain until configuration deletion. `retention_days` bounds
+durable notifications; it does not currently purge active configurations or
+those receipts. [#3799](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3799)
+tracks a coordinated bounded retention policy that preserves uncertain COMMIT
+outcomes and unresolved original HTTP owners.
+
 `NativePushTransport` sends an official `StreamResponse` using the SDK's media
 type and version constants. It validates HTTPS egress, pins the approved IPs,
 verifies TLS and refuses redirects. Its native response/client owners retain
