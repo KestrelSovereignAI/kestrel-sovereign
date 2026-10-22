@@ -146,10 +146,11 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         # Fence application programs before BEGIN can wait for another native
         # writer. The durable configuration belongs to the acquired lock, not
         # to the earlier (possibly stale) external-commit generation.
-        self._journal_program_seal = self._original_journal_configuration()
+        self._journal_program_seal = object()
         try:
             cursor = super().execute('BEGIN IMMEDIATE')
             cursor.close()
+            self._journal_program_seal = self._original_journal_configuration()
         except BaseException:
             if not self.in_transaction:
                 self._journal_program_seal = None

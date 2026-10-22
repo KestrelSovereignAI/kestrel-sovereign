@@ -5130,7 +5130,7 @@ class SignalDispatcher:
             terminal = (execution_finite_error(*errors, retain_originals=True) if cancellation_only
                         else execution_observation_error(*errors))
             for completed_journal in resident_journals:
-                terminal = completed_journal.retain_committed(terminal)
+                terminal = completed_journal.retain_observation(terminal)
             if terminal is not None:
                 raise terminal
             return outcome.result
