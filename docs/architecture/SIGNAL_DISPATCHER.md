@@ -927,6 +927,17 @@ cannot redirect a terminal reconnect. Reused sessions must match that original
 resolved binding. These private in-memory recipes contain credentials and are
 never serialized or included in diagnostics.
 
+Startup authentication parameters are not the current SQL principal. Original
+admission captures the actual effective user, session user, role and session
+authorization; the sealed terminal checkout must still match them before any
+transaction/INSERT. Native pool reset explicitly resets SESSION AUTHORIZATION
+and ROLE as well as ordinary settings, since PostgreSQL RESET ALL excludes both.
+Actual rollback/reset observation preserves caller cancellation alongside an
+ordinary SQL error in a finite observation carrier. Healthy physical retirement
+is not fabricated commit uncertainty, and audit-loss handling cannot swallow
+that withdrawal. Accepted signal identity uses canonical native text/enum values,
+never application string equality or hashing as evidence.
+
 Core-owned SQLite connections likewise track native callback/function/extension
 registration. A customized session remains ineligible for original journals until
 reconnect, including after callback removal. This is a supported configuration

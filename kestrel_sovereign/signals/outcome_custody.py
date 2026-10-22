@@ -208,6 +208,7 @@ class _OriginalPostgresJournalPool:
     wrapper: object
     configuration: tuple
     resolved_configuration: tuple | None = None
+    principal: tuple | None = None
 
     @classmethod
     def capture(cls, backing):
@@ -270,8 +271,9 @@ class _OriginalPostgresJournalPool:
         original_kwargs.update(loop=loop, connection_class=connection_class, record_class=record_class)
         return original_args, original_kwargs
 
-    def with_actual_connection(self, connection):
-        return replace(self, resolved_configuration=_native_effective_connect_configuration(connection))
+    def with_actual_connection(self, connection, principal):
+        return replace(self, resolved_configuration=_native_effective_connect_configuration(connection),
+                       principal=principal)
 
     def matches_actual_connection(self, connection):
         return (self.resolved_configuration is not None
@@ -372,7 +374,12 @@ class _OriginalSignalOutcome:
 
     @staticmethod
     def _signal_identity(signal):
-        return (signal.id, signal.source, signal.target_agent, signal.mode)
+        from kestrel_sdk.signals.models import SignalMode
+        values = (signal.id, signal.source, signal.target_agent)
+        if any(not issubclass(type(value), str) for value in values) or type(signal.mode) is not SignalMode:
+            raise ExecutionAuthorityError('Original signal identity requires native text and mode')
+        # No application equality/hash protocol may become identity evidence.
+        return (*(str.__str__(value) for value in values), signal.mode)
 
     def matches(self, signal, registration):
         return (self._identity == self._signal_identity(signal)
@@ -458,6 +465,7 @@ class _OriginalSignalOutcome:
         if (result is not self._completed_result
                 or asyncio.current_task() is not self._acceptance.owner
                 or self._phase != 'preparing' or not self.matches(signal, registration)
+                or type(result.signal_id) is not str
                 or result.signal_id != self._identity[0]
                 or type(prepared) is not _PreparedSignalOutcome
                 or type(prepared.values) is not tuple or len(prepared.values) != 30

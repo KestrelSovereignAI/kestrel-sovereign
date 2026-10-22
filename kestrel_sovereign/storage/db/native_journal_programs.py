@@ -255,9 +255,21 @@ else:
         def get_reset_query(self):
             # The stock reset runs AFTER COMMIT/local search_path restoration.
             # Its advisory-unlock function must not resolve in an app schema.
-            return super().get_reset_query().replace(
+            # RESET ALL deliberately excludes these PostgreSQL authorization
+            # settings. A returned session must not lend its last user's role
+            # or session authorization to another original native operation.
+            return 'RESET SESSION AUTHORIZATION;\nRESET ROLE;\n' + super().get_reset_query().replace(
                 'SELECT pg_advisory_unlock_all();',
                 'SELECT pg_catalog.pg_advisory_unlock_all();')
+
+        async def _original_journal_principal(self):
+            row = await self.fetchrow('''SELECT CURRENT_USER, SESSION_USER,
+                pg_catalog.current_setting('role'),
+                pg_catalog.current_setting('session_authorization')''')
+            values = tuple(row)
+            if len(values) != 4 or any(type(value) is not str for value in values):
+                raise NativeJournalConfigurationError('Original native principal is not canonical')
+            return values
 
 
 async def _native_journal_connect(*args, **kwargs):

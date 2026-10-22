@@ -48,6 +48,7 @@ from kestrel_sovereign.execution_custody import (
     execution_commit_outcome,
     execution_denial_scopes,
     execution_error_with_cause,
+    execution_observation_error,
     execution_terminal_error,
     is_execution_control_error,
     lock_execution_authority,
@@ -1120,10 +1121,8 @@ class PostgresBackend(DatabaseBackend):
                     await native.__aexit__(type(failure) if failure is not None else None,
                         failure, failure.__traceback__ if failure is not None else None)
                 except BaseException as cleanup:
-                    failure = execution_terminal_error(failure, cleanup, retain_originals=True,
-                        isolate_control_originals=True)
-            failure = execution_terminal_error(state.body_failure, state.terminal, failure, retain_originals=True,
-                isolate_control_originals=True)
+                    failure = execution_observation_error(failure, cleanup)
+            failure = execution_observation_error(state.body_failure, state.terminal, failure)
             if failure is not None:
                 # A new wrapper error AFTER successful reset is still an
                 # observer of this checkout's already-proven commit. Attach
@@ -1210,8 +1209,7 @@ class PostgresBackend(DatabaseBackend):
                     phase.owner = accepted
                 if accepted is not None:
                     joined = await await_owned_task(accepted)
-                    refusal = execution_terminal_error(refusal, joined.error, joined.cancellation,
-                        retain_originals=True, isolate_control_originals=True)
+                    refusal = execution_observation_error(refusal, joined.error, joined.cancellation)
                 terminal = self._refused_native_owner(connection, checkout, refusal, state.scopes, body_failure, native_connection, owner=accepted)
                 if phase is not None:
                     phase.record_native_failure(terminal, commit_outcome=state.outcome)
@@ -1229,9 +1227,8 @@ class PostgresBackend(DatabaseBackend):
                 )
                 # Establish private retirement evidence BEFORE either abort or
                 # finite composition can decorate an earlier shared receipt.
-                terminal = execution_terminal_error(body_failure, retired.error,
-                    retired.cancellation, debt, retain_originals=True,
-                    isolate_control_originals=True)
+                terminal = execution_observation_error(body_failure, retired.error,
+                    retired.cancellation, debt)
                 assert terminal is not None
                 self._abort_native_connection(connection, terminal)
                 for scope in state.scopes:
@@ -1243,8 +1240,7 @@ class PostgresBackend(DatabaseBackend):
                     if execution_commit_outcome(terminal) is None:
                         raise execution_error_with_cause(ExecutionCommitOutcomeError(outcome), terminal)
                 raise terminal
-            terminal = execution_terminal_error(body_failure, retired.cancellation,
-                retain_originals=True, isolate_control_originals=True)
+            terminal = execution_observation_error(body_failure, retired.cancellation)
             if terminal is not None:
                 terminal = state.retain_acknowledgments(terminal)
                 if (phase is not None and retired.cancellation is not None
@@ -1383,8 +1379,7 @@ class PostgresBackend(DatabaseBackend):
                     phase.owner = accepted
                 if accepted is not None:
                     joined = await await_owned_task(accepted)
-                    refusal = execution_terminal_error(refusal, joined.error, joined.cancellation,
-                        retain_originals=True, isolate_control_originals=True)
+                    refusal = execution_observation_error(refusal, joined.error, joined.cancellation)
                 terminal = self._refused_native_owner(connection, transaction, refusal, scopes, body_failure, native_connection, owner=accepted)
                 if phase is not None:
                     phase.record_native_failure(terminal)
@@ -1404,10 +1399,7 @@ class PostgresBackend(DatabaseBackend):
                         classified = ExecutionCommitOutcomeError(outcome)
                         classified = execution_error_with_cause(classified, physical)
                         physical = classified
-                    terminal = execution_terminal_error(
-                        physical, completed.cancellation, retain_originals=True,
-                        isolate_control_originals=True,
-                    )
+                    terminal = execution_observation_error(physical, completed.cancellation)
                     for scope in scopes:
                         scope.preserve_commit_uncertainty(outcome)
                     raise terminal
@@ -1416,10 +1408,7 @@ class PostgresBackend(DatabaseBackend):
                 debt._kestrel_native_retirement_debts = (
                     (_NativePostgresRetirement(transaction, connection, native_connection), completion),
                 )
-                terminal = execution_terminal_error(
-                    body_failure, debt, completed.cancellation, retain_originals=True,
-                    isolate_control_originals=True,
-                )
+                terminal = execution_observation_error(body_failure, debt, completed.cancellation)
                 for scope in scopes:
                     scope.revoke("original native rollback acknowledgement failed")
                 raise terminal
@@ -1434,10 +1423,7 @@ class PostgresBackend(DatabaseBackend):
                 commit_state.acknowledgments[:] = [receipt] if receipt is not None else []
                 if observation is not None:
                     observation.acknowledgments = tuple(commit_state.acknowledgments)
-            terminal = execution_terminal_error(
-                body_failure, completed.cancellation, retain_originals=True,
-                isolate_control_originals=True,
-            )
+            terminal = execution_observation_error(body_failure, completed.cancellation)
             if receipt is not None and completed.cancellation is not None and phase is not None:
                 phase.record_acknowledged_withdrawal(completed.cancellation, receipt)
             if terminal is not None:
@@ -1867,10 +1853,7 @@ class PostgresBackend(DatabaseBackend):
             accepted = admission.task
             if accepted is not None:
                 joined = await await_owned_task(accepted)
-                refusal = execution_terminal_error(
-                    refusal, joined.error, joined.cancellation,
-                    retain_originals=True, isolate_control_originals=True,
-                )
+                refusal = execution_observation_error(refusal, joined.error, joined.cancellation)
             return self._refused_native_owner(
                 connection, connection, refusal, scopes, original, native, owner=accepted,
             )
@@ -1880,10 +1863,7 @@ class PostgresBackend(DatabaseBackend):
             debt = RuntimeError("original advisory session retirement failed")
             debt.__cause__ = outcome.error
             debt._kestrel_native_retirement_debts = ((resource, closer),)
-        terminal = execution_terminal_error(
-            original, debt, outcome.error, outcome.cancellation, retain_originals=True,
-            isolate_control_originals=True,
-        )
+        terminal = execution_observation_error(original, debt, outcome.error, outcome.cancellation)
         if outcome.error is not None:
             for scope in scopes:
                 scope.revoke("original advisory session retirement failed")
@@ -2287,7 +2267,10 @@ class PostgresBackend(DatabaseBackend):
             native = connection._con
             if type(native) is not NativeJournalPostgresConnection or not native._original_journal_programs_supported():
                 raise ExecutionAuthorityError('Original journal requires a plain fenced native PostgreSQL session')
-            journal._postgres_pool = journal._postgres_pool.with_actual_connection(native)
+            principal = await native._original_journal_principal()
+            journal._require_backing()
+            require_execution_work(self)
+            journal._postgres_pool = journal._postgres_pool.with_actual_connection(native, principal)
             relation = await self._read_original_signal_outcome_relation(connection, 'signal_log')
             if relation is None:
                 raise ExecutionAuthorityError('Original native signal journal requires its plain permanent audit table')
@@ -2329,6 +2312,9 @@ class PostgresBackend(DatabaseBackend):
                     native.terminate()  # No query/reset may run an application codec.
                     raise journal.write_refusal('native_programs_changed') from error
                 journal._postgres_session = native
+                if await native._original_journal_principal() != journal._postgres_pool.principal:
+                    raise journal.write_refusal('native_principal_changed')
+                journal.require_original(self)
                 async with self._tracked_native_transaction(connection, state.scopes, state):
                     journal.require_original(self)
                     # Privileged catalog/proof operators must not resolve via
