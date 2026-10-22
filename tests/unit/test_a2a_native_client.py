@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -19,7 +21,12 @@ from a2a.types import (
     SendMessageRequest,
     TaskState,
 )
-from a2a.utils.signing import InvalidSignaturesError, create_agent_card_signer
+from a2a.utils.errors import InvalidParamsError
+from a2a.utils.signing import (
+    InvalidSignaturesError,
+    NoSignatureError,
+    create_agent_card_signer,
+)
 from google.protobuf.json_format import MessageToDict, ParseDict
 from starlette.applications import Starlette
 
@@ -43,6 +50,9 @@ from kestrel_sovereign.a2a.stores.unified.outbound_store import (
 )
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+from tests.unit.test_a2a_native_question_store import (
+    questions as questions,  # noqa: PLC0414 - pytest fixture dependency
+)
 from tests.utils.native_a2a import signing_identity
 from tests.utils.native_a2a_security import NOW, PRINCIPAL, SENDER
 
@@ -376,9 +386,104 @@ async def test_changed_message_cannot_use_a_reservation(peer_session):
 async def test_card_signature_is_verified_before_client_creation(peer_session):
     p = peer_session
     p.arguments["card"].name = "attacker"
-    with pytest.raises(InvalidSignaturesError):
+    with pytest.raises(NativePeerProtocolError) as refused:
         NativePeerSession(**p.arguments)
+    assert isinstance(refused.value.__cause__, InvalidSignaturesError)
     assert not p.trace
+
+
+@pytest.mark.parametrize("fault", ["unsigned", "wrong-document", "missing-name"])
+async def test_invalid_peer_card_is_a_protocol_refusal_before_client_creation(
+    peer_session, fault
+):
+    p = peer_session
+    if fault == "unsigned":
+        p.arguments["card"].ClearField("signatures")
+        cause = NoSignatureError
+    elif fault == "wrong-document":
+        p.arguments["trusted_document"] = {"id": "did:web:another.test"}
+        cause = ValueError
+    else:
+        p.arguments["card"].ClearField("name")
+        cause = InvalidParamsError
+    with pytest.raises(NativePeerProtocolError) as refused:
+        NativePeerSession(**p.arguments)
+    assert isinstance(refused.value.__cause__, cause)
+    assert not p.trace
+    assert not p.http.is_closed
+    assert await p.store.backend.fetch_all("SELECT dispatch_id FROM a2a_outbound_dispatches") == []
+
+
+async def test_peer_card_validation_retains_original_execution_control(
+    peer_session, monkeypatch
+):
+    from kestrel_sovereign.a2a import native_client
+
+    original = ValueError("card validation interrupted")
+    original.__cause__ = ExecutionAuthorityError("original authority retired")
+
+    def verify(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(native_client, "verify_native_agent_card", verify)
+    with pytest.raises(ValueError) as refused:
+        NativePeerSession(**peer_session.arguments)
+    assert refused.value is original
+    assert not peer_session.http.is_closed
+    assert not peer_session.trace
+
+
+@pytest.mark.parametrize("fault", ["unsigned", "tampered", "wrong-document"])
+async def test_peer_card_refusal_preserves_question_recovery_and_deadline_wakes(
+    peer_session, questions, fault
+):
+    from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
+    from tests.unit.test_a2a_native_question_store import reserve as reserve_question
+    from tests.unit.test_a2a_native_question_store import response
+    from tests.unit.test_a2a_native_question_supervisor import dispatcher_for
+
+    p, q = peer_session, questions
+    question, dispatch, request = await reserve_question(q)
+    submitting = await q.outbound.begin_submission(dispatch, operation_id="send")
+    retained = await q.outbound.acknowledge(
+        submitting, response(question, request, state=TaskState.TASK_STATE_WORKING),
+        operation_id="ack",
+    )
+    if fault == "unsigned":
+        p.arguments["card"].ClearField("signatures")
+    elif fault == "tampered":
+        p.arguments["card"].name = "unsigned alteration"
+    else:
+        p.arguments["trusted_document"] = {"id": "did:web:another.test"}
+
+    @asynccontextmanager
+    async def open_dispatch(dispatch_id):
+        assert dispatch_id == retained.dispatch_id
+        session = NativePeerSession(**p.arguments)
+        try:
+            yield session, retained
+        finally:
+            await session.close()
+
+    agent, dispatcher = await dispatcher_for(q)
+    try:
+        supervisor = NativeQuestionSupervisor(
+            store=q.store, open_dispatch=open_dispatch, dispatcher=dispatcher,
+            interval=1, is_current=lambda: True,
+        )
+        await supervisor.recover_once()
+        assert (await q.store.get(question.question_id)).status == "WAITING"
+        assert await q.outbound.get(dispatch.dispatch_id) == retained
+        q.clock.now += timedelta(seconds=11)
+        await supervisor.recover_once()
+        assert (await q.store.get(question.question_id)).status == "EXPIRED"
+        assert not await q.store.pending_wakes()
+        assert (await q.backend.fetch_one("SELECT COUNT(*) FROM durable_signal_events"))[0] == 1
+        assert not p.http.is_closed
+        assert not p.trace
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await asyncio.gather(*agent.tasks, return_exceptions=True)
 
 
 @pytest.mark.parametrize(

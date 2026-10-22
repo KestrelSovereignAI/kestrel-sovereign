@@ -25,7 +25,9 @@ from a2a.types import (
     TaskState,
 )
 from a2a.utils.constants import VERSION_HEADER
+from a2a.utils.errors import InvalidParamsError
 from a2a.utils.proto_utils import validate_proto_required_fields
+from a2a.utils.signing import SignatureVerificationError
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtoMessage
 
@@ -62,6 +64,7 @@ from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     execution_work_operation,
     execution_work_stream,
+    is_execution_control_error,
     native_execution_response_owner,
     owned_execution_stream,
 )
@@ -225,10 +228,17 @@ class NativePeerSession:
         question_store: NativeQuestionStore | None = None,
     ):
         snapshot = AgentCard.FromString(card.SerializeToString())
-        validate_proto_required_fields(snapshot)
-        verify_native_agent_card(
-            snapshot, signing_did=signing_did, trusted_document=trusted_document
-        )
+        try:
+            validate_proto_required_fields(snapshot)
+            verify_native_agent_card(
+                snapshot, signing_did=signing_did, trusted_document=trusted_document
+            )
+        except (ValueError, InvalidParamsError, SignatureVerificationError) as error:
+            if is_execution_control_error(error):
+                raise
+            raise NativePeerProtocolError(
+                "Peer Agent Card is invalid for its selected signing identity"
+            ) from error
         extensions = {item.uri: item for item in snapshot.capabilities.extensions}
         supported = frozenset(NATIVE_EXTENSION_URIS)
         versions = [
