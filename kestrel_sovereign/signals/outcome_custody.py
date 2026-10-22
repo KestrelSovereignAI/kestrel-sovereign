@@ -246,14 +246,13 @@ class _OriginalSignalOutcome:
 
     def acknowledged(self, backend):
         self.require_original(backend)
-        if self._phase != 'submitted':
-            raise ExecutionAuthorityError('Original signal journal was not submitted')
+        if self._phase != 'submitted' or not self.has_acknowledged_commit():
+            raise ExecutionAuthorityError('Original signal journal lacks native COMMIT evidence')
         self._phase = 'acknowledged'
 
     def has_acknowledged_commit(self):
         """A native COMMIT fact is independent of final identity admission."""
-        return (self._phase == 'acknowledged'
-                or (self._sqlite_committed_connection is not None
+        return ((self._sqlite_committed_connection is not None
                     and self._sqlite_committed_connection is self._backing)
                 or any(receipt.acknowledged for receipt in self._acknowledgments))
 

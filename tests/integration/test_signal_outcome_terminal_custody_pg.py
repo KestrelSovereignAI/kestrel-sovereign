@@ -30,13 +30,14 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_actual_committed_journal_observation_is_not_a_projection_placeholder,
     test_projection_cannot_reauthorize_fabricated_result_through_finalizer,
     test_error_after_original_writer_acceptance_still_joins_before_owner_exits,
+    test_projection_callbacks_cannot_mutate_canonical_data,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
-@pytest.mark.parametrize('boundary', ['namespace', 'fake_ack'])
+@pytest.mark.parametrize('boundary', ['namespace', 'fake_ack', 'relation'])
 async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dispatcher_components, native_pg, boundary):
     import asyncpg
     from kestrel_sovereign.execution_custody import (
@@ -80,6 +81,10 @@ async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dis
             await asyncio.wait_for(entered.wait(), 2)
             if boundary == 'namespace':
                 route[0] = alternate
+            elif boundary == 'relation':
+                await control.execute(f'CREATE TABLE "{schema}".replacement_signal_log (LIKE "{schema}".signal_log INCLUDING ALL)')
+                await control.execute(f'DROP TABLE "{schema}".signal_log')
+                await control.execute(f'ALTER TABLE "{schema}".replacement_signal_log RENAME TO signal_log')
             scope.revoke('actual original work cutoff after setup routing change')
             release.set()
             outcome = await await_owned_task(handle.task)
@@ -89,12 +94,17 @@ async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dis
         if boundary == 'namespace':
             assert outcome.error is None
             assert (original_rows, replacement_rows) == (1, 0), 'setup redirected the original fixed journal namespace'
-        else:
+        elif boundary == 'fake_ack':
             assert attempted == [True]
             assert is_execution_control_error(outcome.error)
             assert execution_commit_outcome(outcome.error) != 'committed', 'setup fabricated a COMMIT without native SQL'
             assert (original_rows, replacement_rows) == (0, 0)
             assert c.dispatcher._log_write_failures == 1, 'the actually absent audit was not counted'
+        else:
+            assert is_execution_control_error(outcome.error), 'replacement catalog relation acquired the original journal permission'
+            assert execution_commit_outcome(outcome.error) != 'committed'
+            assert (original_rows, replacement_rows) == (0, 0)
+            assert c.dispatcher._log_write_failures == 1
         assert not c.dispatcher._outcome_log_tasks
     finally:
         release.set()
