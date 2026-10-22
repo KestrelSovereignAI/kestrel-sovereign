@@ -929,6 +929,15 @@ and startup defaults; later PGHOST/PGDATABASE or related environment changes
 cannot redirect a terminal reconnect. Reused sessions must match that original
 resolved binding. These private in-memory recipes contain credentials and are
 never serialized or included in diagnostics.
+TCP identity comes from the actual connected socket peer, not asyncpg's retained
+requested hostname: later DNS changes cannot redirect the original reconnect.
+The independently observed TLS hostname is retained for certificate verification
+and SNI while dialing that numeric peer, for both direct TLS and STARTTLS. A
+connection-local native-loop delegate changes no global resolver. Native query
+cancellation on returned TLS sessions still joins and retires its actual Task.
+Refusing a customized session clears its application observer/listener state
+before native termination; refusal cannot launch a termination listener as new
+application work after cutoff. Ordinary non-journal termination is unchanged.
 
 Startup authentication parameters are not the current SQL principal. Original
 admission captures the actual effective user, session user, role and session
