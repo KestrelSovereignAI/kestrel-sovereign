@@ -1410,7 +1410,6 @@ class SignalDispatcher:
             _durable_admission=durable_admission,
             _durable_delivery_consumer_id=consumer_id,
             _durable_admission_fence=admission_fence,
-            _journal_completion=journal_completion,
         )
         enqueued_signal_id = signal.id
         released = False
