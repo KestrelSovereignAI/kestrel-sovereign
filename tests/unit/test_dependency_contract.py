@@ -56,30 +56,16 @@ SECURITY_FLOORS = {
 # contract v7, #3424) that ``LLMService.decide`` is built on. Version 0.39.1
 # adds the shared outbound policy and native pinned transports; 0.39.2 fixes
 # their canonical host identity before DNS and native requests (#3679).
-# Core's avatar and did:web fetchers require that correction. This is a Core-only
-# release gate: sibling packages are released from their own repositories, but
-# Core must never
-# silently lower its declared/locked line to accommodate an older Frinz or
-# observability constraint. Their compatible releases remain a documented
-# release-cascade prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.39.2"), ("<", "0.40")})
+# Version 0.40 replaces draft A2A types with native AgentSkill contracts.
+# The coordinated 0.41 floor includes the shared computer-use, artifact,
+# resource-scope and workspace-transfer contracts (#3679).
+# This is a Core-only release gate: sibling packages release independently.
+# Core must never lower its declared/locked line to accommodate an older
+# consumer. Host feature acceptance remains a release prerequisite in README.md.
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.41.0"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
-}
-SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
-    # These are release prerequisites, not declarations about sibling repos'
-    # current branches. Each downstream must publish/test this line before a
-    # Core release can be cut.
-    "kestrel-feature-talon": ">=0.37.1,<0.40",
-    "kestrel-feature-story-archive": ">=0.17,<0.40",
-    "kestrel-feature-eye": ">=0.37.1,<0.40",
-    "kestrel-feature-flight": ">=0.37.1,<0.40",
-    "kestrel-claws": ">=0.37.1,<0.40",
-    "kestrel-feature-features": ">=0.36.0,<0.40",
-    "kestrel-channel-telegram": ">=0.36,<0.40",
-    "frinz": ">=0.39.0,<0.40",
-    "observability fleet": ">=0.39.0,<0.40",
 }
 
 def _pyproject() -> dict:
@@ -276,7 +262,7 @@ def _sdk_contract_requirement(
     return requirement
 
 
-def test_sdk_039_release_cascade_contract_is_declared():
+def test_sdk_native_release_cascade_contract_is_declared():
     """Core owns the transport floor; observability adds metrics to that floor.
 
     This deliberately does not inspect sibling worktrees: their compatible
@@ -298,18 +284,14 @@ def test_sdk_039_release_cascade_contract_is_declared():
         assert Version("0.38.2") not in specifier
         assert Version("0.39.0") not in specifier
         assert Version("0.39.1") not in specifier
-        assert Version("0.39.2") in specifier
+        assert Version("0.39.2") not in specifier
         assert Version("0.40.0") not in specifier
-
-    # The human release contract identifies downstream gates without probing
-    # their (possibly dirty or unavailable) repositories from Core CI.
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").casefold()
-    for downstream, specifier in SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS.items():
-        assert downstream in readme
-        assert f"kestrel-sovereign-sdk{specifier}" in readme
+        assert Version("0.41.0") in specifier
+        assert Version("0.42.0") in specifier
+        assert Version("1.0.0") not in specifier
 
 
-def test_sdk_039_release_cascade_contract_is_locked():
+def test_sdk_native_release_cascade_contract_is_locked():
     """The lock must exercise the outbound contract and one canonical floor."""
 
     root = _locked_root_package(_lock())
@@ -341,5 +323,5 @@ def test_sdk_039_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.39.2") <= version < Version("0.40.0") for version in sdk_versions
+        Version("0.41.0") <= version < Version("1.0.0") for version in sdk_versions
     )

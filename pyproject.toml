@@ -97,19 +97,14 @@ dependencies = [
     # synchronous rendering and per-agent activation. The 0.38 line adds the
     # optional awaited preparation hook used before those synchronous renders;
     # legacy features remain supported through defensive hook resolution.
-    # The ceiling tracks the MINOR, not the major, and 0.35.0 is itself the
-    # evidence for that: it added a required member to a runtime-checkable
-    # protocol and tightened validate_for, so leases that validated under
-    # 0.34.0 are now rejected. An SDK minor can therefore break inference-lease
-    # providers. Under a minor ceiling that lands as an unresolvable install;
-    # under <1 it would resolve silently. InferenceLeaseFeature.initialize
-    # catches discovery errors and keeps the agent up with providers={} - so every
-    # installed provider would become "not installed" on an unchanged Core.
-    # Widen this only with a Core release that has tested the newer minor.
-    # Release cascade: Frinz and the observability fleet must publish/test
-    # constraints that admit this line before Core is released. Do not weaken
-    # Core's safety floor to make an older downstream resolver succeed.
-    "kestrel-sovereign-sdk[httpx,tracing]>=0.39.2,<0.40",
+    # 0.40 replaces draft A2A contribution types with native AgentSkill and
+    # get_agent_skills contracts used during agent initialization. The
+    # coordinated 0.41.0 floor also includes the shared computer-use,
+    # artifact, resource-scope and workspace-transfer contracts (#3679).
+    # The lock records the tested release; future minor versions remain
+    # admissible. Verify installed host features against the resolved SDK
+    # before release rather than preserving an obsolete minor ceiling.
+    "kestrel-sovereign-sdk[httpx,tracing]>=0.41.0,<1",
     # Native A2A types/bindings; signed-card publication remains gated on #3685.
     "a2a-sdk[http-server,signing]>=1.2.3,<2",
     # RFC 8785 for the Kestrel sender extension's complete native request digest.

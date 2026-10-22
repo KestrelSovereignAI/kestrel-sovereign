@@ -49,9 +49,10 @@ add the shared computer-use, artifact, resource-scope and workspace-transfer
 contracts. Both are included at SDK commit
 `c01a6e933665bf7778c656a9b13dd8b79e371e36`. The immutable `v0.40.0` tag
 at `eff4c1f86bee3a5cf5c40b4d36c95b3ee29e02a8` predates these contracts.
-Use 0.41 as the minimum for Core's eventual dependency upgrade, including its
-lock, consumer constraints and installed-package acceptance tests. The SDK's
-protected publishing review and native-A2A release gates still apply.
+SDK 0.41.0 is now published. Core's manifest requires at least 0.41.0 and its
+lock resolves that public release. Consumer constraints and installed-package
+acceptance tests must verify the complete host feature set. Native-A2A public
+dependency and conformance gates still apply.
 
 The cutover worktree removes `kestrel_sovereign/a2a/types.py` and
 `kestrel_sovereign/a2a/agent_card.py`, which forwarded the draft models from

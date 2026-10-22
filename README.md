@@ -326,10 +326,16 @@ traffic with `KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE` and
 positive integers. These are independent host budgets: scheduler effect gates
 use the scheduler host's own storage pool, not the agents' advisory pool.
 
-#### SDK 0.39 release cascade
+#### Native SDK release requirements
 
-Core requires `kestrel-sovereign-sdk[httpx,tracing]>=0.39.2,<0.40`; the
-`observability` extra adds `metrics` under that same base constraint. The SDK
+Core requires `kestrel-sovereign-sdk[httpx,tracing]>=0.41.0,<1`; the
+`observability` extra adds `metrics` under that same base constraint. The 0.40
+release replaces draft A2A contribution types with native `AgentSkill` and
+`get_agent_skills` contracts; the coordinated 0.41.0 floor also includes the
+shared computer-use, artifact, resource-scope and workspace-transfer contracts.
+SDK 0.39 lacks the native initialization contract and cannot boot this release.
+The lock records the tested version without excluding future SDK minor
+releases. The SDK
 owns the canonical outbound URL/IP policy and native pinned HTTP transport.
 Version 0.39.2 aligns DNS, canonical URLs and native origin checks to IDNA 2008;
 avatar downloads and DID resolution use it. Core retains only its stdlib HTTPS
@@ -347,21 +353,16 @@ isolated execution, provider-neutral private inference leases (including
 bounded owner-scoped idle renewal), private host ingress, feature-owned
 operator and context-clause contribution contracts, and the awaited
 context-clause preparation hook. It is not a preference that a downstream
-package may relax. The Core-owned release-cascade contract is:
+package may relax.
 
-| Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
-|---|---|---|
-| kestrel-feature-talon | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (PyPI release). |
-| kestrel-feature-story-archive | `kestrel-sovereign-sdk>=0.17,<0.40` | External prerequisite (PyPI release). |
-| kestrel-feature-eye | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
-| kestrel-feature-flight | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
-| kestrel-claws | `kestrel-sovereign-sdk>=0.37.1,<0.40` | External prerequisite (editable manifest; lift on `main`). |
-| kestrel-feature-features | `kestrel-sovereign-sdk>=0.36.0,<0.40` | External prerequisite (PyPI release). |
-| kestrel-channel-telegram | `kestrel-sovereign-sdk>=0.36,<0.40` | External prerequisite (PyPI release). |
-| Frinz | `kestrel-sovereign-sdk>=0.39.0,<0.40` | External prerequisite; Core does not claim Frinz has changed. |
-| Observability fleet | `kestrel-sovereign-sdk>=0.39.0,<0.40` | External prerequisite; Core does not claim observability has changed. |
+Story Archive 0.3.5 removes its old SDK ceiling and admits SDK 0.41. The public
+MCP 0.7.0, Talon 0.2.15, Features 0.3.3, Telegram 0.1.9 and Observability
+0.17.15 releases also declare SDK constraints that admit 0.41. These metadata
+checks establish resolver compatibility, not runtime acceptance. Editable
+Eye, Flight and Claws installations and the rest of each host's feature
+manifest need their own source and runtime verification before Core ships.
 
-A Core release that raises the SDK floor without these lifts makes
+A Core release that raises the SDK floor without compatible feature releases makes
 `kestrel update` refuse every feature whose cap excludes the new line — or
 worse, lets `kestrel feature sync` downgrade the SDK under Core while
 installing a capped package. Survey **every** package in the host feature
@@ -372,9 +373,9 @@ the published downstream constraints and tests before the Core publish. Do not
 weaken Core's requirement to make an older sibling resolver succeed.
 
 The Core dependency-contract test verifies the base and observability
-declarations and lockfile resolve the same SDK line. It cannot validate another
-repository's working tree, so the downstream release verification remains an
-explicit release gate owned by those repositories.
+declarations require the native SDK contracts and that the lock exercises an
+admitted release. It cannot validate another repository's working tree, so
+host feature verification remains an explicit release gate.
 
 #### Telegram acknowledged-ingress release order
 
