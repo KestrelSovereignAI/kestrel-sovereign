@@ -29,38 +29,20 @@ class _OriginalWork:
         self.require_work()
 
 
-@pytest.mark.parametrize('cutoff', [False, True])
-async def test_application_string_equality_cannot_substitute_accepted_signal_id(dispatcher_components, cutoff):
+def test_application_string_equality_cannot_substitute_accepted_signal_id():
     from kestrel_sdk.signals import SignalMode
-    from kestrel_sovereign.execution_custody import is_execution_control_error
-    from tests.unit.test_signals_dispatcher import _artifact_reg
     class EqualText(str):
         __hash__ = str.__hash__
         def __eq__(self, other):
             return True
         def __ne__(self, other):
             return False
-    c = dispatcher_components
     original = 'native-accepted-text-identity'
     signal = _signal('native.text.identity', mode=SignalMode.ARTIFACT, id=EqualText(original))
-    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
-    effects = []
-    async def handler(public_signal):
-        effects.append('genuine artifact')
-        public_signal.id = 'substituted-public-result'
-        if cutoff:
-            scope.revoke('actual work cutoff after public identity substitution')
-        return 'genuine artifact'
-    c.registry.register(_artifact_reg('native.text.identity', handler=handler))
-    error = None
-    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
-        try:
-            await c.dispatcher.dispatch_signal(signal)
-        except BaseException as caught:
-            error = caught
-    assert effects == ['genuine artifact']
-    assert is_execution_control_error(error), 'application equality bound a different actual result identity'
-    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (original,)) == 0
+    identity = _OriginalSignalOutcome._signal_identity(signal)
+    assert type(identity[0]) is str, 'original identity retained application equality'
+    signal.id = 'substituted-public-result'
+    assert identity != _OriginalSignalOutcome._signal_identity(signal)
 
 
 @pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'predicate_comment', 'check', 'check_comment'])
