@@ -39,6 +39,44 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
+async def test_postgres_original_journal_rejects_temporary_relation_at_admission(dispatcher_components, native_pg):
+    import asyncpg
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error, execution_commit_outcome
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    original_pool = c.backend._pool
+    pool = await asyncpg.create_pool(*original_pool._connect_args,
+        **original_pool._connect_kwargs, min_size=0, max_size=1)
+    c.backend._pool = pool
+    effects = []
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    async def handler(payload):
+        effects.append('must not execute against temporary audit destination')
+        scope.revoke('actual work cutoff after admitted handler')
+        return {'genuine': True}
+    c.registry.register(_action_reg('temporary.native.audit', handler=handler))
+    signal = _signal('temporary.native.audit')
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            await c.backend.execute(f'CREATE TEMP TABLE signal_log (LIKE "{schema}".signal_log INCLUDING ALL)')
+            try:
+                await c.dispatcher.dispatch_signal(signal)
+            except BaseException as caught:
+                error = caught
+        assert is_execution_control_error(error), 'temporary table was admitted as a durable audit destination'
+        assert execution_commit_outcome(error) != 'committed'
+        assert effects == []
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 0
+        assert not c.dispatcher._outcome_log_tasks
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
 async def test_postgres_original_journal_checks_deferred_trigger_effect_before_commit(dispatcher_components):
     await test_original_journal_verifies_exact_row_before_native_commit(dispatcher_components, 'deferred_delete')
 

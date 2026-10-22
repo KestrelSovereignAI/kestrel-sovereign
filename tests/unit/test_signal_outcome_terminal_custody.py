@@ -30,6 +30,79 @@ class _OriginalWork:
 
 
 @pytest.mark.timeout(15, method='thread')
+async def test_privacy_getter_cannot_drive_empty_native_commit_helper(dispatcher_components):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+    c = dispatcher_components
+    saved = []
+    yielded = []
+    completed = []
+    refused = []
+    entered = []
+    observation = RuntimeError('one-shot getter error after attempted empty native COMMIT')
+    def epoch():
+        journal = c.dispatcher._original_outcome_writer.get()
+        if journal is None or journal._phase != 'submitted' or entered:
+            return 'unchanged-original-policy'
+        entered.append(True)
+        try:
+            if not saved:
+                operation = c.backend._commit_write(c.backend._connection, original_outcome=journal)
+                saved.append(operation)
+                try:
+                    yielded.append(operation.send(None))
+                except ExecutionAuthorityError as denial:
+                    refused.append(denial)
+                    raise observation
+                except StopIteration:
+                    completed.append(True)
+                    raise observation
+            elif not completed and yielded and yielded[0].done():
+                try:
+                    saved[0].send(None)
+                except StopIteration:
+                    completed.append(True)
+                    raise observation
+        finally:
+            entered.pop()
+        return 'unchanged-original-policy'
+    c.agent._get_privacy_policy_epoch = epoch
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        scope.revoke('actual cutoff before getter helper reentry')
+        return {'genuine': True}
+    c.registry.register(_action_reg('empty.commit.reentry', handler=handler))
+    signal = _signal('empty.commit.reentry')
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            with pytest.raises(BaseException) as caught:
+                await c.dispatcher.dispatch_signal(signal)
+        assert is_execution_control_error(caught.value)
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM main.signal_log WHERE id=?', (signal.id,)) == 0
+        assert execution_commit_outcome(caught.value) != 'committed', 'empty helper COMMIT was recorded as the absent original row'
+        assert c.dispatcher._log_write_failures == 1
+        assert refused and not completed
+        assert not c.dispatcher._outcome_log_tasks
+    finally:
+        # The failing implementation may leave a manually driven coroutine.
+        # Join its ACTUAL native future without changing future/context state,
+        # then close it; never abandon a queued native COMMIT.
+        if yielded and not yielded[0].done():
+            done, _ = await asyncio.wait({yielded[0]}, timeout=5)
+            assert done
+        for operation in saved:
+            if operation.cr_frame is not None:
+                try:
+                    operation.close()
+                except BaseException as terminal:
+                    assert is_execution_control_error(terminal)
+        if c.dispatcher._outcome_log_control_error is not None:
+            try:
+                await c.dispatcher.shutdown_durable_delivery()
+            except BaseException as terminal:
+                assert is_execution_control_error(terminal)
+
+
+@pytest.mark.timeout(15, method='thread')
 @pytest.mark.parametrize('trigger', ['before_ignore', 'after_delete', 'after_mutate'])
 async def test_original_journal_verifies_exact_row_before_native_commit(dispatcher_components, trigger):
     from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_native_source_error, _explicit_control_chain
