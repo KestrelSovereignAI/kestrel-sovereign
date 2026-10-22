@@ -37,7 +37,9 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
-async def test_original_journal_refuses_enclosing_transaction_before_destination_checkout(dispatcher_components):
+@pytest.mark.timeout(15, method='thread')
+@pytest.mark.parametrize('entry', ['dispatch', 'enqueue', 'durable_enqueue'])
+async def test_original_journal_refuses_enclosing_transaction_before_destination_checkout(dispatcher_components, entry):
     import asyncpg
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError, _explicit_control_chain
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
@@ -52,13 +54,26 @@ async def test_original_journal_refuses_enclosing_transaction_before_destination
         return {'genuine': True}
     c.registry.register(_action_reg('enclosing.admission.audit', handler=handler))
     error = None
+    handle = None
     try:
+        # Normal startup completes without holding the sole native pool slot.
+        await c.dispatcher.initialize_durable_delivery()
         try:
-            async with asyncio.timeout(1):
+            async with asyncio.timeout(3):
                 async with c.backend.transaction():
-                    await c.dispatcher.dispatch_signal(_signal('enclosing.admission.audit'))
+                    signal = _signal('enclosing.admission.audit')
+                    if entry == 'dispatch':
+                        await c.dispatcher.dispatch_signal(signal)
+                    elif entry == 'enqueue':
+                        handle = await c.dispatcher.enqueue_signal(signal)
+                    else:
+                        handle = await c.dispatcher.enqueue_durable_cognition(
+                            signal, source_event_id=None, consumer_id='owned-test-consumer')
         except BaseException as caught:
             error = caught
+        if handle is not None:
+            from kestrel_sovereign._async_ownership import await_owned_task
+            await await_owned_task(handle.task)
         assert error is not None
         assert any(isinstance(item, ExecutionAuthorityError) and 'enclosing transaction' in str(item)
                    for item in _explicit_control_chain(error)), 'destination capture waited for its own enclosing transaction pool slot'
