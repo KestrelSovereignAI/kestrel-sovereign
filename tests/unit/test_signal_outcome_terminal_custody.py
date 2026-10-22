@@ -29,6 +29,31 @@ class _OriginalWork:
         self.require_work()
 
 
+@pytest.mark.timeout(15, method='thread')
+@pytest.mark.parametrize('entry', ['dispatch', 'enqueue', 'durable_enqueue'])
+async def test_sqlite_original_dispatch_refuses_enclosing_transaction_at_parent_entry(dispatcher_components, entry):
+    c = dispatcher_components
+    await c.dispatcher.initialize_durable_delivery()
+    effects = []
+    async def handler(payload):
+        effects.append('unsupported effect')
+        return {'genuine': True}
+    c.registry.register(_action_reg('sqlite.enclosing.audit', handler=handler))
+    async with c.backend.transaction():
+        with pytest.raises(ExecutionAuthorityError, match='enclosing transaction'):
+            signal = _signal('sqlite.enclosing.audit')
+            if entry == 'dispatch':
+                await c.dispatcher.dispatch_signal(signal)
+            elif entry == 'enqueue':
+                await c.dispatcher.enqueue_signal(signal)
+            else:
+                await c.dispatcher.enqueue_durable_cognition(
+                    signal, source_event_id=None, consumer_id='owned-test-consumer')
+    assert effects == []
+    assert not c.dispatcher._outcome_log_tasks
+    assert not c.agent.background_tasks
+
+
 @pytest.mark.parametrize('cutoff', ['handler', 'journal'])
 async def test_sqlite_original_journal_cannot_be_shadowed_by_temporary_table(dispatcher_components, monkeypatch, cutoff):
     c = dispatcher_components

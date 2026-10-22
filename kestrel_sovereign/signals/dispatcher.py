@@ -1149,6 +1149,17 @@ class SignalDispatcher:
             gap_seconds,
         )
 
+    def _require_standalone_native_outcome_entry(self):
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+        from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+        backend = getattr(self._store, '_backend', None)
+        if (type(self._store) is SignalLogStore
+                and type(backend) in (SQLiteBackend, PostgresBackend)
+                and backend.owns_open_transaction):
+            raise ExecutionAuthorityError(
+                'Original signal dispatch refuses an enclosing transaction; commit before dispatch/enqueue')
+
     async def dispatch_signal(
         self,
         signal: Signal,
@@ -1163,6 +1174,7 @@ class SignalDispatcher:
         (scheduler, heartbeat). Ordinary failures return `Status.FAILED`.
         Execution-authority loss and uncertain commits remain typed errors
         so the owning invocation can reconcile instead of retrying effects."""
+        self._require_standalone_native_outcome_entry()
         start = time.monotonic()
         # Nested public dispatches inherit ContextVars from their caller. A
         # signal emitted by durable cognition is a new source unit and must not
@@ -1330,6 +1342,7 @@ class SignalDispatcher:
         """Returns immediately with a tracked handle. The dispatch runs as
         an agent-owned background task; exceptions are logged not swallowed,
         and the task is cancellable via the agent's shutdown path."""
+        self._require_standalone_native_outcome_entry()
         durable_admission: asyncio.Future[DurableAdmissionResult] = (
             asyncio.get_running_loop().create_future()
         )
@@ -1363,6 +1376,7 @@ class SignalDispatcher:
         durable executor afterwards; an external cursor must never wait for a
         full LLM turn merely to learn that its work survived process loss.
         """
+        self._require_standalone_native_outcome_entry()
         durable_admission: asyncio.Future[DurableAdmissionResult] = (
             asyncio.get_running_loop().create_future()
         )

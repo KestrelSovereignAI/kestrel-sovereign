@@ -2231,6 +2231,8 @@ class PostgresBackend(DatabaseBackend):
                 or journal._phase != 'accepted'
                 or journal._dispatcher._accepted_signal_outcomes.get(journal._acceptance) is not journal):
             raise ExecutionAuthorityError('Original live acceptance required for native journal destination')
+        if self.owns_open_transaction:
+            raise ExecutionAuthorityError('Original signal destination refuses an enclosing transaction')
         require_execution_work(self)
         journal._require_backing()
         async with self._tracked_pool_checkout(journal._backing, admit_work=True) as (connection, _):

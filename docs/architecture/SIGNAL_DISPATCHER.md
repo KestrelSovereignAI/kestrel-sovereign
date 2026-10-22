@@ -839,6 +839,11 @@ result can bind the immutable row; handler calls to scheduling helpers cannot
 publish a premature result. The original admitted writer Tasks remain owned
 until physically joined, including failures after Task acceptance but before
 callback publication.
+Native dispatch/enqueue must start outside an enclosing backend transaction.
+Public parent entries refuse it before initialization or child Task creation;
+commit the enclosing transaction before publishing a signal. This prevents both
+independent audit publication ahead of the caller's transaction and waiting on
+the caller's occupied pool slot while it waits for dispatch completion.
 Result authorization is sealed only where the original public/recovered
 pipeline actually returns, never by a deferred-finalization helper. Projection
 is a non-reentrant phase entered before callbacks; a helper attempt cannot
