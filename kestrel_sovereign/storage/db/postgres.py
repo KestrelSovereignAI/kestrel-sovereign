@@ -77,7 +77,7 @@ from .interface import (
 )
 from .placeholder import sqlite_to_postgres
 from .timestamp import TimestamptzParameter
-from .native_journal_programs import NativeJournalPostgresConnection, NativeJournalConfigurationError
+from .native_journal_programs import NativeJournalPostgresConnection, NativeJournalConfigurationError, _ORIGINAL_POSTGRES_CONNECT
 from .transaction_control import reject_transaction_control
 from .write_audit import record_write_query, record_write_script
 
@@ -2310,6 +2310,7 @@ class PostgresBackend(DatabaseBackend):
         state = None
         native = None
         program_sealed = False
+        connect_token = _ORIGINAL_POSTGRES_CONNECT.set((journal, self))
         try:
             async with self._tracked_pool_checkout(journal._backing, admit_work=False) as (connection, state):
                 journal.require_original(self)
@@ -2361,9 +2362,12 @@ class PostgresBackend(DatabaseBackend):
                 raise state.retain_acknowledgments(error)
             raise
         finally:
-            if program_sealed:
-                native._end_original_journal()
-            journal._postgres_session = None
+            try:
+                if program_sealed:
+                    native._end_original_journal()
+            finally:
+                journal._postgres_session = None
+                _ORIGINAL_POSTGRES_CONNECT.reset(connect_token)
         return entry.result_summary
 
     async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):

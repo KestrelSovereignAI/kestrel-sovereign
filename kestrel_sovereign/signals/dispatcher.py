@@ -5021,6 +5021,7 @@ class SignalDispatcher:
             # The exact claim was obtained under live ingress authority. Its
             # remaining work must be owned before any early cursor receipt:
             # caller recovery, cognition, renewal, settlement AND audit tails.
+            resident_journals = []
             async def resident_delivery():
                 from kestrel_sovereign.signals.context import (
                     reset_current_signal, set_current_signal,
@@ -5036,6 +5037,7 @@ class SignalDispatcher:
                             consumer_id=consumer_id, use_live_signal=use_live_signal,
                             retry_delay=retry_delay, durable_admission=durable_admission,
                             persisted_event_id=persisted_event_id,
+                            _journal_completion=resident_journals,
                         )
                     finally:
                         await self._drain_outcome_logs_for_signal(signal.id)
@@ -5108,9 +5110,9 @@ class SignalDispatcher:
             # child physically settles. Explicit handle cancellation forwards
             # once; borrowed admission readers still never cancel this owner.
             outcome = await await_owned_task(resident, cancel_on_caller_cancellation=True)
-            terminal = execution_finite_error(
-                outcome.error, outcome.cancellation, retain_originals=True,
-            )
+            terminal = execution_observation_error(outcome.error, outcome.cancellation)
+            for completed_journal in resident_journals:
+                terminal = completed_journal.retain_committed(terminal)
             if terminal is not None:
                 raise terminal
             return outcome.result
@@ -5123,9 +5125,11 @@ class SignalDispatcher:
 
     async def _execute_claimed_durable_cognition(
         self, signal, registration, start, *, delivery, consumer_id,
-        use_live_signal, retry_delay, durable_admission, persisted_event_id,
+        use_live_signal, retry_delay, durable_admission, persisted_event_id, _journal_completion=None,
     ):
         """Own recovered claim admission and its original journal through join."""
+        if _journal_completion is not None and (type(_journal_completion) is not list or _journal_completion):
+            raise TypeError('Original resident journal handoff requires a fresh native slot')
         async with self._admit_durable_operation():
             token = self._original_outcome_admission.set(None)
             original_outcomes = []
@@ -5174,6 +5178,10 @@ class SignalDispatcher:
                     raise terminal
                 return result
             finally:
+                if _journal_completion is not None:
+                    completed_journal = self._original_outcome_admission.get()
+                    if completed_journal is not None:
+                        _journal_completion.append(completed_journal)
                 for acceptance in acceptances:
                     self._accepted_signal_outcomes.pop(acceptance, None)
                 self._original_outcome_admission.reset(token)

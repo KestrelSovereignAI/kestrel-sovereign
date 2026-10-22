@@ -129,6 +129,40 @@ class _AcceptedSignalOutcome:
     registration: object
 
 
+def _freeze_native_connect_configuration(value, ancestors=None):
+    """Private immutable native recipe; no hooks, callbacks, or secret repr."""
+    kind = type(value)
+    if any(kind is native for native in (type(None), bool, int, float, str, bytes)):
+        return ('atom', kind.__name__, value)
+    if kind is not list and kind is not tuple and kind is not dict:
+        raise ExecutionAuthorityError('Original native connect configuration requires plain data, not application programs')
+    if ancestors is None:
+        ancestors = set()
+    identity = id(value)
+    if identity in ancestors:
+        raise ExecutionAuthorityError('Original native connect configuration cannot contain cycles')
+    ancestors.add(identity)
+    try:
+        if kind is dict:
+            if any(type(name) is not str for name in value):
+                raise ExecutionAuthorityError('Original native connect setting names must be plain text')
+            return ('dict', tuple((name, _freeze_native_connect_configuration(value[name], ancestors)) for name in sorted(value)))
+        return (kind.__name__, tuple(_freeze_native_connect_configuration(item, ancestors) for item in value))
+    finally:
+        ancestors.remove(identity)
+
+
+def _restore_native_connect_configuration(value):
+    """Detach the already validated recipe immediately before native connect."""
+    kind = value[0]
+    if kind == 'atom':
+        return value[2]
+    if kind == 'dict':
+        return {name: _restore_native_connect_configuration(item) for name, item in value[1]}
+    items = (_restore_native_connect_configuration(item) for item in value[1])
+    return list(items) if kind == 'list' else tuple(items)
+
+
 @dataclass(frozen=True, eq=False, repr=False)
 class _OriginalPostgresJournalPool:
     """Opaque native pool configuration accepted for this one fixed row.
@@ -142,6 +176,7 @@ class _OriginalPostgresJournalPool:
     connect_args: object
     connect_kwargs: object
     wrapper: object
+    configuration: tuple
 
     @classmethod
     def capture(cls, backing):
@@ -149,18 +184,25 @@ class _OriginalPostgresJournalPool:
         adapted = isinstance(backing, PostgresPoolAdapter)
         native = backing.native_pool if adapted else backing
         cls._require_native_programs(native, backing.wrap_checkout if adapted else None)
+        configuration = _freeze_native_connect_configuration((tuple(native._connect_args), native._connect_kwargs))
+        from kestrel_sovereign.storage.db.native_journal_programs import _native_journal_connect
+        # Adopt the canonical neutral connector while admitted. It remains an
+        # ordinary asyncpg connect outside original journal context. Its check
+        # executes AFTER queueing, at the actual reconnect boundary.
+        native._connect = _native_journal_connect
         return cls(native, native._generation, native._connect_args,
-                   native._connect_kwargs, backing.wrap_checkout if adapted else None)
+                   native._connect_kwargs, backing.wrap_checkout if adapted else None, configuration)
 
     @staticmethod
     def _require_native_programs(native, wrapper):
         import asyncpg
-        from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+        from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection, _native_journal_connect
         if (type(native) is not asyncpg.Pool or wrapper is not None or native._setup is not None
                 or native._init is not None or native._reset is not None
-                or native._connect is not asyncpg.connection.connect
+                or (native._connect is not asyncpg.connection.connect and native._connect is not _native_journal_connect)
                 or native._connection_class is not NativeJournalPostgresConnection
                 or native._record_class is not asyncpg.Record
+                or native._loop is not asyncio.get_running_loop()
                 or any(holder._setup is not None for holder in native._holders)):
             raise ExecutionAuthorityError('Original signal journal refuses application pool programs')
 
@@ -174,8 +216,25 @@ class _OriginalPostgresJournalPool:
                 or native._generation != self.generation
                 or native._connect_args is not self.connect_args
                 or native._connect_kwargs is not self.connect_kwargs
+                or _freeze_native_connect_configuration((tuple(native._connect_args), native._connect_kwargs)) != self.configuration
                 or native.is_closing()):
             raise ExecutionAuthorityError('Original signal journal pool configuration retired')
+
+    def parameters_for_connect(self, args, kwargs):
+        import asyncpg
+        from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+        self.require_original(self.pool)
+        supplied = dict(kwargs)
+        loop = supplied.pop('loop', None)
+        connection_class = supplied.pop('connection_class', None)
+        record_class = supplied.pop('record_class', None)
+        if (loop is not self.pool._loop or connection_class is not NativeJournalPostgresConnection
+                or record_class is not asyncpg.Record
+                or _freeze_native_connect_configuration((tuple(args), supplied)) != self.configuration):
+            raise ExecutionAuthorityError('Original native reconnect parameters differ')
+        original_args, original_kwargs = _restore_native_connect_configuration(self.configuration)
+        original_kwargs.update(loop=loop, connection_class=connection_class, record_class=record_class)
+        return original_args, original_kwargs
 
 
 @dataclass(frozen=True)

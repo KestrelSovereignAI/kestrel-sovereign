@@ -5,7 +5,7 @@ const { spawnSync } = require('node:child_process');
 const { test } = require('node:test');
 
 const cli = path.join(path.dirname(require.resolve('playwright/package.json')), 'cli.js');
-for (const platform of ['ubuntu26.04-x64', 'ubuntu26.04-arm64']) {
+for (const platform of ['ubuntu24.04-x64', 'ubuntu24.04-arm64', 'ubuntu26.04-x64', 'ubuntu26.04-arm64']) {
   test(`locked Playwright resolves Chromium for ${platform}`, () => {
     const result = spawnSync(process.execPath, [cli, 'install', '--dry-run', 'chromium'], {
       env: { ...process.env, PLAYWRIGHT_HOST_PLATFORM_OVERRIDE: platform },

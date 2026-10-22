@@ -60,6 +60,39 @@ def test_native_postgres_proof_targets_only_original_physical_relation():
     assert 'FROM main.signal_log WHERE ' in SignalLogStore._outcome_match_query('main.signal_log', postgres=False)
 
 
+def test_native_connect_recipe_detaches_nested_values_without_application_hooks():
+    from kestrel_sovereign.signals.outcome_custody import _freeze_native_connect_configuration, _restore_native_connect_configuration
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    hosts = ['owned-original-endpoint']
+    settings = {'search_path': 'owned_original_schema'}
+    recipe = (('owned-native-dsn',), {'host': hosts, 'server_settings': settings})
+    frozen = _freeze_native_connect_configuration(recipe)
+    hosts[0] = 'replacement-endpoint'
+    settings['search_path'] = 'replacement_schema'
+    assert _freeze_native_connect_configuration(recipe) != frozen
+    args, restored = _restore_native_connect_configuration(frozen)
+    assert args == ('owned-native-dsn',)
+    assert restored == {'host': ['owned-original-endpoint'], 'server_settings': {'search_path': 'owned_original_schema'}}
+    restored['host'].append('another-endpoint')
+    assert _restore_native_connect_configuration(frozen)[1]['host'] == ['owned-original-endpoint']
+    hooks = []
+    class ForeignMeta(type):
+        def __eq__(self, other):
+            hooks.append('metaclass equality')
+            return False
+    class ForeignData(dict, metaclass=ForeignMeta):
+        def __iter__(self):
+            hooks.append('iteration')
+            return super().__iter__()
+    with pytest.raises(ExecutionAuthorityError):
+        _freeze_native_connect_configuration({'server_settings': ForeignData()})
+    assert not hooks
+    cyclic = []
+    cyclic.append(cyclic)
+    with pytest.raises(ExecutionAuthorityError):
+        _freeze_native_connect_configuration(cyclic)
+
+
 @pytest.mark.parametrize('name,value', [('text_factory', bytes), ('isolation_level', None), ('autocommit', True)])
 def test_native_sqlite_text_configuration_is_fenced_through_real_commit(name, value):
     native = _NativeJournalSQLiteConnection(':memory:')

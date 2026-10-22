@@ -7,6 +7,9 @@ not SQL executors or grants of work authority.
 """
 import asyncio
 import sqlite3
+from contextvars import ContextVar
+
+_ORIGINAL_POSTGRES_CONNECT = ContextVar('original_postgres_journal_connect', default=None)
 
 
 class NativeJournalConfigurationError(RuntimeError):
@@ -146,6 +149,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 try:
     import asyncpg
 except ImportError:
+    asyncpg = None
     NativeJournalPostgresConnection = None
 else:
     class NativeJournalPostgresConnection(asyncpg.Connection):
@@ -249,3 +253,21 @@ else:
             return super().get_reset_query().replace(
                 'SELECT pg_advisory_unlock_all();',
                 'SELECT pg_catalog.pg_advisory_unlock_all();')
+
+
+async def _native_journal_connect(*args, **kwargs):
+    """Check the original recipe at actual reconnect, including queued waits.
+
+    Outside a journal this is the ordinary native connector. Within one, only
+    its genuine fixed original recipe may reach asyncpg; detached values cannot
+    be changed by a caller retaining a host list or startup-settings dictionary.
+    """
+    if asyncpg is None:
+        raise RuntimeError('Native PostgreSQL driver is unavailable')
+    original = _ORIGINAL_POSTGRES_CONNECT.get()
+    if original is not None:
+        journal, backend = original
+        from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+        _require_original_signal_outcome(journal, backend)
+        args, kwargs = journal._postgres_pool.parameters_for_connect(args, kwargs)
+    return await asyncpg.connection.connect(*args, **kwargs)
