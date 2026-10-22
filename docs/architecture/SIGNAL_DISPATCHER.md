@@ -923,6 +923,12 @@ is sealed through actual transaction and pool reset. Native connection codecs
 and callback state are checked, not only the pool recipe. PostgreSQL reset's
 advisory-unlock function is catalog-qualified after local search-path restoration.
 No caller attestation or synthetic native completion substitutes for these fences.
+Original SQLite journals require legacy explicit transaction control, not Python's
+autocommit/implicit-reopening modes. Configuration changes are fenced, and the
+actual native worker verifies COMMIT/rollback ended its transaction before
+clearing its seal. A pooled PostgreSQL successor observes the previous original
+journal task through physical retirement before beginning its own journal; pool
+availability alone does not prove that previous owner's fence has retired.
 
 PostgreSQL audit columns must have their canonical types and unmodified typmods;
 catalog namespace alone cannot exclude CHAR padding/truncation. SQLite partial
@@ -930,6 +936,9 @@ indexes are accepted only as the complete native constitution-hash declaration,
 not by finding a WHERE-like suffix inside arbitrary SQL/comments. Durable enqueue
 reserves and releases its captured original ID even when a UI emitter changes
 the caller's public Signal, so a genuinely NACKed delivery can be reclaimed.
+Allocation and callback-publication refusal also release that reservation only
+after any accepted original dispatch task physically joins. Cleanup is idempotent
+even when a callback registered before raising, and retains the original failure.
 
 SQLite's plain audit shape excludes CHECK programs, column collations,
 expression/custom-collation indexes and noncanonical partial predicates; the

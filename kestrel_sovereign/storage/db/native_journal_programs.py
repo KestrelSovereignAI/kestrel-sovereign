@@ -38,11 +38,18 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         self._journal_programs_configured = False
         self._journal_program_seal = None
         super().__init__(*args, **kwargs)
+        # Native autocommit getters are thread-affine. Mirror only supported
+        # configuration changes here/on their actual successful native setter;
+        # final transaction completion is still checked on the native worker.
+        self._journal_autocommit_legacy = (not hasattr(sqlite3.Connection, 'autocommit')
+            or self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL)
 
     def __setattr__(self, name, value):
         if name in ('text_factory', 'autocommit', 'isolation_level') and self._journal_program_seal is not None:
             raise NativeJournalConfigurationError('Original journal native configuration is fenced')
         super().__setattr__(name, value)
+        if name == 'autocommit':
+            self._journal_autocommit_legacy = self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL
 
     def _program_call(self, name, *args, **kwargs):
         _register_program(self)
@@ -77,8 +84,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 
     def _original_journal_programs_supported(self):
         return (not self._journal_programs_configured and self.text_factory is str
-                and (not hasattr(self, 'autocommit')
-                     or self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL))
+                and self._journal_autocommit_legacy)
 
     def cursor(self, factory=None):
         if factory is None:

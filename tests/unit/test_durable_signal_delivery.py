@@ -2021,7 +2021,7 @@ async def test_failed_enqueue_callback_publication_joins_and_releases_original(t
         await dispatcher.register_durable_consumer(consumer)
         loop.set_task_factory(rejecting_factory)
         try:
-            with pytest.raises(BaseException):
+            with pytest.raises(BaseException) as caught:
                 await dispatcher.enqueue_durable_cognition(signal,
                     source_event_id='telegram:update:publication-failure', consumer_id=consumer.consumer_id)
         finally:
@@ -2031,9 +2031,67 @@ async def test_failed_enqueue_callback_publication_joins_and_releases_original(t
         await await_owned_task(original_dispatch)
         await asyncio.sleep(0)
         assert joined_before_manual_cleanup, 'enqueue unwound without joining its accepted dispatch'
+        from kestrel_sovereign.execution_custody import _explicit_control_chain
+        assert any(error is rejected for error in _explicit_control_chain(caught.value))
         assert signal.id not in dispatcher._live_durable_cognition_event_ids
         [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
         assert delivery.status == RETRY and delivery.attempts == 0
+        async def resume(prompt):
+            return 'genuine resumed turn after refused callback publication'
+        agent.process_input = resume
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
+            while True:
+                [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
+                if delivery.status == ACKNOWLEDGED:
+                    break
+                await asyncio.sleep(0.01)
+        assert delivery.attempts == 1
+    finally:
+        loop.set_task_factory(factory)
+        for task in accepted:
+            await await_owned_task(task)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['allocation', 'publication_before', 'publication_after'])
+async def test_unstarted_durable_enqueue_refusal_releases_original_reservation(tmp_path, failure):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / 'unstarted-enqueue.db', 'did:agent:unstarted-enqueue')
+    signal = _channel_signal(agent.did, 'unstarted-enqueue')
+    rejected = RuntimeError('actual original durable dispatch admission refused')
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    accepted = []
+    class RejectStart(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'close_unstarted':
+                if failure == 'publication_after':
+                    super().add_done_callback(callback, context=context)
+                raise rejected
+            return super().add_done_callback(callback, context=context)
+    def rejecting_factory(loop, coro, **kwargs):
+        if failure == 'allocation':
+            raise rejected
+        task = RejectStart(coro, loop=loop, **kwargs)
+        accepted.append(task)
+        return task
+    try:
+        loop.set_task_factory(rejecting_factory)
+        try:
+            with pytest.raises(BaseException) as caught:
+                await dispatcher.enqueue_durable_cognition(signal,
+                    source_event_id='telegram:update:unstarted', consumer_id=DURABLE_COGNITION_CONSUMER_ID)
+        finally:
+            loop.set_task_factory(factory)
+        from kestrel_sovereign.execution_custody import _explicit_control_chain
+        assert any(error is rejected for error in _explicit_control_chain(caught.value))
+        assert all(task.done() for task in accepted), 'unstarted accepted owner was abandoned'
+        assert signal.id not in dispatcher._live_durable_cognition_event_ids
+        assert await backend.fetch_val('SELECT COUNT(*) FROM durable_signal_events') == 0
     finally:
         loop.set_task_factory(factory)
         for task in accepted:

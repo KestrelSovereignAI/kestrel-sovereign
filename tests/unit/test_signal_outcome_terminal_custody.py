@@ -73,7 +73,7 @@ async def test_original_sqlite_refuses_noop_native_autocommit(dispatcher_compone
     from kestrel_sovereign.execution_custody import is_execution_control_error
     c = dispatcher_components
     native = c.backend._connection._conn
-    if not hasattr(native, 'autocommit'):
+    if not hasattr(sqlite3.Connection, 'autocommit'):
         pytest.skip('Native autocommit property was added in Python 3.12')
     scope = ExecutionCustody(_OriginalWork())
     async def handler(payload):
