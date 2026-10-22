@@ -2980,7 +2980,8 @@ class SignalDispatcher:
             observed_error = outcome.error
             if journal is not None and observed_error is not None and not journal.has_acknowledged_commit():
                 self._record_original_outcome_loss(journal, journal._identity[0], observed_error)
-                if isinstance(observed_error, Exception) and not is_execution_control_error(observed_error):
+                if (isinstance(observed_error, Exception) and not is_execution_control_error(observed_error)
+                        and execution_commit_outcome(observed_error) is None):
                     observed_error = None  # ordinary audit loss, not a failed handler
             originals.extend((journal.retain_committed(observed_error),
                               journal.retain_committed(outcome.cancellation))
@@ -2990,7 +2991,8 @@ class SignalDispatcher:
                 complete, publication_error, _ = reconciliation
                 if journal is not None and publication_error is not None and not journal.has_acknowledged_commit():
                     self._record_original_outcome_loss(journal, journal._identity[0], publication_error)
-                    if isinstance(publication_error, Exception) and not is_execution_control_error(publication_error):
+                    if (isinstance(publication_error, Exception) and not is_execution_control_error(publication_error)
+                            and execution_commit_outcome(publication_error) is None):
                         publication_error = None
                 publication_error = (journal.retain_committed(publication_error)
                     if journal is not None else publication_error)
@@ -7605,7 +7607,7 @@ class SignalDispatcher:
                         prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
                         **_audit_to_log_kwargs(audit))
                 except Exception as error:
-                    if is_execution_control_error(error):
+                    if is_execution_control_error(error) or execution_commit_outcome(error) is not None:
                         raise
                     self._record_original_outcome_loss(journal, signal.id, error)
                     self._release_durable_admission(reservation)
@@ -7630,7 +7632,8 @@ class SignalDispatcher:
                 # for its loss. Accepted writers own their own one outcome.
                 if journal is not None:
                     self._record_original_outcome_loss(journal, signal.id, opening)
-                    if isinstance(opening, Exception) and not is_execution_control_error(opening):
+                    if (isinstance(opening, Exception) and not is_execution_control_error(opening)
+                            and execution_commit_outcome(opening) is None):
                         logger.error('Original outcome writer allocation failed for %s', signal.id, exc_info=True)
                         return
                 raise
@@ -7711,7 +7714,8 @@ class SignalDispatcher:
             writer = publication.task
             if writer is None:
                 self._record_original_outcome_loss(journal, signal.id, error)
-                if isinstance(error, Exception) and not is_execution_control_error(error):
+                if (isinstance(error, Exception) and not is_execution_control_error(error)
+                        and execution_commit_outcome(error) is None):
                     logger.error('Original outcome writer allocation failed for %s', signal.id, exc_info=True)
                     return
                 raise
@@ -7857,7 +7861,8 @@ class SignalDispatcher:
             receipt = await emit("signal_completed", payload)
         except BaseException as error:
             self._record_surface(signal.id, SURFACE_EMIT_FAILED)
-            if is_execution_control_error(error) or not isinstance(error, Exception):
+            if (is_execution_control_error(error) or execution_commit_outcome(error) is not None
+                    or not isinstance(error, Exception)):
                 if journal is not None:
                     raise journal.retain_committed(error)
                 raise

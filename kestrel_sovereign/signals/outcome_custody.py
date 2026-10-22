@@ -217,7 +217,7 @@ class _OriginalSignalOutcome:
             return error
         from kestrel_sovereign.execution_custody import (
             retain_acknowledged_execution_commit, execution_commit_outcome,
-            _FINITE_NATIVE_SOURCES, _native_source_originals,
+            ExecutionCommitOutcomeError, _FINITE_NATIVE_SOURCES, _native_source_originals,
         )
         if self._acknowledgments:
             # The ACK is a real native fact, but the waiter's withdrawal is
@@ -232,11 +232,19 @@ class _OriginalSignalOutcome:
             return error
         if execution_commit_outcome(error) is not None:
             return error
-        # SQLite's existing native COMMIT is awaited inline, not an invented
-        # successful Task/ACK receipt. Preserve only its known committed fact.
-        error._kestrel_unresolved_commit_outcome = 'committed'
-        error.add_note('original signal terminal row COMMIT acknowledged; reconcile that original row before retry')
-        return error
+        if not isinstance(error, Exception):
+            # Preserve actual cancellation/Base control shape. These already
+            # escape ordinary Exception catches, unlike an observation error.
+            error._kestrel_unresolved_commit_outcome = 'committed'
+            error.add_note('original signal terminal row COMMIT acknowledged; reconcile that row before retry')
+            return error
+        # SQLite's actual inline COMMIT is not an invented PG ACK/reset Task.
+        # Use a typed finite classifier, not an ordinary exception annotated
+        # with metadata that downstream best-effort catches could discard.
+        finite = ExecutionCommitOutcomeError('committed')
+        finite.__cause__ = error
+        finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, _native_source_originals(error))
+        return finite
 
 
 def _require_original_signal_outcome(journal, backend):

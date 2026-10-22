@@ -358,8 +358,8 @@ class SignalLogStore(UnifiedStoreBase):
         try:
             payload_redacted = policy.summarize(signal.payload)
         except Exception as e:
-            from kestrel_sovereign.execution_custody import is_execution_control_error
-            if is_execution_control_error(e):
+            from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+            if is_execution_control_error(e) or execution_commit_outcome(e) is not None:
                 raise
             logger.exception(
                 "RedactionPolicy.summarize raised for source '%s'; "
@@ -384,8 +384,8 @@ class SignalLogStore(UnifiedStoreBase):
             try:
                 summary = registration.result_summary(result_body)
             except Exception as e:
-                from kestrel_sovereign.execution_custody import is_execution_control_error
-                if is_execution_control_error(e):
+                from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+                if is_execution_control_error(e) or execution_commit_outcome(e) is not None:
                     raise
                 logger.exception(
                     "result_summary callback raised for source '%s'; "

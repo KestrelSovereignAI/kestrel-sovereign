@@ -2109,7 +2109,7 @@ class SQLiteBackend(DatabaseBackend):
         write lock/privacy hold ahead of that physical fence.
         """
         from kestrel_sovereign.execution_custody import (
-            execution_finite_error, execution_error_with_cause,
+            execution_finite_error, execution_error_with_cause, execution_observation_error,
         )
         journal.require_sqlite_cleanup(self, conn)
         started_at = time.monotonic()
@@ -2138,8 +2138,12 @@ class SQLiteBackend(DatabaseBackend):
                     retain_originals=True, isolate_control_originals=True)
                 raise terminal
             if interrupt_error is not None or withdrawal is not None:
-                raise execution_finite_error(original_error, interrupt_error, withdrawal,
-                    retain_originals=True, isolate_control_originals=True)
+                # A completed cleanup does not erase cancellation of this
+                # writer. Canonical composition keeps its actual C as a Base
+                # carrier instead of selecting an ordinary INSERT error that
+                # best-effort audit handling would suppress.
+                raise execution_observation_error(original_error, interrupt_error, withdrawal,
+                    message='original SQLite journal cleanup withdrawal')
             return
 
     def _execution_commit_scopes(self):

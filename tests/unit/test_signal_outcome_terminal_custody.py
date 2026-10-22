@@ -523,6 +523,132 @@ async def test_inner_writer_observation_retains_commit_and_original_error(dispat
     assert (await c.dispatcher.dispatch_signal(_signal('inner.observation.audit'))).action_result is not None
 
 
+@pytest.mark.parametrize('callback', ['redaction', 'summary', 'inner_allocation', 'outer_allocation', 'inner_publication', 'outer_publication'])
+@pytest.mark.parametrize('representation', ['typed', 'legacy'])
+async def test_actual_committed_journal_observation_is_not_a_projection_placeholder(dispatcher_components, callback, representation):
+    from kestrel_sdk.signals import RedactionPolicy
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_native_source_error, is_execution_control_error, _explicit_control_chain
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+    c = dispatcher_components
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    original = RuntimeError('actual original committed journal observation')
+    class RejectObservation(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'mark_complete':
+                raise original
+            return super().add_done_callback(callback, context=context)
+    def factory(loop, coro, **kwargs):
+        operation = _actual_operation(coro)
+        if getattr(operation, 'cr_code', None) is c.dispatcher._write_outcome_log.__func__.__code__:
+            return RejectObservation(coro, loop=loop, **kwargs)
+        return previous(loop, coro, **kwargs) if previous else asyncio.Task(coro, loop=loop, **kwargs)
+    c.registry.register(_action_reg('actual.committed.audit'))
+    first = _signal('actual.committed.audit')
+    loop.set_task_factory(factory)
+    try:
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(first)
+    finally:
+        loop.set_task_factory(previous)
+    carrier = caught.value
+    assert execution_commit_outcome(carrier) == 'committed'
+    assert is_execution_control_error(carrier)
+    assert execution_native_source_error(carrier) is None
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (first.id,)) == 1
+    if representation == 'legacy':
+        # Compatibility projection of this ACTUAL acknowledged native row's
+        # original observation error into the previous metadata-only format.
+        # No new ACK/Task/authority or product-completion proof is fabricated.
+        original._kestrel_unresolved_commit_outcome = execution_commit_outcome(carrier)
+        carrier = original
+        assert not is_execution_control_error(carrier)
+    def rethrow_actual_carrier(payload):
+        raise carrier
+    registration = _action_reg('committed.projection.audit')
+    if callback == 'redaction':
+        registration.log_redaction = RedactionPolicy(summarize=rethrow_actual_carrier)
+    elif callback == 'summary':
+        registration.result_summary = rethrow_actual_carrier
+    c.registry.register(registration)
+    second = _signal('committed.projection.audit')
+    class RejectCommittedStart(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'close_unstarted':
+                raise carrier
+            return super().add_done_callback(callback, context=context)
+    def second_factory(loop, coro, **kwargs):
+        operation = _actual_operation(coro)
+        method = c.dispatcher._write_outcome_log if callback.startswith('inner_') else c.dispatcher._log_safe
+        if getattr(operation, 'cr_code', None) is method.__func__.__code__:
+            if callback.endswith('allocation'):
+                raise carrier
+            return RejectCommittedStart(coro, loop=loop, **kwargs)
+        return previous(loop, coro, **kwargs) if previous else asyncio.Task(coro, loop=loop, **kwargs)
+    if callback not in ('redaction', 'summary'):
+        loop.set_task_factory(second_factory)
+    try:
+        with pytest.raises(BaseException) as propagated:
+            await c.dispatcher.dispatch_signal(second)
+    finally:
+        loop.set_task_factory(previous)
+    assert execution_commit_outcome(propagated.value) == 'committed'
+    assert any(error is carrier for error in _explicit_control_chain(propagated.value))
+    assert execution_native_source_error(propagated.value) is None
+    assert c.dispatcher._outcome_log_control_error is None
+    assert c.dispatcher._log_write_failures == 1
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (second.id,)) == 0
+    assert (await c.dispatcher.dispatch_signal(_signal('actual.committed.audit'))).action_result is not None
+
+
+async def test_failed_sqlite_insert_preserves_cancellation_during_successful_rollback(dispatcher_components, monkeypatch):
+    import threading
+    from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_commit_outcome, execution_native_source_error
+    c = dispatcher_components
+    await c.backend.execute('DROP TABLE signal_log')
+    conn = c.backend._connection
+    original_execute = conn._execute
+    entered, worker_release = asyncio.Event(), threading.Event()
+    body_errors, used_barrier = [], []
+    loop = asyncio.get_running_loop()
+    async def actual_queue(function, *args, **kwargs):
+        journal = c.dispatcher._original_outcome_writer.get()
+        if journal is not None and getattr(function, '__name__', '') == 'rollback' and not used_barrier:
+            used_barrier.append(True)
+            def native_rollback():
+                loop.call_soon_threadsafe(entered.set)
+                worker_release.wait(5)
+                return function(*args, **kwargs)
+            return await original_execute(native_rollback)
+        try:
+            return await original_execute(function, *args, **kwargs)
+        except BaseException as error:
+            if journal is not None and getattr(function, '__name__', '') == 'execute':
+                body_errors.append(error)
+            raise
+    monkeypatch.setattr(conn, '_execute', actual_queue)
+    c.registry.register(_action_reg('failed.insert.audit'))
+    task = asyncio.create_task(c.dispatcher.dispatch_signal(_signal('failed.insert.audit')))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        journal = next(entry[2] for entry in c.dispatcher._outcome_log_reconciliations.values() if entry[2] is not None)
+        journal._writer_admission.task.cancel()
+        await asyncio.sleep(0)
+        worker_release.set()
+        outcome = await await_owned_task(task)
+        assert outcome.error is not None, 'ordinary INSERT failure swallowed actual cleanup cancellation'
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert len(body_errors) == 1 and any(error is body_errors[0] for error in chain)
+        assert any(isinstance(error, asyncio.CancelledError) for error in chain)
+        assert execution_commit_outcome(outcome.error) is None
+        assert execution_native_source_error(outcome.error) is None
+        assert c.dispatcher._log_write_failures == 1
+        assert c.dispatcher._outcome_log_control_error is None
+    finally:
+        worker_release.set()
+        await await_owned_task(task)
+
+
 async def test_sqlite_original_journal_retains_commit_before_identity_refusal(dispatcher_components, monkeypatch):
     from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
     c = dispatcher_components

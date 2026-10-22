@@ -870,6 +870,12 @@ drain: its original writer retains both the write lock and privacy protection
 through the existing native rollback/cursor fence. Refused or unstarted Tasks
 cannot stand in for that physical completion. Cleanup failures and repeated
 cancellation remain in the original caller's finite evidence.
+Successful cleanup preserves an actual withdrawal as a cancellation/Base
+carrier even when the original INSERT failed ordinarily. Healthy SQLite
+committed-observation errors use a typed finite classifier without becoming
+native-failure sources; actual cancellation retains its cancellation shape.
+Projection, preparation, and publication boundaries preserve both typed and
+legacy commit-bearing errors rather than substituting audit placeholders.
 Audit-loss accounting is per original row, including accepted-but-unstarted
 writers, and does not count the same failure again at another join boundary.
 Projection callbacks and UI emission remain ordinary work: control failures
