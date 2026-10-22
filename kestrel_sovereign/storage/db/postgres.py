@@ -2208,12 +2208,49 @@ class PostgresBackend(DatabaseBackend):
                     )
                     return result == "UPDATE 1"
 
+    async def _read_original_signal_outcome_relation(self, connection, name):
+        from kestrel_sovereign.signals.outcome_custody import _OriginalPostgresJournalRelation
+        row = await connection.fetchrow('''
+            SELECT pg_catalog.current_database() AS database_name,
+                   n.oid::bigint AS namespace_oid, c.oid::bigint AS relation_oid,
+                   n.nspname AS schema_name, c.relname AS relation_name
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind IN ('r', 'p')
+        ''', name)
+        if row is None or row['relation_name'] != 'signal_log':
+            raise ExecutionAuthorityError('Original native signal journal relation unavailable')
+        return _OriginalPostgresJournalRelation(**dict(row))
+
+    async def _capture_original_signal_outcome_relation(self, journal):
+        from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
+        if (type(journal) is not _OriginalSignalOutcome
+                or journal._admission_key is not _JOURNAL_ADMISSION
+                or journal._backend is not self
+                or journal._acceptance.owner is not asyncio.current_task()
+                or journal._phase != 'accepted'
+                or journal._dispatcher._accepted_signal_outcomes.get(journal._acceptance) is not journal):
+            raise ExecutionAuthorityError('Original live acceptance required for native journal destination')
+        require_execution_work(self)
+        journal._require_backing()
+        async with self._tracked_pool_checkout(journal._backing, admit_work=True) as (connection, _):
+            journal._require_backing()
+            relation = await self._read_original_signal_outcome_relation(connection, 'signal_log')
+            journal._require_backing()
+            require_execution_work(self)
+        journal._require_backing()
+        require_execution_work(self)
+        return relation
+
     async def _append_original_signal_outcome(self, journal):
         from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
         _require_original_signal_outcome(journal, self)
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
         entry = journal.begin(self)
+        relation = journal._postgres_relation
+        if relation is None:
+            raise ExecutionAuthorityError('Original native signal journal destination not captured')
         query, _ = sqlite_to_postgres(journal._query)
         state = None
         try:
@@ -2221,7 +2258,13 @@ class PostgresBackend(DatabaseBackend):
                 journal.require_original(self)
                 async with self._tracked_native_transaction(connection, state.scopes, state):
                     journal.require_original(self)
+                    if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
+                        raise ExecutionAuthorityError('Original native signal journal relation replaced')
+                    journal.require_original(self)
                     await connection.execute(query, *self._strip_tz(entry.values))
+                    journal.require_original(self)
+                    if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
+                        raise ExecutionAuthorityError('Original native signal journal relation replaced')
                     journal.require_original(self)
             journal._acknowledgments = tuple(state.acknowledgments)
             journal.acknowledged(self)

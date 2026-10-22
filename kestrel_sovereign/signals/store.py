@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -356,7 +357,7 @@ class SignalLogStore(UnifiedStoreBase):
         # args. Raw UNTRUSTED stays in memory until this point and
         # never touches the wire if the policy is honest.
         try:
-            payload_redacted = policy.summarize(signal.payload)
+            payload_redacted = policy.summarize(deepcopy(signal.payload))
         except Exception as e:
             from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
             if is_execution_control_error(e) or execution_commit_outcome(e) is not None:
@@ -382,7 +383,7 @@ class SignalLogStore(UnifiedStoreBase):
         )
         if registration.result_summary is not None and result_body is not None:
             try:
-                summary = registration.result_summary(result_body)
+                summary = registration.result_summary(deepcopy(result_body))
             except Exception as e:
                 from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
                 if is_execution_control_error(e) or execution_commit_outcome(e) is not None:

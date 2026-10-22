@@ -33,7 +33,7 @@ class _AcceptedSignalOutcome:
     registration: object
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, repr=False)
 class _OriginalPostgresJournalPool:
     """Opaque native pool configuration accepted for this one fixed row.
 
@@ -66,6 +66,21 @@ class _OriginalPostgresJournalPool:
                 or native._connect_kwargs is not self.connect_kwargs
                 or native.is_closing()):
             raise ExecutionAuthorityError('Original signal journal pool configuration retired')
+
+
+@dataclass(frozen=True)
+class _OriginalPostgresJournalRelation:
+    """Actual catalog identity resolved under the original live admission."""
+    database_name: str
+    namespace_oid: int
+    relation_oid: int
+    schema_name: str
+    relation_name: str
+
+    @property
+    def qualified_name(self):
+        return '.'.join('"' + value.replace('"', '""') + '"'
+                        for value in (self.schema_name, self.relation_name))
 
 
 class _OriginalSignalOutcome:
@@ -121,6 +136,7 @@ class _OriginalSignalOutcome:
         self._postgres_pool = (
             _OriginalPostgresJournalPool.capture(self._backing)
             if type(backend) is PostgresBackend else None)
+        self._postgres_relation = None
         self._entry = None
         self._completed_result = None
         self._acknowledgments = ()
@@ -302,7 +318,7 @@ def _require_original_signal_outcome(journal, backend):
     journal.require_original(backend)
 
 
-def _capture_original_outcome(dispatcher, signal, registration, *, acceptance):
+async def _capture_original_outcome(dispatcher, signal, registration, *, acceptance):
     """Only a live original public dispatch can create this terminal unit."""
     from kestrel_sovereign.signals.store import SignalLogStore
     from kestrel_sovereign.storage.db import postgres as postgres_module
@@ -324,4 +340,10 @@ def _capture_original_outcome(dispatcher, signal, registration, *, acceptance):
         if current_execution_custody(dispatcher._agent) or current_execution_custody(backend):
             raise ExecutionAuthorityError('Hosted terminal journal requires a supported native backend')
         return None  # legacy unscoped embeddings retain ordinary append only
-    return _OriginalSignalOutcome(dispatcher, signal, registration, acceptance=acceptance)
+    journal = _OriginalSignalOutcome(dispatcher, signal, registration, acceptance=acceptance)
+    if type(backend) is PostgresBackend:
+        # Resolve under the original live work admission, before any handler.
+        # Later native checkout setup cannot redirect this fixed destination.
+        journal._postgres_relation = await backend._capture_original_signal_outcome_relation(journal)
+        journal._query = SignalLogStore._outcome_insert_query(journal._postgres_relation.qualified_name)
+    return journal

@@ -4299,7 +4299,7 @@ class SignalDispatcher:
                     # stamping are complete. Freeze THIS canonical envelope,
                     # before any handler or durable replay consumer can run.
                     from kestrel_sovereign.signals.outcome_custody import _capture_original_outcome
-                    self._original_outcome_admission.set(_capture_original_outcome(
+                    self._original_outcome_admission.set(await _capture_original_outcome(
                         self, signal, registration, acceptance=original_outcome_acceptance))
                 durable_projection = self._signal_for_durable_persistence(
                     signal, registration
@@ -5187,7 +5187,7 @@ class SignalDispatcher:
         original_acceptances.append(acceptance)
         self._accepted_signal_outcomes[acceptance] = None
         try:
-            self._original_outcome_admission.set(_capture_original_outcome(
+            self._original_outcome_admission.set(await _capture_original_outcome(
                 self, routing_signal, registration, acceptance=acceptance))
         except BaseException:
             self._accepted_signal_outcomes.pop(acceptance, None)
