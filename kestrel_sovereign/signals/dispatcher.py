@@ -1213,13 +1213,11 @@ class SignalDispatcher:
                 registration = self._registry.get(signal.source)
                 if registration is not None:
                     from kestrel_sovereign.signals.outcome_custody import (
-                        _AcceptedSignalOutcome, _OriginalSignalOutcome, _capture_original_outcome,
+                        _AcceptedSignalOutcome, _OriginalSignalOutcome,
                     )
                     original_acceptance = _AcceptedSignalOutcome(
                         asyncio.current_task(), _OriginalSignalOutcome._signal_identity(signal), registration)
                     self._accepted_signal_outcomes[original_acceptance] = None
-                    self._original_outcome_admission.set(_capture_original_outcome(
-                        self, signal, registration, acceptance=original_acceptance))
                 result = await self._run(
                     signal,
                     start,
@@ -1232,6 +1230,7 @@ class SignalDispatcher:
                     durable_delivery_consumer_id=_durable_delivery_consumer_id,
                     durable_terminal_consumer_id=_durable_terminal_consumer_id,
                     durable_admission_fence=_durable_admission_fence,
+                    original_outcome_acceptance=original_acceptance,
                 )
                 # Handler code may invoke scheduling helpers, but only this
                 # returned pipeline result can terminalize the original row.
@@ -1281,7 +1280,7 @@ class SignalDispatcher:
                 admission_error = error
             raise
         except BaseException as e:
-            if is_execution_control_error(e):
+            if is_execution_control_error(e) or execution_commit_outcome(e) is not None:
                 admission_error = e
                 raise
             if not isinstance(e, Exception):
@@ -2984,7 +2983,10 @@ class SignalDispatcher:
             reconciliation = self._outcome_log_reconciliations.get(task)
             if task.done() and reconciliation is not None:
                 complete, publication_error, _ = reconciliation
+                publication_error = (journal.retain_committed(publication_error, observer=True)
+                    if journal is not None else publication_error)
                 originals.append(publication_error)
+                self._retain_durable_writer_control(publication_error)
                 complete(task, joined=True)
         if finite_errors is not None:
             # This local writer batch can be ordinary while a later repair
@@ -4136,6 +4138,7 @@ class SignalDispatcher:
         durable_delivery_consumer_id: Optional[str] = None,
         durable_terminal_consumer_id: Optional[str] = None,
         durable_admission_fence: Any = None,
+        original_outcome_acceptance: Any = None,
     ) -> SignalResult:
         # Step 1: validation
         registration = self._registry.get(signal.source)
@@ -4247,6 +4250,13 @@ class SignalDispatcher:
                 # prevents a user-defined ``__str__`` from entering either
                 # security boundary.
                 signal.caller = self._canonical_caller_identity(signal.caller)
+                if original_outcome_acceptance is not None:
+                    # Ingress sanitization/schema normalization and causation
+                    # stamping are complete. Freeze THIS canonical envelope,
+                    # before any handler or durable replay consumer can run.
+                    from kestrel_sovereign.signals.outcome_custody import _capture_original_outcome
+                    self._original_outcome_admission.set(_capture_original_outcome(
+                        self, signal, registration, acceptance=original_outcome_acceptance))
                 durable_projection = self._signal_for_durable_persistence(
                     signal, registration
                 )

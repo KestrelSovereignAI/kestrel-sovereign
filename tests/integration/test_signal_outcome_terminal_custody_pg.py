@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from kestrel_sovereign.signals import OrderedLockManager, SignalDispatcher, SignalLogStore, SourceRegistry
-from tests.integration.test_execution_authority_postgres import native_pg  # noqa: F401
+from tests.integration.test_execution_authority_postgres import native_pg as _native_pg_fixture
 from tests.unit.test_signals_dispatcher import _FakeAgent
 from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_original_native_outcome_persists_after_work_cutoff_without_fresh_work,
@@ -20,9 +20,11 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_visible_journal_does_not_admit_ui_work_after_cutoff,
     test_accepted_payload_is_not_replaced_after_cutoff,
     test_owner_withdrawal_retains_actual_original_journal_commit,
+    test_terminal_snapshot_matches_canonical_handler_envelope,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+native_pg = _native_pg_fixture
 
 
 @pytest.fixture

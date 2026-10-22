@@ -832,7 +832,8 @@ An accepted native dispatch retains custody of its one terminal `signal_log`
 row even when its original execution scope is revoked before the handler or
 writer finishes. This is a private dispatcher-to-native-storage contract, not
 a caller capability or a general cleanup/work exemption. Acceptance fixes the
-original envelope, registration, runtime and backend identity, connection or
+canonical envelope (after sanitization, schema/caller normalization and
+causation stamping, before handler execution), registration, runtime and backend identity, connection or
 pool generation, and SQL destination. Only the genuine returned pipeline
 result can bind the immutable row; handler calls to scheduling helpers cannot
 publish a premature result. The original admitted writer Tasks remain owned

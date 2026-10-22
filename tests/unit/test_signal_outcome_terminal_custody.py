@@ -10,7 +10,12 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime,
 )
 from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome
-from tests.unit.test_signals_dispatcher import db_path, dispatcher_components, _action_reg, _signal  # noqa: F401
+from tests.unit.test_signals_dispatcher import (
+    db_path as _db_path_fixture, dispatcher_components as _dispatcher_fixture, _action_reg, _signal,
+)
+
+db_path = _db_path_fixture
+dispatcher_components = _dispatcher_fixture
 
 
 @dataclass
@@ -212,15 +217,65 @@ async def test_rejected_completion_callback_physically_joins_original_writer(dis
 
     c.registry.register(_action_reg('publication.audit'))
     loop.set_task_factory(factory)
+    signal = _signal('publication.audit')
     try:
-        result = await asyncio.wait_for(c.dispatcher.dispatch_signal(_signal('publication.audit')), 2)
+        with pytest.raises(BaseException) as caught:
+            await asyncio.wait_for(c.dispatcher.dispatch_signal(signal), 2)
     finally:
         loop.set_task_factory(before)
     assert accepted and all(task.done() for task in accepted)
     assert not c.dispatcher._outcome_log_tasks
     assert not c.dispatcher._outcome_log_tasks_by_signal
     assert c.dispatcher._durable_active_admissions == 0
-    assert str(rejected) in result.error
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, _explicit_control_chain, _acknowledged_commits
+    assert execution_commit_outcome(caught.value) == 'committed'
+    assert any(error is rejected for error in _explicit_control_chain(caught.value))
+    if c.backend.backend_type == 'postgres':
+        assert _acknowledged_commits(caught.value)
+        assert all(receipt.retired for receipt in _acknowledged_commits(caught.value))
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+    assert c.dispatcher._outcome_log_control_error is None
+    following = await c.dispatcher.dispatch_signal(_signal('publication.audit'))
+    assert following.action_result is not None
+
+
+@pytest.mark.parametrize('transformation', ['sanitizer', 'schema'])
+async def test_terminal_snapshot_matches_canonical_handler_envelope(dispatcher_components, transformation):
+    import json
+    from kestrel_sdk.signals import SourceRegistration, SignalMode, RedactionPolicy, Trust
+    from kestrel_sovereign.signals.store import _digest, _serialize_chain
+    c = dispatcher_components
+    canonical = {'allowed': 'normal', 'normalized': True}
+    observed = []
+
+    async def handler(signal):
+        observed.append(dict(signal.payload))
+        assert signal.payload == canonical
+        return {'genuine': True}
+
+    def schema(payload):
+        return {'allowed': payload['allowed'].strip(), 'normalized': True}
+
+    c.registry.register(SourceRegistration(name='canonical.audit', schema=schema,
+        default_mode=SignalMode.ARTIFACT, allowed_modes=frozenset({SignalMode.ARTIFACT}),
+        trust=Trust.UNTRUSTED if transformation == 'sanitizer' else Trust.TRUSTED,
+        sanitizer=(lambda payload: {'allowed': payload['allowed'].strip()}) if transformation == 'sanitizer' else None,
+        artifact_handler=handler,
+        log_redaction=RedactionPolicy(summarize=lambda payload: json.dumps(payload, sort_keys=True),
+                                    store_raw_trusted=True)))
+    signal = _signal('canonical.audit', mode=SignalMode.ARTIFACT,
+                     payload={'allowed': ' normal ', 'secret': 'never-persist-this'})
+    result = await c.dispatcher.dispatch_signal(signal)
+    assert result.artifact == {'genuine': True}
+    assert observed == [canonical]
+    row = await c.backend.fetch_one('SELECT payload_redacted,payload_raw,causation_chain_digest FROM signal_log WHERE id=?', (signal.id,))
+    assert json.loads(row[0]) == canonical
+    if transformation == 'schema':
+        assert json.loads(row[1]) == canonical
+    else:
+        assert row[1] is None
+    assert signal.causation_chain
+    assert row[2] == _digest(_serialize_chain(signal.causation_chain))
 
 
 @pytest.mark.parametrize('legacy', [False, True])
