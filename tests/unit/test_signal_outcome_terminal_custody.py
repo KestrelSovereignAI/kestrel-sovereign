@@ -1358,6 +1358,70 @@ async def test_recovered_claim_has_its_own_terminal_journal(tmp_path, monkeypatc
         await _close(backend, agent)
 
 
+async def test_resident_completed_journal_receipt_reaches_withdrawn_ingress(dispatcher_components, monkeypatch):
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.privacy_transition import DurablePersistenceGate
+    from kestrel_sovereign.signals import DurableConsumerRegistration
+    from kestrel_sovereign.signals.sources.channels import (
+        build_channel_message_registration, DURABLE_COGNITION_CONSUMER_ID,
+        DURABLE_COGNITION_MARKER, DURABLE_COGNITION_MARKER_VALUE,
+    )
+    from tests.unit.test_durable_signal_delivery import _channel_signal
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, _acknowledged_commits
+    c = dispatcher_components
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    class HostedPublisher(type(c.agent)):
+        _runtime_owner_context = KestrelAgent._runtime_owner_context
+        _track_runtime_task = KestrelAgent._track_runtime_task
+        _remember_shutdown_control = KestrelAgent._remember_shutdown_control
+        def _get_durable_persistence_gate(self):
+            return self._durable_persistence_gate
+    c.agent.__class__ = HostedPublisher
+    c.agent._did = 'did:agent:resident-completion-receipt'
+    c.agent._execution_custody = scope
+    c.agent._durable_persistence_gate = DurablePersistenceGate()
+    c.agent._background_tasks = set()
+    c.agent._runtime_publication_ready = asyncio.Event()
+    c.agent._runtime_publication_ready.set()
+    c.registry.register(build_channel_message_registration())
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=c.agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=1)
+    journals, callbacks = [], []
+    original_write = c.dispatcher._write_outcome_log
+    async def observe_write(*args, **kwargs):
+        result = await original_write(*args, **kwargs)
+        journal = c.dispatcher._original_outcome_writer.get()
+        if journal is not None and journal.has_acknowledged_commit():
+            journals.append(journal)
+        return result
+    monkeypatch.setattr(c.dispatcher, '_write_outcome_log', observe_write)
+    original_track = c.dispatcher._track_resident_durable_task
+    def publish_resident(coro, **kwargs):
+        waiting_ingress = asyncio.current_task()
+        resident = original_track(coro, **kwargs)
+        def withdraw_after_actual_completion(completed):
+            callbacks.append((completed.done(), bool(journals)))
+            waiting_ingress.cancel('actual ingress withdrawal after resident commit')
+        resident.add_done_callback(withdraw_after_actual_completion)
+        return resident
+    monkeypatch.setattr(c.dispatcher, '_track_resident_durable_task', publish_resident)
+    await c.dispatcher.register_durable_consumer(consumer)
+    signal = _channel_signal(c.agent.did, 'resident-completed-receipt')
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        handle = await c.dispatcher.enqueue_durable_cognition(signal,
+            source_event_id='telegram:update:resident-completed-receipt', consumer_id=consumer.consumer_id)
+        outcome = await await_owned_task(handle.task)
+    assert callbacks == [(True, True)]
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+    assert execution_commit_outcome(outcome.error) == 'committed', 'actual resident terminal receipt disappeared at withdrawn ingress'
+    if c.backend.backend_type == 'postgres':
+        receipts = _acknowledged_commits(outcome.error)
+        assert receipts and all(receipt.retired for receipt in receipts)
+        assert all(any(actual is receipt for actual in receipts) for journal in journals for receipt in journal._acknowledgments)
+    assert not c.dispatcher._accepted_signal_outcomes
+
+
 async def test_handler_cannot_terminalize_through_scheduler_after_cutoff(dispatcher_components):
     from kestrel_sdk.signals import SignalResult, Status
     from kestrel_sovereign.execution_custody import is_execution_control_error

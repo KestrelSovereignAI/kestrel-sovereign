@@ -34,6 +34,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_original_journal_verifies_exact_row_before_native_commit,
     test_postcommit_privacy_observation_does_not_poison_healthy_dispatch,
     test_projection_retained_alias_cannot_rewrite_actual_result,
+    test_resident_completed_journal_receipt_reaches_withdrawn_ingress,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -44,6 +45,84 @@ async def _fresh_journal_pool(original, **options):
     import asyncpg
     options.setdefault('connection_class', original._connection_class)
     return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
+
+
+@pytest.mark.parametrize('asynchronous', [False, True])
+async def test_postgres_reconnect_never_invokes_application_password_provider(dispatcher_components, native_pg, asynchronous):
+    from urllib.parse import urlsplit, unquote
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    original_pool = c.backend._pool
+    credential = unquote(urlsplit(original_pool._connect_args[0]).password)
+    armed, calls, effects = [], [], []
+    def password():
+        if armed:
+            calls.append(True)
+        return credential
+    async def async_password():
+        return password()
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
+        password=async_password if asynchronous else password)
+    c.backend._pool = pool
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    async def handler(payload):
+        effects.append(True)
+        async with pool.acquire() as connection:
+            await connection.close()
+        scope.revoke('actual cutoff before original journal reconnect')
+        armed.append(True)
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.password.provider', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.password.provider'))
+            except BaseException as caught:
+                error = caught
+        assert not calls, 'original journal reconnect invoked application password provider after cutoff'
+        assert not effects and is_execution_control_error(error)
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
+async def test_postgres_original_recipe_detects_nested_host_mutation_before_reconnect(dispatcher_components, native_pg):
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, _explicit_control_chain
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    original_pool = c.backend._pool
+    hosts = ['127.0.0.1']
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1, host=hosts, timeout=2)
+    c.backend._pool = pool
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    effects = []
+    async def handler(payload):
+        async with pool.acquire() as connection:
+            await connection.close()
+        hosts[0] = '127.0.0.2'
+        effects.append(True)
+        scope.revoke('actual cutoff after caller-owned host list mutation')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.mutable.hosts', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.mutable.hosts'))
+            except BaseException as caught:
+                error = caught
+        assert effects
+        assert not any(isinstance(member, OSError) for member in _explicit_control_chain(error)), 'terminal checkout attempted replacement endpoint before configuration fencing'
+        assert any('pool configuration retired' in str(member) for member in _explicit_control_chain(error))
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
 
 
 async def test_postgres_proof_never_scans_unvalidated_foreign_inheritance(dispatcher_components, native_pg):

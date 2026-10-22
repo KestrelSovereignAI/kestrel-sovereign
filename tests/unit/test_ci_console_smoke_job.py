@@ -56,6 +56,10 @@ def test_browser_dependency_install_has_a_bounded_network_budget():
     assert int(_job()["timeout-minutes"]) <= 20
 
 
+def test_browser_job_pins_a_reviewed_stable_runner_image():
+    assert _job()['runs-on'] == 'ubuntu-24.04'
+
+
 def test_references_no_secret_and_reads_only():
     """No production key can reach the smoke: the job names no secret."""
     text = yaml.safe_dump(_job())
