@@ -31,6 +31,7 @@ from a2a.types import (
 )
 from a2a.utils.errors import (
     InternalError,
+    InvalidParamsError,
     PushNotificationNotSupportedError,
     TaskNotCancelableError,
     TaskNotFoundError,
@@ -181,6 +182,16 @@ async def test_inline_callback_requires_the_advertised_push_capability(wire):
     with pytest.raises(PushNotificationNotSupportedError):
         _ = [event async for event in wire.client().send_message(params)]
     assert wire.submissions == []
+
+
+async def test_empty_text_returns_native_invalid_params_before_admission(wire):
+    params = send(wire.admission)
+    params.message.parts[0].text = ""
+    with pytest.raises(InvalidParamsError):
+        _ = [event async for event in wire.client().send_message(params)]
+    assert not wire.submissions
+    assert await wire.manager.task_store.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert await wire.manager.task_store.backend.fetch_all("SELECT context_id FROM a2a_contexts") == []
 
 
 async def test_sdk_send_get_list_and_cancel_share_native_durable_authority(wire):

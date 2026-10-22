@@ -75,6 +75,10 @@ def prepare_native_task_input(request: SendMessageRequest) -> NativeTaskInput:
         raise TypeError("Task input requires an official SendMessageRequest")
     execution = SendMessageRequest.FromString(request.SerializeToString())
     wire_digest = native_request_digest(execution, "SendMessage")
+    # The executor requires nonempty text. Apply that business constraint to
+    # both first inputs and continuations before callback preparation or writes.
+    if any(part.HasField("text") and not part.text for part in execution.message.parts):
+        raise InvalidParamsError(message="Native task input text cannot be empty")
     callback = None
     if execution.configuration.HasField("task_push_notification_config"):
         config = execution.configuration.task_push_notification_config

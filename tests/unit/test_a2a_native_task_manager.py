@@ -11,6 +11,7 @@ import pytest_asyncio
 from a2a.helpers.proto_helpers import new_data_artifact, new_text_message
 from a2a.types import (
     AgentSkill,
+    Part,
     Role,
     SendMessageRequest,
     Task,
@@ -20,7 +21,7 @@ from a2a.types import (
     TaskStatusUpdateEvent,
 )
 from a2a.utils.errors import InvalidParamsError
-from google.protobuf.json_format import MessageToDict
+from google.protobuf.json_format import MessageToDict, ParseDict
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
@@ -124,6 +125,31 @@ async def test_private_requests_and_missing_required_message_ids_fail_before_adm
         == []
     )
     assert await manager.task_store.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+
+
+@pytest.mark.parametrize("continuation", [False, True])
+@pytest.mark.parametrize("with_data", [False, True])
+async def test_empty_text_refuses_new_and_continued_input_before_storage(
+    manager, continuation, with_data
+):
+    params = request()
+    original = await admit(manager) if continuation else None
+    if original is not None:
+        params.message.task_id = original.id
+    params.message.parts[0].text = ""
+    if with_data:
+        params.message.parts.append(ParseDict({"data": {"value": 1}}, Part()))
+    before = {
+        table: await manager.task_store.backend.fetch_all(f"SELECT * FROM {table}")
+        for table in ("a2a_tasks", "a2a_contexts", "a2a_task_inputs", "a2a_task_changes")
+    }
+    with pytest.raises(InvalidParamsError, match="text.*empty"):
+        if continuation:
+            await manager.continue_task(params, creator_agent_id="did:kestrel:sender")
+        else:
+            await admit(manager, params)
+    for table, rows in before.items():
+        assert await manager.task_store.backend.fetch_all(f"SELECT * FROM {table}") == rows
 
 
 async def test_native_task_ids_are_server_generated_and_message_identity_is_preserved(
