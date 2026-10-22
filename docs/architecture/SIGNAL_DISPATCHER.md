@@ -840,6 +840,12 @@ publish a premature result. The original admitted writer Tasks remain owned
 until physically joined, including failures after Task acceptance but before
 callback publication.
 
+The original privacy-policy epoch and persistence-gate identity also remain
+fixed. The native INSERT holds that same gate shared through COMMIT/reset and
+rechecks the epoch under the hold: a privacy transition either precedes and
+invalidates it, or waits for the old-policy journal to finish before proceeding.
+This gate does not restore any revoked work authority.
+
 Public, resident, and recovered cognition each retain their original owner;
 recovery uses the canonical envelope from its own claimed delivery. Native
 COMMIT acknowledgment, reset/retirement debt, cancellation, and later identity

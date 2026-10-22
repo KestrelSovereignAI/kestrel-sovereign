@@ -53,6 +53,11 @@ class _OriginalSignalOutcome:
         self._agent = dispatcher._agent
         self._agent_id = dispatcher._agent.did
         self._agent_scope = getattr(self._agent, '_execution_custody', None)
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            _resolve_durable_persistence_gate, _resolve_privacy_policy_epoch,
+        )
+        self._privacy_gate = _resolve_durable_persistence_gate(self._agent)
+        self._privacy_epoch = _resolve_privacy_policy_epoch(self._agent)
         self._registration = registration
         # Payload containers and privacy settings belong to acceptance, not
         # to a handler's mutable arguments after revocation.
@@ -91,6 +96,18 @@ class _OriginalSignalOutcome:
                 or getattr(self._agent, '_execution_custody', None) is not self._agent_scope
                 or getattr(backend, '_execution_custody', None) is not self._backend_scope):
             raise ExecutionAuthorityError('Original signal journal runtime identity changed')
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            _resolve_durable_persistence_gate, _resolve_privacy_policy_epoch,
+        )
+        from kestrel_sovereign.execution_custody import execution_error_with_cause
+        try:
+            gate = _resolve_durable_persistence_gate(self._agent)
+            epoch = _resolve_privacy_policy_epoch(self._agent)
+        except BaseException as error:
+            raise execution_error_with_cause(
+                ExecutionAuthorityError('Original signal journal privacy identity unavailable'), error)
+        if gate is not self._privacy_gate or epoch != self._privacy_epoch:
+            raise ExecutionAuthorityError('Original signal journal privacy policy changed')
         if backend.backend_type == 'sqlite':
             if (self._backing is None or backend._connection is not self._backing
                     or backend.connection_generation != self._generation or backend._closing):

@@ -764,3 +764,68 @@ async def test_original_journal_refuses_substituted_identity(dispatcher_componen
             assert await other.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
             await other.close()
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+
+
+@pytest.mark.parametrize('boundary', ['changed_epoch', 'inflight_transition'])
+async def test_original_journal_respects_original_privacy_epoch_and_gate(dispatcher_components, monkeypatch, boundary):
+    from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    gate = DurablePersistenceGate()
+    class PrivacyAgent(type(c.agent)):
+        def _get_durable_persistence_gate(self):
+            return self._test_privacy_gate
+        def _get_privacy_policy_epoch(self):
+            return self._test_privacy_epoch
+    c.agent.__class__ = PrivacyAgent
+    c.agent._test_privacy_gate = gate
+    c.agent._test_privacy_epoch = 'original-policy'
+    entered, release, transition_started, transition_entered = (asyncio.Event() for _ in range(4))
+    original = c.backend._append_original_signal_outcome
+    task = transition = None
+
+    async def held_native(journal):
+        entered.set()
+        await release.wait()
+        return await original(journal)
+
+    async def change_policy():
+        transition_started.set()
+        async with gate.exclusive():
+            transition_entered.set()
+            c.agent._test_privacy_epoch = 'replacement-policy'
+
+    monkeypatch.setattr(c.backend, '_append_original_signal_outcome', held_native)
+    c.registry.register(_action_reg('privacy.epoch.audit'))
+    signal = _signal('privacy.epoch.audit')
+    try:
+        task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+        await asyncio.wait_for(entered.wait(), 2)
+        if boundary == 'changed_epoch':
+            # Direct epoch replacement also covers a policy invalidation
+            # independent of a queued transition. Never grants new work.
+            c.agent._test_privacy_epoch = 'replacement-policy'
+            release.set()
+            outcome = await await_owned_task(task)
+            assert is_execution_control_error(outcome.error)
+            assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+        else:
+            transition = asyncio.create_task(change_policy())
+            await transition_started.wait()
+            assert not transition_entered.is_set(), 'privacy transition crossed an original native journal'
+            release.set()
+            outcome = await await_owned_task(task)
+            assert outcome.error is None
+            await transition
+            assert transition_entered.is_set()
+            assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        if transition is not None:
+            await transition
+        try:
+            await c.dispatcher.shutdown_durable_delivery()
+        except BaseException as error:
+            assert is_execution_control_error(error)

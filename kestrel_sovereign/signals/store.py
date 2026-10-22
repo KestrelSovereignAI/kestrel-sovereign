@@ -264,7 +264,13 @@ class SignalLogStore(UnifiedStoreBase):
         if journal._store is not self:
             from kestrel_sovereign.execution_custody import ExecutionAuthorityError
             raise ExecutionAuthorityError('Original native signal journal store differs')
-        return await self._backend._append_original_signal_outcome(journal)
+        from kestrel_sovereign.storage.privacy_wrapper import optional_durable_persistence_gate
+        # Reuse the SAME original privacy gate, never reacquire a new policy
+        # or a work admission. A queued transition wins before this shared
+        # hold, or waits through original COMMIT/reset. Recheck under the hold.
+        async with optional_durable_persistence_gate(journal._privacy_gate):
+            _require_original_signal_outcome(journal, self._backend)
+            return await self._backend._append_original_signal_outcome(journal)
 
     @staticmethod
     def _outcome_insert_query(table: str = 'signal_log') -> str:
