@@ -424,13 +424,13 @@ terminates a process. It is deliberately not the operator/local HTTP Stop door
 (`POST /api/agent/stop`, `POST /api/host/stop`): those doors neither build nor
 impersonate this signal, and the A2A transport lane cannot reach them.
 
-Two doors feed it, and both call `dispatch_peer_stop`, which builds a `Signal`
-and awaits `SignalDispatcher.dispatch_signal`. Neither door cancels anything:
-
-- `POST /api/agent/peer/stop` carries the replay-protected hybrid A2A envelope
-  (`a2a_verb=peer_stop`). An unsigned envelope is refused.
-- `AgentManager.stop_host_attested_local_peer` carries the manager's
-  same-process route capability for co-hosted agents.
+Native A2A `SendMessage` carries the declared `peer-stop-v1` extension in
+message metadata over either advertised binding. The request handler verifies
+the complete-request hybrid sender proof, recipient authorization, and replay
+reservation before calling `dispatch_peer_stop`. That function builds a
+`Signal` and awaits `SignalDispatcher.dispatch_signal`; cancellation happens
+only inside the dispatcher-invoked handler. The response is a native A2A
+`Message` containing the Stop receipt.
 
 Identities are routing principals, never payload:
 

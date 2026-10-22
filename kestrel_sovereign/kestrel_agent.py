@@ -9553,6 +9553,10 @@ Expected Duration: {expected_duration}
 
     async def _shutdown_background_tasks(self) -> None:
         tasks = set(self._background_tasks)
+        dispatcher = getattr(self, "dispatcher", None)
+        owners = getattr(type(dispatcher), "durable_owner_tasks", None)
+        if callable(owners):
+            tasks.difference_update(owners(dispatcher))
         if not tasks:
             self._raise_shutdown_control()
             return
@@ -9565,7 +9569,7 @@ Expected Duration: {expected_duration}
         from kestrel_sovereign._async_ownership import owned_task_error
         for task in tasks:
             self._remember_shutdown_control(owned_task_error(task))
-        self._background_tasks.clear()
+        self._background_tasks.difference_update(tasks)
         self._raise_shutdown_control()
 
     def _has_pending_llm_storage_dependents(self) -> bool:
@@ -10150,11 +10154,12 @@ Expected Duration: {expected_duration}
         """
         finite_outcomes: list[BaseException] = []
 
-        def remember_finite(error):
+        def remember_finite(error, *, retain_ordinary=False):
             # Shared agent state owns source-only facts. This invocation still
             # owes its finite caller every actual delivered withdrawal.
             if error is not None and (
-                is_execution_control_error(error)
+                retain_ordinary
+                or is_execution_control_error(error)
                 or isinstance(error, asyncio.CancelledError)
             ) and all(error is not prior for prior in finite_outcomes):
                 finite_outcomes.append(error)
@@ -10179,6 +10184,14 @@ Expected Duration: {expected_duration}
         from kestrel_sovereign.execution_custody import (
             retire_process_runtime_custody,
         )
+        if dispatcher is not None:
+            try:
+                dispatcher.shutdown()
+            except BaseException as opening:  # noqa: BLE001 - re-raise the original after mandatory resource cleanup
+                # Admission may already be closed and its original completion
+                # accepted. Preserve the publication failure while the normal
+                # resource sweep and durable tail join that same close owner.
+                remember_finite(opening, retain_ordinary=True)
         # Borrowed tenant/shared host authority must never be retired by
         # shutting down one agent. Deny local children before any await.
         retire_process_runtime_custody(getattr(self, "_execution_custody", None))

@@ -376,6 +376,7 @@ async def test_native_sqlalchemy_cancelled_owner_keeps_original_receipt(tmp_path
 @pytest.mark.parametrize("kind", KINDS)
 async def test_native_worker_poll_control_is_not_an_ordinary_result(tmp_path, monkeypatch, route, kind):
     agent, db = await native_owner(tmp_path)
+    original_dispatcher = getattr(agent, "dispatcher", None)
     original = terminal(kind)
     finished = asyncio.Event()
     async def poll(*args, **kwargs):
@@ -402,6 +403,7 @@ async def test_native_worker_poll_control_is_not_an_ordinary_result(tmp_path, mo
         if worker._task is not None and not worker._task.done():
             worker._task.cancel()
             await join(worker._task)
+        agent.dispatcher = original_dispatcher
         await retire(agent)
         await db.close()
 

@@ -255,6 +255,19 @@ func main() {
 	check(json.Unmarshal(must(os.ReadFile(c.Keys)), &k))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if mode == "proof" {
+		var input struct {
+			Operation  string          `json:"operation"`
+			Params     json.RawMessage `json:"params"`
+			Extensions []string        `json:"extensions"`
+		}
+		check(json.Unmarshal(must(io.ReadAll(io.LimitReader(os.Stdin, 4<<20))), &input))
+		if input.Operation == "" || len(input.Params) == 0 {
+			panic("proof requires the native service operation and ProtoJSON params")
+		}
+		output(map[string]string{"proof": proof(c, k, input.Operation, input.Params, c.CoreStable, input.Extensions)})
+		return
+	}
 	if mode == "client" {
 		httpClient := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 		request := must(http.NewRequestWithContext(ctx, http.MethodGet, c.CoreCardURL, nil))

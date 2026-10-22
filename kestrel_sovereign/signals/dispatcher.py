@@ -960,6 +960,9 @@ class SignalDispatcher:
         # bounded future retry rather than either hot-looping or giving up.
         self._runtime_owner_heartbeat_failures = 0
         self._durable_shutdown = False
+        self._durable_cognition_stop: asyncio.Future[None] | None = None
+        self._entered_durable_cognition_drainers: set[asyncio.Task] = set()
+        self._durable_owned_tasks: set[asyncio.Task] = set()
         # This is intentionally dispatcher-local.  It is not a second durable
         # queue and must disappear on shutdown/restart; ``delivery_id`` is
         # globally unique and every dispatcher owns exactly one agent scope.
@@ -1008,6 +1011,44 @@ class SignalDispatcher:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _own_durable_task(self, task):
+        """Keep the exact owner that this dispatcher's close protocol joins."""
+        self._durable_owned_tasks.add(task)
+        task.add_done_callback(self._durable_owned_tasks.discard)
+        return task
+
+    def durable_owner_tasks(self) -> frozenset[asyncio.Task]:
+        """Metadata owners excluded from the general sweep only after close."""
+        if not self._durable_shutdown:
+            return frozenset()
+        heartbeat = self._runtime_owner_heartbeat_task
+        return frozenset(self._durable_owned_tasks) | (
+            frozenset({heartbeat}) if heartbeat is not None else frozenset()
+        )
+
+    def _cognition_stop_notice(self) -> asyncio.Future[None]:
+        """An irreversible notification, independent of execution authority."""
+        if self._durable_cognition_stop is None:
+            self._durable_cognition_stop = asyncio.get_running_loop().create_future()
+            if self._durable_shutdown:
+                self._durable_cognition_stop.set_result(None)
+        return self._durable_cognition_stop
+
+    async def _run_with_lent_durable_admission(self, operation):
+        """Continue a parent's counted admission on its exact metadata child.
+
+        Execution custody remains unchanged. A cognition child cannot reuse
+        this marker because admission is checked against the current Task.
+        """
+        owner = asyncio.current_task()
+        token = self._durable_admission.set((owner, 1))
+        self._durable_admission_owners.add(owner)
+        try:
+            return await operation()
+        finally:
+            self._durable_admission_owners.discard(owner)
+            self._durable_admission.reset(token)
 
     @asynccontextmanager
     async def _admit_durable_operation(self):
@@ -1342,6 +1383,7 @@ class SignalDispatcher:
         task = self._agent._track_background_task(
             coro, name=f"durable_cognition:{consumer_id}:{signal.id}"
         )
+        self._own_durable_task(task)
         def release_live_admission(_task: asyncio.Task[SignalResult]) -> None:
             self._live_durable_cognition_event_ids.discard(signal.id)
             # A NACK can have committed just before the task becomes terminal.
@@ -1528,6 +1570,7 @@ class SignalDispatcher:
         task = self._agent._track_background_task(
             coro, name=f"durable_terminal:{consumer_id}:{signal.id}"
         )
+        self._own_durable_task(task)
         return SignalDispatchHandle(
             signal_id=signal.id,
             task=task,
@@ -1591,7 +1634,14 @@ class SignalDispatcher:
         tracker = getattr(type(self._agent), "_track_runtime_task", None)
         if callable(tracker):
             options = {"admission": admission} if admission is not None else {}
-            return tracker(self._agent, coro, name=name, **options)
+            task = None
+            try:
+                task = tracker(self._agent, coro, name=name, **options)
+                return task
+            finally:
+                accepted = task if task is not None else getattr(admission, "task", None)
+                if accepted is not None:
+                    self._own_durable_task(accepted)
         # Legacy dispatcher embeddings have no hosted execution authority.
         # They may not impersonate a runtime handoff under an admitted scope.
         from kestrel_sovereign.execution_custody import (
@@ -1602,87 +1652,110 @@ class SignalDispatcher:
             coro.close()
             raise ExecutionAuthorityError("durable handoff requires original runtime owner")
         from kestrel_sovereign._async_ownership import create_owned_task
-        return create_owned_task(coro, name=name, admission=admission)
+        task = None
+        try:
+            task = create_owned_task(coro, name=name, admission=admission)
+            return task
+        finally:
+            accepted = task if task is not None else getattr(admission, "task", None)
+            if accepted is not None:
+                self._own_durable_task(accepted)
 
     async def _drain_durable_cognition_consumer(self, consumer_id: str) -> None:
         """Claim and route all currently-due work for one durable consumer."""
 
-        while not self._durable_shutdown:
-            candidates = await self._drainable_durable_deliveries(consumer_id)
-            if candidates and await self._agent_is_held():
-                # Observe Hold before transferring any lease. One bounded
-                # timer per consumer discovers a cross-process Release; the
-                # pending rows themselves remain the restart-safe backlog.
-                from kestrel_sovereign.hold import HeldWorkDisposition
-                from kestrel_sovereign.hold.metrics import (
-                    record_held_work_disposition,
-                )
+        owner = asyncio.current_task()
+        self._entered_durable_cognition_drainers.add(owner)
+        try:
+            while not self._durable_shutdown:
+                try:
+                    async with self._admit_durable_operation():
+                        candidates = await self._drainable_durable_deliveries(consumer_id)
+                        if candidates and await self._agent_is_held():
+                            # Observe Hold before transferring any lease. One bounded
+                            # timer per consumer discovers a cross-process Release; the
+                            # pending rows themselves remain the restart-safe backlog.
+                            from kestrel_sovereign.hold import HeldWorkDisposition
+                            from kestrel_sovereign.hold.metrics import (
+                                record_held_work_disposition,
+                            )
 
-                if consumer_id not in self._held_durable_cognition_consumers:
-                    record_held_work_disposition(
-                        disposition=HeldWorkDisposition.DEFERRED.value,
-                        source=candidates[0].event.source,
-                    )
-                    self._held_durable_cognition_consumers.add(consumer_id)
-                self._schedule_durable_cognition_drain(consumer_id, delay=1.0)
-                return
-            self._held_durable_cognition_consumers.discard(consumer_id)
-            delivery = None
-            blocked_by_live_admission = False
-            for candidate in candidates:
-                if candidate.event_id in self._live_durable_cognition_event_ids:
-                    blocked_by_live_admission = True
-                    continue
-                delivery = await self.claim_durable_delivery_for_event(
-                    consumer_id=consumer_id,
-                    event_id=candidate.event_id,
-                    executor_id=self._durable_delivery_owner,
-                )
-                if delivery is not None:
-                    break
-            if delivery is None:
-                if blocked_by_live_admission:
-                    # The live callback will either ACK, NACK (which schedules
-                    # us from the persisted retry deadline), or die; a later
-                    # runtime owner restart then discovers its row.
+                            if consumer_id not in self._held_durable_cognition_consumers:
+                                record_held_work_disposition(
+                                    disposition=HeldWorkDisposition.DEFERRED.value,
+                                    source=candidates[0].event.source,
+                                )
+                                self._held_durable_cognition_consumers.add(consumer_id)
+                            self._schedule_durable_cognition_drain(consumer_id, delay=1.0)
+                            return
+                        self._held_durable_cognition_consumers.discard(consumer_id)
+                        delivery = None
+                        blocked_by_live_admission = False
+                        for candidate in candidates:
+                            if candidate.event_id in self._live_durable_cognition_event_ids:
+                                blocked_by_live_admission = True
+                                continue
+                            if self._durable_shutdown:
+                                return
+                            delivery = await self.claim_durable_delivery_for_event(
+                                consumer_id=consumer_id,
+                                event_id=candidate.event_id,
+                                executor_id=self._durable_delivery_owner,
+                            )
+                            if delivery is not None:
+                                break
+                        if delivery is None:
+                            if blocked_by_live_admission:
+                                # The live callback will either ACK, NACK (which schedules
+                                # us from the persisted retry deadline), or die; a later
+                                # runtime owner restart then discovers its row.
+                                return
+                            await self._schedule_next_durable_cognition_drain(consumer_id)
+                            return
+                        registration = self._registry.get(delivery.event.source)
+                        if registration is None:
+                            # A feature can only drain a source it currently owns.  Keep
+                            # the ledger row retryable until boot has registered the
+                            # source again rather than converting it into an ACKable loss.
+                            await self.nack_durable_delivery(
+                                consumer_id=consumer_id,
+                                delivery_id=delivery.delivery_id,
+                                lease_token=delivery.lease_token or "",
+                                error="Durable cognition source registration is unavailable",
+                                retry_delay=_DURABLE_COGNITION_RETRY_DELAY,
+                            )
+                            await self._schedule_next_durable_cognition_drain(consumer_id)
+                            return
+                        seed = self._durable_retry_seed(delivery.event)
+                        # The drainer owns a batch, not any one attempt's Stop lifecycle.
+                        # Give each recovered delivery its own task so the settlement guard
+                        # callback runs at that delivery's ACK/NACK boundary before the
+                        # scanner advances. A later wedged row must not keep prior rows live.
+                        async def recover_delivery(seed=seed, registration=registration, delivery=delivery):
+                            return await self._route_durable_cognition_delivery(
+                                seed,
+                                registration,
+                                time.monotonic(),
+                                persisted_event_id=delivery.event_id,
+                                consumer_id=consumer_id,
+                                durable_admission=None,
+                                durable_created=False,
+                                use_live_signal=False,
+                                claimed_delivery=delivery,
+                                retry_delay=_DURABLE_COGNITION_RETRY_DELAY,
+                            )
+
+                        delivery_task = asyncio.create_task(
+                            self._run_with_lent_durable_admission(recover_delivery),
+                            name=f"durable_cognition_recovery:{delivery.delivery_id}",
+                        )
+                        await delivery_task
+                except _DurableDeliveryShuttingDownError:
+                    if not self._durable_shutdown:
+                        raise
                     return
-                await self._schedule_next_durable_cognition_drain(consumer_id)
-                return
-            registration = self._registry.get(delivery.event.source)
-            if registration is None:
-                # A feature can only drain a source it currently owns.  Keep
-                # the ledger row retryable until boot has registered the
-                # source again rather than converting it into an ACKable loss.
-                await self.nack_durable_delivery(
-                    consumer_id=consumer_id,
-                    delivery_id=delivery.delivery_id,
-                    lease_token=delivery.lease_token or "",
-                    error="Durable cognition source registration is unavailable",
-                    retry_delay=_DURABLE_COGNITION_RETRY_DELAY,
-                )
-                await self._schedule_next_durable_cognition_drain(consumer_id)
-                return
-            seed = self._durable_retry_seed(delivery.event)
-            # The drainer owns a batch, not any one attempt's Stop lifecycle.
-            # Give each recovered delivery its own task so the settlement guard
-            # callback runs at that delivery's ACK/NACK boundary before the
-            # scanner advances. A later wedged row must not keep prior rows live.
-            delivery_task = asyncio.create_task(
-                self._route_durable_cognition_delivery(
-                    seed,
-                    registration,
-                    time.monotonic(),
-                    persisted_event_id=delivery.event_id,
-                    consumer_id=consumer_id,
-                    durable_admission=None,
-                    durable_created=False,
-                    use_live_signal=False,
-                    claimed_delivery=delivery,
-                    retry_delay=_DURABLE_COGNITION_RETRY_DELAY,
-                ),
-                name=f"durable_cognition_recovery:{delivery.delivery_id}",
-            )
-            await delivery_task
+        finally:
+            self._entered_durable_cognition_drainers.discard(owner)
 
     async def _drainable_durable_deliveries(
         self, consumer_id: str, *, limit: int = 100
@@ -2730,6 +2803,9 @@ class SignalDispatcher:
         completion = self._durable_shutdown_completion
         if completion is None or self._durable_shutdown_needs_retry(completion):
             self._durable_shutdown = True
+            self._cognition_stop_notice()
+            if not self._durable_cognition_stop.done():
+                self._durable_cognition_stop.set_result(None)
             completion = asyncio.create_task(
                 self._complete_durable_shutdown(),
                 name=f"durable_signal_shutdown:{self._agent.did}",
@@ -2755,9 +2831,9 @@ class SignalDispatcher:
 
     async def _complete_durable_shutdown(self) -> None:
         """Reconcile durable state once, leaving failures available for retry."""
-        # A drainer is an owner, not a provider callback. Stop it before the
-        # admission gate drains so it cannot begin another lease while this
-        # dispatcher is giving up its runtime-owner generation.
+        # Admission is already closed. Entered drainers own native metadata
+        # replies and must finish them; only wrappers still behind READY can
+        # be cancelled safely. Cognition receives the separate stop notice.
         for timer in self._durable_cognition_drain_timers.values():
             timer.cancel()
         self._durable_cognition_drain_timers.clear()
@@ -2767,10 +2843,10 @@ class SignalDispatcher:
         self._held_durable_claim_consumers.clear()
         drainers = tuple(self._durable_cognition_drainers.values())
         for task in drainers:
-            if not task.done():
+            if not task.done() and task not in self._entered_durable_cognition_drainers:
                 task.cancel()
         if drainers:
-            await asyncio.gather(*drainers, return_exceptions=True)
+            await asyncio.wait(drainers)
         # A retained route has already detached from its dispatch so it does
         # not hold an admission open. Ask it to stop again before draining
         # storage operations; a task that keeps running is fenced below rather
@@ -4890,10 +4966,7 @@ class SignalDispatcher:
                     reset_current_signal,
                     set_current_signal,
                 )
-                owner = asyncio.current_task()
-                token = self._durable_admission.set((owner, 1))
                 signal_token = set_current_signal(signal)
-                self._durable_admission_owners.add(owner)
                 try:
                     try:
                         return await self._execute_claimed_durable_cognition(
@@ -4905,9 +4978,7 @@ class SignalDispatcher:
                     finally:
                         await self._drain_outcome_logs_for_signal(signal.id)
                 finally:
-                    self._durable_admission_owners.discard(owner)
                     reset_current_signal(signal_token)
-                    self._durable_admission.reset(token)
 
             from kestrel_sovereign._async_ownership import (
                 OwnedTaskAdmission,
@@ -4915,7 +4986,7 @@ class SignalDispatcher:
             )
             from kestrel_sovereign.execution_custody import execution_observation_error
             publication = OwnedTaskAdmission()
-            operation = resident_delivery()
+            operation = self._run_with_lent_durable_admission(resident_delivery)
             try:
                 resident = self._track_resident_durable_task(
                     operation, name=f"durable_cognition_owner:{delivery.delivery_id}",
@@ -4975,7 +5046,11 @@ class SignalDispatcher:
             # This original dispatch remains admitted until its new resident
             # child physically settles. Explicit handle cancellation forwards
             # once; borrowed admission readers still never cancel this owner.
-            outcome = await await_owned_task(resident, cancel_on_caller_cancellation=True)
+            def cancel_cognition_owner(owner):
+                if not self._durable_shutdown:
+                    owner.cancel()
+
+            outcome = await await_owned_task(resident, cancel_on_caller_cancellation=cancel_cognition_owner)
             terminal = execution_finite_error(
                 outcome.error, outcome.cancellation, retain_originals=True,
             )
@@ -4989,11 +5064,27 @@ class SignalDispatcher:
             persisted_event_id=persisted_event_id,
         )
 
+    def _defer_unstarted_cognition_for_shutdown(self, signal, registration, start, delivery):
+        """Leave the original pending claim to exact-owner crash recovery.
+
+        Recovery refunds a claim that never crossed begin. Shutdown is not a
+        Hold and must not spend an attempt or manufacture a Hold disposition.
+        """
+        self._pending_cognition_admissions.pop(delivery.delivery_id, None)
+        result = self._failure_result(
+            signal, start, error="Durable cognition admission closed for shutdown",
+        )
+        self._schedule_outcome_log(signal, registration, result)
+        return result
+
     async def _execute_claimed_durable_cognition(
         self, signal, registration, start, *, delivery, consumer_id,
         use_live_signal, retry_delay, durable_admission, persisted_event_id,
     ):
         """Execute the already claimed lease under its existing runtime owner."""
+
+        if self._durable_shutdown:
+            return self._defer_unstarted_cognition_for_shutdown(signal, registration, start, delivery)
 
         # A retried persistence-allowed event must execute the canonical
         # durable envelope, not whatever a duplicate provider callback happens
@@ -5119,6 +5210,8 @@ class SignalDispatcher:
                 )
             self._schedule_outcome_log(routing_signal, registration, result)
             return result
+        if self._durable_shutdown:
+            return self._defer_unstarted_cognition_for_shutdown(signal, registration, start, delivery)
         try:
             await self._begin_durable_cognition_execution(delivery)
         except BaseException as exc:
@@ -5190,12 +5283,13 @@ class SignalDispatcher:
                     self._durable_retry_skips_coalescing.reset(coalescing_token)
                     self._deferred_outcome_logs.reset(deferred_token)
 
+                stop_notice = self._cognition_stop_notice()
                 completed, _ = await asyncio.wait(
-                    {routing_task, lease_lost},
+                    {routing_task, lease_lost, stop_notice},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if lease_lost in completed:
-                    loss = lease_lost.result()
+                if lease_lost in completed or (stop_notice in completed and not routing_task.done()):
+                    loss = lease_lost.result() if lease_lost in completed else "Durable cognition stopped for shutdown"
                     if isinstance(loss, BaseException):
                         lease_loss_error = loss
                         # Publish debt before cancelling the child. Liveness
@@ -5206,7 +5300,7 @@ class SignalDispatcher:
                         lease_loss_reason = str(loss)
                     else:
                         lease_loss_reason = loss
-                    if routing_task not in completed:
+                    if not routing_task.done():
                         settled = await self._cancel_durable_cognition_routing_task(
                             routing_task,
                             delivery=delivery,
@@ -5285,32 +5379,35 @@ class SignalDispatcher:
                 start,
                 error=lease_loss_reason or "Durable cognition routing was cancelled",
             )
-            try:
-                released = await self.nack_durable_delivery(
-                    consumer_id=consumer_id,
-                    delivery_id=delivery.delivery_id,
-                    lease_token=delivery.lease_token or "",
-                    error=failure.error or "Durable cognition routing was cancelled",
-                    retry_delay=retry_delay,
-                )
-                if released is None:
-                    await self.release_durable_delivery_after_task(
+            # Interrupted cognition stays under its exact old lease until
+            # owner retirement and recovery; no ordinary NACK after shutdown.
+            if not self._durable_shutdown:
+                try:
+                    released = await self.nack_durable_delivery(
                         consumer_id=consumer_id,
                         delivery_id=delivery.delivery_id,
                         lease_token=delivery.lease_token or "",
                         error=failure.error or "Durable cognition routing was cancelled",
+                        retry_delay=retry_delay,
                     )
-            except BaseException as error:
-                if is_execution_control_error(error):
-                    await self._terminalize_failed_cognition(delivery, error)
-                    raise
-                if not isinstance(error, Exception):
-                    raise
-                logger.exception(
-                    "Could not release durable cognition lease after cancellation: "
-                    "delivery=%s",
-                    delivery.delivery_id,
-                )
+                    if released is None:
+                        await self.release_durable_delivery_after_task(
+                            consumer_id=consumer_id,
+                            delivery_id=delivery.delivery_id,
+                            lease_token=delivery.lease_token or "",
+                            error=failure.error or "Durable cognition routing was cancelled",
+                        )
+                except BaseException as error:
+                    if is_execution_control_error(error):
+                        await self._terminalize_failed_cognition(delivery, error)
+                        raise
+                    if not isinstance(error, Exception):
+                        raise
+                    logger.exception(
+                        "Could not release durable cognition lease after cancellation: "
+                        "delivery=%s",
+                        delivery.delivery_id,
+                    )
             self._finalize_deferred_durable_outcome(
                 deferred_outcomes,
                 fallback_signal=routing_signal,

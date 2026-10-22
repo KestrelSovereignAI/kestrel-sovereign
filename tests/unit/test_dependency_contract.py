@@ -238,15 +238,16 @@ def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
 
 
 def test_asyncpg_runtime_probe_supports_current_minor_releases():
-    """Doctor uses asyncpg's public connection path, not a pinned parser shape."""
+    """Require native retirement fixes without capping future minor releases."""
     direct = [
         Requirement(raw)
         for raw in _pyproject()["project"]["dependencies"]
         if canonicalize_name(Requirement(raw).name) == "asyncpg"
     ]
     assert len(direct) == 1
-    assert Version("0.30") in direct[0].specifier
-    assert Version("0.31") in direct[0].specifier
+    assert Version("0.31") not in direct[0].specifier
+    assert Version("0.32") in direct[0].specifier
+    assert Version("0.33") in direct[0].specifier
 
     root = _locked_root_package(_lock())
     locked_metadata = [
@@ -254,7 +255,7 @@ def test_asyncpg_runtime_probe_supports_current_minor_releases():
         for requirement in root["metadata"]["requires-dist"]
         if requirement["name"] == "asyncpg"
     ]
-    assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.30.0"}]
+    assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.32.0"}]
 
 
 def _sdk_contract_requirement(
