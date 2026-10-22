@@ -53,6 +53,36 @@ async def test_sqlite_original_journal_rejects_changed_durability_settings(dispa
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
 
 
+async def test_sqlite_late_durability_refusal_does_not_invent_commit_uncertainty(dispatcher_components, monkeypatch):
+    from kestrel_sovereign.storage.db.native_journal_programs import _NativeJournalSQLiteConnection
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_cleanup_debts, is_execution_control_error
+    c = dispatcher_components
+    original_commit = _NativeJournalSQLiteConnection.commit
+    changed, effects = [], []
+    def changed_before_native_commit(connection):
+        if connection._journal_program_seal is not None and not changed:
+            current = connection.execute('PRAGMA fullfsync').fetchone()[0]
+            connection.execute('PRAGMA fullfsync=' + str(1 - current)).close()
+            changed.append(True)
+        return original_commit(connection)  # Real native preflight/COMMIT, no synthetic ACK.
+    monkeypatch.setattr(_NativeJournalSQLiteConnection, 'commit', changed_before_native_commit)
+    async def handler(payload):
+        effects.append('genuine effect')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.late.durability', handler=handler))
+    with pytest.raises(BaseException) as caught:
+        await c.dispatcher.dispatch_signal(_signal('native.late.durability'))
+    assert changed and is_execution_control_error(caught.value)
+    assert execution_commit_outcome(caught.value) is None, 'known native pre-COMMIT refusal is not a lost ACK'
+    assert not execution_cleanup_debts(caught.value)
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+    second = await c.dispatcher.dispatch_signal(_signal('native.late.durability'))
+    assert second.action_result == {'genuine': True}
+    assert effects == ['genuine effect', 'genuine effect']
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+    assert c.dispatcher._log_write_failures == 1
+
+
 async def test_application_string_equality_cannot_substitute_accepted_signal_id():
     from kestrel_sdk.signals import SignalMode
     class EqualText(str):
