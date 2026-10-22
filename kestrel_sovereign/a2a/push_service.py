@@ -42,18 +42,21 @@ async def start_native_push_service(
         retention_days=policy.retention_days,
         lease_seconds=policy.lease_seconds,
     )
+    database_retry_policy = DatabasePollRetryPolicy(
+        max_attempts=policy.database_retry_attempts
+    )
+    retry_delay = timedelta(seconds=policy.retry_seconds)
     worker = NativePushWorker(
         outbox,
         NativePushTransport(
-            outbox.configurations, timeout=timedelta(seconds=policy.timeout_seconds)
+            outbox.configurations, timeout=timedelta(seconds=policy.timeout_seconds),
+            database_retry_policy=database_retry_policy, retry_delay=retry_delay,
         ),
         poll_interval=timedelta(seconds=policy.poll_seconds),
         renewal_interval=timedelta(seconds=policy.renewal_seconds),
-        retry_delay=timedelta(seconds=policy.retry_seconds),
+        retry_delay=retry_delay,
         batch_size=policy.batch_size,
-        database_retry_policy=DatabasePollRetryPolicy(
-            max_attempts=policy.database_retry_attempts
-        ),
+        database_retry_policy=database_retry_policy,
     )
     service = NativePushService(worker, task_factory=task_factory)
     await service.start()

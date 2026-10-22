@@ -411,6 +411,21 @@ async def test_invalid_timeout_policy_fails_without_admission(push_store, timeou
     )
 
 
+@pytest.mark.parametrize("retry_delay", [timedelta(), timedelta(seconds=-1), True])
+async def test_invalid_retirement_retry_delay_refuses_before_admission(push_store, retry_delay):
+    store, _task = push_store
+    with pytest.raises(ValueError, match="retirement retry delay"):
+        NativePushTransport(store, timeout=timedelta(seconds=5), retry_delay=retry_delay)
+    assert await store.backend.fetch_all("SELECT attempt_id FROM a2a_push_delivery_attempts") == []
+
+
+async def test_untyped_retirement_policy_refuses_before_admission(push_store):
+    store, _task = push_store
+    with pytest.raises(TypeError, match="retirement requires its database retry policy"):
+        NativePushTransport(store, timeout=timedelta(seconds=5), database_retry_policy=True)
+    assert await store.backend.fetch_all("SELECT attempt_id FROM a2a_push_delivery_attempts") == []
+
+
 @pytest.mark.parametrize("fault", ["task", "private-model"])
 async def test_push_cannot_send_a_different_task_or_a_private_wire_shape(
     push_store, outbound_tls, fault

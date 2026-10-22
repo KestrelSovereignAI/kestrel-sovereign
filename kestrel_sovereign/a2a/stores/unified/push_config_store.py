@@ -590,11 +590,14 @@ class PushConfigStore(UnifiedStoreBase):
 
         Call only after resource retirement, including on failed HTTP delivery.
         The attempt remains until configuration deletion; retries are idempotent.
+        Publish the result after its explicit native COMMIT, including for an
+        embedding without an execution-custody scope. A lost commit reply must
+        retain its outcome instead of becoming an ordinary polling failure.
         """
         if not self._owns_attempt_process(attempt):
             return False
-        return (
-            await self.backend.execute(
+        async with self.write_transaction():
+            retired = await self.backend.execute(
                 "UPDATE a2a_push_delivery_attempts SET retired = 1 "
                 "WHERE recipient_id = ? AND tenant = ? AND task_id = ? AND config_id = ? "
                 "AND creator_id = ? AND generation = ? AND attempt_id = ? AND executor_id = ? "
@@ -610,5 +613,4 @@ class PushConfigStore(UnifiedStoreBase):
                     attempt._owner_identity_bytes.decode("utf-8"),
                 ),
             )
-            == 1
-        )
+        return retired == 1

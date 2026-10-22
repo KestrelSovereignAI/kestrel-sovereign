@@ -24,6 +24,7 @@ from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx_async_tr
 
 from kestrel_sovereign._async_ownership import await_owned_operation
 from kestrel_sovereign.a2a.push_logging import PushLogRedaction
+from kestrel_sovereign.a2a.push_policy import NativePushPolicy
 from kestrel_sovereign.a2a.stores.unified.push_config_store import (
     PushConfigConflict,
     PushConfigStore,
@@ -37,6 +38,7 @@ from kestrel_sovereign.execution_custody import (
     native_execution_response_owner,
     owned_native_http_client,
 )
+from kestrel_sovereign.storage.db.polling import DatabasePollRetryPolicy
 
 
 class PushDeliveryRevoked(PushConfigConflict):
@@ -93,16 +95,30 @@ class NativePushTransport:
     A successful return proves both an HTTP success and physical retirement.
     Failed delivery also retires its attempt when cleanup is confirmed. A
     native cleanup debt stays unretired and prevents Delete from reporting a
-    false acknowledgement. No background task or implicit retry is created.
+    false acknowledgement. The original owner may retry its idempotent
+    retirement write after known database availability failures. It never
+    recreates an HTTP owner or repeats network delivery.
     """
 
-    def __init__(self, store: PushConfigStore, *, timeout: timedelta):
+    def __init__(
+        self, store: PushConfigStore, *, timeout: timedelta,
+        retry_delay: timedelta | None = None,
+        database_retry_policy: DatabasePollRetryPolicy | None = None,
+    ):
         if not isinstance(store, PushConfigStore):
             raise TypeError("Native push requires its primary configuration ledger")
         if not isinstance(timeout, timedelta) or timeout <= timedelta():
             raise ValueError("Push delivery timeout must be a positive duration")
+        if retry_delay is None:
+            retry_delay = timedelta(seconds=NativePushPolicy().retry_seconds)
+        if not isinstance(retry_delay, timedelta) or retry_delay <= timedelta():
+            raise ValueError("Push retirement retry delay must be a positive duration")
+        if database_retry_policy is not None and not isinstance(database_retry_policy, DatabasePollRetryPolicy):
+            raise TypeError("Push retirement requires its database retry policy")
         self.store = store
         self.timeout = timeout.total_seconds()
+        self.retry_delay = retry_delay
+        self.database_retry_policy = database_retry_policy or DatabasePollRetryPolicy()
 
     async def send(
         self,
@@ -189,7 +205,11 @@ class NativePushTransport:
                 original = error
             if admitted is not False and not execution_cleanup_debts(original):
                 outcome = await await_owned_operation(
-                    self.store.retire_delivery(attempt),
+                    self.database_retry_policy.poll(
+                        lambda: self.store.retire_delivery(attempt),
+                        retry_seconds=self.retry_delay.total_seconds(),
+                        label="native-push-http-retirement",
+                    ),
                     retirement_resource=attempt,
                     retain_originals=True,
                     name="native-push-retire-http-attempt",

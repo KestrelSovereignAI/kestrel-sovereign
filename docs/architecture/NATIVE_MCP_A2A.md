@@ -991,6 +991,17 @@ receipt. An owner whose retirement cannot be proven leaves deletion pending
 with credentials retained; an expired lease cannot establish retirement. Active configurations
 also block task cleanup before their first HTTP request.
 
+After HTTP resources close, the original transport owner retains that fact while
+retrying only its idempotent retirement write through known database outages.
+The same attempt and task span every retry burst; no POST is repeated. Delete
+and observer cancellation join that original writer rather than interrupting
+its native COMMIT. The retirement CAS has an explicit transaction on both
+backends, including embeddings without execution custody. A missing COMMIT
+reply keeps its uncertain outcome and prevents delivery acknowledgement;
+permanent SQL defects stop immediately. Failed HTTP cleanup still prevents any
+retirement write. Hosted workers and transports share the configured database
+retry policy and delay.
+
 `NativePushOutbox.prepare` validates a copied callback before task row locks and
 returns a frozen, secret-bearing `PreparedPushConfig`. Its one
 `register_prepared` path binds that value to the recipient/tenant and the
