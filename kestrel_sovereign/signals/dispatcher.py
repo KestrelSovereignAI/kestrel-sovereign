@@ -7616,6 +7616,11 @@ class SignalDispatcher:
             task = publication.task
             if task is None:
                 self._release_durable_admission(reservation)
+                # No writer was accepted: projection/control or exact binding
+                # refused this original row before _log_safe could account
+                # for its loss. Accepted writers own their own one outcome.
+                if journal is not None:
+                    self._record_log_write_failure(signal.id, opening)
                 raise
             # The native task was accepted, even if its publication failed.
             # It is retained below until the existing async drain joins it.

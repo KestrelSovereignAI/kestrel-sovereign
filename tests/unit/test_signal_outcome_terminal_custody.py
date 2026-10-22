@@ -872,7 +872,7 @@ async def test_original_journal_refuses_substituted_identity(dispatcher_componen
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
 
 
-@pytest.mark.parametrize('boundary', ['changed_epoch', 'inflight_transition'])
+@pytest.mark.parametrize('boundary', ['changed_epoch', 'inflight_transition', 'before_binding'])
 async def test_original_journal_respects_original_privacy_epoch_and_gate(dispatcher_components, monkeypatch, boundary):
     from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
     from kestrel_sovereign.execution_custody import is_execution_control_error
@@ -902,10 +902,32 @@ async def test_original_journal_respects_original_privacy_epoch_and_gate(dispatc
             c.agent._test_privacy_epoch = 'replacement-policy'
 
     monkeypatch.setattr(c.backend, '_append_original_signal_outcome', held_native)
-    c.registry.register(_action_reg('privacy.epoch.audit'))
+    if boundary == 'before_binding':
+        from kestrel_sdk.signals import RedactionPolicy
+        def supersede_during_projection(payload):
+            c.agent._test_privacy_epoch = 'replacement-policy'
+            return '<redacted>'
+        registration = _action_reg('privacy.epoch.audit')
+        registration.log_redaction = RedactionPolicy(summarize=supersede_during_projection)
+    else:
+        registration = _action_reg('privacy.epoch.audit')
+    c.registry.register(registration)
     signal = _signal('privacy.epoch.audit')
     try:
         task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+        if boundary == 'before_binding':
+            from kestrel_sovereign.signals.outcome_custody import SignalOutcomeJournalPrivacyRefusal
+            from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_native_source_error
+            outcome = await await_owned_task(task)
+            refusals = [error for error in _explicit_control_chain(outcome.error)
+                        if isinstance(error, SignalOutcomeJournalPrivacyRefusal)]
+            assert len(refusals) == 1 and refusals[0].reason == 'superseded'
+            assert refusals[0].signal_result.status.value == 'ok'
+            assert execution_native_source_error(outcome.error) is None
+            assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+            assert c.dispatcher._log_write_failures == 1
+            assert not c.dispatcher._outcome_log_tasks
+            return
         await asyncio.wait_for(entered.wait(), 2)
         if boundary == 'changed_epoch':
             # Direct epoch replacement also covers a policy invalidation
