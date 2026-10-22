@@ -23,6 +23,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_terminal_snapshot_matches_canonical_handler_envelope,
     test_inner_writer_observation_retains_commit_and_original_error,
     test_original_journal_respects_original_privacy_epoch_and_gate,
+    test_original_journal_completes_inside_original_exclusive_privacy_hold,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -76,6 +77,7 @@ async def test_original_journal_keeps_acknowledged_commit_after_reset_identity_l
         assert reset_acknowledged == [True]
         assert is_execution_control_error(caught.value)
         assert execution_commit_outcome(caught.value) == 'committed'
+        assert c.dispatcher._log_write_failures == 0
     finally:
         c.agent._did = original_id
         monkeypatch.setattr(asyncpg.pool.Pool, 'release', original_release)

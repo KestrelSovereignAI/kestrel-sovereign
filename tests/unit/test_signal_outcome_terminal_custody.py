@@ -476,8 +476,9 @@ async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_co
 
 
 @pytest.mark.parametrize('registered_before_refusal', [False, True])
-async def test_inner_writer_observation_retains_commit_and_original_error(dispatcher_components, registered_before_refusal):
-    from kestrel_sovereign.execution_custody import execution_commit_outcome, _explicit_control_chain, _acknowledged_commits
+@pytest.mark.parametrize('writer_method', ['_write_outcome_log', '_log_safe'])
+async def test_inner_writer_observation_retains_commit_and_original_error(dispatcher_components, registered_before_refusal, writer_method):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_native_source_error, _explicit_control_chain, _acknowledged_commits
     from tests.unit.test_host_context_native_cleanup import _actual_operation
     c = dispatcher_components
     loop = asyncio.get_running_loop()
@@ -495,7 +496,7 @@ async def test_inner_writer_observation_retains_commit_and_original_error(dispat
 
     def factory(loop, coro, **kwargs):
         operation = _actual_operation(coro)
-        if getattr(operation, 'cr_code', None) is c.dispatcher._write_outcome_log.__func__.__code__:
+        if getattr(operation, 'cr_code', None) is getattr(c.dispatcher, writer_method).__func__.__code__:
             task = RejectObservation(coro, loop=loop, **kwargs)
             accepted.append(task)
             return task
@@ -512,6 +513,7 @@ async def test_inner_writer_observation_retains_commit_and_original_error(dispat
     assert accepted and all(task.done() for task in accepted)
     assert any(error is original for error in _explicit_control_chain(caught.value))
     assert execution_commit_outcome(caught.value) == 'committed'
+    assert execution_native_source_error(caught.value) is None
     if c.backend.backend_type == 'postgres':
         assert _acknowledged_commits(caught.value)
         assert all(receipt.retired for receipt in _acknowledged_commits(caught.value))
@@ -519,6 +521,37 @@ async def test_inner_writer_observation_retains_commit_and_original_error(dispat
     assert c.dispatcher._log_write_failures == 0
     assert c.dispatcher._outcome_log_control_error is None
     assert (await c.dispatcher.dispatch_signal(_signal('inner.observation.audit'))).action_result is not None
+
+
+async def test_original_journal_completes_inside_original_exclusive_privacy_hold(dispatcher_components):
+    from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+    c = dispatcher_components
+    gate = DurablePersistenceGate()
+    class PrivacyAgent(type(c.agent)):
+        def _get_durable_persistence_gate(self):
+            return gate
+    c.agent.__class__ = PrivacyAgent
+    c.registry.register(_action_reg('privacy.exclusive.audit'))
+    signal = _signal('privacy.exclusive.audit')
+
+    async def inline_dispatch():
+        async with gate.exclusive():
+            return await c.dispatcher.dispatch_signal(signal)
+
+    task = asyncio.create_task(inline_dispatch())
+    completed, _ = await asyncio.wait({task}, timeout=2)
+    if not completed:
+        # Cancel the actual child waiting for the gate, not the parent whose
+        # physical join deliberately defers withdrawal. This unwinds the
+        # original exclusive frame without forging a lock release.
+        for _, _, journal in tuple(c.dispatcher._outcome_log_reconciliations.values()):
+            if journal is not None and journal._writer_admission is not None:
+                journal._writer_admission.task.cancel()
+    outcome = await await_owned_task(task)
+    assert completed, 'original inline dispatch deadlocked on its own exclusive privacy gate'
+    assert outcome.error is None
+    assert not gate.locked()
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
 
 
 @pytest.mark.parametrize('stale_hook_identity', [False, True])
