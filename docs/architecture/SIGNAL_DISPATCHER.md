@@ -918,6 +918,11 @@ Audit-loss accounting is per original row, including accepted-but-unstarted
 writers, and does not count the same failure again at another join boundary.
 Projection callbacks and UI emission remain ordinary work: control failures
 propagate, and UI emission after revocation is refused even if the row committed.
+The canonical pre-emission work check classifies a refusal of its exact original
+typed invocation scopes as finite observation, preserving the caller's denial
+and committed row without poisoning later healthy dispatches. This is not an
+emitter-error catch-all: foreign/unscoped controls, uncertainty and cleanup debt
+retain their original source classification, and revoked work is never resumed.
 An ordinary projection failure records an observable audit loss without
 relabelling an already completed effect as failed.
 

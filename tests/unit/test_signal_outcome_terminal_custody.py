@@ -809,11 +809,14 @@ async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_co
             if boundary != 'emitter_cancel':
                 assert is_execution_control_error(outcome.error)
             assert execution_commit_outcome(outcome.error) == 'committed'
+            if boundary == 'before_emit':
+                with pytest.raises(ExecutionAuthorityError):
+                    scope.require_work()
             if boundary in ('emitter_denial', 'emitter_cancel'):
                 assert any(error is original_denial for error in _explicit_control_chain(outcome.error))
         assert len(emitted) == (0 if boundary == 'before_emit' else 1)
         assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
-        if boundary == 'emitter_cancel':
+        if boundary in ('before_emit', 'emitter_cancel'):
             assert c.dispatcher._outcome_log_control_error is None
             assert (await c.dispatcher.dispatch_signal(_signal('visible.audit'))).action_result is not None
     finally:

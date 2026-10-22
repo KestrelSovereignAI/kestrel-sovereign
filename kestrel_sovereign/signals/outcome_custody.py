@@ -115,6 +115,10 @@ class _OriginalSignalOutcome:
         if type(backend) not in (SQLiteBackend, PostgresBackend):
             raise ExecutionAuthorityError('Original native signal backend required')
         require_execution_work(backend)
+        # Admission identity for classifying this invocation's later surface
+        # denial only. These references never authorize fresh UI/storage work.
+        self._surface_scopes = current_execution_custody(dispatcher._agent)
+        require_execution_work(dispatcher._agent)
         self._dispatcher = dispatcher
         self._store = dispatcher._store
         self._backend = backend

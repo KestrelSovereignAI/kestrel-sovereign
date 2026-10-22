@@ -7898,8 +7898,22 @@ class SignalDispatcher:
             self._record_surface(signal.id, SURFACE_NO_EMITTER)
             return
         try:
-            from kestrel_sovereign.execution_custody import require_execution_work
-            require_execution_work(self._agent)
+            from kestrel_sovereign.execution_custody import (
+                require_execution_work, is_scope_local_execution_control, _FINITE_NATIVE_SOURCES,
+            )
+            try:
+                require_execution_work(self._agent)
+            except BaseException as denial:
+                if (journal is not None and journal.has_acknowledged_commit()
+                        and is_scope_local_execution_control(denial, journal._surface_scopes)):
+                    # This exact producer just performed the canonical work
+                    # check. Its original invocation refusal is not a native
+                    # storage failure. Do not apply this to arbitrary emitter
+                    # errors, foreign scopes, COMMIT uncertainty or cleanup debt.
+                    finite = BaseExceptionGroup('completed journal surface admission refusal', [denial])
+                    finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, ())
+                    raise finite from None
+                raise
             payload = _build_ui_event_payload(
                 signal, result, result_summary,
                 reply_message_id=getattr(signal, _REPLY_MESSAGE_ID_ATTR, None),
