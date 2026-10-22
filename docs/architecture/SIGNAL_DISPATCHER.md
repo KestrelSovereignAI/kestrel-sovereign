@@ -839,6 +839,9 @@ result can bind the immutable row; handler calls to scheduling helpers cannot
 publish a premature result. The original admitted writer Tasks remain owned
 until physically joined, including failures after Task acceptance but before
 callback publication.
+Signal identity and runtime agent DID use the same native-text normalization at
+capture and observation. Supported string subclasses cannot supply equality,
+inequality, or hashing evidence that conceals a changed runtime identity.
 Native dispatch/enqueue must start outside an enclosing backend transaction.
 Public parent entries refuse it before initialization or child Task creation;
 commit the enclosing transaction before publishing a signal. This prevents both
@@ -966,6 +969,10 @@ helpers. Revoked work cannot refresh this generation; it receives a finite
 refusal even after an unrelated external commit, never handler replay.
 Original-connection writes do not advance this engine evidence. Native BEGIN
 IMMEDIATE excludes external commits through the final profile/row proof/COMMIT.
+The native program fence is installed before BEGIN can wait, but its final
+configuration seal is sampled only after the actual transaction lock is held.
+An unrelated writer committing during that wait does not leave a stale COMMIT
+seal after the original still-live work legitimately refreshes its generation.
 Ordinary writer failures are retained on the original journal through public
 observation/finalization. A healthy caller still treats them as best-effort
 audit loss; a withdrawing caller retains both its actual cancellation and the
@@ -1008,6 +1015,14 @@ The resident also passes its own original journal evidence to its waiting
 ingress, so a cancellation observed AFTER successful resident COMMIT/reset keeps
 that actual classification and original PostgreSQL receipts. This handoff is
 finite completion evidence, never a grant of work or an invented receipt. An
+invocation-private completion slot also crosses durable enqueue, public dispatch
+and resident completion. Failed enqueue publication joins its actual accepted
+dispatch and reservation cleanup, then observes those same original journals;
+a best-effort successful result cannot discard their COMMIT facts or retained
+SQL errors. The canonical journal observation combines actual withdrawal/errors
+with that evidence, while no observation error keeps healthy best-effort behavior.
+Every nested public dispatch starts with a fresh slot, not an inherited collector.
+An
 ordinary Stop with no independent failure retains CancelledError/lifecycle
 semantics; independent failures and borrowed-wait publication errors use the
 canonical finite Base observation carrier without abandoning the producer.

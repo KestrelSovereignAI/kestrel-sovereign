@@ -27,7 +27,7 @@ def _native_identity_text(value):
     """Identity compares native text storage, never application protocols."""
     if not issubclass(type(value), str):
         raise ExecutionAuthorityError('Original journal identity requires native text')
-    return value
+    return str.__str__(value)
 
 
 def _snapshot_outcome_data(value, memo=None):
