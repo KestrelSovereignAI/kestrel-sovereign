@@ -50,6 +50,138 @@ async def _fresh_journal_pool(original, **options):
     return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
 
 
+async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(dispatcher_components, native_pg, monkeypatch):
+    import socket
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    host, port = control._transport.get_extra_info('peername')[:2]
+    assert host == '127.0.0.1'
+    alias = 'original-journal-peer.invalid'
+    changed, accepted_peers, relays, writers = [], [], [], []
+    loop = asyncio.get_running_loop()
+    resolve = loop.getaddrinfo
+    async def actual_resolution(name, requested_port, *args, **kwargs):
+        if name == alias:
+            name = '::1' if changed else host
+        return await resolve(name, requested_port, *args, **kwargs)
+    monkeypatch.setattr(loop, 'getaddrinfo', actual_resolution)
+    async def copy_bytes(reader, writer):
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    async def relay(reader, writer):
+        remote = None
+        children = []
+        try:
+            other_reader, remote = await asyncio.open_connection(host, port)
+            writers.extend((writer, remote))
+            children = [asyncio.create_task(copy_bytes(reader, remote)),
+                        asyncio.create_task(copy_bytes(other_reader, writer))]
+            await asyncio.wait(children, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for child in children:
+                if not child.done():
+                    child.cancel()
+                await await_owned_task(child)
+            for stream in (writer, remote):
+                if stream is not None:
+                    stream.close()
+                    try:
+                        await stream.wait_closed()
+                    except ConnectionError:
+                        pass
+    def accepted(reader, writer):
+        accepted_peers.append(writer.get_extra_info('sockname'))
+        relays.append(asyncio.create_task(relay(reader, writer)))
+    server = await asyncio.start_server(accepted, '::1', port, family=socket.AF_INET6)
+    original_pool = c.backend._pool
+    pool = None
+    try:
+        pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
+            host=alias, port=port, ssl='disable', timeout=2)
+        c.backend._pool = pool
+        scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+        effects = []
+        async def handler(payload):
+            async with pool.acquire() as connection:
+                assert connection._con._transport.get_extra_info('peername')[:2] == (host, port)
+                await connection.close()
+            effects.append('genuinely completed effect before DNS changes')
+            changed.append(True)
+            scope.revoke('actual work cutoff after original native session closed')
+            return {'genuine': True}
+        c.registry.register(_action_reg('native.socket.peer', handler=handler))
+        signal = _signal('native.socket.peer')
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
+        assert effects and outcome.error is None
+        assert not accepted_peers, 'terminal reconnect followed changed DNS to a different actual socket peer'
+        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 1
+    finally:
+        c.backend._pool = original_pool
+        if pool is not None:
+            async with asyncio.timeout(10):
+                await pool.close()
+        server.close()
+        await server.wait_closed()
+        for writer in writers:
+            writer.close()
+        for task in relays:
+            if not task.done():
+                task.cancel()
+            await await_owned_task(task)
+
+
+@pytest.mark.parametrize('asynchronous', [False, True])
+async def test_postgres_refused_session_retirement_never_invokes_application_listener(dispatcher_components, native_pg, asynchronous):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    await control.execute(f'CREATE TABLE "{schema}".forbidden_termination_effect(value INTEGER)')
+    original_pool = c.backend._pool
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    c.backend._pool = pool
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    calls, callbacks, effects = [], [], []
+    def callback(connection):
+        calls.append('actual application termination listener')
+    async def async_callback(connection):
+        callbacks.append(asyncio.current_task())
+        callback(connection)
+        await control.execute(f'INSERT INTO "{schema}".forbidden_termination_effect VALUES(1)')
+    async def handler(payload):
+        async with pool.acquire() as connection:
+            connection.add_termination_listener(async_callback if asynchronous else callback)
+        effects.append('genuinely completed handler effect')
+        scope.revoke('actual work cutoff before refusal retirement')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.termination.refusal', handler=handler))
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(_signal('native.termination.refusal'))))
+        await asyncio.sleep(0)  # Observe callbacks actually scheduled by native termination.
+        for task in callbacks:
+            await await_owned_task(task)
+        assert effects and is_execution_control_error(outcome.error)
+        assert not calls, 'terminal refusal executed an application termination listener after cutoff'
+        assert not callbacks, 'terminal refusal launched unrelated application Tasks'
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".forbidden_termination_effect') == 0
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 0
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+        for task in callbacks:
+            await await_owned_task(task)
+
+
 @pytest.mark.parametrize('phase', ['rollback', 'reset'])
 @pytest.mark.parametrize('withdrawn_owner', ['inner', 'outer', 'public'])
 async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exit(dispatcher_components, monkeypatch, phase, withdrawn_owner):
