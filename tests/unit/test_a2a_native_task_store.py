@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -60,6 +60,147 @@ async def get(store):
     return await store.get_for_creator(
         "task-one", "did:kestrel:alice", recipient_agent_id="did:kestrel:bob"
     )
+
+
+async def wake_candidate_ids(store, *, live, terminal):
+    return {
+        candidate.task.id
+        for candidate in await store.list_cognition_wake_candidates(
+            recipient_agent_id=store.scope.recipient_id,
+            live_changed_since=live, terminal_changed_since=terminal,
+        )
+    }
+
+
+async def age_task_revision(store, task_id, timestamp):
+    await store.backend.execute(
+        "UPDATE a2a_tasks SET lifecycle_updated_at = ?, updated_at = ? WHERE id = ?",
+        (store.to_timestamp_param(timestamp), store.to_timestamp_param(timestamp), task_id),
+    )
+
+
+async def test_wake_horizons_are_independent_for_live_and_terminal_native_tasks(store):
+    for name, state in (
+        ("live-submitted", TaskState.TASK_STATE_SUBMITTED),
+        ("live-working", TaskState.TASK_STATE_WORKING),
+        ("terminal", TaskState.TASK_STATE_COMPLETED),
+    ):
+        value = task(state)
+        value.id = name
+        await create(store, value)
+    foreign = TaskStore(store.backend, scope=NativeRecipientScope("did:kestrel:other"))
+    value = task()
+    value.id = "foreign-live"
+    await foreign.create(
+        value, creator_agent_id="did:kestrel:alice", recipient_agent_id=foreign.scope.recipient_id,
+    )
+    now = store.now_utc()
+    past, future = now - timedelta(days=1), now + timedelta(days=1)
+    assert await wake_candidate_ids(store, live=past, terminal=future) == {"live-submitted", "live-working"}
+    assert await wake_candidate_ids(store, live=future, terminal=past) == {"terminal"}
+    assert await wake_candidate_ids(store, live=past, terminal=past) == {"live-submitted", "live-working", "terminal"}
+
+
+@pytest.mark.parametrize("transition", ["lifecycle", "terminal", "cancel"])
+async def test_each_native_lifecycle_writer_restamps_the_wake_revision(store, transition):
+    original = task()
+    await create(store, original)
+    horizon = store.now_utc() - timedelta(days=14)
+    await age_task_revision(store, original.id, horizon - timedelta(days=16))
+    assert not await wake_candidate_ids(store, live=horizon, terminal=horizon)
+    outcome = Task.FromString(original.SerializeToString())
+    if transition == "lifecycle":
+        outcome.status.state = TaskState.TASK_STATE_WORKING
+        committed = await store.save_recipient_lifecycle(
+            outcome, baseline=original, recipient_agent_id=store.scope.recipient_id,
+            expected_state=TaskState.TASK_STATE_SUBMITTED,
+        )
+    elif transition == "terminal":
+        outcome.status.state = TaskState.TASK_STATE_COMPLETED
+        committed = await store.save_recipient_terminal_outcome(
+            outcome, baseline=original, recipient_agent_id=store.scope.recipient_id,
+            operation_id="wake-window-terminal",
+        )
+    else:
+        committed = await store.cancel_if_authorized(original.id, actor_agent_id="did:kestrel:alice")
+    assert committed is not None
+    snapshot = await store.get_task_snapshot(original.id, recipient_agent_id=store.scope.recipient_id)
+    assert snapshot.lifecycle_revision == 1
+    assert await wake_candidate_ids(store, live=horizon, terminal=horizon) == {original.id}
+
+
+async def test_artifact_progress_never_reopens_an_expired_native_wake_window(store):
+    value = task(TaskState.TASK_STATE_WORKING)
+    await create(store, value)
+    horizon = store.now_utc() - timedelta(days=14)
+    await age_task_revision(store, value.id, horizon - timedelta(days=16))
+    before = await store.backend.fetch_one(
+        "SELECT lifecycle_revision, lifecycle_updated_at, updated_at FROM a2a_tasks WHERE id = ?",
+        (value.id,),
+    )
+    await store.add_artifact(
+        value.id, new_text_artifact("progress", "still going"),
+        recipient_agent_id=store.scope.recipient_id,
+    )
+    after = await store.backend.fetch_one(
+        "SELECT lifecycle_revision, lifecycle_updated_at, updated_at FROM a2a_tasks WHERE id = ?",
+        (value.id,),
+    )
+    assert after[:2] == before[:2] and after[2] != before[2]
+    assert not await wake_candidate_ids(store, live=horizon, terminal=horizon)
+    for expected, state in (
+        (TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_INPUT_REQUIRED),
+        (TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_WORKING),
+    ):
+        assert await store.update_status(
+            value.id, TaskStatus(state=state), recipient_agent_id=store.scope.recipient_id,
+            expected_state=expected,
+        )
+        candidates = await wake_candidate_ids(store, live=horizon, terminal=horizon)
+        assert candidates == ({value.id} if state == TaskState.TASK_STATE_WORKING else set())
+    snapshot = await store.get_task_snapshot(value.id, recipient_agent_id=store.scope.recipient_id)
+    assert snapshot.lifecycle_revision == 2
+
+
+async def test_sqlite_wake_boundary_normalizes_native_space_and_iso_timestamps(store):
+    if store.backend.backend_type != "sqlite":
+        pytest.skip("SQLite TEXT timestamp comparison contract")
+    value = task()
+    await create(store, value)
+    now = store.now_utc().replace(microsecond=0)
+    stamp = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    await store.backend.execute(
+        "UPDATE a2a_tasks SET status = 'completed', lifecycle_updated_at = NULL, updated_at = ? WHERE id = ?",
+        (stamp, value.id),
+    )
+    assert await wake_candidate_ids(store, live=now, terminal=now - timedelta(hours=3)) == {value.id}
+    assert not await wake_candidate_ids(store, live=now, terminal=now - timedelta(hours=1))
+
+
+async def test_postgres_native_database_fence_versions_direct_status_writes(store):
+    if store.backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL shared native authority trigger contract")
+    value = task()
+    await create(store, value)
+    horizon = store.now_utc() - timedelta(days=1)
+    for revision, state in enumerate(("working", "input-required", "working"), start=1):
+        await age_task_revision(store, value.id, horizon - timedelta(days=29))
+        await store.backend.execute("UPDATE a2a_tasks SET status = ? WHERE id = ?", (state, value.id))
+        snapshot = await store.get_task_snapshot(value.id, recipient_agent_id=store.scope.recipient_id)
+        assert snapshot.lifecycle_revision == revision
+        candidates = await wake_candidate_ids(store, live=horizon, terminal=horizon)
+        assert candidates == ({value.id} if state == "working" else set())
+    await store.backend.execute(
+        "INSERT INTO a2a_tasks (id, session_id, task_type, status, creator_agent_id, "
+        "recipient_agent_id, tenant, history, metadata, artifacts) "
+        "SELECT ?, session_id, task_type, 'submitted', creator_agent_id, "
+        "recipient_agent_id, tenant, history, metadata, artifacts FROM a2a_tasks WHERE id = ?",
+        ("direct-native-insert", value.id),
+    )
+    assert (await store.backend.fetch_one(
+        "SELECT lifecycle_updated_at IS NOT NULL FROM a2a_tasks WHERE id = ?", ("direct-native-insert",)
+    ))[0] is True
+    assert await wake_candidate_ids(store, live=horizon, terminal=horizon) == {value.id, "direct-native-insert"}
 
 
 async def test_native_payload_round_trip_preserves_nested_structs_and_message_identity(
