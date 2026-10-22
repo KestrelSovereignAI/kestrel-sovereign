@@ -40,6 +40,52 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
+@pytest.mark.parametrize('callback_kind', ['setup', 'reset'])
+async def test_postgres_journal_refuses_application_pool_programs(dispatcher_components, native_pg, callback_kind):
+    import asyncpg
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    await c.backend.execute('CREATE TABLE forbidden_pool_effect(id TEXT)')
+    signal = _signal('pool.application.program')
+    armed, effects = [], []
+    async def program(connection):
+        if armed:
+            if callback_kind == 'setup':
+                await connection.execute(f'INSERT INTO "{schema}".forbidden_pool_effect VALUES($1)', signal.id)
+            else:
+                await connection.execute(f'DELETE FROM "{schema}".signal_log WHERE id=$1', signal.id)
+    original_pool = c.backend._pool
+    pool = await asyncpg.create_pool(*original_pool._connect_args, **original_pool._connect_kwargs,
+        min_size=0, max_size=2, **{callback_kind: program})
+    c.backend._pool = pool
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    async def handler(payload):
+        effects.append('genuine handler completion')
+        armed.append(True)
+        scope.revoke('actual cutoff before pool application callback')
+        return {'genuine': True}
+    c.registry.register(_action_reg('pool.application.program', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(signal)
+            except BaseException as caught:
+                error = caught
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".forbidden_pool_effect') == 0, 'revoked terminal checkout executed unrelated application SQL'
+        if effects:
+            assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log WHERE id=$1', signal.id) == 1, 'application reset deleted the acknowledged journal row'
+        assert not effects and is_execution_control_error(error)
+    finally:
+        armed.clear()
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
 async def test_postgres_original_journal_proof_ignores_shadowed_equality(dispatcher_components, native_pg):
     import asyncpg
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error, execution_commit_outcome

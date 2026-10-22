@@ -29,6 +29,106 @@ class _OriginalWork:
         self.require_work()
 
 
+@pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'check'])
+async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatcher_components, shape):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    await c.backend.execute('CREATE TABLE forbidden_schema_effect(id TEXT)')
+    armed, effects = [], []
+    def program(value):
+        if armed:
+            c.backend._connection._conn.execute('INSERT INTO forbidden_schema_effect VALUES(?)', (value,))
+        return value
+    await c.backend._connection.create_function('journal_program', 1, program, deterministic=True)
+    if shape == 'check':
+        sql = await c.backend.fetch_val("SELECT sql FROM sqlite_schema WHERE name='signal_log'")
+        await c.backend.execute('ALTER TABLE signal_log RENAME TO original_audit')
+        await c.backend.execute(sql.rstrip()[:-1] + ', CHECK(journal_program(id)=id))')
+    elif shape == 'expression_index':
+        await c.backend.execute('CREATE INDEX journal_program_index ON signal_log(journal_program(id))')
+    else:
+        await c.backend.execute('CREATE INDEX journal_program_index ON signal_log(id) WHERE journal_program(id)=id')
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        effects.append('handler completed')
+        armed.append(True)
+        scope.revoke('actual cutoff before executable schema')
+        return {'genuine': True}
+    c.registry.register(_action_reg('schema.program', handler=handler))
+    error = None
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        try:
+            await c.dispatcher.dispatch_signal(_signal('schema.program'))
+        except BaseException as caught:
+            error = caught
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM forbidden_schema_effect') == 0, 'privileged journal executed application schema SQL'
+    assert not effects and is_execution_control_error(error)
+
+
+@pytest.mark.parametrize('projection', ['summary', 'redaction'])
+async def test_sqlite_journal_binds_exact_native_projection_text(dispatcher_components, projection):
+    from dataclasses import replace
+    c = dispatcher_components
+    adapted = []
+    class AdaptedText(str):
+        def __conform__(self, protocol):
+            adapted.append(True)
+            return 'substituted-through-application-adapter'
+    original = AdaptedText('genuine-projection')
+    registration = _action_reg('projection.adaptation')
+    if projection == 'summary':
+        registration.result_summary = lambda result: original
+    else:
+        registration.log_redaction = replace(registration.log_redaction, summarize=lambda payload: original)
+    c.registry.register(registration)
+    signal = _signal('projection.adaptation')
+    await c.dispatcher.dispatch_signal(signal)
+    column = 'result_summary' if projection == 'summary' else 'payload_redacted'
+    stored = await c.backend.fetch_val('SELECT '+column+' FROM signal_log WHERE id=?', (signal.id,))
+    assert stored == 'genuine-projection', 'native binding substituted canonical prepared text'
+    assert not adapted
+
+
+async def test_emitter_cannot_change_original_writer_tracking_identity(dispatcher_components, monkeypatch):
+    from dataclasses import replace
+    from kestrel_sdk.signals import Visibility
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    c = dispatcher_components
+    signal = replace(_signal('mutable.emit.identity'), visibility=Visibility.USER_VISIBLE)
+    original_id = signal.id
+    emitted = asyncio.Event()
+    release_drain = asyncio.Event()
+    original_drain = c.dispatcher._drain_outcome_logs_for_signal
+    async def held_drain(signal_id):
+        await release_drain.wait()
+        await original_drain(signal_id)
+    monkeypatch.setattr(c.dispatcher, '_drain_outcome_logs_for_signal', held_drain)
+    async def emit(*args):
+        signal.id = 'mutated-after-actual-commit'
+        emitted.set()
+    c.agent.emit_event = emit
+    c.registry.register(_action_reg('mutable.emit.identity'))
+    task = create_owned_task(c.dispatcher.dispatch_signal(signal))
+    try:
+        await asyncio.wait_for(emitted.wait(), 2)
+        writers = tuple(c.dispatcher._outcome_log_tasks_by_signal.get(original_id, ()))
+        for writer in writers:
+            await await_owned_task(writer)
+            assert writer.done(), 'test must inspect a physically joined writer'
+        assert not c.dispatcher._outcome_log_tasks_by_signal.get(original_id), 'completed original writer remains indexed under its initial ID'
+        release_drain.set()
+        result = await asyncio.wait_for(asyncio.shield(task), 2)
+        assert result.signal_id == original_id
+    finally:
+        if not task.done():
+            task.cancel()
+        release_drain.set()
+        await await_owned_task(task)
+    assert task.done() and not c.dispatcher._outcome_log_tasks
+    assert not c.dispatcher._outcome_log_reconciliations
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (original_id,)) == 1
+
+
 @pytest.mark.parametrize('temporary', [False, True])
 async def test_sqlite_original_journal_never_executes_unrelated_trigger_effect(dispatcher_components, temporary):
     from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome, execution_native_source_error
