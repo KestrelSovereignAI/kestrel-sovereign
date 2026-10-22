@@ -1086,7 +1086,7 @@ jobs:
   console-smoke:
     # Pin this browser/native-library environment; ubuntu-latest moved to
     # 26.04 and repeatedly exhausted the bounded apt/browser install budget.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Explicit `contents: read` so this job does NOT inherit the wider grant
     # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
     # caller's permissions when they declare none, which would hand this

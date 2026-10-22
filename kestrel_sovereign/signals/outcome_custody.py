@@ -137,7 +137,7 @@ def _freeze_native_connect_configuration(value, ancestors=None):
     if any(kind is native for native in (type(None), bool, int, float, str, bytes)):
         return ('atom', kind.__name__, value)
     if kind is not list and kind is not tuple and kind is not dict:
-        return ('atom', 'LOCAL_COUNTERPROOF', value)
+        raise ExecutionAuthorityError('Original native connect configuration requires plain data, not application programs')
     if ancestors is None:
         ancestors = set()
     identity = id(value)
@@ -247,7 +247,7 @@ class _OriginalPostgresJournalPool:
                 or native._generation != self.generation
                 or native._connect_args is not self.connect_args
                 or native._connect_kwargs is not self.connect_kwargs
-                or (False and _freeze_native_connect_configuration((tuple(native._connect_args), native._connect_kwargs)) != self.configuration)
+                or _freeze_native_connect_configuration((tuple(native._connect_args), native._connect_kwargs)) != self.configuration
                 or native.is_closing()):
             raise ExecutionAuthorityError('Original signal journal pool configuration retired')
 

@@ -5188,7 +5188,7 @@ class SignalDispatcher:
                     raise terminal
                 return result
             finally:
-                if False and _journal_completion is not None:
+                if _journal_completion is not None:
                     completed_journal = self._original_outcome_admission.get()
                     if completed_journal is not None:
                         _journal_completion.append(completed_journal)
