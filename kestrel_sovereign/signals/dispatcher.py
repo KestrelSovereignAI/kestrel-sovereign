@@ -115,6 +115,7 @@ from kestrel_sdk.signals import (
 )
 
 from kestrel_sovereign.execution_custody import (
+    execution_commit_outcome,
     execution_finite_error,
     is_execution_control_error,
 )
@@ -1276,7 +1277,7 @@ class SignalDispatcher:
                 raise
             return self._durable_shutdown_signal_result(signal, start)
         except asyncio.CancelledError as error:
-            if is_execution_control_error(error):
+            if is_execution_control_error(error) or execution_commit_outcome(error) is not None:
                 admission_error = error
             raise
         except BaseException as e:
@@ -2978,7 +2979,7 @@ class SignalDispatcher:
             outcome = await await_owned_task(task)
             journal = journals.get(task)
             originals.extend((journal.retain_committed(outcome.error),
-                              journal.retain_committed(outcome.cancellation))
+                              journal.retain_committed(outcome.cancellation, observer=True))
                 if journal is not None else (outcome.error, outcome.cancellation))
             reconciliation = self._outcome_log_reconciliations.get(task)
             if task.done() and reconciliation is not None:
@@ -7703,7 +7704,7 @@ class SignalDispatcher:
             if not isinstance(exc, Exception):
                 raise execution_finite_error(exc, outcome.cancellation)
         if outcome.cancellation is not None:
-            raise journal.retain_committed(outcome.cancellation) if journal is not None else outcome.cancellation
+            raise journal.retain_committed(outcome.cancellation, observer=True) if journal is not None else outcome.cancellation
 
     def _record_log_write_failure(
         self, signal_id: str, error: BaseException

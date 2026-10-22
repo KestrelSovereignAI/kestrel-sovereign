@@ -91,6 +91,9 @@ async def test_original_journal_legacy_pool_compatibility(dispatcher_components,
     handlers = []
 
     class LegacyPool:
+        def __getattr__(self, name):
+            return getattr(original_pool, name)
+
         @asynccontextmanager
         async def acquire(self):
             async with original_pool.acquire() as connection:

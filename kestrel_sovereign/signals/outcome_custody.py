@@ -142,14 +142,21 @@ class _OriginalSignalOutcome:
             raise ExecutionAuthorityError('Original signal journal was not submitted')
         self._phase = 'acknowledged'
 
-    def retain_committed(self, error):
+    def retain_committed(self, error, *, observer=False):
         """Retain the actual terminal INSERT fact, never new work authority."""
         if error is None or self._phase != 'acknowledged':
             return error
         from kestrel_sovereign.execution_custody import (
-            ExecutionCommitOutcomeError, execution_error_with_cause,
             retain_acknowledged_execution_commit, execution_commit_outcome,
+            _FINITE_NATIVE_SOURCES, _native_source_originals,
         )
+        if observer and self._acknowledgments:
+            # The ACK is a real native fact, but the waiter's withdrawal is
+            # not a failed COMMIT/reset source. Keep both on a private finite
+            # carrier without poisoning the shared native-source latch.
+            finite = BaseExceptionGroup('original signal journal observer withdrawal', [error])
+            finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, _native_source_originals(error))
+            error = finite
         for receipt in self._acknowledgments:
             retain_acknowledged_execution_commit(error, receipt)
         if self._acknowledgments:
@@ -158,7 +165,9 @@ class _OriginalSignalOutcome:
             return error
         # SQLite's existing native COMMIT is awaited inline, not an invented
         # successful Task/ACK receipt. Preserve only its known committed fact.
-        return execution_error_with_cause(ExecutionCommitOutcomeError('committed'), error)
+        error._kestrel_unresolved_commit_outcome = 'committed'
+        error.add_note('original signal terminal row COMMIT acknowledged; reconcile that original row before retry')
+        return error
 
 
 def _require_original_signal_outcome(journal, backend):
@@ -180,7 +189,8 @@ def _capture_original_outcome(dispatcher, signal, registration, *, acceptance):
         raise ExecutionAuthorityError('Original accepted dispatch required for terminal journal')
     store = dispatcher._store
     backend = store._backend
-    native = type(store) is SignalLogStore and type(backend) in (SQLiteBackend, PostgresBackend)
+    native = (type(store) is SignalLogStore and store.TABLE == 'signal_log'
+              and type(backend) in (SQLiteBackend, PostgresBackend))
     if native and type(backend) is PostgresBackend:
         native = postgres_module.ASYNCPG_AVAILABLE and isinstance(
             backend._pool, (postgres_module.asyncpg.Pool, PostgresPoolAdapter))

@@ -482,6 +482,11 @@ async def test_owner_withdrawal_retains_actual_original_journal_commit(dispatche
         if c.backend.backend_type == 'postgres':
             retained = _acknowledged_commits(error)
             assert retained and all(any(actual is receipt for actual in retained) for receipt in journal._acknowledgments)
+        # Healthy physical COMMIT/retirement plus finite withdrawal must not
+        # leave the reusable runtime poisoned by an observer's cancellation.
+        assert c.dispatcher._outcome_log_control_error is None
+        following = await c.dispatcher.dispatch_signal(_signal('withdrawal.audit'))
+        assert following.action_result is not None
     finally:
         release.set()
         if task is not None:
