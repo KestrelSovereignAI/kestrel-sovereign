@@ -24,6 +24,9 @@ The same required CI lane runs the real-agent SQLite shutdown regressions.
 These hold original claim and acknowledgement COMMIT replies across dispatcher
 and agent shutdown, verify that shutdown joins those owners, and refuse new
 claims after shutdown. The PostgreSQL counterparts run in the integration lane.
+The foreign peer also runs past its client startup deadline with an admitted
+HTTP request held across SIGTERM. Shutdown must drain that request and write its
+receipts using a fresh bounded cleanup context.
 
 This proves the native protocol and persistence on a loopback SQLite agent.
 It does not establish LLM quality, public reverse-proxy deployment, PostgreSQL

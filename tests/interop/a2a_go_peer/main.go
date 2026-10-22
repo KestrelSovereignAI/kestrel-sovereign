@@ -356,7 +356,7 @@ func main() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM)
 	<-signals
-	deadline, cancel := context.WithTimeout(ctx, 3*time.Second)
+	deadline, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	check(server.Shutdown(deadline))
 	err := <-done

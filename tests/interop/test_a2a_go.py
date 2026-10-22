@@ -8,12 +8,17 @@ the native protocol and persistence, not an LLM's response quality.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import signal
 import time
 from pathlib import Path
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 import httpx
+import psutil
 import pytest
 from a2a.client import A2ACardResolver
 from a2a.helpers.proto_helpers import new_text_message
@@ -30,6 +35,48 @@ from kestrel_sovereign.a2a.native_sender import NativeProofPolicy
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import owned_native_http_client
 from tests.utils.native_go_peer import run_peer, serve_go_peer, write_peer_config
+
+
+@pytest.mark.timeout(120)
+async def test_foreign_peer_retires_an_active_request_after_its_startup_deadline(
+    native_go_environment,
+):
+    environment = native_go_environment
+    async with serve_go_peer(
+        environment.binary, environment.config_path,
+        environment.config, environment.root,
+    ) as base:
+        # Cross the real client's 30-second startup context; shutdown still
+        # needs its own bounded window to drain an original HTTP request.
+        await asyncio.sleep(31)
+        address = urlsplit(base)
+        reader, writer = await asyncio.open_connection(address.hostname, address.port)
+        body = b'{"jsonrpc":"2.0","id":1,"method":"NoSuchMethod"}'
+        try:
+            writer.write((
+                "POST /rpc HTTP/1.1\r\nHost: localhost\r\n"
+                "Content-Type: application/json\r\nExpect: 100-continue\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+            ).encode("ascii"))
+            await writer.drain()
+            continuing = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+            assert continuing.startswith(b"HTTP/1.1 100 Continue"), continuing
+            # This PID came from this context manager's freshly launched child.
+            # Confirm it is still our exact executable before signalling it.
+            ready = json.loads(Path(environment.config["ready"]).read_text())
+            process = psutil.Process(ready["pid"])
+            assert process.ppid() == os.getpid()
+            assert Path(process.exe()).resolve() == environment.binary.resolve()
+            process.send_signal(signal.SIGTERM)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(reader.read(1), 0.2)
+            writer.write(body)
+            await writer.drain()
+            assert await asyncio.wait_for(reader.read(), 5)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    assert json.loads(Path(environment.config["receipts"]).read_text()) is None
 
 
 @pytest.mark.timeout(120)

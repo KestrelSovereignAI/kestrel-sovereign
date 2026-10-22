@@ -3262,7 +3262,7 @@ Repo entry points and standard project files.
 - **tests/interop/conftest.py** — Build public Go dependencies and own isolated native interoperability agents.
   - `def go_peer(tmp_path_factory)`; `async def native_go_environment(go_peer, tmp_path, monkeypatch)`
 - **tests/interop/test_a2a_go.py** — Public Go SDK interoperability with an initialized, isolated Kestrel agent.
-  - `async def test_public_go_sdk_and_booted_kestrel_exchange_native_tasks(native_go_environment)`
+  - `async def test_foreign_peer_retires_an_active_request_after_its_startup_deadline(native_go_environment)`; `async def test_public_go_sdk_and_booted_kestrel_exchange_native_tasks(native_go_environment)`
 - **tests/interop/test_native_drainer_shutdown.py** — A real resident claim must finish its original COMMIT before shutdown joins it.
   - `async def read_owned_delivery(environment, consumer)`; `async def test_shutdown_still_closes_the_primary_after_early_close_publication_fails(native_go_environment, monkeypatch)`; `async def test_shutdown_joins_an_original_resident_claim_commit(native_go_environment, monkeypatch, entrypoint)`; `async def test_shutdown_cancels_only_the_drainer_that_never_crossed_its_ready_barrier(native_go_environment)`; `async def prepare_owned_cognition(environment)`; `async def test_shutdown_drains_the_original_successful_ack_commit(native_go_environment, monkeypatch, entrypoint)`; `async def test_a_completed_cognition_keeps_its_original_ack_admission_after_close(native_go_environment, monkeypatch)`; `async def test_shutdown_does_not_claim_after_an_original_candidate_read(native_go_environment, monkeypatch)`; `…`
 - **tests/js/test_voice_capture_worklet.mjs** — (mjs asset)
