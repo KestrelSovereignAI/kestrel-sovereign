@@ -83,26 +83,36 @@ async def test_sqlite_late_durability_refusal_does_not_invent_commit_uncertainty
     assert c.dispatcher._log_write_failures == 1
 
 
-async def test_sqlite_schema_cookie_reset_cannot_regrant_replaced_relation(dispatcher_components):
+@pytest.mark.parametrize('other_connection', [False, True])
+async def test_sqlite_schema_cookie_reset_cannot_regrant_replaced_relation(dispatcher_components, other_connection):
     from kestrel_sovereign.execution_custody import is_execution_control_error
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
     c = dispatcher_components
+    editing = SQLiteBackend(c.backend.db_path) if other_connection else c.backend
+    if other_connection:
+        await editing.connect()
     scope = ExecutionCustody(_OriginalWork())
     effects = []
     async def handler(payload):
-        cookie = await c.backend.fetch_val('PRAGMA main.schema_version')
-        definition = await c.backend.fetch_val("SELECT sql FROM main.sqlite_schema WHERE name='signal_log'")
-        indexes = await c.backend.fetch_all("SELECT sql FROM main.sqlite_schema WHERE type='index' AND tbl_name='signal_log' AND sql IS NOT NULL ORDER BY rowid")
-        before = await c.backend.fetch_one("SELECT rowid,rootpage,sql FROM main.sqlite_schema WHERE name='signal_log'")
-        await c.backend.execute('DROP TABLE signal_log')
-        await c.backend.execute(definition)
+        cookie = await editing.fetch_val('PRAGMA main.schema_version')
+        definition = await editing.fetch_val("SELECT sql FROM main.sqlite_schema WHERE name='signal_log'")
+        indexes = await editing.fetch_all("SELECT sql FROM main.sqlite_schema WHERE type='index' AND tbl_name='signal_log' AND sql IS NOT NULL ORDER BY rowid")
+        before = await editing.fetch_one("SELECT rowid,rootpage,sql FROM main.sqlite_schema WHERE name='signal_log'")
+        await editing.execute('DROP TABLE signal_log')
+        await editing.execute(definition)
         for row in indexes:
-            await c.backend.execute(row[0])
+            await editing.execute(row[0])
         # This fixture has other tables, so SQLite allocates a later schema
         # rowid. Its public writable-schema mode can restore the original too.
-        await c.backend.execute('PRAGMA writable_schema=ON')
-        await c.backend.execute("UPDATE main.sqlite_schema SET rowid=? WHERE type='table' AND name='signal_log'", (before[0],))
-        await c.backend.execute('PRAGMA writable_schema=OFF')
-        await c.backend.execute('PRAGMA main.schema_version=' + str(cookie))
+        await editing.execute('PRAGMA writable_schema=ON')
+        await editing.execute("UPDATE main.sqlite_schema SET rowid=? WHERE type='table' AND name='signal_log'", (before[0],))
+        await editing.execute('PRAGMA writable_schema=OFF')
+        if other_connection:
+            # Refresh the original engine's schema cache before restoring the
+            # cookie, as a real unrelated reader can do during handler work.
+            await c.backend.fetch_val('SELECT COUNT(*) FROM main.sqlite_schema')
+            assert not c.backend._connection._conn._journal_programs_configured
+        await editing.execute('PRAGMA main.schema_version=' + str(cookie))
         after = await c.backend.fetch_one("SELECT rowid,rootpage,sql FROM main.sqlite_schema WHERE name='signal_log'")
         assert before == after, 'counterexample must actually reproduce the captured native table fingerprint'
         effects.append('actual table replacement with restored real schema cookie')
@@ -110,11 +120,15 @@ async def test_sqlite_schema_cookie_reset_cannot_regrant_replaced_relation(dispa
         return {'genuine': True}
     c.registry.register(_action_reg('native.replaced.schema.cookie', handler=handler))
     error = None
-    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
-        try:
-            await c.dispatcher.dispatch_signal(_signal('native.replaced.schema.cookie'))
-        except BaseException as caught:
-            error = caught
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.replaced.schema.cookie'))
+            except BaseException as caught:
+                error = caught
+    finally:
+        if other_connection:
+            await editing.close()
     assert effects
     assert is_execution_control_error(error), 'restoring the schema cookie regranted a replaced native table'
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0

@@ -50,7 +50,7 @@ async def _fresh_journal_pool(original, **options):
 
 
 @pytest.mark.parametrize('phase', ['rollback', 'reset'])
-@pytest.mark.parametrize('withdrawn_owner', ['inner', 'outer'])
+@pytest.mark.parametrize('withdrawn_owner', ['inner', 'outer', 'public'])
 async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exit(dispatcher_components, monkeypatch, phase, withdrawn_owner):
     import asyncpg
     from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
@@ -66,7 +66,9 @@ async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exi
     async def pause_actual_exit():
         journal = c.dispatcher._original_outcome_writer.get()
         if journal is not None and journal._phase == 'submitted':
-            writers.append(journal._writer_admission.task if withdrawn_owner == 'inner' else journal._outer_admission.task)
+            writers.append(journal._writer_admission.task if withdrawn_owner == 'inner'
+                else journal._outer_admission.task if withdrawn_owner == 'outer'
+                else journal._acceptance.owner)
             exits.append(asyncio.current_task())
             entered.set()
             await release.wait()
