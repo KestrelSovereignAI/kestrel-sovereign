@@ -1991,6 +1991,7 @@ async def test_hold_read_failure_after_claim_releases_exact_lease(
 @pytest.mark.asyncio
 async def test_mutable_enqueued_id_releases_original_first_claim_fence(tmp_path):
     from kestrel_sdk.signals import Visibility
+    from kestrel_sovereign.hold import HoldTurnRefusal
     backend, agent, dispatcher = await _channel_dispatcher(
         tmp_path / 'mutable-enqueue-identity.db', 'did:agent:mutable-enqueue')
     consumer = DurableConsumerRegistration(
