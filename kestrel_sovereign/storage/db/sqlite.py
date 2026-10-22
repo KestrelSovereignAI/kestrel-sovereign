@@ -2328,8 +2328,33 @@ class SQLiteBackend(DatabaseBackend):
                         # relation and BEFORE a trigger program could execute.
                         await conn._execute(conn._conn._begin_original_journal)
                         self._require_write_admission(original_outcome)
-                        if await self._read_original_signal_outcome_relation(original_outcome) != original_outcome._sqlite_relation:
-                            raise original_outcome.write_refusal('destination_changed')
+                        observed = await self._read_original_signal_outcome_relation(original_outcome)
+                        accepted = original_outcome._sqlite_relation
+                        if observed != accepted:
+                            if (observed is None or observed[:-1] != accepted[:-1]
+                                    or observed[-1][:-1] != accepted[-1][:-1]):
+                                raise original_outcome.write_refusal('destination_changed')
+                            # Only the engine's external-commit generation
+                            # changed. A still-live ORIGINAL writer may make a
+                            # fresh ordinary admission on this exact locked
+                            # relation. Revocation never borrows that privilege.
+                            original_outcome._observer_depth += 1
+                            try:
+                                self._require_execution_backend()
+                            except BaseException as denial:
+                                from kestrel_sovereign.execution_custody import is_scope_local_execution_control, _FINITE_NATIVE_SOURCES
+                                if is_scope_local_execution_control(denial, original_outcome._backend_work_scopes):
+                                    # This producer performed the actual work
+                                    # check. Its original invocation cutoff is
+                                    # not a failed native storage source. Never
+                                    # localize UNKNOWN, foreign scope or debt.
+                                    finite = BaseExceptionGroup('original writer live admission refused', [denial])
+                                    finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, ())
+                                    denial = finite
+                                raise original_outcome.write_refusal('external_generation_changed', denial)
+                            finally:
+                                original_outcome._observer_depth -= 1
+                            original_outcome._sqlite_relation = observed
                     cursor = await conn.execute(query, params)
                     self._require_write_admission(original_outcome)
                     if original_outcome is not None:

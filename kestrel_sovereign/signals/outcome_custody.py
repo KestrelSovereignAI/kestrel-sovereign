@@ -321,6 +321,7 @@ class _OriginalSignalOutcome:
         # Admission identity for classifying this invocation's later surface
         # denial only. These references never authorize fresh UI/storage work.
         self._surface_scopes = current_execution_custody(dispatcher._agent)
+        self._backend_work_scopes = current_execution_custody(backend)
         require_execution_work(dispatcher._agent)
         self._dispatcher = dispatcher
         self._store = dispatcher._store
@@ -389,8 +390,8 @@ class _OriginalSignalOutcome:
     def privacy_refusal(self, reason, cause=None):
         return self._finite_refusal(reason, cause, privacy=True)
 
-    def write_refusal(self, reason):
-        return self._finite_refusal(reason, privacy=False)
+    def write_refusal(self, reason, cause=None):
+        return self._finite_refusal(reason, cause, privacy=False)
 
     def _finite_refusal(self, reason, cause=None, *, privacy):
         from kestrel_sovereign.execution_custody import _FINITE_NATIVE_SOURCES, _native_source_originals

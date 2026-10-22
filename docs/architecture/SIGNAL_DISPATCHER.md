@@ -957,10 +957,13 @@ SQL configuration remains available; it cannot retain the stronger journal
 permission. Application authorizer replacement remains separately unsupported.
 
 The original SQLite connection also pins its native read-only `data_version`.
-An externally committed write conservatively retires that journal admission,
-even when another connection restores every catalog value and schema cookie.
-This can refuse an audit row after an unrelated external commit; it never
-replays the completed handler. A fresh signal acquires a fresh generation.
+An externally committed write retires the old generation, even when another
+connection restores every catalog value and schema cookie. Before INSERT, a
+still-live original writer may make a fresh ordinary work admission on the
+same locked relation ONLY if every other captured catalog/configuration value
+matches. The work validator is an observer and cannot reenter privileged
+helpers. Revoked work cannot refresh this generation; it receives a finite
+refusal even after an unrelated external commit, never handler replay.
 Original-connection writes do not advance this engine evidence. Native BEGIN
 IMMEDIATE excludes external commits through the final profile/row proof/COMMIT.
 Ordinary writer failures are retained on the original journal through public

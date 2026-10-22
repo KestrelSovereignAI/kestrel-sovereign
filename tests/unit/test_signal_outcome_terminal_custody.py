@@ -132,6 +132,76 @@ async def test_sqlite_schema_cookie_reset_cannot_regrant_replaced_relation(dispa
     assert effects
     assert is_execution_control_error(error), 'restoring the schema cookie regranted a replaced native table'
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+    assert c.dispatcher._outcome_log_control_error is None, 'known original cutoff poisoned shared shutdown'
+
+
+@pytest.mark.parametrize('cutoff', [False, True])
+async def test_sqlite_external_write_refresh_requires_actual_live_work(dispatcher_components, cutoff):
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    other = SQLiteBackend(c.backend.db_path)
+    await other.connect()
+    await other.execute('CREATE TABLE unrelated_live_effect(value INTEGER)')
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        await other.execute('INSERT INTO unrelated_live_effect VALUES(1)')
+        if cutoff:
+            scope.revoke('actual cutoff before external generation refresh')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.external.live.work', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.external.live.work'))
+            except BaseException as caught:
+                error = caught
+        assert (is_execution_control_error(error) if cutoff else error is None)
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM unrelated_live_effect') == 1
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == (0 if cutoff else 1)
+        assert c.dispatcher._outcome_log_control_error is None
+    finally:
+        await other.close()
+
+
+async def test_sqlite_live_refresh_validator_cannot_reenter_native_commit(dispatcher_components):
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    c = dispatcher_components
+    other = SQLiteBackend(c.backend.db_path)
+    await other.connect()
+    await other.execute('CREATE TABLE live_refresh_effect(value INTEGER)')
+    attempts = []
+    class WorkValidator(_OriginalWork):
+        def require_work(self):
+            journal = c.dispatcher._original_outcome_writer.get()
+            if journal is not None and journal._phase == 'submitted' and not attempts:
+                operation = c.backend._commit_write(c.backend._connection, original_outcome=journal)
+                try:
+                    operation.send(None)
+                except ExecutionAuthorityError:
+                    attempts.append('denied before native I/O')
+                else:
+                    attempts.append('privileged native operation accepted')
+                finally:
+                    operation.close()
+    scope = ExecutionCustody(WorkValidator())
+    async def handler(payload):
+        await other.execute('INSERT INTO live_refresh_effect VALUES(1)')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.live.refresh.observer', handler=handler))
+    error = result = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                result = await c.dispatcher.dispatch_signal(_signal('native.live.refresh.observer'))
+            except BaseException as caught:
+                error = caught
+        assert attempts == ['denied before native I/O']
+        assert error is None and result.action_result == {'genuine': True}
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+    finally:
+        await other.close()
 
 
 async def test_application_string_equality_cannot_substitute_accepted_signal_id():
