@@ -58,7 +58,11 @@ from kestrel_sovereign.a2a.extensions import (
     require_metadata_extensions,
 )
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
-from kestrel_sovereign.a2a.media import encode_inline_json, validate_input_parts
+from kestrel_sovereign.a2a.media import (
+    encode_inline_json,
+    skill_input_modes,
+    validate_input_parts,
+)
 from kestrel_sovereign.a2a.native_context import wait_native_disconnect
 from kestrel_sovereign.a2a.native_security import (
     AuthorizedNativeRequest,
@@ -291,9 +295,14 @@ class NativeA2ARequestHandler(RequestHandler):
             metadata = MessageToDict(params.metadata)
             require_metadata_extensions(metadata, admitted.activated_extensions)
             claims = parse_message_metadata(metadata)
+            modes = skill_input_modes(
+                self._card.default_input_modes,
+                self.manager.get_agent_skills(),
+                claims.skill_hint,
+            )
         except ValueError as error:
             raise InvalidParamsError(message=str(error)) from error
-        validate_input_parts(params.message.parts, self._card.default_input_modes)
+        validate_input_parts(params.message.parts, modes)
         output_modes = params.configuration.accepted_output_modes
         if output_modes and not set(output_modes).intersection(
             self._card.default_output_modes
@@ -337,20 +346,6 @@ class NativeA2ARequestHandler(RequestHandler):
                     Part(raw=encode_inline_json(receipt), media_type="application/json")
                 ],
             )
-        hint = claims.skill_hint
-        if hint is not None:
-            selected = next(
-                (
-                    skill
-                    for skill in self.manager.get_agent_skills()
-                    if skill.id == hint
-                ),
-                None,
-            )
-            if selected is None:
-                raise InvalidParamsError(
-                    message="Recipient does not advertise the suggested skill"
-                )
         try:
             if params.message.task_id:
                 task = await self.manager.continue_task(

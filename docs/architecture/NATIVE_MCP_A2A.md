@@ -660,7 +660,9 @@ The optional `#skill-hint-v1` extension carries exactly
 `{"version": 1, "skill_id": "published-skill-id"}` under its URI metadata key.
 The selected signed card must advertise that skill. The hint describes intent
 for the receiving agent; it neither invokes a provider directly nor grants tool
-permissions. Input MIME admission still uses the agent's declared input modes.
+permissions. Both sender and receiver admit input against the selected skill's
+declared input modes. A skill with no explicit modes inherits the card defaults;
+without a hint the card defaults apply.
 
 `send_a2a_task` carries input handoffs in standard `Message.parts`, including
 text, filenames and arbitrary JSON `data` values. Artifacts are outputs of a
@@ -668,7 +670,11 @@ task. The inbox exposes the complete original native Message, preserving those
 parts. Kestrel currently advertises `text/plain` and `application/json`; it
 rejects unsupported or malformed declared MIME types before creating a task.
 Omitted MIME types use the content-kind default; malformed values never use a
-default. File URLs are content references, not permission to fetch them.
+default. A JSON-only skill can receive `parts=[{"data": {"request": "hello"}}]`
+with the optional `message` omitted. Nonempty text is preserved and must also
+satisfy that skill's contract; the sender never converts or discards it to make
+the request fit. Input must contain message text or at least one standard Part.
+File URLs are content references, not permission to fetch them.
 
 ### Causation v1
 
@@ -821,6 +827,9 @@ authorized reads of the original context/message. An absent result is not
 permission to replay a send. Taskless native Message responses retain their
 actual type rather than acquiring an invented task ID. Questions use the
 sender-owned correlation ID and the same durable recipient/tenant binding.
+Reconciliation requests full task artifacts. A terminal question answer and its
+durable wake retain the complete response, including artifact-only details, so
+a later result read agrees with the acknowledged answer.
 
 History reconciliation has a finite `NativeReconciliationPolicy`. The common
 hosted and standalone peer-session factory loads its settings from environment
@@ -841,6 +850,10 @@ preserves the original `UNKNOWN` dispatch and lets question recovery continue
 with its next retained question. The elapsed bound joins the original read's
 HTTP retirement; unrelated timeouts and original execution-control errors retain
 their identity. An incomplete scan grants no permission to resend the message.
+The resident currently observes due questions serially. Local deadlines and
+wake handoff have an independent lane, but several slow reads can delay another
+peer's answer or remote withdrawal. [#3800](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3800)
+tracks bounded fair observation using retained recipient and tenant identities.
 
 Native message, tracked-task and blocking `ask_agent` tools share the SDK
 producer. Result lookup accepts the immutable local `dispatch_id`, reads the
@@ -933,6 +946,10 @@ durable notifications; it does not currently purge active configurations or
 those receipts. [#3799](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3799)
 tracks a coordinated bounded retention policy that preserves uncertain COMMIT
 outcomes and unresolved original HTTP owners.
+It also tracks denied callback claims: these currently retain their notification
+until a later claim or explicit lifecycle cleanup. Publication unavailability
+must remain distinct from confirmed creator revocation when settling those
+claims and counting actual HTTP retries.
 
 `NativePushTransport` sends an official `StreamResponse` using the SDK's media
 type and version constants. It validates HTTPS egress, pins the approved IPs,

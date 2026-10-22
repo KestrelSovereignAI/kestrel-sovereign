@@ -28,7 +28,7 @@ from tests.utils.native_a2a_security import (
 
 
 @pytest_asyncio.fixture
-async def publication(hosted, hosted_recipient_signing):
+async def publication(hosted, hosted_recipient_signing, request):
     from a2a.types import AgentSkill
     from fastapi import FastAPI
 
@@ -54,7 +54,10 @@ async def publication(hosted, hosted_recipient_signing):
     )
     hosted.manager.register_provider(
         "test",
-        [AgentSkill(id="ask", name="Ask", description="Ask", tags=["chat"])],
+        [AgentSkill(
+            id="ask", name="Ask", description="Ask", tags=["chat"],
+            input_modes=getattr(request, "param", ()),
+        )],
         object(),
     )
     app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
@@ -1086,6 +1089,90 @@ async def test_native_peer_message_tool_reaches_official_host_binding(
     )
     assert task.history[0].parts[0].text == "Message from real peer tool"
     assert task.context_id == result.data["context_id"]
+
+
+@pytest.mark.parametrize("publication", [["application/json"]], indirect=True)
+@pytest.mark.parametrize("include_message", [False, True])
+async def test_task_tool_sends_json_only_skill_input_without_inventing_text(
+    local_native_peer, include_message
+):
+    from google.protobuf.json_format import MessageToDict
+
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router, feature._peer_requester = p.directory, p.requester
+    feature._own_name = "Sender"
+    arguments = {"message": ""} if include_message else {}
+    result = await feature.send_a2a_task(
+        "Peer", skill_id="ask", parts=[{"data": {"request": "hello"}}],
+        **arguments,
+    )
+    assert result.data and result.data.get("sent") is True, result
+    task = await p.manager.get_task_for_creator(
+        result.data["remote_task_id"], PRINCIPAL, recipient_agent_id=p.recipient.did
+    )
+    assert len(task.history[0].parts) == 1
+    assert MessageToDict(task.history[0].parts[0]) == {"data": {"request": "hello"}}
+
+
+@pytest.mark.parametrize("publication", [["application/json"]], indirect=True)
+@pytest.mark.parametrize(
+    "message,parts",
+    [
+        ("Retain this text", [{"data": {"request": "hello"}}]),
+        ("", None),
+        ("   ", [{"data": {"request": "hello"}}]),
+    ],
+)
+async def test_json_only_skill_refuses_incompatible_or_empty_tool_input(
+    local_native_peer, message, parts
+):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router, feature._peer_requester = p.directory, p.requester
+    feature._own_name = "Sender"
+    result = await feature.send_a2a_task(
+        "Peer", message, skill_id="ask", parts=parts
+    )
+    assert not (result.data and result.data.get("sent"))
+    assert not await p.manager.list_tasks(recipient_agent_id=p.recipient.did)
+
+
+@pytest.mark.parametrize("publication", [["application/json"]], indirect=True)
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+async def test_receiver_enforces_skill_input_modes_for_an_independent_sdk_client(
+    local_native_peer, protocol
+):
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.utils.errors import ContentTypeNotSupportedError
+
+    from kestrel_sovereign.a2a.extensions import skill_hint_metadata
+
+    p = local_native_peer
+    async with p.directory.open_a2a_session(p.requester, p.peer) as session:
+        assert list(session.agent_card.skills[0].input_modes) == ["application/json"]
+        raw = ClientFactory(ClientConfig(
+            httpx_client=session._http, polling=False, streaming=False,
+            supported_protocol_bindings=[protocol],
+        )).create(session.agent_card, interceptors=[session._signer])
+        try:
+            request = SendMessageRequest(
+                tenant=p.scope.tenant,
+                message=new_text_message("Unsupported plain text", role=Role.ROLE_USER),
+                metadata=skill_hint_metadata("ask"),
+                configuration={"return_immediately": True},
+            )
+            with pytest.raises(ContentTypeNotSupportedError):
+                async with session._network():
+                    async for _event in raw.send_message(request):
+                        pass
+            assert not await p.manager.list_tasks(recipient_agent_id=p.recipient.did)
+        finally:
+            await raw.close()
 
 
 async def test_same_host_session_rechecks_sender_directory_before_submission(

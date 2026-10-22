@@ -5,10 +5,22 @@ from collections.abc import Sequence
 from email import policy
 from typing import Any
 
-from a2a.types import Part
+from a2a.types import AgentSkill, Part
 from a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 
 DEFAULT_NATIVE_MEDIA_TYPES = ("text/plain", "application/json")
+
+
+def skill_input_modes(
+    defaults: Sequence[str], skills: Sequence[AgentSkill], skill_id: str | None
+) -> tuple[str, ...]:
+    """Resolve one advertised input contract without granting skill execution."""
+    if skill_id is None:
+        return tuple(defaults)
+    selected = next((skill for skill in skills if skill.id == skill_id), None)
+    if selected is None:
+        raise ValueError("Agent does not advertise the suggested skill")
+    return tuple(selected.input_modes or defaults)
 
 
 def encode_inline_json(value: Any) -> bytes:

@@ -44,7 +44,7 @@ from kestrel_sovereign.a2a.extensions import (
     require_metadata_extensions,
 )
 from kestrel_sovereign.a2a.lifecycle import STREAM_STOP_STATES
-from kestrel_sovereign.a2a.media import validate_input_parts
+from kestrel_sovereign.a2a.media import skill_input_modes, validate_input_parts
 from kestrel_sovereign.a2a.native_card import (
     REQUIRED_NATIVE_EXTENSIONS,
     verify_native_agent_card,
@@ -436,22 +436,15 @@ class NativePeerSession:
             require_metadata_extensions(metadata, self._activated_extensions)
             claims = parse_message_metadata(metadata)
             correlation = claims.correlation
+            modes = skill_input_modes(
+                card.default_input_modes, card.skills, claims.skill_hint
+            )
         except ValueError as error:
             raise NativePeerProtocolError(str(error)) from error
         if (correlation is not None) != (verb == "question"):
             raise NativePeerProtocolError(
                 "Native question creation requires its correlation contract"
             )
-        hint = claims.skill_hint
-        modes = card.default_input_modes
-        if hint is not None:
-            selected = next((skill for skill in card.skills if skill.id == hint), None)
-            if selected is None:
-                raise NativePeerProtocolError(
-                    "Peer does not advertise the suggested skill"
-                )
-            if selected.input_modes:
-                modes = selected.input_modes
         validate_input_parts(wire.message.parts, modes)
         return claims
 
@@ -779,6 +772,7 @@ class NativePeerSession:
                         context_id=dispatch.requested_context_id,
                         page_token=token,
                         page_size=policy.page_size,
+                        include_artifacts=True,
                     )
                     async with self._network():
                         result = await self._client.list_tasks(

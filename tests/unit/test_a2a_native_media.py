@@ -1,11 +1,35 @@
 """Native part MIME defaults, ranges and refusal without malformed fallback."""
 
 import pytest
-from a2a.types import Part
+from a2a.types import AgentSkill, Part
 from a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 from google.protobuf.json_format import ParseDict
 
-from kestrel_sovereign.a2a.media import part_media_type, validate_input_parts
+from kestrel_sovereign.a2a.media import (
+    part_media_type,
+    skill_input_modes,
+    validate_input_parts,
+)
+
+
+@pytest.mark.parametrize(
+    "hint,declared,expected",
+    [
+        (None, ["application/json"], ("text/plain",)),
+        ("ask", [], ("text/plain",)),
+        ("ask", ["application/json"], ("application/json",)),
+    ],
+)
+def test_skill_input_contract_uses_explicit_modes_or_inherits_card_defaults(
+    hint, declared, expected
+):
+    skill = AgentSkill(id="ask", input_modes=declared)
+    assert skill_input_modes(["text/plain"], [skill], hint) == expected
+
+
+def test_unknown_skill_cannot_inherit_the_card_input_contract():
+    with pytest.raises(ValueError, match="does not advertise"):
+        skill_input_modes(["text/plain"], [AgentSkill(id="ask")], "unknown")
 
 
 def test_inline_json_preserves_exact_integers_and_filesystem_names():

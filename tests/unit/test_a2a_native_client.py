@@ -4,7 +4,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import fields, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -346,13 +346,27 @@ async def test_lost_acknowledgement_reconciles_by_read_without_resending(peer_se
 
 
 @asynccontextmanager
-async def uncertain_peer_history(p, policy):
+async def uncertain_peer_history(p, policy, *, question=False):
     """Lose a real receipt, then let the admitted peer serve its actual history."""
-    session = NativePeerSession(**(p.arguments | {"reconciliation_policy": policy}))
+    arguments = await question_session_arguments(p) if question else p.arguments
+    session = NativePeerSession(**(arguments | {"reconciliation_policy": policy}))
     try:
+        request = request_for(p)
+        if question:
+            from kestrel_sovereign.a2a.extensions import question_correlation_metadata
+
+            request.metadata.update(question_correlation_metadata("question", uuid4().hex))
         dispatch, wire = await session.reserve(
-            request_for(p), dispatch_tool="send_a2a_task", verb="task"
+            request,
+            dispatch_tool="send_a2a_question" if question else "send_a2a_task",
+            verb="question" if question else "task",
         )
+        questions = arguments.get("question_store")
+        if questions is not None:
+            await questions.reserve(
+                dispatch, wire, origin_turn_id="turn", origin_session_id="chat",
+                deadline=datetime.now(UTC) + timedelta(seconds=60),
+            )
         p.state.drop_ack = True
         with pytest.raises(A2AClientError, match="Acknowledgement lost"):
             await session.send(dispatch, wire)
@@ -363,9 +377,40 @@ async def uncertain_peer_history(p, policy):
             recipient_agent_id=p.admission.scope.recipient_id,
         )
         assert len(result.tasks) == 1
-        yield SimpleNamespace(session=session, dispatch=unknown, result=result)
+        yield SimpleNamespace(
+            session=session, dispatch=unknown, result=result, questions=questions
+        )
     finally:
         await session.close()
+
+
+async def test_question_reconciliation_retains_full_artifacts_after_losing_the_receipt(
+    network_peer,
+):
+    from a2a.types import Artifact
+
+    p = network_peer
+    async with uncertain_peer_history(p, NativeReconciliationPolicy(), question=True) as retained:
+        remote = retained.result.tasks[0]
+        artifact = Artifact(
+            artifact_id=uuid4().hex, name="Detailed answer",
+            parts=[Part(text="The full answer " * 1000)],
+        )
+        completed = await p.admission.manager.complete_task(
+            remote.id, "Read the attached answer", artifacts=[artifact],
+            recipient_agent_id=p.admission.scope.recipient_id,
+        )
+        reconciled = await retained.session.reconcile(retained.dispatch)
+        assert reconciled.state is DispatchState.COMPLETE
+        response = await retained.questions.retained_response(reconciled)
+        assert response == completed
+        assert list(response.artifacts) == [artifact]
+        [wake] = await retained.questions.pending_wakes()
+        assert json.loads(wake.payload_json)["requires_full_response"] is True
+        observed = await retained.session.get_task(reconciled)
+        assert observed.response == completed
+        assert await retained.questions.retained_response(observed.dispatch) == completed
+        assert p.state.received_messages == 1
 
 
 async def test_reconciliation_rejects_fresh_tokens_at_its_configured_page_budget(
@@ -1248,31 +1293,27 @@ async def test_native_subscription_rechecks_authority_before_delivering_next_eve
         await stream.aclose()
 
 
-async def test_official_client_commits_taskless_question_answer_with_its_receipt(
-    peer_session,
-):
-    from datetime import UTC, datetime, timedelta
-
-    from kestrel_sovereign.a2a.extensions import (
-        question_correlation_metadata,
-    )
+async def question_session_arguments(p):
+    """Use the advertised question extension and the real durable correlation store."""
     from kestrel_sovereign.a2a.stores.unified.question_store import NativeQuestionStore
 
-    p = peer_session
     questions = NativeQuestionStore(p.store)
     await questions.initialize()
     extensions = frozenset(item.uri for item in p.arguments["card"].capabilities.extensions)
     original_signer = p.arguments["signer"]
     signer = replace(original_signer, extensions=extensions, nonce=lambda: uuid4().hex)
-    session = NativePeerSession(
-        **(
-            p.arguments
-            | {
-                "signer": signer,
-                "question_store": questions,
-            }
-        )
-    )
+    return p.arguments | {"signer": signer, "question_store": questions}
+
+
+async def test_official_client_commits_taskless_question_answer_with_its_receipt(
+    peer_session,
+):
+    from kestrel_sovereign.a2a.extensions import question_correlation_metadata
+
+    p = peer_session
+    arguments = await question_session_arguments(p)
+    questions = arguments["question_store"]
+    session = NativePeerSession(**arguments)
     p.state.taskless = True
     question_id = uuid4().hex
     try:

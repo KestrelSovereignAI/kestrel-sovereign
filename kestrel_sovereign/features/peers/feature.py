@@ -819,8 +819,8 @@ class PeersFeature(Feature):
         )
         from kestrel_sovereign.a2a.stores.unified.question_store import QuestionConflict
 
-        if not isinstance(message, str) or not message.strip():
-            return ToolResult.failed("A2A message must contain text")
+        if not isinstance(message, str):
+            return ToolResult.failed("A2A message must be text")
         if not isinstance(context_id, str) or not isinstance(skill_id, str):
             return ToolResult.failed("A2A context_id and skill_id must be strings")
         if not isinstance(continue_dispatch_id, str):
@@ -831,8 +831,10 @@ class PeersFeature(Feature):
             )
         if any(not isinstance(part, dict) for part in (parts or [])):
             return ToolResult.failed("Each A2A part must be a standard Part object")
+        if (message and not message.strip()) or (not message and not parts):
+            return ToolResult.failed("A2A input requires message text or standard Parts")
         try:
-            content = [Part(text=message)] + [
+            content = ([Part(text=message)] if message else []) + [
                 ParseDict(part, Part()) for part in (parts or [])
             ]
         except ParseError as error:
@@ -1380,8 +1382,10 @@ class PeersFeature(Feature):
         description=(
             "Delegate tracked work to a peer using native A2A. The dispatch_id is your "
             "immutable local handle; remote_task_id is assigned by the peer and can be null. "
-            "Supply standard message parts for input attachments, such as {'text':'plan', "
-            "'filename':'plan.txt'} or {'data':{'ref_type':'memory','id':'...'}}. "
+            "Use message for text or parts for complete standard input; message may be "
+            "omitted. Match the peer's advertised input modes, including the selected "
+            "skill's overrides. For a JSON-only skill, supply parts such as "
+            "[{'data':{'request':'...'}}] without a text message. "
             "Artifacts are peer outputs. skill_id is an optional advisory hint from the "
             "peer's signed Agent Card; it grants no direct tool invocation. "
             "Use context_id for a conversation context. To send follow-up input to an "
@@ -1395,13 +1399,13 @@ class PeersFeature(Feature):
     async def send_a2a_task(
         self,
         recipient: str,
-        message: str,
+        message: str = "",
         skill_id: str = "",
         context_id: str = "",
         parts: List[Any] = None,
         continue_dispatch_id: str = "",
     ) -> ToolResult:
-        """Delegate work using standard input Parts and an optional advisory skill."""
+        """Delegate text or standard Parts matching the peer's input modes."""
         receipt = await self._dispatch_native_peer(
             recipient,
             message,
