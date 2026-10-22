@@ -862,6 +862,15 @@ Pool generation, connection-argument identities and adapter identity remain
 fixed as well. Phase transitions are not COMMIT evidence: acknowledgment needs
 the original backend's actual native COMMIT fact/receipt. An absent row cannot
 become committed merely by calling an acknowledgment helper from setup.
+Both backends verify one INSERT and the exact canonical row inside the native
+transaction before COMMIT, using one shared column definition and a null-safe
+query bounded to two matches. Trigger-suppressed, deleted or rewritten rows
+raise finite `SignalOutcomeJournalWriteRefusal` with the genuine completed
+result and one audit loss; a healthy rollback is not a native-source failure.
+SQLite performs the proof on its same native worker without an application row
+factory and closes the proof cursor there. A transient post-COMMIT privacy
+observation preserves the real committed fact without adding uncertainty to
+otherwise healthy scopes; independent native failures retain their provenance.
 
 The original privacy-policy epoch and persistence-gate identity also remain
 fixed. The native INSERT retains that same gate through COMMIT/reset and

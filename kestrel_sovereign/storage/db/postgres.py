@@ -2254,6 +2254,7 @@ class PostgresBackend(DatabaseBackend):
         if relation is None:
             raise ExecutionAuthorityError('Original native signal journal destination not captured')
         query, _ = sqlite_to_postgres(journal._query)
+        match_query, _ = sqlite_to_postgres(journal._match_query)
         state = None
         try:
             async with self._tracked_pool_checkout(journal._backing, admit_work=False) as (connection, state):
@@ -2263,7 +2264,15 @@ class PostgresBackend(DatabaseBackend):
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
                         raise ExecutionAuthorityError('Original native signal journal relation replaced')
                     journal.require_original(self)
-                    await connection.execute(query, *self._strip_tz(entry.values))
+                    values = self._strip_tz(entry.values)
+                    status = await connection.execute(query, *values)
+                    journal.require_original(self)
+                    if status != 'INSERT 0 1':
+                        raise journal.write_refusal('row_count')
+                    matches = await connection.fetch(match_query, *values)
+                    journal.require_original(self)
+                    if len(matches) != 1 or tuple(matches[0]) != (1,):
+                        raise journal.write_refusal('row_missing_or_changed')
                     journal.require_original(self)
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
                         raise ExecutionAuthorityError('Original native signal journal relation replaced')

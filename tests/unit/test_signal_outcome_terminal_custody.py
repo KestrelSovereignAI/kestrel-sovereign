@@ -30,6 +30,125 @@ class _OriginalWork:
 
 
 @pytest.mark.timeout(15, method='thread')
+@pytest.mark.parametrize('trigger', ['before_ignore', 'after_delete', 'after_mutate'])
+async def test_original_journal_verifies_exact_row_before_native_commit(dispatcher_components, trigger):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_native_source_error, _explicit_control_chain
+    c = dispatcher_components
+    await c.backend.execute('CREATE TABLE journal_original_effects(id INTEGER PRIMARY KEY)')
+    postgres = c.backend.backend_type == 'postgres'
+    schema = await c.backend.fetch_val('SELECT current_schema()') if postgres else 'main'
+    table = '"' + schema.replace('"', '""') + '".signal_log'
+    effects = []
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    owner = SimpleNamespace(_execution_custody=scope)
+    async def handler(payload):
+        effects.append(len(effects) + 1)
+        await c.backend.execute('INSERT INTO journal_original_effects VALUES(?)', (effects[-1],))
+        if len(effects) == 1:
+            if postgres:
+                function = '"' + schema.replace('"', '""') + '".journal_terminal_filter'
+                body = ('RETURN NULL;' if trigger == 'before_ignore' else
+                    f'DELETE FROM {table} WHERE id=NEW.id; RETURN NULL;' if trigger in ('after_delete', 'deferred_delete') else
+                    f"UPDATE {table} SET status='failed' WHERE id=NEW.id; RETURN NULL;")
+                await c.backend.execute(f'CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN {body} END$$')
+                if trigger == 'deferred_delete':
+                    await c.backend.execute(f'CREATE CONSTRAINT TRIGGER journal_terminal_filter AFTER INSERT ON {table} DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {function}()')
+                else:
+                    timing = 'BEFORE' if trigger == 'before_ignore' else 'AFTER'
+                    await c.backend.execute(f'CREATE TRIGGER journal_terminal_filter {timing} INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION {function}()')
+            else:
+                body = ('SELECT RAISE(IGNORE);' if trigger == 'before_ignore' else
+                    'DELETE FROM signal_log WHERE id=NEW.id;' if trigger == 'after_delete' else
+                    "UPDATE signal_log SET status='failed' WHERE id=NEW.id;")
+                timing = 'BEFORE' if trigger == 'before_ignore' else 'AFTER'
+                await c.backend.execute(f'CREATE TEMP TRIGGER journal_terminal_filter {timing} INSERT ON main.signal_log BEGIN {body} END')
+            scope.revoke('actual work cutoff after trigger installation and committed effect')
+        return {'genuine': True}
+    c.registry.register(_action_reg('trigger.filtered.audit', handler=handler))
+    signal = _signal('trigger.filtered.audit')
+    with bind_execution_runtime(owner):
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(signal)
+    assert execution_commit_outcome(caught.value) != 'committed'
+    assert any(getattr(item, 'signal_result', None) is not None for item in _explicit_control_chain(caught.value))
+    assert await c.backend.fetch_val(f'SELECT COUNT(*) FROM {table} WHERE id=?', (signal.id,)) == 0
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM journal_original_effects') == 1
+    assert c.dispatcher._log_write_failures == 1
+    assert execution_native_source_error(caught.value) is None
+    assert c.dispatcher._outcome_log_control_error is None
+    if postgres:
+        await c.backend.execute(f'DROP TRIGGER journal_terminal_filter ON {table}')
+    else:
+        await c.backend.execute('DROP TRIGGER temp.journal_terminal_filter')
+    # This is a NEW signal, not replay of the already completed original effect.
+    second = await c.dispatcher.dispatch_signal(_signal('trigger.filtered.audit'))
+    assert second.action_result == {'genuine': True}
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM journal_original_effects') == 2
+    assert c.dispatcher._log_write_failures == 1
+
+
+async def test_postcommit_privacy_observation_does_not_poison_healthy_dispatch(dispatcher_components, monkeypatch):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_native_source_error, _explicit_control_chain
+    c = dispatcher_components
+    actual_commit = []
+    raised = []
+    observation = RuntimeError('one-time actual post-COMMIT privacy getter observation')
+    def epoch():
+        if actual_commit and not raised:
+            raised.append(True)
+            raise observation
+        return 'unchanged-original-policy'
+    c.agent._get_privacy_policy_epoch = epoch
+    if c.backend.backend_type == 'sqlite':
+        native_commit = c.backend._connection.commit
+        async def after_actual_commit():
+            result = await native_commit()
+            if c.dispatcher._original_outcome_writer.get() is not None:
+                actual_commit.append(True)
+            return result
+        monkeypatch.setattr(c.backend._connection, 'commit', after_actual_commit)
+    else:
+        import asyncpg
+        native_release = asyncpg.pool.Pool.release
+        pool = c.backend._pool
+        async def after_actual_reset(original_pool, connection, *args, **kwargs):
+            result = await native_release(original_pool, connection, *args, **kwargs)
+            if original_pool is pool and c.dispatcher._original_outcome_writer.get() is not None:
+                actual_commit.append(True)
+            return result
+        monkeypatch.setattr(asyncpg.pool.Pool, 'release', after_actual_reset)
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    owner = SimpleNamespace(_execution_custody=scope)
+    c.registry.register(_action_reg('healthy.commit.observer'))
+    signal = _signal('healthy.commit.observer')
+    try:
+        with bind_execution_runtime(owner):
+            with pytest.raises(BaseException) as caught:
+                await c.dispatcher.dispatch_signal(signal)
+        assert actual_commit and raised == [True]
+        assert execution_commit_outcome(caught.value) == 'committed'
+        assert any(item is observation for item in _explicit_control_chain(caught.value))
+        # Operator observation of the owned fixture, not a work grant to a
+        # possibly poisoned original scope. Verify the real row first.
+        assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+        assert c.dispatcher._log_write_failures == 0
+        assert execution_native_source_error(caught.value) is None, 'healthy post-COMMIT observer became a native-source failure'
+        assert c.dispatcher._outcome_log_control_error is None
+        with bind_execution_runtime(owner):
+            scope.require_work()
+            second = await c.dispatcher.dispatch_signal(_signal('healthy.commit.observer'))
+            assert second.action_result is not None
+            assert c.dispatcher._log_write_failures == 0
+    finally:
+        if c.dispatcher._outcome_log_control_error is not None:
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            try:
+                await c.dispatcher.shutdown_durable_delivery()
+            except BaseException as terminal:
+                assert is_execution_control_error(terminal)
+
+
+@pytest.mark.timeout(15, method='thread')
 @pytest.mark.parametrize('entry', ['dispatch', 'enqueue', 'durable_enqueue'])
 async def test_sqlite_original_dispatch_refuses_enclosing_transaction_at_parent_entry(dispatcher_components, entry):
     c = dispatcher_components

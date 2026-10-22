@@ -31,10 +31,16 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_projection_cannot_reauthorize_fabricated_result_through_finalizer,
     test_error_after_original_writer_acceptance_still_joins_before_owner_exits,
     test_projection_callbacks_cannot_mutate_canonical_data,
+    test_original_journal_verifies_exact_row_before_native_commit,
+    test_postcommit_privacy_observation_does_not_poison_healthy_dispatch,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
+
+
+async def test_postgres_original_journal_checks_deferred_trigger_effect_before_commit(dispatcher_components):
+    await test_original_journal_verifies_exact_row_before_native_commit(dispatcher_components, 'deferred_delete')
 
 
 @pytest.mark.timeout(15, method='thread')

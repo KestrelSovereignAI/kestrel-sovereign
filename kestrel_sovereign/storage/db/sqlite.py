@@ -2187,6 +2187,11 @@ class SQLiteBackend(DatabaseBackend):
                 for scope in scopes:
                     scope.require_work()
         except BaseException as error:
+            if original_outcome is not None:
+                # A healthy original COMMIT followed by a finite observation
+                # refusal must not create native uncertainty on healthy scopes.
+                # Genuine native-source/cleanup failures keep their provenance.
+                raise original_outcome.retain_committed(error)
             outcome = execution_commit_outcome(error) or "committed"
             for scope in scopes:
                 scope.preserve_commit_uncertainty(outcome)
@@ -2202,6 +2207,24 @@ class SQLiteBackend(DatabaseBackend):
         conn = self._ensure_connected()
         return await self._execute_write_operation(conn, query, params)
 
+    async def _verify_original_signal_outcome(self, conn, journal):
+        journal.require_original(self)
+        journal.require_sqlite_cleanup(self, conn)
+        def exact_native_row():
+            # One atomic native worker operation, with no application row
+            # factory and no cursor left pending when it returns or raises.
+            cursor = conn._conn.cursor()
+            cursor.row_factory = None
+            try:
+                cursor.execute(journal._match_query, journal._entry.values)
+                return cursor.fetchmany(2) == [(1,)]
+            finally:
+                cursor.close()
+        matches = await conn._execute(exact_native_row)
+        journal.require_original(self)
+        if not matches:
+            raise journal.write_refusal('row_missing_or_changed')
+
     async def _execute_write_operation(self, conn, query, params, *, original_outcome=None):
         if original_outcome is not None:
             self._require_write_admission(original_outcome)
@@ -2214,6 +2237,10 @@ class SQLiteBackend(DatabaseBackend):
                 try:
                     cursor = await conn.execute(query, params)
                     self._require_write_admission(original_outcome)
+                    if original_outcome is not None:
+                        if cursor.rowcount != 1:
+                            raise original_outcome.write_refusal('row_count')
+                        await self._verify_original_signal_outcome(conn, original_outcome)
                     if not self._in_transaction:
                         if original_outcome is None:
                             await self._commit_write(conn)

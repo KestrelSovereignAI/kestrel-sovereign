@@ -106,6 +106,18 @@ def _truncate_to_bytes(text: str, max_bytes: int) -> str:
     return truncated_body + _TRUNCATION_SUFFIX
 
 
+_OUTCOME_COLUMNS = (
+    'id', 'source', 'kind', 'mode', 'urgency', 'dedupe_key',
+    'target_agent', 'session_id', 'caller_redacted', 'visibility',
+    'dispatched_at', 'completed_at', 'status', 'duration_ms',
+    'turn_id', 'artifact_digest', 'action_result_digest',
+    'payload_digest', 'payload_redacted', 'payload_raw', 'result_summary',
+    'causation_chain_digest', 'error', 'retention_until',
+    'constitution_hash', 'doctrine_bundle_hash', 'echo_canary_status',
+    'injected_clauses_json', 'dropped_clauses_json', 'prompt_template_hash',
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedSignalOutcome:
     """Immutable native row data, not SQL authority or a storage executor."""
@@ -287,20 +299,16 @@ class SignalLogStore(UnifiedStoreBase):
     def _outcome_insert_query(table: str = 'signal_log') -> str:
         # Only ordinary append supplies its supported TABLE override. Native
         # custody captures the fixed default statement before handler execution.
-        return f"""
-            INSERT INTO {table} (
-                id, source, kind, mode, urgency, dedupe_key,
-                target_agent, session_id, caller_redacted, visibility,
-                dispatched_at, completed_at, status, duration_ms,
-                turn_id, artifact_digest, action_result_digest,
-                payload_digest, payload_redacted, payload_raw,
-                result_summary,
-                causation_chain_digest, error, retention_until,
-                constitution_hash, doctrine_bundle_hash, echo_canary_status,
-                injected_clauses_json, dropped_clauses_json,
-                prompt_template_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
+        return (f"INSERT INTO {table} ({', '.join(_OUTCOME_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in _OUTCOME_COLUMNS)})")
+
+    @staticmethod
+    def _outcome_match_query(table: str, *, postgres: bool) -> str:
+        # Only the original native journal uses this fixed, bounded proof.
+        # SQL-side null-safe comparison also handles native JSONB normalization.
+        operator = 'IS NOT DISTINCT FROM' if postgres else 'IS'
+        predicates = ' AND '.join(f'{column} {operator} ?' for column in _OUTCOME_COLUMNS)
+        return f'SELECT 1 FROM {table} WHERE {predicates} LIMIT 2'
 
     def _prepare_outcome(
         self,

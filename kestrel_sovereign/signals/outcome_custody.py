@@ -25,6 +25,15 @@ class SignalOutcomeJournalPrivacyRefusal(ExecutionAuthorityError):
         self.signal_result = signal_result
 
 
+class SignalOutcomeJournalWriteRefusal(ExecutionAuthorityError):
+    """The genuine effect completed, but no exact terminal row can commit."""
+
+    def __init__(self, reason, signal_result):
+        super().__init__('Original signal journal write refusal: ' + reason)
+        self.reason = reason
+        self.signal_result = signal_result
+
+
 @dataclass(frozen=True, eq=False)
 class _AcceptedSignalOutcome:
     """Original dispatcher-issued envelope, not a causation-context proxy."""
@@ -127,8 +136,9 @@ class _OriginalSignalOutcome:
         self._signal_snapshot = deepcopy(signal)
         self._registration_snapshot = replace(registration,
             log_redaction=replace(registration.log_redaction))
-        self._query = SignalLogStore._outcome_insert_query(
-            'main.signal_log' if type(backend) is SQLiteBackend else 'signal_log')
+        table = 'main.signal_log' if type(backend) is SQLiteBackend else 'signal_log'
+        self._query = SignalLogStore._outcome_insert_query(table)
+        self._match_query = SignalLogStore._outcome_match_query(table, postgres=type(backend) is PostgresBackend)
         self._acceptance = acceptance
         self._identity = self._signal_identity(signal)
         self._backend_scope = getattr(backend, '_execution_custody', None)
@@ -158,10 +168,19 @@ class _OriginalSignalOutcome:
                 and registration is self._registration)
 
     def privacy_refusal(self, reason, cause=None):
+        return self._finite_refusal(reason, cause, privacy=True)
+
+    def write_refusal(self, reason):
+        return self._finite_refusal(reason, privacy=False)
+
+    def _finite_refusal(self, reason, cause=None, *, privacy):
         from kestrel_sovereign.execution_custody import _FINITE_NATIVE_SOURCES, _native_source_originals
-        original = SignalOutcomeJournalPrivacyRefusal(reason, self._completed_result)
+        if type(privacy) is not bool:
+            raise TypeError('Original journal refusal kind must be a fixed boolean')
+        kind = SignalOutcomeJournalPrivacyRefusal if privacy else SignalOutcomeJournalWriteRefusal
+        original = kind(reason, self._completed_result)
         original.__cause__ = cause
-        finite = BaseExceptionGroup('original signal terminal audit privacy refusal', [original])
+        finite = BaseExceptionGroup('original signal terminal audit refusal', [original])
         finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, _native_source_originals(cause))
         return finite
 
@@ -337,4 +356,5 @@ async def _capture_original_outcome(dispatcher, signal, registration, *, accepta
         # Later native checkout setup cannot redirect this fixed destination.
         journal._postgres_relation = await backend._capture_original_signal_outcome_relation(journal)
         journal._query = SignalLogStore._outcome_insert_query(journal._postgres_relation.qualified_name)
+        journal._match_query = SignalLogStore._outcome_match_query(journal._postgres_relation.qualified_name, postgres=True)
     return journal
