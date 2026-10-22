@@ -30,6 +30,9 @@ def resident_dispatcher():
     agent._background_tasks = set()
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
     dispatcher._agent = agent
+    # This fixture exercises publisher callbacks, not native row ownership;
+    # dispatch_signal below is an explicit finite callback seam.
+    dispatcher._store = SimpleNamespace(_backend=None)
     dispatcher._durable_shutdown = False
     dispatcher._live_durable_cognition_event_ids = set()
     dispatcher._started_durable_cognition_consumers = {"channel"}
