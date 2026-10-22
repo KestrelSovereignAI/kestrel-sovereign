@@ -57,13 +57,15 @@ async def test_registration_commits_encrypted_config_consumer_and_initial_refere
         subscription.creator_id,
     ) == (task.id, created.config.id, created.generation, "did:creator")
     pending = await value.changes.pending(limit=10)
-    assert len(pending) == 2 and pending[0].sequence == subscription.after_sequence
-    assert pending[1].sequence > subscription.after_sequence
+    assert len(pending) == 1 and pending[0].sequence > subscription.after_sequence
+    assert await value.backend.fetch_val(
+        "SELECT replay_retained FROM durable_signal_consumers"
+    ) == value.signals.to_bool_param(False)
     await value.forward_pending(limit=10)
     rows = await value.backend.fetch_all(
         "SELECT payload, caller_identity FROM durable_signal_events"
     )
-    assert len(rows) == 2
+    assert len(rows) == 1
     assert all(
         "never-journal-this" not in repr(row) and "callback-secret" not in repr(row)
         for row in rows
@@ -106,7 +108,7 @@ async def test_forwarding_and_journal_receipt_rollback_together(outbox):
     pending = await value.changes.pending(limit=10)
     with pytest.raises(TransactionError):
         async with value.write_transaction():
-            assert await value.forward_pending(limit=10) == 2
+            assert await value.forward_pending(limit=10) == 1
             raise RuntimeError("producer stops before its commit")
     assert await value.changes.pending(limit=10) == pending
     assert await value.backend.fetch_all("SELECT * FROM durable_signal_events") == []
@@ -114,28 +116,28 @@ async def test_forwarding_and_journal_receipt_rollback_together(outbox):
         value.configurations, value.signals, retention_days=30, lease_seconds=60
     )
     await restarted.initialize()
-    assert await restarted.forward_pending(limit=10) == 2
+    assert await restarted.forward_pending(limit=10) == 1
     assert await restarted.forward_pending(limit=10) == 0
     assert (
-        len(await value.backend.fetch_all("SELECT * FROM durable_signal_events")) == 2
+        len(await value.backend.fetch_all("SELECT * FROM durable_signal_events")) == 1
     )
     assert (
         len(await value.backend.fetch_all("SELECT * FROM durable_signal_deliveries"))
-        == 2
+        == 1
     )
 
 
 async def test_lost_forward_receipt_ack_cannot_duplicate_native_deliveries(outbox):
     value, task = outbox
     await value.register(callback(task), creator_id="did:creator")
-    assert await value.forward_pending(limit=10) == 2
+    assert await value.forward_pending(limit=10) == 1
     events = await value.backend.fetch_all(
         "SELECT event_id FROM durable_signal_events ORDER BY event_id"
     )
     # Simulate a journal receipt restored without its matching event database.
     # Stable source IDs still select original events and original deliveries.
     await value.backend.execute("UPDATE a2a_task_changes SET forwarded_event_id = NULL")
-    assert await value.forward_pending(limit=10) == 2
+    assert await value.forward_pending(limit=10) == 1
     assert (
         await value.backend.fetch_all(
             "SELECT event_id FROM durable_signal_events ORDER BY event_id"
@@ -144,7 +146,7 @@ async def test_lost_forward_receipt_ack_cannot_duplicate_native_deliveries(outbo
     )
     assert (
         len(await value.backend.fetch_all("SELECT * FROM durable_signal_deliveries"))
-        == 2
+        == 1
     )
 
 
@@ -500,3 +502,72 @@ async def test_missing_service_key_refuses_push_boot_before_any_schema_change(
         )
         is None
     )
+
+
+async def test_waiting_postgres_mutation_observes_the_new_subscription_at_commit(
+    outbox, native_a2a_backend_factory, monkeypatch
+):
+    """A statement begun before registration cannot lose its post-commit change."""
+    from a2a.types import TaskState, TaskStatus
+
+    value, task = outbox
+    if not value.is_postgres:
+        pytest.skip("PostgreSQL statement snapshot after a real row-lock wait")
+    second = native_a2a_backend_factory()
+    await second.connect()
+    store = TaskStore(second, scope=value.configurations.scope, owns_backend=False)
+    original_snapshot = value.changes.enqueue_snapshot
+    staged, release, updating = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    statement_pid = None
+    registering = mutation = None
+
+    async def staged_snapshot(*args, **kwargs):
+        result = await original_snapshot(*args, **kwargs)
+        staged.set()
+        await release.wait()
+        return result
+
+    async def update():
+        nonlocal statement_pid
+        async with second.transaction():
+            statement_pid = await second.fetch_val("SELECT pg_backend_pid()")
+            updating.set()
+            return await store.update_status(
+                task.id,
+                TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                recipient_agent_id=value.configurations.scope.recipient_id,
+                expected_state=TaskState.TASK_STATE_SUBMITTED,
+            )
+
+    monkeypatch.setattr(value.changes, "enqueue_snapshot", staged_snapshot)
+    try:
+        registering = asyncio.create_task(
+            value.register(callback(task), creator_id="did:creator")
+        )
+        await asyncio.wait_for(staged.wait(), 5)
+        mutation = asyncio.create_task(update())
+        await asyncio.wait_for(updating.wait(), 5)
+        async with asyncio.timeout(5):
+            while True:
+                waiting = await value.backend.fetch_val(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = ?",
+                    (statement_pid,),
+                )
+                if waiting == "Lock":
+                    break
+                assert not mutation.done(), "task mutation bypassed registration's row lock"
+                await asyncio.sleep(0.01)
+        release.set()
+        await registering
+        assert await mutation
+        changes = await value.changes.pending(limit=10)
+        assert len(changes) == 2 and changes[0].sequence < changes[1].sequence, (
+            "the waiting mutation's trigger did not see the committed subscription"
+        )
+    finally:
+        release.set()
+        await asyncio.gather(
+            *(operation for operation in (registering, mutation) if operation is not None),
+            return_exceptions=True,
+        )
+        await second.close()

@@ -545,7 +545,7 @@ async def test_sqlite_high_water_survives_newest_purge_and_exact_row_loss(tmp_pa
             persisted[2].event_id,
         ),
     )
-    assert await store.purge_expired(agent_id=agent_id) == 1
+    assert len(await store.purge_expired(agent_id=agent_id)) == 1
     for relation in (
         store.SOURCE_SEQUENCE_SEEN,
         store.SOURCE_SEQUENCES,
@@ -620,7 +620,7 @@ async def test_sqlite_fails_closed_when_all_exact_evidence_is_lost(tmp_path):
                 persisted[2].event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_id) == 1
+        assert len(await store.purge_expired(agent_id=agent_id)) == 1
         for relation in (
             store.SOURCE_SEQUENCE_SEEN,
             store.SOURCE_SEQUENCES,
@@ -1580,7 +1580,7 @@ async def test_sqlite_mixed_writer_mirrors_a_sequence_newer_than_retained_maximu
                 second_event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_id) == 1
+        assert len(await store.purge_expired(agent_id=agent_id)) == 1
         await backend.execute("DROP TABLE durable_signal_source_sequences")
 
         recovered = DurableSignalStore(backend)
@@ -1646,7 +1646,7 @@ async def test_positive_exact_counters_repair_missing_seen_before_history_loss(
                 persisted.event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_id) == 1
+        assert len(await store.purge_expired(agent_id=agent_id)) == 1
         await backend.execute(
             "DELETE FROM durable_signal_source_sequences "
             "WHERE agent_id = ? AND source = ?",
@@ -1713,7 +1713,7 @@ async def test_seen_scope_refuses_loss_of_both_exact_rows_after_any_retention_sh
                 "WHERE event_id = ?",
                 (expired, persisted[index].event_id),
             )
-        assert await store.purge_expired(agent_id=agent_id) == len(purged_indices)
+        assert len(await store.purge_expired(agent_id=agent_id)) == len(purged_indices)
 
         await backend.execute(
             "DELETE FROM durable_signal_source_sequences "
@@ -6156,9 +6156,9 @@ async def test_nack_retry_lease_expiry_terminal_failure_and_retention_are_observ
     assert "lease expired" in terminal.last_error
     # Retention does not erase non-terminal work, but it removes retained
     # terminal history after its configured lifetime.
-    assert await store.purge_expired(
+    assert len(await store.purge_expired(
         agent_id=agent_id, now=now + timedelta(days=2)
-    ) == 1
+    )) == 1
     assert await store.list_deliveries(agent_id=agent_id) == []
     await backend.close()
 

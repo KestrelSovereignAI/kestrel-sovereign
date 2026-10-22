@@ -19,7 +19,7 @@ from tests.unit.test_a2a_native_push_outbox import (
 from tests.unit.test_a2a_native_push_outbox import (
     push_store as push_store,  # noqa: PLC0414 - pytest fixture dependency
 )
-from tests.unit.test_a2a_native_push_outbox import refuse_original_database_write
+from tests.unit.test_a2a_native_push_outbox import callback, refuse_original_database_write
 from tests.unit.test_a2a_native_push_worker import register, worker
 from tests.unit.test_durable_callback_runtime_context import resident_dispatcher
 from tests.utils.native_push import intercept_push_commit_ack
@@ -174,18 +174,22 @@ async def test_preacceptance_refusal_closes_the_fresh_operation_without_adopting
 async def test_original_worker_storage_failure_wakes_startup_without_a_false_ready_ack(
     outbox,
 ):
-    value, _ = outbox
+    value, task = outbox
+    await value.register(callback(task), creator_id="did:creator")
     await refuse_original_database_write(
         value.backend, table="durable_signal_events", event="INSERT"
     )
     service = NativePushService(worker(value), task_factory=create_owned_task)
-    with pytest.raises(TransactionError) as caught:
-        await service.start()
-    assert service.task.done() and service.task.exception() is caught.value
-    assert not service.worker.ready
-    with pytest.raises(TransactionError) as repeated:
-        service.require_ready()
-    assert repeated.value is caught.value
+    try:
+        with pytest.raises(TransactionError) as caught:
+            await service.start()
+        assert service.task.done() and service.task.exception() is caught.value
+        assert not service.worker.ready
+        with pytest.raises(TransactionError) as repeated:
+            service.require_ready()
+        assert repeated.value is caught.value
+    finally:
+        await asyncio.gather(service.close(), return_exceptions=True)
 
 
 async def test_startup_cancellation_joins_the_original_resident_before_returning(
@@ -225,7 +229,8 @@ async def test_startup_cancellation_joins_the_original_journal_commit(
 ):
     from kestrel_sovereign.a2a import push_service
 
-    value, _ = outbox
+    value, task = outbox
+    await value.register(callback(task), creator_id="did:creator")
     entered, release, cancel_sent = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_join = push_service.await_owned_task
     service = NativePushService(worker(value), task_factory=create_owned_task)
@@ -273,7 +278,8 @@ async def test_genuine_journal_commit_ack_failure_keeps_its_original_control(
         is_execution_control_error,
     )
 
-    value, _ = outbox
+    value, task = outbox
+    await value.register(callback(task), creator_id="did:creator")
     original = OSError("original native journal COMMIT acknowledgement failed")
 
     async def failed_ack():

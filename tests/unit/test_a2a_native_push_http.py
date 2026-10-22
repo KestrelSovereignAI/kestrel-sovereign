@@ -267,9 +267,8 @@ async def test_public_delete_waits_for_actual_https_response_retirement(
     created = await wire.client().create_task_push_notification_config(value)
     barrier = request.getfixturevalue("outbound_close_barrier")
     worker = wire.manager.push_service.worker
-    # The first source reference predates this registration and must ACK
-    # without HTTP. The next iteration owns the initial callback snapshot.
-    assert await NativePushWorker.run_once(worker) == 1
+    # The first queued reference is this registration's own initial snapshot.
+    # Its original HTTP owner is admitted only by the monitored iteration below.
     assert not outbound_tls.posts
     original_revoke = worker.outbox.revoke
     revoked = asyncio.Event()

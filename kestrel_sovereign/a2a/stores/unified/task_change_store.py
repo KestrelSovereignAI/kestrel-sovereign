@@ -18,21 +18,28 @@ class NativeTaskChange:
 
 
 class TaskChangeStore(UnifiedStoreBase):
-    """Journal every task mutation in its original database transaction.
+    """Journal subscribed task mutations in their original database transaction.
 
     Database triggers cover all canonical lifecycle, artifact and input writes,
     including writes that do not pass through an in-memory manager. A producer
     forwards these references to the existing durable consumer ledger in a
-    second atomic transaction. Retain references until task cleanup so a newly
-    registered consumer can distinguish older events from its initial snapshot.
+    second atomic transaction. Initial subscriptions own an explicit snapshot.
+    References retire atomically with their terminal durable events.
     """
 
     SQLITE_TRIGGERS = (
-        ("INSERT", "a2a_task_changes_insert_v1"),
-        ("UPDATE", "a2a_task_changes_update_v1"),
+        ("INSERT", "a2a_task_changes_insert_v2"),
+        ("UPDATE", "a2a_task_changes_update_v2"),
     )
-    POSTGRES_TRIGGER = "a2a_task_changes_v1"
-    TRIGGER_NAMES = frozenset(name for _, name in SQLITE_TRIGGERS) | {POSTGRES_TRIGGER}
+    POSTGRES_TRIGGER = "a2a_task_changes_v2"
+    LEGACY_TRIGGER_NAMES = frozenset(
+        {"a2a_task_changes_insert_v1", "a2a_task_changes_update_v1", "a2a_task_changes_v1"}
+    )
+    TRIGGER_NAMES = (
+        frozenset(name for _, name in SQLITE_TRIGGERS)
+        | {POSTGRES_TRIGGER}
+        | LEGACY_TRIGGER_NAMES
+    )
 
     def __init__(self, backend, *, scope: NativeRecipientScope):
         if not isinstance(scope, NativeRecipientScope):
@@ -50,8 +57,9 @@ class TaskChangeStore(UnifiedStoreBase):
         return self.scope.recipient_id, self.scope.tenant
 
     async def initialize(self) -> None:
-        """Install inside TaskStore's exclusive native schema transaction."""
+        """Install references without enabling the optional push producer."""
         async with self.write_transaction():
+            await self._refuse_legacy_capture()
             await self.backend.execute_script(f"""
                 CREATE TABLE IF NOT EXISTS a2a_task_changes (
                     sequence {self.integer_primary_key_type()},
@@ -64,8 +72,65 @@ class TaskChangeStore(UnifiedStoreBase):
                     ON a2a_task_changes (recipient_id, tenant, sequence)
                     WHERE forwarded_event_id IS NULL;
                 CREATE INDEX IF NOT EXISTS a2a_task_changes_task
-                    ON a2a_task_changes (recipient_id, tenant, task_id, sequence)
+                    ON a2a_task_changes (recipient_id, tenant, task_id, sequence);
+                CREATE INDEX IF NOT EXISTS a2a_task_changes_forwarded
+                    ON a2a_task_changes (recipient_id, tenant, forwarded_event_id)
+                    WHERE forwarded_event_id IS NOT NULL
             """)
+
+    async def _refuse_legacy_capture(self) -> None:
+        """A partial older native bundle cannot silently keep global capture."""
+        if self.is_sqlite:
+            rows = await self.backend.fetch_all(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND tbl_name = 'a2a_tasks'"
+            )
+        elif self.is_postgres:
+            rows = await self.backend.fetch_all(
+                "SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = current_schema() AND c.relname = 'a2a_tasks' "
+                "AND NOT t.tgisinternal"
+            )
+        else:
+            raise ValueError("Native task changes require SQLite or PostgreSQL")
+        if any(row[0] in self.LEGACY_TRIGGER_NAMES for row in rows):
+            from kestrel_sovereign.a2a.native_schema import NativeA2AMigrationRequired
+
+            raise NativeA2AMigrationRequired(
+                "Stored native task-change capture requires offline migration"
+            )
+
+    async def enable_push_capture(self) -> None:
+        """Enable capture only after configuration, subscription and ledger DDL.
+
+        These are shared schema objects, never per-agent startup switches.
+        Every trigger derives eligibility from the exact active configuration
+        and consumer rows, so disabled recipients cannot remove another owner's
+        capture. An intentionally paused live subscription retains its backlog.
+        """
+        async with self.write_transaction():
+            for table in (
+                "a2a_push_configs", "a2a_push_subscriptions", "durable_signal_consumers"
+            ):
+                if not await self.backend.table_exists(table):
+                    raise RuntimeError("Native push capture requires its initialized stores")
+            await self._refuse_legacy_capture()
+            subscribed = """
+                EXISTS (
+                    SELECT 1 FROM a2a_push_configs cfg
+                    JOIN a2a_push_subscriptions sub
+                      ON sub.recipient_id = cfg.recipient_id AND sub.tenant = cfg.tenant
+                     AND sub.task_id = cfg.task_id AND sub.config_id = cfg.config_id
+                     AND sub.generation = cfg.generation
+                    JOIN durable_signal_consumers consumer
+                      ON consumer.agent_id = sub.agent_id
+                     AND consumer.consumer_id = sub.consumer_id
+                    WHERE cfg.recipient_id = NEW.recipient_agent_id
+                      AND cfg.tenant = NEW.tenant AND cfg.task_id = NEW.id
+                      AND cfg.state = 'active' AND consumer.active = TRUE
+                )
+            """
             insert = """
                 INSERT INTO a2a_task_changes (recipient_id, tenant, task_id)
                     VALUES (NEW.recipient_agent_id, NEW.tenant, NEW.id);
@@ -75,21 +140,21 @@ class TaskChangeStore(UnifiedStoreBase):
                     await self.backend.execute_script(f"""
                         CREATE TRIGGER IF NOT EXISTS {name}
                         AFTER {event} ON a2a_tasks
-                        WHEN NEW.recipient_agent_id IS NOT NULL
+                        WHEN {subscribed}
                         BEGIN {insert} END
                     """)
             elif self.is_postgres:
                 await self.backend.execute_script(f"""
-                    CREATE OR REPLACE FUNCTION a2a_task_changes_v1()
+                    CREATE OR REPLACE FUNCTION {self.POSTGRES_TRIGGER}()
                     RETURNS trigger LANGUAGE plpgsql AS $$
                     BEGIN
-                        IF NEW.recipient_agent_id IS NOT NULL THEN {insert} END IF;
+                        IF {subscribed} THEN {insert} END IF;
                         RETURN NEW;
                     END;
                     $$;
                     CREATE OR REPLACE TRIGGER {self.POSTGRES_TRIGGER}
                         AFTER INSERT OR UPDATE ON a2a_tasks
-                        FOR EACH ROW EXECUTE FUNCTION a2a_task_changes_v1()
+                        FOR EACH ROW EXECUTE FUNCTION {self.POSTGRES_TRIGGER}()
                 """)
             else:
                 raise ValueError("Native task changes require SQLite or PostgreSQL")
@@ -153,3 +218,21 @@ class TaskChangeStore(UnifiedStoreBase):
         )
         if changed != 1:
             raise NativeStoreConflict("Task change lost its original forwarding claim")
+
+    async def retire_forwarded(self, event_ids: tuple[str, ...]) -> int:
+        """Remove only this scope's references to exact already-deleted events.
+
+        The outbox owns the enclosing transaction through both the signal
+        deletion and this reference retirement. No clock or history scan can
+        substitute for that original deletion result.
+        """
+        removed = 0
+        for event_id in event_ids:
+            if not isinstance(event_id, str) or not event_id:
+                raise ValueError("Task change retirement requires concrete event IDs")
+            removed += await self.backend.execute(
+                "DELETE FROM a2a_task_changes WHERE recipient_id = ? AND tenant = ? "
+                "AND forwarded_event_id = ?",
+                (*self._scope_parameters, event_id),
+            )
+        return removed

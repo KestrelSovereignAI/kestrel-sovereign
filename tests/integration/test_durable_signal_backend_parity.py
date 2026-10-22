@@ -1040,7 +1040,7 @@ async def test_missing_and_stale_source_counters_repair_per_scope_or_fail_closed
                 purged.event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_a) == 1
+        assert len(await store.purge_expired(agent_id=agent_a)) == 1
 
         # A normal initialization does not scan history. The first real scope
         # operation notices and repairs this stale row through the scope index.
@@ -1220,7 +1220,7 @@ async def test_boundary_repairs_missing_seen_before_retention_and_exact_loss(
                 persisted.event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_id) == 1
+        assert len(await store.purge_expired(agent_id=agent_id)) == 1
 
         # A pre-recovery replica advances only the primary API. Its database
         # fence mirrors exact state; deleting seen again reproduces the equal,
@@ -1310,7 +1310,7 @@ async def test_both_exact_row_deletions_fail_closed_per_seen_scope_on_real_backe
                 "WHERE event_id = ?",
                 (expired, persisted[index].event_id),
             )
-        assert await store.purge_expired(agent_id=agent_id) == len(purged_indices)
+        assert len(await store.purge_expired(agent_id=agent_id)) == len(purged_indices)
         await backend.execute(
             "DELETE FROM durable_signal_source_sequences "
             "WHERE agent_id = ? AND source = ?",
@@ -1405,7 +1405,7 @@ async def test_seen_scope_with_no_positive_exact_high_water_fails_closed_everywh
                 "WHERE event_id = ?",
                 (expired, persisted[index].event_id),
             )
-        assert await store.purge_expired(agent_id=agent_id) == len(purged_indices)
+        assert len(await store.purge_expired(agent_id=agent_id)) == len(purged_indices)
         retained = await backend.fetch_all(
             "SELECT source_sequence FROM durable_signal_events "
             "WHERE agent_id = ? AND source = ? ORDER BY source_sequence",
@@ -1567,7 +1567,7 @@ async def test_independent_high_water_survives_review_ordering_on_real_backends(
                 persisted[2].event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_id) == 1
+        assert len(await store.purge_expired(agent_id=agent_id)) == 1
 
         # Exact review reproduction: only retained 1-2 survive, then the seen,
         # primary, and recovery rows disappear. The independent high-water is
@@ -1653,7 +1653,7 @@ async def test_legacy_primary_writer_recovers_before_racing_live_ingress(
                 "WHERE event_id = ?",
                 (expired, persisted[index].event_id),
             )
-        assert await store.purge_expired(agent_id=agent_id) == len(purged_indices)
+        assert len(await store.purge_expired(agent_id=agent_id)) == len(purged_indices)
 
         if loss_kind == "table":
             await backend.execute("DROP TABLE durable_signal_source_sequences")
@@ -3077,8 +3077,8 @@ async def test_postgres_scope_work_drift_validates_every_primary_before_completi
             "UPDATE durable_signal_events SET retention_until = ?",
             (expired,),
         )
-        assert await restarted.purge_expired(agent_id=agent_a) == 2
-        assert await restarted.purge_expired(agent_id=agent_b) == 2
+        assert len(await restarted.purge_expired(agent_id=agent_a)) == 2
+        assert len(await restarted.purge_expired(agent_id=agent_b)) == 2
         assert await backend.fetch_val(
             "SELECT COUNT(*) FROM durable_signal_events"
         ) == 0

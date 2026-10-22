@@ -2661,7 +2661,7 @@ class SignalDispatcher:
             purged = await self._durable_store.purge_expired(agent_id=self._agent.did)
             self._discard_expired_transient_durable_handoffs()
             await self._release_expired_initial_handoffs()
-            return purged
+            return len(purged)
 
     async def shutdown_durable_delivery(self) -> bool:
         """Close admission, drain committed work, then release this owner.

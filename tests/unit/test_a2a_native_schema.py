@@ -4,9 +4,91 @@ import pytest
 from a2a.helpers.proto_helpers import new_text_message
 from a2a.types import Role, SendMessageRequest
 
-from kestrel_sovereign.a2a.native_schema import NativeA2AMigrationRequired
+from kestrel_sovereign.a2a.native_schema import NativeA2AMigrationRequired, NativeStoreSchema
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.storage.db.interface import TransactionError
 from tests.utils.native_a2a import manager_for
+
+
+@pytest.mark.parametrize("previous", [("core", 4), ("push", 1)])
+async def test_previous_global_capture_bundles_require_offline_migration(
+    native_a2a_backend_factory, previous
+):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    manager = manager_for(backend, NativeRecipientScope("did:recipient"), owns_backend=False)
+    try:
+        await backend.execute_script(
+            "CREATE TABLE a2a_native_store_schema (component TEXT PRIMARY KEY, revision INTEGER NOT NULL);"
+            "CREATE TABLE a2a_protocol_schema (singleton INTEGER PRIMARY KEY, revision INTEGER NOT NULL)"
+        )
+        await backend.execute("INSERT INTO a2a_protocol_schema VALUES (1, 1)")
+        rows = [previous]
+        if previous[0] != "core":
+            rows.append(NativeStoreSchema.CORE.value)
+        for row in rows:
+            await backend.execute("INSERT INTO a2a_native_store_schema VALUES (?, ?)", row)
+        with pytest.raises(NativeA2AMigrationRequired, match="not supported"):
+            await manager.initialize()
+        assert not await backend.table_exists("a2a_tasks")
+        assert set(await backend.fetch_all("SELECT * FROM a2a_native_store_schema")) == set(rows)
+    finally:
+        await manager.close()
+        await backend.close()
+
+
+async def test_capture_cannot_start_before_the_optional_push_stores(
+    native_a2a_backend_factory,
+):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    manager = manager_for(
+        backend, NativeRecipientScope("did:recipient"), owns_backend=False
+    )
+    try:
+        await manager.initialize()
+        with pytest.raises(TransactionError, match="initialized stores") as caught:
+            await manager.task_store.changes.enable_push_capture()
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert not await backend.table_exists("a2a_push_configs")
+    finally:
+        await manager.close()
+        await backend.close()
+
+
+async def test_partial_old_capture_refuses_to_publish_a_completed_native_bundle(
+    native_a2a_backend_factory,
+):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    manager = manager_for(
+        backend, NativeRecipientScope("did:recipient"), owns_backend=False
+    )
+    try:
+        # A partial store has no completed manager bundle to validate. Its
+        # actual legacy capture must still be refused before publication.
+        await manager.task_store.initialize()
+        protocol = await backend.fetch_all("SELECT * FROM a2a_protocol_schema")
+        if backend.backend_type == "sqlite":
+            await backend.execute_script(
+                "CREATE TRIGGER a2a_task_changes_update_v1 AFTER UPDATE ON a2a_tasks "
+                "BEGIN SELECT 1; END"
+            )
+        else:
+            await backend.execute_script(
+                "CREATE FUNCTION a2a_task_changes_v1() RETURNS trigger "
+                "LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$; "
+                "CREATE TRIGGER a2a_task_changes_v1 AFTER UPDATE ON a2a_tasks "
+                "FOR EACH ROW EXECUTE FUNCTION a2a_task_changes_v1()"
+            )
+        with pytest.raises(TransactionError, match="capture.*offline") as caught:
+            await manager.initialize()
+        assert isinstance(caught.value.__cause__, NativeA2AMigrationRequired)
+        assert not await backend.table_exists("a2a_native_store_schema")
+        assert await backend.fetch_all("SELECT * FROM a2a_protocol_schema") == protocol
+    finally:
+        await manager.close()
+        await backend.close()
 
 
 @pytest.mark.parametrize(

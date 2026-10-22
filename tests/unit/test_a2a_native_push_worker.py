@@ -58,8 +58,8 @@ async def register(value, task, url):
     native.url = url
     config = await value.register(native, creator_id="did:creator")
     runner = worker(value)
-    # Registration's older task reference is acknowledged without HTTP.
-    assert await runner.run_once() == 1
+    # The initial snapshot is future-only work. No historical task prefix is
+    # claimed before the actual caller owns its first network delivery.
     assert (
         await value.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts")
         == []
@@ -81,7 +81,7 @@ async def test_native_delivery_acknowledges_only_after_actual_https_and_retireme
     ) == [(1,)]
     assert await value.backend.fetch_all(
         "SELECT status FROM durable_signal_deliveries"
-    ) == [(ACKNOWLEDGED,), (ACKNOWLEDGED,)]
+    ) == [(ACKNOWLEDGED,)]
     restarted = worker(value)
     assert await restarted.run_once() == 0
     assert len(outbound_tls.posts) == 1
@@ -370,8 +370,8 @@ async def test_metadata_commit_remains_owned_through_original_caller_withdrawal(
     value, task = outbox
     runner = worker(value)
     entered, release = asyncio.Event(), asyncio.Event()
+    await value.register(callback(task), creator_id="did:creator")
     if operation == "claim":
-        await value.register(callback(task), creator_id="did:creator")
         await value.forward_pending(limit=10)
         owner, method = value.signals, "claim_delivery"
     else:

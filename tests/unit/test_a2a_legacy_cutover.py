@@ -19,6 +19,7 @@ from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.utils.native_a2a import manager_for
+from tests.utils.native_push import managed_push_service
 
 
 def ownership():
@@ -98,7 +99,7 @@ async def legacy(backend, *, terminal_fence=False):
 
 
 async def test_offline_cutover_preserves_archives_ownership_and_history_without_new_wakes(
-    native_a2a_backend_factory,
+    native_a2a_backend_factory, monkeypatch,
 ):
     backend = native_a2a_backend_factory()
     await backend.connect()
@@ -120,8 +121,8 @@ async def test_offline_cutover_preserves_archives_ownership_and_history_without_
         assert not await backend.table_exists("a2a_protocol_schema")
         assert await backend.fetch_all("SELECT * FROM a2a_tasks") == before
         archives = await apply_legacy_migration(backend, plan)
-        # Historical conversion emits no new push work. Fresh mutations must
-        # use the canonical triggers restored by the offline transaction.
+        # Historical conversion emits no new push work. Only an explicitly
+        # subscribed fresh task may produce references after optional startup.
         assert await backend.fetch_one("SELECT COUNT(*) FROM a2a_task_changes") == (0,)
         assert (
             await backend.fetch_all(f'SELECT * FROM "{archives["a2a_tasks"]}"')
@@ -154,14 +155,14 @@ async def test_offline_cutover_preserves_archives_ownership_and_history_without_
                 "sender_verified" not in restored.metadata
                 and "sender" not in restored.metadata
             )
-            fresh = await manager.create_task(
-                SendMessageRequest(
+            params = SendMessageRequest(
                     tenant="tenant",
                     message=new_text_message("Native input", role=Role.ROLE_USER),
                     metadata={"cognition_wake_eligible": 0},
-                ),
-                creator_agent_id="did:creator",
             )
+            params.configuration.task_push_notification_config.url = "https://1.1.1.1/callback"
+            async with managed_push_service(manager, monkeypatch, pause_delivery=True):
+                fresh = await manager.create_task(params, creator_agent_id="did:creator")
             candidates = await manager.task_store.list_cognition_wake_candidates(
                 recipient_agent_id=manager.did,
                 live_changed_since=datetime(2020, 1, 1, tzinfo=UTC),
@@ -182,7 +183,7 @@ async def test_offline_cutover_preserves_archives_ownership_and_history_without_
         await backend.close()
 
 
-async def test_offline_cutover_restores_task_journal_before_runtime_boot(
+async def test_offline_cutover_leaves_push_capture_disabled_before_optional_runtime_boot(
     native_a2a_backend_factory,
 ):
     backend = native_a2a_backend_factory()
@@ -197,8 +198,8 @@ async def test_offline_cutover_restores_task_journal_before_runtime_boot(
             scope=NativeRecipientScope("did:recipient", "tenant"),
             owns_backend=False,
         )
-        # Exercise the original committed triggers before initialize could
-        # reinstall them. This terminal probe cannot start cognition.
+        # Before optional push startup there is no callback admission. Even a
+        # native direct write must leave no unused push reference behind.
         task = Task(
             id="post-cutover-native",
             context_id="post-cutover-context",
@@ -211,9 +212,7 @@ async def test_offline_cutover_restores_task_journal_before_runtime_boot(
             cognition_wake_eligible=False,
             input_wake_eligible=False,
         )
-        assert [change.task_id for change in await store.changes.pending(limit=10)] == [
-            task.id
-        ]
+        assert await store.changes.pending(limit=10) == []
     finally:
         await backend.close()
 

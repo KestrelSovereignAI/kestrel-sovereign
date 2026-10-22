@@ -893,24 +893,41 @@ uncertain, so a lost acknowledgement before HTTP begins is recoverable without
 inventing a network request or replacing the original database outcome.
 
 `TaskChangeStore` records metadata-only references through SQLite and PostgreSQL
-triggers in each original task transaction. The current core schema bundle is
-revision 4. Offline conversion suspends the canonical trigger inventory while
-rewriting history and restores it before commit, without producing new work for
-historical tasks. Task cleanup removes its journal references.
+triggers in each original task transaction. Capture requires an active callback
+generation and its exact active durable consumer; ordinary tasks and disabled
+push recipients accumulate no unused journal. The optional push initializer
+installs capture after its configuration, subscription and consumer stores.
+The current core schema bundle is revision 5 and push is revision 2. Earlier
+native capture requires offline migration, including partial old bundles.
+Offline conversion suspends the canonical trigger inventory while rewriting
+history and restores it before commit, without producing new work for historical
+tasks. Task cleanup removes its journal references.
 
 `NativePushOutbox` commits encrypted configuration, durable consumer registration
 and an initial snapshot reference together. A creator-authorized task row lock
 orders that registration against task changes. The existing `DurableSignalStore`
 owns fan-out, claims, leases, retry and acknowledgement. Forwarding commits the
 signal event, initial deliveries and journal receipt together; stable source IDs
-preserve original deliveries after replay. A recipient/tenant-derived source
-scope and immutable journal boundary prevent cross-tenant delivery and sending
-older backfilled changes to a new subscription.
+preserve original deliveries after replay. Push consumers persist a future-only
+contract: registration and event fan-out share the original source handoff,
+while the explicit snapshot supplies the current state. Claims never backfill
+retained history for these consumers. Other durable consumers retain their
+explicit replay contract. A recipient/tenant-derived source scope and immutable
+journal boundary prevent cross-tenant delivery and sending older queued changes
+to a new subscription.
 
 `NativePushWorker` reads each notification from the latest canonical task under
 the subscription's creator authority. It renews the original delivery token and
 checks it again at actual HTTP dispatch. Acknowledgement follows physical HTTP
-retirement. Retry diagnostics contain error types, excluding callback secrets.
+retirement. A successful terminal-task POST acknowledges its original lease and
+deactivates that consumer in the same transaction. Configuration reads remain
+available until creator deletion. Each resident pass forwards, claims and retires
+finite batches. Its read-only due inventory uses live delivery indexes; idle
+subscriptions and retained event payloads never enter a claim loop. Retention
+deletes only terminal events from the exact private push source and removes
+journal references to those exact deleted IDs in one transaction. Pending,
+retrying and leased deliveries retain their events. Retry diagnostics contain
+error types, excluding callback secrets.
 Owned database transitions finish before cancellation is reported, preserving
 actual commit failures. Delete revokes configuration and consumer admission in
 one transaction, joins local request owners, then requires the durable retirement

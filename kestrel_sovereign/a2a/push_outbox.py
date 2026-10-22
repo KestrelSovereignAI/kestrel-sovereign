@@ -122,14 +122,19 @@ class NativePushOutbox(UnifiedStoreBase):
                     config_id TEXT NOT NULL,
                     generation TEXT NOT NULL,
                     creator_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
                     consumer_id TEXT NOT NULL,
                     after_sequence BIGINT NOT NULL CHECK (after_sequence >= 0),
                     PRIMARY KEY (recipient_id, tenant, task_id, config_id),
+                    UNIQUE (agent_id, consumer_id),
+                    FOREIGN KEY (agent_id, consumer_id)
+                        REFERENCES durable_signal_consumers (agent_id, consumer_id),
                     FOREIGN KEY (recipient_id, tenant, task_id, config_id)
                         REFERENCES a2a_push_configs (recipient_id, tenant, task_id, config_id)
                         ON DELETE CASCADE
                 )
             """)
+            await self.changes.enable_push_capture()
             await publish_native_store_schema(self.backend, NativeStoreSchema.PUSH)
 
     async def register(
@@ -207,11 +212,13 @@ class NativePushOutbox(UnifiedStoreBase):
                     correlation_selector="payload.task_id=" + native.task_id,
                     max_attempts=0,
                     lease_seconds=self.lease_seconds,
+                    replay_retained=False,
                 )
             )
             await self.backend.execute(
                 "INSERT INTO a2a_push_subscriptions (recipient_id, tenant, task_id, config_id, "
-                "generation, creator_id, consumer_id, after_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "generation, creator_id, agent_id, consumer_id, after_sequence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     self.configurations.scope.recipient_id,
                     self.configurations.scope.tenant,
@@ -219,6 +226,7 @@ class NativePushOutbox(UnifiedStoreBase):
                     native.id,
                     configuration.generation,
                     creator_id,
+                    self.agent_id,
                     consumer_id,
                     boundary,
                 ),
@@ -226,18 +234,50 @@ class NativePushOutbox(UnifiedStoreBase):
             await self.changes.enqueue_snapshot(native.task_id, creator_id=creator_id)
         return configuration
 
-    async def subscriptions(self) -> list[PushSubscription]:
-        """Inventory active contracts for this exact recipient and tenant."""
+    async def subscriptions(self, *, due_limit: int | None = None) -> list[PushSubscription]:
+        """Inventory live contracts, optionally restricted to a finite due batch."""
+        due = None
+        parameters = [
+            self.configurations.scope.recipient_id,
+            self.configurations.scope.tenant,
+            self.signals.to_bool_param(True),
+        ]
+        predicate = ""
+        if due_limit is not None:
+            due = await self.signals.due_consumer_ids(
+                agent_id=self.agent_id, source=self.SOURCE, limit=due_limit
+            )
+            if not due:
+                return []
+            predicate = " AND s.consumer_id IN (" + ", ".join("?" for _ in due) + ")"
+            parameters.extend(due)
         rows = await self.backend.fetch_all(
             "SELECT s.task_id, s.config_id, s.generation, s.creator_id, s.consumer_id, s.after_sequence "
             "FROM a2a_push_subscriptions AS s JOIN a2a_push_configs AS c "
             "ON c.recipient_id = s.recipient_id AND c.tenant = s.tenant "
             "AND c.task_id = s.task_id AND c.config_id = s.config_id AND c.generation = s.generation "
-            "WHERE s.recipient_id = ? AND s.tenant = ? AND c.state = 'active' "
+            "JOIN durable_signal_consumers consumer "
+            "ON consumer.agent_id = s.agent_id AND consumer.consumer_id = s.consumer_id "
+            "WHERE s.recipient_id = ? AND s.tenant = ? AND consumer.active = ? "
+            "AND c.state = 'active' " + predicate + " "
             "ORDER BY s.task_id, s.config_id",
-            (self.configurations.scope.recipient_id, self.configurations.scope.tenant),
+            tuple(parameters),
         )
+        if due is not None:
+            found = {row[4] for row in rows}
+            for consumer_id in set(due) - found:
+                if await self.signals.has_active_consumer(self.agent_id, consumer_id):
+                    raise PushConfigConflict("Due push consumer lost its original subscription")
         return [PushSubscription(*row) for row in rows]
+
+    async def retire_history(self, *, limit: int) -> int:
+        """Retire one exact source batch and its journal references atomically."""
+        async with self.write_transaction():
+            deleted = await self.signals.purge_expired(
+                agent_id=self.agent_id, source=self.SOURCE, limit=limit
+            )
+            await self.changes.retire_forwarded(deleted)
+        return len(deleted)
 
     async def revoke(
         self, task_id: str, config_id: str, *, creator_id: str

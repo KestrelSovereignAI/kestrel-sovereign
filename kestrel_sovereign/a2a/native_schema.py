@@ -17,10 +17,10 @@ class NativeStoreSchema(Enum):
     payload encoding. A standalone TaskStore never proves the other stores.
     """
 
-    CORE = ("core", 4)
+    CORE = ("core", 5)
     MEMORY = ("memory", 1)
     FEEDBACK = ("feedback", 1)
-    PUSH = ("push", 1)
+    PUSH = ("push", 2)
 
 
 async def _require_native_input_schema(backend) -> None:

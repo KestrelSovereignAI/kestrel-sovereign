@@ -15,6 +15,7 @@ from kestrel_sovereign._async_ownership import (
     gather_owned,
 )
 from kestrel_sovereign.a2a.push_outbox import NativePushOutbox, PushSubscription
+from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
 from kestrel_sovereign.a2a.push_transport import (
     NativePushTransport,
     PushDeliveryRevoked,
@@ -201,6 +202,7 @@ class NativePushWorker:
         task = asyncio.current_task()
         self._active[task] = run
         try:
+            terminal_sent = False
             payload = delivery.event.payload
             if (
                 delivery.consumer_id != subscription.consumer_id
@@ -236,6 +238,7 @@ class NativePushWorker:
                     raise PushConfigConflict(
                         "Active push configuration lost its canonical task"
                     )
+                terminal_sent = native.status.state in TERMINAL_STATES
                 finished = asyncio.Event()
 
                 async def post():
@@ -278,7 +281,10 @@ class NativePushWorker:
                     name_prefix="native-push-request",
                 )
             if not await self._owned_transition(
-                self.outbox.signals.ack_delivery(**self._lease_parameters(delivery)),
+                self.outbox.signals.ack_delivery(
+                    **self._lease_parameters(delivery),
+                    complete_consumer=terminal_sent,
+                ),
                 delivery,
             ):
                 raise PushDeliveryLeaseLost(
@@ -288,12 +294,12 @@ class NativePushWorker:
             self._active.pop(task, None)
 
     async def run_once(self) -> int:
-        """Forward a bounded journal batch and attempt one delivery per subscriber."""
+        """Forward, deliver and retire finite batches from the original ledgers."""
         await self._owned_transition(
             self.outbox.forward_pending(limit=self.batch_size), self.outbox
         )
         count = 0
-        for subscription in await self.outbox.subscriptions():
+        for subscription in await self.outbox.subscriptions(due_limit=self.batch_size):
             delivery = await self._owned_transition(
                 self.outbox.signals.claim_delivery(
                     agent_id=self.outbox.agent_id,
@@ -346,6 +352,9 @@ class NativePushWorker:
                 logger.warning(
                     "Native push delivery will retry after %s", type(error).__name__
                 )
+        await self._owned_transition(
+            self.outbox.retire_history(limit=self.batch_size), self.outbox
+        )
         return count
 
     async def delete(self, task_id: str, config_id: str, *, creator_id: str) -> None:

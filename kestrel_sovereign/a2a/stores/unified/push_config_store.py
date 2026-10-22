@@ -90,7 +90,10 @@ class PushConfigStore(UnifiedStoreBase):
                     ciphertext TEXT,
                     PRIMARY KEY (recipient_id, tenant, task_id, config_id),
                     CHECK ((state = 'deleted') = (ciphertext IS NULL))
-                )
+                );
+                CREATE INDEX IF NOT EXISTS a2a_push_active_tasks
+                    ON a2a_push_configs (recipient_id, tenant, task_id)
+                    WHERE state = 'active'
             """)
 
             await self.backend.execute_script("""
